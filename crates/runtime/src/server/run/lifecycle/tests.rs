@@ -12092,11 +12092,16 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
             authorized_request("same-session-conflict", &blocked_session),
         )
         .await);
-    let (_, Json(expected_conflict)) = session_writer_conflict_response(&blocked_session, Some(1));
     assert_eq!(same_session.0, StatusCode::CONFLICT);
-    assert_eq!(same_session.1.0.error_code, expected_conflict.error_code);
-    assert_eq!(same_session.1.0.detail, expected_conflict.detail);
-    assert_eq!(same_session.1.0.metadata, expected_conflict.metadata);
+    assert_eq!(
+        same_session.1.0.error_code.as_deref(),
+        Some("session_execution_slot_occupied")
+    );
+    assert_eq!(same_session.1.0.detail, "session already has an active run");
+    assert_eq!(
+        same_session.1.0.metadata,
+        Some(json!({"admission_state": "rejected"}))
+    );
     assert_eq!(
         llm.requests.load(Ordering::SeqCst),
         1,
@@ -29992,19 +29997,17 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         )
         .await
         .expect("append recoverable Explain fact");
-    assert!(
+    // The prior root was completed before the current root was admitted.
+    // Removing its snapshot exercises recovery of that existing terminal
+    // execution, not a second running-to-completed transition.
+    assert_eq!(
         svc.run_engine
-            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                user_id: user,
-                expected_session_id: &session,
-                run_id: &run,
-                status: STATUS_COMPLETED,
-                waiting_for: None,
-                error_message: None,
-                expected_statuses: &["running"],
-            })
+            .load_run(user, &run)
             .await
-            .expect("complete recoverable Explain run")
+            .expect("load recoverable Explain run")
+            .expect("recoverable Explain run exists")
+            .status,
+        STATUS_COMPLETED
     );
     svc.run_engine
         .append_event(
