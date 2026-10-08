@@ -33,8 +33,7 @@ where
             .iter()
             .map(|name| (*name).to_string())
             .collect::<HashSet<_>>();
-        astra_tools::run_script::handle_run_script_with_cancel(args, executor, config, cancel_token)
-            .await
+        astra_tools::run_script::handle_run_script(args, executor, config, cancel_token).await
     }
     #[cfg(not(unix))]
     {

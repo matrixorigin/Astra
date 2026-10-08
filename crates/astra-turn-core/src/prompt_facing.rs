@@ -5,6 +5,9 @@
 //! optimizer decides when pressure justifies compaction. Do not substitute a
 //! display projection for canonical history.
 
+use crate::compression_types::{
+    DUPLICATE_OUTPUT_CALL_ID_FIELD, duplicate_output_reference, duplicate_output_targets,
+};
 use crate::conversation_log::SessionStateCompact;
 use astra_turn_types::{
     RuntimeMessageDelivery, is_runtime_owned_message, runtime_message_delivery,
@@ -195,6 +198,10 @@ fn sanitize_canonical_continuation_messages_impl(
         }
     }
 
+    // Validate before the canonical projection removes result attribution.
+    // Otherwise two different owners could become indistinguishable and an
+    // invalid reference could gain authority when this history is restored.
+    let duplicate_targets = duplicate_output_targets(&messages);
     let start = if preserve_compacted_head {
         compacted_canonical_turn_start(&messages)?
     } else {
@@ -202,14 +209,20 @@ fn sanitize_canonical_continuation_messages_impl(
     };
     let messages = messages
         .into_iter()
+        .enumerate()
         .skip(start)
-        .filter_map(|mut message| {
+        .filter_map(|(index, mut message)| {
             let append_only_required = runtime_message_delivery(&message)
                 == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext);
             let keep = message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
                 && (append_only_required || !is_runtime_owned_message(&message));
             if !keep {
                 return None;
+            }
+            if duplicate_targets[index].is_none()
+                && let Some(object) = message.as_object_mut()
+            {
+                object.remove(DUPLICATE_OUTPUT_CALL_ID_FIELD);
             }
             astra_turn_types::clear_turn_message_provenance(&mut message);
             Some(message)
@@ -401,6 +414,13 @@ fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
         && !name.is_empty()
     {
         projected.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(target) = duplicate_output_reference(tool) {
+        projected.insert("_synthetic".to_string(), Value::Bool(true));
+        projected.insert(
+            DUPLICATE_OUTPUT_CALL_ID_FIELD.to_string(),
+            Value::String(target.to_string()),
+        );
     }
     crate::tool::result::advisory::set_advisories(
         &mut projected,

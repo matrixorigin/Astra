@@ -5112,7 +5112,7 @@ impl ToolExecutor {
                     #[cfg(unix)]
                     {
                         let config = astra_tools::run_script::RunScriptConfig::default();
-                        let result = astra_tools::run_script::handle_run_script_with_cancel(
+                        let result = astra_tools::run_script::handle_run_script(
                             args,
                             self,
                             config,

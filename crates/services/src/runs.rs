@@ -3353,17 +3353,6 @@ pub struct DurableRunStatusSnapshot {
     pub accounting: Option<serde_json::Value>,
 }
 
-/// Minimal identity needed to decide whether a durable run has a delegation
-/// projection. This deliberately excludes the event log: status transitions
-/// must not hydrate an unbounded history merely to refresh a child summary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DurableRunDelegationProjectionTarget {
-    pub user_id: String,
-    pub parent_run_id: Option<String>,
-    pub delegation_id: Option<String>,
-    pub agent_id: Option<String>,
-}
-
 impl From<&DurableRunRecord> for DurableRunControlRecord {
     fn from(run: &DurableRunRecord) -> Self {
         Self {
@@ -5413,14 +5402,6 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
         event_limit: usize,
     ) -> Result<Option<DurableRunObservation>, String>;
-
-    /// Load only the bounded identity needed by delegation projection.
-    /// Shared stores should override this with a metadata-only lookup.
-    async fn load_run_delegation_projection_target(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String>;
 
     /// Load durable events strictly after an event-index cursor together with
     /// the current run status. This is the cross-process live-attach primitive.
@@ -8158,23 +8139,6 @@ impl RunStateStore for InMemoryRunStateStore {
             run: bounded,
             total_event_count,
         }))
-    }
-
-    async fn load_run_delegation_projection_target(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String> {
-        let runs = self.runs.read().await;
-        Ok(runs
-            .get(run_id)
-            .filter(|run| run.user_id == user_id)
-            .map(|run| DurableRunDelegationProjectionTarget {
-                user_id: run.user_id.clone(),
-                parent_run_id: run.parent_run_id.clone(),
-                delegation_id: run.delegation_id.clone(),
-                agent_id: run.agent_id.clone(),
-            }))
     }
 
     async fn load_run_interaction_projection(
@@ -16664,23 +16628,6 @@ impl RunStateStore for DatabaseRunStateStore {
                 .ok()
                 .flatten(),
         )
-    }
-
-    async fn load_run_delegation_projection_target(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDelegationProjectionTarget>, String> {
-        Ok(self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .map(|run| DurableRunDelegationProjectionTarget {
-                user_id: run.user_id,
-                parent_run_id: run.parent_run_id,
-                delegation_id: run.delegation_id,
-                agent_id: run.agent_id,
-            }))
     }
 
     async fn has_unsettled_user_intent(

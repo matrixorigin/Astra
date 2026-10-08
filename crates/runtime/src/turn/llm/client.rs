@@ -3907,6 +3907,10 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
                 "_synthetic",
+                "_reactive",
+                "_messages_removed",
+                "_turns_removed",
+                astra_turn_core::compression_types::DUPLICATE_OUTPUT_CALL_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
                 RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
@@ -15613,6 +15617,11 @@ mod tests {
         runtime["_tool_name"] = json!("read_file");
         runtime["_timestamp"] = json!(1234);
         runtime["_synthetic"] = json!(true);
+        runtime["_reactive"] = json!(true);
+        runtime["_messages_removed"] = json!(4);
+        runtime["_turns_removed"] = json!(2);
+        runtime[astra_turn_core::compression_types::DUPLICATE_OUTPUT_CALL_ID_FIELD] =
+            json!("later-call");
 
         let out = consolidate_system_messages_for_provider(&[runtime], "openai", None);
 
@@ -15638,6 +15647,10 @@ mod tests {
             "_tool_name",
             "_timestamp",
             "_synthetic",
+            "_reactive",
+            "_messages_removed",
+            "_turns_removed",
+            astra_turn_core::compression_types::DUPLICATE_OUTPUT_CALL_ID_FIELD,
             astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
             astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
         ] {

@@ -1,35 +1,24 @@
-//! Context Compression Pipeline
+//! Fixed proactive/retry compaction policy over canonical history values.
 //!
-//! Layered, progressive compression. Each layer fires in order, stopping when
-//! the token budget is satisfied. The pipeline adjusts the effective budget
-//! after each layer so later layers see accurate pressure.
-//!
-//! Layers (cheapest first):
-//! 1. **DuplicateToolOutputElimination** — reference identical tool output (no content loss).
-//! 2. **ToolResultTruncation** — shorten old tool-result content bodies.
-//! 3. **TieredCompaction** — drop middle messages, keep system + first user + recent.
-//! 4. **ReactiveCompact** — emergency: keep system + first user + last 4.
-
-use astra_turn_core::compaction_types::CompactionTier;
-pub use astra_turn_core::compression_types::{
-    CompressionResult, Message, PipelineOutcome, TokenBudget,
-};
-use astra_turn_core::context_assembly_trace::CompressionMethod;
+//! Mechanical rewrites live in `compaction`, shared with request-budget
+//! compaction. This owner selects the existing ordered policy, prepares one
+//! isolated candidate, and installs it only after useful progress.
 
 use astra_config::runtime_config::CompressionConfig;
+use astra_turn_core::compaction_types::CompactionTier;
+pub use astra_turn_core::compression_types::{PipelineOutcome, TokenBudget};
+use astra_turn_core::context_assembly_trace::CompressionMethod;
 use serde_json::Value;
-use std::time::Duration;
 
-use super::compaction::{CompactResult, compact_tiered_impl};
-use super::layers::{
-    DuplicateToolOutputElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
+use super::compaction::{
+    compact_duplicate_tool_outputs, compact_middle_messages, truncate_old_tool_results,
 };
 
-// ───────────────────────────── Pipeline ──────────────────────────────────
-
-/// Ordered pipeline of compression layers.
 pub struct CompactionEngine {
-    layers: Vec<Box<dyn astra_turn_core::compression_types::CompressionLayer>>,
+    triggers: [f64; 4],
+    keep_length: usize,
+    age_secs: u64,
+    keep_recent_turns: usize,
 }
 
 impl Default for CompactionEngine {
@@ -39,267 +28,131 @@ impl Default for CompactionEngine {
 }
 
 impl CompactionEngine {
-    pub fn new() -> Self {
-        Self { layers: Vec::new() }
-    }
-
-    pub fn add_layer(
-        &mut self,
-        layer: Box<dyn astra_turn_core::compression_types::CompressionLayer>,
-    ) {
-        self.layers.push(layer);
-    }
-
-    /// Return the minimum trigger pressure across all layers.
-    /// Used for the fast-path check that skips conversion when under budget.
-    fn min_trigger_pressure(&self) -> f64 {
-        self.layers
-            .iter()
-            .map(|l| l.trigger_pressure())
-            .fold(f64::MAX, f64::min)
-    }
-
-    /// Run all layers in order, adjusting the effective budget between layers.
-    ///
-    /// After each layer fires, `last_measured_tokens` is reduced by the freed
-    /// amount so the next layer's trigger check sees accurate pressure.
-    /// Stops early once the budget is satisfied.
-    ///
-    /// Accepts `Vec<Value>` (the system's wire format), converts to typed
-    /// `Vec<Message>` internally, runs the pipeline, and converts back.
-    /// When budget pressure is below every layer's trigger threshold, the
-    /// conversion is skipped entirely to avoid allocation overhead.
+    /// Run the fixed cheap-to-expensive schedule. The original canonical
+    /// history remains available if candidate preparation fails unexpectedly;
+    /// no externally supplied layer executes inside this rewrite boundary.
     pub fn compress_if_needed(
         &self,
         messages: &mut Vec<Value>,
         budget: &TokenBudget,
     ) -> PipelineOutcome {
         astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
-
-        // Fast-path: if no layer would fire, skip the Value→Message→Value
-        // round-trip to avoid Vec allocation on the hot path.
-        let pressure = budget.pressure();
-        if pressure <= self.min_trigger_pressure() {
-            return PipelineOutcome {
-                layer_results: Vec::new(),
-                total_tokens_freed: 0,
-                budget_satisfied: !budget.is_over_budget(),
-            };
+        let mut outcome = PipelineOutcome {
+            layer_results: Vec::new(),
+            total_tokens_freed: 0,
+            budget_satisfied: !budget.is_over_budget(),
+        };
+        if budget.pressure() <= self.triggers.into_iter().fold(f64::MAX, f64::min) {
+            return outcome;
         }
 
-        // Convert to typed Messages. We clone Values into Messages
-        // so the caller's original Vec<Value> survives any panic in
-        // Message::from or in the layer loop below.
+        // One failure-isolation copy, without converting/reconstructing every
+        // message, content block and provider-owned tool-call extension.
         astra_core::history_work::record_serialized_value(
             astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
             messages,
         );
-        let mut typed: Vec<Message> = messages.iter().map(|v| Message::from(v.clone())).collect();
-
-        let outcome = self.compress_typed(&mut typed, budget);
-
-        // Only now — after every layer succeeded — overwrite the caller's
-        // messages. If any layer panicked, the original Vec<Value> is intact.
-        *messages = typed
-            .into_iter()
-            .map(|message| {
-                // `Value::from(Message)` removes dynamic `_` fields while
-                // retaining stable user-turn semantics. The compaction result
-                // is still canonical runtime state, so restore the typed
-                // ownership/boundary markers needed by later projections.
-                let compact_boundary = message.extra.get("_compact_boundary").cloned();
-                let runtime_provenance = message
-                    .extra
-                    .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
-                    .cloned();
-                let mut value = Value::from(message);
-                if let Some(object) = value.as_object_mut() {
-                    if let Some(marker) = compact_boundary {
-                        object.insert("_compact_boundary".to_string(), marker);
-                    }
-                    if let Some(provenance) = runtime_provenance {
-                        object.insert(
-                            astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD.to_string(),
-                            provenance,
-                        );
-                    }
-                }
-                value
-            })
-            .collect();
-
-        // Re-sanitize after every typed round-trip: Message::from may filter
-        // malformed tool_calls even when no layer ultimately frees tokens, and
-        // that can still leave an empty tool_calls array on the way back out.
-        astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
-
-        outcome
-    }
-
-    /// Run the layer pipeline on typed `Vec<Message>` without the Value
-    /// round-trip. Tests use this to inspect the complete internal compaction
-    /// metadata. Production projection preserves only canonical ownership and
-    /// boundary markers; provider assembly removes them before the wire.
-    pub(crate) fn compress_typed(
-        &self,
-        typed: &mut Vec<Message>,
-        budget: &TokenBudget,
-    ) -> PipelineOutcome {
-        let pressure = budget.pressure();
-        if pressure <= self.min_trigger_pressure() {
-            return PipelineOutcome {
-                layer_results: Vec::new(),
-                total_tokens_freed: 0,
-                budget_satisfied: !budget.is_over_budget(),
-            };
-        }
-
+        let mut candidate = messages.clone();
         let mut running_budget = budget.clone();
-        let mut layer_results = Vec::new();
-        let mut total_freed: u64 = 0;
-
-        for layer in &self.layers {
-            if running_budget.pressure() <= layer.trigger_pressure() {
+        let schedule = [
+            CompressionMethod::DuplicateToolOutputElimination,
+            CompressionMethod::ToolResultTruncation,
+            CompressionMethod::TieredCompaction,
+            CompressionMethod::ReactiveCompact,
+        ];
+        for (method, trigger) in schedule.into_iter().zip(self.triggers) {
+            if running_budget.pressure() <= trigger {
                 continue;
             }
-
-            let result = layer.compress(typed, &running_budget);
+            let (name, result) = match method {
+                CompressionMethod::DuplicateToolOutputElimination => (
+                    "duplicate_tool_output_elimination",
+                    compact_duplicate_tool_outputs(&mut candidate),
+                ),
+                CompressionMethod::ToolResultTruncation => (
+                    "tool_result_truncation",
+                    truncate_old_tool_results(
+                        &mut candidate,
+                        &running_budget,
+                        self.age_secs,
+                        self.keep_length,
+                    ),
+                ),
+                CompressionMethod::TieredCompaction => (
+                    "tiered_compaction",
+                    compact_middle_messages(
+                        &mut candidate,
+                        self.keep_recent_turns.saturating_mul(2),
+                        false,
+                    ),
+                ),
+                CompressionMethod::ReactiveCompact => (
+                    "reactive_compact",
+                    compact_middle_messages(&mut candidate, 4, true),
+                ),
+                CompressionMethod::LlmSummarization => {
+                    unreachable!("model summaries are owned outside mechanical compaction")
+                }
+            };
             if result.estimated_tokens_freed == 0 {
                 continue;
             }
-
-            total_freed += result.estimated_tokens_freed;
+            outcome.total_tokens_freed += result.estimated_tokens_freed;
             running_budget.last_measured_tokens = running_budget
                 .last_measured_tokens
                 .saturating_sub(result.estimated_tokens_freed);
-
-            layer_results.push((layer.name().to_string(), result));
-
+            outcome.layer_results.push((name.to_string(), result));
             if !running_budget.is_over_budget() {
                 break;
             }
         }
+        outcome.budget_satisfied = !running_budget.is_over_budget();
+        if outcome.total_tokens_freed > 0 {
+            *messages = candidate;
+        }
+        outcome
+    }
 
-        PipelineOutcome {
-            layer_results,
-            total_tokens_freed: total_freed,
-            budget_satisfied: !running_budget.is_over_budget(),
+    pub fn from_config(config: &CompressionConfig, max_tokens: u64) -> Self {
+        let base = CompactionTier::pre_turn_trigger(max_tokens);
+        Self {
+            triggers: [
+                (base * 0.625).clamp(0.0, 1.0),
+                (base * 0.75).clamp(0.0, 1.0),
+                (base * 0.9375).clamp(0.0, 1.0),
+                0.95,
+            ],
+            keep_length: config
+                .max_tool_result_length
+                .try_into()
+                .expect("u32 fits usize"),
+            age_secs: 3600,
+            keep_recent_turns: config
+                .preserve_recent_turns
+                .try_into()
+                .expect("u32 fits usize"),
         }
     }
 
-    /// Build a pipeline from RuntimeConfig's CompressionConfig.
-    ///
-    /// `max_tokens` is the model's context-window limit, used to compute
-    /// adaptive thresholds via `CompactionTier` so that large-window models
-    /// aren't over-compressed.
-    pub fn from_config(config: &CompressionConfig, max_tokens: u64) -> Self {
-        let base = CompactionTier::pre_turn_trigger(max_tokens);
-        let mut p = Self::new();
-        // Layer cascade (light → heavy) with CompactionTier-derived base.
-        p.add_layer(Box::new(DuplicateToolOutputElimination::new(
-            (base * 0.625).clamp(0.0, 1.0),
-        )));
-        p.add_layer(Box::new(ToolResultTruncation::new(
-            Duration::from_secs(3600),
-            config
-                .max_tool_result_length
-                .try_into()
-                .expect("u32 → usize conversion"),
-            (base * 0.75).clamp(0.0, 1.0),
-        )));
-        p.add_layer(Box::new(TieredCompaction::new(
-            config
-                .preserve_recent_turns
-                .try_into()
-                .expect("u32 → usize conversion"),
-            (base * 0.9375).clamp(0.0, 1.0),
-        )));
-        p.add_layer(Box::new(ReactiveCompact::new(0.95)));
-        p
-    }
-
-    /// Default pipeline for the given context window size.
-    /// Uses CompactionTier-derived adaptive thresholds.
     pub fn default_pipeline_for(max_tokens: u64) -> Self {
         Self::from_config(&CompressionConfig::default(), max_tokens)
     }
 
-    /// Aggressive pipeline for second-chance compaction retries.
-    /// All thresholds set to 0.0 so every layer fires unconditionally.
     pub fn aggressive_pipeline() -> Self {
-        let mut p = Self::new();
-        p.add_layer(Box::new(DuplicateToolOutputElimination::new(0.0)));
-        p.add_layer(Box::new(ToolResultTruncation::new(
-            Duration::from_secs(300),
-            512,
-            0.0,
-        )));
-        p.add_layer(Box::new(TieredCompaction::new(2, 0.0)));
-        p.add_layer(Box::new(ReactiveCompact::new(0.0)));
-        p
+        Self {
+            triggers: [0.0; 4],
+            keep_length: 512,
+            age_secs: 300,
+            keep_recent_turns: 2,
+        }
     }
 
-    /// Emergency pipeline — absolute last resort before propagating error.
-    /// All thresholds set to 0.0 so every layer fires unconditionally.
     pub fn emergency_pipeline() -> Self {
-        let mut p = Self::new();
-        p.add_layer(Box::new(DuplicateToolOutputElimination::new(0.0)));
-        p.add_layer(Box::new(ToolResultTruncation::new(
-            Duration::from_secs(0),
-            128,
-            0.0,
-        )));
-        p.add_layer(Box::new(TieredCompaction::new(1, 0.0)));
-        p.add_layer(Box::new(ReactiveCompact::new(0.0)));
-        p
-    }
-
-    /// Micro-compact pipeline for manual `/compact` preprocessing.
-    ///
-    /// Runs only DuplicateToolOutputElimination + ToolResultTruncation (no
-    /// message-dropping layers). Designed to reduce input tokens before
-    /// the LLM summary call without losing conversation structure.
-    /// All thresholds are 0.0 so layers fire unconditionally.
-    pub fn micro_pipeline() -> Self {
-        let mut p = Self::new();
-        p.add_layer(Box::new(DuplicateToolOutputElimination::new(0.0)));
-        p.add_layer(Box::new(ToolResultTruncation::new(
-            Duration::from_secs(0),
-            2000,
-            0.0,
-        )));
-        p
-    }
-
-    /// Tier-aware compaction that returns a [`CompactResult`] with rich metadata.
-    ///
-    /// Runs the shared budget-based pass used by Memoria and request assembly.
-    /// This is distinct from the ordered preprocessing/recovery layers in
-    /// `compress_if_needed`; it does not implement another deduplication policy.
-    ///
-    /// Creates a fresh engine configured for the given tier and turn preservation,
-    /// then runs the pipeline.
-    pub fn compact_tiered(
-        messages: &mut Vec<Value>,
-        budget_chars: usize,
-        keep_chars: usize,
-        tier: CompactionTier,
-        keep_recent_turns: usize,
-    ) -> CompactResult {
-        let result =
-            compact_tiered_impl(messages, budget_chars, keep_chars, tier, keep_recent_turns);
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
-            &result.messages,
-        );
-        *messages = result.messages.clone();
-        result
+        Self {
+            triggers: [0.0; 4],
+            keep_length: 128,
+            age_secs: 0,
+            keep_recent_turns: 1,
+        }
     }
 }
-
-// ───────────────────────────── Shared helpers ───────────────────────────
-// helpers.rs — free functions and constants used directly by compaction layers.
-
-#[cfg(test)]
-#[path = "compaction_engine_tests.rs"]
-mod tests;

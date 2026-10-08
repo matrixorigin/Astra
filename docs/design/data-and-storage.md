@@ -16,11 +16,17 @@ Data and storage owns platform state layering, MatrixOne usage, retention, archi
 | C4 debug bundle | short-lived raw diagnostics and manifests. |
 | C5 learning artifacts | redacted, consent-gated derived data. |
 
-Session state projections are written by their production owners: delegation
-settlement and personal-skill activation. The unused general state-item upsert
-API and generic mutation validator are retired. Session lifecycle fencing, projection
-reads, artifact reference accounting, and retention remain owned by the existing
-storage boundaries.
+Delegation topology, status, retry lineage, usage, and terminal evidence are owned
+by `agent_runs` and `agent_run_events`. Run admission and owner-fenced transitions
+persist these canonical facts; there is no separate delegation table or
+delegation-state mirror. The run display projection and bounded terminal-receipt
+repair remain derived from canonical run facts.
+
+Session state projections remain owned by personal-skill activation and
+user-anchor memory. The unused general state-item upsert API and generic mutation
+validator are retired. Session lifecycle fencing, projection reads, artifact
+reference accounting, and retention remain owned by the existing storage
+boundaries.
 
 The unused general authority-event query source API is retired; canonical
 Session authority still persists owner-scoped audit facts. Handoff fencing
@@ -62,7 +68,7 @@ Other SQL and malformed persisted-data errors retain their 500 behavior.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-10-07-v99` stores transcript items and their
+Fresh schema contract `2026-10-07-v100` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
 Model thinking observations use only the configuration-bound snapshot; obsolete

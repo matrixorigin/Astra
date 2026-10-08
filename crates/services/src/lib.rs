@@ -346,8 +346,7 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, StateProjectionError,
-    UserAnchorMemoryItem,
+    DatabaseStateProjectionStore, StateProjectionError, UserAnchorMemoryItem,
 };
 pub use state_sync::MatrixOneSyncService;
 pub use storage::{

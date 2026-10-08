@@ -1277,25 +1277,6 @@ describe("AstraClient — thin protocol", () => {
       "edge-1",
     );
   });
-
-  test("postTaskLeaseClaim sends edge header", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: () => Promise.resolve("{}"),
-      headers: new Headers(),
-    } as unknown as Response);
-    await createClient().postTaskLeaseClaim(
-      "task-1",
-      { edge_agent_id: "e1" },
-      { edgeTransportId: "transport-1" },
-    );
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toContain("/tasks/task-1/lease/claim");
-    expect((call[1].headers as Record<string, string>)["X-Astra-Edge-Id"]).toBe(
-      "transport-1",
-    );
-  });
 });
 
 // ─── Error handling ────────────────────────────────────────────────

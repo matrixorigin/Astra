@@ -723,7 +723,7 @@ impl DefaultToolExecutor {
                 #[cfg(unix)]
                 {
                     let config = crate::run_script::RunScriptConfig::default();
-                    crate::run_script::handle_run_script_with_cancel(
+                    crate::run_script::handle_run_script(
                         args,
                         self,
                         config,

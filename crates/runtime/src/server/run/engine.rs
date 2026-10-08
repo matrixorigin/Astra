@@ -43,28 +43,24 @@ use std::{
     time::Duration,
 };
 
-use astra_services::{
-    DatabaseStateProjectionStore,
-    runs::{
-        AtomicOrphanRunCancellationRequest, AtomicRunActionAdmissionRequest,
-        AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
-        AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest,
-        AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
-        AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
-        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
-        DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
-        DurableRunInteractionProjection, DurableRunInteractionResolveOutcome, DurableRunListPage,
-        DurableRunObservation, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
-        DurableRunStatusSnapshot, DurableRunUserIntentControlDelta, DurableRunWorkScope,
-        DurableWorkItemRunBinding, DurableWorkRunBinding, GuardedRunStatusTransition,
-        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
-        RequestedTurnInteractionMode, ResolvedModelSelection, RunExecutionBoundaryAuthorization,
-        RunExecutionBoundaryAuthorizationRequest, RunListCursor, RunStateStore,
-        RunStatusCasRequest, RunUsageOwnerUpdateRequest, RunUserIntentAdmissionTransition,
-        RuntimeProfileRequest, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
-        USER_INTENT_CONTROL_DELTA_PAGE_SIZE, durable_run_status_is_terminal,
-        durable_run_status_kind,
-    },
+use astra_services::runs::{
+    AtomicOrphanRunCancellationRequest, AtomicRunActionAdmissionRequest,
+    AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
+    AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest,
+    AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
+    AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
+    DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
+    DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
+    DurableRunInteractionProjection, DurableRunInteractionResolveOutcome, DurableRunListPage,
+    DurableRunObservation, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
+    DurableRunStatusSnapshot, DurableRunUserIntentControlDelta, DurableRunWorkScope,
+    DurableWorkItemRunBinding, DurableWorkRunBinding, GuardedRunStatusTransition,
+    GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode,
+    ResolvedModelSelection, RunExecutionBoundaryAuthorization,
+    RunExecutionBoundaryAuthorizationRequest, RunListCursor, RunStateStore, RunStatusCasRequest,
+    RunUsageOwnerUpdateRequest, RunUserIntentAdmissionTransition, RuntimeProfileRequest,
+    SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE,
+    durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::thinking_config::ThinkingConfig;
@@ -364,7 +360,6 @@ fn restart_session_continuation_event(
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
-    projection_store: Option<Arc<DatabaseStateProjectionStore>>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
 }
@@ -1261,7 +1256,6 @@ impl RunEngine {
         Self {
             remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
-            projection_store: None,
             metrics_registry: None,
             owner_lease_authorities: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1309,19 +1303,6 @@ impl RunEngine {
                 expected_owner_generation,
             })
             .await
-    }
-
-    /// Attach the database projection store used by web-agent session state.
-    ///
-    /// Delegation paths call `RunEngine::start_run_ext` and
-    /// owner-fenced RunEngine transitions; wiring here keeps projection persistence on
-    /// the production run lifecycle instead of isolated test helpers.
-    pub fn with_projection_store(
-        mut self,
-        projection_store: Arc<DatabaseStateProjectionStore>,
-    ) -> Self {
-        self.projection_store = Some(projection_store);
-        self
     }
 
     /// Attach the shared metrics registry used by `/metrics`.
@@ -1871,8 +1852,7 @@ impl RunEngine {
 
     /// Start a durable run within the caller's execution deadline. If the
     /// database deadline races commit acknowledgement, the store must prove the
-    /// exact durable receipt before returning execution authority. Repairable
-    /// projection work is best-effort and shares the same deadline.
+    /// exact durable receipt before returning execution authority.
     pub(crate) async fn start_run_ext_with_context_with_deadline(
         &self,
         run_id: &str,
@@ -1913,13 +1893,6 @@ impl RunEngine {
             }
             None => self.store.insert_run(record).await?,
         }
-        self.project_delegation_run_best_effort_with_deadline(
-            user_id,
-            run_id,
-            "run create",
-            execution_deadline,
-        )
-        .await;
         Ok(RunExecutionAuthority { owner_generation })
     }
 
@@ -1936,15 +1909,9 @@ impl RunEngine {
         let record = self
             .build_run_start_record(run_id, user_id, session_id, None, None, None, None, context)
             .await?;
-        let claim = self
-            .store
+        self.store
             .claim_run_start(record, requested_session_id)
-            .await?;
-        if matches!(claim, DurableRunStartClaim::Started { .. }) {
-            self.project_delegation_run_best_effort(user_id, run_id, "run claim")
-                .await;
-        }
-        Ok(claim)
+            .await
     }
 
     async fn build_run_start_record(
@@ -2053,8 +2020,7 @@ impl RunEngine {
                 "persist_status_if_current cannot infer cancellation authority for run {run_id}; use the durable User marker flow or cancel_if_exact_live_owner with an explicit Runtime/Unverified origin"
             ));
         }
-        let updated = self
-            .store
+        self.store
             .update_run_status_with_events_if_current(
                 user_id,
                 expected_session_id,
@@ -2066,23 +2032,7 @@ impl RunEngine {
                 error_message,
                 &[],
             )
-            .await?;
-        if updated {
-            let summary = error_message.or(waiting_for);
-            if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, summary)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    status,
-                    error = %error,
-                    "run transition committed but delegation projection refresh failed"
-                );
-            }
-        }
-        Ok(updated)
+            .await
     }
 
     /// Build an explicit typed cancellation fact for cross-module tests.
@@ -2219,8 +2169,7 @@ impl RunEngine {
         error_message: Option<&str>,
         event: serde_json::Value,
     ) -> Result<bool, String> {
-        let updated = self
-            .store
+        self.store
             .update_run_status_with_events_if_current(
                 user_id,
                 expected_session_id,
@@ -2232,23 +2181,7 @@ impl RunEngine {
                 error_message,
                 std::slice::from_ref(&event),
             )
-            .await?;
-        if updated {
-            let summary = error_message.or(waiting_for);
-            if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, summary)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    status,
-                    error = %error,
-                    "run transition committed but delegation projection refresh failed"
-                );
-            }
-        }
-        Ok(updated)
+            .await
     }
 
     /// Atomically persist a status transition and durable audit event only
@@ -2257,11 +2190,6 @@ impl RunEngine {
     /// The current run is excluded from the session guard so a paused run can
     /// resume itself; any sibling active/input/waiting/manual-paused run blocks
     /// the transition.
-    ///
-    /// Delegation projection refresh after a committed transition is
-    /// intentionally best-effort and outside the store transaction. The
-    /// authoritative facts are the durable run row, run events, and session
-    /// execution slot; projection failures are repairable derived-state lag.
     #[allow(clippy::too_many_arguments)]
     pub async fn transition_status_with_event_if_current_unless_session_blocked(
         &self,
@@ -2275,8 +2203,7 @@ impl RunEngine {
         forbid_open_settlement_generation: Option<u64>,
         event: serde_json::Value,
     ) -> Result<GuardedRunStatusTransition, String> {
-        let outcome = self
-            .store
+        self.store
             .update_run_status_with_event_if_current_unless_session_blocked(
                 GuardedRunStatusTransitionRequest {
                     user_id,
@@ -2290,23 +2217,7 @@ impl RunEngine {
                     event,
                 },
             )
-            .await?;
-        if outcome == GuardedRunStatusTransition::Updated {
-            let summary = error_message.or(waiting_for);
-            if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, summary)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    status,
-                    error = %error,
-                    "guarded run transition committed but delegation projection refresh failed"
-                );
-            }
-        }
-        Ok(outcome)
+            .await
     }
 
     pub async fn load_run_event_by_idempotency_key(
@@ -2353,8 +2264,7 @@ impl RunEngine {
         error_message: Option<&str>,
         events: &[serde_json::Value],
     ) -> Result<bool, String> {
-        let updated = self
-            .store
+        self.store
             .update_run_status_with_events_if_current(
                 user_id,
                 expected_session_id,
@@ -2366,24 +2276,7 @@ impl RunEngine {
                 error_message,
                 events,
             )
-            .await?;
-        if updated {
-            let summary = error_message.or(waiting_for);
-            if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, summary)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    status,
-                    expected_owner_generation,
-                    error = %error,
-                    "owner-fenced run transition committed but delegation projection refresh failed"
-                );
-            }
-        }
-        Ok(updated)
+            .await
     }
 
     /// Append generation-owned facts without mutating the winning lifecycle
@@ -2741,12 +2634,6 @@ impl RunEngine {
             )
             .await?
         {
-            self.project_terminal_delegation_bounded(
-                user_id,
-                run_id,
-                error_message.or(waiting_for),
-            )
-            .await;
             let durable = self
                 .load_run(user_id, run_id)
                 .await?
@@ -2825,12 +2712,6 @@ impl RunEngine {
                 self.repair_terminal_projection_bounded(user_id, expected_session_id, run_id)
                     .await;
             }
-            self.project_terminal_delegation_bounded(
-                user_id,
-                run_id,
-                error_message.or(waiting_for),
-            )
-            .await;
             let durable = self
                 .load_run(user_id, run_id)
                 .await?
@@ -2914,8 +2795,6 @@ impl RunEngine {
                     self.repair_terminal_projection_bounded(user_id, expected_session_id, run_id)
                         .await;
                 }
-                self.project_terminal_delegation_bounded(user_id, run_id, None)
-                    .await;
                 let cancelled = self.load_run(user_id, run_id).await?.ok_or_else(|| {
                     format!("run {run_id} disappeared after cancellation settlement")
                 })?;
@@ -3025,116 +2904,6 @@ impl RunEngine {
                 run_id,
                 "terminal receipt confirmed but display projection repair timed out"
             ),
-        }
-    }
-
-    async fn project_terminal_delegation_bounded(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        last_summary_text: Option<&str>,
-    ) {
-        match tokio::time::timeout(
-            TERMINAL_RECEIPT_MAX_WAIT,
-            self.project_delegation_run_if_needed(user_id, run_id, last_summary_text),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(user_id, run_id, error = %error, "terminal committed but delegation projection refresh failed")
-            }
-            Err(_) => tracing::warn!(
-                user_id,
-                run_id,
-                "terminal committed but delegation projection refresh timed out"
-            ),
-        }
-    }
-
-    async fn project_delegation_run_if_needed(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        last_summary_text: Option<&str>,
-    ) -> Result<(), String> {
-        let Some(projection_store) = self.projection_store.as_ref() else {
-            return Ok(());
-        };
-        let Some(run) = self
-            .store
-            .load_run_delegation_projection_target(user_id, run_id)
-            .await?
-        else {
-            return Ok(());
-        };
-        if run.parent_run_id.is_none() || run.delegation_id.is_none() {
-            return Ok(());
-        }
-        projection_store
-            .upsert_delegation_projection_for_run(
-                &run.user_id,
-                run_id,
-                run.agent_id.as_deref(),
-                last_summary_text,
-            )
-            .await
-            .map_err(|error| {
-                format!("state projection update failed for delegated run {run_id}: {error}")
-            })
-    }
-
-    async fn project_delegation_run_best_effort(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        operation: &str,
-    ) {
-        self.project_delegation_run_best_effort_with_deadline(user_id, run_id, operation, None)
-            .await;
-    }
-
-    async fn project_delegation_run_best_effort_with_deadline(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        operation: &str,
-        execution_deadline: Option<tokio::time::Instant>,
-    ) {
-        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            tracing::warn!(
-                user_id,
-                run_id,
-                operation,
-                "durable run admitted but delegation projection skipped after execution deadline"
-            );
-            return;
-        }
-        let projection = self.project_delegation_run_if_needed(user_id, run_id, None);
-        let projection_result = if let Some(deadline) = execution_deadline {
-            match tokio::time::timeout_at(deadline, projection).await {
-                Ok(result) => Some(result),
-                Err(_) => {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        operation,
-                        "durable run admitted but delegation projection exceeded execution deadline"
-                    );
-                    return;
-                }
-            }
-        } else {
-            Some(projection.await)
-        };
-        if let Some(Err(error)) = projection_result {
-            tracing::warn!(
-                user_id,
-                run_id,
-                operation,
-                error = %error,
-                "durable run admitted but delegation projection refresh failed"
-            );
         }
     }
 
@@ -3402,23 +3171,9 @@ impl RunEngine {
         &self,
         request: AtomicOrphanRunCancellationRequest<'_>,
     ) -> Result<bool, String> {
-        let updated = self
-            .store
+        self.store
             .terminalize_orphaned_run_cancellation(request)
-            .await?;
-        if updated
-            && let Err(error) = self
-                .project_delegation_run_if_needed(request.user_id, request.run_id, None)
-                .await
-        {
-            tracing::warn!(
-                user_id = request.user_id,
-                run_id = request.run_id,
-                error = %error,
-                "orphan cancellation committed but delegation projection refresh failed"
-            );
-        }
-        Ok(updated)
+            .await
     }
 
     pub async fn load_run_control(
@@ -7421,17 +7176,6 @@ mod tests {
         ) -> Result<Option<astra_services::runs::DurableRunObservation>, String> {
             self.inner
                 .load_run_observation(user_id, run_id, event_limit)
-                .await
-        }
-
-        async fn load_run_delegation_projection_target(
-            &self,
-            user_id: &str,
-            run_id: &str,
-        ) -> Result<Option<astra_services::runs::DurableRunDelegationProjectionTarget>, String>
-        {
-            self.inner
-                .load_run_delegation_projection_target(user_id, run_id)
                 .await
         }
 

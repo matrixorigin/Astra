@@ -2033,11 +2033,6 @@ export type EdgeHeartbeatRequestBody = {
   edge_agent_id: string;
 };
 
-export type TaskLeaseMutationRequestBody = {
-  edge_agent_id: string;
-  ttl_sec?: number;
-};
-
 // ─── Work-first public contract ────────────────────────────────────
 
 export type WorkCreateCriterion =

@@ -312,10 +312,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_delegations",
-        sql: "DELETE FROM session_delegations WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "harness_snapshots",
         sql: "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
     },

@@ -17,8 +17,8 @@ use astra_services::runs::{
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
     ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
-    DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseStateProjectionStore,
-    DelegationProjectionUpsert, SessionArtifactJsonRecord, SessionArtifactJsonStore,
+    DatabaseRunStateStore, DatabaseSessionArtifactStore, SessionArtifactJsonRecord,
+    SessionArtifactJsonStore,
 };
 use astra_thin_client::{
     ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
@@ -1757,65 +1757,6 @@ async fn e2e_joint_4_s10_five_level_delegation_and_retry_node() {
         "S10 router health expected 200, got {}",
         health.status()
     );
-
-    let projection = DatabaseStateProjectionStore::new(pool.clone());
-    let delegation_rows = [
-        (&l0, &l1, 1_u32, format!("{l0}/{l1}")),
-        (&l1, &l2, 2_u32, format!("{l0}/{l1}/{l2}")),
-        (
-            &l2,
-            &l3_runs[0],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[0]),
-        ),
-        (
-            &l2,
-            &l3_runs[1],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[1]),
-        ),
-        (
-            &l2,
-            &l3_runs[2],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[2]),
-        ),
-        (
-            &l2,
-            &l3_runs[3],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[3]),
-        ),
-        (
-            &l3_runs[1],
-            &l4,
-            4_u32,
-            format!("{l0}/{l1}/{l2}/{}/{}", l3_runs[1], l4),
-        ),
-    ];
-    for (parent, child, depth, path) in delegation_rows {
-        projection
-            .upsert_delegation_projection(DelegationProjectionUpsert {
-                delegation_id: id("delegation"),
-                user_id: user_id.clone(),
-                session_id: session_id.clone(),
-                parent_run_id: parent.to_string(),
-                child_run_id: child.to_string(),
-                root_run_id: l0.clone(),
-                ancestor_path: path,
-                depth,
-                agent_id: Some(format!("agent-depth-{depth}")),
-                title: Some(format!("delegated depth {depth}")),
-                status: "running".to_string(),
-                retry_of: None,
-                retry_scope: "node".to_string(),
-                last_summary_ref: None,
-                last_summary_text: Some(format!("depth {depth} active")),
-                sibling_exposed_artifacts_json: None,
-            })
-            .await
-            .expect("S10 delegation projection upsert must persist table and state item rows");
-    }
 
     let retry_run = id("retry");
     insert_run_row(

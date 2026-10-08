@@ -79,7 +79,7 @@ Use this when adding methods to [`src/client.ts`](src/client.ts); each should ha
 - Events / edges: `listEvents`, `getCausalChain`, `getEdgesStatus`
 - Thin / edge: `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat`
 
-Legacy task-lease, task-plan, and agent-job helpers are path-only compatibility shims. Their wiremock tests prove request construction, not runtime support; the current runtime route guardrail intentionally keeps these paths unavailable until a canonical replacement contract is delivered.
+The SDK exposes the current Server-owned run and Edge callback APIs listed above. Retired task-lease, task-plan, and agent-job routes are not SDK capabilities; [`runtime_refactor_guardrails.rs`](../../crates/runtime/tests/runtime_refactor_guardrails.rs) checks that the production router keeps those routes unavailable.
 
 Wire helper: `chatRequestToWire` — see `chatRequestToWire` tests in [`client.test.ts`](src/__tests__/client.test.ts).
 

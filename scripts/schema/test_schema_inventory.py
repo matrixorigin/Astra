@@ -457,7 +457,6 @@ fn char_literal() { let slash = '/'; }
             "session_device_leases",
             "session_device_lease_events",
             "session_state_items",
-            "session_delegations",
             "data_versioning_checkpoints",
             "sweeper_leases",
             "workspace_records",
@@ -498,10 +497,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "append-only audit",
             self.tables["session_device_lease_events"]["merge_guidance"],
-        )
-        self.assertIn(
-            "do not merge into agent_runs",
-            self.tables["session_delegations"]["merge_guidance"],
         )
         self.assertIn(
             "DatabaseDataVersioningService reads and writes",

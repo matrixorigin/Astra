@@ -10,11 +10,7 @@ pub(super) async fn build_runtime_wiring(
     let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
         shared_pool.clone(),
     ));
-    let state_projection_store = Arc::new(astra_services::DatabaseStateProjectionStore::new(
-        shared_pool.clone(),
-    ));
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
-        .with_projection_store(Arc::clone(&state_projection_store))
         .with_metrics_registry(state.metrics_registry());
     let selected_workspace_provider = run_engine.execution_owner_pod_id().map(|owner| {
         crate::server::run::workspace_provisioning::ServerWorkspaceProvisioner::from_env(

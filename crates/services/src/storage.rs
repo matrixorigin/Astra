@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-07-v99";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-07-v100";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4734,39 +4734,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(pool, "session_delegations",
-        "CREATE TABLE IF NOT EXISTS session_delegations (
-            delegation_id VARCHAR(128) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            parent_run_id VARCHAR(128) NOT NULL,
-            child_run_id VARCHAR(128) NOT NULL,
-            root_run_id VARCHAR(128) NOT NULL,
-            ancestor_path VARCHAR(2048) NOT NULL,
-            depth INT NOT NULL DEFAULT 0,
-            agent_id VARCHAR(255) NULL,
-            title VARCHAR(255) NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'running',
-            retry_of VARCHAR(128) NULL,
-            retry_scope VARCHAR(32) NOT NULL DEFAULT 'node',
-            last_summary_ref VARCHAR(255) NULL,
-            last_summary_text TEXT NULL,
-            sibling_exposed_artifacts_json LONGTEXT NULL,
-            request_id VARCHAR(128) NULL,
-            trace_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_session_delegations_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
-            UNIQUE KEY uq_session_delegations_child (child_run_id),
-            INDEX idx_delegations_owner_root_depth (user_id, root_run_id, depth, created_at),
-            INDEX idx_delegations_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
-            INDEX idx_delegations_owner_session_status (user_id, session_id, status, updated_at),
-            INDEX idx_delegations_retry_of (retry_of)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(
         pool,
         "agent_event_edges",
@@ -6842,22 +6809,6 @@ async fn verify_core_schema_shape(
         "idx_state_events_category_created",
         &["category", "created_at", "event_id"],
     )?;
-    for (index, expected_columns) in [
-        (
-            "idx_delegations_owner_root_depth",
-            &["user_id", "root_run_id", "depth", "created_at"][..],
-        ),
-        (
-            "idx_delegations_owner_parent_status_updated",
-            &["user_id", "parent_run_id", "status", "updated_at"][..],
-        ),
-        (
-            "idx_delegations_owner_session_status",
-            &["user_id", "session_id", "status", "updated_at"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "session_delegations", index, expected_columns)?;
-    }
     fail_if_obsolete_shape(
         pool,
         database,

@@ -69,6 +69,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     for retired in [
+        "session_delegations",
         "tool_result_projection_decisions",
         "tool_result_projection_receipts",
         "config_versions",
@@ -2846,75 +2847,6 @@ async fn phase4_state_projection_schema_contract() {
         .is_empty(),
         "session_state_item_events must not keep ownerless session index idx_state_events_session_created"
     );
-
-    let delegations = column_names(&pool, &schema, "session_delegations").await;
-    for expected in [
-        "delegation_id",
-        "user_id",
-        "session_id",
-        "parent_run_id",
-        "child_run_id",
-        "root_run_id",
-        "ancestor_path",
-        "depth",
-        "agent_id",
-        "title",
-        "status",
-        "retry_of",
-        "retry_scope",
-        "last_summary_ref",
-        "last_summary_text",
-    ] {
-        assert!(
-            delegations.iter().any(|column| column == expected),
-            "session_delegations missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_delegations",
-            "idx_delegations_owner_root_depth"
-        )
-        .await,
-        ["user_id", "root_run_id", "depth", "created_at"],
-        "delegation root-tree scans must stay owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_delegations",
-            "idx_delegations_owner_parent_status_updated"
-        )
-        .await,
-        ["user_id", "parent_run_id", "status", "updated_at"],
-        "delegation parent/status scans must stay owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_delegations",
-            "idx_delegations_owner_session_status"
-        )
-        .await,
-        ["user_id", "session_id", "status", "updated_at"],
-        "delegation session/status scans must stay owner-bound"
-    );
-    for removed_index in [
-        "idx_delegations_root_depth",
-        "idx_delegations_parent",
-        "idx_delegations_session_status",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "session_delegations", removed_index)
-                .await
-                .is_empty(),
-            "session_delegations must not keep ownerless delegation index {removed_index}"
-        );
-    }
 
     let artifacts = column_names(&pool, &schema, "session_artifacts").await;
     for expected in [

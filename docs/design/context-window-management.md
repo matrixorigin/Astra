@@ -1,7 +1,7 @@
 # Context window management
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-10-07.
 
 Context window management defines how Astra uses finite model context without losing task continuity, provider state, audit-critical facts, or prompt-cache stability.
 
@@ -17,6 +17,38 @@ this retirement does not change their admission or recovery behavior.
 - Provider/tool state must be compact and structured.
 - Compaction must preserve recoverability and attribution.
 - Large tool outputs should become artifacts or summaries, not raw prompt bloat.
+
+## Mechanical rewrite ownership
+
+Canonical history stays in its original JSON representation. One mechanical
+owner implements exact-output deduplication, structured text truncation and
+provider-valid history pruning. The pre-turn/resume and provider-retry engine
+uses its fixed progressive schedule, age/current-round protection and net token
+estimates; request assembly and Memoria retain their serialized-character
+budgets, latest-evidence preference and separately owned memory/summary policy.
+These policies share the rewrite operations, not another message codec or an
+extensible layer execution framework.
+
+A rewrite prepares one isolated candidate and installs it only after useful
+progress. Callers do not clone the result back into a temporary and then return
+another copy. The canonical commit, current retry limits, session-lifetime
+futile-compaction breaker and durable artifact-write-before-install ordering
+remain with their existing owners. Estimated savings include new boundary and
+metadata costs; they are not provider-reported token usage.
+
+Active runtime authority remains attached to its real human anchor and ordered
+current-turn suffix. Provider user-role tool-result envelopes do not start a new
+human turn or expire authority. Expired authority can be pruned. If required
+context alone exceeds the window, the result remains truthfully over budget;
+compaction cannot delete controls to manufacture progress. Tool-call identities,
+opaque extension fields, ordered non-text blocks and artifact recovery handles
+survive every mechanical path. A no-op cannot silently normalize these fields.
+
+Typed duplicate-output dependencies survive canonical commit and continuation
+restore. The shared validator checks unique forward invocation identity and
+original result attribution before the canonical projection removes incidental
+metadata; malformed or mismatched links cannot acquire authority through that
+projection. Provider requests still strip this internal bookkeeping.
 
 ## Budget zones
 

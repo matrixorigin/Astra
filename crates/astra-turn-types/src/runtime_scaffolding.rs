@@ -198,8 +198,8 @@ pub fn runtime_message_delivery(message: &Value) -> Option<RuntimeMessageDeliver
 }
 
 /// Validate a standalone provenance value without relying on the provider
-/// message role. Compression layers use this before reconstructing a full
-/// JSON message so runtime-owned user-role frames cannot become human turns.
+/// message role. Canonical history consumers use this so runtime-owned
+/// user-role frames cannot become human turns.
 #[must_use]
 pub fn runtime_message_delivery_from_provenance(
     provenance: &Value,
@@ -230,11 +230,24 @@ pub fn is_runtime_owned_message(message: &Value) -> bool {
 /// human. Provider role is a wire-shape property: runtime-owned context may
 /// deliberately use `role=user` without creating user intent or a turn
 /// boundary. Semantic consumers must use this predicate instead of inspecting
-/// the role alone.
+/// the role alone. Provider tool-result envelopes never establish human intent,
+/// including user-role block arrays used by Anthropic.
 #[must_use]
 pub fn is_human_user_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
         && !is_runtime_owned_message(message)
+        && message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_none()
+        && !message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
 }
 
 #[must_use]
@@ -464,6 +477,55 @@ mod tests {
         assert!(is_human_user_message(
             &json!({"role": "user", "content": "real request"})
         ));
+    }
+
+    #[test]
+    fn human_turn_identity_uses_envelope_structure_not_prose() {
+        for message in [
+            json!({"role":"user", "content":"Discuss the words tool_result and tool_call_id"}),
+            json!({"role":"user", "content":[{"type":"text", "text":"Inspect this"},
+                {"type":"image_url", "image_url":{"url":"https://example.invalid/image"}}]}),
+        ] {
+            assert!(is_human_user_message(&message));
+        }
+        for message in [
+            json!({"role":"user", "content":"observed output", "tool_call_id":"call-1"}),
+            json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call-1", "content":"observed output"}]}),
+            json!({"role":"user", "content":[{"type":"text", "text":"tool response"},
+                {"type":"tool_result", "tool_use_id":"call-1", "content":"output"}]}),
+        ] {
+            assert!(!is_human_user_message(&message));
+        }
+    }
+
+    #[test]
+    fn tool_result_envelopes_do_not_expire_runtime_authority() {
+        for lifetime in [
+            RuntimeAuthorityLifetime::CurrentUserTurn,
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+        ] {
+            let mut authority = json!({"role":"user", "content":
+                render_append_only_runtime_authority_frame("work", lifetime, "required control").unwrap()});
+            mark_append_only_required_context(&mut authority, "work", lifetime);
+            let mut history = vec![
+                json!({"role":"user", "content":"human goal"}),
+                json!({"role":"assistant", "content":[{"type":"tool_use", "id":"call-1", "name":"read_file", "input":{}}]}),
+                authority,
+                json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call-1", "content":"evidence"}]}),
+            ];
+            assert!(append_only_runtime_authority_is_active(&history, 2));
+            assert_eq!(
+                active_append_only_authority_protected_suffix_start(&history),
+                Some(0)
+            );
+            history.push(json!({"role":"assistant", "content":"decision"}));
+            assert_eq!(
+                append_only_runtime_authority_is_active(&history, 2),
+                lifetime == RuntimeAuthorityLifetime::CurrentUserTurn
+            );
+            history.push(json!({"role":"user", "content":"new human goal"}));
+            assert!(!append_only_runtime_authority_is_active(&history, 2));
+        }
     }
 
     #[test]

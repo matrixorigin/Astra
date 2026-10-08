@@ -256,8 +256,8 @@ pub fn artifact_descriptor_matches_identity(
 }
 
 /// Parse and validate one descriptor value carried in canonical message
-/// metadata.  Keeping this parser separate lets typed compression layers
-/// inspect `Message::extra` without reserializing the complete message.
+/// metadata. Consumers inspect the typed identity without reserializing
+/// the complete canonical message.
 #[must_use]
 pub fn parse_tool_result_artifact_descriptor(
     value: &Value,

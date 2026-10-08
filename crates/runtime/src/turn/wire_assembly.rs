@@ -433,17 +433,16 @@ pub(crate) fn compact_history_for_wire_budget(
             .checked_div(history_tokens)
             .unwrap_or(0)
     };
-    let before = history.clone();
-    let result = crate::turn::cloud::compaction_engine::CompactionEngine::compact_tiered(
+    let result = crate::turn::cloud::compaction::compact_tiered_impl(
         history,
         budget_chars,
         2_000,
         CompactionTier::AggressivePrune,
         4,
     );
-    let boundary = result.boundary;
+    let boundary = result.boundary?;
     *history = result.messages;
-    (*history != before).then_some(boundary).flatten()
+    Some(boundary)
 }
 
 /// Stable semantic identity for runtime-owned authority constructed outside
@@ -1533,15 +1532,13 @@ impl<'a> MemoriaContext<'a> {
                     break;
                 }
 
-                let mut messages = std::mem::take(&mut result.messages);
-                let refined =
-                    crate::turn::cloud::compaction_engine::CompactionEngine::compact_tiered(
-                        &mut messages,
-                        refined_budget_chars,
-                        resolved.keep_chars,
-                        resolved.tier,
-                        resolved.keep_recent_turns,
-                    );
+                let refined = crate::turn::cloud::compaction::compact_tiered_impl(
+                    &result.messages,
+                    refined_budget_chars,
+                    resolved.keep_chars,
+                    resolved.tier,
+                    resolved.keep_recent_turns,
+                );
                 result.messages = refined.messages;
                 if refined.boundary.is_none() {
                     break;

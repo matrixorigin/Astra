@@ -408,27 +408,9 @@ where
 /// Handle a single RPC connection: read one JSON-line request, enforce
 /// policy, dispatch through `tool_executor`, write the response back.
 ///
-/// Never hangs the script: every code path either writes a response or
-/// returns [`RpcOutcome::IoError`] (in which case the script's own socket
-/// `recv` returns EOF and the script fails fast).
-#[allow(dead_code)]
+/// The parent's cancellation token reaches framing, nested tool execution,
+/// and response writes. The run-script owner retains child cleanup authority.
 pub(crate) async fn handle_rpc_connection(
-    stream: tokio::net::UnixStream,
-    tool_executor: &dyn ToolExecutor,
-    call_count: &AtomicUsize,
-    policy: &RpcPolicy,
-    auth_token: &AuthToken,
-) -> RpcOutcome {
-    handle_rpc_connection_with_cancel(stream, tool_executor, call_count, policy, auth_token, None)
-        .await
-}
-
-/// Cancellation-aware variant used by `run_script`.  Keeping the legacy
-/// wrapper above preserves the ordinary RPC contract and test helpers while
-/// ensuring a cancelled parent invocation reaches the actual nested tool
-/// execution instead of merely killing the Python client after the RPC call
-/// has already started.
-pub(crate) async fn handle_rpc_connection_with_cancel(
     stream: tokio::net::UnixStream,
     tool_executor: &dyn ToolExecutor,
     call_count: &AtomicUsize,
@@ -725,7 +707,16 @@ mod tests {
         writer.write_all(b"\n").await.unwrap();
         writer.shutdown().await.unwrap();
 
-        let outcome = handle_rpc_connection(stream, executor, call_count, policy, token).await;
+        let cancel_token = CancellationToken::new();
+        let outcome = handle_rpc_connection(
+            stream,
+            executor,
+            call_count,
+            policy,
+            token,
+            Some(&cancel_token),
+        )
+        .await;
 
         let mut resp = Vec::new();
         let _ = reader.read_to_end(&mut resp).await;
@@ -832,6 +823,37 @@ mod tests {
             "only the parent may sign after its complete generation settles: {metadata:?}"
         );
         drop(parent_writer);
+    }
+
+    #[tokio::test]
+    async fn rpc_cancelled_parent_rejects_unframed_request_without_dispatch() {
+        let (stream, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let policy = default_policy();
+        let auth_token = AuthToken::from_str_for_test("tok");
+        let exec = MockExecutor::new();
+        let counter = AtomicUsize::new(0);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_rpc_connection(
+                stream,
+                &exec,
+                &counter,
+                &policy,
+                &auth_token,
+                Some(&cancel_token),
+            ),
+        )
+        .await
+        .expect("cancelled parent must not wait for an RPC request");
+        assert_eq!(outcome, RpcOutcome::Cancelled);
+        assert_eq!(exec.call_count(), 0);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.is_empty(), "cancelled connection must close");
     }
 
     #[tokio::test]

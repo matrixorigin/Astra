@@ -60,7 +60,6 @@ import type {
   SkillRecord,
   StreamEvent,
   ConnectionState,
-  TaskLeaseMutationRequestBody,
   ToolResultRequestBody,
   UserInfo,
   WorkCreateInput,
@@ -193,10 +192,6 @@ import {
   sessionTranscriptPath,
   skillPath,
   skillUnpublishPath,
-  taskLeaseClaimPath,
-  taskLeasePath,
-  taskLeaseReleasePath,
-  taskLeaseRenewPath,
   workPath,
   workArchivedBranchesPath,
   workBranchesPath,
@@ -3476,65 +3471,6 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(PATH_AGENTS_EDGE_HEARTBEAT, {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers,
-    });
-  }
-
-  /**
-   * @deprecated Legacy compatibility path. The current Astra runtime does
-   * not register `/tasks/{id}/lease`; this only works against older servers.
-   */
-  async getTaskLease(taskId: string): Promise<unknown> {
-    return this.fetch(taskLeasePath(taskId));
-  }
-
-  /** @deprecated Legacy compatibility path; not registered by the current runtime. */
-  async postTaskLeaseClaim(
-    taskId: string,
-    body: TaskLeaseMutationRequestBody,
-    options?: { edgeTransportId?: string },
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {};
-    if (options?.edgeTransportId) {
-      headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
-    }
-    return this.fetch(taskLeaseClaimPath(taskId), {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers,
-    });
-  }
-
-  /** @deprecated Legacy compatibility path; not registered by the current runtime. */
-  async postTaskLeaseRelease(
-    taskId: string,
-    body: TaskLeaseMutationRequestBody,
-    options?: { edgeTransportId?: string },
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {};
-    if (options?.edgeTransportId) {
-      headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
-    }
-    return this.fetch(taskLeaseReleasePath(taskId), {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers,
-    });
-  }
-
-  /** @deprecated Legacy compatibility path; not registered by the current runtime. */
-  async postTaskLeaseRenew(
-    taskId: string,
-    body: TaskLeaseMutationRequestBody,
-    options?: { edgeTransportId?: string },
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {};
-    if (options?.edgeTransportId) {
-      headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
-    }
-    return this.fetch(taskLeaseRenewPath(taskId), {
       method: "POST",
       body: JSON.stringify(body),
       headers,

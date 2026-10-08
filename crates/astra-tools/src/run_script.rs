@@ -58,7 +58,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ToolExecutor;
 use crate::rpc_bridge::{
-    AuthToken, RpcOutcome, RpcPolicy, handle_rpc_connection_with_cancel, kill_process_group,
+    AuthToken, RpcOutcome, RpcPolicy, handle_rpc_connection, kill_process_group,
 };
 
 // Re-export only what external callers need. The char-boundary helpers are
@@ -845,15 +845,7 @@ fn io_context(ctx: &'static str, e: std::io::Error) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("{ctx}: {e}"))
 }
 
-pub async fn run_script(
-    script: &str,
-    config: &RunScriptConfig,
-    tool_executor: &dyn ToolExecutor,
-) -> Result<String, RunScriptError> {
-    run_script_with_cancel(script, config, tool_executor, None).await
-}
-
-async fn run_script_with_cancel(
+async fn run_script(
     script: &str,
     config: &RunScriptConfig,
     tool_executor: &dyn ToolExecutor,
@@ -991,7 +983,7 @@ async fn run_script_with_cancel(
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
-                            let outcome = handle_rpc_connection_with_cancel(
+                            let outcome = handle_rpc_connection(
                                 stream,
                                 tool_executor,
                                 &call_count,
@@ -1446,14 +1438,6 @@ pub async fn handle_run_script(
     args: &Value,
     tool_executor: &dyn ToolExecutor,
     config: RunScriptConfig,
-) -> crate::ToolResult {
-    handle_run_script_with_cancel(args, tool_executor, config, None).await
-}
-
-pub async fn handle_run_script_with_cancel(
-    args: &Value,
-    tool_executor: &dyn ToolExecutor,
-    config: RunScriptConfig,
     cancel_token: Option<&CancellationToken>,
 ) -> crate::ToolResult {
     let script = match args.get("script").and_then(Value::as_str) {
@@ -1471,7 +1455,7 @@ pub async fn handle_run_script_with_cancel(
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         return crate::cancelled_tool_result("run_script", false);
     }
-    match run_script_with_cancel(script, &config, tool_executor, cancel_token).await {
+    match run_script(script, &config, tool_executor, cancel_token).await {
         Ok(output) => {
             if output.is_empty() {
                 crate::ToolResult::text("(script completed with no output)".into())
@@ -2683,11 +2667,34 @@ mod tests {
     #[tokio::test]
     async fn handle_run_script_missing_script_param() {
         let exec = MockToolExecutor::new();
-        let result =
-            handle_run_script(&serde_json::json!({}), &exec, RunScriptConfig::default()).await;
+        let result = handle_run_script(
+            &serde_json::json!({}),
+            &exec,
+            RunScriptConfig::default(),
+            None,
+        )
+        .await;
         assert!(result.is_error);
         assert!(result.output.contains("requires a non-empty"));
         assert!(result.output.contains("empty arguments"));
+    }
+
+    #[tokio::test]
+    async fn handle_run_script_cancelled_parent_does_not_execute() {
+        let exec = MockToolExecutor::new();
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let result = handle_run_script(
+            &serde_json::json!({"script": "raise RuntimeError('must not execute')"}),
+            &exec,
+            RunScriptConfig::default(),
+            Some(&cancel_token),
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(result.metadata.unwrap()["error_kind"], "cancelled");
+        assert!(result.output.contains("not executed: run was cancelled"));
+        assert_eq!(exec.call_count(), 0);
     }
 
     // ── Integration tests (require Python) ───────────────────────────────
@@ -2714,7 +2721,7 @@ r1 = astra_tools.read_file("a.txt")
 r2 = astra_tools.grep("pattern")
 print(f"{r1}|{r2}")
 "#;
-        let result = run_script(script, &config, &exec).await.unwrap();
+        let result = run_script(script, &config, &exec, None).await.unwrap();
         assert!(result.contains("content of a.txt"));
         assert!(result.contains("match: pattern"));
         assert_eq!(exec.call_count(), 2);
@@ -2756,7 +2763,7 @@ print("done")
             mode: ExecutionMode::Strict,
             ..Default::default()
         };
-        let output = run_script(&script, &config, &exec).await.unwrap();
+        let output = run_script(&script, &config, &exec, None).await.unwrap();
         assert!(output.contains("done"), "script did not finish: {output}");
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert!(
@@ -2783,7 +2790,7 @@ print("done")
 print("partial_before_raise")
 raise ValueError("boom")
 "#;
-        let err = run_script(script, &config, &exec).await.unwrap_err();
+        let err = run_script(script, &config, &exec, None).await.unwrap_err();
         match err {
             RunScriptError::ScriptFailed {
                 code,
@@ -2825,7 +2832,7 @@ raise ValueError("boom")
                 ..Default::default()
             };
             let script = format!("print({label:?})");
-            run_script(&script, &config, &exec).await.unwrap()
+            run_script(&script, &config, &exec, None).await.unwrap()
         }
 
         let (a, b) = tokio::join!(run_one("alpha-marker"), run_one("bravo-marker"));
@@ -2855,7 +2862,7 @@ raise ValueError("boom")
             mode: ExecutionMode::Strict,
             ..Default::default()
         };
-        let out = run_script("", &config, &exec).await.unwrap();
+        let out = run_script("", &config, &exec, None).await.unwrap();
         assert_eq!(out, "", "run_script should return empty stdout verbatim");
     }
 
@@ -2874,7 +2881,8 @@ raise ValueError("boom")
             mode: ExecutionMode::Strict,
             ..Default::default()
         };
-        let result = handle_run_script(&serde_json::json!({"script": ""}), &exec, config).await;
+        let result =
+            handle_run_script(&serde_json::json!({"script": ""}), &exec, config, None).await;
         assert!(
             !result.is_error,
             "empty script must exit cleanly: {}",
@@ -2906,7 +2914,7 @@ from astra_tools import bash
 result = bash("echo ok")
 print(result, end="")
 "#;
-        let result = run_script(script, &config, &exec).await.unwrap();
+        let result = run_script(script, &config, &exec, None).await.unwrap();
         assert_eq!(result, "ran: echo ok");
     }
 
@@ -2929,7 +2937,7 @@ import sys
 sys.stderr.write("only-on-stderr\n")
 sys.exit(7)
 "#;
-        match run_script(script, &config, &exec).await {
+        match run_script(script, &config, &exec, None).await {
             Err(RunScriptError::ScriptFailed {
                 code,
                 stdout,
@@ -2966,7 +2974,7 @@ for i in range(100):
     print(f"line_{i:03d}_" + "x" * 20)
 raise RuntimeError("after noise")
 "#;
-        match run_script(script, &config, &exec).await {
+        match run_script(script, &config, &exec, None).await {
             Err(RunScriptError::ScriptFailed { stdout, stderr, .. }) => {
                 // stdout got truncated — notice present + first line retained.
                 assert!(
@@ -3000,7 +3008,7 @@ sys.stderr.write("x" * 50000)
 sys.stderr.flush()
 sys.exit(2)
 "#;
-        let err = run_script(script, &config, &exec).await.unwrap_err();
+        let err = run_script(script, &config, &exec, None).await.unwrap_err();
         match err {
             RunScriptError::ScriptFailed { stderr, .. } => {
                 // stderr notice carries the [stderr] tag to distinguish
@@ -3053,7 +3061,7 @@ for i in range(20):
 print("LEAK: should not have reached here")
 "#;
         let start = std::time::Instant::now();
-        let _ = run_script(script, &config, &exec).await;
+        let _ = run_script(script, &config, &exec, None).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -3087,7 +3095,7 @@ print("LEAK: should not have reached here")
 import os
 print(os.environ.get("MY_SUPER_SECRET", "UNSET"))
 "#;
-        let result = run_script(script, &config, &exec).await.unwrap();
+        let result = run_script(script, &config, &exec, None).await.unwrap();
         assert!(
             result.contains("UNSET"),
             "secret env var leaked to child: {result}"
@@ -3116,7 +3124,7 @@ print(os.environ.get("MY_SUPER_SECRET", "UNSET"))
 import os
 print(os.environ["HOME"])
 "#;
-        let result = run_script(script, &config, &exec).await.unwrap();
+        let result = run_script(script, &config, &exec, None).await.unwrap();
         // Must NOT be the parent sentinel — isolation puts HOME in the
         // per-run tmpdir created by tempfile, whose path starts with /tmp/.
         assert!(
@@ -3156,7 +3164,7 @@ print(os.environ["HOME"])
 data = bytearray(200 * 1024 * 1024)
 print(f"allocated {len(data)} bytes — cgroup did not enforce limit")
 "#;
-        let result = run_script(script, &config, &exec).await;
+        let result = run_script(script, &config, &exec, None).await;
         match result {
             Ok(out) => {
                 panic!("script completed despite memory cap; cgroup not enforced: {out}");

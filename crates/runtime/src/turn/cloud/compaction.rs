@@ -1,6 +1,12 @@
 use crate::prompts::{CompactConfig, CompactionTier};
+use astra_turn_core::compression_types::{
+    CompressionResult, DUPLICATE_OUTPUT_CALL_ID_FIELD, TokenBudget, calls_have_same_identity,
+    duplicate_output_reference, duplicate_output_targets, matching_result_attribution,
+    unique_tool_observations,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 
 /// Shared prefix boundary for mechanical and model-generated history summaries.
 pub(crate) fn protected_history_spill_count(messages: &[Value], proposed: usize) -> usize {
@@ -111,8 +117,18 @@ pub(crate) fn adjust_spill_boundary_for_tool_pairs(
         false
     };
 
-    // Walk backward while the boundary is unsafe. Bail if we'd spill nothing.
+    // Shared ID spans cover non-adjacent/multiple/crossing tool calls. Retain
+    // the existing conservative adjacency fallback for malformed missing IDs.
+    spill_count = spill_count.min(messages.len());
+    let spans = tool_pair_spans(messages);
     while spill_count > 0 {
+        if let Some(&(start, _)) = spans
+            .iter()
+            .find(|&&(start, end)| start < spill_count && spill_count <= end)
+        {
+            spill_count = start;
+            continue;
+        }
         let last_spilled = &messages[spill_count - 1];
         let first_retained = messages.get(spill_count);
         let retained_starts_with_tool = first_retained.map(is_tool_role).unwrap_or(false);
@@ -318,11 +334,11 @@ pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Budget-based truncation. Exact-output deduplication belongs to the pipeline's
-// DuplicateToolOutputElimination layer, never to path/name heuristics here.
+// Shared mechanical operations. The ordered pipeline and character-budget
+// policy select different candidates, but edit the same canonical Values here.
 // ---------------------------------------------------------------------------
 
-fn serialized_value_chars(value: &Value) -> usize {
+fn serialized_value_size(value: &Value) -> (usize, usize) {
     let site = astra_core::history_work::HistoryWorkSite::CompactionHistorySerialization;
     match serde_json::to_string(value) {
         Ok(encoded) => {
@@ -334,29 +350,319 @@ fn serialized_value_chars(value: &Value) -> usize {
                     0,
                 );
             }
-            encoded.chars().count()
+            (encoded.chars().count(), encoded.len())
         }
         Err(error) => {
             astra_core::history_work::record_serialization_failure(site, &error);
-            1
+            (1, 1)
         }
     }
+}
+
+fn serialized_value_chars(value: &Value) -> usize {
+    serialized_value_size(value).0
 }
 
 fn serialized_message_chars(messages: &[Value]) -> usize {
     messages.iter().map(serialized_value_chars).sum()
 }
 
-fn tool_text_chars(message: &Value) -> usize {
+fn message_tokens(message: &Value) -> u64 {
+    crate::prompts::estimate_json_value_tokens(message)
+        .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD) as u64
+}
+
+fn message_turn(message: &Value, index: usize) -> u32 {
+    message
+        .get("_round_index")
+        .and_then(Value::as_u64)
+        .and_then(|round| u32::try_from(round).ok())
+        .unwrap_or((index / 2) as u32)
+}
+
+/// Compaction's task anchor is narrower than a provider user role: a tool
+/// result, empty task or synthetic replacement cannot become the pivot.
+fn is_plain_user_task(message: &Value) -> bool {
+    astra_turn_types::is_human_user_message(message)
+        && message.get("_synthetic").and_then(Value::as_bool) != Some(true)
+        && message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_none()
+        && match message.get("content") {
+            Some(Value::String(text)) => !text.trim().is_empty(),
+            Some(Value::Array(blocks)) => !blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result")),
+            Some(Value::Null) | None => false,
+            Some(_) => true,
+        }
+}
+
+fn protected_head_end(messages: &[Value]) -> usize {
+    let system_end = messages
+        .iter()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    messages[system_end..]
+        .iter()
+        .position(is_plain_user_task)
+        .map_or(system_end, |index| system_end + index + 1)
+}
+
+/// Closed, disjoint invocation spans for both provider encodings. Merging
+/// overlapping spans handles parallel calls, crossing results and ambiguous
+/// repeated IDs conservatively, without repeatedly scanning the transcript.
+fn tool_pair_spans(messages: &[Value]) -> Vec<(usize, usize)> {
+    let mut spans: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        fn record<'a>(spans: &mut HashMap<&'a str, (usize, usize)>, id: &'a str, index: usize) {
+            if !id.is_empty() {
+                spans
+                    .entry(id)
+                    .and_modify(|span| span.1 = index)
+                    .or_insert((index, index));
+            }
+        }
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            for call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    record(&mut spans, id, index);
+                }
+            }
+        }
+        if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+            record(&mut spans, id, index);
+        }
+        for block in message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let field = match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => "id",
+                Some("tool_result") => "tool_use_id",
+                _ => continue,
+            };
+            if let Some(id) = block.get(field).and_then(Value::as_str) {
+                record(&mut spans, id, index);
+            }
+        }
+    }
+    let mut spans: Vec<_> = spans
+        .into_values()
+        .filter(|(start, end)| start < end)
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in spans {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn referenced_tool_results(messages: &[Value]) -> Vec<bool> {
+    let mut referenced = vec![false; messages.len()];
+    for target in duplicate_output_targets(messages).into_iter().flatten() {
+        referenced[target] = true;
+    }
+    referenced
+}
+
+/// Invocation pairing is bidirectional; a dedup reference has a one-way
+/// dependency on its later evidence. Retaining evidence must not force all
+/// obsolete references to survive. Each message and span is visited once.
+fn close_retained_dependencies(messages: &[Value], keep: &mut [bool]) {
+    let spans = tool_pair_spans(messages);
+    let mut span_for_message = vec![None; messages.len()];
+    for (span_index, &(start, end)) in spans.iter().enumerate() {
+        span_for_message[start..=end].fill(Some(span_index));
+    }
+    let targets = duplicate_output_targets(messages);
+    let mut retained_spans = vec![false; spans.len()];
+    let mut queue: VecDeque<_> = keep
+        .iter()
+        .enumerate()
+        .filter_map(|(index, retained)| retained.then_some(index))
+        .collect();
+    while let Some(index) = queue.pop_front() {
+        if let Some(span_index) = span_for_message[index]
+            && !retained_spans[span_index]
+        {
+            retained_spans[span_index] = true;
+            let (start, end) = spans[span_index];
+            for (member, retained) in keep.iter_mut().enumerate().take(end + 1).skip(start) {
+                if !*retained {
+                    *retained = true;
+                    queue.push_back(member);
+                }
+            }
+        }
+        if let Some(target) = targets[index]
+            && !keep[target]
+        {
+            keep[target] = true;
+            queue.push_back(target);
+        }
+    }
+}
+
+/// Apply a removal mask only after authority, pairing and net-progress checks.
+/// The policy supplies its head/tail/pivot; this owns all destructive splicing.
+fn prune_selected_messages(
+    messages: &mut Vec<Value>,
+    mut keep: Vec<bool>,
+    boundary: Option<Value>,
+    pivot: Option<usize>,
+) -> CompressionResult {
+    if let Some(start) =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+    {
+        keep[start..].fill(true);
+    }
+    close_retained_dependencies(messages, &mut keep);
+    let removed_count = keep.iter().filter(|retained| !**retained).count();
+    let removed_tokens: u64 = messages
+        .iter()
+        .zip(&keep)
+        .filter(|(_, retained)| !**retained)
+        .map(|(message, _)| message_tokens(message))
+        .sum();
+    let boundary_tokens = boundary.as_ref().map_or(0, message_tokens);
+    if removed_count == 0 || removed_tokens <= boundary_tokens {
+        return CompressionResult::default();
+    }
+    let pivot_turn = pivot.map(|index| message_turn(&messages[index], index));
+    let mut affected_turns: Vec<_> = messages
+        .iter()
+        .zip(&keep)
+        .enumerate()
+        .filter(|(_, (_, retained))| !**retained)
+        .map(|(index, (message, _))| message_turn(message, index))
+        .filter(|turn| Some(*turn) != pivot_turn)
+        .collect();
+    affected_turns.sort_unstable();
+    affected_turns.dedup();
+    let mut marker = boundary;
+    // Moving surviving Values retains every unknown envelope field and block.
+    let mut compacted =
+        Vec::with_capacity(messages.len() - removed_count + usize::from(marker.is_some()));
+    for (message, retained) in messages.drain(..).zip(keep) {
+        if retained {
+            compacted.push(message);
+        } else if let Some(boundary) = marker.take() {
+            compacted.push(boundary);
+        }
+    }
+    *messages = compacted;
+    CompressionResult {
+        messages_removed: removed_count,
+        estimated_tokens_freed: removed_tokens - boundary_tokens,
+        description: String::new(),
+        affected_turns,
+    }
+}
+
+pub(crate) fn compact_middle_messages(
+    messages: &mut Vec<Value>,
+    keep_tail: usize,
+    reactive: bool,
+) -> CompressionResult {
+    let head_end = protected_head_end(messages);
+    let mut tail_start = messages.len().saturating_sub(keep_tail);
+    if let Some(start) =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+    {
+        tail_start = tail_start.min(start);
+    }
+    // Reserve the complete call/result span rather than retaining only its
+    // producer. A later pivot must be chosen from the actual removed span.
+    for (start, end) in tool_pair_spans(messages) {
+        if start < tail_start && tail_start <= end {
+            tail_start = start;
+            break;
+        }
+    }
+    if tail_start <= head_end {
+        return CompressionResult::default();
+    }
+    let pivot = if messages.get(tail_start).is_some_and(is_plain_user_task) {
+        None
+    } else {
+        messages[head_end..tail_start]
+            .iter()
+            .rposition(is_plain_user_task)
+            .map(|index| head_end + index)
+    };
+    let keep = (0..messages.len())
+        .map(|index| index < head_end || index >= tail_start || Some(index) == pivot)
+        .collect();
+    let summary = if reactive {
+        "[Context compacted: older messages were removed due to context overflow. The conversation continues below.]"
+    } else {
+        "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"
+    };
+    let mut boundary =
+        serde_json::json!({"role":"system", "content":summary, "_compact_boundary":true});
+    if reactive {
+        boundary["_reactive"] = Value::Bool(true);
+    }
+    let mut result = prune_selected_messages(messages, keep, Some(boundary), pivot);
+    if result.estimated_tokens_freed > 0 {
+        let turns_removed = result.affected_turns.len();
+        result.description = if reactive {
+            format!(
+                "Reactive compaction: removed {} messages ({} turns), freed ~{} tokens",
+                result.messages_removed, turns_removed, result.estimated_tokens_freed
+            )
+        } else {
+            format!(
+                "Compacted {} middle messages ({} turns), freed ~{} tokens",
+                result.messages_removed, turns_removed, result.estimated_tokens_freed
+            )
+        };
+    }
+    result
+}
+
+fn tool_text_parts(message: &Value) -> Vec<(Option<usize>, &str)> {
     match message.get("content") {
-        Some(Value::String(content)) => content.chars().count(),
+        Some(Value::String(text)) => vec![(None, text)],
         Some(Value::Array(blocks)) => blocks
             .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .map(|text| text.chars().count())
-            .sum(),
-        _ => 0,
+            .enumerate()
+            .filter_map(|(index, block)| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| {
+                        block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(|text| (Some(index), text))
+                    })
+                    .flatten()
+            })
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+fn tool_text_chars(message: &Value) -> usize {
+    tool_text_parts(message)
+        .iter()
+        .map(|(_, text)| text.chars().count())
+        .sum()
 }
 
 fn truncate_text_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
@@ -371,83 +677,300 @@ fn truncate_text_with_suffix(text: &str, max_chars: usize, suffix: &str) -> Stri
 }
 
 fn is_recoverable_tool_result(message: &Value) -> bool {
-    if message.get("role").and_then(Value::as_str) != Some("tool") {
-        return false;
-    }
     astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message).is_some()
-        || message
-            .get("content")
-            .and_then(Value::as_str)
-            .and_then(astra_turn_core::tool_result_storage::parse_tool_result_artifact_projection)
-            .is_some()
+        || tool_text_parts(message).iter().any(|(_, text)| {
+            astra_turn_core::tool_result_storage::parse_tool_result_artifact_projection(text)
+                .is_some()
+        })
 }
 
-fn truncate_tool_text_content(message: &mut Value, keep_chars: usize, suffix: &str) -> bool {
-    // A persisted result is already a bounded recovery projection.  The
-    // descriptor/strict projection parser is the canonical contract shared by
-    // every cloud compaction path; never turn its handle into an ordinary
-    // truncated string.
-    if is_recoverable_tool_result(message) {
-        return false;
-    }
-    let Some(content) = message.get_mut("content") else {
-        return false;
-    };
-    match content {
-        Value::String(text) => {
-            if text.chars().count() <= keep_chars {
-                return false;
-            }
-            let truncated: String = text.chars().take(keep_chars).collect();
-            *text = truncated + suffix;
-            true
-        }
-        Value::Array(blocks) => {
-            let total_text_chars: usize = blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .map(|text| text.chars().count())
-                .sum();
-            if total_text_chars <= keep_chars {
-                return false;
-            }
+#[derive(Default)]
+struct TruncationProgress {
+    tokens_freed: u64,
+    serialized_chars_freed: usize,
+}
 
-            let mut remaining = keep_chars;
-            let mut retained = Vec::with_capacity(blocks.len());
-            let mut last_text_index = None;
-            for mut block in blocks.drain(..) {
-                let Some(text) = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                else {
-                    retained.push(block);
+/// Only text is replaced. Even exhausted text blocks retain their place and
+/// opaque metadata; image/document/reasoning blocks are never flattened.
+/// Ordered policy retains a byte limit, while the raw budget uses characters.
+fn truncate_tool_text(
+    message: &mut Value,
+    keep_length: usize,
+    suffix: &str,
+    byte_limit: bool,
+    synthetic: bool,
+    duplicate_target: Option<&str>,
+) -> TruncationProgress {
+    if is_recoverable_tool_result(message) || duplicate_output_reference(message).is_some() {
+        return TruncationProgress::default();
+    }
+    let parts = tool_text_parts(message);
+    let length = |text: &str| {
+        if byte_limit {
+            text.len()
+        } else {
+            text.chars().count()
+        }
+    };
+    if parts.iter().map(|(_, text)| length(text)).sum::<usize>() <= keep_length {
+        return TruncationProgress::default();
+    }
+    let mut remaining = keep_length;
+    let mut edits = Vec::with_capacity(parts.len());
+    let mut suffix_index = 0;
+    for (index, (block, text)) in parts.iter().enumerate() {
+        let retained = if byte_limit {
+            &text[..text.floor_char_boundary(remaining.min(text.len()))]
+        } else {
+            &text[..text
+                .char_indices()
+                .nth(remaining)
+                .map_or(text.len(), |(index, _)| index)]
+        };
+        remaining = remaining.saturating_sub(length(retained));
+        // A split multibyte character exhausts the ordered byte budget too.
+        if retained.len() < text.len() {
+            remaining = 0;
+        }
+        if !retained.is_empty() {
+            suffix_index = index;
+        }
+        edits.push((*block, retained.to_owned()));
+    }
+    edits[suffix_index].1.push_str(suffix);
+    let before_tokens = message_tokens(message);
+    let before_size = serialized_value_size(message);
+    let old_synthetic = if synthetic {
+        message
+            .as_object_mut()
+            .expect("tool message object")
+            .insert("_synthetic".into(), Value::Bool(true))
+    } else {
+        None
+    };
+    let old_duplicate_target = duplicate_target.map(|target| {
+        message
+            .as_object_mut()
+            .expect("tool message object")
+            .insert(
+                DUPLICATE_OUTPUT_CALL_ID_FIELD.into(),
+                Value::String(target.to_owned()),
+            )
+    });
+    for (block, text) in &mut edits {
+        let slot = match block {
+            Some(index) => &mut message["content"][*index]["text"],
+            None => &mut message["content"],
+        };
+        if let Value::String(original) = slot {
+            std::mem::swap(original, text);
+        }
+    }
+    let after_tokens = message_tokens(message);
+    let after_size = serialized_value_size(message);
+    if after_tokens < before_tokens
+        && (synthetic || after_size.0 < before_size.0)
+        && after_size.1 < before_size.1
+    {
+        return TruncationProgress {
+            tokens_freed: before_tokens - after_tokens,
+            serialized_chars_freed: before_size.0.saturating_sub(after_size.0),
+        };
+    }
+    // Small bodies and marker overhead are genuine no-ops, including metadata.
+    for (block, text) in edits {
+        match block {
+            Some(index) => message["content"][index]["text"] = Value::String(text),
+            None => message["content"] = Value::String(text),
+        }
+    }
+    if synthetic {
+        let object = message.as_object_mut().expect("tool message object");
+        if let Some(value) = old_synthetic {
+            object.insert("_synthetic".into(), value);
+        } else {
+            object.remove("_synthetic");
+        }
+    }
+    if let Some(previous) = old_duplicate_target {
+        let object = message.as_object_mut().expect("tool message object");
+        if let Some(value) = previous {
+            object.insert(DUPLICATE_OUTPUT_CALL_ID_FIELD.into(), value);
+        } else {
+            object.remove(DUPLICATE_OUTPUT_CALL_ID_FIELD);
+        }
+    }
+    TruncationProgress::default()
+}
+
+fn truncate_tool_text_content(
+    message: &mut Value,
+    keep_chars: usize,
+    suffix: &str,
+) -> TruncationProgress {
+    truncate_tool_text(message, keep_chars, suffix, false, false, None)
+}
+
+#[allow(clippy::ptr_arg)] // Fixed engine stages share a mutable candidate-vector interface.
+pub(crate) fn truncate_old_tool_results(
+    messages: &mut Vec<Value>,
+    budget: &TokenBudget,
+    age_secs: u64,
+    keep_length: usize,
+) -> CompressionResult {
+    let head_end = protected_head_end(messages);
+    let suffix_start =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+            .unwrap_or(messages.len());
+    let cutoff = budget.now_secs.saturating_sub(age_secs);
+    let referenced = referenced_tool_results(messages);
+    let mut result = CompressionResult::default();
+    let mut count = 0;
+    for (index, message) in messages
+        .iter_mut()
+        .enumerate()
+        .take(suffix_start)
+        .skip(head_end)
+    {
+        if referenced[index]
+            || message.get("role").and_then(Value::as_str) != Some("tool")
+            || message
+                .get("_timestamp")
+                .and_then(Value::as_u64)
+                .is_none_or(|timestamp| timestamp > cutoff)
+            || budget.current_round_index.is_some_and(|current| {
+                message
+                    .get("_round_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|round| round >= u64::from(current))
+            })
+        {
+            continue;
+        }
+        let original_length: usize = tool_text_parts(message)
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum();
+        let suffix = format!("… [truncated, was {original_length} chars]");
+        let freed =
+            truncate_tool_text(message, keep_length, &suffix, true, true, None).tokens_freed;
+        if freed > 0 {
+            count += 1;
+            result.estimated_tokens_freed += freed;
+            result.affected_turns.push(message_turn(message, index));
+        }
+    }
+    result.affected_turns.sort_unstable();
+    result.affected_turns.dedup();
+    result.description = format!(
+        "Truncated {count} old tool results, freed ~{} tokens",
+        result.estimated_tokens_freed
+    );
+    result
+}
+
+#[allow(clippy::ptr_arg)] // Fixed engine stages share a mutable candidate-vector interface.
+pub(crate) fn compact_duplicate_tool_outputs(messages: &mut Vec<Value>) -> CompressionResult {
+    let head_end = protected_head_end(messages);
+    let suffix_start =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+            .unwrap_or(messages.len());
+    let referenced = referenced_tool_results(messages);
+    let replacements = {
+        let observations = unique_tool_observations(messages);
+        let mut latest = HashMap::new();
+        let mut replacements = Vec::new();
+        for (index, message) in messages.iter().enumerate().rev() {
+            if message.get("role").and_then(Value::as_str) != Some("tool")
+                || message.get("_synthetic").and_then(Value::as_bool) == Some(true)
+                || is_recoverable_tool_result(message)
+            {
+                continue;
+            }
+            let Some(id) = message.get("tool_call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(&(result_index, call)) = observations.get(id) else {
+                continue;
+            };
+            let Some(content) = message.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(name) = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(arguments) = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if result_index != index {
+                continue;
+            }
+            let key = (name, arguments, content);
+            if let Some(&later) = latest.get(&key) {
+                let retained: &Value = &messages[later];
+                let later_id = retained["tool_call_id"]
+                    .as_str()
+                    .expect("validated result id");
+                let Some(&(_, retained_call)) = observations.get(later_id) else {
                     continue;
                 };
-                if remaining == 0 {
-                    continue;
+                let calls_match = calls_have_same_identity(call, retained_call);
+                if index >= head_end
+                    && index < suffix_start
+                    && !referenced[index]
+                    && calls_match
+                    && matching_result_attribution(message, retained)
+                {
+                    replacements.push((index, later));
                 }
-
-                let text_chars = text.chars().count();
-                if text_chars > remaining {
-                    block["text"] = Value::String(text.chars().take(remaining).collect());
-                    remaining = 0;
-                } else {
-                    remaining -= text_chars;
-                }
-                last_text_index = Some(retained.len());
-                retained.push(block);
+            } else {
+                latest.insert(key, index);
             }
-            if let Some(index) = last_text_index
-                && let Some(Value::String(text)) = retained[index].get_mut("text")
-            {
-                text.push_str(suffix);
-            }
-            *blocks = retained;
-            true
         }
-        _ => false,
+        replacements
+    };
+    let mut result = CompressionResult::default();
+    let mut count = 0;
+    for (index, later) in replacements {
+        let target_id = messages[later]["tool_call_id"]
+            .as_str()
+            .expect("validated result id")
+            .to_owned();
+        let stub = format!("[identical output retained in tool result {target_id}]");
+        // The typed evidence link and synthetic marker participate in the same
+        // byte/token gain check as the replacement text.
+        let freed = truncate_tool_text(
+            &mut messages[index],
+            0,
+            &stub,
+            false,
+            true,
+            Some(&target_id),
+        )
+        .tokens_freed;
+        if freed > 0 {
+            count += 1;
+            result.estimated_tokens_freed += freed;
+            result
+                .affected_turns
+                .push(message_turn(&messages[index], index));
+        }
     }
+    result.affected_turns.sort_unstable();
+    result.affected_turns.dedup();
+    result.description = format!(
+        "Compacted {count} identical tool outputs, freed ~{} tokens",
+        result.estimated_tokens_freed
+    );
+    result
 }
 
 fn truncate_tool_results_to_serialized_budget(
@@ -457,7 +980,9 @@ fn truncate_tool_results_to_serialized_budget(
 ) -> bool {
     const MIN_TOOL_EVIDENCE_CHARS: usize = 80;
     const SUFFIX: &str = "\n...[compacted for context budget; re-run tool if needed]";
-
+    let suffix_start =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+            .unwrap_or(messages.len());
     let latest_tool_index = preserve_latest
         .then(|| {
             messages
@@ -468,27 +993,23 @@ fn truncate_tool_results_to_serialized_budget(
     let suffix_chars = serde_json::to_string(SUFFIX)
         .map(|encoded| encoded.chars().count().saturating_sub(2))
         .unwrap_or_else(|_| SUFFIX.chars().count());
-    // Re-serializing the complete transcript once per tool result makes
-    // compaction quadratic in session length. Maintain the exact serialized
-    // total from per-message deltas so long-running executions remain linear
-    // in the number of messages processed here.
+    let referenced = referenced_tool_results(messages);
     let mut total_chars = serialized_message_chars(messages);
     let mut changed = false;
-    for (index, message) in messages.iter_mut().enumerate() {
+    for (index, message) in messages.iter_mut().enumerate().take(suffix_start) {
         if total_chars <= budget_chars {
             break;
         }
-        if message.get("role").and_then(Value::as_str) != Some("tool") {
-            continue;
-        }
-        if Some(index) == latest_tool_index {
+        if message.get("role").and_then(Value::as_str) != Some("tool")
+            || referenced[index]
+            || Some(index) == latest_tool_index
+        {
             continue;
         }
         let content_chars = tool_text_chars(message);
         if content_chars <= MIN_TOOL_EVIDENCE_CHARS {
             continue;
         }
-
         let overage = total_chars.saturating_sub(budget_chars);
         let keep_chars = content_chars
             .saturating_sub(overage.saturating_add(suffix_chars))
@@ -496,13 +1017,9 @@ fn truncate_tool_results_to_serialized_budget(
         if keep_chars.saturating_add(suffix_chars) >= content_chars {
             continue;
         }
-
-        let before_chars = serialized_value_chars(message);
-        if truncate_tool_text_content(message, keep_chars, SUFFIX) {
-            let after_chars = serialized_value_chars(message);
-            total_chars = total_chars
-                .saturating_sub(before_chars)
-                .saturating_add(after_chars);
+        let progress = truncate_tool_text_content(message, keep_chars, SUFFIX);
+        if progress.tokens_freed > 0 {
+            total_chars = total_chars.saturating_sub(progress.serialized_chars_freed);
             changed = true;
         }
     }
@@ -510,21 +1027,16 @@ fn truncate_tool_results_to_serialized_budget(
 }
 
 fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
-    let protected_suffix_start =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(messages);
-    let first_user_idx = messages
-        .iter()
-        .position(astra_turn_types::is_human_user_message);
+    let first_user_idx = messages.iter().position(is_plain_user_task);
     let conversation_indices: Vec<usize> = messages
         .iter()
         .enumerate()
         .filter_map(|(index, message)| {
-            (astra_turn_types::is_human_user_message(message)
+            (is_plain_user_task(message)
                 || message.get("role").and_then(Value::as_str) == Some("assistant"))
             .then_some(index)
         })
         .collect();
-
     let Some(first_user_idx) = first_user_idx else {
         return false;
     };
@@ -535,35 +1047,29 @@ fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
     else {
         return false;
     };
-    let tail_role = messages[tail_start]
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let tail_is_user = is_plain_user_task(&messages[tail_start]);
     let Some(next_tail_start) = conversation_indices.iter().copied().find(|index| {
-        *index > tail_start
-            && (tail_role != "user" || astra_turn_types::is_human_user_message(&messages[*index]))
+        *index > tail_start && (!tail_is_user || is_plain_user_task(&messages[*index]))
     }) else {
         return false;
     };
-    if protected_suffix_start.is_some_and(|protected| next_tail_start > protected) {
-        // The proposed drain would split the current human turn from active
-        // append-only authority. The provider prefix and Work/control
-        // semantics require this suffix to survive as one ordered span.
+    if astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
+        .is_some_and(|start| next_tail_start > start)
+    {
         return false;
     }
-
-    let before = messages.len();
-    *messages = messages
-        .drain(..)
+    let latest_user = messages.iter().rposition(is_plain_user_task);
+    let keep = messages
+        .iter()
         .enumerate()
-        .filter(|(index, message)| {
+        .map(|(index, message)| {
             message.get("role").and_then(Value::as_str) == Some("system")
-                || *index == first_user_idx
-                || *index >= next_tail_start
+                || index == first_user_idx
+                || Some(index) == latest_user
+                || index >= next_tail_start
         })
-        .map(|(_, message)| message)
         .collect();
-    messages.len() < before
+    prune_selected_messages(messages, keep, None, latest_user).estimated_tokens_freed > 0
 }
 
 // Compaction Types
@@ -573,7 +1079,7 @@ fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactTrigger {
-    /// User requested manual compaction (e.g., /compact command).
+    /// User requested manual compaction.
     Manual,
     /// Automatic compaction triggered by token budget pressure.
     Auto,
@@ -672,8 +1178,7 @@ pub struct CompactResult {
     pub runtime_contexts: Vec<String>,
 }
 
-/// Test entrypoint for the same tier-aware budget pass used by Memoria and
-/// `CompactionEngine::compact_tiered`.
+/// Test entrypoint for the same tier-aware budget pass used by Memoria.
 #[cfg(test)]
 pub(crate) fn compact_tiered_with_result(
     messages: &[Value],
@@ -739,17 +1244,26 @@ pub(crate) fn compact_tiered_impl(
     let mut compacted = messages.to_vec();
     let trunc_limit = match tier {
         CompactionTier::Normal => unreachable!(),
-        CompactionTier::TrimSchemas => keep_chars * 2,
+        CompactionTier::TrimSchemas => keep_chars.saturating_mul(2),
         CompactionTier::CompactHistory => keep_chars,
         CompactionTier::AggressivePrune => keep_chars / 2,
     };
 
+    let protected_suffix_start =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(&compacted)
+            .unwrap_or(compacted.len());
     let latest_tool_index = compacted
         .iter()
         .rposition(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
+    let referenced = referenced_tool_results(&compacted);
     const TOOL_COMPACT_SUFFIX: &str = "\n...[compacted for context budget]";
-    for (index, message) in compacted.iter_mut().enumerate() {
+    for (index, message) in compacted
+        .iter_mut()
+        .enumerate()
+        .take(protected_suffix_start)
+    {
         if message.get("role").and_then(Value::as_str) != Some("tool")
+            || referenced[index]
             || Some(index) == latest_tool_index
         {
             continue;
@@ -774,66 +1288,57 @@ pub(crate) fn compact_tiered_impl(
                 (m.get("role").and_then(Value::as_str) == Some("assistant")).then_some(i)
             })
             .collect();
-        let asst_limit = trunc_limit * 2;
+        let asst_limit = trunc_limit.saturating_mul(2);
         const ASSISTANT_COMPACT_SUFFIX: &str = "\n...[earlier response compacted]";
         if assistant_indices.len() > keep_recent_turns {
             let compact_count = assistant_indices.len() - keep_recent_turns;
             for &index in assistant_indices.iter().take(compact_count) {
-                let content = compacted[index]
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if content.chars().count() > asst_limit {
-                    compacted[index]["content"] = Value::String(truncate_text_with_suffix(
-                        content,
-                        asst_limit,
-                        ASSISTANT_COMPACT_SUFFIX,
-                    ));
+                if index >= protected_suffix_start
+                    || !compacted[index]
+                        .get("content")
+                        .is_some_and(Value::is_string)
+                {
+                    continue;
                 }
+                let suffix = truncate_text_with_suffix("", asst_limit, ASSISTANT_COMPACT_SUFFIX);
+                truncate_tool_text_content(
+                    &mut compacted[index],
+                    asst_limit.saturating_sub(suffix.chars().count()),
+                    &suffix,
+                );
             }
         }
     }
 
     if tier == CompactionTier::AggressivePrune {
-        let protected_suffix_start =
-            astra_turn_types::active_append_only_authority_protected_suffix_start(&compacted);
-        let first_user_idx = compacted
-            .iter()
-            .position(astra_turn_types::is_human_user_message);
-        let latest_user_idx = compacted
-            .iter()
-            .rposition(astra_turn_types::is_human_user_message);
-        let conv_indices: Vec<usize> = compacted
+        let first_user_idx = compacted.iter().position(is_plain_user_task);
+        let latest_user_idx = compacted.iter().rposition(is_plain_user_task);
+        let conversation_indices: Vec<usize> = compacted
             .iter()
             .enumerate()
-            .filter_map(|(i, m)| {
-                (astra_turn_types::is_human_user_message(m)
-                    || m.get("role").and_then(Value::as_str) == Some("assistant"))
-                .then_some(i)
+            .filter_map(|(index, message)| {
+                (is_plain_user_task(message)
+                    || message.get("role").and_then(Value::as_str) == Some("assistant"))
+                .then_some(index)
             })
             .collect();
-        let keep_count = keep_recent_turns * 2;
-        if conv_indices.len() > keep_count {
-            // Drop one contiguous historical span rather than user/assistant
-            // messages in isolation. Tool results live between those control
-            // messages; retaining them while deleting their assistant
-            // `tool_calls` frame produces provider-invalid history.
-            let tail_start = protected_suffix_start
-                .map(|protected| {
-                    protected.min(conv_indices[conv_indices.len() - keep_count.max(1)])
-                })
-                .unwrap_or_else(|| conv_indices[conv_indices.len() - keep_count.max(1)]);
-            compacted = compacted
-                .into_iter()
+        let keep_count = keep_recent_turns.saturating_mul(2);
+        if conversation_indices.len() > keep_count {
+            let tail_start = conversation_indices[conversation_indices.len() - keep_count.max(1)];
+            // Raw-budget policy preserves all system messages and the first
+            // and latest human requests; ordered policy preserves a head and
+            // pivot instead. Pairing and authority guards are shared below.
+            let keep = compacted
+                .iter()
                 .enumerate()
-                .filter(|(index, message)| {
+                .map(|(index, message)| {
                     message.get("role").and_then(Value::as_str) == Some("system")
-                        || Some(*index) == first_user_idx
-                        || Some(*index) == latest_user_idx
-                        || *index >= tail_start
+                        || Some(index) == first_user_idx
+                        || Some(index) == latest_user_idx
+                        || index >= tail_start
                 })
-                .map(|(_, m)| m)
                 .collect();
+            prune_selected_messages(&mut compacted, keep, None, latest_user_idx);
         }
     }
 
@@ -2052,6 +2557,271 @@ mod tests {
         let back: CompactBoundary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.pre_tokens, 0);
         assert_eq!(back.messages_before, 0);
+    }
+}
+
+#[cfg(test)]
+mod mechanical_owner_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn every_raw_budget_tier_preserves_the_entire_active_authority_suffix() {
+        for tier in [
+            CompactionTier::TrimSchemas,
+            CompactionTier::CompactHistory,
+            CompactionTier::AggressivePrune,
+        ] {
+            let mut authority = json!({"role":"user", "content":"current Work contract"});
+            astra_turn_types::mark_append_only_required_context(
+                &mut authority,
+                "work",
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            );
+            let mut messages = vec![
+                json!({"role":"system", "content":"stable contract"}),
+                json!({"role":"user", "content":"initial goal"}),
+                json!({"role":"assistant", "content":"old answer ".repeat(1000)}),
+                json!({"role":"user", "content":"current goal"}),
+                authority,
+            ];
+            for index in 0..8 {
+                messages.push(json!({"role":"assistant", "content":"current response ".repeat(200),
+                    "tool_calls":[{"id":format!("c{index}"), "type":"function", "function":{"name":"read", "arguments":"{}"}}]}));
+                messages.push(json!({"role":"tool", "tool_call_id":format!("c{index}"), "content":"current evidence ".repeat(500)}));
+            }
+            let result = compact_tiered_impl(&messages, 1, 100, tier, 1);
+            let anchor = result
+                .messages
+                .iter()
+                .position(|message| message["content"] == "current goal")
+                .unwrap();
+            assert_eq!(
+                &result.messages[anchor..],
+                &messages[3..],
+                "tier {tier:?} must preserve the ordered authority suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_budget_preserves_crossing_tool_pairs_in_both_provider_encodings() {
+        for anthropic in [false, true] {
+            let call = |id: &str| {
+                if anthropic {
+                    json!({"role":"assistant", "content":[{"type":"tool_use", "id":id, "name":"read", "input":{}}]})
+                } else {
+                    json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read", "arguments":"{}"}}]})
+                }
+            };
+            let result = |id: &str| {
+                if anthropic {
+                    json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":id, "content":"evidence"}]})
+                } else {
+                    json!({"role":"tool", "tool_call_id":id, "content":"evidence"})
+                }
+            };
+            let messages = vec![
+                json!({"role":"user", "content":"first goal"}),
+                json!({"role":"assistant", "content":"obsolete answer ".repeat(1000)}),
+                json!({"role":"user", "content":"current goal"}),
+                call("a"),
+                call("b"),
+                result("a"),
+                result("b"),
+            ];
+            let compacted =
+                compact_tiered_impl(&messages, 1, 100, CompactionTier::AggressivePrune, 1);
+            for message in &messages[2..] {
+                assert!(
+                    compacted.messages.contains(message),
+                    "a crossing group and its human pivot remain closed: {:?}",
+                    compacted.messages
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_truncation_preserves_all_block_positions_and_opaque_metadata() {
+        let image =
+            json!({"type":"image_url", "image_url":{"url":"fixture"}, "text":"opaque text"});
+        let mut message = json!({"role":"tool", "content":[
+            {"type":"text", "text":"你好世界".repeat(500), "citation":{"id":1}},
+            image.clone(),
+            {"type":"text", "text":"second text ".repeat(500), "citation":{"id":2}},
+            {"type":"provider_private", "text":"do not interpret this text", "signature":"opaque"}
+        ], "future_envelope":{"keep":true}});
+        assert!(truncate_tool_text_content(&mut message, 80, "[truncated]").tokens_freed > 0);
+        let blocks = message["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0]["citation"], json!({"id":1}));
+        assert_eq!(blocks[1], image);
+        assert_eq!(
+            blocks[2],
+            json!({"type":"text", "text":"", "citation":{"id":2}})
+        );
+        assert_eq!(
+            blocks[3],
+            json!({"type":"provider_private", "text":"do not interpret this text", "signature":"opaque"})
+        );
+        assert_eq!(message["future_envelope"], json!({"keep":true}));
+    }
+
+    #[test]
+    fn text_replacement_rolls_back_metadata_when_marker_cost_prevents_progress() {
+        for synthetic in [None, Some(json!(false)), Some(json!({"opaque":true}))] {
+            let mut message =
+                json!({"role":"tool", "content":"short result", "extension":{"keep":true}});
+            if let Some(value) = synthetic {
+                message["_synthetic"] = value;
+            }
+            let before = message.clone();
+            assert_eq!(
+                truncate_tool_text(
+                    &mut message,
+                    0,
+                    "a replacement longer than the result",
+                    true,
+                    true,
+                    None
+                )
+                .tokens_freed,
+                0
+            );
+            assert_eq!(message, before);
+        }
+    }
+
+    fn reference_history() -> Vec<Value> {
+        let call = |id: &str| json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read", "arguments":"{}"}}]});
+        let result = |id: &str| json!({"role":"tool", "tool_call_id":id, "content":"same evidence ".repeat(500), "_timestamp":1});
+        vec![
+            json!({"role":"user", "content":"session goal"}),
+            call("source"),
+            json!({"role":"user", "content":"current pivot"}),
+            result("source"),
+            json!({"role":"assistant", "content":"obsolete middle ".repeat(500)}),
+            call("target"),
+            result("target"),
+            json!({"role":"assistant", "content":"obsolete middle ".repeat(500)}),
+            json!({"role":"assistant", "content":"obsolete middle ".repeat(500)}),
+            json!({"role":"assistant", "content":"recent progress"}),
+            json!({"role":"assistant", "content":"recent answer"}),
+        ]
+    }
+
+    #[test]
+    fn typed_dedup_reference_retains_its_evidence_through_later_pruning_and_truncation() {
+        let mut messages = reference_history();
+        let target = messages[6].clone();
+        let before: u64 = messages.iter().map(message_tokens).sum();
+        let duplicate = compact_duplicate_tool_outputs(&mut messages);
+        assert!(duplicate.estimated_tokens_freed > 0);
+        assert_eq!(messages[3][DUPLICATE_OUTPUT_CALL_ID_FIELD], "target");
+        assert_eq!(
+            duplicate.estimated_tokens_freed,
+            before - messages.iter().map(message_tokens).sum::<u64>()
+        );
+        let compacted = compact_middle_messages(&mut messages, 2, false);
+        assert!(compacted.estimated_tokens_freed > 0);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message[DUPLICATE_OUTPUT_CALL_ID_FIELD] == "target")
+        );
+        assert!(
+            messages.contains(&target),
+            "the surviving reference owns a one-way evidence dependency"
+        );
+        let budget = TokenBudget {
+            max_prompt_tokens: 1,
+            last_measured_tokens: 100_000,
+            current_round_index: Some(99),
+            now_secs: 10_000,
+        };
+        assert_eq!(
+            truncate_old_tool_results(&mut messages, &budget, 0, 10).estimated_tokens_freed,
+            0
+        );
+        let raw = compact_tiered_impl(&messages, 1, 10, CompactionTier::CompactHistory, 1);
+        assert!(
+            raw.messages.contains(&target),
+            "raw budget truncation honors the same evidence dependency"
+        );
+    }
+
+    #[test]
+    fn retained_evidence_does_not_pin_obsolete_references_and_prose_creates_no_edge() {
+        let mut messages = reference_history();
+        assert!(compact_duplicate_tool_outputs(&mut messages).estimated_tokens_freed > 0);
+        let mut keep = vec![false; messages.len()];
+        keep[6] = true;
+        assert!(
+            prune_selected_messages(&mut messages, keep, None, None).estimated_tokens_freed > 0
+        );
+        assert_eq!(
+            messages.len(),
+            2,
+            "only the retained target invocation survives"
+        );
+        assert_eq!(messages[1]["tool_call_id"], "target");
+
+        let mut fake = reference_history();
+        fake[3]["content"] = json!("[identical output retained in tool result target]");
+        fake[3]["_synthetic"] = json!(true);
+        assert!(compact_middle_messages(&mut fake, 2, false).estimated_tokens_freed > 0);
+        assert!(
+            !fake
+                .iter()
+                .any(|message| message["tool_call_id"] == "target"),
+            "prose with no typed link cannot pin evidence"
+        );
+    }
+
+    #[test]
+    fn typed_dedup_links_require_unique_matching_same_history_invocations() {
+        let mut messages = reference_history();
+        assert!(compact_duplicate_tool_outputs(&mut messages).estimated_tokens_freed > 0);
+        assert_eq!(duplicate_output_targets(&messages)[3], Some(6));
+        for (pointer, value) in [
+            (
+                "/5/tool_calls/0/function/arguments",
+                json!("{\"different\":true}"),
+            ),
+            ("/6/provider_binding", json!("different owner")),
+            ("/3/_synthetic", json!(false)),
+            ("/6/tool_call_id", json!("source")),
+        ] {
+            let mut changed = Value::Array(messages.clone());
+            if let Some(slot) = changed.pointer_mut(pointer) {
+                *slot = value;
+            } else {
+                changed[6]["provider_binding"] = value;
+            }
+            assert_eq!(
+                duplicate_output_targets(changed.as_array().unwrap())[3],
+                None,
+                "invalid link {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_boundary_and_middle_pruning_share_nonadjacent_pair_closure() {
+        let messages = vec![
+            json!({"role":"user", "content":"goal"}),
+            json!({"role":"assistant", "tool_calls":[{"id":"a"}, {"id":"b"}]}),
+            json!({"role":"assistant", "content":"intervening progress"}),
+            json!({"role":"tool", "tool_call_id":"b", "content":"b"}),
+            json!({"role":"assistant", "content":"more progress"}),
+            json!({"role":"tool", "tool_call_id":"a", "content":"a"}),
+        ];
+        assert_eq!(adjust_spill_boundary_for_tool_pairs(&messages, 4), 1);
+        let mut compacted = messages.clone();
+        let result = compact_middle_messages(&mut compacted, 2, false);
+        assert_eq!(result.estimated_tokens_freed, 0);
+        assert_eq!(compacted, messages);
     }
 }
 

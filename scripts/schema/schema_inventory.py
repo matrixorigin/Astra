@@ -831,7 +831,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         rebuildability="partially rebuildable only while source events, payloads, and projection rules remain complete",
         merge_guidance="keep separate from session_state_item_events; this table is the current projection surface while events preserve mutation history",
         migration_owner="astra_services::storage / state_projection",
-        product_owner="session memory/state projection and active task/delegation context",
+        product_owner="session memory/state projection and active skill context",
     ),
     "session_state_item_events": TableMetadata(
         semantic_owner="astra_services::state_projection",
@@ -841,17 +841,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         rebuildability="not fully rebuildable after source mutation context is gone",
         merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
         migration_owner="astra_services::storage / state_projection",
-        product_owner="session state projection, active skill/delegation audit",
-    ),
-    "session_delegations": TableMetadata(
-        semantic_owner="astra_services::state_projection / runtime delegation engine",
-        state_class="durable delegation topology fact",
-        primary_query="delegation tree lookup by user_id/root_run_id/depth, parent status by user_id/parent_run_id/status, and session status by user_id/session_id/status",
-        retention_policy="retain while multi-agent tree display, retry lineage, sibling artifact exposure, and recovery need parent/child topology; session hard delete removes owner/session rows after child runs are reconciled",
-        rebuildability="not fully rebuildable from agent_runs without losing ancestor_path, retry_scope, sibling exposure metadata, and delegation-specific summaries",
-        merge_guidance="do not merge into agent_runs; run lifecycle authority and delegation topology have different mutation owners and query shapes",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="multi-agent delegation tree, retries, and progress display",
+        product_owner="session state projection and active skill audit",
     ),
     "data_versioning_checkpoints": TableMetadata(
         semantic_owner="astra_services::data_versioning::DatabaseDataVersioningService",

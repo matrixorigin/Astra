@@ -14,7 +14,7 @@
 use serde_json::{Value, json};
 
 use super::compaction::CompactResult;
-use super::compaction_engine::CompactionEngine;
+use super::compaction::compact_tiered_impl;
 use crate::prompts::{CompactConfig, CompactionTier};
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::cloud_summary::SummaryLlmClient;
@@ -1397,13 +1397,8 @@ pub async fn compact_with_memoria(
     // Applicability is local state. Do not resolve credentials when this
     // compaction cannot retrieve memory; actual reads still recheck consent.
     let local_fallback = || {
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        compact_tiered_impl(
             messages,
-        );
-        let mut msgs = messages.to_vec();
-        CompactionEngine::compact_tiered(
-            &mut msgs,
             params.budget_chars,
             params.keep_chars,
             params.tier,
@@ -1474,13 +1469,8 @@ pub async fn compact_with_memoria(
 
     // Apply truncation against a budget that leaves room for typed runtime
     // context. Retrieval results are never inserted into history messages.
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+    let mut result = compact_tiered_impl(
         messages,
-    );
-    let mut msgs = messages.to_vec();
-    let mut result = CompactionEngine::compact_tiered(
-        &mut msgs,
         adjusted_budget_chars,
         params.keep_chars,
         params.tier,

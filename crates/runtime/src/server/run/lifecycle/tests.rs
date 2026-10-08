@@ -1781,8 +1781,13 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
     }
     messages.push(json!({"role": "assistant", "content": "translation complete"}));
 
-    let mut engine = crate::turn::CompactionEngine::new();
-    engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
+    let engine = crate::turn::CompactionEngine::from_config(
+        &astra_config::runtime_config::CompressionConfig {
+            preserve_recent_turns: 2,
+            ..Default::default()
+        },
+        64_000,
+    );
     let outcome = engine.compress_if_needed(
         &mut messages,
         &crate::turn::TokenBudget {
@@ -1917,8 +1922,13 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
         let mut proof =
             CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
         let permit = proof.begin(&messages);
-        let mut engine = crate::turn::CompactionEngine::new();
-        engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
+        let engine = crate::turn::CompactionEngine::from_config(
+            &astra_config::runtime_config::CompressionConfig {
+                preserve_recent_turns: 2,
+                ..Default::default()
+            },
+            64_000,
+        );
         let outcome = engine.compress_if_needed(
             &mut messages,
             &crate::turn::TokenBudget {
@@ -9799,16 +9809,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
     ) -> Result<Option<astra_services::runs::DurableRunObservation>, String> {
         self.inner
             .load_run_observation(user_id, run_id, event_limit)
-            .await
-    }
-
-    async fn load_run_delegation_projection_target(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<astra_services::runs::DurableRunDelegationProjectionTarget>, String> {
-        self.inner
-            .load_run_delegation_projection_target(user_id, run_id)
             .await
     }
 

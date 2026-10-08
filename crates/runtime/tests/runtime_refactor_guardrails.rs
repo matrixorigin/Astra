@@ -277,7 +277,10 @@ async fn legacy_task_plan_and_todo_surfaces_are_not_routable() {
         ("GET", "/tasks"),
         ("POST", "/tasks"),
         ("POST", "/tasks:rpc"),
+        ("GET", "/tasks/task-1/lease"),
         ("POST", "/tasks/task-1/lease/claim"),
+        ("POST", "/tasks/task-1/lease/release"),
+        ("POST", "/tasks/task-1/lease/renew"),
         // Retired lifecycle paths must not become runtime capabilities.
         ("GET", "/agent-jobs"),
         ("POST", "/agent-jobs/task-1/lease/claim"),

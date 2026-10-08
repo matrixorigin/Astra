@@ -644,21 +644,5 @@ export function buildQueryString(
   return s ? `?${s}` : "";
 }
 
-export function taskLeasePath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease`;
-}
-
-export function taskLeaseClaimPath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease/claim`;
-}
-
-export function taskLeaseReleasePath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease/release`;
-}
-
-export function taskLeaseRenewPath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease/renew`;
-}
-
 /** HTTP header for edge transport instance id (matches Rust `ASTRA_EDGE_ID_HEADER`). */
 export const ASTRA_EDGE_ID_HEADER = "X-Astra-Edge-Id";

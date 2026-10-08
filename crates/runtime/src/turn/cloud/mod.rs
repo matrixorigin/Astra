@@ -1,37 +1,14 @@
-//! Cloud turn implementation — typed context compression for Astra ↔ LLM API.
+//! Cloud history compaction with one canonical message representation.
 //!
-//! This module implements **multi-layer progressive context compression**:
-//!
-//! | Position | Layer                     | Trigger (pressure) | Behaviour |
-//! |----------|---------------------------|---------------------|-----------|
-//! | 1        | DuplicateToolOutputElimination  | Tier × 0.625       | Reference byte-identical output by call ID |
-//! | 2        | ToolResultTruncation      | Tier × 0.75        | Truncate old tool results to max length |
-//! | 3        | TieredCompaction          | Tier × 0.9375      | Drop middle turns; insert boundary marker |
-//! | 4        | ReactiveCompact           | 0.95                | Emergency: keep only last 4 messages |
-//!
-//! Triggers derive from `CompactionTier::pre_turn_trigger(usable_input_tokens)`
-//! — one resolved-policy baseline after catalog reserves are applied.
-//!
-//! ## Design
-//!
-//! - **Typed internal representation**: `Message` (from `astra_turn_core`)
-//!   replaces `serde_json::Value` inside all layers. The engine converts
-//!   `Vec<Value>` → `Vec<Message>` on entry and `Vec<Message>` → `Vec<Value>`
-//!   on exit.
-//! - **Pipeline engine** (`compaction_engine.rs`): orchestrates layers,
-//!   adjusts the effective budget between layers, stops when satisfied.
-//! - **Layers** (`layers/*.rs`): each implements `CompressionLayer`.
+//! `compaction` owns mechanical edits and protection rules. `CompactionEngine`
+//! selects the fixed progressive pre-turn/retry schedule; request assembly and
+//! Memoria retain their separate serialized-budget and memory/summary policy.
+//! Required controls, provider message shape and artifact identities survive
+//! both paths. Model summaries and durable artifact commits keep their owners.
 
 pub mod compaction;
 pub mod compaction_engine;
-pub(crate) mod helpers;
-pub mod layers;
 pub mod memoria_compact;
 pub mod session_end_governance;
 
-/// Re-export the pipeline entry point for callers throughout the runtime.
 pub use compaction_engine::CompactionEngine;
-/// Re-export layers for tests and direct consumers.
-pub use layers::{
-    DuplicateToolOutputElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
-};

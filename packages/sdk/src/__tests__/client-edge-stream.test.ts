@@ -1,5 +1,5 @@
 import { AstraClient, chatRequestToWire } from '../client';
-import { ASTRA_EDGE_ID_HEADER, PATH_AGENTS_EDGE, PATH_AGENTS_EDGE_HEARTBEAT, PATH_APPROVAL_RESPOND, PATH_CHAT_STREAM, joinApiPath, taskLeasePath, taskLeaseReleasePath, taskLeaseRenewPath } from '../paths';
+import { ASTRA_EDGE_ID_HEADER, PATH_AGENTS_EDGE, PATH_AGENTS_EDGE_HEARTBEAT, PATH_APPROVAL_RESPOND, PATH_CHAT_STREAM, joinApiPath } from '../paths';
 import { SSEClient } from '../sse-client';
 
 // ─── Mock stream (same idea as sse-client tests) ──────────────────
@@ -100,7 +100,7 @@ describe('AstraClient — streamChat', () => {
   });
 });
 
-describe('AstraClient — thin edge / approval / task lease', () => {
+describe('AstraClient — thin edge / approval', () => {
   function okFetch() {
     return vi.fn().mockResolvedValue({
       ok: true,
@@ -150,36 +150,5 @@ describe('AstraClient — thin edge / approval / task lease', () => {
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(String(call[0]).endsWith(PATH_AGENTS_EDGE_HEARTBEAT)).toBe(true);
     expect((call[1] as { headers: Record<string, string> }).headers[ASTRA_EDGE_ID_HEADER]).toBe('tr');
-  });
-
-  it('getTaskLease GET /tasks/{id}/lease', async () => {
-    globalThis.fetch = okFetch();
-    const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
-    await c.getTaskLease('task-9');
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(String(call[0]).endsWith(taskLeasePath('task-9'))).toBe(true);
-  });
-
-  it('postTaskLeaseRelease with edge header and body', async () => {
-    globalThis.fetch = okFetch();
-    const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
-    await c.postTaskLeaseRelease(
-      'task-a',
-      { edge_agent_id: 'ea' },
-      { edgeTransportId: 'tport' },
-    );
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(String(call[0]).endsWith(taskLeaseReleasePath('task-a'))).toBe(true);
-    expect((call[1] as { method: string }).method).toBe('POST');
-    expect((call[1] as { headers: Record<string, string> }).headers[ASTRA_EDGE_ID_HEADER]).toBe('tport');
-  });
-
-  it('postTaskLeaseRenew with edge header and body', async () => {
-    globalThis.fetch = okFetch();
-    const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
-    await c.postTaskLeaseRenew('task-b', { edge_agent_id: 'eb', ttl_sec: 30 }, { edgeTransportId: 't2' });
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(String(call[0]).endsWith(taskLeaseRenewPath('task-b'))).toBe(true);
-    expect(JSON.parse((call[1] as { body: string }).body as string)).toEqual({ edge_agent_id: 'eb', ttl_sec: 30 });
   });
 });

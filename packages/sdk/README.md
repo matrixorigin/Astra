@@ -2,7 +2,7 @@
 
 TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
 
-Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Legacy task/plan/agent-job helpers remain in the clients for source compatibility with older servers, but the current runtime intentionally returns `404` for those routes and they are not runtime capabilities.
+Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Work and Run APIs use the current Server-owned lifecycle. Retired task-lease, task-plan, and agent-job routes are unavailable and are not exposed by this SDK.
 
 **Distribution:** This package is versioned in the Astra monorepo and configured
 as a public scoped npm package. Publishing remains an explicit release action;
@@ -233,7 +233,6 @@ When a **local edge** runs tools, use the same routes as `astra-thin-client`:
 | Approval | `postApprovalRespond(body)` | `POST /approval/respond` |
 | Register edge | `registerEdge(body, { edgeTransportId })` | `POST /agents/edge` |
 | Heartbeat | `postEdgeHeartbeat(body, { edgeTransportId })` | `POST /agents/edge/heartbeat` |
-| Legacy task lease helpers | `getTaskLease`, `postTaskLeaseClaim` / `Release` / `Renew` | `/tasks/{id}/lease/...` (not registered by the current runtime) |
 
 Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHAT_STREAM`, `joinApiPath`, `ASTRA_EDGE_ID_HEADER`).
 

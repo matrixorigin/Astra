@@ -41,18 +41,6 @@ pub fn is_memory_tool_message(message: &Value) -> bool {
             })
 }
 
-fn is_user_turn_start(message: &Value) -> bool {
-    astra_turn_types::is_human_user_message(message)
-        && !message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            })
-}
-
 /// Remove complete user-turn segments containing a structural memory
 /// tool-use from the knowledge-extraction history.
 ///
@@ -78,7 +66,7 @@ pub fn filter_memory_operation_turns(messages: &[Value]) -> Vec<Value> {
     };
 
     for (index, message) in messages.iter().enumerate() {
-        if index > segment_start && is_user_turn_start(message) {
+        if index > segment_start && astra_turn_types::is_human_user_message(message) {
             let segment = &messages[segment_start..index];
             if !segment.iter().any(is_memory_tool_message) {
                 append_observer_safe_segment(&mut filtered, segment);

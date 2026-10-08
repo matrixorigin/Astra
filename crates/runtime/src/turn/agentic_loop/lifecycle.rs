@@ -9469,13 +9469,10 @@ mod tests {
             state.messages.len()
         );
 
-        // Compaction is already proven by message-count reduction above.
-        // The `_compact_boundary` marker lives in `Message.extra` and is
-        // intentionally stripped by `From<Message> for Value` to keep
-        // prompt-cache prefixes stable on the provider wire — it does NOT
-        // survive into `state.messages` (Vec<Value>). Asserting on it here
-        // would test the wrong layer. See compaction_engine_tests.rs for
-        // typed-level boundary marker assertions.
+        // Message-count reduction proves this canonical rewrite. Boundary
+        // metadata stays in state.messages and is removed only by provider
+        // projection. The public compaction_pipeline integration cases check
+        // its placement; this case retains the quiet-mode telemetry contract.
 
         assert!(
             state.context_compression_triggered,
