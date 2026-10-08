@@ -1376,6 +1376,7 @@ mod tests {
                 tool_calls: vec![json!({"id":"call-grep", "type":"function",
                     "function":{"name":"grep", "arguments":r#"{"pattern":"headless"}"#}})],
                 edge_tool_round: vec![EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: "call-grep".into(),
                     tool: "grep".to_string(),
@@ -2034,6 +2035,7 @@ mod tests {
         harness.step_recorder =
             StepRecorder::with_persistence_for_run("test-user", &session_id, "test-task", &run_id);
         harness.edge_tool_round.push(EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-grep-second".into(),
             tool: "grep".to_string(),
@@ -2302,6 +2304,7 @@ mod tests {
     async fn server_owned_tool_rejects_edge_result_without_server_reroute() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round[0] = EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-notify".to_string(),
             tool: "notify".to_string(),
@@ -3351,6 +3354,7 @@ mod tests {
         let mut harness = PipelineHarness::new();
         begin_recorded_turn(&mut harness, 3);
         let writer = |id: &str| EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: id.to_string(),
             tool: "write_file".to_string(),
@@ -6289,6 +6293,7 @@ mod tests {
             }
         }));
         harness.edge_tool_round = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-agent-fanout-1".to_string(),
             tool: "agent_fanout".to_string(),

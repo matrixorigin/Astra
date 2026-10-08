@@ -14,7 +14,7 @@ criteria:
   delivered_items: 2
   cancellation_after_deliveries: 1
   added_execution_after_initial_deliveries: 1
-  require_added_at_start: true
+  require_added_before_execution: true
 - type: hard_judger
   question: |
     Does the final response accurately report the actual execution order and outcomes?

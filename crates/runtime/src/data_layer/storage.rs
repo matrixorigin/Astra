@@ -1,46 +1,22 @@
 pub use astra_services::storage::*;
 
-use std::time::Duration;
-
 use serde_json::Value;
 use sqlx::{MySql, QueryBuilder, Row, query};
 
-use astra_core::canonical_names::{
-    metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
-};
+use astra_core::canonical_names::{metadata_duration_ms, metadata_tool_name};
 use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_services::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
     canonical_observation_payload_hash, classify_capture, record_observation_collisions,
 };
-use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnCoreEventRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
-};
-use astra_turn_core::hook_plans::SnapshotLinkPlan;
+use astra_turn_core::contracts::{TurnAuxiliaryEventRecord, TurnSkillSelectionRecord};
 use astra_turn_core::trace_event::TraceEvent;
 use uuid::Uuid;
-
-fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
-    metadata
-        .and_then(|value| value.get(key))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
 
 fn mysql_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
-const INSERT_CORE_TURN_EVENT_SQL: &str = "INSERT IGNORE INTO agent_events \
-         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, run_id, turn_seq, token_usage, llm_model_used, llm_params, reasoning_content, \
-          token_input, token_output, token_total, payload_hash, ingestion_write_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
-
-const CORE_TURN_EVENT_COLLISION_SOURCE: &str = "runtime_core_turn_event";
-const TOOL_TURN_EVENT_COLLISION_SOURCE: &str = "runtime_tool_turn_event";
 const TRACE_EVENT_COLLISION_SOURCE: &str = "runtime_trace_event";
 pub(crate) const AUXILIARY_EVENT_COLLISION_SOURCE: &str = "runtime_auxiliary_event";
 
@@ -57,17 +33,6 @@ struct AgentEventCaptureReadback {
     session_id: String,
     payload_hash: String,
     ingestion_write_id: String,
-}
-
-#[derive(Debug, PartialEq)]
-struct CoreTurnEventInsertValues {
-    payload_hash: String,
-    turn_seq: Option<i64>,
-    token_usage_json: Option<String>,
-    llm_params_json: Option<String>,
-    token_input: Option<i64>,
-    token_output: Option<i64>,
-    token_total: Option<i64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -311,57 +276,6 @@ pub(crate) fn trace_event_payload_hash(event: &TraceEvent) -> Result<String, sql
     Ok(hash_agent_event_payload(payload))
 }
 
-fn core_turn_event_payload_hash(event: &TurnCoreEventRecord) -> String {
-    hash_agent_event_payload(serde_json::json!({
-        "event_id": event.event_id,
-        "session_id": event.session_id,
-        "user_id": event.user_id,
-        "agent_id": event.agent_id.as_deref().unwrap_or("astra-cli"),
-        "agent_version": env!("CARGO_PKG_VERSION"),
-        "event_type": event.event_type,
-        "content": event.content,
-        "parent_event_id": event.parent_event_id,
-        "parent_event_ids": event.parent_event_ids,
-        "causal_chain_id": event.causal_chain_id,
-        "run_id": event.run_id,
-        "turn_seq": event.turn_seq,
-        "token_usage": event.token_usage,
-        "llm_model_used": event.llm_model_used,
-        "llm_params": event.llm_params,
-        "reasoning_content": event.reasoning_content,
-    }))
-}
-
-fn tool_turn_event_payload_hash(
-    event: &TurnToolEventRecord,
-    run_id: Option<&str>,
-    tool_call_id: Option<&str>,
-    skill_version: Option<&str>,
-    meta_tool_name: Option<&str>,
-    meta_duration_ms: Option<i32>,
-) -> String {
-    hash_agent_event_payload(serde_json::json!({
-        "event_id": event.event_id,
-        "session_id": event.session_id,
-        "user_id": event.user_id,
-        "agent_id": event.agent_id.as_deref().unwrap_or("astra-cli"),
-        "agent_version": env!("CARGO_PKG_VERSION"),
-        "event_type": event.event_type,
-        "content": event.content,
-        "parent_event_id": event.parent_event_id,
-        "parent_event_ids": event.parent_event_ids,
-        "causal_chain_id": event.causal_chain_id,
-        "run_id": run_id,
-        "tool_call_id": tool_call_id,
-        "metadata": event.metadata,
-        "skill_name": event.skill_name,
-        "skill_version": skill_version,
-        "reasoning_content": event.reasoning_content,
-        "meta_tool_name": meta_tool_name,
-        "meta_duration_ms": meta_duration_ms,
-    }))
-}
-
 pub(crate) fn auxiliary_turn_event_payload_hash(
     event: &TurnAuxiliaryEventRecord,
     meta_tool_name: Option<&str>,
@@ -383,21 +297,6 @@ pub(crate) fn auxiliary_turn_event_payload_hash(
         "meta_tool_name": meta_tool_name,
         "meta_duration_ms": meta_duration_ms,
     }))
-}
-
-fn core_turn_event_insert_values(
-    event: &TurnCoreEventRecord,
-) -> Result<CoreTurnEventInsertValues, sqlx::Error> {
-    let usage = canonical_token_usage_columns(event.token_usage.as_ref())?;
-    Ok(CoreTurnEventInsertValues {
-        payload_hash: core_turn_event_payload_hash(event),
-        turn_seq: event.turn_seq,
-        token_usage_json: persisted_token_usage_json(event.token_usage.as_ref(), usage),
-        llm_params_json: event.llm_params.as_ref().map(serde_json::Value::to_string),
-        token_input: usage.and_then(|usage| usage.input_column()),
-        token_output: usage.and_then(|usage| usage.output_column()),
-        token_total: usage.and_then(|usage| usage.total_column()),
-    })
 }
 
 fn trace_event_insert_values(event: &TraceEvent) -> Result<TraceEventInsertValues, sqlx::Error> {
@@ -550,184 +449,9 @@ pub(crate) async fn insert_trace_events(
     })
 }
 
-pub(crate) async fn insert_core_turn_event(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    event: &TurnCoreEventRecord,
-) -> Result<DurableCaptureOutcome, sqlx::Error> {
-    let values = core_turn_event_insert_values(event)?;
-    let ingestion_write_id = Uuid::new_v4().to_string();
-    let insert_sql = matrixone_statement_with_null_shape(
-        INSERT_CORE_TURN_EVENT_SQL,
-        [
-            event.parent_event_id.is_some(),
-            event.run_id.is_some(),
-            values.turn_seq.is_some(),
-            values.token_usage_json.is_some(),
-            event.llm_model_used.is_some(),
-            values.llm_params_json.is_some(),
-            event.reasoning_content.is_some(),
-            values.token_input.is_some(),
-            values.token_output.is_some(),
-            values.token_total.is_some(),
-        ],
-    );
-    let result = query(&insert_sql)
-        .bind(&event.event_id)
-        .bind(&event.session_id)
-        .bind(&event.user_id)
-        .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
-        .bind(env!("CARGO_PKG_VERSION"))
-        .bind(&event.event_type)
-        .bind(&event.content)
-        .bind(&event.parent_event_id)
-        .bind(&event.causal_chain_id)
-        .bind(&event.run_id)
-        .bind(values.turn_seq)
-        .bind(&values.token_usage_json)
-        .bind(&event.llm_model_used)
-        .bind(&values.llm_params_json)
-        .bind(&event.reasoning_content)
-        .bind(values.token_input)
-        .bind(values.token_output)
-        .bind(values.token_total)
-        .bind(&values.payload_hash)
-        .bind(&ingestion_write_id)
-        .execute(&mut **tx)
-        .await?;
-    let _reported_rows_affected = result.rows_affected();
-    let outcome = classify_agent_event_capture_attempts(
-        tx,
-        &[AgentEventCaptureAttempt {
-            user_id: &event.user_id,
-            session_id: &event.session_id,
-            event_id: &event.event_id,
-            payload_hash: &values.payload_hash,
-        }],
-        &ingestion_write_id,
-        CORE_TURN_EVENT_COLLISION_SOURCE,
-    )
-    .await?
-    .into_iter()
-    .next()
-    .ok_or_else(|| sqlx::Error::Protocol("missing core event capture outcome".to_string()))?;
-    let inserted = outcome == DurableCaptureOutcome::Inserted;
-    if inserted {
-        insert_agent_event_edges(
-            &mut **tx,
-            &event.user_id,
-            &event.session_id,
-            &event.event_id,
-            event.parent_event_id.as_deref(),
-            &event.parent_event_ids,
-        )
-        .await?;
-    }
-    Ok(outcome)
-}
-
-pub(crate) async fn insert_tool_turn_event(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    event: &TurnToolEventRecord,
-    skill_version: Option<&String>,
-) -> Result<bool, sqlx::Error> {
-    let run_id = event
-        .run_id
-        .clone()
-        .or_else(|| metadata_string(event.metadata.as_ref(), "run_id"));
-    let tool_call_id = event
-        .tool_call_id
-        .clone()
-        .or_else(|| metadata_tool_call_id(event.metadata.as_ref()));
-    let metadata_json = event.metadata.as_ref().map(serde_json::Value::to_string);
-    let skill_version = skill_version
-        .cloned()
-        .or_else(|| event.skill_version.clone());
-    let meta_tool_name = metadata_tool_name(event.metadata.as_ref());
-    let meta_duration_ms = metadata_duration_ms(event.metadata.as_ref());
-    let payload_hash = tool_turn_event_payload_hash(
-        event,
-        run_id.as_deref(),
-        tool_call_id.as_deref(),
-        skill_version.as_deref(),
-        meta_tool_name.as_deref(),
-        meta_duration_ms,
-    );
-    let ingestion_write_id = Uuid::new_v4().to_string();
-    let insert_sql = matrixone_statement_with_null_shape(
-        "INSERT IGNORE INTO agent_events \
-         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, run_id, tool_call_id, metadata, skill_name, skill_version, reasoning_content, \
-          meta_tool_name, meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-        [
-            event.parent_event_id.is_some(),
-            run_id.is_some(),
-            tool_call_id.is_some(),
-            metadata_json.is_some(),
-            event.skill_name.is_some(),
-            skill_version.is_some(),
-            event.reasoning_content.is_some(),
-            meta_tool_name.is_some(),
-            meta_duration_ms.is_some(),
-        ],
-    );
-    let result = query(&insert_sql)
-        .bind(&event.event_id)
-        .bind(&event.session_id)
-        .bind(&event.user_id)
-        .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
-        .bind(env!("CARGO_PKG_VERSION"))
-        .bind(&event.event_type)
-        .bind(&event.content)
-        .bind(&event.parent_event_id)
-        .bind(&event.causal_chain_id)
-        .bind(&run_id)
-        .bind(&tool_call_id)
-        .bind(&metadata_json)
-        .bind(&event.skill_name)
-        .bind(&skill_version)
-        .bind(&event.reasoning_content)
-        .bind(&meta_tool_name)
-        .bind(meta_duration_ms)
-        .bind(&payload_hash)
-        .bind(&ingestion_write_id)
-        .execute(&mut **tx)
-        .await?;
-    let _reported_rows_affected = result.rows_affected();
-    let outcome = classify_agent_event_capture_attempts(
-        tx,
-        &[AgentEventCaptureAttempt {
-            user_id: &event.user_id,
-            session_id: &event.session_id,
-            event_id: &event.event_id,
-            payload_hash: &payload_hash,
-        }],
-        &ingestion_write_id,
-        TOOL_TURN_EVENT_COLLISION_SOURCE,
-    )
-    .await?
-    .into_iter()
-    .next()
-    .ok_or_else(|| sqlx::Error::Protocol("missing tool event capture outcome".to_string()))?;
-    let inserted = outcome == DurableCaptureOutcome::Inserted;
-    if inserted {
-        insert_agent_event_edges(
-            &mut **tx,
-            &event.user_id,
-            &event.session_id,
-            &event.event_id,
-            event.parent_event_id.as_deref(),
-            &event.parent_event_ids,
-        )
-        .await?;
-    }
-    Ok(inserted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_string,
         metadata_tool_name, trace_event_insert_values, trace_event_payload_hash,
         unique_trace_event_indices,
     };
@@ -735,7 +459,6 @@ mod tests {
     use astra_services::observation_capture::{
         ObservationPayloadDomain, canonical_observation_payload_hash,
     };
-    use astra_turn_core::contracts::TurnCoreEventRecord;
     use astra_turn_core::trace_event::TraceEvent;
 
     #[tokio::test]
@@ -828,61 +551,16 @@ mod tests {
         pool.close().await;
     }
 
-    #[test]
-    fn core_turn_event_insert_persists_turn_seq() {
-        assert!(
-            INSERT_CORE_TURN_EVENT_SQL.contains(
-                "parent_event_id, causal_chain_id, run_id, turn_seq, token_usage, llm_model_used"
-            ),
-            "core turn events must persist run_id and turn_seq so session traces have durable anchors"
+    fn trace_event_with_token_usage(token_usage: Option<serde_json::Value>) -> TraceEvent {
+        let mut event = TraceEvent::new(
+            "evt-1",
+            "session-1",
+            "user-1",
+            "llm_round_completed",
+            "llm_round",
         );
-        assert_eq!(
-            INSERT_CORE_TURN_EVENT_SQL.matches('?').count(),
-            20,
-            "core turn event insert SQL placeholder count must match its bound values"
-        );
-    }
-
-    #[test]
-    fn metadata_string_trims_empty_values() {
-        assert_eq!(
-            metadata_string(Some(&serde_json::json!({"run_id": " run-1 "})), "run_id").as_deref(),
-            Some("run-1")
-        );
-        assert_eq!(
-            metadata_string(
-                Some(&serde_json::json!({"tool_call_id": "  "})),
-                "tool_call_id"
-            ),
-            None
-        );
-        assert_eq!(
-            metadata_string(
-                Some(&serde_json::json!({"tool_call_id": 7})),
-                "tool_call_id"
-            ),
-            None
-        );
-    }
-
-    fn core_event_with_token_usage(token_usage: Option<serde_json::Value>) -> TurnCoreEventRecord {
-        TurnCoreEventRecord {
-            event_id: "evt-1".to_string(),
-            user_id: "user-1".to_string(),
-            session_id: "session-1".to_string(),
-            run_id: Some("run-1".to_string()),
-            agent_id: None,
-            event_type: "llm_response".to_string(),
-            content: "done".to_string(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "chain-1".to_string(),
-            turn_seq: Some(42),
-            llm_model_used: Some("model-1".to_string()),
-            token_usage,
-            llm_params: Some(serde_json::json!({"temperature": 0.2})),
-            reasoning_content: None,
-        }
+        event.token_usage = token_usage;
+        event
     }
 
     fn canonical_token_usage() -> serde_json::Value {
@@ -902,29 +580,16 @@ mod tests {
             serde_json::json!({"output_tokens":7}),
             serde_json::json!({"input_tokens":null,"output_tokens":7,"total_tokens":null}),
         ] {
-            let event = core_event_with_token_usage(Some(raw.clone()));
-            let core = core_turn_event_insert_values(&event).unwrap();
-            let mut trace = TraceEvent::new(
-                "partial",
-                "session-1",
-                "user-1",
-                "llm_round_completed",
-                "llm_round",
-            );
-            trace.token_usage = Some(raw.clone());
-            let trace = trace_event_insert_values(&trace).unwrap();
-            assert_eq!(core.token_usage_json, trace.token_usage_json);
-            assert_eq!(core.token_input, None);
+            let event = trace_event_with_token_usage(Some(raw.clone()));
+            let trace = trace_event_insert_values(&event).unwrap();
             assert_eq!(trace.token_input, None);
-            assert_eq!(core.token_total, None);
             assert_eq!(trace.token_total, None);
             assert_eq!(
-                core.token_output,
+                trace.token_output,
                 raw.get("output_tokens").and_then(serde_json::Value::as_i64)
             );
-            assert_eq!(trace.token_output, core.token_output);
             let stored: serde_json::Value =
-                serde_json::from_str(core.token_usage_json.as_deref().unwrap()).unwrap();
+                serde_json::from_str(trace.token_usage_json.as_deref().unwrap()).unwrap();
             assert_eq!(stored.get("output_tokens"), raw.get("output_tokens"));
             assert!(stored.get("input_tokens").is_none());
             assert!(stored.get("total_tokens").is_none());
@@ -937,8 +602,8 @@ mod tests {
             "input_tokens":null, "scope":"runtime_accounted_usage", "source":"provider",
             "prompt":99, "cache_read":98, "total":100, "prompt_cache_hit_ratio":0.98,
         });
-        let event = core_event_with_token_usage(Some(raw));
-        let values = core_turn_event_insert_values(&event).unwrap();
+        let event = trace_event_with_token_usage(Some(raw));
+        let values = trace_event_insert_values(&event).unwrap();
         assert_eq!(
             (values.token_input, values.token_output, values.token_total),
             (None, None, None)
@@ -951,53 +616,9 @@ mod tests {
         );
         let usage = astra_turn_types::CanonicalTokenUsage::from_json(&persisted).unwrap();
         assert_eq!(usage.to_json(), serde_json::json!({}));
-        let replay = core_event_with_token_usage(Some(persisted));
-        let replay = core_turn_event_insert_values(&replay).unwrap();
+        let replay = trace_event_with_token_usage(Some(persisted));
+        let replay = trace_event_insert_values(&replay).unwrap();
         assert_eq!(values.token_usage_json, replay.token_usage_json);
-    }
-
-    #[test]
-    fn core_turn_event_insert_values_preserve_turn_seq_and_token_columns() {
-        let event = core_event_with_token_usage(Some(canonical_token_usage()));
-
-        let values = core_turn_event_insert_values(&event).expect("canonical token usage");
-
-        assert_eq!(values.turn_seq, Some(42));
-        assert_eq!(values.token_input, Some(17));
-        assert_eq!(values.token_output, Some(5));
-        assert_eq!(values.token_total, Some(22));
-        assert!(
-            values
-                .token_usage_json
-                .as_deref()
-                .is_some_and(|json| json.contains("\"input_tokens\":10"))
-        );
-        let persisted: serde_json::Value =
-            serde_json::from_str(values.token_usage_json.as_deref().unwrap()).unwrap();
-        assert!(
-            persisted.get("prompt").is_none(),
-            "canonical serialization omits redundant aliases"
-        );
-        assert!(
-            persisted.get("completion").is_none(),
-            "canonical serialization omits redundant aliases"
-        );
-        assert!(
-            persisted.get("cache_read").is_none(),
-            "canonical serialization omits redundant aliases"
-        );
-        assert!(
-            persisted.get("cache_write").is_none(),
-            "canonical serialization omits redundant aliases"
-        );
-        assert!(
-            persisted.get("total").is_none(),
-            "canonical serialization omits redundant aliases"
-        );
-        assert_eq!(
-            values.llm_params_json.as_deref(),
-            Some("{\"temperature\":0.2}")
-        );
     }
 
     #[test]
@@ -1155,28 +776,28 @@ mod tests {
 
     #[test]
     fn token_usage_columns_fail_loudly_on_noncanonical_usage() {
-        let missing_field = core_event_with_token_usage(Some(serde_json::json!({
+        let missing_field = trace_event_with_token_usage(Some(serde_json::json!({
             "cached_input_tokens": 0,
             "cache_creation_tokens": 0,
             "output_tokens": 5,
             "total_tokens": 5,
         })));
-        let err = core_turn_event_insert_values(&missing_field)
+        let err = trace_event_insert_values(&missing_field)
             .expect_err("missing canonical field must fail");
         assert!(
             err.to_string().contains("input_tokens"),
             "error should identify missing canonical field: {err}"
         );
 
-        let mismatched_total = core_event_with_token_usage(Some(serde_json::json!({
+        let mismatched_total = trace_event_with_token_usage(Some(serde_json::json!({
             "input_tokens": 10,
             "cached_input_tokens": 4,
             "cache_creation_tokens": 3,
             "output_tokens": 5,
             "total_tokens": 21,
         })));
-        let err = core_turn_event_insert_values(&mismatched_total)
-            .expect_err("mismatched total must fail");
+        let err =
+            trace_event_insert_values(&mismatched_total).expect_err("mismatched total must fail");
         assert!(
             err.to_string().contains("total_tokens mismatch"),
             "error should identify total mismatch: {err}"
@@ -1224,30 +845,5 @@ pub(crate) async fn insert_turn_skill_selection(
     .bind(record.execution_time_ms)
     .execute(&mut **tx)
     .await?;
-    Ok(())
-}
-
-pub(crate) async fn update_snapshot_llm_ids(
-    pool: &sqlx::Pool<MySql>,
-    plan: &SnapshotLinkPlan,
-) -> Result<(), sqlx::Error> {
-    for _ in 0..5 {
-        let rows_affected = query(
-            "UPDATE ctx_snapshots \
-             SET llm_request_id = ?, llm_response_id = COALESCE(?, llm_response_id) \
-             WHERE context_capture_id = ? AND user_id = ?",
-        )
-        .bind(&plan.llm_request_id)
-        .bind(&plan.llm_response_id)
-        .bind(&plan.context_capture_id)
-        .bind(&plan.user_id)
-        .execute(pool)
-        .await?
-        .rows_affected();
-        if rows_affected > 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     Ok(())
 }

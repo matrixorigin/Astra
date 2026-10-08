@@ -25,6 +25,21 @@ pub(crate) fn install_injected_tool_schema(
         return false;
     }
 
+    let mut provider_schemas =
+        executor.provider_owned_schemas_snapshot("injected_tool_publication");
+    provider_schemas.retain(|schema| {
+        !tool_schema_name(schema).is_some_and(astra_runtime_env::is_mcp_namespaced_tool_name)
+    });
+    if let Some(existing) = provider_schemas
+        .iter_mut()
+        .find(|item| tool_schema_name(item) == Some(name.as_str()))
+    {
+        *existing = schema.clone();
+    } else {
+        provider_schemas.push(schema.clone());
+    }
+    executor.set_cli_local_provider_schemas(provider_schemas);
+
     valid_tool_names.insert(name.clone());
     if let Some(registry) = registry {
         registry.upsert_schema(schema.clone());
@@ -62,8 +77,8 @@ mod tests {
         (dir, executor)
     }
 
-    #[test]
-    fn install_injected_tool_schema_accepts_runtime_bound_skill() {
+    #[tokio::test]
+    async fn install_injected_tool_schema_accepts_runtime_bound_skill() {
         let (_dir, executor) = test_executor();
         let mut all_schemas = Vec::new();
         let mut valid_tool_names = HashSet::new();
@@ -71,7 +86,7 @@ mod tests {
 
         let accepted = install_injected_tool_schema(
             &executor,
-            astra_runtime::turn::skill_tool::skill_tool_schema_v2(),
+            astra_tools::schemas::skill_tool_schema(),
             &mut all_schemas,
             &mut valid_tool_names,
             Some(&mut registry),
@@ -82,6 +97,22 @@ mod tests {
         assert_eq!(all_schemas.len(), 1);
         assert_eq!(tool_schema_name(&all_schemas[0]), Some("skill"));
         assert!(registry.schema_by_name("skill").is_some());
+        let query = json!({"query":"select:discover_skills"});
+        let before = executor.execute("tool_search", &query).await;
+        let before: Value = serde_json::from_str(&before).unwrap();
+        assert!(before["matches"].as_array().unwrap().is_empty());
+        assert!(install_injected_tool_schema(
+            &executor,
+            astra_tools::schemas::discover_skills_tool_schema(),
+            &mut all_schemas,
+            &mut valid_tool_names,
+            Some(&mut registry),
+        ));
+        let after = executor.execute("tool_search", &query).await;
+        let after: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after["matches"][0]["name"], "discover_skills");
+        assert!(after["matches"][0].get("parameters").is_some());
+        assert!(after["missing"].as_array().unwrap().is_empty());
     }
 
     #[test]

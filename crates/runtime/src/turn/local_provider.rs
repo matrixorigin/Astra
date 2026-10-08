@@ -1,26 +1,14 @@
 //! `LocalSessionProvider` — a single concrete struct that implements
-//! [`LiveRuntimeProvider`], [`ObservationProvider`], and [`SessionStateProvider`]
+//! [`LiveRuntimeProvider`] and [`SessionStateProvider`]
 //! by reading from an [`AgenticLoopState`] reference.
 //!
 //! # Safety
 //!
-//! All methods are panic-free. When underlying data is absent (empty journal,
-//! missing task board, unlimited budget), they return sensible zero/defaults.
+//! All methods are panic-free. Missing measurements retain their explicit
+//! unknown state instead of fabricating ratios.
 //!
-//! # Usage
-//!
-//! ```ignore
-//! let provider = LocalSessionProvider::new(&state);
-//! let mut facts = provider.extract_facts();
-//! facts.token_pressure = provider.token_pressure();
-//! facts.performance.token_pressure = provider.token_pressure();
-//! let actions = policy.decide(&facts);
-//! ```
-
-use astra_core::observation_journal::{JournalFacts, MetricTrend};
-
 use super::agentic_loop::host::{self, AgenticLoopState};
-use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
+use super::providers::{LiveRuntimeProvider, SessionStateProvider};
 
 // ─── LocalSessionProvider ────────────────────────────────────────────────────
 
@@ -73,29 +61,6 @@ impl LiveRuntimeProvider for LocalSessionProvider<'_> {
     }
 }
 
-// ─── ObservationProvider impl ────────────────────────────────────────────────
-
-impl ObservationProvider for LocalSessionProvider<'_> {
-    fn extract_facts(&self) -> JournalFacts {
-        self.state.observation_journal.extract_facts(
-            self.state.remaining_turns as u32,
-            self.state.max_turns as u32,
-        )
-    }
-
-    fn compute_trends(&self) -> Vec<MetricTrend> {
-        self.state.observation_journal.compute_trends()
-    }
-
-    fn journal_len(&self) -> usize {
-        self.state.observation_journal.len()
-    }
-
-    fn journal_is_empty(&self) -> bool {
-        self.state.observation_journal.is_empty()
-    }
-}
-
 // ─── SessionStateProvider impl ───────────────────────────────────────────────
 
 impl SessionStateProvider for LocalSessionProvider<'_> {
@@ -122,8 +87,6 @@ impl SessionStateProvider for LocalSessionProvider<'_> {
 mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::AgenticLoopState;
-    use crate::turn::runtime_policy::RuntimePolicy;
-    use astra_core::observation_journal::ObservationJournal;
 
     fn make_state() -> AgenticLoopState {
         let mut state = host::make_test_loop_state();
@@ -194,39 +157,6 @@ mod tests {
         assert_eq!(p.cache_hit_ratio(), Some(0.0));
     }
 
-    // ── ObservationProvider tests ───────────────────────────────────────
-
-    #[test]
-    fn observation_provider_empty_journal() {
-        let state = make_state();
-        let p = make_provider(&state);
-        assert!(p.journal_is_empty());
-        assert_eq!(p.journal_len(), 0);
-        let facts = p.extract_facts();
-        // All streaks should be zero for empty journal
-        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
-    }
-
-    #[test]
-    fn observation_provider_with_entries() {
-        let mut state = make_state();
-        // Record a successful turn to populate the journal
-        let metrics = astra_core::observation::TurnMetrics {
-            rounds_completed: 1,
-            tool_calls_total: 5,
-            mutation_count: 2,
-            error_count: 0,
-            cache_hits: 3,
-            tokens_consumed: 1500,
-            ..Default::default()
-        };
-        state.observation_journal.record_turn(&metrics);
-        let p = make_provider(&state);
-        assert!(!p.journal_is_empty());
-        assert_eq!(p.journal_len(), 1);
-    }
-
     // ── SessionStateProvider tests ──────────────────────────────────────
 
     #[test]
@@ -252,10 +182,8 @@ mod tests {
     fn provider_composition_smoke() {
         let state = make_state();
         let p = make_provider(&state);
-        // All three traits work together without conflict
+        // Live observations and session state share the same execution owner
         let _pressure = p.token_pressure();
-        let _facts = p.extract_facts();
-        let _trends = p.compute_trends();
         let _cache = p.cache_hit_ratio();
         let _errors = p.current_error_rate();
     }

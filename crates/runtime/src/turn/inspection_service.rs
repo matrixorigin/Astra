@@ -22,7 +22,7 @@
 //!
 //! `InspectionService` does NOT own the providers — it borrows them. This keeps
 //! it allocation-free on the hot path and allows the same provider instances to
-//! be shared with `RuntimePolicy::decide()` and `execution_phase`.
+//! be shared with the canonical feedback evaluator and `execution_phase`.
 
 use astra_core::ObservationFacet;
 use astra_turn_core::introspect::{
@@ -257,7 +257,6 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::{self, AgenticLoopState};
     use crate::turn::local_provider::LocalSessionProvider;
-    use crate::turn::runtime_policy::RuntimePolicy;
     use astra_turn_core::introspect::IntrospectSnapshot;
 
     fn sample_frame(

@@ -56,9 +56,9 @@ pub struct JournalToolCall {
     pub ok: Option<bool>,
     pub arguments: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
-    /// Executor-authored failure evidence. A failed invocation has no
-    /// successful `result`; keeping its error separately prevents criteria
-    /// and judges from confusing an execution failure with a tool result.
+    /// Executor-authored failure preview. The complete failed body, when
+    /// available, remains in `result`; otherwise this is the retained failure
+    /// evidence. `ok` distinguishes it from a successful observation.
     pub error: Option<serde_json::Value>,
     pub result_artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
 }
@@ -643,7 +643,7 @@ impl SessionCapture {
             else {
                 continue;
             };
-            for record in records {
+            for (position, record) in records.iter().enumerate() {
                 let Some(name) = record.get("name").and_then(|value| value.as_str()) else {
                     continue;
                 };
@@ -675,20 +675,42 @@ impl SessionCapture {
                             .entry(identity.clone())
                             .or_default()
                             .entry((turn, round))
-                            .or_insert((None, None));
+                            .or_insert_with(|| (None, None, std::collections::BTreeSet::new()));
                         if batch.is_some() {
                             occurrence.0 = batch;
                         }
                         if parallel.is_some() {
                             occurrence.1 = parallel;
                         }
+                        if event.event_type == "llm_round"
+                            && event_run_id(&event.raw).is_some()
+                            && event.raw.get("round").and_then(serde_json::Value::as_u64)
+                                == Some(u64::from(round))
+                        {
+                            occurrence.2.insert(position);
+                        }
                     }
                     if let Some(index) = seen_ids.get(&identity) {
                         // A terminal turn can precede its full round record in
                         // the authorized union. Preserve the verified artifact
-                        // authority without duplicating or reordering the call.
+                        // authority without duplicating the call. Its unique
+                        // round occurrence determines canonical order below.
                         if calls[*index].result_artifact.is_none() {
                             calls[*index].result_artifact = result_artifact;
+                        }
+                        for field in [
+                            "work_attribution",
+                            "disposition",
+                            "error_kind",
+                            "pre_dispatch_rejection",
+                            "exit_semantics",
+                            "result_class",
+                        ] {
+                            if calls[*index].runtime_metadata[field].is_null()
+                                && let Some(value) = record.get(field)
+                            {
+                                calls[*index].runtime_metadata[field] = value.clone();
+                            }
                         }
                         continue;
                     }
@@ -696,9 +718,11 @@ impl SessionCapture {
                 }
                 calls.push(JournalToolCall {
                     runtime_metadata: serde_json::json!({
+                        "work_attribution": record.get("work_attribution"),
                         "error_kind": record.get("error_kind"),
                         "disposition": record.get("disposition"),
                         "pre_dispatch_rejection": record.get("pre_dispatch_rejection"),
+                        "exit_semantics": record.get("exit_semantics"),
                         // Keep the legacy fields needed to reproduce the
                         // canonical ToolCallRecord::effective_disposition
                         // when older journals omitted an explicit
@@ -738,6 +762,7 @@ impl SessionCapture {
                 });
             }
         }
+        let mut canonical_order = vec![None; calls.len()];
         for (identity, index) in seen_ids {
             let call = &mut calls[index];
             // A logical invocation may be replayed in another round. Only a
@@ -753,14 +778,44 @@ impl SessionCapture {
                 && known.len() == 1
                 && known_turns.is_some_and(|turns| turns.len() == 1)
             {
-                let (&(turn, round), (batch, parallel)) = known.first_key_value().unwrap();
+                let (&(turn, round), (batch, parallel, positions)) =
+                    known.first_key_value().unwrap();
                 call.turn = Some(turn);
                 call.round = Some(round);
                 call.batch_id = batch.clone();
                 call.parallel = *parallel;
+                if positions.len() == 1 {
+                    canonical_order[index] = Some((turn, round, *positions.first().unwrap()));
+                }
             }
         }
-        calls
+        // A terminal aggregate may arrive before its producer's round records.
+        // Only unique round evidence orders invocations. Unknown occurrences
+        // and different runs remain boundaries; their timestamps establish no
+        // relative execution order.
+        let mut calls: Vec<_> = calls.into_iter().zip(canonical_order).collect();
+        let mut start = 0;
+        while start < calls.len() {
+            let Some(run_id) = calls[start]
+                .0
+                .run_id
+                .as_deref()
+                .filter(|_| calls[start].1.is_some())
+            else {
+                start += 1;
+                continue;
+            };
+            let end = start
+                + calls[start..]
+                    .iter()
+                    .take_while(|(call, order)| {
+                        call.run_id.as_deref() == Some(run_id) && order.is_some()
+                    })
+                    .count();
+            calls[start..end].sort_by_key(|(_, order)| *order);
+            start = end;
+        }
+        calls.into_iter().map(|(call, _)| call).collect()
     }
 
     /// Bounded durable evidence supplied to an LLM judger. The journal stays
@@ -1251,7 +1306,8 @@ fn tool_occurrence(
 }
 
 fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
-    let mut seen = std::collections::HashMap::<String, (String, Option<&serde_json::Value>)>::new();
+    let mut seen =
+        std::collections::HashMap::<String, (String, [Option<&serde_json::Value>; 7])>::new();
     let mut occurrences = std::collections::HashMap::<_, (Option<String>, Option<bool>)>::new();
     for event in events {
         if event.event_type != "turn" && event.event_type != "llm_round" {
@@ -1276,14 +1332,20 @@ fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
             let Some(name) = record.get("name").and_then(|value| value.as_str()) else {
                 return true;
             };
+            let result = embedded_json(record.get("result_full").or_else(|| record.get("result")));
+            // `error` is a bounded presentation of either the body or its
+            // artifact reference. Materialization already verified any
+            // external body. Compare that complete failure rather than two
+            // legitimate previews; error-only evidence stays strict.
+            let complete_failure = record.get("ok").and_then(serde_json::Value::as_bool)
+                == Some(false)
+                && result.as_ref().is_some_and(|result| !result.is_null());
             let fingerprint = serde_json::to_string(&serde_json::json!({
                 "name": name,
                 "ok": record.get("ok"),
                 "arguments": embedded_json(record.get("args_full").or_else(|| record.get("args"))),
-                "result": embedded_json(
-                    record.get("result_full").or_else(|| record.get("result")),
-                ),
-                "error": record.get("error"),
+                "result": result,
+                "error": (!complete_failure).then(|| record.get("error")).flatten(),
             }))
             .unwrap_or_default();
             let identity = nested_tool_identity(event, call_id);
@@ -1303,20 +1365,32 @@ fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
                     previous.1 = parallel;
                 }
             }
-            let descriptor = record.get("result_artifact");
-            let retained_descriptor = if let Some((existing, previous_descriptor)) =
-                seen.get(&identity)
-            {
+            // Authorized projections may omit retained facts, but two
+            // explicit values for one invocation identity must agree.
+            let descriptors = [
+                "result_artifact",
+                "work_attribution",
+                "disposition",
+                "error_kind",
+                "pre_dispatch_rejection",
+                "exit_semantics",
+                "result_class",
+            ]
+            .map(|field| record.get(field).filter(|value| !value.is_null()));
+            let retained = if let Some((existing, previous)) = seen.get(&identity) {
                 if existing != &fingerprint
-                    || matches!((previous_descriptor, descriptor), (Some(previous), Some(current)) if *previous != current)
+                    || previous
+                        .iter()
+                        .zip(descriptors.iter())
+                        .any(|(a, b)| matches!((a, b), (Some(a), Some(b)) if a != b))
                 {
                     return true;
                 }
-                descriptor.or(*previous_descriptor)
+                std::array::from_fn(|index| descriptors[index].or(previous[index]))
             } else {
-                descriptor
+                descriptors
             };
-            seen.insert(identity, (fingerprint, retained_descriptor));
+            seen.insert(identity, (fingerprint, retained));
         }
     }
     false
@@ -2093,6 +2167,134 @@ mod tests {
         let missing = load_session_from_path(session_id, &journal).expect("capture");
         assert!(missing.has_integrity_errors());
         assert!(missing.journal_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn persisted_failure_mirrors_compare_full_body_and_typed_facts_not_error_previews() {
+        let dir = tempdir().unwrap();
+        let session_id = "failed-mirror";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let args = serde_json::json!({"command":"probe"});
+        let cli = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
+            &astra_turn_core::sse_stream_host::EdgeToolExecResult {
+                work_attribution: Some(astra_services::runs::WorkInvocationAttribution::Unbound),
+                execution_completion: None,
+                request_id: "failed-call".into(),
+                tool: "bash".into(),
+                args: args.clone(),
+                output: format!("{}failure-tail", "tool failed: ".repeat(3000)),
+                tool_result_fields: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "error_kind":"unknown", "exit_semantics":"execution_error",
+                        "result_class":"execution_error"
+                    }))
+                    .unwrap(),
+                ),
+                status: "failed".into(),
+                duration_ms: 1,
+            },
+        );
+        let full = cli.result_full.as_ref().unwrap();
+        assert!(full.len() > 32_000);
+        let persisted =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                &session_dir,
+                "failed-run",
+                "failed-call",
+                "bash",
+                full,
+            )
+            .unwrap();
+        let mut server = astra_turn_core::headless_tool_journal::journal_record_executed_tool_call(
+            "bash".into(),
+            true,
+            1,
+            args.to_string().len() as u32,
+            &persisted.replacement,
+            None,
+            None,
+            Some(args.to_string()),
+        );
+        server.tool_call_id = cli.tool_call_id.clone();
+        server.result_artifact = Some(persisted.descriptor.clone());
+        server.work_attribution = cli.work_attribution.clone();
+        server.error_kind = cli.error_kind;
+        server.exit_semantics = cli.exit_semantics.clone();
+        server.result_class = cli.result_class.clone();
+        assert_ne!(cli.error, server.error);
+        let event = |kind: &str, record: &astra_services::session_journal::ToolCallRecord| {
+            serde_json::json!({"type":kind,"ts":"2026-08-09T00:00:00Z",
+                "session_id":session_id,"turn":1,"round":0,
+                "producer_scope":{"run_id":"failed-run"}, "tool_calls":[record]})
+        };
+        let cli = event("turn", &cli);
+        let server = event("llm_round", &server);
+        let journal = dir.path().join(format!("{session_id}.jsonl"));
+        for reverse in [false, true] {
+            let events = if reverse {
+                [&server, &cli]
+            } else {
+                [&cli, &server]
+            };
+            std::fs::write(&journal, format!("{}\n{}\n", events[0], events[1])).unwrap();
+            let capture = load_session_from_path(session_id, &journal).unwrap();
+            assert!(!capture.has_integrity_errors());
+            let calls = capture.journal_tool_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].ok, Some(false));
+            assert_eq!(
+                calls[0].result,
+                Some(serde_json::Value::String(full.clone()))
+            );
+            assert_eq!(
+                calls[0].result_artifact.as_ref(),
+                Some(&persisted.descriptor)
+            );
+            assert_eq!(calls[0].runtime_metadata["error_kind"], "unknown");
+            let evidence: serde_json::Value =
+                serde_json::from_str(&capture.render_tool_evidence(full.len() + 5000)).unwrap();
+            assert_eq!(evidence["calls"][0]["result"], full.as_str());
+            assert_eq!(evidence["calls"][0]["ok"], false);
+            assert_eq!(evidence["content_omitted"], false);
+        }
+        for (side, field, value) in [
+            (
+                0,
+                "result_full",
+                serde_json::json!("different full failure"),
+            ),
+            (1, "ok", serde_json::json!(true)),
+            (
+                1,
+                "work_attribution",
+                serde_json::json!({"state":"control"}),
+            ),
+            (1, "disposition", serde_json::json!("rejected")),
+            (
+                1,
+                "error_kind",
+                serde_json::to_value(astra_core::ErrorKind::ContractViolation).unwrap(),
+            ),
+            (1, "exit_semantics", serde_json::json!("domain_negative")),
+            (1, "result_class", serde_json::json!("domain_negative")),
+        ] {
+            let mut events = [cli.clone(), server.clone()];
+            events[side]["tool_calls"][0][field] = value;
+            std::fs::write(&journal, format!("{}\n{}\n", events[0], events[1])).unwrap();
+            let capture = load_session_from_path(session_id, &journal).unwrap();
+            assert!(capture.has_integrity_errors(), "{field}");
+            assert!(capture.journal_tool_calls().is_empty(), "{field}");
+        }
+        let mut invalid_artifact = server;
+        invalid_artifact["tool_calls"][0]["result_artifact"]["content_sha256"] =
+            serde_json::json!("0".repeat(64));
+        std::fs::write(&journal, format!("{cli}\n{invalid_artifact}\n")).unwrap();
+        assert!(
+            load_session_from_path(session_id, &journal)
+                .unwrap()
+                .has_integrity_errors()
+        );
     }
 
     #[test]
@@ -3423,6 +3625,120 @@ mod tests {
             super::load_session_for_owners(session_id, &owners).expect("conflicting capture");
         assert!(conflicting.has_integrity_errors());
         assert!(conflicting.journal_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn same_invocation_cannot_change_frozen_work_attribution() {
+        let event = |scope| JournalEvent {
+            event_type: "turn".into(),
+            raw: serde_json::json!({"producer_scope":{"run_id":"run"}, "tool_calls":[{
+                "tool_call_id":"call", "name":"read_file", "ok":true,
+                "disposition":"executed", "work_attribution":scope
+            }]}),
+        };
+        let first = event(serde_json::json!({"state":"unbound"}));
+        let mut capture = SessionCapture {
+            events: vec![first.clone(), first],
+            ..Default::default()
+        };
+        assert!(!capture.has_integrity_errors());
+        assert_eq!(capture.journal_tool_calls().len(), 1);
+        for reverse in [false, true] {
+            let mut partial = capture.clone();
+            partial.events[0].raw["tool_calls"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("work_attribution");
+            if reverse {
+                partial.events.reverse();
+            }
+            assert!(!partial.has_integrity_errors());
+            assert_eq!(
+                partial.journal_tool_calls()[0].runtime_metadata["work_attribution"],
+                serde_json::json!({"state":"unbound"})
+            );
+        }
+        let round = |name: &str, call_id: &str, round: u32| JournalEvent {
+            event_type: "llm_round".into(),
+            raw: serde_json::json!({
+                "producer_scope":{"run_id":"run"}, "turn":1, "round":round,
+                "tool_calls":[{
+                    "tool_call_id":call_id, "name":name, "ok":true,
+                    "disposition":"executed", "work_attribution":{"state":"unbound"}
+                }]
+            }),
+        };
+        let start = round("start_work", "start", 0);
+        let ordinary = round("read_file", "call", 1);
+        let settle = round("settle_work_item", "settle", 2);
+        let mut aggregate = ordinary.clone();
+        aggregate.event_type = "turn".into();
+        aggregate.raw.as_object_mut().unwrap().remove("round");
+        for field in ["work_attribution", "disposition"] {
+            aggregate.raw["tool_calls"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        let ordered = SessionCapture {
+            events: vec![aggregate, start, ordinary, settle],
+            ..Default::default()
+        };
+        let names = |capture: &SessionCapture| {
+            capture
+                .journal_tool_calls()
+                .into_iter()
+                .map(|call| call.name)
+                .collect::<Vec<_>>()
+        };
+        assert!(!ordered.has_integrity_errors());
+        assert_eq!(
+            names(&ordered),
+            ["start_work", "read_file", "settle_work_item"]
+        );
+        let calls = ordered.journal_tool_calls();
+        assert_eq!(calls[1].round, Some(1));
+        assert_eq!(
+            calls[1].runtime_metadata["work_attribution"],
+            serde_json::json!({"state":"unbound"})
+        );
+        assert_eq!(calls[1].runtime_metadata["disposition"], "executed");
+
+        // The canonical occurrence, rather than tool names or arrival time,
+        // decides order. Execution before genesis must remain visible.
+        let mut before_claim = ordered.clone();
+        before_claim.events[1].raw["round"] = 1.into();
+        before_claim.events[2].raw["round"] = 0.into();
+        assert_eq!(
+            names(&before_claim),
+            ["read_file", "start_work", "settle_work_item"]
+        );
+        for replay in [false, true] {
+            let mut ambiguous = ordered.clone();
+            if replay {
+                let mut later = ambiguous.events[2].clone();
+                later.raw["round"] = 3.into();
+                ambiguous.events.push(later);
+            } else {
+                ambiguous.events.remove(2);
+            }
+            let calls = ambiguous.journal_tool_calls();
+            assert_eq!(calls[0].name, "read_file");
+            assert_eq!(calls[0].round, None);
+            assert_eq!(calls[0].batch_id, None);
+            assert_eq!(calls[0].parallel, None);
+        }
+        let mut cross_run = ordered.clone();
+        let mut other_run = round("list_dir", "other", 0);
+        other_run.raw["producer_scope"]["run_id"] = "other-run".into();
+        cross_run.events.insert(1, other_run);
+        assert_eq!(
+            names(&cross_run),
+            ["read_file", "list_dir", "start_work", "settle_work_item"]
+        );
+        capture.events[1] = event(serde_json::json!({"state":"control"}));
+        assert!(capture.has_integrity_errors());
+        assert!(capture.journal_tool_calls().is_empty());
     }
 
     #[test]

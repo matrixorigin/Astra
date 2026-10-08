@@ -7150,6 +7150,105 @@ pub(crate) mod tests {
             assert!(second_slot["result_end_offset"].as_u64().unwrap() > 65_536);
             assert_eq!(second_slot["result_truncated"], true);
             assert!(second_slot.get("next_call").is_none());
+
+            // Evaluate actual producer receipts, including the aggregate
+            // preview that deliberately consumes no pagination bytes.
+            use astra_test_harness::{
+                criteria::{Criterion, evaluate_deterministic_with_session},
+                runner::RunOutcome,
+                session_capture::{JournalEvent, SessionCapture},
+            };
+            let started: Value = serde_json::from_str(&start).unwrap();
+            let mut capture = SessionCapture::default();
+            for agent in started["agents"].as_array().unwrap() {
+                capture.events.push(JournalEvent {
+                    event_type: "agent_spawned".into(),
+                    raw: json!({"metadata":{
+                        "run_id":agent["run_id"],"agent_id":agent["agent_id"],
+                        "parent_run_id":ctx.run_id,
+                        "fanout_slot":{"group_id":"review-explicit-pages","slot_index":agent["slot_index"]}
+                    }}),
+                });
+                capture.events.push(JournalEvent {
+                    event_type: "agent_terminated".into(),
+                    raw: json!({"metadata":{
+                        "run_id":agent["run_id"],"agent_id":agent["agent_id"],"status":"completed"
+                    }}),
+                });
+            }
+            for (round, args, receipt) in [
+                (1, json!({"action":"start","target_count":2}), started),
+                (
+                    2,
+                    json!({"action":"get_results","group_id":"review-explicit-pages"}),
+                    aggregate,
+                ),
+                (
+                    3,
+                    json!({"action":"get_results","group_id":"review-explicit-pages","slot_index":0,"offset":0}),
+                    first,
+                ),
+                (
+                    4,
+                    json!({"action":"get_results","group_id":"review-explicit-pages","slot_index":0,"offset":65_536}),
+                    second,
+                ),
+            ] {
+                capture.events.push(JournalEvent {
+                    event_type:"llm_round".into(),
+                    raw:json!({"turn":1,"round":round,"producer_scope":{"run_id":ctx.run_id},"tool_calls":[{
+                        "name":"agent_fanout","tool_call_id":format!("read-{round}"),"ok":true,
+                        "args_full":args.to_string(),"result_full":receipt.to_string()
+                    }]}),
+                });
+            }
+            capture.events.push(JournalEvent {
+                event_type: "trace_span".into(),
+                raw: json!({"metadata":{"attrs":{
+                    "parent_run_id":ctx.run_id,"outcome":"finalization_accepted","round_index":"5"
+                }}}),
+            });
+            let criterion: Criterion = serde_json::from_value(json!({
+                "type":"session_child_result_adopted","allow_get_result":true,
+                "spawn_match":{"path":"/metadata/fanout_slot/slot_index","equals":0}
+            }))
+            .unwrap();
+            let check = |capture: &SessionCapture| {
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(&criterion),
+                    &RunOutcome::default(),
+                    Some(capture),
+                )[0]
+                .passed
+            };
+            assert!(
+                check(&capture),
+                "aggregate preview must not poison complete slot reads"
+            );
+            let mut incomplete = capture.clone();
+            incomplete.events.remove(6); // First consumed slot page.
+            assert!(
+                !check(&incomplete),
+                "preview cannot supply the missing first page"
+            );
+            let mut wrong_total = capture.clone();
+            let raw = &mut wrong_total.events[5].raw["tool_calls"][0]["result_full"];
+            let mut preview: Value = serde_json::from_str(raw.as_str().unwrap()).unwrap();
+            preview["results"][0]["result_bytes"] = json!(65_545);
+            *raw = json!(preview.to_string());
+            assert!(
+                !check(&wrong_total),
+                "preview must retain the same immutable total length"
+            );
+            let mut malformed = capture;
+            let raw = &mut malformed.events[5].raw["tool_calls"][0]["result_full"];
+            let mut preview: Value = serde_json::from_str(raw.as_str().unwrap()).unwrap();
+            preview["result_read"]["slot_index"] = json!(0);
+            *raw = json!(preview.to_string());
+            assert!(
+                !check(&malformed),
+                "a slot page cannot claim unconsumed preview bytes"
+            );
         }
     }
 

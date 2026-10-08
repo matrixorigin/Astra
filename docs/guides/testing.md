@@ -337,8 +337,15 @@ ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
 ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
 RUST_MIN_STACK=16777216 \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- \
-  --ignored --nocapture
+  --ignored --nocapture --test-threads=1
 ```
+
+Run journeys sharing a database serially: every Server bootstrap performs
+startup recovery and can fence another fixture's live execution under the same
+process owner. Parallel journeys require separate databases, not just distinct
+users or sessions. The Phase-0 production baseline journeys have additional
+exclusive-run configuration; see their dedicated instructions before enabling
+them.
 
 Requires the same environment as `astra-server`: `MATRIXONE_*`,
 `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding

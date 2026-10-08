@@ -735,7 +735,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     // Astra deliberately supports long, iterative work. A high round count
     // must never become a quality verdict by itself; require an independent,
     // typed low-yield fact such as repeated reads/validation or an exploration
-    // streak. This mirrors RuntimePolicy's online rule and avoids teaching the
+    // streak. This mirrors the canonical behavioral-feedback rule and avoids teaching the
     // agent to stop merely because useful work takes time.
     if eval.signals.iter().any(is_strong_low_yield_signal)
         && let Some(rounds) = telemetry

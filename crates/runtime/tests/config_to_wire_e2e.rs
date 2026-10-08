@@ -12,9 +12,7 @@ use serde_json::Value;
 use std::io::Write;
 
 fn catalog_schemas() -> Vec<Value> {
-    let mut schemas = astra_tools::schemas::all_tool_schemas();
-    schemas.push(astra_runtime::turn::skill_tool::skill_tool_schema_v2());
-    schemas
+    astra_tools::schemas::all_tool_schemas()
 }
 
 fn names(schemas: &[Value]) -> Vec<String> {

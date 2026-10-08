@@ -67,8 +67,7 @@ pub fn default_always_load_names() -> &'static [String] {
 }
 
 fn canonical_builtin_surface_schema_names() -> std::collections::BTreeSet<String> {
-    let mut schemas = astra_tools::schemas::all_tool_schemas();
-    schemas.push(crate::turn::skill_tool::skill_tool_schema_v2());
+    let schemas = astra_tools::schemas::all_tool_schemas();
     schemas
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))

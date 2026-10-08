@@ -831,18 +831,17 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         // The model produced output but the API cut it off at max_tokens.
         // Append a visible marker so the user sees the text is incomplete.
         // Skip exploration tasks (they tolerate truncation naturally).
-        if !state.task_profile.exploratory_task {
-            let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
-            let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-            if let Some(marker) = policy.truncation_marker(state.last_finish_reason.as_deref()) {
-                state.final_text.push_str("\n\n");
-                state.final_text.push_str(marker);
-                state.final_text_streamed = false;
-                tracing::info!(
-                    finish_reason = "length",
-                    "ensure_terminal_text: appended truncation marker"
-                );
-            }
+        if !state.task_profile.exploratory_task
+            && state.last_finish_reason.as_deref() == Some("length")
+        {
+            state
+                .final_text
+                .push_str("\n\n[truncated — output cut off by token limit]");
+            state.final_text_streamed = false;
+            tracing::info!(
+                finish_reason = "length",
+                "ensure_terminal_text: appended truncation marker"
+            );
         }
         return;
     }
@@ -1093,6 +1092,30 @@ mod tests {
             ExecutorBinding::server_local(),
         );
         state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
+    }
+
+    #[test]
+    fn terminal_truncation_marker_preserves_exploration_and_natural_completion() {
+        for exploratory in [false, true] {
+            for finish_reason in [Some("length"), Some("stop"), Some("tool_calls"), None] {
+                let mut state = make_state();
+                state.final_text = "answer".into();
+                state.final_text_streamed = true;
+                state.task_profile.exploratory_task = exploratory;
+                state.last_finish_reason = finish_reason.map(str::to_string);
+                ensure_terminal_text(&mut state);
+                let truncated = !exploratory && finish_reason == Some("length");
+                assert_eq!(
+                    state.final_text,
+                    if truncated {
+                        "answer\n\n[truncated — output cut off by token limit]"
+                    } else {
+                        "answer"
+                    }
+                );
+                assert_eq!(state.final_text_streamed, !truncated);
+            }
+        }
     }
 
     #[test]

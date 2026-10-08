@@ -10,17 +10,13 @@
 //! | Trait | Responsibility |
 //! |-------|----------------|
 //! | `LiveRuntimeProvider` | Real-time token pressure, prompt-cache read share, error rate, budget |
-//! | `ObservationProvider` | Journal facts, trends, entry counts |
-//! | `SessionStateProvider` | Task board completion, phase, circuit breaker |
+//! | `SessionStateProvider` | Phase, circuit breaker, round budget |
 //!
 //! # Unhappy-path guarantees
 //!
-//! Every method must be panic-free. When underlying data is absent (empty
-//! journal, missing task board, unlimited budget), methods return sensible
-//! zero/default values rather than panicking. Ratios without a measured
+//! Every method must be panic-free. Missing observations retain their
+//! declared zero/default values. Ratios without a measured
 //! denominator return `None`, not a fabricated zero.
-
-use astra_core::observation_journal::{JournalFacts, MetricTrend};
 
 // ─── LiveRuntimeProvider ─────────────────────────────────────────────────────
 
@@ -44,28 +40,6 @@ pub trait LiveRuntimeProvider: Send + Sync {
 
     /// Maximum round budget allocated for this turn.
     fn budget_max(&self) -> u32;
-}
-
-// ─── ObservationProvider ─────────────────────────────────────────────────────
-
-/// Historical observation data from the turn journal.
-pub trait ObservationProvider: Send + Sync {
-    /// Extract a factual snapshot from the journal.
-    ///
-    /// The returned `JournalFacts` includes outcome streaks, budget data,
-    /// and read-only streaks. **Does not** include live metrics (token
-    /// pressure, error rate, task completion) — those come from the other
-    /// provider traits.
-    fn extract_facts(&self) -> JournalFacts;
-
-    /// Compute metric trends across the journal's ring buffer.
-    fn compute_trends(&self) -> Vec<MetricTrend>;
-
-    /// Number of entries in the journal ring buffer.
-    fn journal_len(&self) -> usize;
-
-    /// Whether the journal has any recorded turns.
-    fn journal_is_empty(&self) -> bool;
 }
 
 // ─── SessionStateProvider ────────────────────────────────────────────────────

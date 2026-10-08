@@ -1416,6 +1416,7 @@ fn server_context_window_policy_from_accum(accum: &ChatTurnSseAccum) -> Option<(
 
 #[derive(Clone, Debug)]
 struct ToolResultIdentity {
+    work_attribution: Option<astra_services::runs::WorkInvocationAttribution>,
     session_id: String,
     run_id: String,
     turn_chain_id: String,
@@ -1425,6 +1426,7 @@ struct ToolResultIdentity {
 impl ToolResultIdentity {
     fn from_batch_request(req: &ToolBatchRequest) -> Self {
         Self {
+            work_attribution: req.work_attribution.clone(),
             session_id: req.session_id.clone(),
             run_id: req.run_id.clone(),
             turn_chain_id: req.turn_chain_id.clone(),
@@ -2174,6 +2176,9 @@ impl<'a> CliSseStreamHost<'a> {
 
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         let result = EdgeToolExecResult {
+            work_attribution: self
+                .tool_result_identity(request_id)
+                .and_then(|identity| identity.work_attribution),
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -2959,6 +2964,7 @@ impl<'a> CliSseStreamHost<'a> {
         }
 
         let result = EdgeToolExecResult {
+            work_attribution: req.work_attribution.clone(),
             execution_completion: None,
             request_id: req.request_id.clone(),
             tool: req.tool.clone(),
@@ -4250,6 +4256,8 @@ async fn execute_server_budgeted(
         .min(request.execution_timeout_ms);
     if remaining_execution_ms == 0 {
         let mut result = EdgeToolExecResult {
+            work_attribution: request.work_attribution.clone(),
+
             execution_completion: None,
             request_id: request.request_id.clone(),
             tool: request.tool.clone(),
@@ -5331,6 +5339,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             allowed = false;
         }
         let start = std::time::Instant::now();
+        if matches!(tool, "skill" | "discover_skills") && request.admitted_skill_names.is_none() {
+            allowed = false;
+            denied_output =
+                Some("Error: missing server-admitted skill directory authority".to_string());
+        }
         let mut tool_result_fields = None;
         let mut tool_execution_marked_error = false;
         let mut output = if allowed {
@@ -5338,16 +5351,46 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // Edge-path skill dedup: if the same skill was already invoked
                 // during this SSE stream, return a short dedup message instead
                 // of executing it again.
-                let skill_name = astra_runtime::turn::skill_tool::extract_skill_name(args);
-                let dedup_key = skill_name.unwrap_or_default().to_string();
+                let dedup_key = args
+                    .get("skill_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if !dedup_key.is_empty() && self.skills_invoked.contains(&dedup_key) {
-                    format!(
-                        "Skill '{}' was already loaded in this turn. \
-                         Follow the instructions already provided.",
-                        dedup_key,
-                    )
+                    let context = astra_runtime::turn::skill_tool::SkillContext {
+                        admitted_skill_names: request
+                            .admitted_skill_names
+                            .as_ref()
+                            .map(|names| names.iter().cloned().collect()),
+                        ..Default::default()
+                    };
+                    let admission = if let Some(resolver) = &self.skill_resolver {
+                        astra_runtime::turn::skill_tool::admit_public_skill(
+                            resolver.as_ref(),
+                            &dedup_key,
+                            &context,
+                        )
+                        .await
+                    } else {
+                        Err("Error: skill resolver not available".to_string())
+                    };
+                    match admission {
+                        Ok(_) => {
+                            tool_result_fields = Some(crate::edge_tools::nonexecuted_tool_result_fields(
+                                astra_services::session_journal::ToolCallDisposition::Suppressed,
+                            ));
+                            format!(
+                                "Skill '{dedup_key}' was already loaded in this turn. Follow the instructions already provided."
+                            )
+                        }
+                        Err(error) => {
+                            tool_result_fields = Some(rejected_tool_result_fields());
+                            tool_execution_marked_error = true;
+                            error
+                        }
+                    }
                 } else if let Some(resolver) = &self.skill_resolver {
-                    let skill_context = self
+                    let mut skill_context = self
                         .perm_manager
                         .as_ref()
                         .map(|manager| {
@@ -5359,6 +5402,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                         })
                         .unwrap_or_default();
+                    skill_context.read_only_execution |= read_only_execution;
+                    skill_context.admitted_skill_names = request
+                        .admitted_skill_names
+                        .as_ref()
+                        .map(|names| names.iter().cloned().collect());
                     let executed = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
@@ -5387,13 +5435,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             } else if tool == astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME {
                 if let Some(resolver) = &self.skill_resolver {
                     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                    let catalog = resolver.available_skills();
-                    let (text, _) = astra_runtime::turn::skill_tool::execute_discover_skills(
-                        query,
-                        &catalog,
-                        std::collections::HashSet::new(),
-                    );
-                    text
+                    let catalog = resolver
+                        .available_skills()
+                        .into_iter()
+                        .filter(|skill| {
+                            request
+                                .admitted_skill_names
+                                .as_ref()
+                                .is_some_and(|names| names.contains(&skill.name))
+                        })
+                        .collect::<Vec<_>>();
+                    astra_runtime::turn::skill_tool::execute_discover_skills(query, &catalog)
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
@@ -5770,6 +5822,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
+            work_attribution: self
+                .tool_result_identity(request_id)
+                .and_then(|identity| identity.work_attribution),
+
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -5800,6 +5856,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .last()
             .cloned()
             .unwrap_or_else(|| EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: String::new(),
                 tool: String::new(),
@@ -6620,6 +6677,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let tool_result_fields =
                 self.tool_result_fields_with_cli_runtime(&req.tool, outcome.tool_result_fields);
             let result = EdgeToolExecResult {
+                work_attribution: req.work_attribution.clone(),
+
                 execution_completion: None,
                 request_id: req.request_id.clone(),
                 tool: req.tool.clone(),
@@ -8882,6 +8941,7 @@ mod tests {
             host.tool_result_identities.insert(
                 "denied-git".to_string(),
                 ToolResultIdentity {
+                    work_attribution: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -12050,6 +12110,8 @@ mod tests {
 
     fn parallel_batch_request(owner: &str, id: &str, tool: &str, args: Value) -> ToolBatchRequest {
         ToolBatchRequest {
+            work_attribution: None,
+            admitted_skill_names: None,
             session_id: format!("batch-session-{owner}"),
             run_id: format!("batch-run-{id}"),
             turn_chain_id: format!("batch-chain-{id}"),
@@ -12437,6 +12499,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -12449,6 +12513,8 @@ mod tests {
                     args: serde_json::json!({"path": first.to_string_lossy()}),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "child-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -12503,6 +12569,8 @@ mod tests {
         ] {
             let results = host
                 .execute_tools_batch(vec![ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".into(),
                     run_id: run_id.into(),
                     turn_chain_id: "test-chain".into(),
@@ -12546,6 +12614,8 @@ mod tests {
         }
         let rejected = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".into(),
                 run_id: "child-run".into(),
                 turn_chain_id: "test-chain".into(),
@@ -12632,6 +12702,7 @@ mod tests {
         host.tool_result_identities.insert(
             "expired-1".to_string(),
             ToolResultIdentity {
+                work_attribution: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -12641,6 +12712,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -12715,6 +12788,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".into(),
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
@@ -12727,6 +12802,8 @@ mod tests {
                     args: serde_json::json!({"path": "one.txt"}),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".into(),
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
@@ -12949,6 +13026,7 @@ mod tests {
             request.session_id = "sess-live".into();
             assert!(host.on_server_tool_surface_admission(&request).is_err());
             host.on_tool_result(&EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: id.into(),
                 tool: request.tool,
@@ -12963,6 +13041,7 @@ mod tests {
         incremental_state.replace_tool_records(Vec::new());
         incremental_state.replace_tools_used(Vec::new());
         host.on_tool_result(&EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "tool-1".to_string(),
             tool: "bash".to_string(),
@@ -14407,20 +14486,133 @@ mod tests {
 
     // ── Edge-path skill dedup tests ─────────────────────────────────────
 
-    #[test]
-    fn skill_dedup() {
-        // hashset tracks invocations
-        let mut invoked = std::collections::HashSet::new();
-        assert!(invoked.insert("code-review".to_string()));
-        assert!(!invoked.insert("code-review".to_string()));
-        assert!(invoked.insert("test-writer".to_string()));
-        // produces correct message
-        let msg = format!(
-            "Skill '{}' was already loaded in this turn. Follow the instructions already provided.",
-            "code-review"
-        );
-        assert!(msg.contains("code-review"));
-        assert!(msg.contains("already loaded"));
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn skill_callbacks_respect_directory_scope_before_dedup() {
+        let workspace = tempdir().unwrap();
+        let directory = workspace.path().join("skills");
+        for name in ["code-review", "test-writer"] {
+            let path = directory.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: Review workflow\n---\n{name} instructions."
+                ),
+            )
+            .unwrap();
+        }
+        let mut registry = astra_runtime::skills::registry::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory]),
+        ));
+        registry.discover_all().await.unwrap();
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        host.skill_resolver = Some(std::sync::Arc::new(
+            astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
+                registry,
+            )),
+        ));
+        let mut requests = Vec::new();
+        let mut results = Vec::new();
+        for (id, tool, args, scope, succeeds) in [
+            (
+                "search",
+                "discover_skills",
+                serde_json::json!({"query":"review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "repeat",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "revoked",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec![]),
+                false,
+            ),
+            (
+                "excluded",
+                "skill",
+                serde_json::json!({"skill_name":"test-writer"}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
+                "missing",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                None,
+                false,
+            ),
+        ] {
+            let mut request = parallel_batch_request("skills", id, tool, args);
+            request.run_id = "skill-scope-run".to_string();
+            request.turn_chain_id = "skill-scope-chain".to_string();
+            request.admitted_skill_names = scope;
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let mut settled = host.execute_tools_batch(vec![request.clone()]).await;
+            let result = settled.pop().unwrap();
+            assert_eq!(
+                result.status == "completed",
+                succeeds,
+                "{id}: {}",
+                result.output
+            );
+            if id == "search" {
+                assert!(result.output.contains("code-review"));
+                assert!(!result.output.contains("test-writer"));
+            }
+            let record =
+                astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
+            if id == "repeat" {
+                assert!(result.output.contains("already loaded"));
+                assert_eq!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
+                );
+                assert_eq!(
+                    result.tool_result_fields.as_ref().unwrap()["executed"],
+                    false
+                );
+                assert_eq!(
+                    record.result_class.as_deref(),
+                    Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS),
+                );
+            } else if succeeds {
+                assert_eq!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                );
+            }
+            if !succeeds {
+                assert!(!result.output.contains("<skill-loaded"));
+                if id == "revoked" || id == "missing" {
+                    assert_eq!(
+                        record.disposition,
+                        Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+                    );
+                }
+            }
+            requests.push(request);
+            results.push(result);
+        }
+        fixture.assert_settlements(&requests, &results).await;
     }
 
     // ── CLI skill-loaded marker tests ──────────────────────────────────
@@ -14792,6 +14984,7 @@ mod tests {
             host.tool_result_identities.insert(
                 request_id.to_string(),
                 ToolResultIdentity {
+                    work_attribution: None,
                     session_id: "session-1".to_string(),
                     run_id: "run-1".to_string(),
                     turn_chain_id: "turn-1".to_string(),
@@ -15018,6 +15211,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15035,6 +15230,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15127,6 +15324,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15144,6 +15343,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15228,6 +15429,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15245,6 +15448,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15261,6 +15466,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15344,6 +15551,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -15433,6 +15642,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15450,6 +15661,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15548,6 +15761,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15563,6 +15778,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15680,6 +15897,8 @@ mod tests {
             false,
         );
         let request = |request_id: &str, tool: &str, args: serde_json::Value| ToolBatchRequest {
+            work_attribution: None,
+            admitted_skill_names: None,
             session_id: "test-session".to_string(),
             run_id: "test-run".to_string(),
             turn_chain_id: "test-chain".to_string(),
@@ -16029,6 +16248,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16044,6 +16265,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16058,6 +16281,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16260,6 +16485,8 @@ mod tests {
         while event_rx.try_recv().is_ok() {}
         let result = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "cache-session".into(),
                 run_id: "cache-root".into(),
                 turn_chain_id: "cache-chain".into(),
@@ -16575,6 +16802,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16590,6 +16819,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16604,6 +16835,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16842,6 +17075,7 @@ mod tests {
     #[test]
     fn test_merge_edge_tool_rounds() {
         let consumed = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
@@ -16862,6 +17096,7 @@ mod tests {
 
         // deduplicates by request_id (host wins)
         let host = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
@@ -16925,6 +17160,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16940,6 +17177,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16954,6 +17193,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17040,6 +17281,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -17126,6 +17369,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17141,6 +17386,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17236,6 +17483,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17253,6 +17502,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17339,6 +17590,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -17565,6 +17818,7 @@ mod tests {
         ] {
             let state = IncrementalTurnState::default();
             let result = EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-1".into(),
                 tool: tool.into(),
@@ -17601,6 +17855,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-err".into(),
                 tool: "bash".into(),
@@ -17632,6 +17887,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-skip".into(),
                 tool: "read_file".into(),
@@ -17661,6 +17917,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-invalid-git".into(),
                 tool: "git".into(),

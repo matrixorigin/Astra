@@ -298,6 +298,9 @@ pub static READ_ONLY_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
 
 /// One edge-executed tool row in the current LLM round (ordering preserved vs `tool_calls`).
 pub trait EdgeToolRoundRow {
+    fn work_attribution(&self) -> Option<&astra_services::runs::WorkInvocationAttribution> {
+        None
+    }
     fn execution_completion(
         &self,
     ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {

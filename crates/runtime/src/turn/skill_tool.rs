@@ -25,7 +25,7 @@
 //!
 //! Skills with [`ExecutionContext::Fork`](crate::skills::manifest::ExecutionContext::Fork)
 //! run in a nested agentic loop via [`astra_skills::executor::IsolatedSkillExecutor`] and a
-//! host-provided [`astra_skills::executor::SkillSubRunExecutor`] (e.g. CLI fork sub-run host).
+//! Server-owned [`astra_skills::executor::SkillSubRunExecutor`].
 //! Recursive fork is disabled in sub-runs (`skill_executor: None`); nested `skill` calls are
 //! still resolved and executed **inline** so composition can proceed.
 
@@ -56,6 +56,11 @@ pub use astra_skills::traits::{ResolvedSkill, SkillResolver, SkillToolInfo};
 /// Built at execution time from the agentic loop state.
 #[derive(Clone, Default)]
 pub struct SkillContext {
+    /// Canonical skill identities admitted for this invocation. This is
+    /// transport authority, never a model argument or a session-wide cache.
+    /// An empty scope denies every public skill; trusted composition keeps
+    /// its existing manifest and composability checks.
+    pub admitted_skill_names: Option<HashSet<String>>,
     /// Trusted execution ceiling, never populated from skill arguments.
     pub read_only_execution: bool,
     /// Current session identifier.
@@ -490,22 +495,6 @@ pub fn warn_if_full_skill_catalog_surface_is_large(skill_count: usize) {
     }
 }
 
-/// Skills visible this session after merging previously discovered entries.
-pub fn merge_discovered_skills_into_visible(
-    base: Vec<SkillToolInfo>,
-    all_skills: &[SkillToolInfo],
-    discovered: &HashSet<String>,
-) -> Vec<SkillToolInfo> {
-    let mut out = base;
-    let mut have: HashSet<String> = out.iter().map(|s| s.name.clone()).collect();
-    for s in all_skills {
-        if discovered.contains(&s.name) && have.insert(s.name.clone()) {
-            out.push(s.clone());
-        }
-    }
-    out
-}
-
 fn filter_already_invoked_skills(
     skills: Vec<SkillToolInfo>,
     invoked: &HashMap<String, InvokedSkill>,
@@ -533,42 +522,6 @@ pub fn visible_skills_for_host_turn(
     invoked: &HashMap<String, InvokedSkill>,
 ) -> Vec<SkillToolInfo> {
     filter_already_invoked_skills(full.to_vec(), invoked)
-}
-
-/// Lowercased canonical names and aliases — used to filter `discover_skills` results.
-pub fn skill_mask_names_lowercase(skills: &[SkillToolInfo]) -> HashSet<String> {
-    let mut m = HashSet::new();
-    for s in skills {
-        m.insert(s.name.to_lowercase());
-        for a in &s.aliases {
-            m.insert(a.to_lowercase());
-        }
-    }
-    m
-}
-
-/// OpenAI-style tool schema for `discover_skills`.
-pub fn discover_skills_tool_schema() -> Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": DISCOVER_SKILLS_TOOL_NAME,
-            "description": "Search the full skill catalog for additional workflow packs not shown in the current skill listing.\n\n\
-                Call this when you are pivoting, planning a multi-step workflow, or the surfaced skills do not cover your next action. \
-                Skills already listed for this turn (or discovered earlier in the session) are filtered out.\n\n\
-                After a successful discovery, invoke `skill` with one of the returned names.",
-            "parameters": {
-                "type": "object",
-                "required": ["query"],
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Concrete description of what you are trying to do next (task, domain, or workflow)."
-                    }
-                }
-            }
-        }
-    })
 }
 
 /// True if this tool call targets the public `discover_skills` tool.
@@ -608,125 +561,45 @@ impl astra_tools::relevance_score::Scoreable for SkillScoreAdapter<'_> {
     }
 }
 
-/// Run discovery; returns assistant-facing text and canonical names to merge into session state.
+/// Search the current authorized catalog; returns the model-visible search result.
 /// Scores skill-catalog candidates by query relevance. Empty queries list the first page;
 /// non-empty queries only return relevant matches. This retrieval path is intentionally
 /// separate from declarative tool surfacing.
-pub fn execute_discover_skills(
-    query: &str,
-    catalog: &[SkillToolInfo],
-    mut excluded_lowercase: HashSet<String>,
-) -> (String, Vec<String>) {
-    // Filter excluded skills first.
-    let candidates: Vec<(usize, &SkillToolInfo)> = catalog
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| {
-            !excluded_lowercase.contains(&s.name.to_lowercase())
-                && !s
-                    .aliases
-                    .iter()
-                    .any(|a| excluded_lowercase.contains(&a.to_lowercase()))
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return (DISCOVER_SKILLS_NO_MATCH_MESSAGE.to_string(), Vec::new());
+pub fn execute_discover_skills(query: &str, catalog: &[SkillToolInfo]) -> String {
+    if catalog.is_empty() {
+        return DISCOVER_SKILLS_NO_MATCH_MESSAGE.to_string();
     }
 
     // Score candidates by query relevance, fall back to insertion order.
     let result_indices: Vec<usize> = if query.trim().is_empty() {
-        candidates
-            .iter()
+        (0..catalog.len())
             .take(DISCOVER_SKILLS_MAX_RESULTS)
-            .map(|(idx, _)| *idx)
             .collect()
     } else {
-        let adapters: Vec<SkillScoreAdapter> = candidates
-            .iter()
-            .map(|(_, s)| SkillScoreAdapter(s))
-            .collect();
+        let adapters: Vec<SkillScoreAdapter> = catalog.iter().map(SkillScoreAdapter).collect();
         let ranked = astra_tools::relevance_score::rank_by_relevance(
             &adapters,
             query,
             DISCOVER_SKILLS_MAX_RESULTS,
         );
         if ranked.is_empty() {
-            return (DISCOVER_SKILLS_NO_MATCH_MESSAGE.to_string(), Vec::new());
+            return DISCOVER_SKILLS_NO_MATCH_MESSAGE.to_string();
         } else {
-            // Map adapter indices back to catalog indices.
-            ranked
-                .iter()
-                .map(|(adapter_idx, _)| candidates[*adapter_idx].0)
-                .collect()
+            ranked.iter().map(|(idx, _)| *idx).collect()
         }
     };
 
     let mut lines = Vec::new();
-    let mut new_names = Vec::new();
     for idx in result_indices {
         let s = &catalog[idx];
         lines.push(format!("- **{}**: {}", s.name, format_skill_description(s)));
-        new_names.push(s.name.clone());
-        excluded_lowercase.insert(s.name.to_lowercase());
-        for a in &s.aliases {
-            excluded_lowercase.insert(a.to_lowercase());
-        }
     }
 
     let body = lines.join("\n");
-    (
-        format!(
-            "Additional skills (now available via `skill` for this session):\n\n{body}\n\n\
-             Invoke `skill` with `skill_name` set to one of the names above."
-        ),
-        new_names,
+    format!(
+        "Matching skills from the current authorized catalog:\n\n{body}\n\n\
+         Invoke `skill` with `skill_name` set to one of the names above."
     )
-}
-
-/// Generate the `skill` tool schema — cache-stable, list-free.
-///
-/// The schema takes `skill_name` as an open string and carries no enum.
-/// The catalog is surfaced through [`crate::prompts::build_skill_listing_section`]
-/// which lives in the cacheable prefix, so adding a skill no longer perturbs
-/// the tool schema bytes. This is the Phase-3 replacement for the earlier
-/// [`skill_tool_schema`], which is kept for the transition period until all
-/// call sites flip to v2.
-pub fn skill_tool_schema_v2() -> Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": SKILL_TOOL_NAME,
-            "description":
-                "Execute a skill from the <available_skills> system listing. \
-                 Call it only when the user's request matches a skill whose \
-                 canonical name or alias appears literally in that listing; \
-                 never invent or infer a skill name. For work this agent owns, \
-                 call a matching skill before substantive work on that objective. \
-                 If a child owns the objective, launch it first and let the child \
-                 load its own skills. \
-                 `skill_name` is the listed canonical name or alias. `task` is optional \
-                 extra context; omit to use the current conversation. On seeing \
-                 `<skill-loaded name=\"...\"/>` in a tool result, follow that \
-                 skill's instructions — do not re-invoke it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": {
-                        "type": "string",
-                        "description":
-                            "Canonical name or alias of the skill to run."
-                    },
-                    "task": {
-                        "type": "string",
-                        "description":
-                            "Optional task description or extra context for the skill."
-                    }
-                },
-                "required": ["skill_name"]
-            }
-        }
-    })
 }
 
 // Production uses an open-string schema and keeps the available skill catalog
@@ -890,13 +763,11 @@ pub struct InterceptedToolResult {
 /// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
 ///
 /// This keeps discovery deterministic when a model invokes `discover_skills` and `skill`
-/// in the same tool round: discovery results are merged before skill activation runs.
+/// in the same tool round: search results precede skill activation without changing authority.
 pub async fn partition_discover_and_execute_skills(
     tool_calls: &[Value],
     resolver: &dyn SkillResolver,
     catalog: &[SkillToolInfo],
-    discover_exclude_lowercase: &HashSet<String>,
-    discovered_skills: &mut HashSet<String>,
     executor: Option<&Arc<dyn SkillExecutor>>,
     quality_tracker: Option<&mut crate::skills::quality::SkillQualityTracker>,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
@@ -922,11 +793,6 @@ pub async fn partition_discover_and_execute_skills(
     let mut combined_results = Vec::new();
     let mut activation: Option<SkillActivation> = None;
 
-    let mut excluded = discover_exclude_lowercase.clone();
-    for n in discovered_skills.iter() {
-        excluded.insert(n.to_lowercase());
-    }
-
     for tc in discover_calls {
         let call_id = tc
             .get("id")
@@ -939,19 +805,7 @@ pub async fn partition_discover_and_execute_skills(
         let (result, ok) = match args {
             Some(args) => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                let (text, discovered) = execute_discover_skills(query, catalog, excluded.clone());
-                for n in &discovered {
-                    discovered_skills.insert(n.clone());
-                }
-                for s in catalog {
-                    if discovered.contains(&s.name) {
-                        excluded.insert(s.name.to_lowercase());
-                        for a in &s.aliases {
-                            excluded.insert(a.to_lowercase());
-                        }
-                    }
-                }
-                (text, true)
+                (execute_discover_skills(query, catalog), true)
             }
             None => (
                 "Invalid discover_skills arguments: expected object or JSON string".to_string(),
@@ -1763,8 +1617,8 @@ async fn execute_remote_skill(
 /// Execute a single skill call and return the output text + activation metadata.
 ///
 /// When the skill has `execution_context: Fork` and an executor is available,
-/// the skill is run in an isolated sub-agent loop. On failure, execution falls
-/// back to inline mode. MCP skills are sandboxed: inline shell commands and
+/// the skill is run in an isolated sub-agent loop. Executor failures remain
+/// failures and do not activate inline instructions. MCP skills are sandboxed: inline shell commands and
 /// hooks are blocked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SkillInvocationOrigin {
@@ -1796,6 +1650,65 @@ fn execute_skill<'a>(
     )
 }
 
+/// Resolve a public skill through the same admission boundary used by execution.
+/// Successful dedup receipts must pass this boundary too; resolution runs no hooks.
+pub async fn admit_public_skill(
+    resolver: &dyn SkillResolver,
+    skill_name: &str,
+    skill_ctx: &SkillContext,
+) -> Result<ResolvedSkill, String> {
+    resolve_admitted_skill(
+        resolver,
+        skill_name,
+        skill_ctx,
+        SkillInvocationOrigin::Public,
+    )
+    .await
+}
+
+async fn resolve_admitted_skill(
+    resolver: &dyn SkillResolver,
+    skill_name: &str,
+    skill_ctx: &SkillContext,
+    origin: SkillInvocationOrigin,
+) -> Result<ResolvedSkill, String> {
+    let mut catalog = resolver.available_skills();
+    let public_scope = matches!(origin, SkillInvocationOrigin::Public)
+        .then_some(skill_ctx.admitted_skill_names.as_ref())
+        .flatten();
+    if let Some(scope) = public_scope {
+        catalog.retain(|skill| scope.contains(&skill.name));
+    }
+    let public_name = skill_name_matches_catalog(skill_name, &catalog);
+    let trusted_pipeline_name = matches!(origin, SkillInvocationOrigin::TrustedPipelineStep)
+        && resolver.execution_catalog_contains(skill_name);
+    if (resolver.catalog_is_authoritative() || public_scope.is_some())
+        && !public_name
+        && !trusted_pipeline_name
+    {
+        return Err(format!(
+            "Unknown skill `{skill_name}`. Choose a skill from the available skills list."
+        ));
+    }
+    if !trusted_pipeline_name
+        && is_unregistered_native_tool_name(skill_name, &catalog, &skill_ctx.available_tools)
+    {
+        return Err(format!(
+            "`{skill_name}` is a native tool, not an available skill. Use the tool's current visible or deferred selection contract."
+        ));
+    }
+    let skill = resolver
+        .resolve_for_execution(skill_name)
+        .await
+        .map_err(|error| format!("Failed to load skill '{skill_name}': {error}"))?;
+    if public_scope.is_some_and(|scope| !scope.contains(&skill.name)) {
+        return Err(format!(
+            "Skill `{skill_name}` resolved outside the admitted directory."
+        ));
+    }
+    Ok(skill)
+}
+
 fn execute_skill_with_origin<'a>(
     resolver: &'a dyn SkillResolver,
     executor: Option<&'a Arc<dyn SkillExecutor>>,
@@ -1814,32 +1727,6 @@ fn execute_skill_with_origin<'a>(
         } else {
             task_hint
         };
-        let catalog = resolver.available_skills();
-        let public_name = skill_name_matches_catalog(skill_name, &catalog);
-        let trusted_pipeline_name = matches!(origin, SkillInvocationOrigin::TrustedPipelineStep)
-            && resolver.execution_catalog_contains(skill_name);
-        if resolver.catalog_is_authoritative() && !public_name && !trusted_pipeline_name {
-            return SkillCallResult {
-                output: format!(
-                    "Unknown skill `{skill_name}`. Choose a skill from the available skills list."
-                ),
-                success: false,
-                activation: None,
-                verification: None,
-            };
-        }
-        if !trusted_pipeline_name
-            && is_unregistered_native_tool_name(skill_name, &catalog, &skill_ctx.available_tools)
-        {
-            return SkillCallResult {
-                output: format!(
-                    "`{skill_name}` is a native tool, not an available skill. Use the tool's current visible or deferred selection contract."
-                ),
-                success: false,
-                activation: None,
-                verification: None,
-            };
-        }
         if let Some(ctx) = composition_ctx {
             // Depth check
             if let Err(e) = ctx.check_depth() {
@@ -1861,7 +1748,7 @@ fn execute_skill_with_origin<'a>(
             }
         }
 
-        match resolver.resolve_for_execution(skill_name).await {
+        match resolve_admitted_skill(resolver, skill_name, skill_ctx, origin).await {
             Ok(skill) => {
                 // Composability gate: nested calls must target composable skills
                 if let Some(ctx) = composition_ctx {
@@ -2124,12 +2011,18 @@ fn execute_skill_with_origin<'a>(
                                 };
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "  ⚠ Fork execution of skill '{}' failed: {}; falling back to inline",
-                                    skill_name, e
-                                );
-                                // pre_invoke already ran; notify lifecycle hooks, then fall back to inline.
+                                // The child may have executed before transport or
+                                // durable settlement failed. Preserve the failure;
+                                // inline activation is not a valid completion receipt.
                                 run_hooks(&skill.hooks.on_error, skip_effectful_hooks);
+                                return SkillCallResult {
+                                    output: format!(
+                                        "Fork execution of skill '{skill_name}' failed: {e}"
+                                    ),
+                                    success: false,
+                                    activation: None,
+                                    verification: None,
+                                };
                             }
                         }
                     }
@@ -2145,7 +2038,7 @@ fn execute_skill_with_origin<'a>(
                     skill.skill_dir.as_deref(),
                 );
 
-                // Inline execution (default, and fork-failure fallback)
+                // Inline execution
                 let mut output = format!(
                     "# Skill: {}\n\n\
                  You are now executing the **{}** skill. \
@@ -2174,7 +2067,7 @@ fn execute_skill_with_origin<'a>(
                 }
             }
             Err(e) => SkillCallResult {
-                output: format!("Failed to load skill '{}': {}", skill_name, e),
+                output: e,
                 success: false,
                 activation: None,
                 verification: None,
@@ -2753,29 +2646,14 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let mut ex = HashSet::new();
-        ex.insert("surfaced".into());
-        let (text, names) = execute_discover_skills("kubernetes deploy", &catalog, ex);
+        let text = execute_discover_skills("kubernetes deploy", &catalog);
         assert!(text.contains("hidden-deploy"), "{text}");
-        assert_eq!(names, vec!["hidden-deploy".to_string()]);
+        assert!(!text.contains("**surfaced**"), "{text}");
     }
 
     #[test]
-    fn discover_skills_respects_cap_and_excludes_names_and_aliases() {
-        let mut catalog = vec![
-            SkillToolInfo {
-                name: "already-visible".into(),
-                aliases: vec!["visible-alias".into()],
-                description: "Already surfaced".into(),
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "blocked-by-alias".into(),
-                aliases: vec!["alias-blocked".into()],
-                description: "Should be excluded via alias".into(),
-                ..Default::default()
-            },
-        ];
+    fn discover_skills_respects_result_cap() {
+        let mut catalog = Vec::new();
         for idx in 0..(DISCOVER_SKILLS_MAX_RESULTS + 3) {
             catalog.push(SkillToolInfo {
                 name: format!("candidate-{idx}"),
@@ -2785,13 +2663,14 @@ mod tests {
             });
         }
 
-        let excluded = HashSet::from(["already-visible".to_string(), "alias-blocked".to_string()]);
-        let (text, names) = execute_discover_skills("candidate", &catalog, excluded);
+        let text = execute_discover_skills("candidate", &catalog);
 
-        assert_eq!(names.len(), DISCOVER_SKILLS_MAX_RESULTS);
-        assert!(!names.iter().any(|name| name == "already-visible"));
-        assert!(!names.iter().any(|name| name == "blocked-by-alias"));
-        assert!(names.iter().all(|name| name.starts_with("candidate-")));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("- **candidate-"))
+                .count(),
+            DISCOVER_SKILLS_MAX_RESULTS
+        );
         assert!(text.contains("candidate-0"), "{text}");
     }
 
@@ -2814,8 +2693,14 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (_, names) = execute_discover_skills("deploy kubernetes", &catalog, HashSet::new());
-        assert_eq!(names[0], "deploy-k8s", "best match should be first");
+        let text = execute_discover_skills("deploy kubernetes", &catalog);
+        assert!(
+            text.lines()
+                .find(|line| line.starts_with("- **"))
+                .unwrap()
+                .starts_with("- **deploy-k8s**"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2827,9 +2712,13 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (_, names) = execute_discover_skills("", &catalog, HashSet::new());
-        assert_eq!(names.len(), 5);
-        assert_eq!(names[0], "skill-0");
+        let text = execute_discover_skills("", &catalog);
+        let results = text
+            .lines()
+            .filter(|line| line.starts_with("- **"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 5);
+        assert!(results[0].starts_with("- **skill-0**"), "{text}");
     }
 
     #[test]
@@ -2841,12 +2730,8 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (text, names) =
-            execute_discover_skills("zzz_nonexistent_xyz", &catalog, HashSet::new());
-        assert!(
-            names.is_empty(),
-            "unmatched queries must not surface arbitrary skills"
-        );
+        let text = execute_discover_skills("zzz_nonexistent_xyz", &catalog);
+        assert!(!text.lines().any(|line| line.starts_with("- **")), "{text}");
         assert!(text.contains("No additional skills matched"), "{text}");
     }
 
@@ -2866,36 +2751,13 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (_, names) = execute_discover_skills("validate", &catalog, HashSet::new());
-        assert_eq!(
-            names[0], "also-generic",
-            "when_to_use containing query term should boost ranking"
-        );
-    }
-
-    #[test]
-    fn discover_skills_exclusion_overrides_score() {
-        let catalog = vec![
-            SkillToolInfo {
-                name: "deploy".into(),
-                description: "Deploy application".into(),
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "backup".into(),
-                description: "Backup before deploy".into(),
-                ..Default::default()
-            },
-        ];
-        let excluded = HashSet::from(["deploy".to_string()]);
-        let (_, names) = execute_discover_skills("deploy", &catalog, excluded);
+        let text = execute_discover_skills("validate", &catalog);
         assert!(
-            !names.contains(&"deploy".to_string()),
-            "excluded must not appear"
-        );
-        assert!(
-            names.contains(&"backup".to_string()),
-            "non-excluded match should appear"
+            text.lines()
+                .find(|line| line.starts_with("- **"))
+                .unwrap()
+                .starts_with("- **also-generic**"),
+            "{text}"
         );
     }
 
@@ -2903,10 +2765,6 @@ mod tests {
     async fn partition_runs_discover_before_skill() {
         let resolver = stub_resolver();
         let catalog = resolver.available_skills();
-        let mut ex = HashSet::new();
-        // Simulate "code-review" already in the turn surface; "test-writer" is discoverable.
-        ex.insert("code-review".into());
-        let mut discovered = HashSet::new();
         let tool_calls = vec![
             serde_json::json!({
                 "id": "d1",
@@ -2927,8 +2785,6 @@ mod tests {
             &tool_calls,
             &resolver,
             &catalog,
-            &ex,
-            &mut discovered,
             None,
             None,
             None,
@@ -3085,6 +2941,58 @@ mod tests {
         // Activation is returned so typed workflow hints remain available.
         let act = r.activation.unwrap();
         assert!(act.allowed_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_skill_scope_checks_catalog_and_resolved_identity() {
+        struct CollidingResolver(StubResolver);
+        impl SkillResolver for CollidingResolver {
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                let mut catalog = self.0.available_skills();
+                catalog[0].aliases.push("review".to_string());
+                catalog
+            }
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                self.0.resolve(if name == "review" {
+                    "test-writer"
+                } else {
+                    name
+                })
+            }
+        }
+        let resolver = CollidingResolver(stub_resolver());
+        let mut context = SkillContext {
+            admitted_skill_names: Some(HashSet::from(["code-review".to_string()])),
+            ..Default::default()
+        };
+        for (name, succeeds) in [
+            ("code-review", true),
+            ("test-writer", false),
+            ("review", false),
+        ] {
+            let result = execute_skill_inline(
+                &resolver,
+                SKILL_TOOL_NAME,
+                &serde_json::json!({"skill_name": name}),
+                &context,
+            )
+            .await;
+            assert_eq!(result.success, succeeds, "{name}: {}", result.output);
+            if !succeeds {
+                assert!(result.activation.is_none());
+            }
+        }
+        context.admitted_skill_names = Some(HashSet::new());
+        assert!(
+            !execute_skill_inline(
+                &resolver,
+                SKILL_TOOL_NAME,
+                &serde_json::json!({"skill_name": "code-review"}),
+                &context,
+            )
+            .await
+            .success
+        );
     }
 
     #[tokio::test]
@@ -4118,6 +4026,7 @@ mod tests {
 
         struct InterruptedExecutor {
             calls: Arc<AtomicUsize>,
+            return_error: bool,
         }
         #[async_trait]
         impl SkillExecutor for InterruptedExecutor {
@@ -4130,6 +4039,11 @@ mod tests {
                 crate::skills::traits::SkillError,
             > {
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.return_error {
+                    return Err(crate::skills::SkillError::Internal(
+                        "child executed but settlement failed".into(),
+                    ));
+                }
                 Ok(crate::skills::traits::SkillExecutionResult {
                     output: "partial child evidence".into(),
                     tokens_used: 10,
@@ -4146,29 +4060,45 @@ mod tests {
             }
         }
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let executor: Arc<dyn SkillExecutor> = Arc::new(InterruptedExecutor {
-            calls: Arc::clone(&calls),
-        });
-        let result = execute_skill(
-            &ForkResolver,
-            Some(&executor),
-            "fork-review",
-            "review task",
-            None,
-            &SkillContext::default(),
-        )
-        .await;
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(!result.success);
-        assert!(result.activation.is_none());
-        assert_eq!(result.output, "partial child evidence");
+        for return_error in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let executor: Arc<dyn SkillExecutor> = Arc::new(InterruptedExecutor {
+                calls: Arc::clone(&calls),
+                return_error,
+            });
+            let result = execute_skill(
+                &ForkResolver,
+                Some(&executor),
+                "fork-review",
+                "review task",
+                None,
+                &SkillContext::default(),
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(!result.success);
+            assert!(result.activation.is_none());
+            if return_error {
+                assert!(
+                    result
+                        .output
+                        .contains("child executed but settlement failed")
+                );
+            } else {
+                assert_eq!(result.output, "partial child evidence");
+            }
+            assert!(
+                !result
+                    .output
+                    .contains("This instruction must not be returned")
+            );
+        }
     }
 
     #[test]
     fn skill_context_as_substitution_vars() {
         let ctx = SkillContext {
+            admitted_skill_names: None,
             read_only_execution: false,
             session_id: Some("sess-42".into()),
             session_dir: Some("/tmp/sessions/42".into()),

@@ -1009,6 +1009,54 @@ pub struct WorkItemRuntimeBindingRequest {
     pub attempt_id: String,
 }
 
+/// Producer-owned attribution frozen with an admitted invocation decision.
+/// This records causality; it does not grant authority to execute or recover.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkInvocationAttribution {
+    /// Canonical Work management or a proven read-only control observation.
+    Control,
+    /// The producer has no selected Work item at this dispatch boundary.
+    Unbound,
+    Attempt {
+        producer_run_id: String,
+        binding: WorkRuntimeBindingRequest,
+    },
+    /// Missing custody or an operation whose execution role is not proven.
+    #[default]
+    Unknown,
+}
+
+impl WorkInvocationAttribution {
+    pub fn validate(&self, expected_producer: Option<&str>) -> Result<(), String> {
+        let Self::Attempt {
+            producer_run_id,
+            binding,
+        } = self
+        else {
+            return Ok(());
+        };
+        crate::work::WorkItemAttemptId::parse(producer_run_id.clone())
+            .map_err(|error| format!("invalid invocation producer: {error}"))?;
+        if expected_producer.is_some_and(|expected| expected != producer_run_id) {
+            return Err("Work invocation attribution belongs to another producer run".into());
+        }
+        crate::work::WorkId::parse(binding.work_id.clone()).map_err(|error| error.to_string())?;
+        crate::work::WorkBranchId::parse(binding.branch_id.clone())
+            .map_err(|error| error.to_string())?;
+        let item = binding
+            .item
+            .as_ref()
+            .ok_or("Work invocation attribution has no item")?;
+        crate::work::WorkItemId::parse(item.item_id.clone()).map_err(|error| error.to_string())?;
+        crate::work::WorkItemRevision::new(item.item_revision)
+            .map_err(|error| error.to_string())?;
+        crate::work::WorkItemAttemptId::parse(item.attempt_id.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunStartIdempotencyKind {
     ProviderTask,
@@ -1304,7 +1352,8 @@ pub struct ChatRunRecord {
 pub struct ChatStreamRecord {
     pub session_id: String,
     pub run_id: String,
-    /// Batch events (populated after loop completes for persistence).
+    /// Retained events for a settled durable run; the HTTP handler replays
+    /// these when no live receiver is needed.
     pub events: Vec<serde_json::Value>,
     /// When present, SSE events are streamed incrementally through this
     /// channel. The HTTP handler converts this into a streaming response.
@@ -4709,6 +4758,7 @@ pub struct AtomicRunToolRequestCommitRequest<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomicRunToolRequestCommitReceipt {
+    pub work_attribution: WorkInvocationAttribution,
     pub action_event_index: i64,
     pub tool_request_event_index: i64,
     pub tool_request_event_hash: String,
@@ -4753,7 +4803,18 @@ fn validate_existing_atomic_tool_request(
     if let Some(object) = durable.as_object_mut() {
         object.remove("index");
     }
-    if &durable != request.tool_request_event {
+    let mut candidate = request.tool_request_event.clone();
+    // Work selection can advance after dispatch. Replay consumes the original
+    // producer-owned attribution; every other request fact remains immutable.
+    for event in [&mut durable, &mut candidate] {
+        if let Some(data) = event
+            .get_mut("data")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            data.remove("work_attribution");
+        }
+    }
+    if durable != candidate {
         return Err(format!(
             "tool request for action {} is already bound to different immutable facts",
             request.action.action_id
@@ -4763,13 +4824,33 @@ fn validate_existing_atomic_tool_request(
 }
 
 fn atomic_tool_request_receipt(
+    authoritative_run_id: &str,
     action_event_index: i64,
     tool_request_event_index: i64,
     tool_request_event: &serde_json::Value,
 ) -> Result<AtomicRunToolRequestCommitReceipt, String> {
-    let payload = serde_json::to_string(tool_request_event)
+    let mut canonical = tool_request_event.clone();
+    if let Some(object) = canonical.as_object_mut() {
+        object.remove("index");
+    }
+    let work_attribution: WorkInvocationAttribution = canonical
+        .pointer("/data/work_attribution")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid guarded Work attribution: {error}"))?
+        .unwrap_or_default();
+    if let Some(producer) = canonical
+        .pointer("/data/run_id")
+        .and_then(serde_json::Value::as_str)
+        && producer != authoritative_run_id
+    {
+        return Err("guarded tool request producer does not match admitted run".to_string());
+    }
+    work_attribution.validate(Some(authoritative_run_id))?;
+    let payload = serde_json::to_string(&canonical)
         .map_err(|error| format!("serialize guarded tool request: {error}"))?;
     Ok(AtomicRunToolRequestCommitReceipt {
+        work_attribution,
         action_event_index,
         tool_request_event_index,
         tool_request_event_hash: sha256_hex(payload.as_bytes()),
@@ -8502,9 +8583,10 @@ impl RunStateStore for InMemoryRunStateStore {
                     }
                     return Ok(AtomicRunToolRequestCommitOutcome::AlreadyCommitted(
                         atomic_tool_request_receipt(
+                            request.action.run_id,
                             grant_index,
                             request_index,
-                            request.tool_request_event,
+                            tool_request,
                         )?,
                     ));
                 }
@@ -8564,16 +8646,17 @@ impl RunStateStore for InMemoryRunStateStore {
 
             let action_event_index = run.last_event_idx.saturating_add(1);
             let tool_request_event_index = action_event_index.saturating_add(1);
+            let receipt = atomic_tool_request_receipt(
+                request.action.run_id,
+                action_event_index,
+                tool_request_event_index,
+                request.tool_request_event,
+            )?;
             run.events
                 .push(action_admission_granted_event(request.action));
             run.events.push(request.tool_request_event.clone());
             run.last_event_idx = tool_request_event_index;
             run.updated_at = chrono::Utc::now().to_rfc3339();
-            let receipt = atomic_tool_request_receipt(
-                action_event_index,
-                tool_request_event_index,
-                request.tool_request_event,
-            )?;
             (run.clone(), receipt)
         };
         self.sync_projection_event_metadata(
@@ -19286,9 +19369,10 @@ impl RunStateStore for DatabaseRunStateStore {
                     .map_err(|error| error.to_string())?;
                 validate_existing_atomic_tool_request(request, &durable)?;
                 let expected_receipt = atomic_tool_request_receipt(
+                    request.action.run_id,
                     event_index,
                     request_index,
-                    request.tool_request_event,
+                    &durable,
                 )?;
                 if request_index != event_index.saturating_add(1)
                     || request_hash != expected_receipt.tool_request_event_hash
@@ -19458,11 +19542,13 @@ impl RunStateStore for DatabaseRunStateStore {
             "insert_atomic_guarded_tool_request",
         )
         .await?;
-        let receipt = AtomicRunToolRequestCommitReceipt {
+        let mut receipt = atomic_tool_request_receipt(
+            request.action.run_id,
             action_event_index,
             tool_request_event_index,
-            tool_request_event_hash: event_row.event_hash.clone(),
-        };
+            request.tool_request_event,
+        )?;
+        receipt.tool_request_event_hash = event_row.event_hash.clone();
         if let Err(source) = tx.commit().await {
             drop(connection);
             let commit_error = db_error(
@@ -39948,6 +40034,7 @@ mod tests {
 
     fn ack_recovery_receipt() -> AtomicRunToolRequestCommitReceipt {
         AtomicRunToolRequestCommitReceipt {
+            work_attribution: Default::default(),
             action_event_index: 7,
             tool_request_event_index: 8,
             tool_request_event_hash: "exact-request-hash".to_string(),
@@ -40067,7 +40154,50 @@ mod tests {
             .insert_run(durable_run_record("guarded-edge-pair"))
             .await
             .unwrap();
-        let event = edge_tool_request_event("write-a", "write_file");
+        let mut event = edge_tool_request_event("write-a", "write_file");
+        event["data"]["run_id"] = serde_json::json!("guarded-edge-pair");
+        event["data"]["work_attribution"] = serde_json::json!({"state":"attempt", "producer_run_id":"another-run", "binding":{
+            "work_id":"work", "branch_id":"branch", "item":{"item_id":"item","item_revision":1,"attempt_id":"original-attempt"}
+        }});
+        let before = store
+            .load_run("u1", "guarded-edge-pair")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .commit_guarded_tool_request(guarded_tool_request(
+                    "guarded-edge-pair",
+                    "turn:1:round:0:edge:a",
+                    &event
+                ))
+                .await
+                .is_err()
+        );
+        event["data"]["run_id"] = serde_json::json!("another-run");
+        assert!(
+            store
+                .commit_guarded_tool_request(guarded_tool_request(
+                    "guarded-edge-pair",
+                    "turn:1:round:0:edge:a",
+                    &event
+                ))
+                .await
+                .is_err()
+        );
+        event["data"]["run_id"] = serde_json::json!("guarded-edge-pair");
+        let after = store
+            .load_run("u1", "guarded-edge-pair")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.events, before.events);
+        assert_eq!(after.last_event_idx, before.last_event_idx);
+        event["data"]["work_attribution"] = serde_json::json!({"state":"attempt", "producer_run_id":"guarded-edge-pair", "binding":{
+            "work_id":"work", "branch_id":"branch", "item":{"item_id":"item","item_revision":1,"attempt_id":"original-attempt"}
+        }});
+        let original: WorkInvocationAttribution =
+            serde_json::from_value(event["data"]["work_attribution"].clone()).unwrap();
         let request = guarded_tool_request("guarded-edge-pair", "turn:1:round:0:edge:a", &event);
 
         let first = store.commit_guarded_tool_request(request).await.unwrap();
@@ -40090,6 +40220,23 @@ mod tests {
                 }
             )
         ));
+        let mut changed = event.clone();
+        changed["data"]["work_attribution"]["binding"]["item"]["attempt_id"] =
+            serde_json::json!("next-attempt");
+        let replay = store
+            .commit_guarded_tool_request(guarded_tool_request(
+                "guarded-edge-pair",
+                "turn:1:round:0:edge:a",
+                &changed,
+            ))
+            .await
+            .unwrap();
+        match replay {
+            AtomicRunToolRequestCommitOutcome::AlreadyCommitted(receipt) => {
+                assert_eq!(receipt.work_attribution, original)
+            }
+            other => panic!("unexpected replay: {other:?}"),
+        }
         let run = store
             .load_run("u1", "guarded-edge-pair")
             .await

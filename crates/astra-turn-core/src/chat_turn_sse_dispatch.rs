@@ -625,6 +625,8 @@ pub struct EdgeApprovalRequest {
 #[derive(Debug, Clone)]
 pub enum ChatTurnEdgePending {
     ToolRequest {
+        work_attribution: Option<astra_services::runs::WorkInvocationAttribution>,
+        admitted_skill_names: Option<Vec<String>>,
         session_id: String,
         run_id: String,
         turn_chain_id: String,
@@ -1163,6 +1165,29 @@ fn apply_one_event(
                     );
                     return;
                 }
+                let admitted_skill_names = event.get("admitted_skill_names").and_then(|value| {
+                    let values = value.as_array()?;
+                    if values.len() > 512 {
+                        return None;
+                    }
+                    values
+                        .iter()
+                        .map(|value| {
+                            let name = value.as_str()?;
+                            (!name.trim().is_empty() && name.len() <= 128).then(|| name.to_string())
+                        })
+                        .collect::<Option<Vec<_>>>()
+                });
+                if (matches!(tool.as_str(), "skill" | "discover_skills")
+                    || event.get("admitted_skill_names").is_some())
+                    && admitted_skill_names.is_none()
+                {
+                    accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                    accum.error_message = Some(
+                        "Server tool_request omitted valid skill directory authority".to_string(),
+                    );
+                    return;
+                }
                 let Some(execution_timeout_ms) = execution_timeout_ms else {
                     accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
                     accum.error_message = Some(
@@ -1189,7 +1214,34 @@ fn apply_one_event(
                     );
                     return;
                 }
+                let work_attribution = event
+                    .get("work_attribution")
+                    .map(|value| {
+                        serde_json::from_value::<astra_services::runs::WorkInvocationAttribution>(
+                            value.clone(),
+                        )
+                    })
+                    .transpose();
+                let work_attribution = match work_attribution {
+                    Ok(value)
+                        if value.as_ref().is_none_or(|scope| {
+                            scope
+                                .validate(event.get("run_id").and_then(Value::as_str))
+                                .is_ok()
+                        }) =>
+                    {
+                        value
+                    }
+                    _ => {
+                        accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                        accum.error_message =
+                            Some("Server tool_request has invalid Work attribution".into());
+                        return;
+                    }
+                };
                 edge_pending.push(ChatTurnEdgePending::ToolRequest {
+                    work_attribution,
+                    admitted_skill_names,
                     session_id: event
                         .get("session_id")
                         .and_then(Value::as_str)
@@ -3815,6 +3867,92 @@ mod tests {
                 assert_eq!(args["command"], "echo x");
             }
             _ => panic!("expected ToolRequest"),
+        }
+    }
+
+    #[test]
+    fn tool_request_retains_frozen_work_scope_and_rejects_wrong_producer() {
+        let mut event = serde_json::json!({"type":"tool_request","request_id":"call","run_id":"run",
+            "schema_admitted_by_server":true,"execution_timeout_ms":300000,"command_timeout_cap_ms":30000,
+            "execution_deadline_unix_ms":1700000300000u64,"tool":"bash","args":{"command":"true"},
+            "work_attribution":{"state":"attempt","producer_run_id":"run","binding":{
+                "work_id":"work","branch_id":"branch","item":{"item_id":"item","item_revision":1,"attempt_id":"attempt"}
+            }}
+        });
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), &mut accum, &mut pending);
+        let ChatTurnEdgePending::ToolRequest {
+            work_attribution: Some(scope),
+            ..
+        } = &pending[0]
+        else {
+            panic!("missing scope")
+        };
+        assert_eq!(
+            serde_json::to_value(scope).unwrap(),
+            event["work_attribution"]
+        );
+        event["work_attribution"]["producer_run_id"] = serde_json::json!("foreign");
+        pending.clear();
+        dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), &mut accum, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+    }
+
+    #[test]
+    fn skill_tool_request_requires_bounded_directory_authority() {
+        for tool in ["skill", "discover_skills"] {
+            for (scope, accepted) in [
+                (None, false),
+                (Some(Value::Null), false),
+                (Some(serde_json::json!([1])), false),
+                (Some(serde_json::json!([""])), false),
+                (Some(serde_json::json!(["x".repeat(129)])), false),
+                (Some(serde_json::json!(vec!["skill"; 513])), false),
+                (Some(serde_json::json!([])), true),
+                (Some(serde_json::json!(["review"])), true),
+            ] {
+                let mut event = serde_json::json!({
+                    "type": "tool_request", "request_id": "req-skill",
+                    "schema_admitted_by_server": true,
+                    "execution_timeout_ms": 300000,
+                    "execution_deadline_unix_ms": 1700000300000_u64,
+                    "tool": tool, "args": {}
+                });
+                if let Some(scope) = scope.clone() {
+                    event["admitted_skill_names"] = scope;
+                }
+                let mut accum = ChatTurnSseAccum::default();
+                let mut pending = Vec::new();
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut pending,
+                );
+                assert_eq!(pending.len(), usize::from(accepted), "{tool}: {scope:?}");
+                if accepted {
+                    let ChatTurnEdgePending::ToolRequest {
+                        admitted_skill_names,
+                        ..
+                    } = &pending[0]
+                    else {
+                        panic!("expected tool request")
+                    };
+                    assert_eq!(
+                        serde_json::to_value(admitted_skill_names).unwrap(),
+                        scope.unwrap()
+                    );
+                } else {
+                    assert_eq!(
+                        accum.error_kind,
+                        Some(astra_core::ErrorKind::ContractViolation)
+                    );
+                }
+            }
         }
     }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use astra_services::session_journal::{JournalEvent, JournalWriter};
@@ -24,9 +24,6 @@ pub struct ObservabilityHub {
 
     /// Active sessions.
     sessions: RwLock<HashMap<String, Arc<RwLock<ObservabilitySession>>>>,
-
-    /// High-failure tools surfaced for SelfModel reasoning.
-    low_confidence_tools: Mutex<Vec<(String, f64, u32)>>,
 }
 
 impl Default for ObservabilityHub {
@@ -43,7 +40,6 @@ impl ObservabilityHub {
             profile_manager: UserProfileManager::new(profile_store),
             feedback_signals: FeedbackSignalStore::new(),
             sessions: RwLock::new(HashMap::new()),
-            low_confidence_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -62,7 +58,6 @@ impl ObservabilityHub {
             profile_manager: UserProfileManager::new(profile_store),
             feedback_signals: FeedbackSignalStore::with_storage(feedback_path),
             sessions: RwLock::new(HashMap::new()),
-            low_confidence_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -179,32 +174,6 @@ impl ObservabilityHub {
     /// Observe a tool call (updates profile stats).
     pub fn observe_tool(&self, user_id: &str, tool_name: &str) {
         self.profile_manager.observe_tool(user_id, tool_name);
-    }
-
-    // ─── Low-Confidence Tools (SelfModel Signal) ────────────────────────────
-
-    /// Replace the current high-failure tool list (doesn't append). Also
-    /// mirrors the value into each active session so downstream snapshot
-    /// builders (e.g. SelfModel) can read it via the session handle.
-    pub fn record_low_confidence_tools(&self, entries: Vec<(String, f64, u32)>) {
-        if let Ok(mut guard) = self.low_confidence_tools.lock() {
-            *guard = entries.clone();
-        }
-        if let Ok(sessions) = self.sessions.read() {
-            for session in sessions.values() {
-                if let Ok(mut guard) = session.write() {
-                    guard.low_confidence_tools = entries.clone();
-                }
-            }
-        }
-    }
-
-    /// Get the current high-failure tool list.
-    pub fn low_confidence_tools(&self) -> Vec<(String, f64, u32)> {
-        self.low_confidence_tools
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
     }
 
     /// Return retained feedback signals from oldest to newest.

@@ -330,6 +330,7 @@ pub fn stream_idle_timeout_after_progress() -> std::time::Duration {
 /// Result of executing an edge tool request via the host.
 #[derive(Debug, Clone)]
 pub struct EdgeToolExecResult {
+    pub work_attribution: Option<astra_services::runs::WorkInvocationAttribution>,
     /// Server-owned evidence provenance, never read from tool-result metadata.
     pub execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
     pub request_id: String,
@@ -345,6 +346,9 @@ pub struct EdgeToolExecResult {
 }
 
 impl crate::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResult {
+    fn work_attribution(&self) -> Option<&astra_services::runs::WorkInvocationAttribution> {
+        self.work_attribution.as_ref()
+    }
     fn execution_completion(
         &self,
     ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
@@ -385,6 +389,9 @@ pub struct EdgeApprovalResult {
 /// A tool request bundled for batch execution.
 #[derive(Debug, Clone)]
 pub struct ToolBatchRequest {
+    pub work_attribution: Option<astra_services::runs::WorkInvocationAttribution>,
+    /// Canonical skill directory admitted for this exact invocation.
+    pub admitted_skill_names: Option<Vec<String>>,
     pub session_id: String,
     pub run_id: String,
     pub turn_chain_id: String,
@@ -1594,6 +1601,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     for item in items {
         match item {
             ChatTurnEdgePending::ToolRequest {
+                work_attribution,
+                admitted_skill_names,
                 session_id,
                 run_id,
                 turn_chain_id,
@@ -1623,6 +1632,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     continue;
                 }
                 let request = ToolBatchRequest {
+                    work_attribution,
+                    admitted_skill_names,
                     session_id,
                     run_id,
                     turn_chain_id,
@@ -1636,6 +1647,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 };
                 if let Err(error) = host.on_server_tool_surface_admission(&request) {
                     let result = EdgeToolExecResult {
+                        work_attribution: request.work_attribution.clone(),
+
                         execution_completion: None,
                         request_id: request.request_id,
                         tool: request.tool,
@@ -1804,6 +1817,7 @@ impl SseStreamHost for NoopSseStreamHost {
         let tool = request.tool.as_str();
         let args = &request.args;
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -1963,6 +1977,7 @@ impl SseStreamHost for RecordingSseStreamHost {
             .cloned()
             .unwrap_or_else(|| format!("mock output for {tool}"));
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -2107,6 +2122,7 @@ mod tests {
                 self.token.cancelled().await;
                 self.observed_cancel = true;
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -2259,6 +2275,7 @@ mod tests {
                 self.token.cancelled().await;
                 self.settled = true;
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -2348,6 +2365,7 @@ mod tests {
                 let args = &request.args;
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -2438,6 +2456,7 @@ mod tests {
                 let args = &request.args;
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -3324,6 +3343,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("tool:{request_id}"));
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -3426,6 +3446,7 @@ mod tests {
                 let tool = request.tool.as_str();
                 let args = &request.args;
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -3833,6 +3854,8 @@ mod tests {
 
     fn make_tool_pending(tool: &str) -> ChatTurnEdgePending {
         ChatTurnEdgePending::ToolRequest {
+            work_attribution: None,
+            admitted_skill_names: None,
             session_id: "s1".to_string(),
             run_id: "r1".to_string(),
             turn_chain_id: "c1".to_string(),
@@ -4409,6 +4432,7 @@ mod tests {
                 let tool = request.tool.as_str();
                 let args = &request.args;
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
@@ -4430,6 +4454,7 @@ mod tests {
                 requests
                     .into_iter()
                     .map(|req| EdgeToolExecResult {
+                        work_attribution: None,
                         execution_completion: None,
                         request_id: req.request_id,
                         tool: req.tool,
@@ -4506,7 +4531,7 @@ mod tests {
         // only one \n\n at the end). This simulates them arriving in the
         // same TCP chunk as a single framed event.
         let block = format!(
-            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
+            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"admitted_skill_names\":[\"test-skill\"],\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
             "skill"
         );
         let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(block.into_bytes())];
@@ -4527,6 +4552,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(tool.to_string());
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
@@ -4730,6 +4756,7 @@ mod tests {
                     .unwrap()
                     .push(format!("exec:{request_id}:{tool}"));
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
@@ -4897,6 +4924,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("exec:{rid}:{tool}"));
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: rid.to_string(),
                     tool: tool.to_string(),

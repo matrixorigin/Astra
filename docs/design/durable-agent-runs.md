@@ -367,8 +367,10 @@ vetoes an otherwise authorized recheck. Strict restoration rejects checkpoints
 with that retired field. Existing permissions, execution budgets, and runtime
 policy advisories remain the owners of action control and feedback.
 
+Skill search results are not persisted as a session visibility or authorization set.
+Handoffs carrying the retired `discovered` field are rejected by strict decoding.
 Skill execution facts preserve the instructions already delivered, re-entry and
-auto-route attempt history, pinned/discovered skills, effort and effective sandbox
+auto-route attempt history, pinned skills, effort and effective sandbox
 constraints. They are separate from freshly authorized resolvers and request
 constraints. Reassembly installs those facts without activating the skill again
 or replacing delivered instructions with a newer catalog version. A saved sandbox

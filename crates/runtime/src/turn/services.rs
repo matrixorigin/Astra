@@ -1,29 +1,12 @@
 use crate::data_layer::storage::{
     AUXILIARY_EVENT_COLLISION_SOURCE, AgentEventCaptureAttempt, auxiliary_turn_event_payload_hash,
-    classify_agent_event_capture_attempts, insert_trace_events, touch_agent_session_activity,
-};
-use crate::server::run::lifecycle::{
-    TranscriptPersistItem, TranscriptPersistPayload, append_session_transcript_items_admitted_in_tx,
+    classify_agent_event_capture_attempts, insert_trace_events,
 };
 use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
 use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 use sqlx::Acquire;
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct InMemoryTurnReflectionStateStore {
-    pub(crate) state: Arc<tokio::sync::Mutex<HashMap<String, TurnReflectionMark>>>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct NoopTurnReflectionLessonWriter;
-
-#[derive(Clone, Debug)]
-pub struct DatabaseTurnReflectionLessonWriter {
-    pub(crate) base_url: String,
-    pub(crate) master_key: Option<String>,
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;
@@ -32,35 +15,6 @@ pub(crate) struct NoopTurnObserverWorker;
 pub struct DatabaseTurnObserverWorker {
     pub(crate) base_url: String,
     pub(crate) master_key: Option<String>,
-}
-
-fn validate_tool_lifecycle_event_type(event_type: &str) -> Result<(), String> {
-    if matches!(
-        event_type,
-        "tool_call_started"
-            | "tool_call_completed"
-            | "tool_call_failed"
-            | "tool_call_rejected"
-            | "tool_call_reused"
-            | "tool_call_suppressed"
-            | "tool_call_deferred"
-    ) {
-        Ok(())
-    } else {
-        Err(format!(
-            "non-canonical tool lifecycle event type: {event_type:?}"
-        ))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DatabaseTurnSessionActivityWriter {
-    pool: Option<SharedPool>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DatabaseTurnToolEventWriter {
-    pool: Option<SharedPool>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,47 +30,8 @@ pub struct DatabaseTurnAuxiliaryEventWriter {
 }
 
 #[derive(Clone, Debug)]
-pub struct DatabaseTurnCoreEventWriter {
-    pool: Option<SharedPool>,
-}
-
-#[derive(Clone, Debug)]
 pub struct DatabaseTraceEventWriter {
     pool: Option<SharedPool>,
-}
-
-impl DatabaseTurnSessionActivityWriter {
-    pub fn new(_matrixone: MatrixOneSettings) -> Self {
-        Self { pool: None }
-    }
-    pub fn with_pool(mut self, pool: SharedPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
-        self.pool
-            .as_ref()
-            .map(|p| p.get().clone())
-            .ok_or_else(|| "shared pool not configured".to_string())
-    }
-}
-
-impl DatabaseTurnToolEventWriter {
-    pub fn new(_matrixone: MatrixOneSettings) -> Self {
-        Self { pool: None }
-    }
-    pub fn with_pool(mut self, pool: SharedPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
-        self.pool
-            .as_ref()
-            .map(|p| p.get().clone())
-            .ok_or_else(|| "shared pool not configured".to_string())
-    }
 }
 
 impl DatabaseTurnHookDbWriter {
@@ -166,23 +81,6 @@ impl DatabaseTurnAuxiliaryEventWriter {
     }
 }
 
-impl DatabaseTurnCoreEventWriter {
-    pub fn new(_matrixone: MatrixOneSettings) -> Self {
-        Self { pool: None }
-    }
-    pub fn with_pool(mut self, pool: SharedPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, String> {
-        self.pool
-            .as_ref()
-            .map(|p| p.get().clone())
-            .ok_or_else(|| "shared pool not configured".to_string())
-    }
-}
-
 impl DatabaseTraceEventWriter {
     pub fn new(_matrixone: MatrixOneSettings) -> Self {
         Self { pool: None }
@@ -197,20 +95,6 @@ impl DatabaseTraceEventWriter {
             .as_ref()
             .map(|p| p.get().clone())
             .ok_or_else(|| TraceWriteError::Unavailable("shared pool not configured".to_string()))
-    }
-}
-
-fn record_session_event_delta(
-    deltas: &mut std::collections::BTreeMap<(String, String), (i64, Option<String>)>,
-    event: &TurnCoreEventRecord,
-    last_event_id: Option<&str>,
-) {
-    let entry = deltas
-        .entry((event.user_id.clone(), event.session_id.clone()))
-        .or_default();
-    entry.0 += 1;
-    if let Some(last_event_id) = last_event_id {
-        entry.1 = Some(last_event_id.to_string());
     }
 }
 
@@ -293,57 +177,6 @@ async fn apply_touched_session_deltas_in_tx(
     Ok(())
 }
 
-fn transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersistItem> {
-    let role = match event.event_type.as_str() {
-        "user_query" => "user",
-        "llm_response" => "assistant",
-        // Runtime reconciliation is durable evidence, not a user utterance.
-        // Its visible assistant result is still materialized by the paired
-        // `llm_response` event below.
-        _ => return None,
-    };
-    // Tool-only model rounds intentionally have no user-visible assistant
-    // text. Persist their typed tool events, but do not materialize a blank
-    // transcript row on every continuation.
-    if role == "assistant"
-        && event.content.trim().is_empty()
-        && event
-            .reasoning_content
-            .as_deref()
-            .is_none_or(|reasoning| reasoning.trim().is_empty())
-    {
-        return None;
-    }
-    let payload = event
-        .reasoning_content
-        .as_ref()
-        .filter(|reasoning| !reasoning.trim().is_empty())
-        .map(|reasoning| TranscriptPersistPayload {
-            reasoning: Some(reasoning.clone()),
-            reasoning_status: Some("completed".to_string()),
-            ..Default::default()
-        });
-    Some(TranscriptPersistItem {
-        // CLI turns use local runtime identities, not durable
-        // `agent_runs` rows. A NULL run_id keeps them visible in both the
-        // session transcript and its root-conversation projection.
-        run_id: None,
-        role,
-        content: event.content.clone(),
-        payload,
-        source_event_id: event.event_id.clone(),
-    })
-}
-
-impl DatabaseTurnReflectionLessonWriter {
-    pub fn new(base_url: String, master_key: Option<String>) -> Self {
-        Self {
-            base_url,
-            master_key,
-        }
-    }
-}
-
 impl DatabaseTurnObserverWorker {
     pub fn new(base_url: String, master_key: Option<String>) -> Self {
         Self {
@@ -393,159 +226,6 @@ fn reserve_memory_extraction_payload(
         astra_core::history_work::HistoryWorkSite::MemoryExtractionQueue,
         payload.len().try_into().unwrap_or(u64::MAX),
     )
-}
-
-#[async_trait]
-impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
-    async fn persist(&self, plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String> {
-        if plan.user_query_event.is_none()
-            && plan.llm_response_event.is_none()
-            && plan.snapshot_link_plan.is_none()
-        {
-            return Ok(TurnCorePersistOutcome::default());
-        }
-        let pool = self.get_pool()?;
-        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|error| error.to_string())?;
-        let transcript_owner = plan
-            .user_query_event
-            .as_ref()
-            .or(plan.llm_response_event.as_ref())
-            .map(|event| (event.user_id.clone(), event.session_id.clone()));
-        if let (Some(user), Some(assistant)) = (
-            plan.user_query_event.as_ref(),
-            plan.llm_response_event.as_ref(),
-        ) && (user.user_id != assistant.user_id || user.session_id != assistant.session_id)
-        {
-            return Err("core turn events must share one transcript owner/session".to_string());
-        }
-        admit_event_owners_in_tx(&mut tx, transcript_owner.clone()).await?;
-        let mut deltas =
-            std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
-        let mut transcript_items = Vec::new();
-        let mut collision_detected = false;
-        if let Some(event) = plan.user_query_event.as_ref() {
-            let capture = insert_core_turn_event(&mut tx, event)
-                .await
-                .map_err(|error| error.to_string())?;
-            if capture == DurableCaptureOutcome::Inserted {
-                record_session_event_delta(&mut deltas, event, Some(&event.event_id));
-            }
-            if matches!(
-                capture,
-                DurableCaptureOutcome::Inserted | DurableCaptureOutcome::Replayed
-            ) {
-                transcript_items.extend(transcript_item(event));
-            }
-            collision_detected |= matches!(capture, DurableCaptureOutcome::Collision { .. });
-        }
-        let mut llm_response_event_id = None;
-        if let Some(event) = plan.llm_response_event.as_ref() {
-            let capture = insert_core_turn_event(&mut tx, event)
-                .await
-                .map_err(|error| error.to_string())?;
-            if capture == DurableCaptureOutcome::Inserted {
-                record_session_event_delta(&mut deltas, event, Some(&event.event_id));
-            }
-            if matches!(
-                capture,
-                DurableCaptureOutcome::Inserted | DurableCaptureOutcome::Replayed
-            ) {
-                transcript_items.extend(transcript_item(event));
-                llm_response_event_id = Some(event.event_id.clone());
-            }
-            collision_detected |= matches!(capture, DurableCaptureOutcome::Collision { .. });
-        }
-        if let Some((user_id, session_id)) = transcript_owner
-            && !transcript_items.is_empty()
-        {
-            append_session_transcript_items_admitted_in_tx(
-                &mut tx,
-                &user_id,
-                &session_id,
-                &transcript_items,
-            )
-            .await
-            .map_err(|error| format!("persist transcript items: {error}"))?;
-        }
-        apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
-        tx.commit().await.map_err(|error| error.to_string())?;
-        connection.release();
-        if !collision_detected
-            && let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
-            && let Err(error) = update_snapshot_llm_ids(&pool, snapshot_link_plan).await
-        {
-            astra_core::agent_error!("turn", "snapshot link update failed: {error}");
-        }
-        let outcome = TurnCorePersistOutcome {
-            llm_response_event_id,
-        };
-        Ok(outcome)
-    }
-}
-
-#[async_trait]
-impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
-    async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String> {
-        if plan.events.is_empty() {
-            return Ok(());
-        }
-        for event in &plan.events {
-            validate_tool_lifecycle_event_type(&event.event_type)?;
-        }
-        let pool = self.get_pool()?;
-        let skill_versions = resolve_active_skill_versions(
-            &pool,
-            plan.events
-                .iter()
-                .filter_map(|event| event.skill_name.as_deref())
-                .collect(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|error| error.to_string())?;
-        admit_event_owners_in_tx(
-            &mut tx,
-            plan.events
-                .iter()
-                .map(|event| (event.user_id.clone(), event.session_id.clone())),
-        )
-        .await?;
-        let mut deltas = SessionEventDeltas::new();
-        for event in &plan.events {
-            if insert_tool_turn_event(
-                &mut tx,
-                event,
-                skill_versions.get(event.skill_name.as_deref().unwrap_or("")),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            {
-                let entry = deltas
-                    .entry((event.user_id.clone(), event.session_id.clone()))
-                    .or_default();
-                entry.0 += 1;
-                entry.1 = Some(event.event_id.clone());
-            }
-        }
-        apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
-        tx.commit().await.map_err(|error| error.to_string())?;
-        connection.release();
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -747,28 +427,6 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
 }
 
 #[async_trait]
-impl TurnReflectionStateStore for InMemoryTurnReflectionStateStore {
-    async fn mark_reflecting(&self, mark: TurnReflectionMark) -> Result<(), String> {
-        self.state
-            .lock()
-            .await
-            .insert(mark.session_id.clone(), mark);
-        Ok(())
-    }
-
-    async fn pop_reflecting(&self, session_id: &str) -> Result<Option<TurnReflectionMark>, String> {
-        Ok(self.state.lock().await.remove(session_id))
-    }
-}
-
-#[async_trait]
-impl TurnReflectionLessonWriter for NoopTurnReflectionLessonWriter {
-    async fn persist_lesson(&self, _lesson: TurnReflectionLessonRecord) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
     async fn run(&self, _request: TurnObserverRequest) -> Result<(), String> {
         Ok(())
@@ -813,45 +471,6 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         } else {
             Err(format!(
                 "memoria observer run failed: status={}",
-                response.status()
-            ))
-        }
-    }
-}
-
-#[async_trait]
-impl TurnReflectionLessonWriter for DatabaseTurnReflectionLessonWriter {
-    async fn persist_lesson(&self, lesson: TurnReflectionLessonRecord) -> Result<(), String> {
-        let Some(master_key) = self.master_key.as_ref() else {
-            return Ok(());
-        };
-        let payload = serde_json::json!({
-            "content": lesson.content,
-            "memory_type": "procedural",
-            "trust_tier": "T3",
-            "session_id": lesson.session_id,
-        });
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|error| error.to_string())?
-            .post(format!(
-                "{}/v1/memories",
-                self.base_url.trim_end_matches('/')
-            ))
-            .header("Authorization", format!("Bearer {master_key}"))
-            .header("X-Impersonate-User", lesson.user_id)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "memoria lesson persist failed: status={}",
                 response.status()
             ))
         }
@@ -959,58 +578,6 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
         connection.release();
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl TurnSessionActivityWriter for DatabaseTurnSessionActivityWriter {
-    async fn update_session_activity(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        plan: SessionActivityUpdatePlan,
-    ) -> Result<(), String> {
-        let pool = self.get_pool()?;
-        touch_agent_session_activity(&pool, session_id, user_id, plan.last_event_id.as_deref())
-            .await
-            .map_err(|error| error.to_string())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct NoopTurnSessionActivityWriter;
-
-#[async_trait]
-impl TurnSessionActivityWriter for NoopTurnSessionActivityWriter {
-    async fn update_session_activity(
-        &self,
-        _session_id: &str,
-        _user_id: &str,
-        _plan: SessionActivityUpdatePlan,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct NoopTurnCoreEventWriter;
-
-#[async_trait]
-impl TurnCoreEventWriter for NoopTurnCoreEventWriter {
-    async fn persist(&self, plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String> {
-        Ok(TurnCorePersistOutcome {
-            llm_response_event_id: plan.llm_response_event.map(|event| event.event_id),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct NoopTurnToolEventWriter;
-
-#[async_trait]
-impl TurnToolEventWriter for NoopTurnToolEventWriter {
-    async fn persist(&self, _plan: TurnToolEventPersistPlan) -> Result<(), String> {
         Ok(())
     }
 }
@@ -1160,141 +727,8 @@ mod tests {
         assert!(metadata_tool_name(Some(&v)).is_none());
     }
 
-    #[test]
-    fn tool_event_writer_accepts_only_canonical_lifecycle_types() {
-        for event_type in [
-            "tool_call_started",
-            "tool_call_completed",
-            "tool_call_failed",
-            "tool_call_rejected",
-            "tool_call_reused",
-            "tool_call_suppressed",
-            "tool_call_deferred",
-        ] {
-            assert!(validate_tool_lifecycle_event_type(event_type).is_ok());
-        }
-        for event_type in ["tool_call", "tool_result", "tool_error", ""] {
-            assert!(validate_tool_lifecycle_event_type(event_type).is_err());
-        }
-    }
-
-    #[test]
-    fn transcript_projection_excludes_runtime_envelope_but_keeps_reply() {
-        let user = core_event(
-            "user-event",
-            "user-1",
-            "session-1",
-            "chain-1",
-            "user_query",
-            "real user input",
-            None,
-        );
-        let runtime = core_event(
-            "runtime-event",
-            "user-1",
-            "session-1",
-            "chain-2",
-            "runtime_reconciliation",
-            astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE,
-            None,
-        );
-        let response = core_event(
-            "response-event",
-            "user-1",
-            "session-1",
-            "chain-2",
-            "llm_response",
-            "reconciled result",
-            Some("runtime-event"),
-        );
-
-        let user_item = transcript_item(&user).expect("human input transcript item");
-        assert_eq!(user_item.role, "user");
-        assert_eq!(user_item.content, "real user input");
-        assert!(user_item.run_id.is_none());
-        assert!(transcript_item(&runtime).is_none());
-        let response_item = transcript_item(&response).expect("runtime reply transcript item");
-        assert_eq!(response_item.role, "assistant");
-        assert_eq!(response_item.content, "reconciled result");
-    }
-
-    #[test]
-    fn transcript_projection_skips_blank_tool_only_model_rounds() {
-        let response = core_event(
-            "response-event",
-            "user-1",
-            "session-1",
-            "chain-1",
-            "llm_response",
-            "  ",
-            Some("user-event"),
-        );
-
-        assert!(transcript_item(&response).is_none());
-    }
-
-    fn core_event(
-        event_id: &str,
-        user_id: &str,
-        session_id: &str,
-        causal_chain_id: &str,
-        event_type: &str,
-        content: &str,
-        parent_event_id: Option<&str>,
-    ) -> TurnCoreEventRecord {
-        TurnCoreEventRecord {
-            event_id: event_id.to_string(),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            run_id: None,
-            agent_id: None,
-            event_type: event_type.to_string(),
-            content: content.to_string(),
-            parent_event_id: parent_event_id.map(str::to_string),
-            parent_event_ids: parent_event_id
-                .map(|id| vec![id.to_string()])
-                .unwrap_or_default(),
-            causal_chain_id: causal_chain_id.to_string(),
-            turn_seq: Some(1),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        }
-    }
-
     fn trace_event(event_id: &str, user_id: &str, session_id: &str) -> TraceEvent {
         TraceEvent::new(event_id, session_id, user_id, "trace", "runtime")
-    }
-
-    fn tool_event(
-        event_id: &str,
-        user_id: &str,
-        session_id: &str,
-        causal_chain_id: &str,
-        event_type: &str,
-        content: &str,
-        parent_event_id: Option<&str>,
-    ) -> TurnToolEventRecord {
-        TurnToolEventRecord {
-            event_id: event_id.to_string(),
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-            run_id: None,
-            tool_call_id: None,
-            agent_id: None,
-            event_type: event_type.to_string(),
-            content: content.to_string(),
-            parent_event_id: parent_event_id.map(str::to_string),
-            parent_event_ids: parent_event_id
-                .map(|id| vec![id.to_string()])
-                .unwrap_or_default(),
-            causal_chain_id: causal_chain_id.to_string(),
-            metadata: None,
-            skill_name: None,
-            skill_version: None,
-            reasoning_content: None,
-        }
     }
 
     fn auxiliary_event(
@@ -1325,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn turn_event_writers_increment_event_count_by_insert_delta_on_live_matrixone() {
+    async fn auxiliary_events_increment_event_count_by_insert_delta_on_live_matrixone() {
         let shared = setup_live_pool_for_test().await;
         let pool = shared.get().clone();
         let settings = MatrixOneSettings::from_env();
@@ -1333,10 +767,6 @@ mod tests {
         let session_id = format!("turn-writer-{suffix}");
         let user_id = format!("user-{suffix}");
         let causal_chain_id = format!("chain-{suffix}");
-        let core_user_event_id = format!("core-user-{suffix}");
-        let core_response_event_id = format!("core-response-{suffix}");
-        let tool_duplicate_event_id = format!("tool-dup-{suffix}");
-        let tool_unique_event_id = format!("tool-unique-{suffix}");
         let aux_duplicate_event_id = format!("aux-dup-{suffix}");
         let aux_unique_event_id = format!("aux-unique-{suffix}");
 
@@ -1350,86 +780,6 @@ mod tests {
         .await
         .expect("insert session");
 
-        let core_writer =
-            DatabaseTurnCoreEventWriter::new(settings.clone()).with_pool(shared.clone());
-        core_writer
-            .persist(TurnCorePersistPlan {
-                user_query_event: Some(core_event(
-                    &core_user_event_id,
-                    &user_id,
-                    &session_id,
-                    &causal_chain_id,
-                    "user_query",
-                    "hello",
-                    None,
-                )),
-                llm_response_event: Some(core_event(
-                    &core_response_event_id,
-                    &user_id,
-                    &session_id,
-                    &causal_chain_id,
-                    "llm_response",
-                    "world",
-                    Some(&core_user_event_id),
-                )),
-                snapshot_link_plan: None,
-            })
-            .await
-            .expect("persist core events");
-        core_writer
-            .persist(TurnCorePersistPlan {
-                user_query_event: Some(core_event(
-                    &core_user_event_id,
-                    &user_id,
-                    &session_id,
-                    &causal_chain_id,
-                    "user_query",
-                    "duplicate",
-                    None,
-                )),
-                llm_response_event: None,
-                snapshot_link_plan: None,
-            })
-            .await
-            .expect("persist duplicate core event");
-
-        let tool_writer =
-            DatabaseTurnToolEventWriter::new(settings.clone()).with_pool(shared.clone());
-        tool_writer
-            .persist(TurnToolEventPersistPlan {
-                events: vec![
-                    tool_event(
-                        &tool_duplicate_event_id,
-                        &user_id,
-                        &session_id,
-                        &causal_chain_id,
-                        "tool_call_started",
-                        "first duplicate",
-                        Some(&core_response_event_id),
-                    ),
-                    tool_event(
-                        &tool_duplicate_event_id,
-                        &user_id,
-                        &session_id,
-                        &causal_chain_id,
-                        "tool_call_started",
-                        "second duplicate",
-                        Some(&core_response_event_id),
-                    ),
-                    tool_event(
-                        &tool_unique_event_id,
-                        &user_id,
-                        &session_id,
-                        &causal_chain_id,
-                        "tool_call_completed",
-                        "unique",
-                        Some(&tool_duplicate_event_id),
-                    ),
-                ],
-            })
-            .await
-            .expect("persist tool events");
-
         let aux_writer =
             DatabaseTurnAuxiliaryEventWriter::new(settings.clone()).with_pool(shared.clone());
         aux_writer
@@ -1441,7 +791,7 @@ mod tests {
                     &causal_chain_id,
                     "system_note",
                     "first duplicate",
-                    Some(&tool_unique_event_id),
+                    None,
                 ),
                 auxiliary_event(
                     &aux_duplicate_event_id,
@@ -1450,7 +800,7 @@ mod tests {
                     &causal_chain_id,
                     "system_note",
                     "second duplicate",
-                    Some(&tool_unique_event_id),
+                    None,
                 ),
                 auxiliary_event(
                     &aux_unique_event_id,
@@ -1464,18 +814,18 @@ mod tests {
             ])
             .await
             .expect("persist auxiliary events");
-
-        DatabaseTurnSessionActivityWriter::new(settings)
-            .with_pool(shared.clone())
-            .update_session_activity(
-                &session_id,
+        aux_writer
+            .persist_events(vec![auxiliary_event(
+                &aux_duplicate_event_id,
                 &user_id,
-                SessionActivityUpdatePlan {
-                    last_event_id: Some(aux_unique_event_id.clone()),
-                },
-            )
+                &session_id,
+                &causal_chain_id,
+                "system_note",
+                "first duplicate",
+                None,
+            )])
             .await
-            .expect("touch session activity");
+            .expect("exact replay must not increment the count or replace the tail");
 
         let row = sqlx::query(
             "SELECT event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
@@ -1488,7 +838,7 @@ mod tests {
         assert_eq!(
             row.try_get::<i64, _>("event_count")
                 .expect("decode event_count"),
-            6,
+            2,
             "writers must add only actual inserted rows; duplicate INSERT IGNORE rows must not bump"
         );
         assert_eq!(
@@ -1507,7 +857,7 @@ mod tests {
         .expect("count persisted events")
         .try_get::<i64, _>("c")
         .expect("decode event count");
-        assert_eq!(actual_events, 6);
+        assert_eq!(actual_events, 2);
 
         let collision_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM observation_identity_collisions \
@@ -1518,8 +868,8 @@ mod tests {
         .await
         .expect("count hash-fenced writer collisions");
         assert_eq!(
-            collision_count, 3,
-            "changed core, tool, and auxiliary stable IDs must be classified as collisions"
+            collision_count, 1,
+            "changed auxiliary stable IDs must be classified as collisions"
         );
 
         sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
@@ -1527,6 +877,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup event writer collision receipts");
+        sqlx::query("DELETE FROM agent_event_edges WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup auxiliary fixture event edges");
         sqlx::query("DELETE FROM agent_events WHERE session_id = ? AND user_id = ?")
             .bind(&session_id)
             .bind(&user_id)
@@ -1539,217 +895,6 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup event count fixture agent_sessions");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-    async fn core_event_collision_does_not_link_snapshot_or_attribute_response_but_replay_repairs()
-    {
-        let shared = setup_live_pool_for_test().await;
-        let pool = shared.get().clone();
-        let settings = MatrixOneSettings::from_env();
-        let suffix = Uuid::new_v4().to_string();
-        let session_id = format!("core-collision-session-{suffix}");
-        let user_id = format!("core-collision-user-{suffix}");
-        let causal_chain_id = format!("core-collision-chain-{suffix}");
-        let response_event_id = format!("core-collision-response-{suffix}");
-        let context_capture_id = Uuid::new_v4().to_string();
-
-        sqlx::query(
-            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-             VALUES (?, ?, 'core-collision-it', 'active', 0)",
-        )
-        .bind(&session_id)
-        .bind(&user_id)
-        .execute(&pool)
-        .await
-        .expect("insert core collision session");
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, context_data) \
-             VALUES (?, ?, ?, ?, CAST('{}' AS JSON))",
-        )
-        .bind(&context_capture_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&response_event_id)
-        .execute(&pool)
-        .await
-        .expect("insert core collision snapshot");
-
-        let original = core_event(
-            &response_event_id,
-            &user_id,
-            &session_id,
-            &causal_chain_id,
-            "llm_response",
-            "original durable response",
-            None,
-        );
-        let writer = DatabaseTurnCoreEventWriter::new(settings).with_pool(shared);
-        writer
-            .persist(TurnCorePersistPlan {
-                user_query_event: None,
-                llm_response_event: Some(original.clone()),
-                snapshot_link_plan: None,
-            })
-            .await
-            .expect("seed original response event");
-        sqlx::query(
-            "DELETE FROM session_transcript_items \
-             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&response_event_id)
-        .execute(&pool)
-        .await
-        .expect("remove seeded response transcript");
-
-        let snapshot_link_plan = SnapshotLinkPlan {
-            context_capture_id: context_capture_id.clone(),
-            user_id: user_id.clone(),
-            llm_request_id: "attempted-request".to_string(),
-            llm_response_id: Some(response_event_id.clone()),
-        };
-        let collision = writer
-            .persist(TurnCorePersistPlan {
-                user_query_event: None,
-                llm_response_event: Some(TurnCoreEventRecord {
-                    content: "conflicting attempted response".to_string(),
-                    ..original.clone()
-                }),
-                snapshot_link_plan: Some(snapshot_link_plan.clone()),
-            })
-            .await
-            .expect("record response collision receipt");
-        assert_eq!(
-            collision.llm_response_event_id, None,
-            "a rejected response payload must not be reported as durably attributed"
-        );
-        let snapshot_after_collision = sqlx::query(
-            "SELECT llm_request_id, llm_response_id FROM ctx_snapshots \
-             WHERE context_capture_id = ? AND user_id = ?",
-        )
-        .bind(&context_capture_id)
-        .bind(&user_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read snapshot after collision");
-        assert_eq!(
-            snapshot_after_collision
-                .try_get::<Option<String>, _>("llm_request_id")
-                .unwrap(),
-            None,
-            "a collision must not apply its snapshot link plan"
-        );
-        assert_eq!(
-            snapshot_after_collision
-                .try_get::<Option<String>, _>("llm_response_id")
-                .unwrap(),
-            None
-        );
-        let transcript_after_collision: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_transcript_items \
-             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&response_event_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count transcript after collision");
-        assert_eq!(transcript_after_collision, 0);
-
-        let replay = writer
-            .persist(TurnCorePersistPlan {
-                user_query_event: None,
-                llm_response_event: Some(original),
-                snapshot_link_plan: Some(SnapshotLinkPlan {
-                    llm_request_id: "replayed-request".to_string(),
-                    ..snapshot_link_plan
-                }),
-            })
-            .await
-            .expect("repair exact response replay");
-        assert_eq!(
-            replay.llm_response_event_id.as_deref(),
-            Some(response_event_id.as_str())
-        );
-        let repaired_snapshot = sqlx::query(
-            "SELECT llm_request_id, llm_response_id FROM ctx_snapshots \
-             WHERE context_capture_id = ? AND user_id = ?",
-        )
-        .bind(&context_capture_id)
-        .bind(&user_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read replay-repaired snapshot");
-        assert_eq!(
-            repaired_snapshot
-                .try_get::<Option<String>, _>("llm_request_id")
-                .unwrap()
-                .as_deref(),
-            Some("replayed-request")
-        );
-        assert_eq!(
-            repaired_snapshot
-                .try_get::<Option<String>, _>("llm_response_id")
-                .unwrap()
-                .as_deref(),
-            Some(response_event_id.as_str())
-        );
-        let repaired_content: String = sqlx::query_scalar(
-            "SELECT content FROM session_transcript_items \
-             WHERE user_id = ? AND session_id = ? AND source_event_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&response_event_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read replay-repaired transcript");
-        assert_eq!(repaired_content, "original durable response");
-        let collision_receipts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM observation_identity_collisions \
-             WHERE user_id = ? AND identity_kind = 'agent_event' AND identity_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&response_event_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count durable core collision receipts");
-        assert_eq!(collision_receipts, 1);
-
-        for statement in [
-            "DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
-            "DELETE FROM agent_event_edges WHERE user_id = ? AND session_id = ?",
-            "DELETE FROM agent_events WHERE user_id = ? AND session_id = ?",
-        ] {
-            sqlx::query(statement)
-                .bind(&user_id)
-                .bind(&session_id)
-                .execute(&pool)
-                .await
-                .expect("cleanup core collision fixture");
-        }
-        sqlx::query("DELETE FROM observation_identity_collisions WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup core collision receipt");
-        sqlx::query("DELETE FROM ctx_snapshots WHERE context_capture_id = ? AND user_id = ?")
-            .bind(&context_capture_id)
-            .bind(&user_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup core collision snapshot");
-        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&user_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup core collision session");
     }
 
     #[tokio::test]
@@ -1943,7 +1088,7 @@ mod tests {
         .expect("cleanup admitted-trace owner sessions");
     }
 
-    /// Verify that all Database*Writer structs fail instantly when no pool is
+    /// Verify that the retained writers fail instantly when no pool is
     /// configured, rather than blocking on a 2s connect_matrixone() timeout.
     #[tokio::test]
     async fn no_pool_writers_fail_fast_without_timeout() {
@@ -1964,63 +1109,10 @@ mod tests {
 
         let start = Instant::now();
 
-        // CoreEventWriter
-        let w = DatabaseTurnCoreEventWriter::new(settings.clone());
-        let r = w
-            .persist(TurnCorePersistPlan {
-                user_query_event: Some(TurnCoreEventRecord {
-                    event_id: "e1".into(),
-                    user_id: "u".into(),
-                    session_id: "s".into(),
-                    run_id: None,
-                    agent_id: None,
-                    event_type: "user_query".into(),
-                    content: "hi".into(),
-                    parent_event_id: None,
-                    parent_event_ids: vec![],
-                    causal_chain_id: "c".into(),
-                    turn_seq: Some(1),
-                    llm_model_used: None,
-                    token_usage: None,
-                    llm_params: None,
-                    reasoning_content: None,
-                }),
-                llm_response_event: None,
-                snapshot_link_plan: None,
-            })
-            .await;
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("not configured"));
-
         // An empty hook must succeed without even a configured pool.
         let w = DatabaseTurnHookDbWriter::new(settings.clone());
         let r = w.persist(TurnHookDbPersistPlan::default()).await;
         assert!(r.is_ok());
-
-        // ToolEventWriter
-        let w = DatabaseTurnToolEventWriter::new(settings.clone());
-        let r = w
-            .persist(TurnToolEventPersistPlan {
-                events: vec![TurnToolEventRecord {
-                    event_id: "e3".into(),
-                    user_id: "u".into(),
-                    session_id: "s".into(),
-                    run_id: None,
-                    tool_call_id: None,
-                    agent_id: None,
-                    event_type: "tool_call_started".into(),
-                    content: "x".into(),
-                    parent_event_id: None,
-                    parent_event_ids: vec![],
-                    causal_chain_id: "c".into(),
-                    metadata: None,
-                    skill_name: None,
-                    skill_version: None,
-                    reasoning_content: None,
-                }],
-            })
-            .await;
-        assert!(r.is_err());
 
         // AuxiliaryEventWriter
         let w = DatabaseTurnAuxiliaryEventWriter::new(settings.clone());
@@ -2041,20 +1133,7 @@ mod tests {
             .await;
         assert!(r.is_err());
 
-        // SessionActivityWriter
-        let w = DatabaseTurnSessionActivityWriter::new(settings);
-        let r = w
-            .update_session_activity(
-                "s",
-                "u",
-                SessionActivityUpdatePlan {
-                    last_event_id: Some("e5".into()),
-                },
-            )
-            .await;
-        assert!(r.is_err());
-
-        // All 5 must complete in <100ms (previously each took 2s)
+        // Remaining writers must complete in <100ms (previously each took 2s)
         assert!(
             start.elapsed().as_millis() < 100,
             "no-pool writers took {}ms — should be instant",

@@ -333,7 +333,8 @@ async fn prepare_remote_request(
     if let Some(resolver) = state.skills.resolver.as_ref() {
         let skills = resolver.available_skills();
         if !skills.is_empty() {
-            host.inject_tool_schema(astra_runtime::turn::skill_tool::skill_tool_schema_v2());
+            host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+            host.inject_tool_schema(astra_tools::schemas::discover_skills_tool_schema());
             let edge_skills = skills.iter().map(|skill| json!({"name":skill.name,"version":null,"description":skill.description,"when_to_use":skill.when_to_use,"aliases":skill.aliases})).collect::<Vec<_>>();
             state.skills.listing_message = astra_runtime::prompts::build_skill_listing_section_with_context_window_and_caps(&skills,
                 (state.max_turn_input_tokens > 0).then_some(state.max_turn_input_tokens.saturating_mul(10).div_ceil(8).min(u64::from(u32::MAX)) as u32),

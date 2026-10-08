@@ -67,10 +67,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub agent_binding_registry: AgentBindingRegistryConfig,
 
-    /// Budget policy for auto-expansion based on outcome streaks.
-    #[serde(default)]
-    pub budget_policy: Option<BudgetPolicyConfig>,
-
     /// Explain Analyze presentation and capture preferences.
     #[serde(default)]
     pub explain: ExplainConfig,
@@ -169,44 +165,6 @@ impl ExplainConfig {
     /// Resolve the format used for the next report publication.
     pub fn effective_report_format(&self) -> ExplainReportFormat {
         self.report_format.unwrap_or_default()
-    }
-}
-
-// ─── Budget Policy Configuration ────────────────────────────────────────────
-
-/// User-configurable budget policy parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BudgetPolicyConfig {
-    /// Expand budget after this many consecutive rounds with observable outcome.
-    #[serde(default = "default_expand_after_consecutive_outcomes")]
-    pub expand_after_consecutive_outcomes: u32,
-
-    /// Multiply current max rounds by this factor on expansion.
-    #[serde(default = "default_expand_factor")]
-    pub expand_factor: f64,
-
-    /// Absolute ceiling: budget never exceeds this regardless of expansions.
-    #[serde(default = "default_max_ceiling")]
-    pub max_ceiling: u32,
-}
-
-fn default_expand_after_consecutive_outcomes() -> u32 {
-    2
-}
-fn default_expand_factor() -> f64 {
-    1.5
-}
-fn default_max_ceiling() -> u32 {
-    1000
-}
-
-impl Default for BudgetPolicyConfig {
-    fn default() -> Self {
-        Self {
-            expand_after_consecutive_outcomes: default_expand_after_consecutive_outcomes(),
-            expand_factor: default_expand_factor(),
-            max_ceiling: default_max_ceiling(),
-        }
     }
 }
 
@@ -346,7 +304,6 @@ impl Default for RuntimeConfig {
             tool_surface: ToolSurfaceConfig::default(),
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
-            budget_policy: None,
             explain: ExplainConfig::default(),
         }
     }
@@ -1500,7 +1457,12 @@ mod tests {
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("max_history_tokens"));
         assert!(toml.contains("retrieval_top_k"));
-        for retired in ["token_budget", "tool_selection", "fork_prefix"] {
+        for retired in [
+            "token_budget",
+            "tool_selection",
+            "fork_prefix",
+            "budget_policy",
+        ] {
             assert!(!toml.contains(retired));
             assert!(toml::from_str::<RuntimeConfig>(&format!("[{retired}]\n")).is_err());
             assert!(
@@ -1572,16 +1534,14 @@ mod tests {
             "compression":{"preserve_tool_calls":false},
             "tool_surface":{"pinned_tools":["read_file"]},
             "runtime_limits":{"max_turns":20},
-            "trace":{"sampling_rate":0.5},
-            "budget_policy":{"expand_after_consecutive_outcomes":4,"expand_factor":2.0,"max_ceiling":1200}
+            "trace":{"sampling_rate":0.5}
         }"#).unwrap().apply_to(&RuntimeConfig::default()).unwrap();
         let higher = RuntimeConfigLayer::from_json(
             r#"{
             "memory":{"retrieval_top_k":5,"include_repository_memories":true},
             "compression":{"preserve_tool_calls":true},
             "tool_surface":{"pinned_tools":[]},
-            "runtime_limits":{"max_turns":0},
-            "budget_policy":{"max_ceiling":800}
+            "runtime_limits":{"max_turns":0}
         }"#,
         )
         .unwrap()
@@ -1594,15 +1554,6 @@ mod tests {
         assert!(higher.tool_surface.pinned_tools.is_empty());
         assert_eq!(higher.runtime_limits.max_turns, 0);
         assert_eq!(higher.trace.sampling_rate, 0.5);
-        let policy = higher.budget_policy.as_ref().unwrap();
-        assert_eq!(policy.expand_after_consecutive_outcomes, 4);
-        assert_eq!(policy.expand_factor, 2.0);
-        assert_eq!(policy.max_ceiling, 800);
-        let cleared = RuntimeConfigLayer::from_json(r#"{"budget_policy":null}"#)
-            .unwrap()
-            .apply_to(&higher)
-            .unwrap();
-        assert!(cleared.budget_policy.is_none());
     }
 
     #[test]

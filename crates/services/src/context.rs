@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
-use crate::storage::{agent_event_exists_for_user_session, agent_session_exists_for_user};
+use crate::storage::agent_session_exists_for_user;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -243,21 +243,6 @@ impl ContextService for DatabaseContextService {
                 format!("Session {} not found", request.session_id),
             ));
         }
-        if !agent_event_exists_for_user_session(
-            &pool,
-            &request.event_id,
-            &request.session_id,
-            &user_id,
-        )
-        .await
-        .map_err(internal_error)?
-        {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Event {} not found", request.event_id),
-            ));
-        }
-
         let capture_id = Uuid::new_v4().to_string();
         let data_str = request.context_data.to_string();
 
@@ -274,19 +259,29 @@ impl ContextService for DatabaseContextService {
             ));
         }
 
-        query(
+        // Bind the snapshot to the exact accepted event in the write itself.
+        // An input/tool anchor does not identify a later model response.
+        let inserted = query(
             "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, context_data, created_at) \
-             VALUES (?, ?, ?, ?, ?, NOW())",
+             (context_capture_id, user_id, session_id, event_id, llm_response_id, context_data, created_at) \
+             SELECT ?, e.user_id, e.session_id, e.event_id, \
+                    CASE WHEN e.event_type = 'llm_response' THEN e.event_id ELSE NULL END, ?, NOW() \
+             FROM agent_events e WHERE e.event_id = ? AND e.session_id = ? AND e.user_id = ? LIMIT 1",
         )
         .bind(&capture_id)
-        .bind(&user_id)
-        .bind(&request.session_id)
-        .bind(&request.event_id)
         .bind(&data_str)
+        .bind(&request.event_id)
+        .bind(&request.session_id)
+        .bind(&user_id)
         .execute(&pool)
         .await
         .map_err(internal_error)?;
+        if inserted.rows_affected() == 0 {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Event {} not found", request.event_id),
+            ));
+        }
 
         let select_sql = format!(
             "SELECT {} FROM ctx_snapshots WHERE context_capture_id = ? AND user_id = ?",

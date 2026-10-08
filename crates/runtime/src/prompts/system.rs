@@ -611,22 +611,21 @@ fn output_format_section() -> &'static str {
      - **Search results**: cite file:line and quote only the key lines.\n\
      - **Build/test output**: report pass/fail/errors. A smoke check proves its slice; state scope/unverified unless broader acceptance ran.\n\
      - **Multiple findings**: use a list or table.\n\
-     - **NEVER repeat a summary/report.**\n\
-     - **Ask the user only for real decisions.** Use `ask_user` only when visible or activated; otherwise ask in your normal response.\n"
+     - **NEVER repeat a summary/report.**\n"
 }
 
 /// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
      ### Retry Budget\n\
-     Fix the cause and retry ONCE, then change path or ask.\n\
+     Fix the cause and retry ONCE, then use a permitted path or report the blocker.\n\
      - **File not found**: confirm; never guess variants.\n\
      - **Tool schema or argument error**: follow the schema; do not mask it by switching to bash/python. `read_file` uses inclusive lines, not offset/limit.\n\
      - **str_replace old_str did not match**: re-read exact lines with unique context.\n\
      - **bash command timeout**: narrow it; no identical longer retry.\n\
      - **Truncated output**: narrow scope or result limit.\n\
      - **ask_user shape error**: use top-level `questions[]` when visible; otherwise ask normally.\n\
-     - **Auth / credential / permission error**: request a permitted path.\n\
+     - **Auth / credential / permission error**: preserve the authorization boundary and report the missing capability.\n\
      - **Non-errors**: a memory read returns empty or search finds nothing; these are evidence.\n\
      - **Unknown tool name**: it is absent from the current capability binding; use visible tools. Do not claim it was 'reclaimed', 'on-demand', or activated.\n"
 }
@@ -656,7 +655,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
         );
     } else {
         body.push_str(
-            "         - If a needed structured tool is not visible, use a visible alternative or ask in your normal response.\n",
+            "         - If a needed structured tool is not visible, use a permitted visible alternative or report the missing capability.\n",
         );
     }
     let agent_visible = tool_visible(tool_names, "agent");
@@ -724,7 +723,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
 
     if can_start {
         body.push_str(
-            "- `start_work`: declare all known outcomes and `after_initial_tasks` dependencies; defer undecided changes. Once bound, use `propose_work_plan`, never new genesis. Trust IDs, receipts, and `next_action`.\n",
+            "- `start_work`: declare all known outcomes and `after_initial_tasks` dependencies; defer undecided changes. Once bound, use `propose_work_plan`, never new genesis. Trust returned `initial_task`, receipt IDs and state; honor latest user scope before an assigned next action.\n",
         );
         body.push_str(
             "- `activation=start` executes; `activation=defer` only prepares/establishes or honors explicit no-execute, owns no active attempt, and stops without routine decomposition approval.\n",
@@ -732,7 +731,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     }
     if can_run_next_work_item {
         body.push_str(
-        "- Existing Work uses the server-selected assignment. `run_next_work_item` handles deferred/recovery; `status=complete` without an item never accepts the latest request or proves completion.\n",
+        "- Execute server-selected assignments within latest user scope; apply requested graph changes first. `run_next_work_item` handles deferred/recovery; `status=complete` without an item never accepts the latest request or proves completion.\n",
         );
     }
     body.push_str(
@@ -741,11 +740,6 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     if can_inspect || can_propose {
         body.push_str(
             "- For add/remove/cancel/replace/reorder, inspect the pinned plan and propose the smallest typed change with returned `context_id` (not branch/work IDs). Confirm only an accepted receipt; cancel via a cancelled revision; apply at the meaningful boundary, not every target; choose the smallest if underspecified. Background tools are never the Work board.\n",
-        );
-    }
-    if can_run_next_work_item && can_start {
-        body.push_str(
-            "- Bound Work is not an active assignment; execute returned `initial_task` or inspect/propose a revision.\n",
         );
     }
     if can_settle {
@@ -1277,7 +1271,7 @@ mod tests {
 
         let executable =
             tool_conditional_section(&["start_work", "run_next_work_item", "settle_work_item"]);
-        assert!(executable.contains("Trust IDs, receipts, and `next_action`"));
+        assert!(executable.contains("honor latest user scope before an assigned next action"));
         assert!(executable.contains("declare all known outcomes"));
         assert!(executable.contains("`after_initial_tasks` dependencies"));
         assert!(!executable.contains("only outcomes executable now"));
@@ -1378,9 +1372,9 @@ mod tests {
             bound_work_surface.contains("Once bound, use `propose_work_plan`, never new genesis")
         );
         assert!(
-            bound_work_surface
-                .contains("execute returned `initial_task` or inspect/propose a revision")
+            bound_work_surface.contains("Trust returned `initial_task`, receipt IDs and state")
         );
+        assert!(bound_work_surface.contains("apply requested graph changes first"));
         assert!(
             bound_work_surface
                 .contains("inspect the pinned plan and propose the smallest typed change")

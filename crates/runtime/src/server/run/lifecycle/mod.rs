@@ -130,8 +130,8 @@ use astra_turn_core::agent_live_event::{
     AgentLiveTermination, SharedAgentLiveEventSink,
 };
 use astra_turn_core::contracts::{
-    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
+    TurnSkillSelectionRecord,
 };
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
@@ -1613,9 +1613,10 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
             .await
             .map_err(|error| format!("guarded tool request persistence failed: {error}"))?;
 
-        let committed_event = || {
+        let committed_event = |receipt: astra_services::runs::AtomicRunToolRequestCommitReceipt| {
             let mut event = event.clone();
             if let Some(object) = event.as_object_mut() {
+                object.insert("work_attribution".into(), json!(receipt.work_attribution));
                 object.insert(
                     HOST_INTERACTION_COMMITTED_FIELD.to_string(),
                     Value::Bool(true),
@@ -1624,19 +1625,19 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
             event
         };
         Ok(match outcome {
-            astra_services::runs::AtomicRunToolRequestCommitOutcome::Committed(_) => {
+            astra_services::runs::AtomicRunToolRequestCommitOutcome::Committed(receipt) => {
                 server_loop_host::GuardedToolRequestCommitOutcome::Committed {
-                    event: committed_event(),
+                    event: committed_event(receipt),
                 }
             }
-            astra_services::runs::AtomicRunToolRequestCommitOutcome::AckRecoveredCommitted(_) => {
-                server_loop_host::GuardedToolRequestCommitOutcome::AckRecoveredCommitted {
-                    event: committed_event(),
-                }
-            }
-            astra_services::runs::AtomicRunToolRequestCommitOutcome::AlreadyCommitted(_) => {
+            astra_services::runs::AtomicRunToolRequestCommitOutcome::AckRecoveredCommitted(
+                receipt,
+            ) => server_loop_host::GuardedToolRequestCommitOutcome::AckRecoveredCommitted {
+                event: committed_event(receipt),
+            },
+            astra_services::runs::AtomicRunToolRequestCommitOutcome::AlreadyCommitted(receipt) => {
                 server_loop_host::GuardedToolRequestCommitOutcome::AlreadyCommitted {
-                    event: committed_event(),
+                    event: committed_event(receipt),
                 }
             }
             astra_services::runs::AtomicRunToolRequestCommitOutcome::Superseded {
@@ -4745,7 +4746,6 @@ impl LoopExecutionFacts {
                 last_request_usage: None,
                 agentic_turn_budget,
                 budget_is_explicit,
-                budget_policy: None,
                 loop_entry: Default::default(),
                 current_round_index: 0,
                 llm_rounds_completed: 0,
@@ -5021,7 +5021,7 @@ struct LoopEnvironment {
     compact_strategy: astra_turn_core::microcompact::CompactStrategy,
     inference_purpose: astra_turn_types::InferencePurpose,
     request_constraints: RequestConstraints,
-    client_pipeline_skill_names: HashSet<String>,
+    client_pipeline_skills: Vec<astra_turn_types::SkillCatalogIdentity>,
     listing_message: Option<Value>,
     skill_registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
@@ -13045,14 +13045,14 @@ impl AgenticRunLifecycleService {
                 .unwrap_or_default(),
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             request_constraints: request_constraints.clone(),
-            client_pipeline_skill_names: edge_context
+            client_pipeline_skills: edge_context
                 .edge_skills
                 .iter()
                 .filter(|skill| Self::edge_skill_is_allowed(skill, request_constraints))
-                .flat_map(|skill| {
-                    std::iter::once(skill.name.clone()).chain(skill.aliases.iter().cloned())
+                .map(|skill| astra_turn_types::SkillCatalogIdentity {
+                    name: skill.name.clone(),
+                    aliases: skill.aliases.clone(),
                 })
-                .map(|name| name.trim().to_ascii_lowercase())
                 .collect(),
             listing_message: prepared_capabilities
                 .agent_binding
@@ -13328,7 +13328,7 @@ impl AgenticRunLifecycleService {
             compact_strategy,
             inference_purpose,
             mut request_constraints,
-            client_pipeline_skill_names,
+            client_pipeline_skills,
             listing_message,
             skill_registry,
             skill_resolver,
@@ -13378,7 +13378,6 @@ impl AgenticRunLifecycleService {
             remaining_turns: facts.remaining_turns,
             charged_iterations: facts.charged_iterations,
             budget_is_explicit: facts.original.budget_is_explicit,
-            budget_policy: facts.original.budget_policy,
             current_round_index: facts.original.current_round_index,
             turn_event_buffer: facts.turn_event_buffer,
             loop_entry: facts.original.loop_entry,
@@ -13399,7 +13398,7 @@ impl AgenticRunLifecycleService {
                 },
                 resolver: skill_resolver,
                 executor: skill_executor,
-                client_pipeline_skill_names,
+                client_pipeline_skills,
                 request_constraints,
                 listing_message,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
@@ -13640,9 +13639,7 @@ impl AgenticRunLifecycleService {
             ));
         }
         const MAX_EDGE_SKILLS: usize = 512;
-        const MAX_SKILL_NAME_BYTES: usize = 128;
         const MAX_SKILL_METADATA_BYTES: usize = 4096;
-        const MAX_SKILL_ALIASES: usize = 32;
         if context.edge_skills.len() > MAX_EDGE_SKILLS {
             return Err(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -13650,19 +13647,14 @@ impl AgenticRunLifecycleService {
             ));
         }
         let malformed = context.edge_skills.iter().any(|skill| {
-            let name = skill.name.trim();
-            name.is_empty()
-                || name.len() > MAX_SKILL_NAME_BYTES
-                || skill.description.len() > MAX_SKILL_METADATA_BYTES
+            !astra_turn_types::SkillCatalogIdentity::routing_metadata_is_valid(
+                &skill.name,
+                &skill.aliases,
+            ) || skill.description.len() > MAX_SKILL_METADATA_BYTES
                 || skill
                     .when_to_use
                     .as_deref()
                     .is_some_and(|value| value.len() > MAX_SKILL_METADATA_BYTES)
-                || skill.aliases.len() > MAX_SKILL_ALIASES
-                || skill
-                    .aliases
-                    .iter()
-                    .any(|alias| alias.trim().is_empty() || alias.len() > MAX_SKILL_NAME_BYTES)
         });
         if malformed {
             return Err(error_response(
@@ -22251,6 +22243,9 @@ impl ServerSubRunExecutor {
         };
         check_admission()?;
         let Some(run_engine) = self.durable_run_engine() else {
+            if config.work_item.is_some() {
+                return Err("WorkItem execution requires durable run admission".into());
+            }
             return Ok(None);
         };
         let existing = run_engine.load_run(&config.user_id, &config.run_id).await?;
@@ -24015,7 +24010,10 @@ impl SubRunExecutor for ServerSubRunExecutor {
             agentic_turn_budget,
             true,
             max_turn_input_tokens,
-            None,
+            // A delegated run owns one execution chain. Use its admitted run
+            // identity, not the parent's chain or model-authored context, so
+            // descendant admission and invocation replay share the same scope.
+            Some(config.run_id.clone()),
             &config.request_constraints,
             admitted_tool_policy,
             StopHookState {
@@ -24043,7 +24041,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             thinking: generation_controls.thinking.clone(),
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             request_constraints: config.request_constraints.clone(),
-            client_pipeline_skill_names: HashSet::new(),
+            client_pipeline_skills: Vec::new(),
             listing_message: None,
             skill_registry,
             skill_resolver,
@@ -24129,7 +24127,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             {
                 executor = executor.with_memoria_port(memoria_port);
             }
-            executor.set_work_item_attempt_bound(config.work_item.is_some());
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_capabilities(crate::capabilities::delegated_subrun_capabilities(
                     self.shared_pool.is_some(),
@@ -24182,6 +24179,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         .map_err(|error| format!("invalid child Work owner binding: {error}"))?;
                     let session_id = InternalSessionId::parse(config.session_id.clone())
                         .map_err(|error| format!("invalid child Work session binding: {error}"))?;
+                    if let Some(item) = binding.item() {
+                        executor.set_delegated_work_item(config.run_id.clone(), item.clone());
+                    }
                     executor.set_work_binding(runtime_tool_executor::WorkRuntimeBinding::new(
                         pool.clone(),
                         owner_id,

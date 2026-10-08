@@ -619,6 +619,7 @@ mod tests {
         ])
         .with_admitted_results(vec![
             vec![EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "call-read-1".into(),
                 tool: "read_file".into(),
@@ -1644,6 +1645,7 @@ mod tests {
 
         // Tool turn → should send progress to parent.
         let edge_tools = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-read-1".into(),
             tool: "read_file".into(),
@@ -2043,6 +2045,7 @@ mod tests {
         })];
 
         let callback = EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-read".into(),
             tool: "read_file".into(),
@@ -2417,6 +2420,7 @@ mod tests {
 
         // Edge round has the grep result (executed at edge during SSE)
         let edge_tool_round = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             // Edge execution custody is keyed by the provider-emitted tool-call
             // id.  An id-less result is diagnostic only and must not be

@@ -344,6 +344,16 @@ the only physical-operation serialization boundary.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.
+- A task assignment is not evidence that its tools executed. Tool invocation
+  decisions freeze the producer Run and exact Work/branch/item revision/attempt
+  before dispatch, and the canonical journal retains that attribution even when
+  completion persistence fails. Harness replacement checks count actual executed
+  invocations, including failed outcomes, rather than treating a claim as a side
+  effect. Missing, conflicting, or stale attribution cannot certify that a
+  cancelled task remained unexecuted; replay uses the original frozen decision.
+  Pipeline-intercepted skill executions freeze the same attribution before
+  execution. Already-loaded skill receipts are suppressed, not executed; a
+  subsequent admission rejection remains rejected.
 - Work now has a durable execution-selection record keyed by isolation domain,
   owner, Session, and branch. Authorized admission pins the canonical Server
   sandbox or records an authenticated Edge placement. A read never creates or

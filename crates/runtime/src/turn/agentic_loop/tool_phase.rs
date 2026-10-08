@@ -28,7 +28,6 @@ use super::super::headless_tool_pipeline::CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD
 use super::execution_phase::{
     TurnExecutionPhase, apply_workspace_observation_quarantine_transition,
     capture_deferred_candidate_text, observe_turn_end_without_tools, record_edge_tool_selection,
-    turn_result_tokens_consumed,
 };
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, BudgetWrapupOrigin,
@@ -41,8 +40,6 @@ use astra_turn_core::tool_call_shape::{tool_call_arguments_value, tool_call_name
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use crate::turn::inspection_service::InspectionService;
 use crate::turn::local_provider::LocalSessionProvider;
-use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
-use crate::turn::runtime_policy::RuntimePolicy;
 use astra_turn_core::agentic_post_tool_policy::{
     AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
 };
@@ -123,8 +120,9 @@ fn record_trusted_client_pipeline_skills(
         };
         if !state
             .skills
-            .client_pipeline_skill_names
-            .contains(&name.trim().to_ascii_lowercase())
+            .client_pipeline_skills
+            .iter()
+            .any(|skill| skill.matches_selector(&name))
         {
             continue;
         }
@@ -142,16 +140,24 @@ fn record_trusted_client_pipeline_skills(
                 "parallel_subruns" => Some(astra_services::WorkExecutionTopology::ParallelSubruns),
                 _ => None,
             });
-        state.skills.execution.invoked.insert(
-            name.clone(),
-            crate::turn::skill_tool::InvokedSkill {
+        let invoked_at_turn = state.current_session_turn_number();
+        state
+            .skills
+            .execution
+            .invoked
+            .entry(name.clone())
+            .and_modify(|invoked| {
+                // A completed repeated invocation acknowledges the original
+                // load; its short receipt must not replace delivered instructions.
+                invoked.reentry_count = invoked.reentry_count.saturating_add(1);
+            })
+            .or_insert_with(|| crate::turn::skill_tool::InvokedSkill {
                 name,
                 content: result.output.clone(),
-                invoked_at_turn: state.current_session_turn_number(),
+                invoked_at_turn,
                 reentry_count: 0,
                 execution_topology,
-            },
-        );
+            });
     }
 }
 
@@ -1272,36 +1278,6 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
     })
 }
 
-/// Extract a strategy-change observation from a memory tool call's structured
-/// arguments. The agent marks strategy changes with
-/// `memory(action='remember', tags=['strategy_change'], content='...')`.
-fn strategy_change_description(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Option<String> {
-    if record.name != "memory" {
-        return None;
-    }
-    let args = serde_json::from_str::<Value>(record.authoritative_args_full()?).ok()?;
-    let has_strategy_change_tag = args
-        .get("tags")
-        .and_then(Value::as_array)
-        .is_some_and(|tags| {
-            tags.iter()
-                .any(|tag| tag.as_str() == Some("strategy_change"))
-        });
-    if !has_strategy_change_tag {
-        return None;
-    }
-    Some(
-        args.get("content")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|description| !description.is_empty())
-            .unwrap_or("Strategy changed")
-            .to_string(),
-    )
-}
-
 fn append_session_journal_event(
     user_id: &str,
     session_id: &str,
@@ -1946,13 +1922,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 ignored_rounds = state.budget_wrapup_ignored_rounds,
                 "budget wrapup ignored after lockout — aborting turn",
             );
-            observe_turn_end_without_tools(
-                state,
-                turn_index,
-                prep.turn_start_time,
-                turn_result.ttft_ms,
-                turn_result_tokens_consumed(&turn_result),
-            );
+            observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
             state.step_recorder.end_turn(false);
             finalize_and_render(host, state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
@@ -2436,47 +2406,13 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         let tool_names = provider_tool_call_names;
 
         // ── Publish introspect snapshot ──
-        // Scoped so provider + inspection borrows are released before the
-        // mutable observation_journal access below.
+        // The inspection reads the current execution directly.
         {
             let lifecycle_summary = host.turn_start_lifecycle_summary(state);
             let provider = LocalSessionProvider::new(state);
             let inspection = InspectionService::new(&provider, &provider);
             publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
         } // provider + inspection dropped — releases immutable borrow of state
-
-        // ── Record turn metrics into observation journal ──
-        // Feed the sliding window so the next round's auto-injected self-status
-        // block can show trends and strategy verification.
-        {
-            let samples: Vec<astra_core::ToolCallSample<'_>> = round_tool_calls
-                .iter()
-                .filter(|r| r.was_executed())
-                .map(|r| astra_core::ToolCallSample {
-                    name: &r.name,
-                    ok: r.ok,
-                    round: r.round.or(Some(state.llm_rounds_completed)),
-                    file_path: r.file_path.as_deref(),
-                    error: r.error.as_deref(),
-                })
-                .collect();
-            let tokens = turn_result_tokens_consumed(&turn_result);
-            let metrics =
-                astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
-
-            // The in-memory journal is the canonical runtime observation window.
-            state.observation_journal.record_turn(&metrics);
-
-            // ── Agent-marked strategy change ──
-            // Read the structured memory-tool tag so the agent can explicitly
-            // signal a strategy change and later see before/after verification.
-            for record in &round_tool_calls {
-                if let Some(description) = strategy_change_description(record) {
-                    state.observation_journal.mark_strategy_change(description);
-                    break;
-                }
-            }
-        }
 
         let producer_agent_id = (state.inference_purpose
             == astra_turn_types::InferencePurpose::SubAgent)
@@ -2840,7 +2776,8 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 // Phase-9: byte-stable schema — no enum, skill list is surfaced
                 // via <available_skills> in session-cached prompt prefix.
                 if !resolver.available_skills().is_empty() {
-                    host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+                    host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+                    host.inject_tool_schema(astra_tools::schemas::discover_skills_tool_schema());
                 }
             }
         }
@@ -2976,11 +2913,9 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
 
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
-        if let Some(hub) = state.telemetry.observability_hub.as_ref() {
-            let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
-            if !high_failure.is_empty() {
-                hub.record_low_confidence_tools(high_failure);
-            }
+        if let Some(session) = state.telemetry.observability_session.as_ref() {
+            astra_core::sync_poison::recover_rwlock_write(session).low_confidence_tools =
+                state.turn_guard.health.high_failure_tools(3, 0.5);
         }
         let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
 
@@ -3078,6 +3013,63 @@ mod tests {
     };
     use crate::turn::agentic_loop::host::{build_introspect_snapshot, introspect_token_pressure};
 
+    #[tokio::test]
+    async fn tool_health_projection_is_session_owned_and_clears_recovered_failures() {
+        use crate::turn::agentic_loop::host::{
+            run_agentic_loop_with_host, tests::edge_tool_result,
+        };
+        use astra_turn_core::tool_health::ToolOutcome;
+
+        let hub = Arc::new(ObservabilityHub::new());
+        let current = hub.start_session("current-user", "test-session");
+        let other = hub.start_session("other-user", "other-session");
+        let other_evidence = vec![("other-tool".to_string(), 1.0, 3)];
+        other.write().unwrap().low_confidence_tools = other_evidence.clone();
+
+        // Each run goes through the shared execution loop and admitted callback.
+        // The second run has no remaining failure evidence for this session.
+        for has_failures in [true, false] {
+            let mut state = make_state();
+            state.telemetry.observability_hub = has_failures.then(|| hub.clone());
+            state.telemetry.observability_session = Some(current.clone());
+            if has_failures {
+                for index in 0..3 {
+                    state.turn_guard.health.record_outcome(
+                        &astra_pipeline::ToolHealthIdentity::new(
+                            "previous-tool".into(),
+                            format!("attempt-{index}").as_bytes(),
+                        ),
+                        ToolOutcome::new(false, 1, "failed"),
+                    );
+                }
+            }
+            let mut result = make_edge_tool("bash", "healthy");
+            result.args = json!({"command": "printf healthy"});
+            let mut host = MockHost::new(vec![
+                edge_tool_result(vec![result], 10, 5, None),
+                text_result("done", 10, 5, None),
+            ])
+            .with_valid_tools(&["bash"])
+            .with_admission_hook();
+            assert!(matches!(
+                run_agentic_loop_with_host(&mut host, &mut state)
+                    .await
+                    .unwrap(),
+                AgenticLoopOutcome::Completed
+            ));
+            assert_eq!(host.admitted_tool_call_batches.len(), 1);
+            assert_eq!(
+                current.read().unwrap().low_confidence_tools,
+                if has_failures {
+                    vec![("previous-tool".to_string(), 1.0, 3)]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(other.read().unwrap().low_confidence_tools, other_evidence);
+        }
+    }
+
     #[test]
     fn deferred_invocation_reports_logical_tool_not_carrier() {
         let digest = format!("sha256:{}", "c".repeat(64));
@@ -3171,25 +3163,35 @@ mod tests {
         let mut state = make_state();
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("parallel-review".to_string());
-        let calls = vec![json!({
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "parallel-review".into(),
+                aliases: Vec::new(),
+            });
+        let mut calls = vec![json!({
             "id":"skill-call-1",
             "function":{
                 "name":"skill",
                 "arguments":"{\"skill_name\":\"parallel-review\"}"
             }
         })];
-        let results = vec![EdgeToolExecResult {
+        let mut results = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "skill-call-1".into(),
             tool: "skill".into(),
             args: json!({"skill_name":"parallel-review"}),
             output: "Use two agents in parallel.\n<skill-loaded name=\"parallel-review\"/>".into(),
-            tool_result_fields: Some(serde_json::Map::from_iter([(
-                crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.into(),
-                json!(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
-            )])),
+            tool_result_fields: Some(serde_json::Map::from_iter([
+                (
+                    crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.into(),
+                    json!(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
+                ),
+                (
+                    "astra_skill_execution_topology".into(),
+                    json!("parallel_subruns"),
+                ),
+            ])),
             status: "completed".into(),
             duration_ms: 1,
         }];
@@ -3200,6 +3202,29 @@ mod tests {
             state.skills.execution.invoked["parallel-review"].content,
             results[0].output
         );
+        let first = state.skills.execution.invoked["parallel-review"].clone();
+        calls[0]["id"] = json!("skill-call-2");
+        results[0].request_id = "skill-call-2".into();
+        results[0].output = "Skill was already loaded in this turn.".into();
+        results[0]
+            .tool_result_fields
+            .as_mut()
+            .unwrap()
+            .remove("astra_skill_execution_topology");
+        record_trusted_client_pipeline_skills(&mut state, &calls, &results);
+        let repeated = &state.skills.execution.invoked["parallel-review"];
+        assert_eq!(repeated.content, first.content);
+        assert_eq!(repeated.invoked_at_turn, first.invoked_at_turn);
+        assert_eq!(
+            repeated.execution_topology,
+            Some(astra_services::WorkExecutionTopology::ParallelSubruns)
+        );
+        assert_eq!(repeated.reentry_count, 1);
+        let encoded = serde_json::to_value(&state.skills.execution).unwrap();
+        let restored: crate::turn::agentic_loop::host::SkillExecutionState =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.invoked["parallel-review"].content, first.content);
+        assert_eq!(restored.invoked["parallel-review"].reentry_count, 1);
     }
 
     #[test]
@@ -3207,8 +3232,11 @@ mod tests {
         let mut state = make_state();
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("parallel-review".to_string());
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "parallel-review".into(),
+                aliases: Vec::new(),
+            });
         let calls = vec![json!({
             "id":"skill-call-1",
             "function":{
@@ -3217,6 +3245,7 @@ mod tests {
             }
         })];
         let results = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "skill-call-1".into(),
             tool: "skill".into(),
@@ -3243,8 +3272,11 @@ mod tests {
         let mut state = make_state();
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("parallel-review".to_string());
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "parallel-review".into(),
+                aliases: Vec::new(),
+            });
         let calls = vec![json!({
             "id":"skill-call-1",
             "function":{
@@ -3253,6 +3285,7 @@ mod tests {
             }
         })];
         let results = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "skill-call-1".into(),
             tool: "skill".into(),
@@ -3276,13 +3309,17 @@ mod tests {
         let mut state = make_state();
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("parallel-review".to_string());
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "parallel-review".into(),
+                aliases: Vec::new(),
+            });
         let calls = vec![json!({
             "id":"read-1",
             "function":{"name":"read_file","arguments":"{\"path\":\"notes.txt\"}"}
         })];
         let results = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "read-1".into(),
             tool: "read_file".into(),
@@ -3323,6 +3360,7 @@ mod tests {
             },
         ];
         let edge = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "edge-1".into(),
             tool: "read_file".into(),
@@ -4025,44 +4063,6 @@ mod tests {
     }
 
     #[test]
-    fn strategy_change_uses_structured_memory_tags() {
-        let record = ToolCallRecord {
-            name: "memory".into(),
-            args_full: Some(
-                serde_json::json!({
-                    "action": "remember",
-                    "tags": ["strategy_change", "debugging"],
-                    "content": "switch to a minimal reproducer",
-                })
-                .to_string(),
-            ),
-            ..Default::default()
-        };
-        assert_eq!(
-            strategy_change_description(&record).as_deref(),
-            Some("switch to a minimal reproducer")
-        );
-    }
-
-    #[test]
-    fn strategy_change_does_not_infer_tags_from_free_text() {
-        let record = ToolCallRecord {
-            name: "memory".into(),
-            args_full: Some(
-                serde_json::json!({
-                    "action": "remember",
-                    "tags": ["note"],
-                    "content": "the phrase strategy_change appears here only as prose",
-                })
-                .to_string(),
-            ),
-            args_preview: Some("strategy_change".into()),
-            ..Default::default()
-        };
-        assert_eq!(strategy_change_description(&record), None);
-    }
-
-    #[test]
     fn work_unit_observation_uses_the_shared_protocol_not_tool_names() {
         let observation = astra_core::work_unit::WorkUnitObservation::new(
             "work-1",
@@ -4075,6 +4075,7 @@ mod tests {
         let mut fields = serde_json::Map::new();
         observation.insert_into(&mut fields);
         let structured = astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "req-1".into(),
             tool: "a_tool_that_did_not_exist_when_the_loop_was_written".into(),
@@ -4732,6 +4733,7 @@ mod tests {
     #[test]
     fn terminal_foreground_fanout_receipt_opens_synthesis_boundary() {
         let result = EdgeToolExecResult {
+work_attribution: None,
             execution_completion: None,
             request_id: "fanout-call".into(),
             tool: "agent_fanout".into(),
@@ -4935,6 +4937,7 @@ mod tests {
         );
 
         let unrelated = EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "other-page".into(),
             tool: "agent_fanout".into(),
@@ -4989,6 +4992,7 @@ mod tests {
             ),
         ] {
             let invalid_page = EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: request_id.into(),
                 tool: "agent_fanout".into(),
@@ -5017,6 +5021,7 @@ mod tests {
         }
 
         let first_final_page = EdgeToolExecResult {
+work_attribution: None,
             execution_completion: None,
             request_id: "first-final-page".into(),
             tool: "agent_fanout".into(),
@@ -5049,6 +5054,7 @@ mod tests {
         );
 
         let second_final_page = EdgeToolExecResult {
+work_attribution: None,
             execution_completion: None,
             request_id: "second-final-page".into(),
             tool: "agent_fanout".into(),
@@ -5082,6 +5088,7 @@ mod tests {
     fn paginated_fanout_keeps_early_child_issues_after_a_clean_final_page() {
         let mut state = make_state();
         let start = EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "fanout-start-issues".into(),
             tool: "agent_fanout".into(),
@@ -5114,6 +5121,7 @@ mod tests {
         );
 
         let final_page = EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "fanout-final-page-issues".into(),
             tool: "agent_fanout".into(),
@@ -5803,8 +5811,7 @@ esac
 
     use crate::turn::inspection_service::InspectionService;
     use crate::turn::local_provider::LocalSessionProvider;
-    use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
-    use crate::turn::runtime_policy::RuntimePolicy;
+    use crate::turn::providers::{LiveRuntimeProvider, SessionStateProvider};
 
     /// Verify that InspectionService enriches snapshot with live metrics.
     #[test]
@@ -5829,7 +5836,6 @@ esac
             });
         publish_test_feedback(&mut state, 1, 2, 8);
 
-        let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider);
 
@@ -5850,7 +5856,6 @@ esac
     #[test]
     fn inspection_service_zero_state_returns_safe_defaults() {
         let state = make_state();
-        let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider);
 
@@ -5867,25 +5872,10 @@ esac
         );
     }
 
-    /// Verify that budget_policy=None falls back to default RuntimePolicy.
-    #[test]
-    fn inspection_service_uses_default_policy_when_none() {
-        let state = make_state();
-        let _policy = RuntimePolicy::default();
-        let provider = LocalSessionProvider::new(&state);
-        let inspection = InspectionService::new(&provider, &provider);
-
-        let snapshot =
-            build_introspect_snapshot(&state, "default-policy".to_string(), Some(&inspection));
-
-        assert!(snapshot.circuit_breaker.is_some());
-    }
-
     /// Verify provider trait methods return safe defaults for empty state.
     #[test]
     fn provider_traits_return_safe_defaults_for_empty_state() {
         let state = make_state();
-        let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
 
         // LiveRuntimeProvider
@@ -5894,13 +5884,6 @@ esac
         assert_eq!(provider.current_error_rate(), 0.0);
         assert_eq!(provider.budget_remaining(), 10);
         assert_eq!(provider.budget_max(), 10);
-
-        // ObservationProvider
-        assert!(provider.journal_is_empty());
-        assert_eq!(provider.journal_len(), 0);
-        let facts = provider.extract_facts();
-        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
 
         // SessionStateProvider
         assert_eq!(provider.current_phase_label(), "execution");
@@ -5935,7 +5918,6 @@ esac
         );
         state.turn_guard.health.record_success("read_file");
 
-        let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
         let inspection = InspectionService::new(&provider, &provider);
 

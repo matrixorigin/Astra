@@ -49,8 +49,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::turn::runtime_policy::RuntimePolicy;
-use astra_core::ObservationJournal;
 use astra_services::DatabaseEventService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord, TraceSpanBuilder};
@@ -864,13 +862,6 @@ pub trait AgenticLoopHost: Send {
         _results: &[Value],
     ) -> Option<RuntimeSuccessfulToolCompletion> {
         None
-    }
-
-    /// Whether the host already injects round budget guidance into the system
-    /// prompt during `execute_turn`.  When true, the agentic loop skips its
-    /// own user-message guidance injection to avoid double injection.
-    fn injects_round_guidance(&self) -> bool {
-        false
     }
 
     /// Apply typed intent context needed by the next local model boundary.
@@ -1732,7 +1723,7 @@ pub struct SkillState {
     /// Exact identifiers advertised by the connected client's typed skill
     /// catalog. These calls remain client-pipeline owned even when the server
     /// also has an unrelated resolver.
-    pub client_pipeline_skill_names: HashSet<String>,
+    pub client_pipeline_skills: Vec<astra_turn_types::SkillCatalogIdentity>,
     /// Optional skill executor for fork-context skills. When set, skills with
     /// `execution_context: Fork` are executed via this executor (sub-agent loop).
     pub executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
@@ -1741,7 +1732,7 @@ pub struct SkillState {
     /// model requirements project by their explicit propagation scope.
     pub request_constraints: RequestConstraints,
     /// Per-skill quality metrics accumulated during the session.
-    /// Used to boost high-performing skills in selection priority.
+    /// Compared with the turn baseline to emit execution-outcome feedback.
     pub quality_tracker: crate::skills::quality::SkillQualityTracker,
     /// Snapshot at the start of this user turn. Observation emission compares
     /// against this baseline so historical outcomes are not re-attributed to
@@ -1766,7 +1757,7 @@ impl Default for SkillState {
             execution: Default::default(),
             registry_for_activation: None,
             resolver: None,
-            client_pipeline_skill_names: HashSet::new(),
+            client_pipeline_skills: Vec::new(),
             executor: None,
             request_constraints: Default::default(),
             quality_tracker: Default::default(),
@@ -1797,8 +1788,6 @@ pub struct SkillExecutionState {
     pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
     #[serde(serialize_with = "serialize_skill_set")]
     pub pinned: HashSet<String>,
-    #[serde(serialize_with = "serialize_skill_set")]
-    pub discovered: HashSet<String>,
     /// Original delivered instructions and re-entry counters, not reloaded content.
     #[serde(serialize_with = "serialize_invoked_skills")]
     pub invoked: HashMap<String, crate::turn::skill_tool::InvokedSkill>,
@@ -2043,7 +2032,7 @@ impl StallTrackingState {
 
     /// Purge accumulating state: trim tool_call_records, reset fired flags.
     pub fn purge_state(&mut self) {
-        // Keep last 20 records — enough context for TurnMetrics
+        // Retain the bounded local tool-record window.
         self.tool_call_records.truncate(20);
     }
 }
@@ -2575,8 +2564,6 @@ pub(crate) struct OriginalLoopExecutionFacts {
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub last_request_usage: Option<astra_turn_types::RequestTokenUsage>,
     pub budget_is_explicit: bool,
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    pub budget_policy: Option<crate::turn::runtime_policy::RuntimePolicy>,
     pub current_round_index: u32,
     pub llm_rounds_completed: u32,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
@@ -2596,8 +2583,7 @@ pub(crate) struct OriginalLoopExecutionFacts {
 
 impl OriginalLoopExecutionFacts {
     pub(crate) fn capture(state: &AgenticLoopState) -> Result<Self, &'static str> {
-        // Check before filtering: even telemetry may be part of an unresolved
-        // attempt lease. Only a settled delivery boundary can be handed off.
+        // Only a settled delivery boundary can be handed off.
         if state
             .volatile_pending
             .iter()
@@ -2605,15 +2591,7 @@ impl OriginalLoopExecutionFacts {
         {
             return Err("pending runtime context still belongs to an unresolved provider attempt");
         }
-        let pending_context = state
-            .volatile_pending
-            .iter()
-            .filter(|entry| {
-                entry.kind.delivery_class()
-                    != astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::TelemetryOnly
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let pending_context = state.volatile_pending.clone();
         validate_pending_context(&pending_context)?;
         Ok(Self {
             evaluation_thresholds: state.evaluation_thresholds,
@@ -2647,7 +2625,6 @@ impl OriginalLoopExecutionFacts {
             last_request_usage: state.last_request_usage,
             agentic_turn_budget: state.agentic_turn_budget,
             budget_is_explicit: state.budget_is_explicit,
-            budget_policy: state.budget_policy.clone(),
             current_round_index: state.current_round_index,
             llm_rounds_completed: state.llm_rounds_completed,
             last_request_message_count: state.last_request_message_count,
@@ -2712,10 +2689,7 @@ fn validate_pending_context(pending: &[VolatileInjection]) -> Result<(), &'stati
         if entry.attempt_leased {
             return Err("pending runtime context still belongs to an unresolved provider attempt");
         }
-        if entry.kind.delivery_class()
-            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::TelemetryOnly
-            || volatile_payload_is_empty(&entry.payload)
-        {
+        if volatile_payload_is_empty(&entry.payload) {
             return Err("runtime context continuation contains a non-deliverable item");
         }
         if is_retained_mailbox_context(entry)
@@ -2793,9 +2767,6 @@ pub enum VolatileKind {
     /// Authoritative budget/turn/round context. Actual budget enforcement is
     /// owned by the runtime; this lane tells the model which boundary is active.
     BudgetAdvisory,
-    /// Runtime telemetry snapshot. It must never be treated as a user
-    /// utterance, because doing so pollutes latest-user-goal extraction.
-    SelfStatus,
     /// Structured soft-policy evidence for the next LLM decision point.
     /// This is not a user correction or runtime command.
     PolicyAdvisory,
@@ -2846,7 +2817,7 @@ pub enum VolatileKind {
     /// A provider response completed before newly applied runtime input.
     /// The stale response is not executable; the next request re-evaluates.
     RuntimeInputBoundary,
-    /// Context-pressure guidance from [`RuntimePolicy`]. Singleton so repeated
+    /// Live context-pressure guidance. Singleton so repeated
     /// pressure checks replace the prior guidance instead of stacking prompt
     /// noise inside the same LLM call.
     ContextPressure,
@@ -2929,7 +2900,6 @@ impl VolatileKind {
                 | Self::SessionHookContext
                 | Self::HarnessBoundary
                 | Self::PlanModeMarker
-                | Self::SelfStatus
                 | Self::PermissionMode
                 | Self::PolicyAdvisory
                 | Self::RuntimeInputBoundary
@@ -2970,7 +2940,6 @@ impl VolatileKind {
             Self::PolicyAdvisory | Self::BehaviorAdvisory | Self::SourceRecoveryAdvisory => {
                 VolatileDeliveryClass::DecisionFeedback
             }
-            Self::SelfStatus => VolatileDeliveryClass::TelemetryOnly,
             Self::ToolBatchCoaching
             | Self::CircuitBreaker
             | Self::ContextPressure
@@ -3589,9 +3558,6 @@ pub struct AgenticLoopState {
     /// budget. Evidence-derived profile reconciliation must never enlarge an
     /// explicit resource contract.
     pub budget_is_explicit: bool,
-    /// Budget policy for auto-expansion based on outcome streaks.
-    /// When `None` (default), the production `Default::default()` is used.
-    pub budget_policy: Option<RuntimePolicy>,
     /// Current agentic loop turn index (0-based, updated each iteration).
     /// Used by the CLI to inject `round_index` into the bridge payload so the
     /// system prompt can include round budget directives.
@@ -3872,12 +3838,6 @@ pub struct AgenticLoopState {
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
-
-    // ── Observation journal (cross-turn trend tracking) ──
-    /// Sliding window of per-turn metrics for trend analysis and strategy
-    /// verification. Updated after each tool phase; read before each LLM
-    /// round to auto-inject a compact self-status block into the prompt.
-    pub observation_journal: ObservationJournal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4032,7 +3992,6 @@ impl AgenticLoopState {
             charged_iterations: 0,
             agentic_turn_budget,
             budget_is_explicit: false,
-            budget_policy: None,
             loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -4111,7 +4070,6 @@ impl AgenticLoopState {
             canonical_turn_started_at: Default::default(),
             canonical_trace_time_bounds: Default::default(),
             harness: super::super::harness_adapter::HarnessSlot::empty(),
-            observation_journal: Default::default(),
         }
     }
 
@@ -6722,6 +6680,7 @@ pub(crate) mod tests {
                     let arguments = tool_call.get("function")?.get("arguments")?.as_str()?;
                     let args = serde_json::from_str(arguments).ok()?;
                     Some(EdgeToolExecResult {
+                        work_attribution: None,
                         execution_completion: None,
                         request_id,
                         tool,
@@ -7159,6 +7118,7 @@ pub(crate) mod tests {
             );
         }
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: format!("req-{name}"),
             tool: name.to_string(),
@@ -7185,6 +7145,7 @@ pub(crate) mod tests {
         .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
         .insert_into(&mut fields);
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "req-bash".to_string(),
             tool: "bash".to_string(),
@@ -7211,6 +7172,7 @@ pub(crate) mod tests {
         .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
         .insert_into(&mut fields);
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "req-agent-fanout".to_string(),
             tool: "agent_fanout".to_string(),
@@ -7310,6 +7272,7 @@ pub(crate) mod tests {
             );
         }
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: format!("req-{name}"),
             tool: name.to_string(),
@@ -10478,12 +10441,15 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        assert_eq!(host.injected_schemas.len(), 1);
-        let name = host.injected_schemas[0]["function"]["name"]
-            .as_str()
-            .unwrap();
-        assert_eq!(name, "skill");
+        assert_eq!(
+            host.injected_schemas,
+            vec![
+                astra_tools::schemas::skill_tool_schema(),
+                astra_tools::schemas::discover_skills_tool_schema(),
+            ]
+        );
         assert!(host.valid_tools.contains("skill"));
+        assert!(host.valid_tools.contains("discover_skills"));
     }
 
     #[tokio::test]
@@ -10914,9 +10880,12 @@ pub(crate) mod tests {
             assert_eq!(state.remaining_turns, 4);
             assert_eq!(state.total_prompt, 133);
             assert_eq!(
-                host.injected_schemas.len(),
-                1,
-                "a new host needs its skill schema in either entry mode"
+                host.injected_schemas,
+                vec![
+                    astra_tools::schemas::skill_tool_schema(),
+                    astra_tools::schemas::discover_skills_tool_schema(),
+                ],
+                "a new host needs invocation and discovery schemas in either entry mode"
             );
             let context = host.executed_volatile[0]
                 .iter()
@@ -11205,6 +11174,11 @@ pub(crate) mod tests {
             serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
         serde_json::from_value::<OriginalLoopExecutionFacts>(wire.clone()).unwrap();
 
+        for retired_policy in [serde_json::Value::Null, json!({"expand_factor": 1.5})] {
+            let mut old_policy = wire.clone();
+            old_policy["budget_policy"] = retired_policy;
+            assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(old_policy).is_err());
+        }
         let mut old_state = wire.clone();
         old_state["provider_adaptation"]["work_direction"] = json!({
             "attempted": [],
@@ -11235,15 +11209,13 @@ pub(crate) mod tests {
             VolatileKind::FinalAnswerSettlement,
             json!({"mode": "text_only"}),
         );
-        state.push_volatile_payload(VolatileKind::SelfStatus, json!({"debug": "telemetry-only"}));
         let leased = state.lease_volatile_pending().unwrap();
-        assert_eq!(leased.len(), 4);
+        assert_eq!(leased.len(), 3);
         assert!(OriginalLoopExecutionFacts::capture(&state).is_err());
         state.restore_volatile_attempt_lease();
         let original = OriginalLoopExecutionFacts::capture(&state).unwrap();
         let wire = serde_json::to_value(&original).unwrap();
         assert!(!wire.to_string().contains("attempt_leased"));
-        assert!(!wire.to_string().contains("telemetry-only"));
         let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
         let mut resumed = make_state();
         resumed.volatile_pending = restored.pending_context;
@@ -11284,10 +11256,6 @@ pub(crate) mod tests {
         let mut invalid = wire;
         invalid["pending_context"][0]["kind"] = json!("self_status");
         assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(invalid).is_err());
-        let mut only_telemetry = make_state();
-        only_telemetry.push_volatile(VolatileKind::SelfStatus, "leased telemetry");
-        only_telemetry.lease_volatile_pending().unwrap();
-        assert!(OriginalLoopExecutionFacts::capture(&only_telemetry).is_err());
     }
 
     #[tokio::test]
@@ -11304,6 +11272,12 @@ pub(crate) mod tests {
         let original = state.skills.execution.invoked["test-skill"].clone();
         let wire =
             serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+        assert!(wire["skill_execution"].get("discovered").is_none());
+        for stale in [json!([]), json!(["test-skill"])] {
+            let mut bad = wire.clone();
+            bad["skill_execution"]["discovered"] = stale;
+            assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(bad).is_err());
+        }
         let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
 
@@ -13830,6 +13804,7 @@ mod parallel_execution_tests {
                     json!({"path": format!("/tmp/{id}.txt")})
                 };
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: (*id).to_string(),
                     tool: (*name).to_string(),

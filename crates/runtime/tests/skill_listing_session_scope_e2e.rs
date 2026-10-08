@@ -11,7 +11,6 @@
 //! turn-over-turn (sorted alphabetically, no ranking).
 
 use astra_runtime::prompts::{CacheScope, build_skill_listing_section};
-use astra_runtime::turn::skill_tool::skill_tool_schema_v2;
 use astra_skills::traits::SkillToolInfo;
 
 fn skill(name: &str, desc: &str) -> SkillToolInfo {
@@ -59,7 +58,7 @@ fn skill_tool_schema_in_production_has_no_enum() {
     // Direct proof that the live `skill` tool schema is the byte-stable
     // v2 variant — no `enum` field under skill_name that would rebuild
     // whenever the skill catalog changed.
-    let schema = skill_tool_schema_v2();
+    let schema = astra_tools::schemas::skill_tool_schema();
     let skill_name = &schema["function"]["parameters"]["properties"]["skill_name"];
     assert!(
         skill_name.get("enum").is_none(),

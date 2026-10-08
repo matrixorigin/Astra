@@ -1009,8 +1009,72 @@ fn propose_work_criteria_schema() -> Value {
     })
 }
 
+/// Canonical skill activation contract; names do not change schema bytes.
+pub fn skill_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "skill",
+            "description":
+                "Execute a skill from the <available_skills> system listing. \
+                 Call it only when the user's request matches a skill whose \
+                 canonical name or alias appears literally in that listing or a current skill-search result; \
+                 never invent or infer a skill name. For work this agent owns, \
+                 call a matching skill before substantive work on that objective. \
+                 If a child owns the objective, launch it first and let the child \
+                 load its own skills. \
+                 `skill_name` is the listed canonical name or alias. `task` is optional \
+                 extra context; omit to use the current conversation. On seeing \
+                 `<skill-loaded name=\"...\"/>` in a tool result, follow that \
+                 skill's instructions — do not re-invoke it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description":
+                            "Canonical name or alias of the skill to run."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description":
+                            "Optional task description or extra context for the skill."
+                    }
+                },
+                "required": ["skill_name"]
+            }
+        }
+    })
+}
+
+/// OpenAI-style tool schema for `discover_skills`.
+pub fn discover_skills_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "discover_skills",
+            "description": "Search the full skill catalog for additional workflow packs not shown in the current skill listing.\n\n\
+                Call this when you are pivoting, planning a multi-step workflow, or the surfaced skills do not cover your next action. \
+                Results are bounded and drawn only from the current authorized catalog. Repeated searches may return the same skills.\n\n\
+                After a successful discovery, invoke `skill` with one of the returned names.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Concrete description of what you are trying to do next (task, domain, or workflow)."
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = all_tool_schemas_core();
+    schemas.push(skill_tool_schema());
+    schemas.push(discover_skills_tool_schema());
     // run_script is Unix-only (UDS RPC transport). Always exposed on Unix;
     // there is no environment gate for production tools.
     #[cfg(unix)]
@@ -1932,7 +1996,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\"}`\n\n\
          ## Execution mode\n\
-        `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. After an accepted launch, when no relevant independent work remains, use agent(wait) for input; proposing a final answer also lets the runtime wait and present the child outcome. Do not use shell sleep or busy-poll status to wait. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; observe the automatically delivered child outcome before relying on it; do not re-fetch an already observed, sufficient result. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
+        `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. While owned children remain pending and no independent work remains, use agent(wait) or propose an answer for runtime completion waiting. After sufficient terminal outcomes arrive, finish the request; wait for future input only when requested. Do not use shell sleep or busy-poll status to wait. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; observe the automatically delivered child outcome before relying on it; do not re-fetch an already observed, sufficient result. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
          ## Parallel sub-agent fan-out\n\
          For independent parallel tasks, call `agent` with `action=spawn` once per child. Each launch has its own receipt and may succeed or fail independently; report partial outcomes honestly. Do not issue the same child task twice unless the user explicitly asks for independent duplicate runs. Use `agent_fanout` only when the user needs all-child preflight, target-count accounting, or group-wide control. Preflight does not guarantee every child will execute successfully. Do not simulate a group with an `agents:[...]` payload on `agent`. `agent_fanout.start` launches the admitted slots concurrently and returns a launch receipt; the parent-owned completion boundary prevents finalization before terminal child outcomes are staged. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\

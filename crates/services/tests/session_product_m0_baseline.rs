@@ -569,14 +569,6 @@ fn m2_removed_conversation_authorities_are_physically_absent() {
             "task_board_monitor",
         ),
         (
-            "crates/core/src/observation_journal.rs",
-            "struct TaskSnapshot",
-        ),
-        (
-            "crates/core/src/observation_journal.rs",
-            "task_completion_ratio",
-        ),
-        (
             "crates/runtime/src/turn/runtime_policy.rs",
             "PhaseTransitionSuggested",
         ),

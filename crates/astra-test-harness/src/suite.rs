@@ -94,70 +94,100 @@ fn cleanup_ready_session_ids(
     (ready, errors)
 }
 
-/// Render the assistant responses in the order in which they were produced.
+/// Render each user request with its response in execution order.
 ///
 /// `RunOutcome.text` is intentionally an aggregate used by deterministic
 /// criteria and report consumers.  It is not a sufficient judging surface for
 /// a multi-turn case: a plain concatenation makes the first answer
 /// indistinguishable from a follow-up answer, so a judge can attribute a
 /// later claim to the wrong user request.  Keep the aggregate untouched and
-/// give only the semantic judge an explicitly labelled transcript.
+/// give only the semantic judge an explicitly labelled, paired transcript.
 fn render_ordered_judger_transcript(
+    root_prompt: &str,
     outcome: &RunOutcome,
     attempts: &[AttemptRecord],
     steps: &[StepResult],
 ) -> String {
-    // Preserve the existing single-turn judging surface byte-for-byte.  The
-    // labels are needed only when there is more than one response to
-    // disambiguate, or when a retry produced multiple root attempts.
-    if steps.is_empty() && attempts.len() <= 1 {
-        return outcome.text.clone();
-    }
-
-    let mut transcript = String::new();
-    let mut append_response = |label: &str, text: &str| {
-        if !transcript.is_empty() {
-            transcript.push_str("\n\n");
-        }
-        transcript.push_str(label);
-        transcript.push('\n');
-        if text.is_empty() {
-            transcript.push_str("(no assistant text)");
-        } else {
-            transcript.push_str(text);
-        }
-    };
-
+    let mut exchanges = Vec::new();
     if attempts.is_empty() {
-        append_response("### Initial assistant response (turn 0)", &outcome.text);
+        exchanges.push((
+            "Initial turn 0".to_string(),
+            root_prompt,
+            outcome.text.as_str(),
+        ));
     } else if attempts.len() == 1 {
-        append_response(
-            "### Initial assistant response (turn 0)",
-            &attempts[0].outcome.text,
-        );
+        exchanges.push((
+            "Initial turn 0".to_string(),
+            root_prompt,
+            attempts[0].outcome.text.as_str(),
+        ));
     } else {
         for attempt in attempts {
-            append_response(
-                &format!(
-                    "### Root attempt {} assistant response",
-                    attempt.attempt_index
-                ),
-                &attempt.outcome.text,
-            );
+            exchanges.push((
+                format!("Root attempt {}", attempt.attempt_index),
+                root_prompt,
+                attempt.outcome.text.as_str(),
+            ));
         }
     }
-
     for step in steps {
-        append_response(
-            &format!(
-                "### Follow-up assistant response (step {})",
-                step.step_index
-            ),
-            &step.outcome.text,
-        );
+        exchanges.push((
+            format!("Follow-up step {}", step.step_index),
+            step.prompt.as_str(),
+            step.outcome.text.as_str(),
+        ));
     }
-
-    transcript
+    // JSON keeps prompts and responses inside their own data boundaries.
+    // Bound content per field before the final request bounds text, so a large
+    // early response cannot erase a later request or its turn identity.
+    let render = |limit: usize, retained: usize| {
+        serde_json::json!({
+            "ordered_exchanges": exchanges.iter().take(retained).map(|(label, user, assistant)| {
+                serde_json::json!({
+                    "label": label,
+                    "user_prompt": crate::judger::truncate_for_judger(user, limit),
+                    "assistant_response": crate::judger::truncate_for_judger(assistant, limit),
+                })
+            }).collect::<Vec<_>>(),
+            "content_omitted": exchanges.iter().any(|(_, user, assistant)| {
+                user.chars().count() > limit || assistant.chars().count() > limit
+            }),
+            "omitted_exchanges": exchanges.len() - retained,
+        })
+        .to_string()
+    };
+    let largest = exchanges
+        .iter()
+        .flat_map(|(_, user, assistant)| [user, assistant])
+        .map(|text| text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let fits = |text: &str| text.chars().count() <= crate::judger::JUDGER_TEXT_CAP;
+    let complete = render(largest, exchanges.len());
+    if fits(&complete) {
+        return complete;
+    }
+    let mut retained = exchanges.len();
+    let mut best = render(0, retained);
+    while !fits(&best) {
+        retained -= 1;
+        best = render(0, retained);
+    }
+    if retained != exchanges.len() {
+        return best;
+    }
+    let (mut low, mut high) = (0, largest);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let candidate = render(mid, retained);
+        if fits(&candidate) {
+            low = mid;
+            best = candidate;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
 }
 
 /// What to do with session journals.
@@ -1133,7 +1163,8 @@ impl<'a> SuiteRunner<'a> {
         // make multi-turn semantic judging position-aware.  Without this,
         // the initial response and later follow-ups become one unlabeled
         // paragraph and a judge may score the wrong turn.
-        judger_outcome.text = render_ordered_judger_transcript(&outcome, &attempts, &step_results);
+        judger_outcome.text =
+            render_ordered_judger_transcript(&case.prompt, &outcome, &attempts, &step_results);
         if let Some(session) = &session {
             attach_durable_judger_evidence(&mut judger_outcome, session);
         }
@@ -1695,6 +1726,20 @@ mod tests {
     #[test]
     fn judger_transcript_labels_multi_turn_responses_without_changing_aggregate() {
         let root = outcome_ok("m", "initial acknowledgement", &[]);
+        let single: serde_json::Value = serde_json::from_str(&render_ordered_judger_transcript(
+            "initial request",
+            &root,
+            &[],
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(
+            single,
+            serde_json::json!({"ordered_exchanges":[
+            {"label":"Initial turn 0", "user_prompt":"initial request",
+                "assistant_response":"initial acknowledgement"}
+        ],"content_omitted":false,"omitted_exchanges":0})
+        );
         let step = StepResult {
             step_index: 0,
             prompt: "follow up".into(),
@@ -1707,15 +1752,22 @@ mod tests {
         aggregate.text.push_str("\n\nfollow-up answer");
 
         assert_eq!(
-            render_ordered_judger_transcript(
+            serde_json::from_str::<serde_json::Value>(&render_ordered_judger_transcript(
+                "initial request",
                 &aggregate,
                 &[AttemptRecord {
                     attempt_index: 0,
                     outcome: root,
                 }],
                 &[step],
-            ),
-            "### Initial assistant response (turn 0)\ninitial acknowledgement\n\n### Follow-up assistant response (step 0)\nfollow-up answer"
+            ))
+            .unwrap(),
+            serde_json::json!({"ordered_exchanges":[
+                {"label":"Initial turn 0", "user_prompt":"initial request",
+                    "assistant_response":"initial acknowledgement"},
+                {"label":"Follow-up step 0", "user_prompt":"follow up",
+                    "assistant_response":"follow-up answer"}
+            ],"content_omitted":false,"omitted_exchanges":0})
         );
         assert_eq!(
             aggregate.text,
@@ -1736,9 +1788,68 @@ mod tests {
         let outcome = second.outcome.clone();
 
         assert_eq!(
-            render_ordered_judger_transcript(&outcome, &[first, second], &[]),
-            "### Root attempt 0 assistant response\nabandoned attempt\n\n### Root attempt 1 assistant response\nfinal attempt"
+            serde_json::from_str::<serde_json::Value>(&render_ordered_judger_transcript(
+                "root request",
+                &outcome,
+                &[first, second],
+                &[],
+            ))
+            .unwrap(),
+            serde_json::json!({"ordered_exchanges":[
+                {"label":"Root attempt 0", "user_prompt":"root request",
+                    "assistant_response":"abandoned attempt"},
+                {"label":"Root attempt 1", "user_prompt":"root request",
+                    "assistant_response":"final attempt"}
+            ],"content_omitted":false,"omitted_exchanges":0})
         );
+    }
+
+    #[test]
+    fn judger_transcript_budgets_fields_without_erasing_later_turns() {
+        let root = outcome_ok("m", &"old\\\"事实".repeat(2000), &[]);
+        let step = StepResult {
+            step_index: 0,
+            prompt: "new\\\"request".repeat(2000),
+            outcome: outcome_ok("m", &"new\\\"answer".repeat(2000), &[]),
+            duration_ms: 1,
+            criteria: vec![],
+            passed: true,
+        };
+        let text = render_ordered_judger_transcript(
+            &"old\\\"request".repeat(2000),
+            &root,
+            &[AttemptRecord {
+                attempt_index: 0,
+                outcome: root.clone(),
+            }],
+            &[step],
+        );
+        assert!(text.chars().count() <= crate::judger::JUDGER_TEXT_CAP);
+        let projection: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(projection["content_omitted"], true);
+        assert_eq!(projection["omitted_exchanges"], 0);
+        assert_eq!(projection["ordered_exchanges"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            projection["ordered_exchanges"][1]["label"],
+            "Follow-up step 0"
+        );
+        for exchange in projection["ordered_exchanges"].as_array().unwrap() {
+            for field in ["user_prompt", "assistant_response"] {
+                assert!(exchange[field].as_str().unwrap().contains("chars elided"));
+            }
+        }
+        let mut outcome = root;
+        outcome.text = text.clone();
+        let request = crate::judger::build_judger_request(
+            &Criterion::HardJudger {
+                question: "Judge each turn".into(),
+                threshold: 1.0,
+                model: None,
+            },
+            &outcome,
+        )
+        .unwrap();
+        assert_eq!(request.state["text"], text);
     }
 
     #[test]
@@ -4429,13 +4540,14 @@ mod tests {
 
         struct CaptureJudger {
             questions: std::sync::Mutex<Vec<String>>,
+            states: std::sync::Mutex<Vec<serde_json::Value>>,
         }
         #[async_trait]
         impl Judger for CaptureJudger {
             async fn judge(
                 &self,
                 criterion: &Criterion,
-                _o: &RunOutcome,
+                outcome: &RunOutcome,
             ) -> Result<crate::judger::JudgerResult, String> {
                 self.questions
                     .lock()
@@ -4445,8 +4557,12 @@ mod tests {
                         | Criterion::HardJudger { question, .. } => question.clone(),
                         _ => panic!("expected judger criterion"),
                     });
+                self.states
+                    .lock()
+                    .unwrap()
+                    .push(crate::judger::build_judger_request(criterion, outcome)?.state);
                 Ok(crate::judger::JudgerResult {
-                    assessment: JudgerAssessment::Grade(1.0),
+                    assessment: JudgerAssessment::Acceptance(true),
                     rationale: "ok".into(),
                     full_rationale: "ok".into(),
                     votes: vec![],
@@ -4455,6 +4571,7 @@ mod tests {
         }
         let judger = CaptureJudger {
             questions: std::sync::Mutex::new(vec![]),
+            states: std::sync::Mutex::new(vec![]),
         };
         let loader = NoopSessionLoader;
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
@@ -4478,11 +4595,52 @@ mod tests {
             criteria: vec![],
             timeout_seconds: None,
         }];
-        let _ = runner.run_all(&[case]).await;
-        let questions = judger.questions.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = runner.run_all(&[case.clone()]).await;
         assert!(
-            questions.is_empty(),
+            judger.questions.lock().unwrap().is_empty(),
             "only an explicit semantic criterion may spend a judge call or product session"
+        );
+        case.criteria.push(Criterion::HardJudger {
+            question: "Judge the response to each user request".into(),
+            threshold: 1.0,
+            model: None,
+        });
+        let report = runner.run_all(&[case.clone()]).await;
+        assert_eq!(report.runs[0].outcome.text, "step0\n\n6");
+        case.steps.clear();
+        let single = runner.run_all(&[case]).await;
+        assert_eq!(single.runs[0].outcome.text, "step0");
+        let states = judger.states.lock().unwrap();
+        assert_eq!(states.len(), 2);
+        let transcript: serde_json::Value =
+            serde_json::from_str(states[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            transcript["ordered_exchanges"][0]["user_prompt"],
+            "What is 2+2? Answer with just the number."
+        );
+        assert_eq!(
+            transcript["ordered_exchanges"][0]["assistant_response"],
+            "step0"
+        );
+        assert_eq!(
+            transcript["ordered_exchanges"][1]["user_prompt"],
+            "Actually what is 2+2+2?"
+        );
+        assert_eq!(
+            transcript["ordered_exchanges"][1]["assistant_response"],
+            "6"
+        );
+        assert_eq!(transcript["omitted_exchanges"], 0);
+        let single: serde_json::Value =
+            serde_json::from_str(states[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(single["ordered_exchanges"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            single["ordered_exchanges"][0]["user_prompt"],
+            "What is 2+2? Answer with just the number."
+        );
+        assert_eq!(
+            single["ordered_exchanges"][0]["assistant_response"],
+            "step0"
         );
     }
 

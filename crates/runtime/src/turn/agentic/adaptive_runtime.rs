@@ -44,8 +44,6 @@ fn per_turn_skill_quality_entries(
                     total_duration_ms: current
                         .total_duration_ms
                         .saturating_sub(baseline.map_or(0, |entry| entry.total_duration_ms)),
-                    satisfaction_sum: 0.0,
-                    satisfaction_count: 0,
                 },
             ))
         })

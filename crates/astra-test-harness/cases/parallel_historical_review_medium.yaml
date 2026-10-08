@@ -2,7 +2,7 @@ name: parallel_historical_review_medium
 description: |
   **What**: Review a fixed, historical medium-sized commit from two
   complementary angles and return one synthesized report.
-  **Tests**: Real repository evidence, bounded foreground fanout, terminal
+  **Tests**: Real repository evidence, bounded fanout, terminal
   child delivery, and parent synthesis without turning reviewer perspectives
   into separate durable work items.
   **Why**: A stable historical fixture gives a meaningful review workload
@@ -14,7 +14,7 @@ prompt: |
   branch (not the current working-tree changes) from two independent angles:
   (1) correctness, data integrity, and
   lifecycle risks; (2) tests, API contracts, and regression coverage. Use
-  exactly one foreground two-agent fanout with defaults.agent_type="code-review"
+  exactly one two-agent fanout with defaults.agent_type="task"
   and defaults.complexity="normal". Each child must inspect the commit with git
   evidence and return bounded findings. Then synthesize one report
   that cites the commit hash and distinguishes evidence from recommendations.
@@ -25,7 +25,7 @@ prompt_variants:
     prompt: |
       请只审查 main 分支历史提交 449b13b95，不要审查当前工作区改动。用两个独立视角：
       （1）正确性、数据完整性和生命周期风险；（2）测试、API 契约和回归覆盖。
-      只进行一次前台 two-agent fanout，defaults.agent_type="code-review"，
+      只进行一次 two-agent fanout，defaults.agent_type="task"，
       defaults.complexity="normal"；两个子 agent 都必须用 git 证据审查该提交，最后综合成一份报告，
       并明确区分证据和建议。不要修改文件。
 models:
@@ -55,6 +55,14 @@ criteria:
     path: /target_count
     equals: 2
   - type: session_event_count
+    event_type: agent_spawned
+    min: 2
+    max: 2
+    json_match:
+      path: /metadata/fanout_slot/target_count
+      equals: 2
+      unique_by: /metadata/run_id
+  - type: session_event_count
     event_type: agent_terminated
     min: 2
   - type: journal_tool_json
@@ -62,16 +70,18 @@ criteria:
     document: result
     path: /fanout/accepted
     equals: 2
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /fanout/terminal
-    equals: 2
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /provenance/all_slots_delivered
-    equals: true
+  # Launch receipts are not terminal results. Check that each exact slot's
+  # completed result was adopted by the owning parent before finalization.
+  - type: session_child_result_adopted
+    allow_get_result: true
+    spawn_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 0
+  - type: session_child_result_adopted
+    allow_get_result: true
+    spawn_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 1
   - type: journal_tool_outcome_count
     name: agent_fanout
     ok: false
@@ -85,6 +95,9 @@ criteria:
     name: agent
     min: 0
     max: 0
+    document: arguments
+    path: /action
+    equals: spawn
   - type: journal_turn_evaluation_success
     equals: true
   - type: text_contains

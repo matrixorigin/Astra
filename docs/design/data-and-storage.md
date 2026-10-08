@@ -68,9 +68,11 @@ Other SQL and malformed persisted-data errors retain their 500 behavior.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-10-07-v100` stores transcript items and their
+Fresh schema contract `2026-10-08-v101` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
+Context snapshot anchor, request, and response IDs share the canonical event ID
+capacity, and the schema guard checks all three columns.
 Model thinking observations use only the configuration-bound snapshot; obsolete
 capability and error mirror columns are absent.
 The retired tool-result projection decision/receipt tables and special event

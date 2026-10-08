@@ -118,6 +118,40 @@ impl ProviderWorkBudget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProviderDispatchBudget {
     client_timeout: Option<Duration>,
+    run_work_limited: bool,
+}
+
+impl ProviderDispatchBudget {
+    fn classify_deadline(
+        self,
+        mut error: astra_core::ClassifiedError,
+    ) -> astra_core::ClassifiedError {
+        if !self.run_work_limited || error.kind != astra_core::ErrorKind::ProviderDeadline {
+            return error;
+        }
+        let Some(mut details) = error
+            .details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        else {
+            return error;
+        };
+        // Only the client's invocation-wide work deadline carries this scope.
+        // Semantic-progress, completion and ledger deadlines retain their own
+        // recovery contracts even when the dispatch also has a run limit.
+        if details.pointer("/deadline/scope").and_then(Value::as_str) == Some("provider_attempt")
+            && details.pointer("/deadline/phase").and_then(Value::as_str)
+                != Some("semantic_progress")
+            && details
+                .pointer("/deadline/retry_safety")
+                .and_then(Value::as_str)
+                == Some("convergence_only")
+        {
+            details["deadline"]["execution_boundary"] = json!("run_work");
+            error.details_json = Some(details.to_string());
+        }
+        error
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4004,7 +4038,7 @@ pub(crate) struct RuntimeExecutionHandoff {
     pub(crate) admission_tool_schemas: Vec<Value>,
     pub(crate) deferred_tool_schemas: Vec<Value>,
     pub(crate) always_load_tool_names: BTreeSet<String>,
-    pub(crate) client_pipeline_skill_names: BTreeSet<String>,
+    pub(crate) client_pipeline_skills: Vec<astra_turn_types::SkillCatalogIdentity>,
     pub(crate) admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     pub(crate) permissions: astra_turn_core::permission::types::PermissionSyncContinuation,
     pub(crate) tool_history: Vec<HistoricalToolCallContinuation>,
@@ -4081,6 +4115,16 @@ impl RuntimeExecutionHandoff {
             ));
         }
         payload.heavy = validate_handoff_heavy(payload.heavy)?;
+        if payload.client_pipeline_skills.len() > 512
+            || payload.client_pipeline_skills.iter().any(|skill| {
+                !astra_turn_types::SkillCatalogIdentity::routing_metadata_is_valid(
+                    &skill.name,
+                    &skill.aliases,
+                )
+            })
+        {
+            return Err(invalid("adopted execution has an invalid skill directory"));
+        }
         validate_handoff_tool_history(
             &payload.tool_history,
             &checkpoint.user_id,
@@ -7404,6 +7448,7 @@ impl ServerAgenticLoopHost {
         let Some(execution_time_budget) = execution_time_budget else {
             return Ok(ProviderDispatchBudget {
                 client_timeout: boundary.provider_work_budget(None),
+                run_work_limited: false,
             });
         };
         // The wire schema is second-granular. Clamp the actual provider slice
@@ -7426,7 +7471,13 @@ impl ServerAgenticLoopHost {
         let client_timeout = boundary.provider_work_budget(Some(ProviderWorkBudget(
             Duration::from_secs(remaining_seconds),
         )));
-        Ok(ProviderDispatchBudget { client_timeout })
+        Ok(ProviderDispatchBudget {
+            client_timeout,
+            run_work_limited: !final_settlement
+                && boundary
+                    .budget()
+                    .is_none_or(|cap| cap >= Duration::from_secs(remaining_seconds)),
+        })
     }
 
     fn provider_attempt_is_settlement(
@@ -8012,8 +8063,14 @@ impl ServerAgenticLoopHost {
                 .is_some_and(|resolver| !resolver.available_skills().is_empty());
             let client_catalog_ready = self.runtime_declared_tool_names.contains(name)
                 && self.has_client_tool_delivery_lane()
-                && (state.skills.resolver.is_none()
-                    || !state.skills.client_pipeline_skill_names.is_empty());
+                && !state.skills.client_pipeline_skills.is_empty();
+            if name == crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME
+                && !state.skills.client_pipeline_skills.is_empty()
+            {
+                // Discovery uses the selected client directory. A server
+                // catalog must not mask a missing client search contract.
+                return Some(client_catalog_ready);
+            }
             return Some(server_catalog_ready || client_catalog_ready);
         }
 
@@ -13486,6 +13543,7 @@ impl ServerAgenticLoopHost {
         self.emit_edge_executor_offline_events(request_id, tool_name, &output, &fields);
 
         astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool_name.to_string(),
@@ -13840,6 +13898,8 @@ impl ServerAgenticLoopHost {
                 &ledger_tool_calls,
                 &action_context,
                 resolved_deferred_activations,
+                &state.skills.client_pipeline_skills,
+                state.runtime_tool_executor.as_deref(),
             )
                 .await;
         for result in &mut delivered.results {
@@ -13877,19 +13937,18 @@ impl ServerAgenticLoopHost {
         if !is_turn_pipeline_tool(name) || !self.runtime_declared_tool_names.contains(name) {
             return false;
         }
-        // With no server resolver, the connected client is the only possible
-        // pipeline owner. With both catalogs, route only exact client targets.
-        if state.skills.resolver.is_none() {
-            return true;
-        }
+        // A delivery lane is not a skill-directory authorization. Route only
+        // targets admitted from the client's directory, even without a server
+        // resolver.
         if name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME) {
-            return !state.skills.client_pipeline_skill_names.is_empty();
+            return !state.skills.client_pipeline_skills.is_empty();
         }
         crate::turn::skill_tool::extract_skill_name(tool_call).is_some_and(|target| {
             state
                 .skills
-                .client_pipeline_skill_names
-                .contains(&target.trim().to_ascii_lowercase())
+                .client_pipeline_skills
+                .iter()
+                .any(|skill| skill.matches_selector(&target))
         })
     }
 
@@ -14420,6 +14479,7 @@ impl ServerAgenticLoopHost {
         results_by_id.insert(
             request_id.to_string(),
             astra_turn_core::sse_stream_host::EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 tool_result_fields: Some(
                     self.edge_result_fields_with_runtime(request_id, tool_name, args, fields),
@@ -14522,6 +14582,7 @@ impl ServerAgenticLoopHost {
                 // executor run. `executed` is only a model-visible hint.
                 fields.insert("execution_started".to_string(), Value::Bool(false));
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id,
                     tool: tool_name,
@@ -14563,6 +14624,7 @@ impl ServerAgenticLoopHost {
         fields.insert("retryable".to_string(), Value::Bool(true));
         fields.insert("executed".to_string(), Value::Bool(false));
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id,
             tool: tool_name,
@@ -14602,6 +14664,7 @@ impl ServerAgenticLoopHost {
         fields.insert("retryable".to_string(), Value::Bool(false));
         fields.insert("executed".to_string(), Value::Null);
         EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id,
             tool: tool_name,
@@ -14627,6 +14690,8 @@ impl ServerAgenticLoopHost {
             tool_calls,
             action_context,
             &HashMap::new(),
+            &[],
+            None,
         )
         .await
     }
@@ -14638,6 +14703,8 @@ impl ServerAgenticLoopHost {
         tool_calls: &[Value],
         action_context: &EdgeActionAdmissionContext,
         resolved_deferred_activations: &HashMap<String, astra_turn_types::DeferredToolActivation>,
+        client_pipeline_skills: &[astra_turn_types::SkillCatalogIdentity],
+        runtime_tool_executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     ) -> AdmittedToolCallOutcome {
         use astra_turn_core::cloud_tool_delivery::{
             cloud_tool_requires_approval_for_delivery, collect_approval_batches,
@@ -14805,6 +14872,7 @@ impl ServerAgenticLoopHost {
                 results_by_id.insert(
                     request_id.clone(),
                     EdgeToolExecResult {
+                        work_attribution: None,
                         execution_completion: None,
                         request_id: request_id.clone(),
                         tool: tool_name.clone(),
@@ -14847,6 +14915,7 @@ impl ServerAgenticLoopHost {
                 results_by_id.insert(
                     request_id.clone(),
                     EdgeToolExecResult {
+                        work_attribution: None,
                         execution_completion: None,
                         request_id: request_id.clone(),
                         tool: tool_name.clone(),
@@ -14882,6 +14951,7 @@ impl ServerAgenticLoopHost {
             results_by_id.insert(
                 request_id.clone(),
                 EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: request_id.clone(),
                     tool: tool_name.clone(),
@@ -15522,12 +15592,29 @@ impl ServerAgenticLoopHost {
                     break;
                 };
                 let mut tool_request_event = tool_request_event;
+                let work_attribution = runtime_tool_executor
+                    .map(|executor| {
+                        executor.work_attribution_for_scope(&self.user_id, &self.session_id, run_id)
+                    })
+                    .unwrap_or_default();
+                tool_request_event["work_attribution"] = json!(work_attribution);
                 // `execution_timeout_ms` is the Edge delivery deadline and
                 // intentionally includes the settlement grace. Keep the
                 // executor's command cap in a server-authored field, not
                 // the model's `timeout` argument: rewriting that argument
                 // changes explicitness-sensitive tool semantics.
                 if let Some(event) = tool_request_event.as_object_mut() {
+                    if matches!(tool_name.as_str(), "skill" | "discover_skills") {
+                        event.insert(
+                            "admitted_skill_names".to_string(),
+                            json!(
+                                client_pipeline_skills
+                                    .iter()
+                                    .map(|skill| &skill.name)
+                                    .collect::<Vec<_>>()
+                            ),
+                        );
+                    }
                     if tool_name == "bash" {
                         event.insert(
                             "command_timeout_cap_ms".to_string(),
@@ -15600,7 +15687,7 @@ impl ServerAgenticLoopHost {
                 let callback_key = tool_callback_key(&identity);
                 // Persist the canonical request, not the host's later
                 // transient "already committed" projection marker.
-                let dispatch_payload = tool_request_event.to_string();
+                let mut dispatch_event = tool_request_event.clone();
                 let admission = interaction_sink
                     .commit_guarded_tool_request(GuardedToolRequestCommit {
                         action_id,
@@ -15615,6 +15702,32 @@ impl ServerAgenticLoopHost {
                 // could commit between the final offer check and the ledger
                 // write.
                 drop(policy_leases);
+                let mut frozen_work_attribution =
+                    astra_services::runs::WorkInvocationAttribution::Unknown;
+                let admission = admission.and_then(|outcome| {
+                    let event = match &outcome {
+                        GuardedToolRequestCommitOutcome::Committed { event }
+                        | GuardedToolRequestCommitOutcome::AckRecoveredCommitted { event }
+                        | GuardedToolRequestCommitOutcome::AlreadyCommitted { event } => {
+                            Some(event)
+                        }
+                        _ => None,
+                    };
+                    if let Some(event) = event {
+                        frozen_work_attribution = event
+                            .get("work_attribution")
+                            .map(|value| serde_json::from_value(value.clone()))
+                            .transpose()
+                            .map_err(|error| {
+                                format!("invalid committed Work attribution: {error}")
+                            })?
+                            .unwrap_or_default();
+                        frozen_work_attribution.validate(Some(run_id))?;
+                    }
+                    Ok(outcome)
+                });
+                dispatch_event["work_attribution"] = json!(frozen_work_attribution);
+                let dispatch_payload = dispatch_event.to_string();
                 let mut committed_event = match admission {
                     Ok(
                         GuardedToolRequestCommitOutcome::Committed { event }
@@ -15867,10 +15980,10 @@ impl ServerAgenticLoopHost {
                         "durable tool request projection failed; callback remains recoverable from committed run truth"
                     );
                 }
-                delivered_calls.push((tc, execution_deadline));
+                delivered_calls.push((tc, execution_deadline, frozen_work_attribution));
             }
 
-            for (tc, execution_deadline) in delivered_calls {
+            for (tc, execution_deadline, work_attribution) in delivered_calls {
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
@@ -15939,6 +16052,7 @@ impl ServerAgenticLoopHost {
                 results_by_id.insert(
                     id.clone(),
                     EdgeToolExecResult {
+                        work_attribution: Some(work_attribution),
                         execution_completion,
                         request_id: id,
                         tool: tool_name,
@@ -18668,7 +18782,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 admission_tool_schemas: self.admission_tool_schemas.clone(),
                 deferred_tool_schemas: self.deferred_tool_schemas.clone(),
                 always_load_tool_names: self.always_load_tool_names.iter().cloned().collect(),
-                client_pipeline_skill_names: state.skills.client_pipeline_skill_names.iter().cloned().collect(),
+                client_pipeline_skills: state.skills.client_pipeline_skills.clone(),
                 admitted_tool_policy: state.admitted_tool_policy.clone(),
                 permissions,
                 tool_history,
@@ -18869,10 +18983,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
             }
         }
-    }
-
-    fn injects_round_guidance(&self) -> bool {
-        true // Server injects guidance into the system prompt in execute_turn.
     }
 
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
@@ -21116,7 +21226,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         Some(&explain_provider_attempt_observer),
                         if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
                         dispatch_budget.client_timeout,
-                    ).await
+                    ).await.map_err(|error| dispatch_budget.classify_deadline(error))
                 };
                 // Root answer text stays provisional while Work admission is
                 // unresolved, but a provider failure closes that admission
@@ -23685,6 +23795,74 @@ mod tests {
     }
 
     #[test]
+    fn only_run_limited_provider_work_deadlines_authorize_final_settlement() {
+        for (deadline, boundary, final_settlement, expected) in [
+            (
+                Some(test_execution_deadline(20)),
+                ProviderAttemptBoundary::new(false, false),
+                false,
+                true,
+            ),
+            (
+                Some(test_execution_deadline(600)),
+                ProviderAttemptBoundary::new(true, false),
+                false,
+                false,
+            ),
+            (
+                Some(test_execution_deadline(20)),
+                ProviderAttemptBoundary::new(false, true),
+                true,
+                false,
+            ),
+            (
+                None,
+                ProviderAttemptBoundary::new(false, false),
+                false,
+                false,
+            ),
+        ] {
+            let dispatch = ServerAgenticLoopHost::provider_dispatch_budget(
+                deadline,
+                boundary,
+                final_settlement,
+            )
+            .unwrap();
+            for (scope, phase, work_deadline) in [
+                ("provider_attempt", "consuming the provider stream", true),
+                ("provider_attempt", "semantic_progress", false),
+                ("provider_completion", "actionable_output", false),
+                ("inference_ledger", "terminalization", false),
+            ] {
+                let original = json!({"deadline": {
+                    "scope": scope, "phase": phase, "retry_safety": "convergence_only"
+                }, "partial_full_text": "", "tool_calls": []});
+                let error = dispatch.classify_deadline(
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        "provider work deadline",
+                    )
+                    .with_details_json(original.to_string()),
+                );
+                assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+                let mut actual: Value =
+                    serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    actual
+                        .pointer("/deadline/execution_boundary")
+                        .and_then(Value::as_str),
+                    (expected && work_deadline).then_some("run_work")
+                );
+                actual["deadline"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_boundary");
+                assert_eq!(actual, original, "retain exact delivery and error evidence");
+            }
+        }
+    }
+
+    #[test]
     fn execution_time_budget_zero_rejects_new_timeout() {
         let budget = test_execution_deadline(0);
         let remaining = budget.remaining_at(std::time::Instant::now());
@@ -23769,6 +23947,7 @@ mod tests {
             .expect("initial provider budget"),
             ProviderDispatchBudget {
                 client_timeout: Some(Duration::from_secs(70)),
+                run_work_limited: true,
             }
         );
 
@@ -24305,6 +24484,8 @@ mod tests {
                 &[call],
                 &context,
                 &HashMap::new(),
+                &[],
+                None,
             )
             .await;
 
@@ -24584,8 +24765,11 @@ mod tests {
         state.total_prompt = 123;
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("original-client-skill".into());
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "original-client-skill".into(),
+                aliases: Vec::new(),
+            });
         state.step_recorder = astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
             &user, session, run_id, run_id,
         );
@@ -24853,8 +25037,11 @@ mod tests {
             assert_eq!(recovered.deferred_tool_schemas, original_deferred);
             assert_eq!(recovered.always_load_tool_names, original_always_load);
             assert_eq!(
-                recovered.client_pipeline_skill_names,
-                BTreeSet::from(["original-client-skill".into()])
+                recovered.client_pipeline_skills,
+                vec![astra_turn_types::SkillCatalogIdentity {
+                    name: "original-client-skill".into(),
+                    aliases: Vec::new(),
+                }]
             );
             assert_eq!(recovered.reservation, reservation);
             assert_eq!(recovered.original_user_message, "\n  inspect result\t\n");
@@ -25207,7 +25394,7 @@ mod tests {
                 "admission_tool_schemas",
                 "deferred_tool_schemas",
                 "always_load_tool_names",
-                "client_pipeline_skill_names",
+                "client_pipeline_skills",
             ] {
                 let original = wire["heavy"]
                     .as_object_mut()
@@ -29713,7 +29900,7 @@ mod tests {
 
     fn sample_edge_tools_with_skill() -> Vec<Value> {
         let mut tools = sample_edge_tools();
-        tools.push(crate::turn::skill_tool::skill_tool_schema_v2());
+        tools.push(astra_tools::schemas::skill_tool_schema());
         tools
     }
 
@@ -30482,6 +30669,8 @@ mod tests {
                     "invalid-weather".to_string(),
                     state.deferred_tool_activations[0].clone(),
                 )]),
+                &[],
+                None,
             )
             .await;
         assert_eq!(invalid_outcome.results.len(), 1);
@@ -46873,7 +47062,7 @@ mod tests {
                 ),
             )
             .build();
-        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+        host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
 
         let mut state = create_test_state();
         state.runtime_tool_executor = Some(Arc::new(
@@ -46894,8 +47083,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn visible_turn_tools_hide_skill_until_server_catalog_is_ready() {
+    #[tokio::test]
+    async fn visible_turn_tools_hide_skill_until_server_catalog_is_ready() {
         let dir = tempfile::TempDir::new().expect("temp workspace");
         let mut host = test_host_builder("u", "s")
             .with_execution_binding_snapshot(
@@ -46905,22 +47094,38 @@ mod tests {
                 ),
             )
             .build();
-        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
-
+        host.resolved_model_name = Some("test-model".to_string());
+        host.resolved_context_window = Some(200_000);
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
         let mut state = create_test_state();
-        state.skills.resolver = Some(Arc::new(ServerSkillResolver));
-        let before_discovery = schema_names(&host.visible_turn_tools(&mut state));
-        assert!(
-            !before_discovery.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
-            "installing a resolver before discovery must not expose an empty skill promise: {before_discovery:?}"
-        );
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
 
-        state.skills.resolver = Some(Arc::new(ListedSkillResolver));
-        let after_discovery = schema_names(&host.visible_turn_tools(&mut state));
-        assert!(
-            after_discovery.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
-            "a non-empty server catalog makes the shared skill tool executable: {after_discovery:?}"
-        );
+        for catalog in 0..3 {
+            let ready = catalog == 2;
+            state.skills.resolver = match catalog {
+                0 => None,
+                1 => Some(Arc::new(ServerSkillResolver)),
+                _ => Some(Arc::new(ListedSkillResolver)),
+            };
+            crate::turn::agentic_loop::lifecycle::configure_loop_host(&mut host, &state);
+            let _visible = host.visible_turn_tools(&mut state);
+            for name in ["skill", "discover_skills"] {
+                let selection = executor
+                    .execute_with_metadata(
+                        "tool_search",
+                        &json!({"query":format!("select:{name}")}),
+                    )
+                    .await;
+                assert!(!selection.is_error, "{name}: {}", selection.output);
+                let parsed: Value = serde_json::from_str(&selection.output)
+                    .expect("tool_search must return its structured selection result");
+                let matches = parsed["matches"]
+                    .as_array()
+                    .expect("tool_search selection matches");
+                let selected = matches.iter().any(|item| item["name"] == name);
+                assert_eq!(selected, ready, "{name}: {}", selection.output);
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -46932,6 +47137,13 @@ mod tests {
         host.prefer_client_tool_delivery();
         install_in_memory_interaction_sink(&mut host);
         let mut state = create_test_state();
+        state
+            .skills
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "analyze-session".into(),
+                aliases: Vec::new(),
+            });
         state.current_run_id = Some("test-run".to_string());
         state.canonical_turn_chain_id = Some("test-chain".to_string());
         let action_context = test_edge_action_context("u", "test-run").await;
@@ -47064,8 +47276,11 @@ mod tests {
         state.skills.resolver = Some(Arc::new(ListedSkillResolver));
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("review-code".to_string());
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "review-code".into(),
+                aliases: Vec::new(),
+            });
         state.current_run_id = Some("test-run".to_string());
         state.canonical_turn_chain_id = Some("test-chain".to_string());
         let action_context = test_edge_action_context("u", "test-run").await;
@@ -47132,8 +47347,11 @@ mod tests {
         state.skills.resolver = Some(Arc::new(ServerSkillResolver));
         state
             .skills
-            .client_pipeline_skill_names
-            .insert("project-review".to_string());
+            .client_pipeline_skills
+            .push(astra_turn_types::SkillCatalogIdentity {
+                name: "project-review".into(),
+                aliases: Vec::new(),
+            });
         let client_call = json!({
             "id": "call-client",
             "type": "function",
@@ -47154,6 +47372,43 @@ mod tests {
         let routed = host.client_pipeline_tool_calls(&state, &[client_call, server_call]);
         assert_eq!(routed.len(), 1);
         assert_eq!(routed[0]["id"], "call-client");
+
+        state.skills.resolver = Some(Arc::new(ListedSkillResolver));
+        assert_eq!(
+            host.dynamic_service_binding_ready("discover_skills", &state),
+            Some(false),
+            "the server catalog cannot substitute for the selected client's missing search contract"
+        );
+        host.runtime_declared_tool_names
+            .insert("discover_skills".to_string());
+        assert_eq!(
+            host.dynamic_service_binding_ready("discover_skills", &state),
+            Some(true)
+        );
+
+        state.skills.resolver = None;
+        let unknown_call = json!({
+            "id": "call-unadmitted",
+            "type": "function",
+            "function": {
+                "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
+                "arguments": r#"{"skill_name":"unadmitted-skill"}"#
+            }
+        });
+        assert!(
+            host.client_pipeline_tool_calls(&state, &[unknown_call])
+                .is_empty()
+        );
+        state.skills.client_pipeline_skills.clear();
+        let search_call = json!({
+            "id": "call-search",
+            "type": "function",
+            "function": {"name": "discover_skills", "arguments": r#"{"query":"review"}"#}
+        });
+        assert!(
+            host.client_pipeline_tool_calls(&state, &[search_call])
+                .is_empty()
+        );
     }
 
     #[test]
@@ -47835,7 +48090,7 @@ mod tests {
         );
         let initial_count = host.tool_schemas.len();
 
-        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+        host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
 
         assert!(
             host.valid_tool_names()
@@ -47858,8 +48113,8 @@ mod tests {
 
         let initial_count = host.tool_schemas.len();
 
-        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
-        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+        host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+        host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
 
         // Only one injection — duplicate is skipped
         assert_eq!(host.tool_schemas.len(), initial_count + 1);

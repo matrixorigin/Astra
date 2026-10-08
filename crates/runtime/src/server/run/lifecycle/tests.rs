@@ -13871,6 +13871,174 @@ fn test_executable_subrun_config(
 }
 
 #[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost fixture"]
+async fn server_subrun_initializes_descendant_admission_identity_from_owned_run() {
+    use crate::server::model_execution_admission::inheritance_test_support::{
+        ServiceBackedOffering, genesis_execution,
+    };
+    use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
+    use astra_turn_types::{DelegationIntentRequirements, DelegationUserRequirementSource};
+
+    // Drive the actual child executor and provider boundary. No test code
+    // installs canonical_turn_chain_id or an owner generation on loop state.
+    let gateway = ProviderGateway::start(vec![ProviderScript::bounded(
+        "child descendant admission",
+        |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+        3,
+        vec![
+            ProviderResponse::OpenAi(json!({
+                "choices": [{"index":0,"message":{"role":"assistant","content":"",
+                    "tool_calls":[{"id":"nested-call","type":"function","function":{
+                        "name":"agent","arguments":json!({"action":"spawn",
+                            "description":"Return a bounded reply","agent_type":"general-purpose",
+                            "prompt":"Reply with the exact text DESCENDANT_OK; do not use tools."}).to_string()
+                    }}]},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+            })),
+            ProviderResponse::OpenAi(json!({
+                "choices":[{"index":0,"message":{"role":"assistant",
+                    "content":"DESCENDANT_OK"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+            })),
+            ProviderResponse::OpenAi(json!({
+                "choices":[{"index":0,"message":{"role":"assistant",
+                    "content":"DESCENDANT_OK"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+            })),
+            ProviderResponse::OpenAi(json!({
+                "choices":[{"index":0,"message":{"role":"assistant",
+                    "content":"DESCENDANT_OK"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+            })),
+        ],
+    )]).await;
+    let mut admitted = genesis_execution();
+    admitted.base_url = format!("{}/v1", gateway.base_url);
+    let owner = crate::server::model_execution_admission::inheritance_test_support::USER_ID;
+    let pool = setup_lifecycle_run_db_it().await;
+    let svc = db_backed_test_service(&pool, "nested-admission-owner")
+        .with_fixture_workspace_provider(
+            Arc::new(tempfile::tempdir().unwrap()),
+            "nested-admission-executor",
+        )
+        .with_model_service(Arc::new(ServiceBackedOffering::new(admitted.clone())));
+    let run = Uuid::new_v4().to_string();
+    let session = format!("nested-admission-{}", Uuid::new_v4());
+    let parent = Uuid::new_v4().to_string();
+    let mut config = test_executable_subrun_config(&run, admitted.clone());
+    config.session_id = session.clone();
+    config.parent_run_id = parent.clone();
+    config.user_id = owner.into();
+    // A pending child's provisional answer can require a final synthesis
+    // request after delivery. Both provider orderings are valid.
+    config.max_turns = Some(4);
+    config.initial_turns = None;
+    config.request_constraints =
+        RequestConstraints::new(Some(HashSet::from(["agent".into()])), None, None, None);
+    config.request_constraints.delegated_model_requirements =
+        DelegationIntentRequirements::Unconstrained {
+            source: DelegationUserRequirementSource {
+                user_id: owner.into(),
+                session_id: config.session_id.clone(),
+                session_turn: 1,
+                applied_intent_id: None,
+                command_intent_id: None,
+                user_intent_digest: "original-human-intent".into(),
+            },
+        };
+    // Model-authored context must not supply the execution identity.
+    config
+        .context
+        .insert("turn_chain_id".into(), json!("foreign-chain"));
+    crate::server::run::insert_active_run_session_fixture(&pool, owner, &session).await;
+    let engine = svc.run_engine.clone();
+    engine.start_run(&parent, owner, &session).await.unwrap();
+    let ledger = svc
+        .invocation_ledger
+        .clone()
+        .expect("database invocation ledger");
+    let entry = svc.server_agent_spawner_for_session(owner, &session).await;
+    let executor = entry.executor.build_subrun_executor(
+        InheritedPermissions::auto_approve(),
+        None,
+        Some(&admitted),
+        Arc::new(Vec::new()),
+    );
+    config.child_supervisor = Some(Arc::downgrade(&entry.spawner));
+    config.cancellation_binding_id = Some(format!("binding-{run}"));
+    config.cancel_token = Some(Arc::new(CancellationToken::new()));
+    let authority = executor
+        .ensure_durable_subrun_started(&config, Some(&admitted))
+        .await
+        .unwrap()
+        .expect("admitted child owner");
+    config.execution_owner_generation = Some(authority.owner_generation);
+    config.execution_owner_generation_sink = Some(Arc::new(
+        ExecutionOwnerGenerationSink::preparing(authority.owner_generation),
+    ));
+    let _guard = entry
+        .executor
+        .bind_admitted_child_runtime(&config, &admitted)
+        .await
+        .unwrap();
+    let receipt = tokio::time::timeout(Duration::from_secs(15), executor.execute(config))
+        .await
+        .expect("bounded child execution")
+        .expect("actual child executor");
+    assert_eq!(receipt.result.status, STATUS_COMPLETED, "{receipt:?}");
+    let tool_outputs: Vec<String> = gateway
+        .requests
+        .lock()
+        .await
+        .iter()
+        .flat_map(|request| request.body["messages"].as_array().into_iter().flatten())
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str().map(str::to_string))
+        .collect();
+    let launched = tool_outputs
+        .iter()
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .find(|result| result["status"] == "launched")
+        .unwrap_or_else(|| panic!("descendant launch receipt: {tool_outputs:?}"));
+    let descendant = launched["run_id"]
+        .as_str()
+        .expect("exact launched descendant run");
+    let descendant_run =
+        wait_for_durable_run_status(&engine, owner, descendant, STATUS_COMPLETED).await;
+    assert_eq!(descendant_run.session_id, session);
+    assert_eq!(descendant_run.parent_run_id.as_deref(), Some(run.as_str()));
+    gateway.assert_complete();
+    let identity =
+        astra_turn_types::ToolInvocationIdentity::new(owner, &session, &run, &run, "nested-call")
+            .unwrap();
+    let record = ledger
+        .get(&identity)
+        .await
+        .unwrap()
+        .expect("descendant admission was frozen");
+    let admission = &record.decision.snapshot["delegation_model_admission"];
+    assert_eq!(admission["source"]["run_id"], run);
+    assert_eq!(admission["source"]["turn_chain_id"], run);
+    let durable = engine.load_run(owner, &run).await.unwrap().unwrap();
+    assert_eq!(
+        admission["source"]["owner_generation"],
+        durable.run_generation
+    );
+    assert_eq!(
+        admission["source"]["user_intent_digest"],
+        "original-human-intent"
+    );
+    assert_eq!(
+        admission["child_requirements"][0]["source"]["user_id"],
+        owner
+    );
+    cleanup_lifecycle_run_fixture(&pool, owner, descendant).await;
+    cleanup_lifecycle_run_fixture(&pool, owner, &run).await;
+    cleanup_lifecycle_run_fixture(&pool, owner, &parent).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, owner, &session).await;
+}
+
+#[tokio::test]
 async fn precreated_child_runtime_reuses_admitted_controls_and_retains_pause() {
     let service = test_service();
     let entry = service
@@ -15529,6 +15697,19 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         #[cfg(feature = "harness")]
         harness_sink: None,
     };
+
+    let unowned = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    );
+    assert!(
+        unowned
+            .ensure_durable_subrun_started(&config, None)
+            .await
+            .expect_err("WorkItem cannot use an execution path without durable ownership")
+            .contains("requires durable run admission")
+    );
 
     let error = executor
         .ensure_durable_subrun_started(&config, None)
@@ -27477,11 +27658,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         .skill_execution
         .pinned
         .extend(["z-skill".into(), "a-skill".into()]);
-    facts
-        .original
-        .skill_execution
-        .discovered
-        .insert("test-skill".into());
     facts
         .original
         .skill_execution

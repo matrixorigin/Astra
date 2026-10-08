@@ -32,6 +32,7 @@ pub fn journal_record_edge_tool_result(
     );
     record.tool_call_id = Some(result.request_id.clone());
     record.execution_completion = result.execution_completion.clone();
+    record.work_attribution = result.work_attribution.clone();
     let fields = result.tool_result_fields.as_ref();
     record.disposition = Some(
         fields
@@ -494,16 +495,24 @@ mod tests {
             ),
         ] {
             let result = crate::sse_stream_host::EdgeToolExecResult {
+                work_attribution: Some(astra_services::runs::WorkInvocationAttribution::Unbound),
+
                 request_id: "call-1".into(),
                 tool: tool.into(),
                 args: serde_json::json!({"path": "document.txt"}),
                 output: output.into(),
                 status: status.into(),
                 duration_ms: 1,
-                tool_result_fields: None,
+                tool_result_fields: Some(
+                    serde_json::from_value(
+                        serde_json::json!({"work_attribution":{"state":"control"}}),
+                    )
+                    .unwrap(),
+                ),
                 execution_completion: None,
             };
             let local = journal_record_edge_tool_result(&result);
+            assert_eq!(local.work_attribution, result.work_attribution);
             let remote_content = crate::edge_ledger::tool_content_from_ledger_entry(
                 &serde_json::json!({"body": {"status": status, "output": output}}),
             );

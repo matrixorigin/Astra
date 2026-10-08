@@ -179,32 +179,16 @@ pub(super) fn install_turn_persistence_services(
     shared_pool: &SharedPool,
 ) -> AppState {
     state
-        .with_turn_core_event_writer(Arc::new(
-            DatabaseTurnCoreEventWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
-        .with_turn_tool_event_writer(Arc::new(
-            DatabaseTurnToolEventWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
         .with_turn_hook_db_writer(Arc::new(
             DatabaseTurnHookDbWriter::new(settings.matrixone.clone())
                 .with_pool(shared_pool.clone()),
         ))
-        .with_turn_reflection_lesson_writer(Arc::new(DatabaseTurnReflectionLessonWriter::new(
-            settings.memoria.base_url.clone(),
-            settings.memoria.master_key.clone(),
-        )))
         .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),
         )))
         .with_turn_auxiliary_event_writer(Arc::new(
             DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
-        .with_turn_session_activity_writer(Arc::new(
-            DatabaseTurnSessionActivityWriter::new(settings.matrixone.clone())
                 .with_pool(shared_pool.clone()),
         ))
 }

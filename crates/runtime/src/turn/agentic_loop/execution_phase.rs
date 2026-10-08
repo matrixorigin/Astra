@@ -24,7 +24,6 @@ use crate::turn::run_control::{ProviderBoundaryAuthorization, UserIntentAdmissio
 use astra_config::user_profile::{
     MutationCompletionScope, Scenario, TurnIntentDomain, WorkspaceMutationIntent,
 };
-use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore, SessionArtifactStore};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
@@ -4303,16 +4302,6 @@ fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
     !model_guidance.is_empty()
 }
 
-pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
-    NormalizedPromptCacheUsage::new(
-        turn_result.accum.prompt_tokens,
-        turn_result.accum.cache_read_tokens,
-        turn_result.accum.cache_creation_tokens,
-    )
-    .total_input_tokens()
-    .saturating_add(turn_result.accum.completion_tokens)
-}
-
 fn runtime_feedback_run_usage(
     state: &AgenticLoopState,
     accum: &astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum,
@@ -4513,51 +4502,32 @@ fn apply_terminal_control_stream_snapshot(
     }
 }
 
-fn route_runtime_policy_evidence(
-    state: &mut AgenticLoopState,
-    facts: &astra_core::observation_journal::JournalFacts,
-    evidence: crate::turn::runtime_policy::RuntimePolicyEvidence,
-) {
-    use crate::turn::runtime_policy::RuntimePolicyEvidence;
-
-    match evidence {
-        RuntimePolicyEvidence::BudgetExpansionSuggested {
-            factor,
-            max_ceiling,
-        } => {
-            tracing::info!(
-                target: "astra::policy",
-                factor,
-                max_ceiling,
-                consecutive_outcomes = facts.streaks.consecutive_rounds_with_outcome,
-                current_max_turns = state.max_turns,
-                remaining_turns = state.remaining_turns,
-                "policy recorded budget-expansion evidence without mutating budget"
-            );
-        }
-        RuntimePolicyEvidence::ContextPressureObserved { urgency } => {
-            let pressure = facts.performance.token_pressure;
-            state.push_volatile_payload(
-                super::host::VolatileKind::ContextPressure,
-                serde_json::json!({
-                    "schema": "runtime_policy_advisory.v1",
-                    "signal": "context_pressure_observed",
-                    "evidence": {
-                        "token_pressure": pressure,
-                        "urgency": urgency.to_string(),
-                    },
-                    "authority": "advisory_evidence_only",
-                }),
-            );
-            tracing::info!(
-                target: "astra::policy",
-                %urgency,
-                token_pressure = pressure,
-                "policy context-pressure evidence recorded"
-            );
-        }
-        RuntimePolicyEvidence::NoAdvisory => {}
-    }
+fn refresh_context_pressure_advisory(state: &mut AgenticLoopState) {
+    use crate::turn::providers::LiveRuntimeProvider;
+    let pressure = crate::turn::local_provider::LocalSessionProvider::new(state).token_pressure();
+    state.clear_volatile(super::host::VolatileKind::ContextPressure);
+    let urgency = if pressure >= 0.90 {
+        "aggressive"
+    } else if pressure >= 0.70 {
+        "normal"
+    } else {
+        return;
+    };
+    state.push_volatile_payload(
+        super::host::VolatileKind::ContextPressure,
+        serde_json::json!({
+            "schema": "runtime_policy_advisory.v1",
+            "signal": "context_pressure_observed",
+            "evidence": {"token_pressure": pressure, "urgency": urgency},
+            "authority": "advisory_evidence_only",
+        }),
+    );
+    tracing::info!(
+        target: "astra::policy",
+        urgency,
+        token_pressure = pressure,
+        "policy context-pressure evidence recorded"
+    );
 }
 
 fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
@@ -4813,73 +4783,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // placement nor generation proves reuse of accumulated history or model
     // adoption.
     let show_policy_feedback_status = host.turn_interaction_mode().shows_policy_feedback_status();
-    // Inject round budget guidance so the model knows to batch or synthesize.
-    // Use llm_rounds_completed (actual LLM call count) not turn_index (step
-    // counter inflated by progressive penalty).
-    // Skip when the host already injects guidance (e.g. server path injects
-    // it into the system prompt in its own execute_turn).
-    //
-    if !host.injects_round_guidance() {
-        // ── Self-Status injection (push-mode observation) ─────────────────
-        // Always inject a compact self-status block so the agent sees its
-        // current health (token pressure, trends, alerts, circuit breaker)
-        // without needing to call `introspect`. This closes the pull→push gap.
-        // Skip when budget is exhausted — the agent should produce final
-        // output, not introspect.
-        if state.remaining_turns > 0
-            && (state.llm_rounds_completed > 0 || !state.observation_journal.is_empty())
-        {
-            // Construct a lightweight provider for live metrics.
-            use crate::turn::providers::{LiveRuntimeProvider, SessionStateProvider};
-            let status_provider = crate::turn::local_provider::LocalSessionProvider::new(state);
-            let cb_state = status_provider.circuit_breaker_state().to_string();
-            let cache_ratio = status_provider.cache_hit_ratio();
-            let token_pressure = status_provider.token_pressure();
-            let alerts: Vec<String> = {
-                let mut a = Vec::new();
-                if state.stall.work_evidence_advisory_emitted {
-                    a.push("work_evidence_sufficiency".to_string());
-                }
-                let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
-                if recent_tool_failures > 0 {
-                    a.push(format!(
-                        "tool_failures={recent_tool_failures}; tools remain available unless an explicit restricted_tool result appears"
-                    ));
-                }
-                a
-            };
-            let status = render_compact_status(
-                &state.observation_journal,
-                &alerts,
-                &cb_state,
-                token_pressure,
-                cache_ratio,
-                state.llm_rounds_completed,
-            );
-            if !status.is_empty() {
-                state.push_volatile(super::host::VolatileKind::SelfStatus, status);
-            }
-        }
-
-        let mut guidance = crate::prompts::tool_round_guidance_trace(&state.messages).0;
-        if !state.suppress_execution_slice_guidance() {
-            let slice_guidance = crate::prompts::execution_slice_guidance(
-                state.remaining_turns,
-                state.max_turns,
-                super::lifecycle::adaptive_budget_is_renewable(state),
-            );
-            if !slice_guidance.is_empty() {
-                if !guidance.is_empty() {
-                    guidance.push_str("\n\n");
-                }
-                guidance.push_str(&slice_guidance);
-            }
-        }
-        if !guidance.is_empty() {
-            state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
-        }
-    }
-
     // Resolve from this execution's selected policy without round-local I/O.
     let tool_cfg = &state.admitted_tool_policy;
     let resolved_tool_policy =
@@ -4911,45 +4814,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // ── Policy-driven evaluation (RuntimePolicy) ───────────────────────
-    // Compute JournalFacts from the current loop state and delegate to
-    // RuntimePolicy::decide(). The policy produces `RuntimePolicyEvidence`
-    // values that complement the guard pipeline above.
-    //
-    // This runs after the guard pipeline so it sees the latest tool-call
-    // records and circuit-breaker state.
-    {
-        use crate::turn::local_provider::LocalSessionProvider;
-        use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider};
-        use astra_core::observation_journal::JournalFacts;
-
-        let provider = LocalSessionProvider::new(state);
-
-        // Extract journal facts from the ObservationProvider trait.
-        let mut facts = provider.extract_facts();
-
-        // Populate session-wide fields from authoritative state.
-        // extract_facts provides streak and budget data from the journal
-        // window; these fields come from the full session state.
-        facts.budget.rounds_completed = state.llm_rounds_completed;
-        facts.performance.total_observation_calls = state.total_observation_tool_calls;
-        facts.performance.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
-        facts.performance.total_tool_calls = state.total_tool_calls;
-
-        // Stall reason from the unified stall diagnosis.
-        facts.stall.stall_reason = interruption_diagnosis_summary(state);
-
-        // Populate token pressure from the LiveRuntimeProvider.
-        facts.performance.token_pressure = provider.token_pressure();
-
-        let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
-        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-        let policy_evidence = policy.decide(&facts);
-
-        for evidence in policy_evidence {
-            route_runtime_policy_evidence(state, &facts, evidence);
-        }
-    }
+    refresh_context_pressure_advisory(state);
 
     // ── Circuit breaker observation ──────────────────────────────────────
     // Feed the previous round's signal to the circuit breaker. The runtime
@@ -5330,6 +5195,31 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     error = %error,
                     "provider attempt ended before executable or visible delivery; scheduling one safe thinking-off recovery round"
                 );
+                state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+            // The client reserves inference-ledger settlement inside the run
+            // work slice. Its deadline may therefore leave a whole second of
+            // work while the run's final-answer window is still untouched.
+            // After the one safe recovery, only a dispatch proven to be
+            // run-work-limited can enter that existing terminal boundary.
+            if state.provider_adaptation.action_convergence_attempted
+                && provider_deadline_has_no_actionable_delivery(&error)
+                && error
+                    .details_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .is_some_and(|details| {
+                        details
+                            .pointer("/deadline/execution_boundary")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("run_work")
+                    })
+                && host
+                    .execution_time_budget_remaining()
+                    .is_some_and(|remaining| remaining.total_remaining > remaining.work_remaining)
+                && super::lifecycle::enter_deadline_budget_settlement(host, state).await
+            {
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
@@ -5751,13 +5641,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     Some("rate_limited"),
                 );
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
+                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -5991,13 +5875,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     Some("interrupted"),
                 );
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
+                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 finalize_and_render(host, state).await;
@@ -6081,10 +5959,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         );
                         observe_turn_end_without_tools(
                             state,
-                            turn_index,
                             prep.turn_start_time,
                             turn_result.ttft_ms,
-                            turn_result_tokens_consumed(&turn_result),
                         );
                         state.step_recorder.end_turn(false);
                         try_write_heavy_checkpoint(state);
@@ -6173,10 +6049,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     observe_turn_end_without_tools(
                         state,
-                        turn_index,
                         prep.turn_start_time,
                         turn_result.ttft_ms,
-                        turn_result_tokens_consumed(&turn_result),
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
@@ -6233,10 +6107,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     observe_turn_end_without_tools(
                         state,
-                        turn_index,
                         prep.turn_start_time,
                         turn_result.ttft_ms,
-                        turn_result_tokens_consumed(&turn_result),
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
@@ -6302,13 +6174,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         "completion_contract_incomplete"
                     }),
                 );
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
+                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 finalize_and_render(host, state).await;
@@ -6338,13 +6204,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
             state.step_recorder.end_turn(true);
 
-            observe_turn_end_without_tools(
-                state,
-                turn_index,
-                prep.turn_start_time,
-                turn_result.ttft_ms,
-                turn_result_tokens_consumed(&turn_result),
-            );
+            observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
 
             finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -6369,7 +6229,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // tools after such a signal is not a protocol violation, so there is no
     // "ignored correction" phase and no synthetic abort here.
     emit_subrun_text_preview(host, state, prep.quiet);
-    if let Some(control) = handle_token_budget(host, state, turn_index, prep, &turn_result).await {
+    if let Some(control) = handle_token_budget(host, state, prep, &turn_result).await {
         return Ok(control);
     }
     record_tool_selection(state, &turn_result, turn_index);
@@ -8778,10 +8638,8 @@ fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostT
 
 pub(crate) fn observe_turn_end_without_tools(
     state: &mut AgenticLoopState,
-    _turn_index: usize,
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
-    tokens_consumed: u64,
 ) {
     // ── Telemetry timing ─────────────────────────────────────────
     if let (Some(hub), Some(session)) = (
@@ -8799,15 +8657,6 @@ pub(crate) fn observe_turn_end_without_tools(
         };
         let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
-    }
-
-    // Tool-less turns still feed the canonical in-memory observation window.
-    {
-        let mut metrics = astra_core::TurnMetrics::default();
-        metrics.rounds_completed = state.llm_rounds_completed;
-        metrics.tokens_consumed = tokens_consumed;
-
-        state.observation_journal.record_turn(&metrics);
     }
 }
 
@@ -8832,7 +8681,6 @@ const MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS: u32 = 3;
 async fn handle_token_budget<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    turn_index: usize,
     prep: TurnIterationPrep,
     turn_result: &HostTurnResult,
 ) -> Option<TurnExecutionControl> {
@@ -8868,13 +8716,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             prep.turn_start_time,
             Some("token_budget_exceeded"),
         );
-        observe_turn_end_without_tools(
-            state,
-            turn_index,
-            prep.turn_start_time,
-            turn_result.ttft_ms,
-            turn_result_tokens_consumed(turn_result),
-        );
+        observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -19975,33 +19817,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_policy_budget_evidence_preserves_budget_and_history() {
-        let mut state = make_state();
-        state.max_turns = 8;
-        state.remaining_turns = 2;
-        let mut facts = astra_core::observation_journal::JournalFacts::default();
-        facts.streaks.consecutive_rounds_with_outcome = 3;
-        let history_before = state.messages.clone();
-
-        route_runtime_policy_evidence(
-            &mut state,
-            &facts,
-            crate::turn::runtime_policy::RuntimePolicyEvidence::BudgetExpansionSuggested {
-                factor: 1.5,
-                max_ceiling: 20,
-            },
-        );
-
-        assert_eq!(state.max_turns, 8);
-        assert_eq!(state.remaining_turns, 2);
-        assert_eq!(state.messages, history_before);
-        assert!(
-            state.take_volatile_pending().is_empty(),
-            "an internal budget recommendation must not influence model completion"
-        );
-    }
-
-    #[test]
     fn context_manifest_turn_intent_ignores_prompt_facing_benchmark_marker() {
         let mut state = make_state();
         state.message = "please compare these results [TASK_ID:bnh]".into();
@@ -20144,6 +19959,7 @@ mod tests {
         error: Option<astra_core::ClassifiedError>,
         valid_tools: HashSet<String>,
         calls: usize,
+        time_remaining: Option<astra_turn_types::ExecutionTimeRemaining>,
     }
 
     struct BoundaryDecisionRunControl {
@@ -20225,6 +20041,7 @@ mod tests {
                 error: Some(error),
                 valid_tools: HashSet::new(),
                 calls: 0,
+                time_remaining: None,
             }
         }
 
@@ -20235,6 +20052,11 @@ mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for DirectErrorHost {
+        fn execution_time_budget_remaining(
+            &self,
+        ) -> Option<astra_turn_types::ExecutionTimeRemaining> {
+            self.time_remaining
+        }
         async fn execute_turn(
             &mut self,
             _state: &mut AgenticLoopState,
@@ -20402,19 +20224,11 @@ mod tests {
         state.telemetry.observability_session = Some(session.clone());
 
         let turn_start_time = Instant::now() - Duration::from_millis(25);
-        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7), 123);
+        observe_turn_end_without_tools(&mut state, turn_start_time, Some(7));
 
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
-        assert_eq!(
-            state
-                .observation_journal
-                .last_entry()
-                .map(|entry| entry.tokens_consumed),
-            Some(123),
-            "tool-less observation must record the current LLM round cost, not cumulative session tokens"
-        );
     }
 
     #[test]
@@ -20836,6 +20650,79 @@ mod tests {
                 assert!(provider.released.lock().await.is_empty());
             }
             assert_eq!(host.turn_count(), 1, "no stale request is retried in place");
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_run_provider_recovery_uses_existing_final_window() {
+        for (boundary, recovery_used, delivery, settlement_active, expected_settlement) in [
+            (Some("run_work"), true, "none", false, true),
+            (Some("run_work"), false, "none", false, false),
+            (None, true, "none", false, false),
+            (Some("run_work"), true, "text", false, false),
+            (Some("run_work"), true, "tool", false, false),
+            (Some("run_work"), true, "malformed", false, false),
+            (Some("run_work"), true, "none", true, false),
+        ] {
+            let mut state = make_state();
+            state.provider_adaptation.action_convergence_attempted = recovery_used;
+            state.hooks.completion_settlement.text_only = settlement_active;
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                "provider work deadline",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "deadline": {"execution_boundary": boundary},
+                    "partial_full_text": if delivery == "text" { "already delivered" } else { "" },
+                    "partial_reasoning": "provisional reasoning",
+                    "tool_calls": match delivery {
+                        "tool" => serde_json::json!([{"id": "selected-action"}]),
+                        "malformed" => serde_json::Value::Null,
+                        _ => serde_json::json!([]),
+                    },
+                })
+                .to_string(),
+            );
+            let mut host = DirectErrorHost::new(error);
+            host.time_remaining = Some(astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(3),
+                total_remaining: Duration::from_secs(33),
+            });
+            let result = execute_turn_and_ingest_phase(
+                &mut host,
+                &mut state,
+                0,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+            )
+            .await;
+            assert_eq!(host.turn_count(), 1);
+            if expected_settlement {
+                assert!(matches!(result, Ok(TurnExecutionControl::ContinueLoop)));
+                assert!(state.hooks.completion_settlement.text_only);
+                assert!(state.budget_wrapup_injected);
+                assert_eq!(
+                    state.hooks.completion_settlement.wrapup_origin,
+                    Some(super::super::host::BudgetWrapupOrigin::ExecutionDeadline)
+                );
+                assert!(
+                    state
+                        .hooks
+                        .completion_settlement
+                        .completion_action_window
+                        .is_none()
+                );
+            } else if !recovery_used {
+                assert!(matches!(result, Ok(TurnExecutionControl::ContinueLoop)));
+                assert!(state.provider_adaptation.force_next_thinking_off);
+                assert!(!state.budget_wrapup_injected);
+            } else {
+                assert!(result.is_err());
+                assert!(!state.budget_wrapup_injected);
+            }
         }
     }
 
@@ -23312,7 +23199,6 @@ mod tests {
         let control = handle_token_budget(
             &mut host,
             &mut state,
-            0,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23374,7 +23260,6 @@ mod tests {
         let first = handle_token_budget(
             &mut host,
             &mut state,
-            0,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23401,7 +23286,6 @@ mod tests {
         let second = handle_token_budget(
             &mut host,
             &mut state,
-            1,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23428,7 +23312,6 @@ mod tests {
         let third = handle_token_budget(
             &mut host,
             &mut state,
-            2,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23466,7 +23349,6 @@ mod tests {
         let control = handle_token_budget(
             &mut host,
             &mut state,
-            0,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -26470,6 +26352,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_pressure_reaches_provider_without_changing_execution_authority() {
+        for (tokens, expected) in [
+            (69_999, None),
+            (70_000, Some("normal")),
+            (89_999, Some("normal")),
+            (90_000, Some("aggressive")),
+        ] {
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            let base = super::super::host::introspect_estimated_input_tokens(&state);
+            state.pinned_tool_schema_tokens = tokens - base;
+            // A previous observation must disappear once live pressure drops.
+            state.push_volatile_payload(
+                VolatileKind::ContextPressure,
+                serde_json::json!({"old": true}),
+            );
+            let history = state.messages.clone();
+            let budget = (state.max_turns, state.remaining_turns);
+            let restrictions = state.restricted_tools.clone();
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+            execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+                .await
+                .expect("provider boundary");
+            let delivered = host.executed_volatile[0]
+                .iter()
+                .filter(|entry| entry.kind == VolatileKind::ContextPressure)
+                .collect::<Vec<_>>();
+            assert_eq!(delivered.len(), usize::from(expected.is_some()));
+            if let Some(urgency) = expected {
+                let entry = delivered[0];
+                assert_eq!(entry.payload["evidence"]["urgency"], urgency);
+                assert_eq!(
+                    entry.payload["evidence"]["token_pressure"],
+                    tokens as f64 / 100_000.0
+                );
+                assert_eq!(entry.payload["authority"], "advisory_evidence_only");
+                let edge = super::super::host::volatile_injection_edge_profile(entry);
+                let wire =
+                    crate::turn::wire_assembly::runtime_volatile_preamble_messages(&edge).unwrap();
+                assert!(!wire.is_empty());
+                assert!(wire.iter().all(|message| message["role"] == "system"));
+            }
+            assert_eq!(host.executed_messages[0], history);
+            assert_eq!((state.max_turns, state.remaining_turns), budget);
+            assert_eq!(state.restricted_tools, restrictions);
+        }
+    }
+
+    #[tokio::test]
     async fn converged_policy_reaches_provider() {
         let mut state = make_state();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
@@ -26503,92 +26434,6 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("one decisive check or synthesize")
-        );
-    }
-
-    #[tokio::test]
-    async fn local_host_delivers_low_slice_horizon_at_the_model_boundary() {
-        let mut state = make_state();
-        state.max_turns = 40;
-        state.remaining_turns = 4;
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .expect("local turn");
-
-        let delivered = host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        let advisory = delivered
-            .iter()
-            .find(|injection| injection.kind == VolatileKind::BudgetAdvisory)
-            .expect("low-slice budget advisory");
-        assert!(
-            advisory
-                .payload
-                .to_string()
-                .contains("available_model_boundaries_including_current\\\":5"),
-            "the model must receive the live execution horizon: {advisory:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn renewable_capacity_boundary_does_not_require_completion() {
-        let mut state = make_state();
-        state.max_turns = 32;
-        state.remaining_turns = 0;
-        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
-        state.agentic_turn_budget.extension_turns = 12;
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .expect("renewable review-boundary turn");
-
-        let delivered = host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        let advisory = delivered
-            .iter()
-            .find(|injection| injection.kind == VolatileKind::BudgetAdvisory)
-            .expect("renewable review advisory");
-        let text = advisory.payload.to_string();
-        assert!(text.contains("adaptive capacity checkpoint"), "{text}");
-        assert!(
-            text.contains("not evidence of progress or unfinished work"),
-            "{text}"
-        );
-        assert!(!text.contains("Do not call any tool"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn local_host_suppresses_slice_horizon_during_token_rail_wrapup() {
-        let mut state = make_state();
-        state.max_turns = 40;
-        state.remaining_turns = 1;
-        state.budget_wrapup_injected = true;
-        state.hooks.completion_settlement.text_only = false;
-        state.hooks.completion_settlement.work_settlement_only = false;
-        state.hooks.completion_settlement.completion_action_window = None;
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .expect("token-rail wrap-up turn");
-
-        let delivered = host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        assert!(
-            delivered.iter().all(|injection| {
-                injection.kind != VolatileKind::BudgetAdvisory
-                    || !injection.payload.to_string().contains("<execution-slice>")
-            }),
-            "token-rail wrap-up must remain the only budget instruction: {delivered:?}"
         );
     }
 

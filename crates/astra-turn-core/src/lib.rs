@@ -14,7 +14,6 @@
 
 pub mod action_compensation;
 pub mod active_conversation;
-pub mod activity;
 pub mod agent_live_event;
 pub mod database_snapshots;
 
@@ -50,7 +49,6 @@ pub mod fork;
 pub mod guardrails;
 pub mod headless;
 pub mod history;
-pub mod hook_plans;
 pub mod injection_tracking;
 pub mod interaction_types;
 pub mod interruption;

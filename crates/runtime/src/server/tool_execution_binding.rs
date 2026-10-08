@@ -192,6 +192,10 @@ pub(crate) fn runtime_execution_provider_id_for_executor(executor: &ExecutorBind
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolPolicySnapshot {
+    /// Installed by the invocation owner and persisted in its decision only.
+    /// Provider requests cannot carry Work causality or invent an attempt.
+    #[serde(skip)]
+    pub work_attribution: astra_services::runs::WorkInvocationAttribution,
     /// Invocation-local monotonic admission cutoff selected from the admitted
     /// run authority. Never a provider permission or a serialized deadline.
     #[serde(skip)]

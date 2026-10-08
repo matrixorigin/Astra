@@ -566,13 +566,17 @@ pub enum Criterion {
         delivered_items: usize,
         #[serde(default)]
         cancellation_after_deliveries: usize,
-        /// Minimum delivered initial items before any added item is assigned
-        /// or observed executing. Creation alone does not satisfy execution.
+        /// Minimum delivered initial items before any added item executes.
+        /// Creation and assignment alone do not satisfy execution.
         #[serde(default)]
         added_execution_after_initial_deliveries: usize,
         /// The complete start receipt must already contain every added item.
         #[serde(default)]
         require_added_at_start: bool,
+        /// Every added identity must be committed before the first scoped
+        /// tool execution, including one whose execution result is an error.
+        #[serde(default)]
+        require_added_before_execution: bool,
     },
 
     /// Proves a successful canonical graph patch was committed after Work was
@@ -1910,6 +1914,113 @@ fn fanout_launch_set_proven(
     launched.is_some_and(|launched| launched.len() == agents.len() && launched == spawned)
 }
 
+/// Prove a complete terminal result from the parent's bounded reads. Pages
+/// remain evidence from one immutable child result, not a new storage replica.
+fn assemble_fanout_result_reads(
+    calls: &[crate::session_capture::JournalToolCall],
+    parent: &str,
+    group: &str,
+    body: &serde_json::Value,
+    through_round: u32,
+) -> Option<serde_json::Value> {
+    let agent = body.get("agent_id")?.as_str()?;
+    let run = body.get("run_id")?.as_str()?;
+    let metadata = body.as_object()?;
+    let mut pages = Vec::new();
+    let mut total = None;
+    for call in calls {
+        if call.name != "agent_fanout"
+            || call.ok != Some(true)
+            || call.run_id.as_deref() != Some(parent)
+            || !call.round.is_some_and(|round| round <= through_round)
+        {
+            continue;
+        }
+        let Some(args) = call.arguments.as_ref() else {
+            continue;
+        };
+        let Some(result) = call.result.as_ref() else {
+            continue;
+        };
+        if args["action"] != "get_results"
+            || args["group_id"] != group
+            || result["group_id"] != group
+            || result["fanout"]["parent_run_id"] != parent
+        {
+            continue;
+        }
+        let slots = result.get("results")?.as_array()?;
+        for slot in slots {
+            if slot["agent_id"] != agent || slot["run_id"] != run {
+                continue;
+            }
+            let page = slot.get("result")?.as_object()?;
+            if page.len() != metadata.len()
+                || metadata
+                    .iter()
+                    .any(|(key, value)| key != "result" && page.get(key) != Some(value))
+            {
+                return None;
+            }
+            let text = page.get("result")?.as_str()?;
+            let start = usize::try_from(slot.get("result_start_offset")?.as_u64()?).ok()?;
+            let end = usize::try_from(slot.get("result_end_offset")?.as_u64()?).ok()?;
+            let bytes = usize::try_from(slot.get("result_bytes")?.as_u64()?).ok()?;
+            if total.is_some_and(|total| total != bytes) {
+                return None;
+            }
+            total = Some(bytes);
+            // Aggregate previews consume no bytes. Their continuation starts
+            // at zero even though the presentation contains a text prefix.
+            // Only the producer's explicit aggregate read scope can identify
+            // these receipts; a malformed slot page must still fail closed.
+            if !text.is_empty()
+                && start == 0
+                && end == 0
+                && slot.get("result_truncated")?.as_bool()?
+                && args
+                    .get("slot_index")
+                    .is_none_or(serde_json::Value::is_null)
+                && result.pointer("/result_read/slot_index") == Some(&serde_json::Value::Null)
+                && result
+                    .pointer("/result_read/offset")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+            {
+                continue;
+            }
+            if end < start
+                || end > bytes
+                || end - start != text.len()
+                || slot.get("result_truncated")?.as_bool()? != (start > 0 || end < bytes)
+            {
+                return None;
+            }
+            pages.push((start, end, text.as_bytes()));
+        }
+    }
+    pages.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut assembled = Vec::new();
+    for (start, end, text) in pages {
+        if start > assembled.len() {
+            return None;
+        }
+        let overlap = end.min(assembled.len()) - start;
+        if assembled[start..start + overlap] != text[..overlap] {
+            return None;
+        }
+        if end > assembled.len() {
+            assembled.extend_from_slice(&text[overlap..]);
+        }
+    }
+    if assembled.is_empty() || Some(assembled.len()) != total {
+        return None;
+    }
+    let mut complete = body.clone();
+    complete["result"] = serde_json::Value::String(String::from_utf8(assembled).ok()?);
+    Some(complete)
+}
+
 fn child_result_adoption_proven(
     session: &SessionCapture,
     expected_result: Option<&str>,
@@ -2013,6 +2124,7 @@ fn child_result_adoption_proven(
                         return false;
                     }
                     let action = arguments.get("action").and_then(serde_json::Value::as_str);
+                    let assembled;
                     let result = if call.name == "agent"
                         && action == Some("get_result")
                         && arguments
@@ -2060,31 +2172,20 @@ fn child_result_adoption_proven(
                         let Some(body) = slot.get("result") else {
                             return false;
                         };
-                        let Some(bytes) = body
-                            .get("result")
-                            .and_then(serde_json::Value::as_str)
-                            .map(|body| body.len() as u64)
-                        else {
+                        let Some(round) = call.round else {
                             return false;
                         };
-                        if slot
-                            .get("result_truncated")
-                            .and_then(serde_json::Value::as_bool)
-                            != Some(false)
-                            || slot
-                                .get("result_start_offset")
-                                .and_then(serde_json::Value::as_u64)
-                                != Some(0)
-                            || slot
-                                .get("result_end_offset")
-                                .and_then(serde_json::Value::as_u64)
-                                != Some(bytes)
-                            || slot.get("result_bytes").and_then(serde_json::Value::as_u64)
-                                != Some(bytes)
-                        {
-                            return false;
-                        }
-                        body
+                        assembled = match assemble_fanout_result_reads(
+                            &calls,
+                            parent_run_id,
+                            group_id,
+                            body,
+                            round,
+                        ) {
+                            Some(result) => result,
+                            None => return false,
+                        };
+                        &assembled
                     } else {
                         return false;
                     };
@@ -3722,6 +3823,7 @@ fn evaluate_one_with_primary_cache(
             cancellation_after_deliveries,
             added_execution_after_initial_deliveries,
             require_added_at_start,
+            require_added_before_execution,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_work_replacement_lifecycle");
@@ -3737,6 +3839,7 @@ fn evaluate_one_with_primary_cache(
                     added_execution_after_initial_deliveries:
                         *added_execution_after_initial_deliveries,
                     require_added_at_start: *require_added_at_start,
+                    require_added_before_execution: *require_added_before_execution,
                 },
             );
             CriterionResult {
@@ -7608,6 +7711,68 @@ mod tests {
         let response = serde_json::json!({"group_id":"review-group", "fanout":{"parent_run_id":"parent-run"}, "results":[slot]});
         call["result_full"] = serde_json::json!(response.to_string());
         assert!(check_retrieved(&aggregate));
+        // Real fanout reads mark every slice truncated, including the last
+        // page. Complete, consistent coverage is equivalent to one full read.
+        let mut paged = aggregate.clone();
+        let text = response["results"][0]["result"]["result"].as_str().unwrap();
+        for (index, start, end, round) in [(2, 0, 16, 2), (3, 12, bytes, 3)] {
+            if index == 3 {
+                let page = paged.events[2].clone();
+                paged.events.insert(3, page);
+            }
+            let mut page = response.clone();
+            page["results"][0]["result"]["result"] = serde_json::json!(&text[start..end]);
+            page["results"][0]["result_start_offset"] = serde_json::json!(start);
+            page["results"][0]["result_end_offset"] = serde_json::json!(end);
+            page["results"][0]["result_truncated"] = serde_json::json!(true);
+            paged.events[index].raw["round"] = serde_json::json!(round);
+            paged.events[index].raw["tool_calls"][0]["round"] = serde_json::json!(round);
+            paged.events[index].raw["tool_calls"][0]["tool_call_id"] =
+                serde_json::json!(format!("page-{index}"));
+            paged.events[index].raw["tool_calls"][0]["result_full"] =
+                serde_json::json!(page.to_string());
+        }
+        paged.events[4].raw["metadata"]["attrs"]["round_index"] = serde_json::json!("4");
+        assert!(check_retrieved(&paged));
+        for index in [2, 3] {
+            let mut missing = paged.clone();
+            missing.events.remove(index);
+            assert!(
+                !check_retrieved(&missing),
+                "a missing page is not full delivery"
+            );
+        }
+        for (path, value) in [
+            ("/results/0/run_id", serde_json::json!("wrong-child")),
+            ("/results/0/result_bytes", serde_json::json!(bytes + 1)),
+            ("/results/0/result_start_offset", serde_json::json!(17)),
+            (
+                "/results/0/result/result",
+                serde_json::json!(text[12..].replacen('a', "X", 1)),
+            ),
+            ("/results/0/result/status", serde_json::json!("failed")),
+        ] {
+            let mut wrong = paged.clone();
+            let mut page: serde_json::Value = serde_json::from_str(
+                wrong.events[3].raw["tool_calls"][0]["result_full"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            *page.pointer_mut(path).unwrap() = value;
+            if path == "/results/0/result_start_offset" {
+                page["results"][0]["result"]["result"] = serde_json::json!(&text[17..]);
+            }
+            wrong.events[3].raw["tool_calls"][0]["result_full"] =
+                serde_json::json!(page.to_string());
+            assert!(!check_retrieved(&wrong), "invalid paged result {path}");
+        }
+        let mut premature = paged.clone();
+        premature.events[4].raw["metadata"]["attrs"]["round_index"] = serde_json::json!("3");
+        assert!(
+            !check_retrieved(&premature),
+            "all pages must precede finalization"
+        );
         for (field, value) in [
             ("result_truncated", serde_json::json!(true)),
             ("result_start_offset", serde_json::json!(1)),

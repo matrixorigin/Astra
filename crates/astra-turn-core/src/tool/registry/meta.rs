@@ -762,6 +762,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 30,
     },
     ToolMeta {
+        name: "discover_skills",
+        description: "Search the current skill catalog for matching workflows.",
+        triggers: &["skill", "workflow", "discover", "技能"],
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        requires: &[Capability::SkillsCatalog],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 30,
+    },
+    ToolMeta {
         name: "enter_plan_mode",
         description: "Switch the runtime into plan-authoring mode. Server-owned state machine.",
         triggers: &["plan", "enter plan mode"],
@@ -1014,6 +1024,7 @@ mod tests {
             ("rollback_database_snapshots", Capability::Database),
             ("lsp", Capability::LSPServer),
             ("skill", Capability::SkillsCatalog),
+            ("discover_skills", Capability::SkillsCatalog),
             ("enter_plan_mode", Capability::PlanLifecycle),
             ("exit_plan_mode", Capability::PlanLifecycle),
         ];

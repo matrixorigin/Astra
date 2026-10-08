@@ -30,6 +30,15 @@ recovery, and Server result projection consume the same classification; a later
 control receipt cannot erase an unrelated failed verification.
 An observation error does not establish child termination or release ownership.
 Presentation windows preserve the typed child envelope and pagination authority.
+Each Server delegated run initializes its execution chain from its admitted run
+identity. Descendant admission uses that chain and the current execution-owner
+generation while retaining the original human requirement provenance; child
+prompt text cannot replace either authority.
+
+Wait guidance applies while required children remain pending. After their
+terminal outcomes have been observed, the parent uses those outcomes to finish
+the request. Waiting for future input is appropriate only when the request
+requires continued observation, not merely because a child was launched earlier.
 
 Model-authored child sizing (`complexity` and `initial_turns`) selects only an
 initial, renewable execution slice. It is not a user-owned hard limit: a parent

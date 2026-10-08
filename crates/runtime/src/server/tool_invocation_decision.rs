@@ -22,10 +22,11 @@ use super::tool_execution_binding::{
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 
-const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v6";
+const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v7";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
+    pub work_attribution: astra_services::runs::WorkInvocationAttribution,
     contract_version: String,
     pub tool: DurableToolReference,
     pub route: ToolExecutionRouteKind,
@@ -131,6 +132,11 @@ impl ToolInvocationDecisionSnapshot {
         route: ToolExecutionRouteKind,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> Result<Self, ToolInvocationDecisionError> {
+        request
+            .policy
+            .work_attribution
+            .validate(Some(&request.run_id))
+            .map_err(ToolInvocationDecisionError::InvalidWorkAttribution)?;
         let provider_policy = request.policy.resolved_provider_policy.clone();
         if let Some(policy) = provider_policy.as_ref() {
             let offer = request.selected_offer.as_ref().ok_or_else(|| {
@@ -194,6 +200,7 @@ impl ToolInvocationDecisionSnapshot {
         }
         let semantic_cache = resolve_semantic_read_cache_decision(provider_policy.as_ref())?;
         let mut transport_policy = request.policy.clone();
+        transport_policy.work_attribution = Default::default();
         transport_policy.allowed_tools.sort();
         transport_policy.allowed_tools.dedup();
         transport_policy.resolved_provider_policy = None;
@@ -204,6 +211,7 @@ impl ToolInvocationDecisionSnapshot {
         transport_policy.semantic_read_condition = None;
 
         Ok(Self {
+            work_attribution: request.policy.work_attribution.clone(),
             contract_version: DECISION_CONTRACT_VERSION.to_string(),
             tool,
             route,
@@ -344,6 +352,10 @@ impl ToolInvocationDecisionSnapshot {
         }
         let snapshot: Self = serde_json::from_value(decision.snapshot.clone())
             .map_err(|error| ToolInvocationDecisionError::Serialization(error.to_string()))?;
+        snapshot
+            .work_attribution
+            .validate(None)
+            .map_err(ToolInvocationDecisionError::InvalidWorkAttribution)?;
         if snapshot.decision_id()? != decision.decision_id {
             return Err(ToolInvocationDecisionError::DecisionEnvelopeMismatch);
         }
@@ -390,7 +402,13 @@ impl ToolInvocationDecisionSnapshot {
     /// original prepare. Display labels remain current because they are not
     /// execution authority; every route/policy/identity-bearing field comes
     /// from the durable decision.
-    pub(crate) fn apply_to_request(&self, request: &mut ToolExecutionRequest) {
+    pub(crate) fn apply_to_request(
+        &self,
+        request: &mut ToolExecutionRequest,
+    ) -> Result<(), ToolInvocationDecisionError> {
+        self.work_attribution
+            .validate(Some(&request.run_id))
+            .map_err(ToolInvocationDecisionError::InvalidWorkAttribution)?;
         request.workspace.kind = self.workspace.kind;
         request.workspace.cwd = self.workspace.cwd.clone();
         request.workspace.authority = self.workspace.authority;
@@ -436,6 +454,7 @@ impl ToolInvocationDecisionSnapshot {
         request.selected_offer = self.selected_offer.clone();
         let execution_binding_generation = request.policy.execution_binding_generation;
         request.policy = self.transport_policy.clone();
+        request.policy.work_attribution = self.work_attribution.clone();
         request.policy.execution_binding_generation = execution_binding_generation;
         request.policy.resolved_provider_policy = self.provider_policy.clone();
         request.policy.permission_grant = self.permission_grant.as_ref().map(|grant| {
@@ -453,6 +472,7 @@ impl ToolInvocationDecisionSnapshot {
             self.runtime_process_authorization_required;
         request.runtime_edge_dispatch_authorization_required =
             self.runtime_edge_dispatch_authorization_required;
+        Ok(())
     }
 }
 
@@ -539,6 +559,8 @@ pub(crate) enum ToolInvocationDecisionError {
     },
     #[error("tool invocation is missing its frozen admission snapshot")]
     MissingAdmissionSnapshot,
+    #[error("invalid Work invocation attribution: {0}")]
+    InvalidWorkAttribution(String),
     #[error("invalid delegation model admission: {0}")]
     InvalidDelegationModelAdmission(String),
     #[error("serialize tool invocation decision: {0}")]
@@ -741,7 +763,7 @@ mod tests {
         );
         let mut replay = request.clone();
         replay.policy.delegation_model_admission = None;
-        restored.apply_to_request(&mut replay);
+        restored.apply_to_request(&mut replay).unwrap();
         assert_eq!(
             replay.policy.delegation_model_admission,
             request.policy.delegation_model_admission
@@ -922,7 +944,7 @@ mod tests {
         );
         current.policy.semantic_read_freshness =
             Some(astra_turn_types::SemanticReadFreshnessResolution::Available(second_freshness));
-        restored.apply_to_request(&mut current);
+        restored.apply_to_request(&mut current).unwrap();
         assert!(
             current.policy.semantic_read_freshness.is_none(),
             "restoring execution authority must not restore stale freshness evidence"
@@ -1082,6 +1104,20 @@ mod tests {
         let mut request = request();
         request.workspace.cwd = Some("/original".to_string());
         request.policy.max_output_bytes = Some(4096);
+        request.policy.work_attribution =
+            astra_services::runs::WorkInvocationAttribution::Attempt {
+                producer_run_id: request.run_id.clone(),
+                binding: astra_services::runs::WorkRuntimeBindingRequest {
+                    work_id: "work".into(),
+                    branch_id: "branch".into(),
+                    item: Some(astra_services::runs::WorkItemRuntimeBindingRequest {
+                        item_id: "item".into(),
+                        item_revision: 1,
+                        attempt_id: "original-attempt".into(),
+                    }),
+                },
+            };
+
         request.runtime_process_authorization = Some(std::sync::Arc::new(
             astra_services::runs::RuntimeProcessAuthorizationContext {
                 authorization: "Bearer request-scoped".to_string(),
@@ -1111,13 +1147,14 @@ mod tests {
         request.workspace.authority = WorkspaceAuthority::None;
         request.executor.status = astra_runtime_env::ExecutorStatus::Offline;
         request.policy.max_output_bytes = Some(1);
+        request.policy.work_attribution = astra_services::runs::WorkInvocationAttribution::Unknown;
         request.runtime_process_authorization = None;
         request.runtime_process_authorization_required = false;
         request.runtime_edge_dispatch_authorization = None;
         request.runtime_edge_dispatch_authorization_required = false;
         request.policy.admission_snapshot = Some(Default::default());
         let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
-        restored.apply_to_request(&mut request);
+        restored.apply_to_request(&mut request).unwrap();
 
         assert_eq!(request.workspace.cwd.as_deref(), Some("/original"));
         assert_eq!(request.workspace.authority, WorkspaceAuthority::ReadWrite);
@@ -1126,6 +1163,27 @@ mod tests {
             astra_runtime_env::ExecutorStatus::Online
         );
         assert_eq!(request.policy.max_output_bytes, Some(4096));
+        assert_eq!(request.policy.work_attribution, original.work_attribution);
+        let mut missing_scope = durable.clone();
+        missing_scope
+            .snapshot
+            .as_object_mut()
+            .unwrap()
+            .remove("work_attribution");
+        assert!(ToolInvocationDecisionSnapshot::from_durable(&missing_scope).is_err());
+        let mut foreign_request = request.clone();
+        foreign_request.run_id = "another-run".into();
+        assert!(restored.apply_to_request(&mut foreign_request).is_err());
+        for invalid in [
+            serde_json::json!({"state":"attempt","producer_run_id":"","binding":{"work_id":"work","branch_id":"branch","item":{"item_id":"item","item_revision":1,"attempt_id":"attempt"}}}),
+            serde_json::json!({"state":"attempt","producer_run_id":request.run_id,"binding":{"work_id":"work","branch_id":"branch"}}),
+            serde_json::json!({"state":"attempt","producer_run_id":request.run_id,"binding":{"work_id":"work","branch_id":"branch","item":{"item_id":"item","item_revision":0,"attempt_id":"attempt"}}}),
+        ] {
+            let mut invalid_snapshot = durable.clone();
+            invalid_snapshot.snapshot["work_attribution"] = invalid;
+            assert!(ToolInvocationDecisionSnapshot::from_durable(&invalid_snapshot).is_err());
+        }
+
         assert!(request.runtime_process_authorization.is_none());
         assert!(request.runtime_process_authorization_required);
         assert!(request.runtime_edge_dispatch_authorization.is_none());

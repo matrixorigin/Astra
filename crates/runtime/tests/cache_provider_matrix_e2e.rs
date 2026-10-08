@@ -520,10 +520,10 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
             prefix.clone(),
             "Explain this without changing files.",
         );
-        state.push_volatile(
-            VolatileKind::ContextPressure,
-            "context-pressure-sentinel-937",
-        );
+        // Produce pressure from current input state; stale advisory payloads
+        // are deliberately replaced at the provider boundary.
+        state.max_turn_input_tokens = 100_000;
+        state.pinned_tool_schema_tokens = 80_000;
         state.push_volatile(
             VolatileKind::ToolBatchCoaching,
             "tool-batch-coaching-sentinel-512",
@@ -545,7 +545,7 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
         assert!(
             !serde_json::to_string(&state.messages)
                 .unwrap()
-                .contains("context-pressure-sentinel-937")
+                .contains("context_pressure_observed")
         );
         assert!(
             !serde_json::to_string(&state.messages)
@@ -573,7 +573,7 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
             case.label
         );
         assert_eq!(
-            wire.contains("context-pressure-sentinel-937"),
+            wire.contains("context_pressure_observed"),
             !required_only,
             "{} optional pressure delivery",
             case.label
@@ -586,7 +586,7 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
         );
         if case.is_marker_isolated {
             let cached = stable_system_prefix(case, &requests[0].body).to_string();
-            assert!(!cached.contains("context-pressure-sentinel-937"));
+            assert!(!cached.contains("context_pressure_observed"));
             assert!(!cached.contains("behavior-evidence-sentinel-438"));
         }
     }

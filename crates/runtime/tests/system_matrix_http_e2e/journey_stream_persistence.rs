@@ -4,15 +4,10 @@
 //!
 //! ## Architecture note
 //!
-//! The `/chat/stream` path uses the server-driven agentic loop (`stream_chat()`),
-//! NOT the bridge-driven path. It persists:
-//!
-//! 1. **`user_query`** + **`llm_response`** events — via `persist_server_loop_core_events()`
-//!    using `TurnCoreEventWriter` after the agentic loop completes
-//! 2. **`context_trace_signal`** events — via `ContextTracePersistenceContext` during
-//!    `finalize_turn_trace()` at loop exit
-//! 3. **Run status + usage** — via `RunEngine` (when configured) to durable store
-//! 4. **Promotion events** — via `persist_runtime_promotion_events()`
+//! The `/chat/stream` path uses the Server-owned agentic loop. Canonical append
+//! and atomic terminal settlement persist user/assistant transcript items,
+//! accepted trace events, run status, and usage under the execution owner fence.
+//! Context trace and promotion events retain their existing publication owners.
 //!
 //! These tests verify that infrastructure.
 

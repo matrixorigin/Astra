@@ -3147,6 +3147,30 @@ fn begin_deadline_budget_settlement(state: &mut AgenticLoopState) -> bool {
     settled
 }
 
+pub(super) async fn enter_deadline_budget_settlement<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> bool {
+    if state.hooks.completion_settlement.text_only
+        || state.hooks.completion_settlement.work_settlement_only
+        || state.budget_wrapup_injected
+        || !begin_deadline_budget_settlement(state)
+    {
+        return false;
+    }
+    let _cancelled = cancel_unfinished_child_agents(
+        host,
+        state,
+        "parent execution deadline is reserved for final settlement",
+        CancellationOrigin::Runtime,
+    )
+    .await;
+    state.final_text_model_item_id = None;
+    state.final_text.clear();
+    state.interruption = None;
+    true
+}
+
 fn begin_budget_settlement_for_work_state(
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
@@ -3434,7 +3458,8 @@ pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &Agen
         // so adding/removing a skill no longer perturbs the tool schema
         // bytes.
         if !resolver.available_skills().is_empty() {
-            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+            host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+            host.inject_tool_schema(astra_tools::schemas::discover_skills_tool_schema());
         }
     }
 
@@ -3766,18 +3791,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             || state.hooks.completion_settlement.work_settlement_only
             || state.budget_wrapup_injected;
         if !settlement_already_active {
-            if begin_deadline_budget_settlement(state) {
-                let _cancelled = cancel_unfinished_child_agents(
-                    host,
-                    state,
-                    "parent execution deadline is reserved for final settlement",
-                    CancellationOrigin::Runtime,
-                )
-                .await;
-                state.final_text_model_item_id = None;
-                state.final_text.clear();
-                state.interruption = None;
-            } else {
+            if !enter_deadline_budget_settlement(host, state).await {
                 let _cancelled = cancel_unfinished_child_agents(
                     host,
                     state,

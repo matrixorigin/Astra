@@ -216,6 +216,7 @@ fn judger_parameters(criterion: &Criterion) -> Option<(&str, f64, Option<&str>)>
 const ACCEPTANCE_ID: &str = "criterion_accepted";
 
 pub(crate) const JUDGER_STDERR_CAP: usize = 8_000;
+pub(crate) const JUDGER_TEXT_CAP: usize = 8_000;
 
 const RUBRIC: &[(&str, f64, &str)] = &[
     (
@@ -252,7 +253,7 @@ pub(crate) fn build_judger_request(
             "criterion":question,
             "tools_used":outcome.tools_used,
             "tool_calls_count":outcome.tool_calls_count,
-            "text":truncate_for_judger(&outcome.text, 8_000),
+            "text":truncate_for_judger(&outcome.text, JUDGER_TEXT_CAP),
             "stderr":truncate_for_judger(&outcome.stderr, JUDGER_STDERR_CAP),
         }),
         questions: if matches!(criterion, Criterion::HardJudger { .. }) {

@@ -791,6 +791,19 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
         intercept_disallowed_tool_calls(state, effective_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
+    // Freeze execution attribution before the skill executor can await or
+    // mutate Work. The interceptor bypasses the regular tool dispatch, but
+    // its journal must retain the same execution-owned provenance.
+    let skill_work_attribution = state
+        .runtime_tool_executor
+        .as_deref()
+        .zip(state.context_manifest_user_id.as_deref())
+        .zip(state.current_session_id.as_deref())
+        .zip(state.current_run_id.as_deref())
+        .map(|(((executor, user_id), session_id), run_id)| {
+            executor.work_attribution_for_scope(user_id, session_id, run_id)
+        })
+        .unwrap_or_default();
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
@@ -902,6 +915,9 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
             error_kind: (skill_locked_out == Some(true))
                 .then_some(astra_core::ErrorKind::ToolUnavailable),
             disposition: Some(disposition),
+            work_attribution: (disposition
+                == astra_services::session_journal::ToolCallDisposition::Executed)
+                .then(|| skill_work_attribution.clone()),
             ..Default::default()
         });
     }
@@ -1140,15 +1156,16 @@ async fn intercept_skill_calls(
     let full_catalog = resolver.available_skills();
     let is_client_owned = |tool_call: &Value| {
         if crate::turn::skill_tool::is_discover_skills_call(tool_call) {
-            return !state.skills.client_pipeline_skill_names.is_empty();
+            return !state.skills.client_pipeline_skills.is_empty();
         }
         let Some(target) = crate::turn::skill_tool::extract_skill_name(tool_call) else {
             return false;
         };
         state
             .skills
-            .client_pipeline_skill_names
-            .contains(&target.trim().to_ascii_lowercase())
+            .client_pipeline_skills
+            .iter()
+            .any(|skill| skill.matches_selector(&target))
     };
     let server_interceptable_calls = tool_calls
         .iter()
@@ -1161,16 +1178,11 @@ async fn intercept_skill_calls(
             .filter(|selected| {
                 state
                     .skills
-                    .client_pipeline_skill_names
-                    .contains(&selected.trim().to_ascii_lowercase())
+                    .client_pipeline_skills
+                    .iter()
+                    .any(|skill| skill.matches_selector(selected))
             }),
     );
-    let visible_for_mask = crate::turn::skill_tool::visible_skills_for_host_turn(
-        &full_catalog,
-        &state.skills.execution.invoked,
-    );
-    let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
-
     let (dedup_pairs, fresh_tool_calls) = dedup_skill_calls(state, &server_interceptable_calls);
     state
         .telemetry
@@ -1188,8 +1200,6 @@ async fn intercept_skill_calls(
             &fresh_tool_calls,
             resolver.as_ref(),
             &full_catalog,
-            &discover_exclude,
-            &mut state.skills.execution.discovered,
             state.skills.executor.as_ref(),
             Some(&mut state.skills.quality_tracker),
             Some(&composition_ctx),
@@ -1337,6 +1347,7 @@ pub(crate) fn build_skill_context(
     });
 
     crate::turn::skill_tool::SkillContext {
+        admitted_skill_names: None,
         read_only_execution: state.permission_context.as_ref().is_some_and(|context| {
             context
                 .try_read()

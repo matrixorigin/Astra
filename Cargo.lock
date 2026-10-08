@@ -465,6 +465,7 @@ dependencies = [
  "astra-services",
  "astra-skills",
  "astra-sync-protocol",
+ "astra-test-harness",
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",

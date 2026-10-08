@@ -40,6 +40,17 @@ fixtures
 privacy_scope
 ```
 
+Semantic judges receive ordered user-request/assistant-response pairs, including
+root retry attempts and executed follow-up steps. The evidence stays bounded,
+with explicit content or exchange omission markers; deterministic criteria keep
+their original aggregate. Missing evidence cannot authorize a passing judgment.
+
+Tool-result identity comes from invocation scope, arguments, outcome, complete
+result and typed execution facts. A verified artifact supplies the complete body;
+a bounded error preview is presentation, and cannot contradict an identical
+complete failure body. Error-only records remain failure evidence, and conflicting
+bodies, artifacts, dispositions or typed failure facts are rejected.
+
 ## Replay modes
 
 | Mode | Meaning |

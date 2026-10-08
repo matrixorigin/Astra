@@ -529,11 +529,7 @@ impl AgenticRunLifecycleService {
             &facts.hooks,
         );
         let mut state = Self::assemble_loop_state(environment, facts);
-        state.skills.client_pipeline_skill_names = handoff
-            .client_pipeline_skill_names
-            .iter()
-            .cloned()
-            .collect();
+        state.skills.client_pipeline_skills = handoff.client_pipeline_skills.clone();
         bind_execution_owner_generation(&mut state, run.run_generation);
         if let Some(cursor) = canonical.reservation.expected_cursor.as_ref() {
             state.initialize_canonical_rewrite_proof(

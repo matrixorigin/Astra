@@ -81,7 +81,9 @@ use crate::server::tool_route_runtime::{
     ExecutedToolRoute, ToolRouteObserver, ToolRouteRuntimeContext,
     emit_tool_route_completion_events, execute_tool_route_before_completion_events,
 };
-use crate::server::tool_route_selection::{ToolExecutionClass, tool_execution_class};
+use crate::server::tool_route_selection::{
+    ToolExecutionClass, ToolExecutionRouteKind, tool_execution_class,
+};
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
@@ -252,6 +254,12 @@ pub(crate) struct PendingRuntimeToolCompletion {
     duration_ms: u64,
     binding_fields: Map<String, Value>,
     durable: Option<PendingDurableToolCompletion>,
+}
+
+impl PendingRuntimeToolCompletion {
+    pub(crate) fn work_attribution(&self) -> &astra_services::runs::WorkInvocationAttribution {
+        &self.boundary.request().policy.work_attribution
+    }
 }
 
 pub(crate) struct GovernableRuntimeToolResult {
@@ -716,13 +724,9 @@ pub struct RuntimeToolExecutor {
     pub(super) context_manifest_pool: Option<SharedPool>,
     /// Owner- and session-validated canonical Work branch for typed Work tools.
     pub(super) work_binding: std::sync::OnceLock<WorkRuntimeBinding>,
-    /// Whether this executor is a delegated WorkItem attempt. Root
-    /// coordinators use the same executor type, but must not execute
-    /// Attempt-role tools until their primary attempt has been installed.
-    /// Keeping this as typed executor state lets the final route boundary
-    /// defend against an admission/execution race without inspecting model
-    /// prose or task names.
-    work_item_attempt_bound: bool,
+    /// Exact immutable attempt installed by the delegated lifecycle owner.
+    /// A boolean cannot identify the attempt in dispatch/replay evidence.
+    delegated_work_item: Option<(String, astra_services::runs::DurableWorkItemRunBinding)>,
     active_primary_work_attempt: Arc<std::sync::RwLock<Option<ActivePrimaryWorkAttempt>>>,
     /// Trusted physical-call to durable Work-establishment identity. This is
     /// internal provenance installed by the loop host; provider arguments and
@@ -995,7 +999,7 @@ impl RuntimeToolExecutor {
             session_artifact_store: None,
             context_manifest_pool: None,
             work_binding: std::sync::OnceLock::new(),
-            work_item_attempt_bound: false,
+            delegated_work_item: None,
             active_primary_work_attempt: Arc::new(std::sync::RwLock::new(None)),
             work_establishment_invocations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             plan_repo: None,
@@ -1886,8 +1890,12 @@ impl RuntimeToolExecutor {
     /// Delegated attempts receive their immutable binding before execution;
     /// root sessions retain the default coordinator role and instead require
     /// an installed active primary attempt.
-    pub(crate) fn set_work_item_attempt_bound(&mut self, bound: bool) {
-        self.work_item_attempt_bound = bound;
+    pub(crate) fn set_delegated_work_item(
+        &mut self,
+        run_id: String,
+        item: astra_services::runs::DurableWorkItemRunBinding,
+    ) {
+        self.delegated_work_item = Some((run_id, item));
     }
 
     pub(crate) fn has_active_primary_work_attempt(&self) -> bool {
@@ -1897,7 +1905,7 @@ impl RuntimeToolExecutor {
     }
 
     pub(crate) fn has_assigned_work_item_attempt(&self) -> bool {
-        self.work_item_attempt_bound || self.has_active_primary_work_attempt()
+        self.delegated_work_item.is_some() || self.has_active_primary_work_attempt()
     }
 
     pub(super) fn active_primary_work_attempt(&self) -> Option<ActivePrimaryWorkAttempt> {
@@ -1921,7 +1929,7 @@ impl RuntimeToolExecutor {
             };
         };
         let Some(binding) = self.work_binding.get() else {
-            return if active.is_none() {
+            return if active.is_none() && self.delegated_work_item.is_none() {
                 PrimaryWorkHandoff::NoBinding
             } else {
                 PrimaryWorkHandoff::Unavailable {
@@ -1934,25 +1942,39 @@ impl RuntimeToolExecutor {
             || active
                 .as_ref()
                 .is_some_and(|attempt| attempt.executor_run_id != producer_run_id)
+            || self
+                .delegated_work_item
+                .as_ref()
+                .is_some_and(|(run_id, _)| run_id != producer_run_id || active.is_some())
         {
             return PrimaryWorkHandoff::Unavailable {
                 reason: PrimaryWorkUnavailable::BindingMismatch,
             };
         }
-        let item =
-            active.as_ref().map(
+        let item = active
+            .as_ref()
+            .map(
                 |attempt| astra_services::runs::WorkItemRuntimeBindingRequest {
                     item_id: attempt.item_id.clone(),
                     item_revision: attempt.item_revision,
                     attempt_id: attempt.attempt_id.clone(),
                 },
-            );
+            )
+            .or_else(|| {
+                self.delegated_work_item.as_ref().map(|(_, item)| {
+                    astra_services::runs::WorkItemRuntimeBindingRequest {
+                        item_id: item.item_id().as_str().into(),
+                        item_revision: item.item_revision().get(),
+                        attempt_id: item.attempt_id().as_str().into(),
+                    }
+                })
+            });
         let binding = astra_services::runs::WorkRuntimeBindingRequest {
             work_id: binding.work_id.as_str().into(),
             branch_id: binding.branch_id.as_str().into(),
             item,
         };
-        let snapshot = if active.is_some() {
+        let snapshot = if binding.item.is_some() {
             PrimaryWorkHandoff::Active { binding }
         } else {
             PrimaryWorkHandoff::BindingOnly { binding }
@@ -3556,6 +3578,73 @@ impl RuntimeToolExecutor {
             .result
     }
 
+    pub(crate) fn work_attribution_for_scope(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> astra_services::runs::WorkInvocationAttribution {
+        use astra_services::runs::WorkInvocationAttribution;
+
+        if run_id.trim().is_empty() {
+            return WorkInvocationAttribution::Unknown;
+        }
+        match self.primary_work_handoff(user_id, session_id, run_id) {
+            PrimaryWorkHandoff::NoBinding | PrimaryWorkHandoff::BindingOnly { .. } => {
+                WorkInvocationAttribution::Unbound
+            }
+            PrimaryWorkHandoff::Active { binding } => WorkInvocationAttribution::Attempt {
+                producer_run_id: run_id.to_owned(),
+                binding,
+            },
+            PrimaryWorkHandoff::Unavailable { .. } => WorkInvocationAttribution::Unknown,
+        }
+    }
+
+    fn work_invocation_attribution(
+        &self,
+        request: &ToolExecutionRequest,
+        route: ToolExecutionRouteKind,
+    ) -> astra_services::runs::WorkInvocationAttribution {
+        use astra_runtime_env::{RequiredExecutor, WorkExecutionRole};
+        use astra_services::runs::WorkInvocationAttribution;
+
+        if self.user_id != request.user_id
+            || self.session_id != request.session_id
+            || route == ToolExecutionRouteKind::Unsupported
+        {
+            return WorkInvocationAttribution::Unknown;
+        }
+        if route == ToolExecutionRouteKind::ServerControlPlane
+            && request.policy.delegation_model_admission.is_none()
+        {
+            let Some(spec) = self
+                .tool_execution_service
+                .tool_registry()
+                .get(&request.tool_name)
+                .filter(|spec| spec.required.executor == RequiredExecutor::ControlPlane)
+            else {
+                return WorkInvocationAttribution::Unknown;
+            };
+            let work_control = spec.required.work_execution_role != WorkExecutionRole::Any;
+            let read_only_control = astra_turn_core::tool::categories::classify(
+                &request.tool_name,
+                Some(&request.args),
+            )
+            .category
+            .is_read_only()
+                && request
+                    .policy
+                    .resolved_provider_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.is_read_only());
+            if work_control || read_only_control {
+                return WorkInvocationAttribution::Control;
+            }
+        }
+        self.work_attribution_for_scope(&request.user_id, &request.session_id, &request.run_id)
+    }
+
     async fn execute_request_before_governance(
         &self,
         mut request: ToolExecutionRequest,
@@ -3701,6 +3790,7 @@ impl RuntimeToolExecutor {
                     .await
             } else {
                 let route = self.tool_execution_service.routing_decision(&request);
+                request.policy.work_attribution = self.work_invocation_attribution(&request, route);
                 let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
                 &request,
                 route,
@@ -3846,7 +3936,11 @@ impl RuntimeToolExecutor {
                 );
             }
             let admission_deadline = request.policy.admission_deadline;
-            frozen.apply_to_request(&mut request);
+            if let Err(error) = frozen.apply_to_request(&mut request) {
+                return GovernableRuntimeToolResult::completed(
+                    tool_invocation_decision_rejected_result(error.to_string()),
+                );
+            }
             request.policy.admission_deadline = admission_deadline;
             let semantic_read_preparation = self
                 .prepare_semantic_read(&frozen, &identity, &request.args)
@@ -5359,6 +5453,13 @@ impl ToolExecutor for RuntimeToolExecutor {
 
     fn tool_schemas(&self) -> Vec<Value> {
         self.capability_filtered_server_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                !schema["function"]["name"].as_str().is_some_and(
+                    crate::server::tool_route_selection::is_intercepted_turn_pipeline_tool,
+                )
+            })
+            .collect()
     }
 
     fn project_root(&self) -> &Path {
@@ -8280,7 +8381,13 @@ pub(crate) mod tests {
     #[test]
     fn visible_server_tools_have_local_execution_handlers() {
         let (exec, _dir) = test_executor();
-        let missing = schema_name_set(exec.tool_schemas())
+        let schema_names = schema_name_set(exec.tool_schemas());
+        for name in ["skill", "discover_skills"] {
+            assert!(!schema_names.contains(name));
+            assert!(!exec.tool_engine.contains(name));
+            assert!(exec.provider_visible_runtime_tool_names().contains(name));
+        }
+        let missing = schema_names
             .into_iter()
             .filter(|schema_name| !exec.tool_engine.contains(schema_name))
             .collect::<Vec<_>>();
@@ -9333,13 +9440,159 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn intercepted_skills_freeze_work_before_execution_and_reach_journal_criteria() {
+        use crate::turn::agentic::tool_interception::try_prepare_intercepted_tool_round;
+        use crate::turn::agentic_loop::host::tests::make_state;
+        use astra_test_harness::{
+            criteria::{Criterion, evaluate_deterministic_with_session},
+            runner::RunOutcome,
+            session_capture::{JournalEvent, SessionCapture},
+        };
+        use astra_turn_core::tool::deferred_activation::CanonicalToolInvocation;
+
+        struct AdvancingExecutor(Arc<RuntimeToolExecutor>);
+        #[async_trait::async_trait]
+        impl astra_skills::traits::SkillExecutor for AdvancingExecutor {
+            async fn execute(
+                &self,
+                _: &astra_skills::manifest::LoadedSkill,
+                _: &astra_skills::traits::SkillExecutionContext,
+            ) -> Result<astra_skills::traits::SkillExecutionResult, astra_skills::SkillError>
+            {
+                tokio::task::yield_now().await;
+                self.0
+                    .install_active_primary_work_attempt(ActivePrimaryWorkAttempt {
+                        attempt_id: "later-attempt".into(),
+                        executor_run_id: "producer".into(),
+                        item_id: "later-item".into(),
+                        item_revision: 1,
+                        objective: "later objective".into(),
+                        expected_result: "later result".into(),
+                    })
+                    .unwrap();
+                Err(astra_skills::SkillError::Internal(
+                    "execution failed after advancing custody".into(),
+                ))
+            }
+            fn supports(&self, _: &astra_skills::manifest::ExecutionContext) -> bool {
+                true
+            }
+        }
+
+        let provider = astra_skills::providers::bundled::BundledSkillProvider::new();
+        provider.register_from_skill_md(
+            "---\nname: review\ndescription: Review workflow\ncontext: fork\n---\nReview instructions."
+        ).unwrap();
+        let mut registry = crate::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(provider));
+        registry.discover_all().await.unwrap();
+        registry.load("review").await.unwrap();
+        let resolver = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::new(registry)));
+        for tool in ["discover_skills", "skill"] {
+            let (executor, _dir) = test_executor();
+            let executor = Arc::new(executor);
+            let mut state = make_state();
+            state.runtime_tool_executor = Some(executor.clone());
+            state.context_manifest_user_id = Some("test-user".into());
+            state.current_session_id = Some("test-session".into());
+            state.current_run_id = Some("producer".into());
+            state.skills.resolver = Some(resolver.clone());
+            state.skills.executor = Some(Arc::new(AdvancingExecutor(executor.clone())));
+            let args = if tool == "skill" {
+                json!({"skill_name":"review"})
+            } else {
+                json!({"query":"review"})
+            };
+            let call = json!({"id":"skill-call","type":"function","function":{"name":tool,"arguments":args.to_string()}});
+            let turn = crate::turn::agentic_loop::host::HostTurnResult {
+                accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                    tool_calls: vec![call.clone()],
+                    ..Default::default()
+                },
+                ttft_ms: None,
+                error_kind: None,
+            };
+            try_prepare_intercepted_tool_round(
+                &mut state,
+                &turn,
+                Vec::new(),
+                &[CanonicalToolInvocation::ordinary(call.clone())],
+                &[call],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let record = state.stall.tool_call_records.last().unwrap();
+            assert_eq!(
+                record.disposition,
+                Some(astra_services::session_journal::ToolCallDisposition::Executed)
+            );
+            assert_eq!(
+                record.work_attribution,
+                Some(astra_services::runs::WorkInvocationAttribution::Unbound)
+            );
+            assert_eq!(record.ok, tool == "discover_skills");
+            if tool == "skill" {
+                assert_eq!(
+                    executor.work_attribution_for_scope("test-user", "test-session", "producer"),
+                    astra_services::runs::WorkInvocationAttribution::Unknown
+                );
+            }
+            let mut capture = SessionCapture::default();
+            capture.events.push(JournalEvent {
+                event_type: "llm_round".into(),
+                raw: json!({
+                    "producer_scope":{"run_id":"producer"},"turn":1,"round":0,"tool_calls":[record]
+                }),
+            });
+            let criterion: Criterion = serde_json::from_value(json!({
+                "type":"journal_work_replacement_lifecycle", "initial_items":2,
+                "cancelled_items":1,"added_items":1,"delivered_items":2
+            }))
+            .unwrap();
+            // The real serialized invocation passes attribution, even before
+            // genesis; this intentionally incomplete lifecycle fails later.
+            let evaluate = |capture: &SessionCapture| {
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(&criterion),
+                    &RunOutcome::default(),
+                    Some(capture),
+                )
+                .remove(0)
+            };
+            assert_eq!(
+                evaluate(&capture).detail,
+                "replacement lifecycle lacks canonical Work genesis"
+            );
+            capture.events[0].raw["tool_calls"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("work_attribution");
+            assert_eq!(
+                evaluate(&capture).detail,
+                "executed invocation lacks valid frozen Work attribution"
+            );
+        }
+    }
+
     #[test]
     fn primary_work_handoff_never_confuses_unavailable_with_absent() {
+        use astra_services::runs::WorkInvocationAttribution;
+
         let (executor, _dir) = test_executor();
         assert!(matches!(
             executor.primary_work_handoff("test-user", "test-session", "run"),
             PrimaryWorkHandoff::NoBinding
         ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "run"),
+            WorkInvocationAttribution::Unbound
+        );
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", ""),
+            WorkInvocationAttribution::Unknown
+        );
         for (user, session) in [
             ("other-user", "test-session"),
             ("test-user", "other-session"),
@@ -9350,6 +9603,10 @@ pub(crate) mod tests {
                     reason: PrimaryWorkUnavailable::BindingMismatch
                 }
             ));
+            assert_eq!(
+                executor.work_attribution_for_scope(user, session, "run"),
+                WorkInvocationAttribution::Unknown
+            );
         }
         *executor.active_primary_work_attempt.write().unwrap() = Some(ActivePrimaryWorkAttempt {
             attempt_id: "attempt".into(),
@@ -9365,6 +9622,10 @@ pub(crate) mod tests {
                 reason: PrimaryWorkUnavailable::BindingMismatch
             }
         ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "run"),
+            WorkInvocationAttribution::Unknown
+        );
         let lock = executor.active_primary_work_attempt.clone();
         assert!(
             std::thread::spawn(move || {
@@ -9380,6 +9641,169 @@ pub(crate) mod tests {
                 reason: PrimaryWorkUnavailable::AttemptLockUnavailable
             }
         ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "run"),
+            WorkInvocationAttribution::Unknown
+        );
+    }
+
+    #[test]
+    fn delegated_work_attempt_cannot_be_reported_as_unbound() {
+        use astra_services::runs::DurableWorkItemRunBinding;
+        use astra_services::work::{WorkItemAttemptId, WorkItemId, WorkItemRevision};
+
+        let (mut executor, _dir) = test_executor();
+        executor.set_delegated_work_item(
+            "child-run".into(),
+            DurableWorkItemRunBinding::new(
+                WorkItemId::parse("item").unwrap(),
+                WorkItemRevision::INITIAL,
+                WorkItemAttemptId::parse("attempt").unwrap(),
+            ),
+        );
+        assert!(executor.has_assigned_work_item_attempt());
+        // The lifecycle must also install owner/session/branch custody.
+        // Losing that binding must never become absence evidence.
+        assert!(matches!(
+            executor.primary_work_handoff("test-user", "test-session", "child-run"),
+            PrimaryWorkHandoff::Unavailable {
+                reason: PrimaryWorkUnavailable::BindingMismatch
+            }
+        ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "child-run"),
+            astra_services::runs::WorkInvocationAttribution::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_freezes_control_attribution_without_provider_policy() {
+        use astra_services::runs::WorkInvocationAttribution;
+
+        let (mut executor, _dir) = test_executor();
+        executor.enable_durable_invocations();
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "search",
+        )
+        .unwrap();
+        let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+            reason: None,
+            updates_hash: None,
+        };
+        let result = executor
+            .execute_invocation_with_metadata(
+                "run",
+                "chain",
+                "search",
+                "tool_search",
+                &json!({"query": "select:read_file"}),
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let record = executor
+            .invocation_ledger
+            .as_ref()
+            .unwrap()
+            .get(&identity)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(
+                &record.decision,
+            )
+            .unwrap();
+        assert_eq!(
+            decision.work_attribution,
+            WorkInvocationAttribution::Control
+        );
+        assert!(decision.provider_policy.is_none());
+    }
+
+    #[test]
+    fn control_attribution_requires_the_actual_control_plane_owner_and_read_only_semantics() {
+        use astra_services::runs::WorkInvocationAttribution;
+
+        let (executor, _dir) = test_executor();
+        for (name, args, expected) in [
+            (
+                "tool_search",
+                json!({"query": "select:read_file"}),
+                WorkInvocationAttribution::Control,
+            ),
+            ("start_work", json!({}), WorkInvocationAttribution::Control),
+            (
+                "agent",
+                json!({"action": "spawn"}),
+                WorkInvocationAttribution::Unbound,
+            ),
+            ("ask_user", json!({}), WorkInvocationAttribution::Unbound),
+            (
+                "web_fetch",
+                json!({"url": "https://example.com"}),
+                WorkInvocationAttribution::Unbound,
+            ),
+            (
+                "unknown_tool",
+                json!({}),
+                WorkInvocationAttribution::Unknown,
+            ),
+        ] {
+            let mut request = executor.tool_execution_request(name, &args);
+            request.run_id = "run".into();
+            let route = executor.tool_execution_service.routing_decision(&request);
+            assert_eq!(
+                executor.work_invocation_attribution(&request, route),
+                expected,
+                "{name}"
+            );
+        }
+        let mut search = executor.tool_execution_request("tool_search", &json!({"query": "read"}));
+        search.run_id = "run".into();
+        let mut policy = semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+        );
+        policy.effect = ResolvedToolEffect::Mutating;
+        search.policy.resolved_provider_policy = Some(policy.clone());
+        assert_eq!(
+            executor
+                .work_invocation_attribution(&search, ToolExecutionRouteKind::ServerControlPlane),
+            WorkInvocationAttribution::Unbound
+        );
+        policy.effect = ResolvedToolEffect::ReadOnly;
+        let mut spawn = executor.tool_execution_request("agent", &json!({"action": "spawn"}));
+        spawn.run_id = "run".into();
+        spawn.policy.resolved_provider_policy = Some(policy.clone());
+        assert_eq!(
+            executor
+                .work_invocation_attribution(&spawn, ToolExecutionRouteKind::ServerControlPlane),
+            WorkInvocationAttribution::Unbound
+        );
+        for name in ["unknown_tool", "web_fetch"] {
+            let mut request = executor.tool_execution_request(name, &json!({}));
+            request.run_id = "run".into();
+            request.policy.resolved_provider_policy = Some(policy.clone());
+            assert_eq!(
+                executor.work_invocation_attribution(
+                    &request,
+                    ToolExecutionRouteKind::ServerControlPlane
+                ),
+                WorkInvocationAttribution::Unknown
+            );
+        }
+        search.user_id = "other-user".into();
+        assert_eq!(
+            executor
+                .work_invocation_attribution(&search, ToolExecutionRouteKind::ServerControlPlane),
+            WorkInvocationAttribution::Unknown
+        );
     }
 
     #[test]

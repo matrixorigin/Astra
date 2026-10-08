@@ -5,8 +5,7 @@
 //! Only the summarized result returns to the parent conversation.
 //!
 //! The actual sub-run execution is delegated to a [`SkillSubRunExecutor`] which
-//! is implemented differently for CLI (OwnedCliLoopHost) vs Server
-//! (ServerSubRunExecutor wrapper).
+//! is implemented by the Server-owned execution boundary.
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -16,8 +15,7 @@ use crate::traits::{SkillError, SkillExecutionContext, SkillExecutionResult, Ski
 
 /// Trait for executing isolated skill sub-runs.
 ///
-/// Implemented by the CLI (via `OwnedCliLoopHost`) and the server
-/// (via `ServerSubRunExecutor` wrapper).
+/// The production implementation is the Server's `ServerSkillSubRunExecutor`.
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait SkillSubRunExecutor: Send + Sync {

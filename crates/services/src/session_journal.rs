@@ -921,6 +921,9 @@ pub enum RuntimeWorkEstablishmentReceipt {
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    /// Producer-owned causality frozen before dispatch; never execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_attribution: Option<crate::runs::WorkInvocationAttribution>,
     /// Runtime-only ledger binding; restored evidence must be checked against
     /// the authoritative invocation ledger, never reconstructed from display.
     #[serde(skip)]

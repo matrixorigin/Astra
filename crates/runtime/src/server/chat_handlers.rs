@@ -454,7 +454,7 @@ pub(super) async fn chat_stream_handler(
                 let run_id = stream.run_id.clone();
                 sse_streaming_response(session_id, run_id, request_id.clone(), event_rx)
             } else {
-                // Batch fallback (test stubs, etc.)
+                // Replay retained events for an already-settled durable run.
                 let mut events = vec![serde_json::json!({
                     "type": "session_info",
                     "session_id": stream.session_id,

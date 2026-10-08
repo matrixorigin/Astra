@@ -4,10 +4,12 @@
 //! extracted from the monolithic runtime crate for better modularity.
 
 mod context_history_artifact;
+mod skill_catalog_identity;
 pub use context_history_artifact::{
     CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
     MAX_CONTEXT_HISTORY_BYTES,
 };
+pub use skill_catalog_identity::SkillCatalogIdentity;
 
 mod agent_communication;
 mod agent_transcript_evidence;

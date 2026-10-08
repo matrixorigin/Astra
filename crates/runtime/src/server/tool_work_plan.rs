@@ -129,7 +129,12 @@ fn work_plan_error(code: &str, message: &str, retryable: bool) -> astra_tools::T
 /// canonical context. Preserve that execution boundary in the shared ledger so
 /// a corrected retry does not leave a false unresolved execution failure.
 fn work_plan_context_stale_error(message: &str) -> astra_tools::ToolResult {
-    let mut result = work_plan_error("work_plan_context_stale", message, true);
+    let message = format!(
+        "{message}. Refresh with inspect_work_plan using empty arguments (omit context_id and offsets); \
+         then use its returned context_id for pagination or a corrected proposal. \
+         branch_id and work_id are not context_id."
+    );
+    let mut result = work_plan_error("work_plan_context_stale", &message, true);
     let metadata = result.metadata.get_or_insert_with(Default::default);
     metadata.insert(
         "rejection_code".to_string(),

@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-07-v100";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-08-v101";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4777,17 +4777,15 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // Context / decisions / evaluation essentials used by turn persistence
-    core_schema_create!(
-        pool,
-        "ctx_snapshots",
+    let ctx_snapshot_ddl = format!(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
             context_capture_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            event_id VARCHAR(128) NOT NULL,
+            event_id VARCHAR({AGENT_EVENT_ID_LEN}) NOT NULL,
             context_data JSON NULL,
-            llm_request_id VARCHAR(64) NULL,
-            llm_response_id VARCHAR(64) NULL,
+            llm_request_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
+            llm_response_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
             token_budget INT NULL,
             total_tokens BIGINT NULL,
             assembly_time_ms BIGINT NULL,
@@ -4798,9 +4796,10 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at),
             INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)
         )",
-    )
-    .execute(&pool)
-    .await?;
+    );
+    core_schema_create!(pool, "ctx_snapshots", &ctx_snapshot_ddl)
+        .execute(&pool)
+        .await?;
 
     core_schema_create!(pool, "ctx_decision_audits",
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
@@ -6865,7 +6864,11 @@ async fn verify_core_schema_shape(
         pool,
         database,
         "ctx_snapshots",
-        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
+        &[
+            ("event_id", AGENT_EVENT_ID_LEN as u64),
+            ("llm_request_id", AGENT_EVENT_ID_LEN as u64),
+            ("llm_response_id", AGENT_EVENT_ID_LEN as u64),
+        ],
     )
     .await?;
     for (index, expected_columns) in [

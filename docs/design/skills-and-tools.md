@@ -122,7 +122,9 @@ infer a named-argument request protocol from raw text.
 The source-only health-ranking injection API is also retired: no production
 caller supplied its turn-scoped inputs. Discovery retains stable provider source
 priority and its metadata budget. Runtime tool-health feedback and skill-quality
-learning remain separate, active responsibilities.
+execution-outcome feedback remain separate, active responsibilities. The unused
+local quality-score selection boost, satisfaction accumulator, and quality-file
+load/save APIs are retired; catalog selection does not consume them.
 
 The unused source-only `check_compatibility` diagnostic is retired. Manifest
 compatibility metadata remains serializable descriptive data; it does not grant
@@ -178,9 +180,29 @@ Skill discovery should be progressive:
 - deterministic ordering;
 - clear diagnostics for unavailable skill dependencies.
 
+`skill` and `discover_skills` share canonical tool schemas and require a ready,
+non-empty skill directory. Search reads that directory without changing session
+visibility or granting authority; repeating a query may return the same names.
+The prompt index may omit names to fit its budget, and a current search result
+can supply the exact name or alias for activation.
+
+When the admitted directory belongs to the client, search uses that directory
+and requires the client's declared search contract. A Server directory does not
+substitute for a missing client contract. Each durable client skill/search request carries
+its admitted canonical names separately from model arguments. Missing or malformed
+authority is rejected; an empty scope denies public activation. Public activation
+checks both the current catalog selector and the resolved canonical identity,
+including before an already-loaded receipt. Trusted composable steps retain their
+manifest and composition admission checks.
+
 CLI admissions keep fork-skill dispatch on the Server-owned execution. The CLI
 retains skill discovery and inline tool callbacks; it does not construct a second
 fork-skill executor or invocation ledger.
+
+When a fork executor returns an error, the shared invocation reports failure
+without inline activation or a success hook. A child may already have performed
+effects before its result transport or durable settlement fails; the error does
+not authorize repeating the work in the parent context.
 
 ## Observability
 

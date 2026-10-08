@@ -2085,7 +2085,10 @@ cat "$TERMINAL_FILE"
         }];
         for (key, value) in [
             ("PROBE_VALUE", "expected".to_string()),
-            ("EXPECTED_CWD", tmp.path().display().to_string()),
+            (
+                "EXPECTED_CWD",
+                tmp.path().canonicalize().unwrap().display().to_string(),
+            ),
             ("PROBE_LOG", log.display().to_string()),
             ("CAPTURE_FILE", capture_path.display().to_string()),
             ("PENDING_CAPTURE_FILE", pending_path.display().to_string()),
@@ -2101,7 +2104,7 @@ cat "$TERMINAL_FILE"
         let outcome = AstraCliExecutor::new(cfg.clone())
             .execute(&case, "test-model")
             .await;
-        assert_eq!(outcome.exit_code, 0, "{}", outcome.text);
+        assert_eq!(outcome.exit_code, 0, "{outcome:?}");
         let stream = outcome.stream_capture.as_ref().unwrap();
         assert!(stream.identity_verified);
         assert!(crate::criteria::evaluate_deterministic(&case.criteria, &outcome)[0].passed);

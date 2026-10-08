@@ -772,6 +772,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             },
             post_tool_modified,
         );
+        // Capture before completion persistence: a failed commit must not erase
+        // the scope of a provider execution that already crossed dispatch.
+        let work_attribution = execution.pending_runtime_completion.as_ref()
+            .map(|pending| pending.work_attribution().clone())
+            .or_else(|| execution.confirmed_invocation.as_ref().and_then(|record| {
+                crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(&record.decision)
+                    .ok().map(|decision| decision.work_attribution)
+            }))
+            .or_else(|| execution.edge_terminal_authority.then(|| {
+                self.ctx.edge_tool_round.iter().find(|edge|
+                    edge.tool_call_id() == Some(execution.id.as_str()) && edge.tool_name() == execution.name
+                ).and_then(|edge| edge.work_attribution()).cloned()
+            }).flatten())
+            .unwrap_or_default();
         let finalized = if let Some(pending) = execution.pending_runtime_completion.take() {
             let executor = self
                 .ctx
@@ -964,6 +978,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
             rec.execution_completion = execution_completion;
+            rec.work_attribution = Some(work_attribution);
             rec.runtime_args_full = raw_args_full;
             rec.tool_call_id = Some(execution.id.clone());
             rec.result_artifact = journal_result.artifact.clone();

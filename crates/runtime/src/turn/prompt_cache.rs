@@ -272,8 +272,7 @@ pub(crate) fn runtime_always_load_tool_names() -> std::collections::HashSet<Stri
 pub(crate) fn resolve_always_load_tool_names_for_config(
     cfg: &ToolSurfaceConfig,
 ) -> std::collections::HashSet<String> {
-    let mut schemas = astra_tools::schemas::all_tool_schemas();
-    schemas.push(crate::turn::skill_tool::skill_tool_schema_v2());
+    let schemas = astra_tools::schemas::all_tool_schemas();
     crate::tool_registry::surface::ToolSurface::build(schemas, cfg, &[])
         .always_load_names()
         .into_iter()

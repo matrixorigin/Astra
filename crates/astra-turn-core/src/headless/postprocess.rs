@@ -62,7 +62,18 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
     } = request;
     let mut resource_limit_recorded = false;
     if *is_err && !tool_already_restricted {
-        let category = source_error_kind.unwrap_or(ErrorCategory::Unknown);
+        let category = source_error_kind
+            .or_else(|| source_recovery_evidence.map(|evidence| evidence.kind))
+            .unwrap_or(ErrorCategory::Unknown);
+
+        // Admission rejections retain their producer-owned repair instructions.
+        // An unknown classification is not evidence of an execution failure or
+        // a reason to suggest a different capability or workspace.
+        if execution_disposition == HeadlessExecutionDisposition::RejectedBeforeExecution
+            && category == ErrorCategory::Unknown
+        {
+            return false;
+        }
 
         if matches!(category, ErrorCategory::ResourceLimit) {
             if execution_disposition == HeadlessExecutionDisposition::Executed {
@@ -491,6 +502,61 @@ mod tests {
             serde_json::from_str::<Value>(&output).unwrap()["status"],
             "waiting"
         );
+    }
+
+    #[test]
+    fn unclassified_rejection_preserves_source_recovery_without_execution_advice() {
+        for disposition in [
+            HeadlessExecutionDisposition::RejectedBeforeExecution,
+            HeadlessExecutionDisposition::Executed,
+        ] {
+            let mut guard = TurnGuard::new();
+            let mut advisories = Vec::new();
+            let output = json!({"error": {"code": "precondition_changed",
+                "message": "Refresh the current context before submitting again"}})
+            .to_string();
+            let mut is_error = true;
+            let resource_limit = enrich_headless_tool_output_for_errors_and_limits(
+                HeadlessOutputEnrichRequest {
+                    name: "update_plan",
+                    result_str: &output,
+                    is_err: &mut is_error,
+                    source_error_kind: None,
+                    source_recovery_evidence: None,
+                    tool_already_restricted: false,
+                    execution_disposition: disposition,
+                },
+                &mut HeadlessOutputEnrichCtx {
+                    turn_guard: &mut guard,
+                    advisories: &mut advisories,
+                },
+                |_| panic!("a precondition rejection is not a resource failure"),
+            );
+            assert!(!resource_limit);
+            assert!(is_error);
+            assert_eq!(
+                advisories.is_empty(),
+                disposition == HeadlessExecutionDisposition::RejectedBeforeExecution
+            );
+            let quality = append_headless_result_quality_feedback(
+                HeadlessResultQualityRequest {
+                    name: "update_plan",
+                    result_str: &output,
+                    source_error_kind: None,
+                    execution_failed: true,
+                    execution_disposition: disposition,
+                    resource_limit_recorded: resource_limit,
+                },
+                &mut guard,
+                &mut advisories,
+            );
+            assert_eq!(quality, ResultQuality::Error);
+            assert_eq!(guard.errors.total_errors, 1);
+            assert_eq!(
+                guard.health.get("update_plan").is_some(),
+                disposition == HeadlessExecutionDisposition::Executed
+            );
+        }
     }
 
     #[test]

@@ -814,15 +814,16 @@ impl IntrospectionService for DatabaseIntrospectionService {
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
-        let usage_by_event_id = usage_rows
+        let mut usage_by_event_id = usage_rows
             .iter()
             .map(token_usage_event_from_row)
             .map(|result| result.map(|row| (row.event_id, row.token_usage)))
             .collect::<ServiceResult<HashMap<_, _>>>()?;
 
+        // Each response contributes once within the bounded snapshot window.
         let usages: Vec<Value> = response_event_ids
             .iter()
-            .filter_map(|response_event_id| usage_by_event_id.get(response_event_id).cloned())
+            .filter_map(|response_event_id| usage_by_event_id.remove(response_event_id))
             .collect();
 
         if usages.is_empty() {

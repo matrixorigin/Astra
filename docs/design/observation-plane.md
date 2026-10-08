@@ -72,6 +72,18 @@ Introspect should answer:
 - what sync state is safe or degraded;
 - what recent failures matter.
 
+Tool-failure evidence used by SelfModel belongs to the current execution's
+observability session. Publishing a tool round replaces that session's full
+projection, including an empty result after recovery; it must not broadcast
+one execution's health to other sessions sharing an observation hub.
+
+Live execution, canonical tool-boundary feedback, and recorded round/trace
+facts own runtime observations. The separate turn-metrics journal, trend
+renderer, and strategy-change verification projection are retired. Context
+pressure remains a live provider-boundary advisory at 0.70 and 0.90; it does
+not authorize budget changes, tool restrictions, or completion. A fresh
+pressure projection replaces any previous one, including after pressure drops.
+
 ## Reflect
 
 Reflect is agent reasoning over observation facts. It should not mutate state by itself. It can propose strategy, identify uncertainty, and request action.

@@ -7,7 +7,7 @@
 //! busted the Anthropic cache.
 //!
 //! Contracts this file pins:
-//!   1. `skill_tool_schema_v2()` is a zero-arg function — the schema is
+//!   1. `astra_tools::schemas::skill_tool_schema()` is a zero-arg function — the schema is
 //!      a constant string of bytes. No skill list, no dynamic enum.
 //!   2. The schema advertises `skill_name` as an open string (no `enum`)
 //!      because the catalog is now surfaced through a separate listing
@@ -25,7 +25,7 @@
 //! is the whole point of TDD.
 
 use astra_runtime::prompts::build_skill_listing_section;
-use astra_runtime::turn::skill_tool::{SkillToolInfo, skill_tool_schema_v2};
+use astra_runtime::turn::skill_tool::SkillToolInfo;
 use astra_turn_core::section_types::CacheScope;
 
 fn skill(name: &str, desc: &str) -> SkillToolInfo {
@@ -43,19 +43,19 @@ fn skill_tool_schema_v2_takes_no_skill_list() {
     // Bare compile check — the *signature* is the contract. If anyone adds
     // a parameter here, this test stops compiling and forces the reviewer
     // to justify the cache hit they just deleted.
-    let _: serde_json::Value = skill_tool_schema_v2();
+    let _: serde_json::Value = astra_tools::schemas::skill_tool_schema();
 }
 
 #[test]
 fn skill_tool_schema_v2_is_byte_stable_across_calls() {
-    let a = serde_json::to_vec(&skill_tool_schema_v2()).unwrap();
-    let b = serde_json::to_vec(&skill_tool_schema_v2()).unwrap();
+    let a = serde_json::to_vec(&astra_tools::schemas::skill_tool_schema()).unwrap();
+    let b = serde_json::to_vec(&astra_tools::schemas::skill_tool_schema()).unwrap();
     assert_eq!(a, b, "schema must be byte-stable");
 }
 
 #[test]
 fn skill_tool_schema_v2_has_open_string_skill_name_no_enum() {
-    let schema = skill_tool_schema_v2();
+    let schema = astra_tools::schemas::skill_tool_schema();
     let params = &schema["function"]["parameters"];
     let skill_name = &params["properties"]["skill_name"];
     assert_eq!(
@@ -72,7 +72,7 @@ fn skill_tool_schema_v2_has_open_string_skill_name_no_enum() {
 
 #[test]
 fn skill_tool_schema_v2_names_skill_tool_correctly() {
-    let schema = skill_tool_schema_v2();
+    let schema = astra_tools::schemas::skill_tool_schema();
     assert_eq!(
         schema["function"]["name"].as_str(),
         Some("skill"),
@@ -185,7 +185,7 @@ fn skill_listing_contains_skill_invocation_nudge() {
 fn skill_listing_and_schema_assign_skills_to_objective_owner() {
     let section =
         build_skill_listing_section(&[skill("review-changes", "Review code changes")]).unwrap();
-    let schema = skill_tool_schema_v2();
+    let schema = astra_tools::schemas::skill_tool_schema();
     let description = schema["function"]["description"].as_str().unwrap();
     for text in [section.text.as_str(), description] {
         assert!(text.contains("work this agent owns") || text.contains("work you own"));

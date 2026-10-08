@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::session_capture::SessionCapture;
+use crate::session_capture::{JournalToolCall, SessionCapture};
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value
@@ -61,6 +61,120 @@ pub(super) struct Timing {
     pub cancellation_after_deliveries: usize,
     pub added_execution_after_initial_deliveries: usize,
     pub require_added_at_start: bool,
+    pub require_added_before_execution: bool,
+}
+
+fn validate_added_before_execution(
+    calls: &[JournalToolCall],
+    boundary: usize,
+    scope: &(String, String),
+    declared: &BTreeMap<String, u64>,
+    added_count: usize,
+) -> Result<BTreeMap<String, u64>, String> {
+    let producer = calls[boundary]
+        .run_id
+        .as_deref()
+        .ok_or("first execution lacks producer")?;
+    let prefix = &calls[..boundary];
+    let start = prefix
+        .iter()
+        .find(|call| {
+            call.name == "start_work"
+                && call.ok == Some(true)
+                && call.run_id.as_deref() == Some(producer)
+                && call
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result["status"] == "started")
+        })
+        .and_then(|call| call.result.as_ref())
+        .ok_or("addition timing lacks genesis")?;
+    let mut added: BTreeMap<_, _> = board_items(&start["task_board_update"])?
+        .into_iter()
+        .filter(|(id, _)| !declared.contains_key(id))
+        .map(|(id, item)| (id, item.revision))
+        .collect();
+    for (index, call) in prefix.iter().enumerate() {
+        if call.name != "propose_work_plan" || call.ok != Some(true) {
+            continue;
+        }
+        let result = call.result.as_ref().ok_or("proposal lacks receipt")?;
+        if result["status"] != "accepted" {
+            continue;
+        }
+        let args = call
+            .arguments
+            .as_ref()
+            .ok_or("accepted addition lacks typed arguments")?;
+        let additions = args["additions"]
+            .as_array()
+            .ok_or("accepted addition lacks additions")?;
+        if additions.is_empty() {
+            continue;
+        }
+        let context = string(args, "context_id")?;
+        let inspection = prefix[..index]
+            .iter()
+            .rev()
+            .find_map(|inspection| {
+                if inspection.name != "inspect_work_plan"
+                    || inspection.ok != Some(true)
+                    || inspection.run_id.as_deref() != Some(producer)
+                {
+                    return None;
+                }
+                inspection
+                    .result
+                    .as_ref()
+                    .filter(|result| result["context_id"] == context)
+            })
+            .ok_or("accepted addition lacks its prior inspection context")?;
+        let basis = &inspection["basis"];
+        if call.run_id.as_deref() != Some(producer)
+            || string(basis, "work_id")? != scope.0
+            || string(basis, "branch_id")? != scope.1
+            || revision(result, "result_graph_revision")? <= revision(basis, "graph_revision")?
+        {
+            return Err(
+                "accepted addition crosses scope or does not advance its inspection basis".into(),
+            );
+        }
+        let mut requested = BTreeSet::new();
+        for addition in additions {
+            let id = string(addition, "item_id")?;
+            if id == "root" || declared.contains_key(id) || !requested.insert(id.to_owned()) {
+                return Err("accepted addition does not use unique fresh identities".into());
+            }
+        }
+        let mut applied = BTreeMap::new();
+        for addition in result["applied_mutations"]["added_items"]
+            .as_array()
+            .ok_or("accepted addition lacks applied item receipts")?
+        {
+            let id = string(addition, "item_id")?.to_owned();
+            if applied
+                .insert(id, revision(addition, "revision")?)
+                .is_some()
+            {
+                return Err("accepted addition repeats an applied identity".into());
+            }
+        }
+        if requested != applied.keys().cloned().collect() {
+            return Err("accepted addition arguments disagree with applied receipts".into());
+        }
+        for (id, revision) in applied {
+            if added
+                .insert(id, revision)
+                .is_some_and(|old| old != revision)
+            {
+                return Err("accepted addition changes a previously committed identity".into());
+            }
+        }
+    }
+    if added.len() != added_count {
+        return Err("every required addition must be committed before first execution".into());
+    }
+    Ok(added)
 }
 
 pub(super) fn verify(
@@ -75,6 +189,7 @@ pub(super) fn verify(
         cancellation_after_deliveries: after_deliveries,
         added_execution_after_initial_deliveries: added_after_initial_deliveries,
         require_added_at_start,
+        require_added_before_execution,
     } = timing;
     if session.has_integrity_errors() || session.skipped_lines > 0 || session.dropped_lines > 0 {
         return Err("replacement lifecycle requires an intact, complete journal".into());
@@ -85,12 +200,107 @@ pub(super) fn verify(
     let mut previous: BTreeMap<String, Item> = BTreeMap::new();
     let mut previous_graph = 0;
     let mut executed = BTreeSet::new();
+    let mut pre_execution_additions = None;
+    let mut assigned_attempts = BTreeMap::new();
     let mut cancelled = BTreeSet::new();
     // One item may have an idempotently replayed settlement, but cannot count
     // as delivered again under a different execution attempt or revision.
     let mut delivered: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut intervening_mutation = false;
-    for call in &calls {
+    for (call_index, call) in calls.iter().enumerate() {
+        // Claims and board projections are not evidence of tool execution.
+        // Only the executor's frozen attribution can assign an invocation to
+        // an attempt, including executions that returned an error.
+        if !matches!(
+            call.name.as_str(),
+            "start_work" | "run_next_work_item" | "settle_work_item" | "propose_work_plan"
+        ) {
+            let disposition = call
+                .runtime_metadata
+                .get("disposition")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value::<astra_services::session_journal::ToolCallDisposition>(
+                        value.clone(),
+                    )
+                })
+                .transpose()
+                .map_err(|_| "invocation has an invalid execution disposition")?;
+            if disposition == Some(astra_services::session_journal::ToolCallDisposition::Executed) {
+                let attribution: astra_services::runs::WorkInvocationAttribution =
+                    serde_json::from_value(
+                        call.runtime_metadata
+                            .get("work_attribution")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    )
+                    .map_err(|_| "executed invocation lacks valid frozen Work attribution")?;
+                let producer = call
+                    .run_id
+                    .as_deref()
+                    .ok_or("executed invocation lacks producer run identity")?;
+                attribution.validate(Some(producer))?;
+                match attribution {
+                    astra_services::runs::WorkInvocationAttribution::Attempt {
+                        binding, ..
+                    } => {
+                        if identity.as_ref() != Some(&(binding.work_id, binding.branch_id)) {
+                            return Err(
+                                "executed invocation crosses Work/branch scope or precedes genesis"
+                                    .into(),
+                            );
+                        }
+                        let item = binding.item.expect("validated attempt contains an item");
+                        let selected = previous
+                            .get(&item.item_id)
+                            .ok_or("executed invocation references an absent item")?;
+                        if selected.revision != item.item_revision as u64
+                            || selected.declaration != "active"
+                        {
+                            return Err(
+                                "executed invocation references a stale or retired item revision"
+                                    .into(),
+                            );
+                        }
+                        if assigned_attempts.get(&item.item_id)
+                            != Some(&(item.item_revision as u64, item.attempt_id.clone()))
+                        {
+                            return Err(
+                                "executed invocation does not match the assigned attempt".into()
+                            );
+                        }
+                        if require_added_before_execution && executed.is_empty() {
+                            pre_execution_additions = Some(validate_added_before_execution(
+                                &calls,
+                                call_index,
+                                identity.as_ref().unwrap(),
+                                &declared,
+                                added_count,
+                            )?);
+                        }
+                        executed.insert(item.item_id);
+                        if delivered
+                            .keys()
+                            .filter(|id| declared.contains_key(*id))
+                            .count()
+                            < added_after_initial_deliveries
+                            && executed.iter().any(|id| !declared.contains_key(id))
+                        {
+                            return Err(
+                                "added item executed before the required initial deliveries".into(),
+                            );
+                        }
+                    }
+                    astra_services::runs::WorkInvocationAttribution::Unknown => {
+                        return Err("executed invocation has unknown Work attribution".into());
+                    }
+                    astra_services::runs::WorkInvocationAttribution::Control
+                    | astra_services::runs::WorkInvocationAttribution::Unbound => {}
+                }
+            } else if identity.is_some() && disposition.is_none() {
+                return Err("invocation lacks an executor-authored execution disposition".into());
+            }
+        }
         if call.ok != Some(true) {
             continue;
         }
@@ -186,13 +396,13 @@ pub(super) fn verify(
             return Err("canonical graph revision moved backwards".into());
         }
         let items = board_items(board)?;
-        if call.name == "start_work" && require_added_at_start {
+        if call.name == "start_work" && (require_added_at_start || require_added_before_execution) {
             let added_at_start: BTreeSet<_> = items
                 .keys()
                 .filter(|id| !declared.contains_key(*id))
                 .cloned()
                 .collect();
-            if added_at_start.len() != added_count {
+            if require_added_at_start && added_at_start.len() != added_count {
                 return Err(
                     "initial board does not already contain every required added item".into(),
                 );
@@ -239,8 +449,18 @@ pub(super) fn verify(
             .chain(result.get("next_task"))
         {
             if assignment.get("status").and_then(Value::as_str) == Some("assigned") {
-                string(assignment, "attempt_id")?;
-                executed.insert(string(assignment, "item_id")?.to_owned());
+                let id = string(assignment, "item_id")?;
+                let attempt = string(assignment, "attempt_id")?;
+                let selected = items
+                    .get(id)
+                    .ok_or("assigned item is absent from its board")?;
+                if revision(assignment, "item_revision")? != selected.revision {
+                    return Err("assignment revision disagrees with its board".into());
+                }
+                if selected.declaration != "active" {
+                    return Err("assignment references a retired item".into());
+                }
+                assigned_attempts.insert(id.to_owned(), (selected.revision, attempt.to_owned()));
             }
         }
         if call.name == "settle_work_item" {
@@ -261,6 +481,12 @@ pub(super) fn verify(
                 return Err("settlement identity disagrees with its canonical transition".into());
             }
             let execution = (item_revision, string(result, "attempt_id")?.to_owned());
+            if assigned_attempts
+                .get(id)
+                .is_some_and(|assigned| assigned != &execution)
+            {
+                return Err("settlement does not match the assigned execution attempt".into());
+            }
             if let Some(existing) = delivered.get(id) {
                 if existing != &execution {
                     return Err("item delivered under multiple execution identities".into());
@@ -289,7 +515,8 @@ pub(super) fn verify(
                 if !cancelled.contains(id) && after_deliveries > 0 {
                     let previously_waiting = previous.get(id).is_some_and(|old| {
                         old.declaration == "active"
-                            && old.execution == "not_started"
+                            && matches!(old.execution.as_str(), "not_started" | "running")
+                            && !executed.contains(id)
                             && old.delivery == "unreported"
                     });
                     // A complete prior snapshot after N deliveries proves the
@@ -305,7 +532,7 @@ pub(super) fn verify(
                     }
                 }
                 cancelled.insert(id.to_owned());
-            } else if item.execution != "not_started" || item.delivery != "unreported" {
+            } else if item.execution == "completed" || item.delivery != "unreported" {
                 executed.insert(id.to_owned());
             }
         }
@@ -330,6 +557,16 @@ pub(super) fn verify(
         .filter(|id| !declared.contains_key(*id))
         .cloned()
         .collect();
+    if require_added_before_execution {
+        let proved = pre_execution_additions.ok_or("addition timing lacks scoped execution")?;
+        if proved.keys().cloned().collect::<BTreeSet<_>>() != added
+            || proved
+                .iter()
+                .any(|(id, revision)| previous[id].revision != *revision)
+        {
+            return Err("final complete board does not corroborate pre-execution additions".into());
+        }
+    }
     let expected: BTreeSet<_> = declared
         .keys()
         .filter(|id| !cancelled.contains(*id))
@@ -418,21 +655,188 @@ mod tests {
         let mut early = valid.clone();
         result(&mut early, 0)["task_board_update"]["tasks"][2]["execution_status"] =
             json!("running");
-        assert!(
-            super::verify(&early, 2, 1, 1, 2, timing())
-                .unwrap_err()
-                .contains("added item executed")
-        );
+        assert!(super::verify(&early, 2, 1, 1, 2, timing()).is_ok());
         let mut assigned = valid.clone();
         result(&mut assigned, 0)["initial_task"] = json!({
-            "status":"assigned","item_id":"fresh","attempt_id":"early-attempt"
+            "status":"assigned","item_id":"fresh","item_revision":1,"attempt_id":"early-attempt"
         });
-        assert!(super::verify(&assigned, 2, 1, 1, 2, timing()).is_err());
+        result(&mut assigned, 2)["attempt_id"] = json!("early-attempt");
+        assert!(super::verify(&assigned, 2, 1, 1, 2, timing()).is_ok());
+        for ok in [true, false] {
+            let mut actual = assigned.clone();
+            actual.events.insert(1, JournalEvent {
+                event_type: "turn".into(),
+                raw: json!({"producer_scope":{"run_id":"producer"},"tool_calls":[{
+                    "tool_call_id":"fresh-execution","name":"read_file","ok":ok,"disposition":"executed",
+                    "work_attribution":{"state":"attempt","producer_run_id":"producer","binding":{
+                        "work_id":"work","branch_id":"branch","item":{
+                            "item_id":"fresh","item_revision":1,"attempt_id":"early-attempt"
+                        }
+                    }}
+                }]}),
+            });
+            assert!(
+                super::verify(&actual, 2, 1, 1, 2, timing())
+                    .unwrap_err()
+                    .contains("added item executed")
+            );
+        }
         let mut after_delivery = valid;
         result(&mut after_delivery, 1)["next_task"] = json!({
-            "status":"assigned","item_id":"fresh","attempt_id":"attempt-b"
+            "status":"assigned","item_id":"fresh","item_revision":1,"attempt_id":"attempt-b"
         });
         assert!(super::verify(&after_delivery, 2, 1, 1, 2, timing()).is_ok());
+    }
+
+    #[test]
+    fn additions_before_first_execution_require_scoped_committed_receipts() {
+        let mut valid = fixture(false, true);
+        result(&mut valid, 0)["initial_task"] = json!({
+            "status":"assigned","item_id":"alpha","item_revision":1,"attempt_id":"attempt-a"
+        });
+        let first_board = &mut result(&mut valid, 1)["task_board_update"];
+        first_board["tasks"][1] = item("beta", 1, "active", "running", "unreported");
+        result(&mut valid, 1)["next_task"] = json!({
+            "status":"assigned","item_id":"beta","item_revision":1,"attempt_id":"original-b"
+        });
+        result(&mut valid, 2)["task_board_update"]["graph_revision"] = json!(3);
+        let mut selected_board = result(&mut valid, 2)["task_board_update"].clone();
+        selected_board["tasks"][2] = item("fresh", 1, "active", "running", "unreported");
+        let event = |name: &str, args: Value, result: Value| JournalEvent {
+            event_type: "llm_round".into(),
+            raw: json!({"tool_calls":[{"name":name,"ok":true,"args_full":args,"result_full":result}]}),
+        };
+        let inspection = event(
+            "inspect_work_plan",
+            json!({}),
+            json!({
+                "context_id":"context", "basis":{"work_id":"work","branch_id":"branch","graph_revision":1}
+            }),
+        );
+        let addition = event(
+            "propose_work_plan",
+            json!({
+                "context_id":"context", "additions":[{"item_id":"fresh"}]
+            }),
+            json!({"status":"accepted","result_graph_revision":2,
+            "applied_mutations":{"added_items":[{"item_id":"fresh","revision":1}]}}),
+        );
+        let execution = |id: &str, attempt: &str| {
+            let mut call = event("read_file", json!({"path":"evidence"}), json!("observed"));
+            call.raw["tool_calls"][0]["work_attribution"] = json!({
+                "state":"attempt", "producer_run_id":"producer", "binding":{
+                    "work_id":"work","branch_id":"branch","item":{
+                        "item_id":id,"item_revision":1,"attempt_id":attempt
+                    }
+                }
+            });
+            call
+        };
+        let start = valid.events.remove(0);
+        let first_settlement = valid.events.remove(0);
+        let last_settlement = valid.events.remove(0);
+        valid.events = vec![
+            start,
+            inspection,
+            addition,
+            execution("alpha", "attempt-a"),
+            first_settlement,
+            event(
+                "propose_work_plan",
+                json!({"additions":[]}),
+                json!({"status":"accepted"}),
+            ),
+            event(
+                "run_next_work_item",
+                json!({}),
+                json!({
+                    "status":"assigned","work_id":"work","branch_id":"branch","item_id":"fresh",
+                    "item_revision":1,"attempt_id":"attempt-b","task_board_update":selected_board
+                }),
+            ),
+            execution("fresh", "attempt-b"),
+            last_settlement,
+        ];
+        let rounds = |capture: &mut SessionCapture| {
+            for (index, event) in capture.events.iter_mut().enumerate() {
+                event.event_type = "llm_round".into();
+                event.raw["producer_scope"] = json!({"run_id":"producer"});
+                event.raw["turn"] = json!(1);
+                event.raw["round"] = json!(index);
+                let record = &mut event.raw["tool_calls"][0];
+                record["tool_call_id"] = json!(format!("call-{index}"));
+                record["disposition"] = json!("executed");
+                if record.get("work_attribution").is_none() {
+                    record["work_attribution"] = json!({"state":"control"});
+                }
+            }
+        };
+        rounds(&mut valid);
+        let timing = || Timing {
+            require_added_before_execution: true,
+            cancellation_after_deliveries: 1,
+            added_execution_after_initial_deliveries: 1,
+            ..Default::default()
+        };
+        assert!(super::verify(&valid, 2, 1, 1, 2, timing()).is_ok());
+        let mut recovered = valid.clone();
+        let mut rejected_start = recovered.events[0].clone();
+        rejected_start.raw["tool_calls"][0]["ok"] = json!(false);
+        rejected_start.raw["tool_calls"][0]["result_full"] = json!({"status":"rejected"});
+        recovered.events.insert(0, rejected_start);
+        rounds(&mut recovered);
+        assert!(super::verify(&recovered, 2, 1, 1, 2, timing()).is_ok());
+        for ok in [true, false] {
+            let mut late = valid.clone();
+            late.events.swap(2, 3);
+            late.events[2].raw["tool_calls"][0]["ok"] = json!(ok);
+            rounds(&mut late);
+            assert!(
+                super::verify(&late, 2, 1, 1, 2, timing())
+                    .unwrap_err()
+                    .contains("before first execution")
+            );
+        }
+        for (event, path, value) in [
+            (2, "/result_full/status", json!("rejected")),
+            (1, "/result_full/basis/work_id", json!("other-work")),
+            (1, "/result_full/basis/branch_id", json!("other-branch")),
+            (1, "/result_full/basis/graph_revision", json!(2)),
+            (2, "/args_full/context_id", json!("forged-context")),
+            (
+                2,
+                "/result_full/applied_mutations/added_items/0/item_id",
+                json!("forged-item"),
+            ),
+            (
+                2,
+                "/result_full/applied_mutations/added_items/0/revision",
+                json!(2),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.events[event].raw["tool_calls"][0]
+                .pointer_mut(path)
+                .unwrap() = value;
+            assert!(
+                super::verify(&invalid, 2, 1, 1, 2, timing()).is_err(),
+                "{path}"
+            );
+        }
+        let criterion: crate::criteria::Criterion = serde_json::from_value(json!({
+            "type":"journal_work_replacement_lifecycle", "initial_items":2,"cancelled_items":1,
+            "added_items":1,"delivered_items":2,"cancellation_after_deliveries":1,
+            "added_execution_after_initial_deliveries":1,"require_added_before_execution":true
+        }))
+        .unwrap();
+        assert!(
+            crate::criteria::evaluate_deterministic_with_session(
+                &[criterion],
+                &crate::runner::RunOutcome::default(),
+                Some(&valid)
+            )[0]
+            .passed
+        );
     }
 
     fn item(id: &str, revision: u64, declaration: &str, execution: &str, delivery: &str) -> Value {
@@ -529,21 +933,70 @@ mod tests {
     }
 
     #[test]
-    fn executed_or_assigned_cancelled_items_fail() {
+    fn cancelled_board_cannot_claim_running_or_receive_an_assignment() {
         let mut running = fixture(false, false);
         result(&mut running, 0)["task_board_update"]["tasks"][1]["execution_status"] =
             json!("running");
         assert!(verify(&running, 2, 1, 1, 2, 0).is_err());
         let mut assigned = fixture(false, false);
-        result(&mut assigned, 0)["initial_task"] =
-            json!({"status":"assigned","item_id":"beta","attempt_id":"allocated"});
+        result(&mut assigned, 0)["initial_task"] = json!({"status":"assigned","item_id":"beta","item_revision":1,"attempt_id":"allocated"});
         assert!(verify(&assigned, 2, 1, 1, 2, 0).is_err());
-        let mut history = fixture(false, false);
-        let target = &mut result(&mut history, 0)["task_board_update"]["tasks"][1];
-        target["declaration_state"] = json!("active");
-        target["execution_status"] = json!("running");
-        target["item_revision"] = json!(1);
-        assert!(verify(&history, 2, 1, 1, 2, 0).is_err());
+    }
+
+    #[test]
+    fn claimed_item_can_be_cancelled_but_actual_failed_execution_cannot() {
+        let mut claimed = fixture(false, true);
+        result(&mut claimed, 0)["initial_task"] = json!({
+            "status":"assigned", "item_id":"beta", "item_revision":1, "attempt_id":"attempt-beta"
+        });
+        result(&mut claimed, 0)["task_board_update"]["tasks"][1]["execution_status"] =
+            json!("running");
+        assert!(verify(&claimed, 2, 1, 1, 2, 1).is_ok());
+        let execution = |ok, attribution| JournalEvent {
+            event_type: "turn".into(),
+            raw: json!({"producer_scope":{"run_id":"producer"}, "tool_calls":[{
+                "tool_call_id":"actual-call", "name":"read_file", "ok":ok,
+                "disposition":"executed", "work_attribution":attribution
+            }]}),
+        };
+        let attribution = json!({"state":"attempt", "producer_run_id":"producer",
+        "binding":{"work_id":"work", "branch_id":"branch", "item":{
+            "item_id":"beta", "item_revision":1, "attempt_id":"attempt-beta"
+        }}});
+        for ok in [true, false] {
+            let mut actual = claimed.clone();
+            actual.events.insert(1, execution(ok, attribution.clone()));
+            assert!(
+                verify(&actual, 2, 1, 1, 2, 1)
+                    .unwrap_err()
+                    .contains("execution/delivery evidence")
+            );
+        }
+        for disposition in [json!("future_disposition"), json!(17), Value::Null] {
+            let mut actual = claimed.clone();
+            let mut event = execution(false, attribution.clone());
+            event.raw["tool_calls"][0]["disposition"] = disposition;
+            actual.events.insert(1, event);
+            assert!(verify(&actual, 2, 1, 1, 2, 1).is_err());
+        }
+        for invalid in [
+            Value::Null,
+            json!({"state":"unknown"}),
+            {
+                let mut wrong = attribution.clone();
+                wrong["producer_run_id"] = json!("other-run");
+                wrong
+            },
+            {
+                let mut wrong = attribution;
+                wrong["binding"]["item"]["attempt_id"] = json!("stale-attempt");
+                wrong
+            },
+        ] {
+            let mut actual = claimed.clone();
+            actual.events.insert(1, execution(false, invalid));
+            assert!(verify(&actual, 2, 1, 1, 2, 1).is_err());
+        }
     }
 
     #[test]
@@ -593,6 +1046,16 @@ mod tests {
             }]}),
         });
         assert!(verify(&capture, 2, 1, 1, 2, 0).is_ok());
+        result(&mut capture, 2)["attempt_id"] = json!("another-attempt");
+        assert!(
+            verify(&capture, 2, 1, 1, 2, 0)
+                .unwrap_err()
+                .contains("assigned execution attempt")
+        );
+        result(&mut capture, 2)["attempt_id"] = json!("attempt-a");
+        result(&mut capture, 1)["item_revision"] = json!(2);
+        assert!(verify(&capture, 2, 1, 1, 2, 0).is_err());
+        result(&mut capture, 1)["item_revision"] = json!(1);
         result(&mut capture, 4)["status"] = json!("invented");
         assert!(verify(&capture, 2, 1, 1, 2, 0).is_err());
         result(&mut capture, 4)["status"] = json!("complete");

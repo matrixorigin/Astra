@@ -190,7 +190,19 @@ struct CliCapabilityView {
 
 /// Authorized inventory for registry/provider setup before request restrictions.
 pub fn local_tool_schemas() -> Vec<Value> {
-    local_runtime_tool_schemas(all_tool_schemas())
+    let schemas = all_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(schema)
+                .and_then(astra_turn_core::tool::registry::meta::tool_meta)
+                .is_none_or(|meta| {
+                    !meta
+                        .requires
+                        .contains(&astra_turn_core::capability::Capability::SkillsCatalog)
+                })
+        })
+        .collect();
+    local_runtime_tool_schemas(schemas)
 }
 
 /// Plan-mode write guard tool list (CLI parity with

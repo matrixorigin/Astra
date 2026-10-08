@@ -1,9 +1,7 @@
 use super::server::tool_transport::ToolExecutionService;
 use super::*;
 use crate::turn::services::{
-    InMemoryTurnReflectionStateStore, NoopTurnAuxiliaryEventWriter, NoopTurnCoreEventWriter,
-    NoopTurnHookDbWriter, NoopTurnObserverWorker, NoopTurnReflectionLessonWriter,
-    NoopTurnSessionActivityWriter, NoopTurnToolEventWriter,
+    NoopTurnAuxiliaryEventWriter, NoopTurnHookDbWriter, NoopTurnObserverWorker,
 };
 use astra_services::auth;
 
@@ -100,27 +98,17 @@ impl MemoriaHealth {
 
 #[derive(Clone)]
 pub(crate) struct TurnPersistenceState {
-    pub(crate) core_event_writer: Arc<dyn TurnCoreEventWriter>,
-    pub(crate) tool_event_writer: Arc<dyn TurnToolEventWriter>,
     pub(crate) hook_db_writer: Arc<dyn TurnHookDbWriter>,
-    pub(crate) reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-    pub(crate) reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     pub(crate) observer_worker: Arc<dyn TurnObserverWorker>,
     pub(crate) auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
-    pub(crate) session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
 }
 
 impl Default for TurnPersistenceState {
     fn default() -> Self {
         Self {
-            core_event_writer: Arc::new(NoopTurnCoreEventWriter),
-            tool_event_writer: Arc::new(NoopTurnToolEventWriter),
             hook_db_writer: Arc::new(NoopTurnHookDbWriter),
-            reflection_state_store: Arc::new(InMemoryTurnReflectionStateStore::default()),
-            reflection_lesson_writer: Arc::new(NoopTurnReflectionLessonWriter),
             observer_worker: Arc::new(NoopTurnObserverWorker),
             auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
-            session_activity_writer: Arc::new(NoopTurnSessionActivityWriter),
         }
     }
 }
@@ -619,22 +607,6 @@ impl AppState {
         self
     }
 
-    pub fn with_turn_core_event_writer(
-        mut self,
-        turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
-    ) -> Self {
-        self.turn_persistence.core_event_writer = turn_core_event_writer;
-        self
-    }
-
-    pub fn with_turn_tool_event_writer(
-        mut self,
-        turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
-    ) -> Self {
-        self.turn_persistence.tool_event_writer = turn_tool_event_writer;
-        self
-    }
-
     pub fn with_turn_hook_db_writer(
         mut self,
         turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
@@ -642,35 +614,11 @@ impl AppState {
         self.turn_persistence.hook_db_writer = turn_hook_db_writer;
         self
     }
-    pub fn with_turn_reflection_lesson_writer(
-        mut self,
-        turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
-    ) -> Self {
-        self.turn_persistence.reflection_lesson_writer = turn_reflection_lesson_writer;
-        self
-    }
-
-    pub fn with_turn_reflection_state_store(
-        mut self,
-        turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-    ) -> Self {
-        self.turn_persistence.reflection_state_store = turn_reflection_state_store;
-        self
-    }
-
     pub fn with_turn_observer_worker(
         mut self,
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
     ) -> Self {
         self.turn_persistence.observer_worker = turn_observer_worker;
-        self
-    }
-
-    pub fn with_turn_session_activity_writer(
-        mut self,
-        turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
-    ) -> Self {
-        self.turn_persistence.session_activity_writer = turn_session_activity_writer;
         self
     }
 

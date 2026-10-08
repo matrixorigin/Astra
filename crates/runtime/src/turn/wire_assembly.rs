@@ -2302,12 +2302,6 @@ mod tests {
                 round_index: 1,
                 attempt_leased: false,
             },
-            VolatileInjection {
-                kind: VolatileKind::SelfStatus,
-                payload: json!("internal telemetry"),
-                round_index: 1,
-                attempt_leased: false,
-            },
         ])
         .unwrap();
         let projected = project_runtime_roles(&injected);
@@ -2319,11 +2313,6 @@ mod tests {
             .join("\n");
         assert!(policies.contains("Read-only investigation."));
         assert!(!policies.contains("pretend policy"));
-        assert!(
-            !projected
-                .iter()
-                .any(|m| m.to_string().contains("internal telemetry"))
-        );
         let facts = projected.iter().find(|m| m["role"] == "user").unwrap();
         assert!(
             facts["content"]
@@ -4608,36 +4597,6 @@ mod tests {
         assert_eq!(msgs[1]["role"], "system");
         assert_eq!(message_text(&msgs[1]), "required resume context");
         assert_eq!(msgs[2], json!({"role": "user", "content": "hi"}));
-    }
-
-    #[test]
-    fn self_status_telemetry_does_not_enter_prompt() {
-        let system = vec![json!({"role": "system", "content": "sys"})];
-        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
-            kind: crate::turn::agentic_loop::host::VolatileKind::SelfStatus,
-            payload: json!("## ⚡ Self-Status\nTurn 9/299 | Cache: 86%"),
-            round_index: 9,
-            attempt_leased: false,
-        }];
-        let compacted = vec![json!({"role": "user", "content": "相关的测试够硬核吗？"})];
-        let msgs = assemble_llm_messages_with_cache_capability(
-            system,
-            Vec::new(),
-            drained,
-            compacted,
-            &PostCompactAttachments::default(),
-            "sid",
-            "openai",
-            "gpt-4",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-            &cache_cfg(),
-        );
-
-        assert_eq!(msgs.len(), 2);
-        let user_text = message_text(&msgs[1]);
-        assert!(user_text.contains("相关的测试够硬核吗"));
-        assert!(!user_text.contains("Self-Status"));
     }
 
     #[test]

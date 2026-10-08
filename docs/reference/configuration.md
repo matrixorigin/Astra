@@ -155,7 +155,9 @@ process-level selection of their Server execution-round ceilings.
 
 Runtime configuration exposes controls consumed by execution: compression,
 retrieval, tool policy and tracing. The retired `verification`,
-`memory_pressure`, `context_window` and `token_budget` sections are not supported.
+`memory_pressure`, `context_window`, `token_budget` and `budget_policy` sections
+are not supported. Execution capacity uses the admitted limits and canonical
+adaptive renewal; the retired outcome-streak policy never controlled it.
 Execution input budgets belong to RuntimeLimits (`ASTRA_MAX_TURN_INPUT_TOKENS`)
 and the admitted model context window; self budget views report observed budget
 state instead of an inactive configuration cap. Model context

@@ -474,6 +474,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // a matching skill is selected; it is not part of every turn's cache
         // prefix.
         control_plane("skill", ToolLoadPolicy::Deferred),
+        control_plane("discover_skills", ToolLoadPolicy::Deferred),
         work_coordinator_control_plane("start_work", ToolLoadPolicy::AlwaysLoad),
         // This is intentionally distinct from the generic `agent` surface:
         // it selects and starts one canonical Work item from durable state.

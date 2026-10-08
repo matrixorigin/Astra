@@ -50,8 +50,7 @@ pub use self_model::introspection;
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 
 pub(crate) use data_layer::storage::{
-    ensure_core_schema, insert_core_turn_event, insert_tool_turn_event,
-    insert_turn_skill_selection, resolve_active_skill_versions, update_snapshot_llm_ids,
+    ensure_core_schema, insert_turn_skill_selection, resolve_active_skill_versions,
 };
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
@@ -219,21 +218,14 @@ pub use orchestration::AgentHistoryRecord;
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
-pub(crate) use astra_turn_core::contracts::TurnReflectionLessonRequest;
-
 pub use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
-    TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
-    TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
-    TurnSessionActivityWriter, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
-    TurnToolEventRecord, TurnToolEventWriter,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
+    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
 };
 
 pub use turn::services::{
-    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter,
-    DatabaseTurnHookDbWriter, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
-    DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
+    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnHookDbWriter,
+    DatabaseTurnObserverWorker,
 };
 
 pub use astra_turn_core::{
@@ -242,7 +234,6 @@ pub use astra_turn_core::{
         explicit_approval_reason, tool_action_profile, tool_action_profile_value,
         tool_requires_explicit_approval,
     },
-    activity::SessionActivityUpdatePlan,
     cloud_attachments::{
         AttachmentBuilder, PlanAttachment, PostCompactAttachments, SkillAttachment,
     },
@@ -260,7 +251,6 @@ pub use astra_turn_core::{
         RecoveredEventRow, append_recovered_events, find_tool_call_safe_split,
         merge_tool_results_into_history,
     },
-    hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan},
     observer::{build_observer_messages, should_run_observer},
     response_guard::{is_prompt_leaked, is_repetition_loop},
     stall::{

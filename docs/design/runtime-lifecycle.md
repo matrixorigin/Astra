@@ -15,6 +15,13 @@ This document defines the target lifecycle contract. Current code can be evaluat
 - Cancel, delete, archive, pause, blocked, and resume must have explicit transitions.
 - Recovery correctness depends on durable state, checkpoints, transcript, and events.
 
+The run's provider-work window and final-answer window share one absolute
+deadline. Inference-ledger settlement may end a provider request before the
+work window reaches zero. After the existing single safe recovery, a proven
+run-work deadline with no visible text or selected tool enters the existing
+final settlement boundary. Ordinary provider timeouts and uncertain delivery
+do not grant that transition or another tool-execution attempt.
+
 ## Source API retirement
 
 The unused `LoopDispatcher` source API is retired; production hosts invoke the
@@ -679,3 +686,26 @@ Server semantic phase facts are emitted only by actual pending tasks. Work and
 user observation use distinct purpose slots within a model round; these slots
 are not provider retries. A skipped dispatch does not create a synthetic timed
 admission. Cancellation and completion use the same slot as task startup.
+
+The source-only turn core/tool event writers, activity writer, and reflection
+state/lesson writer assembly are retired. Canonical loop append and atomic
+terminal settlement own the transcript and accepted trace-event projections;
+hook DB writes, observer extraction, and auxiliary events keep their existing
+owners. Removing the unused snapshot-link updater does not remove context
+snapshots or their introspection reads. Automatic request/response attribution
+requires exact owned capture identities; it must not infer links from the latest
+snapshot or event timing.
+
+Explicit context snapshot creation binds its exact owner/session/event in the
+snapshot INSERT. A snapshot anchored to an accepted `llm_response` records that
+same response identity for introspection; other anchors do not identify a later
+response. Within its bounded recent-snapshot window, context trend counts each referenced
+response once even when multiple snapshots share it. This does not introduce automatic capture or reconstruct
+request identities.
+
+Execution-slice guidance is assembled through the canonical context pipeline.
+The retired journal-based resource policy did not control execution capacity;
+adaptive renewal and settlement retain their existing owners. Runtime config
+and handoff facts reject the retired `budget_policy` field, and pending context
+rejects the retired `self_status` kind. Provider output ending with `length`
+still receives the terminal truncation marker outside exploratory tasks.

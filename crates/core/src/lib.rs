@@ -851,7 +851,6 @@ pub mod log;
 pub mod model_override;
 pub mod net;
 pub mod observation;
-pub mod observation_journal;
 pub mod runtime_limits;
 pub mod tool_offer;
 pub mod tool_schema;
@@ -871,19 +870,15 @@ pub use error_kind::{
     is_llm_context_window_error,
 };
 pub use observation::{
-    ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
+    EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
     ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationDepth,
     ObservationEvidence, ObservationFacet, ObservationFailureCluster, ObservationGraphEdge,
     ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationHorizon,
     ObservationProviderCoverage, ObservationRecord, ObservationTopic, ObservationView,
-    SourcePolicy, ToolCallSample, ToolFamily, TurnMetrics, Urn, budget_observation_support,
-    classify_event_kind, classify_tool_family, normalize_observation_arg, observation_priority_key,
-    push_graph_edge, push_graph_node, truncate_graph_summary, urn_component,
-};
-pub use observation_journal::{
-    JournalEntry, JournalFacts, MetricTrend, ObservationJournal, StrategyVerification,
-    render_compact_status,
+    SourcePolicy, ToolFamily, Urn, budget_observation_support, classify_event_kind,
+    classify_tool_family, normalize_observation_arg, observation_priority_key, push_graph_edge,
+    push_graph_node, truncate_graph_summary, urn_component,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]
