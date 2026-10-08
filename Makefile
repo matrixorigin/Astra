@@ -1100,7 +1100,7 @@ test-dashboard: ## Build astra-test and launch live dashboard
 .PHONY: test-offline
 # Run the focused runtime profile gate first so provider/surface regressions fail
 # before the broader workspace, server E2E-hook, SDK, and web offline suites.
-test-offline: sweep validate-capability-matrix test-runtime-profiles test-workspace test-runtime-e2e-hooks test-sdk-offline test-web-offline
+test-offline: sweep validate-capability-matrix test-runtime-profiles test-workspace test-history-work test-runtime-e2e-hooks test-sdk-offline test-web-offline
 
 .PHONY: validate-capability-matrix
 validate-capability-matrix:
@@ -1209,6 +1209,13 @@ test-workspace: sweep test-mcp-fixture
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
+.PHONY: test-history-work
+# Copy accounting is process-scoped and deliberately disabled in ordinary tests.
+# These deterministic measurements need neither MatrixOne nor a live provider.
+test-history-work:
+	@ASTRA_HISTORY_WORK_TRACE=1 CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+		-p astra-runtime --test compaction_work --run-ignored only $(NEXTEST_OFFLINE_FLAGS)
+
 # Compiles deterministic model/edge hooks used by runtime system journeys.
 .PHONY: test-runtime-e2e-hooks
 test-runtime-e2e-hooks: sweep
@@ -1249,7 +1256,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(compaction_work) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1257,7 +1264,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(perf_benchmarks) and not binary(compaction_work) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \

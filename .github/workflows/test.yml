@@ -120,6 +120,8 @@ jobs:
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
           --profile ci
+      - name: Measure history compaction work (offline)
+        run: make test-history-work NEXTEST_OFFLINE_PROFILE=ci
 
   shard-c:
     name: "Test: turn-core + services + plan"

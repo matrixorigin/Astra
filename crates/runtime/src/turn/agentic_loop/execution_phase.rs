@@ -23383,6 +23383,19 @@ mod tests {
         )
         .await;
         assert!(matches!(first, Some(TurnExecutionControl::ContinueLoop)));
+        assert!(!state.budget_wrapup_injected);
+        assert_eq!(state.compaction_effectiveness.attempt_count, 1);
+        let first_savings = state.compaction_effectiveness.cumulative_tokens_freed;
+        assert!(first_savings > 0);
+
+        // A second provider round can add genuinely prunable evidence. Pressure
+        // alone must not count the already-installed boundary as new savings.
+        for i in 0..12 {
+            state.messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!("new evidence {i}: {}", "z".repeat(240)),
+            }));
+        }
 
         state.last_measured_prompt_tokens = Some(88_000);
         let second = handle_token_budget(
@@ -23404,6 +23417,32 @@ mod tests {
         assert!(
             !state.budget_wrapup_injected,
             "repeat pressure after a successful compact should not flip straight into wrapup mode"
+        );
+        assert_eq!(state.compaction_effectiveness.attempt_count, 2);
+        assert!(state.compaction_effectiveness.cumulative_tokens_freed > first_savings);
+
+        // Without new history, another retry cannot claim progress from gross
+        // removed bytes while replacing them with an equally large boundary.
+        let compacted = state.messages.clone();
+        let savings = state.compaction_effectiveness.cumulative_tokens_freed;
+        let third = handle_token_budget(
+            &mut host,
+            &mut state,
+            2,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            &text_result("still working", 88_000, 320, Some(20)),
+        )
+        .await;
+        assert!(matches!(third, Some(TurnExecutionControl::ContinueLoop)));
+        assert!(state.budget_wrapup_injected);
+        assert_eq!(state.messages, compacted);
+        assert_eq!(state.compaction_effectiveness.attempt_count, 2);
+        assert_eq!(
+            state.compaction_effectiveness.cumulative_tokens_freed,
+            savings
         );
     }
 

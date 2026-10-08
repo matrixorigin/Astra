@@ -11,6 +11,9 @@ make test
 # Workspace + server E2E hooks only (no online #[ignore] suites)
 make test-offline
 
+# Deterministic history-copy/serialization accounting (included in test-offline)
+make test-history-work
+
 # Online #[ignore] suites only (exports ASTRA_TEST_DB_IT=1; set ASTRA_TEST_DB_IT_TEST_THREADS=1 for serial execution)
 make test-online
 
@@ -23,6 +26,11 @@ make format-check
 make lint
 make type-check
 ```
+
+`test-history-work` enables `ASTRA_HISTORY_WORK_TRACE=1` only for the dedicated
+`compaction_work` test binary. Its ignored measurements are offline tests, not
+live database integration tests; ordinary test processes keep instrumentation
+disabled. CI runs this gate in the runtime shard.
 
 Direct `cargo` usage:
 
