@@ -995,7 +995,11 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
         .stream_capture
         .as_ref()
         .ok_or("execution not captured")?;
-    if !stream.identity_verified || !stream.diagnostics.is_empty() {
+    // Stream diagnostics mix sidecar gaps with other warnings. A presentation
+    // gap alone cannot invalidate the separately fetched Server capture;
+    // identity, owner, canonical completeness, and lifecycle checks are
+    // enforced independently.
+    if !stream.identity_verified {
         return Err("execution identity or coverage unverified");
     }
     let capture = stream
@@ -6311,6 +6315,12 @@ mod tests {
         stream.execution = Some(crate::execution_capture::tests::tool_capture());
         outcome.stream_capture = Some(stream);
         assert!(check(&outcome, &absence));
+        let stream = outcome.stream_capture.as_mut().unwrap();
+        stream.diagnostics = vec!["agent_live_gap".into(), "capture_truncated".into()];
+        assert!(
+            check(&outcome, &absence),
+            "presentation capture loss must not invalidate the separate canonical Server capture"
+        );
         let requested = Criterion::ExecutionToolCount {
             name: "agent".into(),
             min: 1,
@@ -6380,6 +6390,21 @@ mod tests {
             }],
             error_contains: None,
         };
+        assert!(check(&outcome, &requested));
+        let evaluated = evaluate_deterministic(std::slice::from_ref(&requested), &outcome);
+        assert!(!execution_verification_unavailable(&evaluated[0], &outcome));
+        let mut unverified = outcome.clone();
+        unverified
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .identity_verified = false;
+        let unavailable = evaluate_deterministic(std::slice::from_ref(&requested), &unverified);
+        assert!(!unavailable[0].passed);
+        assert!(execution_verification_unavailable(
+            &unavailable[0],
+            &unverified
+        ));
         assert!(check(&outcome, &result));
         let mut mixed = outcome.clone();
         let capture = mixed
