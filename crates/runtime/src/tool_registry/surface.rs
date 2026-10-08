@@ -443,7 +443,11 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "offset",
                 "max_bytes",
             ][..],
-            "explain.target=previous|run; run needs run_id. question=label OR artifact=handle; not both. History=reflect.",
+            function
+                .get("parameters")
+                .and_then(|parameters| parameters.get("x-astra-discovery-summary"))
+                .and_then(Value::as_str)
+                .unwrap_or("Read runtime evidence."),
         ),
         "reflect" => (
             &["question"][..],
@@ -495,6 +499,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         _ => return schema,
     };
 
+    let description = description.to_owned();
     let Some(parameters) = function
         .get_mut("parameters")
         .and_then(Value::as_object_mut)
@@ -627,7 +632,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "{description} For services that must survive this call, set run_in_background with an independent ready_check; neither supplies the foreground delta. Select the full contract with tool_search for artifact preservation."
             )
         } else {
-            description.to_string()
+            description
         }),
     );
     schema

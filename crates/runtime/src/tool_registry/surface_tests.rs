@@ -519,6 +519,15 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
         find(&full, "agent")["function"]["parameters"]["properties"]["prompt"]["x-astra-discovery-summary"]
     );
+    let summary = find(&full, "introspect")["function"]["parameters"]["x-astra-discovery-summary"]
+        .as_str()
+        .expect("historical query guidance belongs to the producer");
+    assert!(!summary.trim().is_empty());
+    assert_eq!(
+        find(&resident, "introspect")["function"]["description"].as_str(),
+        Some(summary),
+        "resident projection must not erase the combined historical evidence contract"
+    );
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
             .iter()
@@ -1498,15 +1507,13 @@ fn observation_recovery_is_eager_and_reflection_can_be_pinned() {
         properties["explain"]["properties"]["target"]["enum"],
         serde_json::json!(["previous", "run"])
     );
-    assert!(
-        introspect["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("explain.target=previous|run")
+    assert_eq!(
+        properties["explain"]["properties"]["run_id"]["type"],
+        "string"
     );
-    let description = introspect["function"]["description"].as_str().unwrap();
-    assert!(description.contains("question=label"));
-    assert!(description.contains("artifact=handle; not both"));
+    for field in ["question", "artifact"] {
+        assert_eq!(properties[field]["type"], "string");
+    }
     for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),
