@@ -14,46 +14,18 @@ timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: glm-5.2
-  - type: session_event_count
-    event_type: LlmRoundCompleted
-    min: 1
-    json_match:
-      path: /payload/model
-      equals: glm-5.2
-      same_run_as:
-        event_type: agent_spawned
-        run_id_path: /metadata/run_id
-  - type: session_event_count
-    event_type: agent_terminated
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/status
-      equals: completed
-      same_run_as:
-        event_type: agent_spawned
-        run_id_path: /metadata/run_id
-  - type: session_child_result_adopted
-    expected_result: "42"
+  - type: execution_child_results_adopted
+    children:
+      - expected_result: {text: "42"}
+        model: glm-5.2
   - type: text_equals
     expected: "42"
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: bash
     root_only: true
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: read_file
     root_only: true
     min: 0

@@ -8,7 +8,6 @@ struct RuntimeWiring {
     matrix_rt: Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>,
     run_lifecycle: AgenticRunLifecycleService,
     delegation_engine: Arc<crate::server::delegation::engine::DelegationEngine>,
-    team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
 }
 
@@ -108,7 +107,6 @@ pub async fn build_server_state(
         .with_artifact_signing_secret(artifact_signing_secret)
         .with_run_lifecycle_service(run_lifecycle)
         .with_delegation_engine(delegation_engine)
-        .with_team_store(Arc::clone(&wiring.team_store))
         .with_resource_governor(Arc::clone(&wiring.resource_governor))
         .with_auxiliary_pools(control_pool.into_iter().collect());
     let state = state.with_matrix_cloud_runtime(Some(matrix_rt));

@@ -2553,8 +2553,7 @@ mod tests {
         let mut rx = Some(spawner.subscribe_progress());
         let last_snapshot = build_watch_snapshot(&[], &[]);
         let context = SpawnContext {
-            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             parent_run_id: "root-run".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,

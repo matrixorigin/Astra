@@ -8,17 +8,16 @@ timeout_seconds: 90
 criteria:
   - type: exit_code
     code: 0
-  - type: session_event_count
-    event_type: agent_spawned
+  - type: execution_child_count
     min: 0
     max: 0
   - type: text_equals
     expected: "42"
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: bash
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: read_file
     min: 0
     max: 0

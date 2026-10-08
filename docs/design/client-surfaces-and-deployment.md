@@ -70,24 +70,6 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 - local diagnostics;
 - reconnect/resume.
 
-The native Team roster editor owns one local draft, with the loaded definition
-as its revision baseline. `/team` offers create and inspect/edit actions; member
-responsibilities and exact Offering selections are draft fields, never changes
-to the foreground model. Inheritance is explicit. Save uses the existing
-owner-bound Team transport for one create or revision-conditional update and
-publishes only its accepted response, without a confirmation read. Conflict or
-unconfirmed delivery retains the draft and identity. A conflict requires explicit
-refresh and review. An unconfirmed save remains blocked until a read matches the
-sent definition and expected accepted revision; a missing or older definition
-does not authorize retry. Confirmation preserves subsequent local edits and never
-replays the write. Editor identity, attachment epoch and pending-operation
-identity fence asynchronous results. The captured account also follows Team and
-lead selection through the final intent change. Back returns to the Team browser;
-that explicit navigation may read the catalog again.
-During an active turn the browser and editor remain available, but selecting a
-Team or lead is disabled with an explanation. Reopen `/team` after the turn ends
-to change conversation intent; viewing configuration never changes admitted work.
-Closing an editor never undoes a sent save or reconfigures admitted work.
 
 A CLI turn consumes one Server-owned SSE execution stream. Edge callbacks run
 inside that stream; their completion never grants the client another model

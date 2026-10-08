@@ -49,7 +49,6 @@ pub enum HistoryWorkSite {
     CliSessionRestoreHydration,
     CliSessionRestoreCanonicalHistoryClone,
     CliSessionRestoreJournalHistoryClone,
-    CliTurnRetryHistoryClone,
     CliTurnUserInputProjection,
     CslMaterializedStateClone,
     CslPersistInputClone,
@@ -141,7 +140,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 121;
+    const COUNT: usize = 120;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -177,7 +176,6 @@ impl HistoryWorkSite {
         Self::CliSessionRestoreHydration,
         Self::CliSessionRestoreCanonicalHistoryClone,
         Self::CliSessionRestoreJournalHistoryClone,
-        Self::CliTurnRetryHistoryClone,
         Self::CliTurnUserInputProjection,
         Self::CslMaterializedStateClone,
         Self::CslPersistInputClone,
@@ -310,7 +308,6 @@ impl HistoryWorkSite {
             Self::CliSessionRestoreJournalHistoryClone => {
                 "cli_session_restore_journal_history_clone"
             }
-            Self::CliTurnRetryHistoryClone => "cli_turn_retry_history_clone",
             Self::CliTurnUserInputProjection => "cli_turn_user_input_projection",
             Self::CslMaterializedStateClone => "csl_materialized_state_clone",
             Self::CslPersistInputClone => "csl_persist_input_clone",
@@ -446,7 +443,6 @@ impl HistoryWorkSite {
             }
             Self::CliSessionRestoreCanonicalHistoryClone
             | Self::CliSessionRestoreJournalHistoryClone => "cli.session_restore",
-            Self::CliTurnRetryHistoryClone => "cli.turn_facade",
             Self::CliTurnUserInputProjection => "cli.stream_settlement",
             Self::CslMaterializedStateClone
             | Self::CslPersistInputClone
@@ -553,7 +549,6 @@ impl HistoryWorkSite {
             // Phase 1 commits before installing live state, removing the
             // whole-session rollback copy from turn settlement.
             Self::CliSettlementRollbackSnapshot
-            | Self::CliTurnRetryHistoryClone
             | Self::CliTurnUserInputProjection
             | Self::ObservabilityRollbackSnapshotClone
             | Self::ObservabilityRollbackRestoreClone => 1,

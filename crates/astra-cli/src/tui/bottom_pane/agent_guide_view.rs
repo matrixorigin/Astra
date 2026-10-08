@@ -19,11 +19,13 @@ use super::view::{
     ViewActionRequest,
 };
 
+enum InputPurpose {
+    Guide(crate::tui::event_loop::AgentGuideTarget),
+    Continue(crate::tui::event_loop::SessionContinuationTarget),
+}
+
 pub(crate) struct AgentGuideView {
-    agent_id: String,
-    agent_name: String,
-    run_id: String,
-    target: crate::tui::agent_run_projection::AgentControlTarget,
+    purpose: InputPurpose,
     input: TextArea,
     error: Option<String>,
     completed: bool,
@@ -31,17 +33,9 @@ pub(crate) struct AgentGuideView {
 }
 
 impl AgentGuideView {
-    pub(crate) fn new(
-        agent_id: String,
-        agent_name: String,
-        run_id: String,
-        target: crate::tui::agent_run_projection::AgentControlTarget,
-    ) -> Self {
+    pub(crate) fn new(target: crate::tui::event_loop::AgentGuideTarget) -> Self {
         Self {
-            agent_id,
-            agent_name,
-            run_id,
-            target,
+            purpose: InputPurpose::Guide(target),
             input: TextArea::new(),
             error: None,
             completed: false,
@@ -49,15 +43,28 @@ impl AgentGuideView {
         }
     }
 
+    pub(crate) fn for_continuation(
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        draft: String,
+        error: Option<String>,
+    ) -> Self {
+        let mut input = TextArea::new();
+        input.set_text(&draft);
+        Self {
+            purpose: InputPurpose::Continue(target),
+            input,
+            error,
+            completed: false,
+            pending_action: None,
+        }
+    }
+
     pub(crate) fn with_draft(
-        agent_id: String,
-        agent_name: String,
-        run_id: String,
-        target: crate::tui::agent_run_projection::AgentControlTarget,
+        target: crate::tui::event_loop::AgentGuideTarget,
         draft: String,
         error: impl Into<String>,
     ) -> Self {
-        let mut view = Self::new(agent_id, agent_name, run_id, target);
+        let mut view = Self::new(target);
         view.input.set_text(&draft);
         view.error = Some(error.into());
         view
@@ -75,16 +82,19 @@ impl AgentGuideView {
     fn submit(&mut self) {
         let content = self.input.text().trim().to_string();
         if content.is_empty() {
-            self.error = Some("Write guidance before sending.".into());
+            self.error = Some("Write an instruction before sending.".into());
             return;
         }
         self.pending_action = Some(ViewActionRequest {
-            action: BottomPaneViewAction::SubmitAgentGuide {
-                agent_id: self.agent_id.clone(),
-                agent_name: self.agent_name.clone(),
-                run_id: self.run_id.clone(),
-                target: self.target.clone(),
-                content,
+            action: match &self.purpose {
+                InputPurpose::Guide(target) => BottomPaneViewAction::SubmitAgentGuide {
+                    target: target.clone(),
+                    content,
+                },
+                InputPurpose::Continue(target) => BottomPaneViewAction::SubmitSessionContinuation {
+                    target: target.clone(),
+                    content,
+                },
             },
             disposition: ViewActionDisposition::Close,
         });
@@ -97,18 +107,32 @@ impl BottomPaneView for AgentGuideView {
             return;
         }
         let theme = crate::tui::theme::current();
+        let (title, name, state, placeholder) = match &self.purpose {
+            InputPurpose::Guide(target) => (
+                " Guide ",
+                target.agent_name(),
+                " · active ",
+                "What should this agent adjust, inspect, or prioritize?",
+            ),
+            InputPurpose::Continue(_) => (
+                " Continue ",
+                "main conversation",
+                " · next turn ",
+                "What should the conversation continue or change?",
+            ),
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Line::from(vec![
                 Span::styled(
-                    " Guide ",
+                    title,
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(&self.agent_name, Style::default().fg(theme.fg)),
-                Span::styled(" · active ", Style::default().fg(theme.success)),
+                Span::styled(name, Style::default().fg(theme.fg)),
+                Span::styled(state, Style::default().fg(theme.success)),
             ]));
         block.render(area, buf);
 
@@ -117,7 +141,7 @@ impl BottomPaneView for AgentGuideView {
             buf.set_string(
                 input_area.x,
                 input_area.y,
-                "What should this agent adjust, inspect, or prioritize?",
+                placeholder,
                 Style::default().fg(theme.dim),
             );
         } else {
@@ -189,7 +213,7 @@ impl BottomPaneView for AgentGuideView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("Enter send · Shift+Enter newline · Esc back".into())
+        Some("Enter send · Shift+Enter newline · Esc cancel".into())
     }
 
     fn take_action_request(&mut self) -> Option<ViewActionRequest> {
@@ -208,46 +232,44 @@ mod tests {
 
     #[test]
     fn submit_is_typed_and_does_not_expose_run_identity_as_text() {
-        let target = crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
-            run_id: "run-7".into(),
-        };
-        let mut view = AgentGuideView::new(
-            "agent-1".into(),
+        let target = crate::tui::event_loop::AgentGuideTarget::capture(
             "Reviewer".into(),
             "run-7".into(),
-            target.clone(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "run-7".into(),
+            },
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            Some("session".into()),
+            0,
         );
+        let mut view = AgentGuideView::new(target.clone());
         assert!(view.handle_paste("inspect the failing test"));
         view.handle_key(key(KeyCode::Enter));
         assert!(matches!(
             view.take_action_request(),
             Some(ViewActionRequest {
                 action: BottomPaneViewAction::SubmitAgentGuide {
-                    agent_id,
-                    agent_name,
-                    run_id,
                     target: submitted_target,
                     content,
                 },
                 disposition: ViewActionDisposition::Close,
-            }) if agent_id == "agent-1"
-                && agent_name == "Reviewer"
-                && run_id == "run-7"
-                && submitted_target == target
+            }) if submitted_target == target
                 && content == "inspect the failing test"
         ));
     }
 
     #[test]
     fn empty_submit_keeps_view_open_and_paste_stays_in_focused_input() {
-        let mut view = AgentGuideView::new(
-            "agent-1".into(),
+        let mut view = AgentGuideView::new(crate::tui::event_loop::AgentGuideTarget::capture(
             "Reviewer".into(),
             "run-7".into(),
             crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
                 agent_id: "agent-1".into(),
             },
-        );
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            Some("session".into()),
+            0,
+        ));
         view.handle_key(key(KeyCode::Enter));
         assert!(view.take_action_request().is_none());
         assert!(!view.is_complete());

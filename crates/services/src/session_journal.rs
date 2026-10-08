@@ -633,6 +633,16 @@ fn open_unlocked_journal_file_with_creation(path: &Path) -> std::io::Result<Open
 fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     for event in events {
+        let redacted_event = if matches!(&event.event_type, JournalEventType::AgentTerminated)
+            && journal_content_redact_enabled()
+        {
+            let mut redacted = event.clone();
+            redact_agent_terminated_content(&mut redacted);
+            Some(redacted)
+        } else {
+            None
+        };
+        let event = redacted_event.as_ref().unwrap_or(event);
         let mut line = serde_json::to_vec(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
@@ -651,6 +661,48 @@ fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>>
         buf.extend(line);
     }
     Ok(buf)
+}
+
+fn redact_agent_terminated_content(event: &mut JournalEvent) {
+    let Some(metadata) = event
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    if let Some(full_text) = metadata.get_mut("full_text") {
+        redact_journal_value(full_text);
+    }
+    if let Some(intents) = metadata.get_mut("applied_user_intents") {
+        match intents {
+            serde_json::Value::Array(intents) => {
+                for intent in intents {
+                    if let Some(content) = intent
+                        .as_object_mut()
+                        .and_then(|fields| fields.get_mut("content"))
+                    {
+                        redact_journal_value(content);
+                    } else if !intent.is_object() {
+                        redact_journal_value(intent);
+                    }
+                }
+            }
+            intents => redact_journal_value(intents),
+        }
+    }
+}
+
+fn redact_journal_value(value: &mut serde_json::Value) {
+    if let Some(raw) = value.as_str() {
+        if !is_journal_content_marker(raw) {
+            *value = serde_json::Value::String(journal_content_marker(raw));
+        }
+    } else {
+        let raw = value.to_string();
+        *value = serde_json::Value::String(journal_content_marker(&raw));
+    }
 }
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {
@@ -855,6 +907,17 @@ pub struct ToolResultArtifactDescriptor {
     pub content_sha256: String,
 }
 
+/// Runtime-only semantic receipt for the lifecycle decision made by
+/// `start_work`. It is captured before the model/journal presentation can be
+/// replaced by an artifact reference; the provider call id remains the
+/// invocation identity on [`ToolCallRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeWorkEstablishmentReceipt {
+    Started,
+    Continued,
+    Deferred { operation_id: String },
+}
+
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -942,6 +1005,12 @@ pub struct ToolCallRecord {
     /// feedback.
     #[serde(skip)]
     pub runtime_model_result_full: Option<String>,
+    /// Semantic `start_work` outcome captured before artifact presentation.
+    /// This is live reconciliation authority, not journal data or model
+    /// context; the exact call identity and executed disposition are checked
+    /// separately before it can settle an establishment.
+    #[serde(skip)]
+    pub runtime_work_establishment_receipt: Option<RuntimeWorkEstablishmentReceipt>,
     /// Full tool result text (untruncated, after per-tool output limit).
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6717,6 +6786,27 @@ pub fn journal_content_marker(raw: &str) -> String {
     format!("<redacted: len={} sha={:016x}>", raw.len(), h.finish())
 }
 
+/// Returns true only for the exact privacy marker emitted by
+/// [`journal_content_marker`]. A marker is evidence that source content was
+/// deliberately omitted, not a recoverable transcript value.
+pub fn is_journal_content_marker(value: &str) -> bool {
+    let Some(payload) = value
+        .strip_prefix("<redacted: len=")
+        .and_then(|value| value.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let Some((length, digest)) = payload.split_once(" sha=") else {
+        return false;
+    };
+    !length.is_empty()
+        && length.bytes().all(|byte| byte.is_ascii_digit())
+        && digest.len() == 16
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 // ═══════════════════════════ Session Lifecycle ════════════════════════════
 
 /// Result of a single session lifecycle maintenance run.
@@ -9830,9 +9920,17 @@ mod tests {
         let a = journal_content_marker("hello world");
         let b = journal_content_marker("hello world");
         assert_eq!(a, b);
+        assert!(is_journal_content_marker(&a));
         assert!(a.starts_with("<redacted: len=11 sha="));
         assert!(a.ends_with('>'));
         assert!(!a.contains("hello"));
+        for not_marker in [
+            "<redacted: len=11 sha=123>",
+            "<redacted: len=11 sha=0123456789ABCDEF>",
+            "assistant output",
+        ] {
+            assert!(!is_journal_content_marker(not_marker));
+        }
         assert_ne!(
             journal_content_marker("hello"),
             journal_content_marker("world")
@@ -9966,6 +10064,57 @@ mod tests {
         assert!(!user.contains("secret query"));
         assert!(user.starts_with("<redacted:"));
         assert_eq!(evt.error.as_deref(), Some("boom"));
+
+        // The terminal producer appends these fields after constructing the
+        // typed event. The journal writer is the storage boundary, so raw
+        // child output and applied guidance must still be redacted there.
+        let tmp = tempdir().unwrap();
+        let _journal_dir = JournalDirGuard::new(tmp.path());
+        let session_id = "redacted-child-terminal";
+        let writer = JournalWriter::new(session_id).unwrap();
+        let mut terminal = JournalEvent::agent_terminated(
+            Some(session_id),
+            "child-1",
+            "run-1",
+            "task",
+            "completed",
+            Some("normal"),
+            Some(1),
+            2,
+            100,
+            20,
+            300,
+            None,
+        );
+        terminal.metadata.as_mut().unwrap()["full_text"] =
+            serde_json::json!("private child result");
+        terminal.metadata.as_mut().unwrap()["applied_user_intents"] = serde_json::json!([{
+            "intent_id": "intent-1",
+            "delivery": "guide_current_run",
+            "status": "applied",
+            "event_index": 3,
+            "content": "private user guidance"
+        }]);
+        writer.append(&terminal).unwrap();
+        let persisted = std::fs::read_to_string(writer.path()).unwrap();
+        assert!(!persisted.contains("private child result"));
+        assert!(!persisted.contains("private user guidance"));
+        let terminal = read_journal_append_order(session_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == JournalEventType::AgentTerminated)
+            .expect("terminal event is durably readable");
+        let metadata = terminal.metadata.unwrap();
+        assert!(is_journal_content_marker(
+            metadata["full_text"].as_str().unwrap()
+        ));
+        assert!(is_journal_content_marker(
+            metadata["applied_user_intents"][0]["content"]
+                .as_str()
+                .unwrap()
+        ));
+        assert_eq!(metadata["run_id"], "run-1");
+        assert_eq!(metadata["status"], "completed");
 
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
     }

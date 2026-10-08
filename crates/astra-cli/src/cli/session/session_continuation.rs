@@ -8,7 +8,6 @@ use serde_json::Value;
 #[derive(Debug)]
 pub(crate) struct SessionContinuation {
     pub(crate) completed_turn_count: Option<u32>,
-    pub(crate) agent_profile_selection: Option<astra_turn_types::AgentProfileSelection>,
     pub(crate) messages: Vec<Value>,
     pub(crate) deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     pub(crate) active_conversation: astra_turn_core::active_conversation::ActiveConversation,
@@ -121,9 +120,6 @@ pub(crate) fn continuation_from_resume_bundle(
         repair_actions,
         projections,
     } = bundle;
-    let agent_profile_selection = projections
-        .provider_at(&cursor)
-        .and_then(|provider| provider.agent_profile_selection.clone());
     let projection_activation = projections
         .activation_at(&cursor)
         .into_iter()
@@ -165,7 +161,6 @@ pub(crate) fn continuation_from_resume_bundle(
         .ok()?;
     Some(SessionContinuation {
         completed_turn_count: Some(cursor.completed_turn),
-        agent_profile_selection,
         deferred_tool_activations: continuation_deferred_tool_activations(
             &messages,
             projection_activation,
@@ -266,7 +261,6 @@ pub(crate) fn load_session_continuation_for_recovery(
             )?;
             return Some(SessionContinuation {
                 completed_turn_count: Some(active_conversation.cursor().completed_turn),
-                agent_profile_selection: None,
                 deferred_tool_activations,
                 messages,
                 active_conversation,
@@ -356,7 +350,6 @@ pub(crate) fn load_session_continuation_for_recovery(
                 )?;
                 Some(SessionContinuation {
                     completed_turn_count: Some(cursor.completed_turn),
-                    agent_profile_selection: None,
                     deferred_tool_activations,
                     active_conversation,
                     messages,
@@ -554,7 +547,6 @@ pub(crate) fn load_csl_continuation(
     .ok_or_else(|| format!("failed to select CSL continuation for session {session_id}"))?;
     Ok((!messages.is_empty()).then_some(SessionContinuation {
         completed_turn_count: Some(cursor.completed_turn),
-        agent_profile_selection: None,
         active_conversation,
         deferred_tool_activations,
         messages,

@@ -64,6 +64,10 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
             optional: false, ..
         }
         | Criterion::SessionChildResultAdopted { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. }
+        | Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildCount { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalToolCalled {
             optional: false, ..

@@ -417,7 +417,32 @@ pub(crate) enum PreparedTurnIteration {
 /// pause-control wait primitive for both turn preparation and provider
 /// boundaries: local flags give prompt same-pod wakeups while the bounded
 /// durable poll preserves correct cross-pod resume/cancel behavior.
-pub(crate) async fn wait_for_pause_clear_or_cancel(state: &mut AgenticLoopState) -> bool {
+pub(crate) async fn wait_for_pause_clear_or_cancel<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Result<bool, astra_core::ClassifiedError> {
+    if !state
+        .cancellation
+        .pause_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return Ok(false);
+    }
+    match host.execution_time_budget_remaining() {
+        Some(budget) => tokio::time::timeout(budget.total_remaining, wait_for_pause_control(state))
+            .await
+            .map_err(|_| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::BudgetExhausted,
+                    "execution deadline expired while paused",
+                )
+            }),
+        None => Ok(wait_for_pause_control(state).await),
+    }
+}
+
+async fn wait_for_pause_control(state: &mut AgenticLoopState) -> bool {
     let mut last_db_poll = tokio::time::Instant::now();
     while state
         .cancellation
@@ -3638,7 +3663,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // recursive `Box::pin(prepare_turn_iteration(...)).await` which
     // would stack-overflow during long pause windows.
     loop {
-        if wait_for_pause_clear_or_cancel(state).await {
+        if wait_for_pause_clear_or_cancel(host, state).await? {
             let origin = resolve_cancellation_origin(state).await;
             return Ok(finish_cancellation(host, state, origin).await);
         }

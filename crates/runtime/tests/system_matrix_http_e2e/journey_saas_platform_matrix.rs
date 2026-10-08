@@ -1354,11 +1354,6 @@ pub async fn run_saas_skills_cross_user_isolation() {
     ctx.close().await;
 }
 
-/// Team isolation — delegates to shared journey (§5.4).
-pub async fn run_saas_team_cross_user_isolation() {
-    super::journey_team_isolation_matrix::run_team_cross_user_isolation().await;
-}
-
 /// GET /chat/runs/{id}/projection after POST /chat (§4.3).
 pub async fn run_saas_run_projection_smoke() {
     let b = bootstrap().await;

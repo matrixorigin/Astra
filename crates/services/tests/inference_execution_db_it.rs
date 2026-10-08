@@ -861,7 +861,7 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
             .await
             .expect("join recovery")
             .expect("recover rollback"),
-        InferenceInvocationAdmissionResolution::Settled
+        (InferenceInvocationAdmissionResolution::Settled, None)
     );
 
     let atomic = sqlx::query(
@@ -939,7 +939,7 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
         settle_uncertain_inference_admission(&shared_pool, &unknown_plan, &terminal)
             .await
             .expect("strengthen generic debt to pre-delivery"),
-        InferenceInvocationAdmissionResolution::Settled
+        (InferenceInvocationAdmissionResolution::Settled, None)
     );
     let strengthened_delivery_state = sqlx::query_scalar::<_, String>(
         "SELECT provider_delivery_state
@@ -959,7 +959,10 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
         settle_uncertain_inference_admission(&shared_pool, &conflicting, &terminal)
             .await
             .expect("classify competing admission owner"),
-        InferenceInvocationAdmissionResolution::ConflictingIdentity
+        (
+            InferenceInvocationAdmissionResolution::ConflictingIdentity,
+            None
+        )
     );
     let debt_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM inference_invocation_settlement_debts
@@ -4353,13 +4356,22 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
         .await
         .unwrap();
     append_run_control_event(pool, &user_id, &session_id, &run_id, 1, "user_intent").await;
-    for plan in [&missing, &admitted] {
+    for (plan, resolution) in [
+        (
+            &missing,
+            InferenceInvocationAdmissionResolution::ScopeUnavailable,
+        ),
+        (&admitted, InferenceInvocationAdmissionResolution::Settled),
+    ] {
         for _ in 0..2 {
             assert_eq!(
                 settle_uncertain_inference_admission(&shared_pool, plan, &recovery_terminal)
                     .await
                     .unwrap(),
-                InferenceInvocationAdmissionResolution::GuidancePending
+                (
+                    resolution,
+                    Some(astra_services::InferenceScopeRejection::GuidancePending)
+                )
             );
         }
     }
@@ -4440,7 +4452,10 @@ async fn uncertain_admission_rejects_a_different_terminal_fingerprint_without_pr
         settle_uncertain_inference_admission(&shared_pool, &plan, &recovery_terminal)
             .await
             .expect("classify different terminal fingerprint"),
-        InferenceInvocationAdmissionResolution::ConflictingIdentity
+        (
+            InferenceInvocationAdmissionResolution::ConflictingIdentity,
+            None
+        )
     );
     let attempt_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inference_provider_attempts

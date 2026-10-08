@@ -118,6 +118,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
@@ -160,6 +161,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
@@ -213,6 +215,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();

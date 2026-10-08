@@ -256,7 +256,7 @@ impl AgentProfile {
     ///
     /// The runtime remains the final authority for effective permissions; this
     /// check only rejects malformed profile bounds before they become part of
-    /// a registry or Team execution snapshot.
+    /// an execution registry.
     pub fn validate_capability_bounds(&self) -> Result<(), String> {
         if self.agent_id.trim().is_empty() {
             return Err("agent profile agent_id must not be empty".to_string());

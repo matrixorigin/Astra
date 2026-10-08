@@ -284,6 +284,8 @@ pub(crate) struct AgentTranscriptView {
     /// live/durable item reconciliation: until both lanes share an item id,
     /// the view must not erase output based on equal text.
     terminal_refresh_requested: bool,
+    local_root_live: Option<super::root_transcript_view::LocalLiveItem>,
+    root_refresh_pending: bool,
     /// The transcript projection is built for the same viewport that opened
     /// it. A delegated run is a first-class conversation, not a compact task
     /// detail panel with a different layout budget than another run.
@@ -337,6 +339,8 @@ impl AgentTranscriptView {
             live: LiveTranscript::default(),
             pending_transcript_commit: None,
             terminal_refresh_requested: false,
+            local_root_live: None,
+            root_refresh_pending: false,
             viewport_width,
             completed: false,
             reopen: Some(reopen.into()),
@@ -345,6 +349,8 @@ impl AgentTranscriptView {
             export_pending: false,
             export_seen_cursors: std::collections::HashSet::new(),
         };
+        view.transcript
+            .set_activity_status(Some("Syncing durable agent history…".into()));
         view.rebuild_transcript();
         view
     }
@@ -383,6 +389,8 @@ impl AgentTranscriptView {
             live: LiveTranscript::default(),
             pending_transcript_commit: None,
             terminal_refresh_requested: false,
+            local_root_live: None,
+            root_refresh_pending: false,
             viewport_width,
             completed: false,
             reopen: Some(reopen.into()),
@@ -508,6 +516,13 @@ impl AgentTranscriptView {
         }
         self.next_before_seq = page.next_before_seq;
         self.has_more = page.has_more;
+        if self
+            .local_root_live
+            .as_ref()
+            .is_some_and(|live| live.is_represented(&self.items))
+        {
+            self.local_root_live = None;
+        }
         self.loading = false;
         self.error = None;
         self.transcript
@@ -546,7 +561,10 @@ impl AgentTranscriptView {
             self.request_load(None);
         }
         self.rebuild_transcript();
-        if self.export_pending {
+        if self.root_refresh_pending {
+            self.root_refresh_pending = false;
+            self.request_load(None);
+        } else if self.export_pending {
             self.continue_export();
         }
     }
@@ -616,7 +634,7 @@ impl AgentTranscriptView {
     }
 
     fn transcript_snapshot(&self) -> TranscriptSnapshot {
-        if self.items.is_empty() && self.live.is_empty() {
+        if self.items.is_empty() && self.live.is_empty() && self.local_root_live.is_none() {
             let message = if self.loading {
                 "Loading durable conversation…"
             } else if let Some(error) = self.error.as_deref() {
@@ -648,6 +666,16 @@ impl AgentTranscriptView {
 
         let mut projected = durable_transcript_items(&self.items);
         self.append_live_projection(&mut projected);
+        if let Some(live) = &self.local_root_live {
+            projected.push(TranscriptItem::rendered(
+                TranscriptItemId::from_widget_id(u64::MAX - 1),
+                vec![Line::from(
+                    "Live local projection · awaiting durable reconciliation",
+                )],
+                0,
+            ));
+            projected.push(live.item.clone());
+        }
         TranscriptSnapshot::new(projected)
     }
 
@@ -743,7 +771,7 @@ impl AgentTranscriptView {
         if event.run_id.trim().is_empty() {
             return false;
         }
-        if event.agent_id != self.agent_id {
+        if self.run_id.trim().is_empty() && event.agent_id != self.agent_id {
             let launched_from_this_view = matches!(
                 &event.kind,
                 AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
@@ -1038,6 +1066,26 @@ fn transcript_evidence_kind(
     }
 }
 
+fn tool_display_content(item: &astra_thin_client::SessionTranscriptItem, compact: bool) -> String {
+    let mut content = if compact {
+        crate::tui::agent_control_status::compact_delegation_result(
+            item.tool_result
+                .as_ref()
+                .and_then(|result| result.status.as_deref()),
+            Some(&item.content),
+        )
+    } else {
+        item.content.clone()
+    };
+    if let Some(result) = &item.tool_result {
+        astra_turn_core::tool::result::advisory::append_display_guidance(
+            &mut content,
+            &result.runtime_advisories,
+        );
+    }
+    content
+}
+
 /// Render durable conversation items for any root or delegated run through
 /// the shared transcript browser. Identity comes from the typed item envelope;
 /// this projection never compares visible text to reconcile records.
@@ -1162,7 +1210,8 @@ pub(crate) fn durable_transcript_items(
                                     }
                                 })
                             },
-                            delegation.is_none().then(|| result_item.content.clone()),
+                            (delegation.is_none() || !result.runtime_advisories.is_empty())
+                                .then(|| tool_display_content(result_item, delegation.is_some())),
                         );
                     }
                     let component = if call.tool_use_id.is_empty() {
@@ -1219,7 +1268,10 @@ pub(crate) fn durable_transcript_items(
                     } else {
                         item.content.lines().next().map(ToString::to_string)
                     },
-                    (!delegation && !unresolved_carrier).then(|| item.content.clone()),
+                    (!unresolved_carrier
+                        && (!delegation
+                            || result.is_some_and(|result| !result.runtime_advisories.is_empty())))
+                    .then(|| tool_display_content(item, delegation)),
                 );
                 projected.push(TranscriptItem::tool(id, cell, 1));
             }
@@ -1262,13 +1314,18 @@ impl BottomPaneView for AgentTranscriptView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.transcript.is_search_active() {
+            self.transcript.handle_key(key);
+            return;
+        }
         match key.code {
-            KeyCode::Left if self.transcript.is_search_active() => self.transcript.handle_key(key),
-            KeyCode::Left if !self.transcript.collapse_current_item() => {
-                self.pending_action = Some(ViewActionRequest {
-                    action: self.return_action.clone(),
-                    disposition: ViewActionDisposition::KeepOpen,
-                });
+            KeyCode::Left => {
+                if !self.transcript.collapse_current_item() {
+                    self.pending_action = Some(ViewActionRequest {
+                        action: self.return_action.clone(),
+                        disposition: ViewActionDisposition::KeepOpen,
+                    });
+                }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.pending_action = Some(ViewActionRequest {
@@ -1303,6 +1360,61 @@ impl BottomPaneView for AgentTranscriptView {
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         self.transcript.on_ctrl_c()
+    }
+
+    fn refresh_root_transcript_live(
+        &mut self,
+        binding: Option<(&str, &str)>,
+        item: Option<TranscriptItem>,
+    ) -> bool {
+        let Some((session_id, run_id)) = binding else {
+            return false;
+        };
+        if self.session_id.as_deref() != Some(session_id)
+            || self.run_id != run_id
+            || self.transcript_target
+                != Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer)
+        {
+            return false;
+        }
+        match (item, self.local_root_live.as_mut()) {
+            (Some(item), _) => {
+                let settled = item.is_settled_tool();
+                self.local_root_live =
+                    Some(super::root_transcript_view::LocalLiveItem { item, settled });
+                if !settled {
+                    self.terminal_refresh_requested = false;
+                } else if !self.terminal_refresh_requested {
+                    self.terminal_refresh_requested = true;
+                    if self.loading {
+                        self.root_refresh_pending = true;
+                    } else {
+                        self.request_load(None);
+                    }
+                }
+            }
+            (None, Some(live)) if !live.settled => {
+                live.settled = true;
+                if !self.terminal_refresh_requested {
+                    self.terminal_refresh_requested = true;
+                    if self.loading {
+                        self.root_refresh_pending = true;
+                    } else {
+                        self.request_load(None);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        if self
+            .local_root_live
+            .as_ref()
+            .is_some_and(|live| live.is_represented(&self.items))
+        {
+            self.local_root_live = None;
+        }
+        self.rebuild_transcript();
+        true
     }
 
     fn refresh_agent_transcript(&mut self, update: AgentTranscriptUpdate) -> bool {
@@ -1344,6 +1456,10 @@ impl BottomPaneView for AgentTranscriptView {
                 self.transcript
                     .set_activity_status(Some(status.to_string()));
                 self.rebuild_transcript();
+                if self.root_refresh_pending {
+                    self.root_refresh_pending = false;
+                    self.request_load(None);
+                }
             }
             _ => return false,
         }
@@ -1357,15 +1473,19 @@ impl BottomPaneView for AgentTranscriptView {
         let mut changed = false;
         let pending_tool_call_id = self.agent_id.strip_prefix("pending:");
         let matched_row = snapshot.rows.iter().find(|row| {
-            row.agent_id == self.agent_id
-                || pending_tool_call_id.is_some_and(|tool_call_id| {
-                    row.spawn_tool_call_id.as_deref() == Some(tool_call_id)
-                })
+            if self.run_id.trim().is_empty() {
+                row.agent_id == self.agent_id
+                    || pending_tool_call_id.is_some_and(|tool_call_id| {
+                        row.spawn_tool_call_id.as_deref() == Some(tool_call_id)
+                    })
+            } else {
+                row.run_id.as_deref() == Some(self.run_id.as_str())
+            }
         });
         let Some(row) = matched_row else {
             return false;
         };
-        if row.agent_id != self.agent_id {
+        if self.run_id.trim().is_empty() && row.agent_id != self.agent_id {
             self.agent_id = row.agent_id.clone();
             self.agent_name = row.name.clone();
             self.error = None;
@@ -1410,7 +1530,7 @@ impl BottomPaneView for AgentTranscriptView {
     }
 
     fn has_pending_agent_transcript_identity(&self) -> bool {
-        self.run_id.trim().is_empty() || self.agent_id.starts_with("pending:")
+        self.run_id.trim().is_empty()
     }
 
     fn refresh_agent_live_event(&mut self, event: &AgentLiveEvent) -> bool {
@@ -1438,9 +1558,11 @@ impl BottomPaneView for AgentTranscriptView {
             ),
             None,
         );
-        self.transcript.set_activity_status(Some(
-            "Live activity incomplete · R refresh durable history".to_string(),
-        ));
+        if !self.loading {
+            self.transcript.set_activity_status(Some(
+                "Live activity incomplete · R refresh durable history".to_string(),
+            ));
+        }
         self.rebuild_transcript();
         true
     }
@@ -1510,6 +1632,84 @@ mod tests {
         crate::tui::testing::render::buffer_to_string(&buffer)
     }
 
+    #[test]
+    fn root_terminal_racing_initial_page_preserves_live_output_and_refreshes_once() {
+        for initial_read_fails in [false, true] {
+            let mut view = AgentTranscriptView::loading(
+                "root".into(),
+                "Main conversation".into(),
+                "session-1".into(),
+                "root".into(),
+                crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+                "agents",
+                80,
+                24,
+            );
+            let mut cell =
+                crate::tui::history_cell::assistant::AssistantCell::from_markdown("root_live_body");
+            cell.model_item_id = Some("root-model-item".into());
+            let item = TranscriptItem::committed(
+                TranscriptItemId::from_widget_id(1),
+                std::sync::Arc::new(cell),
+                0,
+            );
+            assert!(view.refresh_root_transcript_live(Some(("session-1", "root")), Some(item)));
+            assert!(
+                view.take_action_request().is_none(),
+                "token projection does not fetch"
+            );
+            assert!(!view.refresh_root_transcript_live(None, None));
+            assert!(!view.refresh_root_transcript_live(Some(("other-session", "root")), None));
+            assert!(!view.refresh_root_transcript_live(Some(("session-1", "other-root")), None));
+            assert!(view.refresh_root_transcript_live(Some(("session-1", "root")), None));
+            assert!(view.root_refresh_pending);
+            assert!(view.take_action_request().is_none());
+            let update = if initial_read_fails {
+                AgentTranscriptUpdate::Failed {
+                    agent_id: "root".into(),
+                    run_id: "root".into(),
+                    message: "initial read failed".into(),
+                }
+            } else {
+                let mut empty = page();
+                empty.items.clear();
+                AgentTranscriptUpdate::Loaded {
+                    agent_id: "root".into(),
+                    run_id: "root".into(),
+                    page: empty,
+                    replace: true,
+                    source: AgentTranscriptSource::DurableServer,
+                }
+            };
+            assert!(view.refresh_agent_transcript(update));
+            assert!(
+                matches!(view.take_action_request(), Some(ViewActionRequest { action: BottomPaneViewAction::LoadAgentTranscript { run_id, before_seq: None, .. }, .. }) if run_id == "root")
+            );
+            assert!(view.take_action_request().is_none());
+            assert!(rendered(&view).contains("root_live_body"));
+            view.refresh_agent_transcript(AgentTranscriptUpdate::Failed {
+                agent_id: "root".into(),
+                run_id: "root".into(),
+                message: "terminal read failed".into(),
+            });
+            assert!(view.take_action_request().is_none());
+            assert!(rendered(&view).contains("root_live_body"));
+            let mut durable = page();
+            durable.items[0].run_id = Some("root".into());
+            durable.items[0].model_item_id = Some("root-model-item".into());
+            durable.items[0].content = "root_live_body".into();
+            view.refresh_agent_transcript(AgentTranscriptUpdate::Loaded {
+                agent_id: "root".into(),
+                run_id: "root".into(),
+                page: durable,
+                replace: true,
+                source: AgentTranscriptSource::DurableServer,
+            });
+            assert!(view.local_root_live.is_none());
+            assert_eq!(rendered(&view).matches("root_live_body").count(), 1);
+        }
+    }
+
     fn page() -> astra_thin_client::SessionTranscriptPage {
         astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
@@ -1564,6 +1764,7 @@ mod tests {
         transcript_target: crate::tui::agent_run_projection::AgentTranscriptTarget,
     ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentRow {
         crate::tui::bottom_pane::in_flight_agents_view::AgentRow {
+            kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
             agent_id: "agent-1".into(),
             name: "Reviewer".into(),
             spawn_tool_call_id: None,
@@ -1599,6 +1800,45 @@ mod tests {
     }
 
     #[test]
+    fn durable_tool_guidance_is_rendered_without_mutating_result_evidence() {
+        let mut item = page().items.remove(0);
+        item.role = "tool".into();
+        item.tool_calls.clear();
+        item.content = r#"{"value":42}"#.into();
+        item.tool_result = Some(astra_thin_client::SessionTranscriptToolResult {
+            tool_use_id: "call".into(),
+            name: Some("read_file".into()),
+            status: Some("completed".into()),
+            duration_ms: None,
+            runtime_advisories: vec!["Read the remaining lines if needed.".into()],
+        });
+        let display = tool_display_content(&item, false);
+        assert_eq!(display, tool_display_content(&item, false));
+        let view = TranscriptView::from_snapshot(
+            TranscriptSnapshot::new(durable_transcript_items(std::slice::from_ref(&item))),
+            24,
+            100,
+        );
+        let rendered = view.export_plain_lines().join("\n");
+        assert!(
+            rendered.contains("Read the remaining lines if needed."),
+            "{rendered}"
+        );
+        assert_eq!(
+            display
+                .matches("Read the remaining lines if needed.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&item.content).unwrap()["value"],
+            42
+        );
+        item.content = "Literal [Runtime tool guidance] from the tool".into();
+        assert!(tool_display_content(&item, false).starts_with(&item.content));
+    }
+
+    #[test]
     fn durable_tool_pairing_is_run_scoped_and_handles_local_observations() {
         let mut observed = page().items.remove(0);
         observed.item_seq = 1;
@@ -1612,6 +1852,7 @@ mod tests {
             arguments: r#"{"path":"a.txt"}"#.into(),
         }];
         observed.tool_result = Some(astra_thin_client::SessionTranscriptToolResult {
+            runtime_advisories: vec![],
             tool_use_id: "same-call".into(),
             name: Some("write_file".into()),
             status: Some("completed".into()),
@@ -1672,14 +1913,25 @@ mod tests {
                 name: "agent".into(),
                 arguments: r#"{"action":"spawn","prompt":"private child instructions"}"#.into(),
             });
-        let mut result = item(2, "tool", "private child result");
+        let mut result = item(2, "tool", r#"{"result":"private child result"}"#);
         result.tool_result = Some(astra_thin_client::SessionTranscriptToolResult {
+            runtime_advisories: vec!["Check the member status before continuing.".into()],
             tool_use_id: "spawn-1".into(),
             name: Some("agent".into()),
             status: Some("launched".into()),
             duration_ms: Some(12),
         });
         let result_only = result.clone();
+        assert_eq!(
+            tool_display_content(&result, true)
+                .matches("private child result")
+                .count(),
+            0
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content).unwrap()["result"],
+            "private child result"
+        );
         view.apply_page(
             astra_thin_client::SessionTranscriptPage {
                 session_id: "session-1".into(),
@@ -1694,6 +1946,20 @@ mod tests {
         assert!(output.contains("Agent spawn"), "{output}");
         assert!(!output.contains("private child instructions"), "{output}");
         assert!(!output.contains("private child result"), "{output}");
+        let detailed = view.transcript.export_plain_lines().join("\n");
+        assert!(
+            !detailed.contains("private child instructions"),
+            "{detailed}"
+        );
+        assert!(!detailed.contains("private child result"), "{detailed}");
+        assert_eq!(
+            view.transcript
+                .export_plain_lines()
+                .join("\n")
+                .matches("Check the member status before continuing.")
+                .count(),
+            1
+        );
 
         // A page boundary can leave the result without its initiating call.
         view.apply_page(
@@ -1707,6 +1973,20 @@ mod tests {
             AgentTranscriptSource::DurableServer,
         );
         assert!(!rendered(&view).contains("private child result"));
+        let detailed = view.transcript.export_plain_lines().join("\n");
+        assert!(
+            !detailed.contains("private child instructions"),
+            "{detailed}"
+        );
+        assert!(!detailed.contains("private child result"), "{detailed}");
+        assert_eq!(
+            view.transcript
+                .export_plain_lines()
+                .join("\n")
+                .matches("Check the member status before continuing.")
+                .count(),
+            1
+        );
 
         let mut deferred = item(3, "assistant", "");
         deferred.tool_calls.push(astra_thin_client::SessionTranscriptToolCall {
@@ -1716,6 +1996,7 @@ mod tests {
         });
         let mut deferred_result = item(4, "tool", "private deferred result");
         deferred_result.tool_result = Some(astra_thin_client::SessionTranscriptToolResult {
+            runtime_advisories: vec![],
             tool_use_id: "deferred-spawn".into(),
             name: Some("invoke_tool".into()),
             status: Some("launched".into()),
@@ -1741,6 +2022,7 @@ mod tests {
 
         let mut orphan = item(5, "tool", "private orphaned deferred result");
         orphan.tool_result = Some(astra_thin_client::SessionTranscriptToolResult {
+            runtime_advisories: vec![],
             tool_use_id: "unknown-deferred".into(),
             name: Some("invoke_tool".into()),
             status: Some("success".into()),
@@ -1809,6 +2091,7 @@ mod tests {
             "left first collapses the selected detail"
         );
         assert!(!rendered(&view).contains("Inspect state ownership"));
+        assert!(view.take_action_request().is_none());
         view.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(
@@ -1816,11 +2099,32 @@ mod tests {
             "left while typing a transcript search must not leave the agent conversation"
         );
         assert!(view.cursor_pos(Rect::new(0, 0, 80, 20)).is_some());
+        for ch in "qros".chars() {
+            view.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(rendered(&view).contains("Search: /qros"));
+        assert!(view.take_action_request().is_none());
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!view.transcript.is_search_active());
+        assert!(!view.is_complete());
+        assert!(view.take_action_request().is_none());
     }
 
     #[test]
     fn agent_refresh_keeps_confirmed_history_and_reports_sync_progress_or_failure() {
         let mut view = loading_view(80, 24);
+        assert!(
+            view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-child".into(),
+                agent_id: "agent-1".into(),
+                dropped_event_count: 2,
+            })
+        );
+        let initial = rendered(&view);
+        assert!(
+            initial.contains("Syncing durable agent history…"),
+            "{initial}"
+        );
         view.apply_page(page(), true, AgentTranscriptSource::DurableServer);
 
         view.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
@@ -2407,6 +2711,7 @@ mod tests {
                         reasoning_status: None,
                         tool_calls: Vec::new(),
                         tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
+                            runtime_advisories: vec![],
                             tool_use_id: "tool-1".into(),
                             name: Some("read_file".into()),
                             status: Some("success".into()),
@@ -2926,6 +3231,7 @@ mod tests {
                         reasoning_status: None,
                         tool_calls: Vec::new(),
                         tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
+                            runtime_advisories: vec![],
                             tool_use_id: "call-1".into(),
                             name: Some("read_file".into()),
                             status: Some("success".into()),

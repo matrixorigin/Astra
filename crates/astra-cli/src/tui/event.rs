@@ -28,6 +28,11 @@ pub(crate) enum TuiEvent {
     /// into the composer would turn presentation bytes into a control
     /// protocol and could collide with real user input.
     RuntimeNotificationTurn,
+    /// Literal, owner-bound next-turn input; never a composer key event.
+    SessionContinuation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        content: String,
+    },
 }
 
 pub(crate) struct TuiEventStream {

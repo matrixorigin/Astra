@@ -40,11 +40,6 @@ mod journey_session_artifacts_matrix;
 mod journey_session_http_db_matrix;
 mod journey_stream_persistence;
 mod journey_tasks_runs;
-mod journey_team_crud_matrix;
-mod journey_team_data_fidelity_matrix;
-mod journey_team_http_negatives_matrix;
-mod journey_team_isolation_matrix;
-mod journey_team_snapshots_matrix;
 #[path = "../test_support.rs"]
 mod test_support;
 
@@ -253,31 +248,6 @@ matrix_test! {
     e2e_matrix_stream_failed_fanout_settles_once_without_orphaning_children, 4,
     "live MatrixOne + failing mock child LLM; structured fan-in unhappy-path gate",
     journey_stream_persistence::run_stream_failed_fanout_settles_once_without_orphaning_children
-}
-matrix_test! {
-    e2e_matrix_team_crud_and_db, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_crud_matrix::run_team_crud_db
-}
-matrix_test! {
-    e2e_matrix_team_snapshots_and_db, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_snapshots_matrix::run_team_snapshots_db
-}
-matrix_test! {
-    e2e_matrix_team_http_negative_paths, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_http_negatives_matrix::run_team_http_negative_paths
-}
-matrix_test! {
-    e2e_matrix_team_http_db_fidelity, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_data_fidelity_matrix::run_team_http_db_fidelity
-}
-matrix_test! {
-    e2e_matrix_team_cross_user_isolation, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_isolation_matrix::run_team_cross_user_isolation
 }
 matrix_test! {
     e2e_matrix_meta_health, 2,
@@ -544,11 +514,6 @@ matrix_test! {
     e2e_matrix_saas_skills_cross_user_isolation, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skills isolation",
     journey_saas_platform_matrix::run_saas_skills_cross_user_isolation
-}
-matrix_test! {
-    e2e_matrix_saas_team_cross_user_isolation, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 team isolation",
-    journey_saas_platform_matrix::run_saas_team_cross_user_isolation
 }
 matrix_test! {
     e2e_matrix_saas_run_projection_smoke, 2,

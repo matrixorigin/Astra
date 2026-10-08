@@ -39,7 +39,7 @@ use std::{
 };
 
 use super::agent_run_projection::{
-    AgentProjectionConfidence, AgentProjectionSource, AgentRunState, AgentRunStatus,
+    AgentProjectionConfidence, AgentProjectionSource, AgentRunKind, AgentRunState, AgentRunStatus,
 };
 use super::history_cell::{
     HistoryCell, assistant::AssistantCell, explain_analyze::ExplainAnalyzeCell,
@@ -88,6 +88,7 @@ pub(crate) enum UserEvent {
 /// Wire-side sources. Streaming tokens, tool lifecycle, turn end.
 #[derive(Debug, Clone)]
 pub(crate) enum WireEvent {
+    RunBound(String),
     /// Token streamed as part of the model's final reply body.
     AnswerDelta {
         model_item_id: Option<String>,
@@ -217,7 +218,15 @@ pub(crate) struct TurnStats {
 /// (assistant streaming, reasoning, single-tool execution) — these
 /// are mutually exclusive within a turn so one slot suffices.
 ///
+#[derive(Clone, Copy)]
+struct PendingAgentControl {
+    from: AgentRunState,
+    action: astra_thin_client::SessionRunAction,
+    request_id: uuid::Uuid,
+}
+
 struct AgentRunProjection {
+    kind: AgentRunKind,
     detail: Box<TaskCell>,
     label_kind: AgentRunLabelKind,
     state: AgentRunState,
@@ -239,7 +248,7 @@ struct AgentRunProjection {
     transcript_target: Option<crate::tui::agent_run_projection::AgentTranscriptTarget>,
     transcript_source: Option<AgentProjectionSource>,
     durable_event_high_watermark: Option<i64>,
-    control_requested_from: Option<AgentRunState>,
+    pending_control: Option<PendingAgentControl>,
     /// Latest structured reason why this run needs attention. This is a
     /// projection field, never a prompt-facing transcript substitute: the
     /// full event remains in the run transcript with its stable identity.
@@ -275,6 +284,7 @@ impl AgentRunProjection {
     fn new(id: String, label: String, label_kind: AgentRunLabelKind, state: AgentRunState) -> Self {
         let fallback = agent_display_name(&id, None);
         let mut projection = Self {
+            kind: AgentRunKind::Agent,
             detail: Box::new(TaskCell::new_running(id, fallback)),
             label_kind: AgentRunLabelKind::RoutingFallback,
             state,
@@ -296,7 +306,7 @@ impl AgentRunProjection {
             transcript_target: None,
             transcript_source: None,
             durable_event_high_watermark: None,
-            control_requested_from: None,
+            pending_control: None,
             attention_summary: None,
             live_transcript_events: std::collections::VecDeque::new(),
             live_transcript_bytes: 0,
@@ -320,18 +330,20 @@ impl AgentRunProjection {
                 self.state.status,
                 AgentRunStatus::Pausing | AgentRunStatus::Resuming | AgentRunStatus::Cancelling
             )
-            && let Some(requested_from) = self.control_requested_from
+            && let Some(pending) = self.pending_control
         {
-            if state.status == requested_from.status {
+            if state.status == pending.from.status {
                 // A poll that still reports the pre-request state is older
                 // than the pending local control operation. Keep the overlay
                 // until an authoritative transition or rejection arrives.
                 return false;
             }
-            self.control_requested_from = None;
         }
         if !should_accept_agent_state(self.state, state) {
             return false;
+        }
+        if state.source != AgentProjectionSource::LocalIntent {
+            self.pending_control = None;
         }
         let lifecycle_changed = self.state.status != state.status;
         self.state = state;
@@ -447,9 +459,11 @@ impl AgentRunProjection {
         self.transcript_target = Some(target);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_runtime_metadata(
         &mut self,
         source: AgentProjectionSource,
+        kind: AgentRunKind,
         run_id: String,
         parent_run_id: Option<String>,
         depth: u32,
@@ -468,9 +482,10 @@ impl AgentRunProjection {
             return;
         }
         self.metadata_source = Some(source);
+        self.kind = kind;
         self.run_id = Some(run_id);
         self.parent_run_id = parent_run_id;
-        self.depth = depth.max(1);
+        self.depth = depth;
         self.reported_child_agents = child_agents;
     }
 
@@ -520,26 +535,45 @@ impl AgentRunProjection {
         }
     }
 
-    fn begin_control(&mut self, action: astra_thin_client::SessionRunAction) -> bool {
-        if !self.available_actions.contains(&action) {
-            return false;
+    fn begin_control(&mut self, action: astra_thin_client::SessionRunAction) -> Option<uuid::Uuid> {
+        if self.pending_control.is_some()
+            || !self.state.is_actionable_active()
+            || !self.available_actions.contains(&action)
+        {
+            return None;
         }
-        if self.control_requested_from.is_none() {
-            self.control_requested_from = Some(self.state);
-        }
+        let from = self.state;
         let status = match action {
             astra_thin_client::SessionRunAction::Pause => AgentRunStatus::Pausing,
             astra_thin_client::SessionRunAction::Resume
             | astra_thin_client::SessionRunAction::ContinueSession => AgentRunStatus::Resuming,
             astra_thin_client::SessionRunAction::Cancel => AgentRunStatus::Cancelling,
         };
-        self.set_state(AgentRunState::local_intent(status))
+        if !self.set_state(AgentRunState::local_intent(status)) {
+            return None;
+        }
+        let request_id = uuid::Uuid::new_v4();
+        self.pending_control = Some(PendingAgentControl {
+            from,
+            action,
+            request_id,
+        });
+        Some(request_id)
+    }
+
+    fn available_control_actions(&self) -> &[astra_thin_client::SessionRunAction] {
+        if self.pending_control.is_some() {
+            &[]
+        } else {
+            &self.available_actions
+        }
     }
 
     fn reject_control(&mut self) -> bool {
-        let Some(mut previous) = self.control_requested_from.take() else {
+        let Some(pending) = self.pending_control.take() else {
             return false;
         };
+        let mut previous = pending.from;
         if previous.status.is_active() {
             previous.confidence = AgentProjectionConfidence::Stale;
         }
@@ -672,6 +706,7 @@ struct AgentControlBinding {
 
 #[derive(PartialEq, Eq)]
 struct AgentRunSignature {
+    kind: AgentRunKind,
     id: String,
     state: AgentRunState,
     description: String,
@@ -777,7 +812,15 @@ impl AgentRunRegistry {
     }
 
     fn ids(&self) -> Vec<String> {
-        self.order.clone()
+        self.order
+            .iter()
+            .filter(|key| {
+                self.runs
+                    .get(*key)
+                    .is_some_and(|run| run.kind == AgentRunKind::Agent)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The compact status strip represents one current work surface, not the
@@ -787,7 +830,9 @@ impl AgentRunRegistry {
         let live_group = self.order.iter().rev().find_map(|id| {
             self.runs
                 .get(id)
-                .filter(|projection| projection.state.status.is_active())
+                .filter(|projection| {
+                    projection.kind == AgentRunKind::Agent && projection.state.status.is_active()
+                })
                 .and_then(|_| self.fanout_membership.get(id))
                 .map(|fanout| fanout.group_id.as_str())
         });
@@ -808,10 +853,9 @@ impl AgentRunRegistry {
             .order
             .iter()
             .filter(|id| {
-                self.runs
-                    .get(*id)
-                    .is_some_and(|projection| projection.state.status.is_active())
-                    && !self.fanout_membership.contains_key(*id)
+                self.runs.get(*id).is_some_and(|projection| {
+                    projection.kind == AgentRunKind::Agent && projection.state.status.is_active()
+                }) && !self.fanout_membership.contains_key(*id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -836,7 +880,18 @@ impl AgentRunRegistry {
                 })
                 .cloned()
                 .collect(),
-            None => self.order.last().cloned().into_iter().collect(),
+            None => self
+                .order
+                .iter()
+                .rev()
+                .find(|key| {
+                    self.runs
+                        .get(*key)
+                        .is_some_and(|run| run.kind == AgentRunKind::Agent)
+                })
+                .cloned()
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1064,6 +1119,7 @@ impl AgentRunRegistry {
                 .iter()
                 .filter_map(|id| {
                     self.runs.get(id).map(|projection| AgentRunSignature {
+                        kind: projection.kind,
                         id: id.clone(),
                         state: projection.state,
                         description: projection.detail.description.clone(),
@@ -1083,7 +1139,7 @@ impl AgentRunRegistry {
                         fanout: self.fanout_membership.get(id).cloned(),
                         control_target: projection.control_target.clone(),
                         transcript_target: projection.transcript_target,
-                        available_actions: projection.available_actions.clone(),
+                        available_actions: projection.available_control_actions().to_vec(),
                         durable_event_high_watermark: projection.durable_event_high_watermark,
                         attention: agent_text_fingerprint(projection.attention_summary.as_deref()),
                     })
@@ -1142,6 +1198,7 @@ fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProj
     if let (Some(metadata_source), Some(run_id)) = (source_metadata_source, source_run_id) {
         target.set_runtime_metadata(
             metadata_source,
+            source.kind,
             run_id,
             source_parent_run_id,
             source_depth,
@@ -1424,23 +1481,20 @@ fn local_agent_runtime_metadata(
 
 fn append_agent_lineage_subtree(
     index: usize,
-    depth: u32,
     rows: &[crate::tui::bottom_pane::in_flight_agents_view::AgentRow],
     children: &std::collections::HashMap<usize, Vec<usize>>,
     visited: &mut std::collections::HashSet<usize>,
     ordered: &mut Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow>,
 ) {
-    let mut pending = vec![(index, depth)];
-    while let Some((index, depth)) = pending.pop() {
+    let mut pending = vec![index];
+    while let Some(index) = pending.pop() {
         if !visited.insert(index) {
             continue;
         }
-        let mut row = rows[index].clone();
-        row.depth = depth.max(1);
-        ordered.push(row);
+        ordered.push(rows[index].clone());
         if let Some(child_indices) = children.get(&index) {
             for child_index in child_indices.iter().rev() {
-                pending.push((*child_index, depth.saturating_add(1)));
+                pending.push(*child_index);
             }
         }
     }
@@ -1481,12 +1535,12 @@ fn order_agent_monitor_rows_by_lineage(
     let mut visited = std::collections::HashSet::with_capacity(rows.len());
     let mut ordered = Vec::with_capacity(rows.len());
     for root in roots {
-        append_agent_lineage_subtree(root, 1, &rows, &children, &mut visited, &mut ordered);
+        append_agent_lineage_subtree(root, &rows, &children, &mut visited, &mut ordered);
     }
     // Malformed cycles have no root. Preserve every row as a visible root and
     // let the visited set break the cycle rather than dropping monitor data.
     for index in 0..rows.len() {
-        append_agent_lineage_subtree(index, 1, &rows, &children, &mut visited, &mut ordered);
+        append_agent_lineage_subtree(index, &rows, &children, &mut visited, &mut ordered);
     }
     ordered
 }
@@ -1749,6 +1803,9 @@ const RECENT_SETTLED_TOOL_USE_ID_LIMIT: usize = 512;
 
 pub(crate) struct ChatWidget {
     session_id: String,
+    /// Identity of the accepted stream that owns the current local suffix.
+    active_root_run_id: Option<String>,
+    root_stream_history_start: usize,
     history: Vec<Arc<dyn HistoryCell>>,
     /// UI projection identities parallel to `history`. IDs are allocated when
     /// a cell is created, not when it is committed, so a live cell keeps the
@@ -1868,6 +1925,8 @@ impl ChatWidget {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            active_root_run_id: None,
+            root_stream_history_start: 0,
             history: Vec::new(),
             history_cell_ids: Vec::new(),
             active_cell: None,
@@ -2012,6 +2071,7 @@ impl ChatWidget {
                         .unwrap_or((1, 0));
                     projection.set_runtime_metadata(
                         AgentProjectionSource::LocalRuntime,
+                        AgentRunKind::Agent,
                         agent.run_id.clone(),
                         (!agent.parent_run_id.trim().is_empty())
                             .then(|| agent.parent_run_id.clone()),
@@ -2086,6 +2146,7 @@ impl ChatWidget {
             if let Some(projection) = self.agent_runs.get_mut(&restored_agent.id) {
                 projection.set_runtime_metadata(
                     AgentProjectionSource::WorkspaceSnapshot,
+                    AgentRunKind::Agent,
                     restored_agent.run_id.clone(),
                     Some(restored_agent.parent_run_id.clone()),
                     restored_agent_depth(restored_agent, restored),
@@ -2160,6 +2221,7 @@ impl ChatWidget {
             };
             projection.set_runtime_metadata(
                 AgentProjectionSource::LocalJournal,
+                AgentRunKind::Agent,
                 run.run_id.clone(),
                 run.parent_run_id.clone(),
                 1,
@@ -2211,7 +2273,13 @@ impl ChatWidget {
                         },
                     );
                     let mut present = std::collections::HashSet::new();
-                    for node in snapshot.runs.iter().filter(|node| node.is_agent_run()) {
+                    for node in snapshot.runs.iter().filter(|node| {
+                        node.is_agent_run()
+                            || (node.parent_run_id.is_none()
+                                && node.depth == 0
+                                && !node.run_id.trim().is_empty()
+                                && node.root_run_id.as_deref() == Some(node.run_id.as_str()))
+                    }) {
                         present.insert(node.run_id.as_str());
                         // The live stream/local runtime commonly keys a row
                         // by agent_id, while the durable server keys the same
@@ -2241,6 +2309,12 @@ impl ChatWidget {
                             .filter(|label| !label.trim().is_empty())
                             .map(|label| (label.to_string(), AgentRunLabelKind::BindingName))
                             .unwrap_or_else(|| {
+                                if !node.is_agent_run() {
+                                    return (
+                                        "Main conversation".into(),
+                                        AgentRunLabelKind::BindingName,
+                                    );
+                                }
                                 (
                                     agent_display_name(
                                         node.agent_id.as_deref().unwrap_or(&node.run_id),
@@ -2280,6 +2354,11 @@ impl ChatWidget {
                             Some(node.run_event_high_watermark);
                         projection.set_runtime_metadata(
                             AgentProjectionSource::DurableServer,
+                            if node.is_agent_run() {
+                                AgentRunKind::Agent
+                            } else {
+                                AgentRunKind::ConversationRoot
+                            },
                             node.run_id.clone(),
                             node.parent_run_id.clone(),
                             node.depth,
@@ -2379,14 +2458,30 @@ impl ChatWidget {
         &self,
         max_recent_completed: usize,
     ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot {
+        self.monitor_snapshot(max_recent_completed, false)
+    }
+
+    fn monitor_snapshot(
+        &self,
+        max_recent_completed: usize,
+        include_conversation_roots: bool,
+    ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot {
         use crate::tui::bottom_pane::in_flight_agents_view::{AgentMonitorSnapshot, AgentRow};
 
         let registry_rows: Vec<AgentRow> = self
             .agent_runs
             .order
             .iter()
+            .filter(|id| {
+                include_conversation_roots
+                    || self
+                        .agent_runs
+                        .get(id)
+                        .is_some_and(|run| run.kind == AgentRunKind::Agent)
+            })
             .filter_map(|id| {
                 self.agent_runs.get(id).map(|projection| AgentRow {
+                    kind: projection.kind,
                     agent_id: id.clone(),
                     name: projection.detail.description.clone(),
                     spawn_tool_call_id: self.agent_runs.spawn_tool_use_for_key(id),
@@ -2406,7 +2501,7 @@ impl ChatWidget {
                     fanout: self.agent_runs.fanout_membership(id).cloned(),
                     control_target: projection.control_target.clone(),
                     transcript_target: projection.transcript_target,
-                    available_actions: projection.available_actions.clone(),
+                    available_actions: projection.available_control_actions().to_vec(),
                     runtime: projection.runtime_facts.clone(),
                 })
             })
@@ -2471,7 +2566,6 @@ impl ChatWidget {
         }
         AgentMonitorSnapshot {
             rows: order_agent_monitor_rows_by_lineage(rows),
-            show_root_conversation: false,
             server_truth_state: self.agent_runs.server_truth_state,
             durable_snapshot_truncated: self.agent_runs.durable_snapshot_truncated,
         }
@@ -2511,21 +2605,10 @@ impl ChatWidget {
     pub(crate) fn agent_workbench_snapshot(
         &self,
     ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot {
-        let mut snapshot =
-            self.agent_monitor_snapshot(crate::tui::local_agent_journal::RECENT_TERMINAL_RUN_LIMIT);
-        // The root transcript belongs in an actual run tree, not as a fake
-        // agent row. With no observed children and a confirmed/unbound server
-        // lane, Ctrl+G should acknowledge the empty state without stealing
-        // focus into a one-row workbench. Degraded durable observation still
-        // opens the monitor so its freshness/action state remains visible.
-        snapshot.show_root_conversation = !snapshot.rows.is_empty()
-            || matches!(
-                snapshot.server_truth_state,
-                crate::tui::server_agent_observer::ServerAgentTruthState::Loading
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Stale
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Unavailable
-            );
-        snapshot
+        self.monitor_snapshot(
+            crate::tui::local_agent_journal::RECENT_TERMINAL_RUN_LIMIT,
+            true,
+        )
     }
 
     /// Tool-use identities of agent cells still running in the current turn.
@@ -2559,17 +2642,44 @@ impl ChatWidget {
             .retain(|id| !to_drop.contains(id.as_str()));
     }
 
-    pub fn mark_agent_control_pending(
+    pub fn begin_agent_control(
         &mut self,
         agent_id: &str,
+        target: &crate::tui::agent_run_projection::AgentControlTarget,
         action: astra_thin_client::SessionRunAction,
-    ) -> bool {
-        self.agent_runs
-            .get_mut(agent_id)
-            .is_some_and(|projection| projection.begin_control(action))
+    ) -> Option<uuid::Uuid> {
+        let projection = self.agent_runs.get_mut(agent_id)?;
+        if projection.control_target.as_ref() != Some(target) {
+            return None;
+        }
+        projection.begin_control(action)
     }
 
-    pub fn reject_agent_control(&mut self, agent_id: &str) -> bool {
+    pub fn agent_control_request_matches(
+        &self,
+        agent_id: &str,
+        target: &crate::tui::agent_run_projection::AgentControlTarget,
+        action: astra_thin_client::SessionRunAction,
+        request_id: uuid::Uuid,
+    ) -> bool {
+        self.agent_runs.get(agent_id).is_some_and(|projection| {
+            projection.control_target.as_ref() == Some(target)
+                && projection.pending_control.is_some_and(|pending| {
+                    pending.request_id == request_id && pending.action == action
+                })
+        })
+    }
+
+    pub fn reject_agent_control(
+        &mut self,
+        agent_id: &str,
+        target: &crate::tui::agent_run_projection::AgentControlTarget,
+        action: astra_thin_client::SessionRunAction,
+        request_id: uuid::Uuid,
+    ) -> bool {
+        if !self.agent_control_request_matches(agent_id, target, action, request_id) {
+            return false;
+        }
         self.agent_runs
             .get_mut(agent_id)
             .is_some_and(AgentRunProjection::reject_control)
@@ -2812,7 +2922,64 @@ impl ChatWidget {
     /// uses this identity for live projection and never writes a competing
     /// per-cell transcript file.
     pub fn set_session_id(&mut self, sid: impl Into<String>) {
-        self.session_id = sid.into();
+        let sid = sid.into();
+        if self.session_id != sid {
+            self.active_root_run_id = None;
+            self.session_id = sid;
+        }
+    }
+
+    pub(crate) fn active_root_binding(&self) -> Option<(&str, &str)> {
+        Some((
+            self.session_id.as_str(),
+            self.active_root_run_id.as_deref()?,
+        ))
+        .filter(|(session_id, _)| !session_id.trim().is_empty())
+    }
+
+    pub(crate) fn begin_root_stream(&mut self) {
+        self.active_root_run_id = None;
+        self.root_stream_history_start = self.history.len();
+    }
+
+    pub(crate) fn root_suffix_cell(&self) -> Option<(u64, &dyn HistoryCell, Option<&str>)> {
+        if let Some(cell) = self.active_cell() {
+            return Some((
+                self.active_cell_id()?,
+                cell,
+                self.active_tool_use_id.as_deref().or_else(|| {
+                    cell.as_any_ref()
+                        .downcast_ref::<TaskCell>()
+                        .map(|task| task.tool_use_id.as_str())
+                }),
+            ));
+        }
+        let (index, cell) = self
+            .history
+            .iter()
+            .enumerate()
+            .skip(self.root_stream_history_start)
+            .rev()
+            .find(|(_, cell)| {
+                cell.as_any_ref().is::<ToolCell>()
+                    || cell.as_any_ref().is::<TaskCell>()
+                    || cell.as_any_ref().is::<AssistantCell>()
+                    || cell.as_any_ref().is::<ReasoningCell>()
+            })?;
+        if !cell.as_any_ref().is::<ToolCell>() && !cell.as_any_ref().is::<TaskCell>() {
+            return None;
+        }
+        let id = self.history_cell_id(index);
+        let call_id = self
+            .settled_tool_cell_ids
+            .iter()
+            .find_map(|(call_id, cell_id)| (*cell_id == id).then_some(call_id.as_str()))
+            .or_else(|| {
+                cell.as_any_ref()
+                    .downcast_ref::<TaskCell>()
+                    .map(|task| task.tool_use_id.as_str())
+            });
+        Some((id, cell.as_ref(), call_id))
     }
 
     /// Replay a previously-persisted turn stream into `history`.
@@ -2927,6 +3094,11 @@ impl ChatWidget {
 
     fn handle_wire(&mut self, ev: WireEvent) {
         match ev {
+            WireEvent::RunBound(run_id) => {
+                if !run_id.trim().is_empty() && self.active_root_run_id.is_none() {
+                    self.active_root_run_id = Some(run_id);
+                }
+            }
             WireEvent::AnswerDelta {
                 model_item_id,
                 text,
@@ -3464,6 +3636,7 @@ impl ChatWidget {
         if let Some(run_id) = canonical_run_id {
             projection.set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
+                AgentRunKind::Agent,
                 run_id,
                 projection.parent_run_id.clone(),
                 projection.depth,
@@ -3705,6 +3878,7 @@ impl ChatWidget {
             };
             projection.set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
+                AgentRunKind::Agent,
                 run_id,
                 parent_run_id.clone(),
                 1,
@@ -3861,6 +4035,7 @@ impl ChatWidget {
             if projection.run_id.is_none() {
                 projection.set_runtime_metadata(
                     AgentProjectionSource::LiveStream,
+                    AgentRunKind::Agent,
                     routing_run_id.to_string(),
                     event_parent_run_id,
                     event_depth,
@@ -3902,6 +4077,7 @@ impl ChatWidget {
             {
                 projection.set_runtime_metadata(
                     AgentProjectionSource::LiveStream,
+                    AgentRunKind::Agent,
                     event.run_id.clone(),
                     parent_run_id.clone(),
                     *depth,
@@ -4037,6 +4213,7 @@ impl ChatWidget {
         if projection.run_id.is_none() {
             projection.set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
+                AgentRunKind::Agent,
                 gap.run_id,
                 projection.parent_run_id.clone(),
                 projection.depth,
@@ -4098,8 +4275,10 @@ impl ChatWidget {
             .map(|baseline| {
                 self.agent_runs
                     .runs
-                    .keys()
-                    .filter(|run_key| !baseline.contains(*run_key))
+                    .iter()
+                    .filter(|(run_key, projection)| {
+                        projection.kind == AgentRunKind::Agent && !baseline.contains(*run_key)
+                    })
                     .count()
             })
             .filter(|count| *count > 0);
@@ -8001,8 +8180,8 @@ mod tests {
         assert_eq!(row.run_id.as_deref(), Some("run-child-1"));
         assert_eq!(row.parent_run_id.as_deref(), Some("run-root"));
         assert_eq!(
-            row.depth, 1,
-            "a parent outside the visible agent set is rendered as a visible forest root"
+            row.depth, 2,
+            "canonical depth is preserved even when the parent is not visible"
         );
         assert!(row.available_actions.is_empty());
         assert!(row.control_target.is_none());
@@ -10170,6 +10349,75 @@ mod tests {
             Some("reviewer-v2")
         );
         assert!(rows[0].runtime.permission.is_none());
+        assert_eq!(widget.agent_runs.ids(), vec!["child-run"]);
+        assert_eq!(widget.agent_runs.status_strip_ids(), vec!["child-run"]);
+        let workbench = widget.agent_workbench_snapshot();
+        assert_eq!(workbench.rows.len(), 2);
+        let root = &workbench.rows[0];
+        assert_eq!(root.kind, AgentRunKind::ConversationRoot);
+        assert_eq!(root.name, "Main conversation");
+        assert_eq!(root.run_id.as_deref(), Some("root-run"));
+        assert_eq!(root.depth, 0);
+        assert_eq!(
+            root.control_target,
+            Some(
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "root-run".into(),
+                }
+            )
+        );
+        assert_eq!(
+            root.transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer)
+        );
+        assert_eq!(workbench.rows[1].agent_id, "child-run");
+    }
+
+    #[test]
+    fn ordinary_roots_require_exact_lineage_and_never_become_child_agents() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut widget = fresh();
+        let mut nodes = Vec::new();
+        for run_id in [
+            "root-a",
+            "root-b",
+            "wrong-root",
+            "wrong-depth",
+            "has-parent",
+        ] {
+            let mut node = server_run_node(run_id, SessionRunLifecycleStatus::Running, 1);
+            node.agent_id = None;
+            node.agent_name = None;
+            node.parent_run_id = None;
+            node.root_run_id = Some(run_id.into());
+            node.depth = 0;
+            match run_id {
+                "wrong-root" => node.root_run_id = Some("other-root".into()),
+                "wrong-depth" => node.depth = 1,
+                "has-parent" => node.parent_run_id = Some("parent".into()),
+                _ => {}
+            }
+            nodes.push(node);
+        }
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            nodes,
+            false,
+        ));
+        let workbench = widget.agent_workbench_snapshot();
+        assert_eq!(
+            workbench
+                .rows
+                .iter()
+                .map(|row| row.run_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("root-a"), Some("root-b")]
+        );
+        assert!(workbench.should_open());
+        assert!(widget.agent_monitor_snapshot(5).is_empty());
+        assert!(widget.agent_runs.ids().is_empty());
+        assert!(widget.agent_runs.status_strip_ids().is_empty());
     }
 
     #[test]
@@ -10217,15 +10465,12 @@ mod tests {
             server_run_node("ordinary-child-run", SessionRunLifecycleStatus::Running, 1);
         ordinary_child.agent_id = None;
         ordinary_child.agent_name = Some("not sufficient identity".into());
-        let mut root_agent = server_run_node(
-            "team-orchestrator-run",
-            SessionRunLifecycleStatus::Running,
-            1,
-        );
+        let mut root_agent =
+            server_run_node("orchestrator-run", SessionRunLifecycleStatus::Running, 1);
         root_agent.parent_run_id = None;
         root_agent.root_run_id = Some(root_agent.run_id.clone());
         root_agent.depth = 0;
-        root_agent.agent_id = Some("team-orchestrator".into());
+        root_agent.agent_id = Some("orchestrator".into());
 
         let mut widget = fresh();
         widget.reconcile_server_agent_projection(&server_agent_projection(
@@ -10236,8 +10481,9 @@ mod tests {
 
         let snapshot = widget.agent_monitor_snapshot(0);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].agent_id, "team-orchestrator-run");
-        assert_eq!(snapshot[0].depth, 1);
+        assert_eq!(snapshot[0].agent_id, "orchestrator-run");
+        assert_eq!(snapshot[0].depth, 0);
+        assert_eq!(snapshot[0].kind, AgentRunKind::Agent);
     }
 
     #[test]
@@ -10465,16 +10711,27 @@ mod tests {
             )]),
             &[],
         );
-        assert!(widget.mark_agent_control_pending(
-            "local-child",
-            astra_thin_client::SessionRunAction::Cancel,
-        ));
+        let target = crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+            agent_id: "local-child".into(),
+        };
+        let request_id = widget
+            .begin_agent_control(
+                "local-child",
+                &target,
+                astra_thin_client::SessionRunAction::Cancel,
+            )
+            .unwrap();
         assert_eq!(
             widget.agent_run_state("local-child").unwrap().status,
             AgentRunStatus::Cancelling
         );
 
-        assert!(widget.reject_agent_control("local-child"));
+        assert!(widget.reject_agent_control(
+            "local-child",
+            &target,
+            astra_thin_client::SessionRunAction::Cancel,
+            request_id
+        ));
         let restored = widget.agent_run_state("local-child").unwrap();
         assert_eq!(restored.status, AgentRunStatus::Running);
         assert_eq!(restored.confidence, AgentProjectionConfidence::Stale);
@@ -10493,12 +10750,56 @@ mod tests {
             false,
         ));
 
-        assert!(widget.mark_agent_control_pending("server-child", SessionRunAction::Pause));
+        let target = crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+            run_id: "server-child".into(),
+        };
+        let wrong_target = crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+            run_id: "different-run".into(),
+        };
+        assert!(
+            widget
+                .begin_agent_control("server-child", &wrong_target, SessionRunAction::Pause)
+                .is_none()
+        );
+        assert_eq!(
+            widget.agent_run_state("server-child").unwrap().status,
+            AgentRunStatus::Running
+        );
+        let first_request = widget
+            .begin_agent_control("server-child", &target, SessionRunAction::Pause)
+            .unwrap();
+        assert!(widget.agent_control_request_matches(
+            "server-child",
+            &target,
+            SessionRunAction::Pause,
+            first_request
+        ));
+        assert!(
+            widget
+                .begin_agent_control("server-child", &target, SessionRunAction::Pause)
+                .is_none()
+        );
         assert_eq!(
             widget.agent_run_state("server-child").unwrap().status,
             AgentRunStatus::Pausing
         );
-        assert!(widget.reject_agent_control("server-child"));
+        widget
+            .agent_runs
+            .get_mut("server-child")
+            .unwrap()
+            .mark_stale_if_active();
+        assert!(widget.agent_control_request_matches(
+            "server-child",
+            &target,
+            SessionRunAction::Pause,
+            first_request
+        ));
+        assert!(widget.reject_agent_control(
+            "server-child",
+            &target,
+            SessionRunAction::Pause,
+            first_request
+        ));
         assert_eq!(
             widget.agent_run_state("server-child").unwrap(),
             AgentRunState {
@@ -10515,7 +10816,9 @@ mod tests {
             vec![paused],
             false,
         ));
-        assert!(widget.mark_agent_control_pending("server-child", SessionRunAction::Resume));
+        let resume_request = widget
+            .begin_agent_control("server-child", &target, SessionRunAction::Resume)
+            .unwrap();
         assert_eq!(
             widget.agent_run_state("server-child").unwrap().status,
             AgentRunStatus::Resuming
@@ -10531,7 +10834,47 @@ mod tests {
         let state = widget.agent_run_state("server-child").unwrap();
         assert_eq!(state.status, AgentRunStatus::Running);
         assert_eq!(state.confidence, AgentProjectionConfidence::Confirmed);
-        assert!(!widget.reject_agent_control("server-child"));
+        assert!(!widget.reject_agent_control(
+            "server-child",
+            &target,
+            SessionRunAction::Resume,
+            resume_request
+        ));
+        let second_request = widget
+            .begin_agent_control("server-child", &target, SessionRunAction::Pause)
+            .unwrap();
+        assert_ne!(first_request, second_request);
+        assert!(!widget.reject_agent_control(
+            "server-child",
+            &target,
+            SessionRunAction::Pause,
+            first_request
+        ));
+        assert!(widget.agent_control_request_matches(
+            "server-child",
+            &target,
+            SessionRunAction::Pause,
+            second_request
+        ));
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "server-child",
+                SessionRunLifecycleStatus::Completed,
+                6,
+            )],
+            false,
+        ));
+        assert!(!widget.reject_agent_control(
+            "server-child",
+            &target,
+            SessionRunAction::Pause,
+            second_request
+        ));
+        assert_eq!(
+            widget.agent_run_state("server-child").unwrap().status,
+            AgentRunStatus::Completed
+        );
     }
 
     #[test]
@@ -10634,7 +10977,17 @@ mod tests {
             )]),
             &[],
         );
-        assert!(widget.mark_agent_control_pending("local-agent", SessionRunAction::Cancel));
+        assert!(
+            widget
+                .begin_agent_control(
+                    "local-agent",
+                    &crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+                        agent_id: "local-agent".into()
+                    },
+                    SessionRunAction::Cancel
+                )
+                .is_some()
+        );
 
         let snapshot = widget.agent_monitor_snapshot(0);
         assert_eq!(snapshot[0].state.source, AgentProjectionSource::LocalIntent);
@@ -11024,16 +11377,20 @@ mod tests {
             AgentRunState::confirmed_server(AgentRunStatus::Running),
         );
         projection.available_actions = vec![astra_thin_client::SessionRunAction::Pause];
-        assert!(projection.begin_control(astra_thin_client::SessionRunAction::Pause));
+        assert!(
+            projection
+                .begin_control(astra_thin_client::SessionRunAction::Pause)
+                .is_some()
+        );
         assert_eq!(projection.state.status, AgentRunStatus::Pausing);
 
         assert!(!projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Running)));
         assert_eq!(projection.state.status, AgentRunStatus::Pausing);
-        assert!(projection.control_requested_from.is_some());
+        assert!(projection.pending_control.is_some());
 
         assert!(projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Paused)));
         assert_eq!(projection.state.status, AgentRunStatus::Paused);
-        assert!(projection.control_requested_from.is_none());
+        assert!(projection.pending_control.is_none());
     }
 
     #[test]
@@ -11224,6 +11581,7 @@ mod tests {
             .unwrap()
             .set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
+                AgentRunKind::Agent,
                 "run-review".into(),
                 Some("run-root".into()),
                 1,
@@ -11333,6 +11691,7 @@ mod tests {
             );
             registry.get_mut(key).unwrap().set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
+                AgentRunKind::Agent,
                 format!("run-{key}"),
                 parent.map(str::to_string),
                 u32::from(parent.is_some()),

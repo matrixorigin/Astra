@@ -1,7 +1,7 @@
 //! Multi-agent coordination prompt templates.
 //!
 //! Each function generates context-aware instructions that are injected into
-//! sub-run tasks so agents understand their role within a team execution.
+//! sub-run tasks so agents understand their role within a coordinated execution.
 
 /// Prompt preamble for fan-out agents executing in parallel.
 ///
@@ -40,7 +40,7 @@ pub fn fan_out_agent_prompt(agent_id: &str, sibling_agents: &[&str], aggregation
     };
 
     format!(
-        "## Team Coordination: Parallel Execution\n\
+        "## Agent Coordination: Parallel Execution\n\
          {sibling_clause}\n\n\
          **Aggregation strategy:** {aggregation}\n\
          {aggregation_guidance}\n\n\
@@ -84,7 +84,7 @@ pub fn sequential_stage_prompt(
     };
 
     format!(
-        "## Team Coordination: Sequential Execution (Stage {pos})\n\
+        "## Agent Coordination: Sequential Execution (Stage {pos})\n\
          You are agent **{agent_id}**, the {position} stage in a {total_stages}-stage sequence.\n\
          {previous_clause}{stop_clause}",
         pos = stage_index + 1,
@@ -104,7 +104,7 @@ pub fn fork_child_prompt(
     };
 
     format!(
-        "## Team Coordination: Fork (Child #{idx} of {total_forks})\n\
+        "## Agent Coordination: Fork (Child #{idx} of {total_forks})\n\
          You are an independent fork executing a portion of a larger task.\n\
          {context_clause}\n\n\
          **Rules:**\n\
@@ -117,7 +117,7 @@ pub fn fork_child_prompt(
 
 /// Combine a coordination prompt with the original task.
 ///
-/// Prepends the team context block before the actual task, separated by a
+/// Prepends the coordination context block before the actual task, separated by a
 /// clear delimiter so the LLM can distinguish meta-instructions from work.
 pub fn wrap_task_with_coordination(coordination_prompt: &str, original_task: &str) -> String {
     if coordination_prompt.is_empty() {

@@ -46,7 +46,7 @@
 //!
 //! `rules_hash` is the SHA-256 of `.astra/permissions.json` at the
 //! moment trust was granted. If the project file later changes
-//! (team adds rules), the next session sees a hash mismatch and
+//! (the project adds rules), the next session sees a hash mismatch and
 //! can prompt the user "N rules changed — re-review?".
 //!
 //! Corruption is surfaced loudly per the P5b contract: if the
@@ -307,7 +307,7 @@ impl WorkspaceTrustLedger {
     }
 
     /// Recorded `rules_hash` for a workspace, if any. Used by the
-    /// TUI to detect "team added new rules since you trusted this".
+    /// TUI to detect "the project added new rules since you trusted this".
     #[must_use]
     pub fn rules_hash_for(&self, workspace: &Path) -> Option<&str> {
         let key = canonicalize_key(workspace);

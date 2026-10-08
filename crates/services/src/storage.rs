@@ -5973,46 +5973,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ─── Team definitions ───────────────────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "team_definitions",
-        "CREATE TABLE IF NOT EXISTS team_definitions (
-            team_id       VARCHAR(64)  PRIMARY KEY,
-            user_id       VARCHAR(128)  NOT NULL,
-            name          VARCHAR(128) NOT NULL,
-            description   TEXT,
-            members_json  TEXT         NOT NULL,
-            context_json  TEXT,
-            revision      BIGINT UNSIGNED NOT NULL,
-            UNIQUE KEY uq_team_user_name (user_id, name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ─── Team snapshots ─────────────────────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "team_snapshots",
-        "CREATE TABLE IF NOT EXISTS team_snapshots (
-            snapshot_id          VARCHAR(64)  PRIMARY KEY,
-            team_id              VARCHAR(64)  NOT NULL,
-            team_name            VARCHAR(128) NOT NULL,
-            user_id              VARCHAR(128)  NOT NULL,
-            label                VARCHAR(255) DEFAULT '',
-            git_commit           VARCHAR(64),
-            session_id           VARCHAR(64),
-            team_definition_json LONGTEXT,
-            created_at           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_ts_user_team (user_id, team_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ─── Conversation State Log (CSL) ──────────────────────────────────────────
 
     core_schema_create!(

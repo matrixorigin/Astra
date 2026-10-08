@@ -1,19 +1,20 @@
 //! Authentication retry handling for a failed turn.
 
-use crate::cli::auth_flow::is_auth_error;
 use crate::cli::session::session_runtime;
 
 pub(crate) fn should_retry_after_auth_refresh(failure: &crate::TurnFailure) -> bool {
-    if let Some(metadata) = &failure.partial.error_metadata
-        && metadata.get("source").and_then(serde_json::Value::as_str) == Some("model_access")
-    {
-        return failure.partial.error_code.as_deref() == Some(astra_core::ErrorKind::Auth.as_str())
-            && metadata
-                .get("http_status")
-                .and_then(serde_json::Value::as_u64)
-                == Some(401);
-    }
-    is_auth_error(&failure.error)
+    failure.partial.error_code.as_deref() == Some(astra_core::ErrorKind::Auth.as_str())
+        && failure
+            .partial
+            .error_metadata
+            .as_ref()
+            .is_some_and(|metadata| {
+                metadata.get("source").and_then(serde_json::Value::as_str) == Some("model_access")
+                    && metadata
+                        .get("http_status")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(401)
+            })
 }
 
 pub(crate) async fn prepare_auth_refresh_retry(
@@ -48,7 +49,7 @@ mod tests {
         for (error, expected) in [
             (
                 "API Error (401): Could not validate credentials\n  Hint: Session expired — try /login",
-                true,
+                false,
             ),
             ("LLM provider authentication failed", false),
             ("[auth] LLM provider authentication failed", false),

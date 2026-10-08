@@ -437,19 +437,14 @@ pub enum InferenceProviderDeliveryState {
 /// the database acknowledgement.
 ///
 /// Resolution is performed while holding the same durable scope locks as the
-/// original admission transaction, so `Absent` cannot race a late commit.
+/// original admission transaction, so confirmed absence cannot race a late
+/// commit. Scope authority is returned separately from this settlement fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceInvocationAdmissionResolution {
-    /// The old admission is absent or closed; apply guidance before new work.
-    GuidancePending,
     Settled,
     ExactTerminal,
     ConflictingIdentity,
     ScopeUnavailable,
-    /// The exact ambiguous identity was conclusively closed, but the caller's
-    /// run generation/owner/lease/control capability is no longer live. The
-    /// caller must not create a replacement logical attempt.
-    AuthorityLost,
 }
 
 /// Authoritative result of projecting one exact durable settlement decision.
@@ -1302,16 +1297,19 @@ async fn rollback_inference_tx(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationScopeAuthority {
     Live,
-    GuidancePending,
-    Unavailable,
+    Rejected(InferenceScopeRejection),
 }
 
 /// Typed admission fence. New guidance invalidates a request snapshot, not
-/// the execution owner; callers must reconcile it before trying new work.
+/// the execution owner; a retained pause suspends that same owner. Callers must
+/// reconcile these control causes before trying new work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceScopeRejection {
     GuidancePending,
+    /// The exact run owner retains a live lease and a waiting obligation.
+    /// Provider delivery remains forbidden until the existing pause clears.
+    Paused,
     Unavailable,
 }
 
@@ -1319,12 +1317,43 @@ impl std::fmt::Display for InferenceScopeRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::GuidancePending => "new user guidance requires a fresh execution snapshot",
+            Self::Paused => "inference execution is paused with retained owner authority",
             Self::Unavailable => "inference execution scope is no longer available",
         })
     }
 }
 
 impl std::error::Error for InferenceScopeRejection {}
+
+fn classify_run_invocation_scope_authority(
+    expected: &InferenceRunAdmissionAuthority,
+    stored_generation: i64,
+    owner_pod_id: Option<&str>,
+    lease_active: bool,
+    cancellation_requested: bool,
+    status: &str,
+    has_waiting_obligation: bool,
+) -> ServiceResult<InvocationScopeAuthority> {
+    let expected_generation = i64::try_from(expected.expected_owner_generation).map_err(|_| {
+        ServiceError::invalid("expected_owner_generation exceeds the durable BIGINT range")
+    })?;
+    if stored_generation != expected_generation
+        || owner_pod_id != Some(expected.expected_owner_pod_id.as_str())
+        || !lease_active
+        || cancellation_requested
+    {
+        return Ok(InvocationScopeAuthority::Rejected(
+            InferenceScopeRejection::Unavailable,
+        ));
+    }
+    Ok(match status {
+        "running" => InvocationScopeAuthority::Live,
+        "paused" if has_waiting_obligation => {
+            InvocationScopeAuthority::Rejected(InferenceScopeRejection::Paused)
+        }
+        _ => InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+    })
+}
 
 async fn lock_invocation_scope_authority(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -1363,10 +1392,11 @@ async fn lock_invocation_scope_authority(
                     }
                 };
             if !scope_admitted {
-                InvocationScopeAuthority::Unavailable
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
             } else {
                 let row = sqlx::query(
                     "SELECT status, run_generation, owner_pod_id, last_event_idx,
+                            CAST(waiting_for IS NOT NULL AS SIGNED) AS has_waiting_obligation,
                             CAST(cancellation_requested_at IS NOT NULL AS SIGNED)
                                 AS cancellation_requested,
                             CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
@@ -1388,7 +1418,9 @@ async fn lock_invocation_scope_authority(
                     )
                 })?;
                 let Some(row) = row else {
-                    return Ok(InvocationScopeAuthority::Unavailable);
+                    return Ok(InvocationScopeAuthority::Rejected(
+                        InferenceScopeRejection::Unavailable,
+                    ));
                 };
                 let status: String = row.try_get("status").map_err(|error| {
                     ServiceError::with_source(
@@ -1434,25 +1466,34 @@ async fn lock_invocation_scope_authority(
                             error,
                         )
                     })?;
-                let expected_generation = i64::try_from(expected.expected_owner_generation)
-                    .map_err(|_| {
-                        ServiceError::invalid(
-                            "expected_owner_generation exceeds the durable BIGINT range",
+                let has_waiting_obligation: i64 =
+                    row.try_get("has_waiting_obligation").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode inference run waiting obligation",
+                            error,
                         )
                     })?;
-                if expected.expected_control_epoch > last_event_idx {
+                let authority = classify_run_invocation_scope_authority(
+                    expected,
+                    stored_generation,
+                    owner_pod_id.as_deref(),
+                    lease_active == 1,
+                    cancellation_requested != 0,
+                    &status,
+                    has_waiting_obligation == 1,
+                )?;
+                if authority
+                    != InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
+                    && expected.expected_control_epoch > last_event_idx
+                {
                     return Err(ServiceError::invalid(format!(
                         "inference control epoch {} is ahead of durable run event index {}",
                         expected.expected_control_epoch, last_event_idx
                     )));
                 }
-                if status != "running"
-                    || stored_generation != expected_generation
-                    || owner_pod_id.as_deref() != Some(expected.expected_owner_pod_id.as_str())
-                    || lease_active != 1
-                    || cancellation_requested != 0
-                {
-                    InvocationScopeAuthority::Unavailable
+                if authority != InvocationScopeAuthority::Live {
+                    authority
                 } else {
                     // The run row is held before its event range, preserving
                     // canonical session -> lifecycle-fence/slot -> run -> run-events
@@ -1480,7 +1521,7 @@ async fn lock_invocation_scope_authority(
                         )
                     })?;
                     if control_fence.is_some() {
-                        InvocationScopeAuthority::GuidancePending
+                        InvocationScopeAuthority::Rejected(InferenceScopeRejection::GuidancePending)
                     } else {
                         InvocationScopeAuthority::Live
                     }
@@ -1492,7 +1533,9 @@ async fn lock_invocation_scope_authority(
                 .await
             {
                 Ok(()) => InvocationScopeAuthority::Live,
-                Err(sqlx::Error::RowNotFound) => InvocationScopeAuthority::Unavailable,
+                Err(sqlx::Error::RowNotFound) => {
+                    InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
+                }
                 Err(error) => {
                     return Err(ServiceError::with_source(
                         ServiceErrorKind::Persistence,
@@ -1511,13 +1554,14 @@ fn unavailable_scope_error(
     authority: InvocationScopeAuthority,
 ) -> ServiceError {
     let reason = match authority {
-        InvocationScopeAuthority::GuidancePending => InferenceScopeRejection::GuidancePending,
-        InvocationScopeAuthority::Unavailable => InferenceScopeRejection::Unavailable,
+        InvocationScopeAuthority::Rejected(reason) => reason,
         InvocationScopeAuthority::Live => unreachable!("live authority is not a rejection"),
     };
     ServiceError::with_source(
         match reason {
-            InferenceScopeRejection::GuidancePending => ServiceErrorKind::Conflict,
+            InferenceScopeRejection::GuidancePending | InferenceScopeRejection::Paused => {
+                ServiceErrorKind::Conflict
+            }
             InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
         },
         format!(
@@ -1863,11 +1907,18 @@ async fn insert_inference_invocation_admission(
 /// admission token decide the outcome. Scope validation uses the same short
 /// `FOR UPDATE` lock as the original transaction, so deletion cannot race the
 /// recovery insert.
+///
+/// Return the confirmed recovery fact separately from its scope fence.
+/// A paused owner may resume an absent plan, but never an identity already
+/// transferred to settlement. No result is returned before commit/debt proof.
 pub async fn settle_uncertain_inference_admission(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
     terminal: &InferenceInvocationTerminal,
-) -> ServiceResult<InferenceInvocationAdmissionResolution> {
+) -> ServiceResult<(
+    InferenceInvocationAdmissionResolution,
+    Option<InferenceScopeRejection>,
+)> {
     if terminal.status != InferenceTerminalStatus::Cancelled
         || terminal.usage != InferenceUsage::default()
         || terminal.usage_status != InferenceUsageStatus::Unavailable
@@ -1923,7 +1974,7 @@ pub async fn settle_uncertain_inference_admission(
             error,
         )
     })?;
-    let mut resolution = match row {
+    let resolution = match row {
         None => {
             if scope_authority == InvocationScopeAuthority::Live {
                 insert_inference_invocation_admission(&mut tx, plan).await?;
@@ -2018,29 +2069,16 @@ pub async fn settle_uncertain_inference_admission(
         )
         .await?;
     }
-    if scope_authority == InvocationScopeAuthority::GuidancePending
-        && matches!(
-            resolution,
-            InferenceInvocationAdmissionResolution::Settled
-                | InferenceInvocationAdmissionResolution::ExactTerminal
-                | InferenceInvocationAdmissionResolution::ScopeUnavailable
-        )
-    {
-        resolution = InferenceInvocationAdmissionResolution::GuidancePending;
-    }
-    if scope_authority == InvocationScopeAuthority::Unavailable
-        && matches!(
-            resolution,
-            InferenceInvocationAdmissionResolution::Settled
-                | InferenceInvocationAdmissionResolution::ExactTerminal
-        )
-    {
-        resolution = InferenceInvocationAdmissionResolution::AuthorityLost;
-    }
     let error = match tx.commit().await {
         Ok(()) => {
             connection.release();
-            return Ok(resolution);
+            return Ok((
+                resolution,
+                match scope_authority {
+                    InvocationScopeAuthority::Live => None,
+                    InvocationScopeAuthority::Rejected(reason) => Some(reason),
+                },
+            ));
         }
         Err(error) => {
             drop(connection);
@@ -2077,7 +2115,13 @@ pub async fn settle_uncertain_inference_admission(
     .await;
     reconciliation.release();
     match match_result {
-        Ok(true) => Ok(resolution),
+        Ok(true) => Ok((
+            resolution,
+            match scope_authority {
+                InvocationScopeAuthority::Live => None,
+                InvocationScopeAuthority::Rejected(reason) => Some(reason),
+            },
+        )),
         Ok(false) => Err(commit_error),
         Err(read_error) => {
             tracing::warn!(
@@ -7811,6 +7855,389 @@ mod tests {
         }
     }
 
+    fn assert_scope_rejection(error: &ServiceError, expected: InferenceScopeRejection) {
+        assert_eq!(
+            error.kind,
+            match expected {
+                InferenceScopeRejection::GuidancePending | InferenceScopeRejection::Paused => {
+                    ServiceErrorKind::Conflict
+                }
+                InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
+            }
+        );
+        assert_eq!(
+            error
+                .source
+                .as_deref()
+                .and_then(|source| source.downcast_ref::<InferenceScopeRejection>()),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn retained_pause_requires_exact_live_uncancelled_owner_and_waiting_obligation() {
+        let input = input();
+        let expected = input.run_authority.as_ref().unwrap();
+        let owner = Some(expected.expected_owner_pod_id.as_str());
+        for (status, generation, stored_owner, lease_live, cancelled, waiting, authority) in [
+            (
+                "running",
+                0,
+                owner,
+                true,
+                false,
+                false,
+                InvocationScopeAuthority::Live,
+            ),
+            (
+                "running",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Live,
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Paused),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                false,
+                false,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                1,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                Some("other-owner"),
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                None,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                false,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                true,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "running",
+                0,
+                owner,
+                false,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "running",
+                0,
+                owner,
+                true,
+                true,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "waiting",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "cancelled",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "completed",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+        ] {
+            assert_eq!(
+                classify_run_invocation_scope_authority(
+                    expected,
+                    generation,
+                    stored_owner,
+                    lease_live,
+                    cancelled,
+                    status,
+                    waiting,
+                )
+                .unwrap(),
+                authority,
+                "status={status}, generation={generation}, owner={stored_owner:?}, lease={lease_live}, cancelled={cancelled}, waiting={waiting}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn retained_pause_fences_real_logical_and_final_provider_admission() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("retained-pause-{suffix}");
+        let session_id = format!("retained-pause-session-{suffix}");
+        let run_id = format!("retained-pause-run-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, status, event_count, project_retention_policy,
+              created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
+              status, execution_mode, owner_pod_id, owner_lease_expires_at,
+              run_generation, last_event_idx, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent',
+                     'test-inference-owner', TIMESTAMPADD(MINUTE, 5, NOW(6)),
+                     0, 0, 0, 0, 0, NOW(6), NOW(6))",
+        )
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let plan = |operation_id: &str| {
+            let mut input = input();
+            input.user_id = user_id.clone();
+            input.scope = InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 0,
+                round: 0,
+                operation_id: operation_id.into(),
+                logical_attempt: 0,
+            };
+            plan_inference_invocation(input).unwrap()
+        };
+        let attempt = |plan: &InferenceInvocationPlan| {
+            plan_inference_provider_attempt(
+                plan,
+                0,
+                InferenceProviderWireIdentity::new("openai_compatible", "a".repeat(64), 2).unwrap(),
+            )
+        };
+        let final_plan = plan("paused_final");
+        admit_inference_invocation(&pool, &final_plan)
+            .await
+            .unwrap();
+        let settlement_plan = plan("paused_settlement");
+        admit_inference_invocation(&pool, &settlement_plan)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET status = 'paused', waiting_for = 'user_resume' WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        let logical_plan = plan("paused_logical");
+        let combined_plan = plan("paused_combined");
+        for error in [
+            admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            admit_inference_invocation_with_first_provider_attempt(
+                &pool,
+                &combined_plan,
+                &attempt(&combined_plan),
+            )
+            .await
+            .unwrap_err(),
+            begin_inference_provider_attempt(&pool, &attempt(&final_plan))
+                .await
+                .unwrap_err(),
+        ] {
+            assert_scope_rejection(&error, InferenceScopeRejection::Paused);
+        }
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        for (plan, resolution) in [
+            (
+                &logical_plan,
+                InferenceInvocationAdmissionResolution::ScopeUnavailable,
+            ),
+            (
+                &settlement_plan,
+                InferenceInvocationAdmissionResolution::Settled,
+            ),
+        ] {
+            assert_eq!(
+                settle_uncertain_inference_admission(&pool, plan, &terminal)
+                    .await
+                    .unwrap(),
+                (resolution, Some(InferenceScopeRejection::Paused)),
+            );
+        }
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &plan("paused_settlement"), &terminal)
+                .await
+                .unwrap(),
+            (
+                InferenceInvocationAdmissionResolution::ConflictingIdentity,
+                Some(InferenceScopeRejection::Paused)
+            ),
+        );
+        for (table, expected) in [
+            ("inference_routes", 2_i64),
+            ("inference_invocations", 2),
+            ("inference_provider_attempts", 0),
+            ("inference_invocation_settlement_debts", 1),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?"))
+                    .bind(&user_id)
+                    .fetch_one(pool.get())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                count, expected,
+                "paused recovery has an unexpected row count in {table}"
+            );
+        }
+        let waiting_for: Option<String> = sqlx::query_scalar(
+            "SELECT waiting_for FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(waiting_for.as_deref(), Some("user_resume"));
+        sqlx::query("UPDATE agent_runs SET waiting_for = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert_scope_rejection(
+            &admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            InferenceScopeRejection::Unavailable,
+        );
+        sqlx::query("UPDATE agent_runs SET waiting_for = 'user_resume', owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_scope_rejection(
+            &admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            InferenceScopeRejection::Unavailable,
+        );
+        // Resume the same owner and the already-admitted invocation. A pause
+        // must not force logical re-admission or replace its physical identity.
+        sqlx::query("UPDATE agent_runs SET status = 'running', waiting_for = NULL, owner_lease_expires_at = TIMESTAMPADD(MINUTE, 5, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            begin_inference_provider_attempt(&pool, &attempt(&settlement_plan))
+                .await
+                .unwrap_err()
+                .kind,
+            ServiceErrorKind::Conflict,
+            "resume must not revive an invocation already handed to settlement",
+        );
+        begin_inference_provider_attempt(&pool, &attempt(&final_plan))
+            .await
+            .unwrap();
+        let resumed_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ?",
+        )
+        .bind(&user_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(resumed_attempts, 1);
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_provider_attempts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_runs",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
     async fn inference_price_snapshot_survives_persisted_replay_and_recovery() {
@@ -7881,7 +8308,7 @@ mod tests {
             settle_uncertain_inference_admission(&pool, &recovery, &terminal)
                 .await
                 .unwrap(),
-            InferenceInvocationAdmissionResolution::Settled,
+            (InferenceInvocationAdmissionResolution::Settled, None),
         );
         let retained: String = sqlx::query_scalar(
             "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_routes WHERE user_id = ? AND route_id = ?",

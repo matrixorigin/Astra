@@ -180,6 +180,7 @@ fn emit_tool_display_feedback(
 struct PersistedRecordResult {
     content: String,
     artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
+    delivery_unavailable: bool,
 }
 
 fn persist_tool_result_for_record_with_authority(
@@ -229,6 +230,7 @@ fn persist_tool_document_for_record_with_authority(
     } = document;
     let Some(sid) = current_session_id else {
         return Ok(PersistedRecordResult {
+            delivery_unavailable: full_model_result_str != inline_model_result_str,
             content: if kind.is_result() {
                 inline_model_result_str
             } else {
@@ -239,6 +241,7 @@ fn persist_tool_document_for_record_with_authority(
     };
     let Some(run_id) = current_run_id else {
         return Ok(PersistedRecordResult {
+            delivery_unavailable: full_model_result_str != inline_model_result_str,
             // Without a run identity there is no immutable artifact identity.
             // Preserve the complete sanitized evidence inline instead of
             // emitting a handle that introspect cannot safely resolve.
@@ -276,6 +279,7 @@ fn persist_tool_document_for_record_with_authority(
                 "tool-result artifact unavailable; retaining full sanitized journal result"
             );
             return Ok(PersistedRecordResult {
+                delivery_unavailable: full_model_result_str != inline_model_result_str,
                 content: full_model_result_str.to_string(),
                 artifact: None,
             });
@@ -284,10 +288,12 @@ fn persist_tool_document_for_record_with_authority(
     };
     Ok(match persisted {
         Some(persisted) => PersistedRecordResult {
+            delivery_unavailable: false,
             content: persisted.replacement,
             artifact: Some(persisted.descriptor),
         },
         None => PersistedRecordResult {
+            delivery_unavailable: false,
             content: inline_model_result_str,
             artifact: None,
         },
@@ -353,6 +359,15 @@ fn model_tool_result_for_followup(
     inline_model_result_str: String,
     journal_result: &PersistedRecordResult,
 ) -> String {
+    if presentation == astra_tools::ModelResultPresentation::Generic
+        && journal_result.delivery_unavailable
+    {
+        return serde_json::json!({
+            "result_delivery_complete": false,
+            "error": {"code": "result_delivery_unavailable",
+                "message": "The complete result could not be delivered. This does not change the execution outcome. Do not repeat an executed action merely to recover its output; report the delivery gap or retrieve the retained result."},
+        }).to_string();
+    }
     if presentation == astra_tools::ModelResultPresentation::Generic
         && journal_result.artifact.is_some()
     {
@@ -580,6 +595,39 @@ fn work_receipt_for_model(tool_name: &str, content: &str) -> Option<String> {
     serde_json::to_string(&Value::Object(projected)).ok()
 }
 
+fn work_establishment_receipt(
+    tool_name: &str,
+    content: &str,
+) -> Option<astra_services::session_journal::RuntimeWorkEstablishmentReceipt> {
+    if tool_name != "start_work" {
+        return None;
+    }
+    let result = serde_json::from_str::<Value>(content).ok()?;
+    match result.get("status")?.as_str()? {
+        "started" => {
+            Some(astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started)
+        }
+        "continued" => {
+            Some(astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Continued)
+        }
+        "deferred"
+            if result.get("operation_state").and_then(Value::as_str) == Some("cancelled")
+                && result.get("assignment_created").and_then(Value::as_bool) == Some(false) =>
+        {
+            let operation_id = result
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())?;
+            Some(
+                astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Deferred {
+                    operation_id: operation_id.to_string(),
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
 fn model_tool_result_session_dir(
     current_user_id: Option<&str>,
     session_id: &str,
@@ -629,6 +677,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // failed tool cannot leak the very credential the model could not see.
         let initial_sanitized =
             astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&execution.result_str);
+        let runtime_work_establishment_receipt = if !is_err {
+            work_establishment_receipt(&execution.name, &initial_sanitized.content)
+        } else {
+            None
+        };
         execution.result_str = initial_sanitized.content;
         if let Some(metadata) = execution.tool_result_fields.take() {
             let sanitized =
@@ -871,6 +924,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     error_kind = Some(astra_core::ErrorKind::ContractViolation);
                     (
                         PersistedRecordResult {
+                            delivery_unavailable: false,
                             content: failure,
                             artifact: None,
                         },
@@ -1188,6 +1242,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     || result_presentation != astra_tools::ModelResultPresentation::Generic)
             {
                 (!model_result_str.is_empty()).then_some(model_result_str.clone())
+            } else {
+                None
+            };
+            record.runtime_work_establishment_receipt = if !is_err && record.was_executed() {
+                runtime_work_establishment_receipt
             } else {
                 None
             };
@@ -1585,15 +1644,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn durable_record_io_failure_retains_sanitized_inline_result_without_descriptor() {
+    #[tokio::test]
+    async fn durable_record_io_failure_retains_result_but_reports_incomplete_model_delivery() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = format!("persisted-io-{}", uuid::Uuid::new_v4());
         let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tool-results"), "not a directory").unwrap();
-        let sanitized = "complete sanitized result retained for degraded audit";
+        let spawner = crate::orchestration::agent_tool::tests::test_spawner_without_executor();
+        let ctx = crate::orchestration::agent_tool::tests::test_spawn_context(spawner, None);
+        ctx.fanout_admission.set_direct_child_for_test(
+            crate::orchestration::spawner::DirectChildCompletion {
+                agent_id: "child".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: ctx.agent_id.clone(),
+                status: crate::orchestration::AgentStatus::Completed {
+                    result: "delivery ".repeat(10_000),
+                    finish_reason: None,
+                },
+                applied_user_intents: Vec::new(),
+            },
+        );
+        ctx.fanout_admission.take_completed_direct_children();
+        let sanitized = crate::orchestration::agent_tool::handle_agent_tool(
+            &json!({"action":"get_result", "agent_id":"child"}),
+            Some(&ctx),
+        )
+        .await;
+        let inline = model_projection_before_artifact_replacement(
+            "agent",
+            &sanitized,
+            astra_tools::ModelResultPresentation::Generic,
+        );
+        assert_ne!(sanitized, inline);
 
         let persisted = persist_tool_result_for_record_with_authority(
             Some("reviewer-a"),
@@ -1601,13 +1685,26 @@ mod tests {
             Some("run-io"),
             "call-io",
             "agent",
-            sanitized,
-            "bounded preview".to_string(),
+            &sanitized,
+            inline.clone(),
         )
         .expect("ordinary IO degradation must preserve the original tool outcome");
 
         assert_eq!(persisted.content, sanitized);
         assert!(persisted.artifact.is_none());
+        let delivery: Value = serde_json::from_str(&model_tool_result_for_followup(
+            astra_tools::ModelResultPresentation::Generic,
+            inline,
+            &persisted,
+        ))
+        .unwrap();
+        assert_eq!(delivery["result_delivery_complete"], false);
+        assert_eq!(delivery["error"]["code"], "result_delivery_unavailable");
+        assert!(
+            ctx.fanout_admission
+                .retained_direct_child_result("child")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1865,6 +1962,38 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn work_establishment_receipt_is_typed_and_requires_completed_defer_semantics() {
+        use astra_services::session_journal::RuntimeWorkEstablishmentReceipt as Receipt;
+
+        assert_eq!(
+            work_establishment_receipt("start_work", r#"{"status":"started"}"#),
+            Some(Receipt::Started)
+        );
+        assert_eq!(
+            work_establishment_receipt("start_work", r#"{"status":"continued"}"#),
+            Some(Receipt::Continued)
+        );
+        assert_eq!(
+            work_establishment_receipt(
+                "start_work",
+                r#"{"status":"deferred","operation_id":"op-1","operation_state":"cancelled","assignment_created":false}"#
+            ),
+            Some(Receipt::Deferred {
+                operation_id: "op-1".to_string(),
+            })
+        );
+        for incomplete in [
+            r#"{"status":"deferred","operation_id":"op-1","operation_state":"running","assignment_created":false}"#,
+            r#"{"status":"deferred","operation_id":"op-1","operation_state":"cancelled","assignment_created":true}"#,
+            r#"{"status":"deferred","operation_state":"cancelled","assignment_created":false}"#,
+        ] {
+            assert!(work_establishment_receipt("start_work", incomplete).is_none());
+        }
+        assert!(work_establishment_receipt("read_file", r#"{"status":"started"}"#).is_none());
+        assert!(work_establishment_receipt("start_work", "not json").is_none());
     }
 
     #[test]

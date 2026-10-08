@@ -369,19 +369,6 @@ const INSTRUCTIONS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("show", "Show loaded project instructions"),
 ];
 
-const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("add-member", "Add member to team"),
-    ("context", "Set shared context for team"),
-    ("create", "Create new team"),
-    ("delete", "Delete a team"),
-    ("help", "Show team overview and examples"),
-    ("info", "Show team information"),
-    ("list", "List all teams"),
-    ("restore", "Restore team snapshot"),
-    ("run", "Run a task with the team"),
-    ("snapshot", "Save a team snapshot"),
-];
-
 const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[("edit", "Open the runtime configuration editor")];
 
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
@@ -648,7 +635,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_subcommands(SKILL_SUBCOMMANDS)
     .with_tui_subcommands(TUI_SKILL_SUBCOMMANDS)
     .with_tui_route(TuiCommandRoute::Native),
-    // ── Team and account commands ─────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
         "Explore connected MCP servers, tools, prompts, and resources",
@@ -665,16 +651,6 @@ pub static COMMANDS: &[CommandMeta] = &[
         "mcp read <server>:<uri>",
         "mcp ping [server]",
     ])
-    .with_tui_route(TuiCommandRoute::Native),
-    // ── Team & account ───────────────────────────────────────────────────
-    CommandMeta::new(
-        "/team",
-        "Teams: list|info|create|add-member|context|run|snapshot|restore|delete|help",
-        CommandGroup::Work,
-    )
-    .with_subcommands(TEAM_SUBCOMMANDS)
-    .with_tui_subcommands(&[("run", "Start an ordinary lead turn with a configured team")])
-    .with_arg_hint("[list|info|create|add-member|context|run|…]")
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/agent",
@@ -1027,7 +1003,6 @@ mod tests {
         // Commands with subcommands should also have arg hints
         assert!(get_arg_hint("/session").is_some());
         assert!(get_arg_hint("/skill").is_none());
-        assert!(get_arg_hint("/team").is_some());
 
         // Command without arg_hint should return None
         assert!(get_arg_hint("/clear").is_none());
@@ -1125,7 +1100,6 @@ mod tests {
                 "/info",
                 "/skill",
                 "/mcp",
-                "/team",
                 "/agent",
                 "/login",
                 "/register",

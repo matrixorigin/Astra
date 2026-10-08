@@ -32,13 +32,11 @@ pub(crate) fn clear_pending_recovery_for_ordinary_chat_input(state: &mut Session
     state.resume_restricted_tools.clear();
 }
 
-pub(crate) async fn finalize_effective_line(
+pub(crate) fn finalize_effective_line(
     prepared: PreparedInput,
     user_intent: String,
-    resume_guidance: Option<String>,
     state: &mut SessionState,
 ) -> FinalizedInput {
-    state.diagnostics_context = None;
     let mut runtime_required_texts = prepared.runtime_required_texts;
     let runtime_volatile_texts = Vec::new();
 
@@ -53,10 +51,10 @@ pub(crate) async fn finalize_effective_line(
         ));
     }
 
-    if let Some(guidance) = resume_guidance
+    if let Some(guidance) = state.resume_guidance.as_ref()
         && !guidance.trim().is_empty()
     {
-        runtime_required_texts.push(guidance);
+        runtime_required_texts.push(guidance.clone());
     }
 
     FinalizedInput {
@@ -135,17 +133,18 @@ mod tests {
         assert!(prepared.runtime_required_texts.is_empty());
     }
 
-    #[tokio::test]
-    async fn finalize_effective_line_routes_resume_guidance_to_required_lane() {
-        let mut state = SessionState::default();
+    #[test]
+    fn finalize_effective_line_routes_resume_guidance_to_required_lane() {
+        let mut state = SessionState {
+            resume_guidance: Some("Resume the interrupted turn before answering.".into()),
+            ..SessionState::default()
+        };
 
         let finalized = finalize_effective_line(
             PreparedInput::user_only("continue"),
             "raw continue".into(),
-            Some("Resume the interrupted turn before answering.".into()),
             &mut state,
-        )
-        .await;
+        );
 
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.user_intent, "raw continue");
@@ -183,10 +182,11 @@ mod tests {
         assert!(state.resume_restricted_tools.is_empty());
     }
 
-    #[tokio::test]
-    async fn finalize_effective_line_drains_notifications_without_mutating_user_message() {
+    #[test]
+    fn finalize_effective_line_drains_notifications_without_mutating_user_message() {
         let mut state = SessionState {
             diagnostics_context: Some("<diag/>".into()),
+            resume_guidance: Some("Resume the interrupted task.".into()),
             pending_bg_notifications: vec![
                 "bg-shell-1 completed".into(),
                 "bg-shell-2 failed".into(),
@@ -197,10 +197,8 @@ mod tests {
         let finalized = finalize_effective_line(
             PreparedInput::user_only("continue"),
             "continue".into(),
-            Some("Resume the interrupted task.".into()),
             &mut state,
-        )
-        .await;
+        );
 
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_required_texts.len(), 2);
@@ -217,7 +215,7 @@ mod tests {
         assert!(finalized.runtime_volatile_texts.is_empty());
         assert!(!finalized.user_message.contains("<system-reminder>"));
         assert!(state.pending_bg_notifications.is_empty());
-        assert!(state.diagnostics_context.is_none());
+        assert_eq!(state.diagnostics_context.as_deref(), Some("<diag/>"));
     }
 
     #[tokio::test]
@@ -228,10 +226,8 @@ mod tests {
         let finalized = finalize_effective_line(
             PreparedInput::user_only("what is running?"),
             "what is running?".into(),
-            None,
             &mut state,
-        )
-        .await;
+        );
 
         assert!(
             finalized.runtime_volatile_texts.is_empty(),

@@ -77,6 +77,12 @@ pub(crate) enum AgentControlTarget {
     DurableRun { run_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentRunKind {
+    Agent,
+    ConversationRoot,
+}
+
 /// Authoritative read path for a run transcript.
 ///
 /// This intentionally does not carry pause/resume/cancel authority. A launch

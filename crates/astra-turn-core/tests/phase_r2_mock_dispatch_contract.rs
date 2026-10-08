@@ -26,8 +26,8 @@
 //!      flat, or `{"function":{...}}` OpenAI-style)
 //!   2. the dispatch normalizer needs to handle nested `tool:{name,args}`
 //!
-//! Either way it's a real bug that would break `/team run --mock
-//! tool_then_complete` in any harness that actually reads tool_calls.
+//! Either way it's a real bug for a tool-then-complete stream consumed by
+//! a harness that actually reads tool_calls.
 
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,

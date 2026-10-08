@@ -51,7 +51,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 | **接入与认证** | 注册/登录/刷新/登出；未授权 401/403 明确 | Auth E2E + 安全测试 |
 | **Thin Client 协议** | CLI、SDK、Web 共用同一 HTTP 协议，无 hidden state | SDK E2E + §4 场景 |
 | **Cloud 运行时** | `/chat/stream` server-owned loop、SSE、审计链完整 | Server/Edge callback E2E（system_matrix + legacy mock hook） |
-| **租户与用户隔离** | 用户 A 无法读/写用户 B 的 Session/Memory/Team | 隔离矩阵测试 |
+| **租户与用户隔离** | 用户 A 无法读/写用户 B 的 Session/Memory | 隔离矩阵测试 |
 | **资源治理** | 超配额拒绝；Admin 可 override；计量准确 | ResourceGovernor + Admin API |
 | **Admin 运维** | 冷启动、模型加载、用户/Token/配置管理 | Admin smoke + 部署验收 |
 | **弹性与可用性** | 多副本无状态；HPA 扩缩；依赖故障可恢复 | K8s 压测 + 混沌 |
@@ -233,7 +233,6 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 |------|------|
 | Session | 用户 A 的 `GET /sessions/{id}` 对用户 B → 404/403 |
 | Memory | Memoria 代理以 JWT user 为准；body 伪造无效 |
-| Team | `e2e_matrix_team_*` 跨用户 negative |
 | Audit / Events | 无法读取他人 causal chain |
 | Skills 配置 | user scope 互不可见 |
 | Resource usage | 计量按 user_id 独立 |

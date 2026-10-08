@@ -1411,7 +1411,7 @@ async fn independent_sessions_share_one_physical_checkout() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_plain_turn() {
+async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     let pool = common::setup_pool().await;
     let owner_id = format!("staged-manifest-owner-{}", Uuid::new_v4());
     let session_id = format!("staged-manifest-session-{}", Uuid::new_v4());
@@ -1513,12 +1513,7 @@ async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_pla
     .await
     .expect("stage legacy manifest reference");
 
-    let selection = astra_turn_types::AgentProfileSelection {
-        team_id: "delivery".into(),
-        lead_agent_id: Some("lead".into()),
-    };
     let delta = CanonicalTurnDeltaV1 {
-        agent_profile_selection: Some(selection.clone()),
         schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
         completed_turn: 1,
         journal_event_seq: 1,
@@ -1563,7 +1558,6 @@ async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_pla
     assert_eq!(materialized.messages, messages);
 
     let snapshot = coordinator.load_admission_snapshot(&key).await.unwrap();
-    assert_eq!(snapshot.agent_profile_selection, Some(selection));
     assert_eq!(snapshot.head.unwrap().cursor, cursor);
     assert!(matches!(
         coordinator
@@ -1573,7 +1567,7 @@ async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_pla
         CoordinatorMutationV1::AlreadyApplied { .. }
     ));
     let mut changed = delta.clone();
-    changed.agent_profile_selection = None;
+    changed.config_version_id = Some("changed-config".into());
     assert!(matches!(
         coordinator
             .commit_turn(&reservation, changed, "commit-staged-manifest")
@@ -1589,7 +1583,6 @@ async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_pla
         other => panic!("unexpected reservation: {other:?}"),
     };
     let mut plain = delta.clone();
-    plain.agent_profile_selection = None;
     plain.completed_turn = 2;
     plain.journal_event_seq = 2;
     plain.conversation_seq = 2;
@@ -1600,21 +1593,10 @@ async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_pla
         .commit_turn(&next, plain, "plain-commit")
         .await
         .unwrap();
-    assert!(
-        coordinator
-            .load_admission_snapshot(&key)
-            .await
-            .unwrap()
-            .agent_profile_selection
-            .is_none()
-    );
-    // The first receipt has now been archived; replay must still bind selection.
+    // The first receipt has now been archived; replay must still bind the
+    // same canonical idempotency record.
     let mut changed = delta.clone();
-    changed
-        .agent_profile_selection
-        .as_mut()
-        .unwrap()
-        .lead_agent_id = Some("other-lead".into());
+    changed.config_version_id = Some("other-config".into());
     assert!(matches!(
         coordinator
             .commit_turn(&reservation, changed, "commit-staged-manifest")

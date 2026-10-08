@@ -656,12 +656,14 @@ name = "astra-test-harness"
 version = "0.2.10"
 dependencies = [
  "anyhow",
+ "astra-config",
  "astra-core",
  "astra-credentials",
  "astra-harness",
  "astra-pipeline",
  "astra-server-types",
  "astra-services",
+ "astra-thin-client",
  "astra-turn-core",
  "astra-turn-types",
  "async-trait",

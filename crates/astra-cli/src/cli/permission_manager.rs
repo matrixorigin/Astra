@@ -621,7 +621,7 @@ pub(crate) struct PermissionSettingsLoadOutcome {
 /// Issue #326 P0: `PermissionSettings::load` used to call
 /// `unwrap_or_default()` on parse errors, silently dropping any rules
 /// in a corrupt file. That meant `deny` rules got lost without warning
-/// and team-shared rule files couldn't be diagnosed. This enum exposes
+/// and shared rule files couldn't be diagnosed. This enum exposes
 /// the failure mode so the TUI can surface it (banner / fallback to
 /// session-only) and headless mode can exit non-zero.
 #[derive(Debug)]

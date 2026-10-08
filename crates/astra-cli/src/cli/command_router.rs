@@ -6,8 +6,7 @@ use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
 };
 use crate::cli::cli_config::cli_args::{
-    AuditCmd, ChatArgs, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd,
-    SkillCmd, TeamRunArgs, TeamSubcommand,
+    AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -40,14 +39,14 @@ use crate::cli::skill_catalog::{
 use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
-use crate::cli::slash::{slash_agent, slash_team, slash_telemetry};
+use crate::cli::slash::{slash_agent, slash_telemetry};
 use crate::cli::stream::streaming_types::{
     StreamResult, stream_result_from_resumable_turn_failure,
 };
 use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
 use crate::cli::{diff_presenter, journal_diff, journal_digest, journal_tree, theme};
 use astra_thin_client::paths;
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
 use std::io::Read;
 
@@ -98,6 +97,218 @@ async fn settle_one_shot_stream_event_writer(
 
 fn durable_run_is_terminal(status: Option<&str>) -> bool {
     matches!(status, Some("completed" | "failed" | "cancelled"))
+}
+
+/// Inspection only: two existing Server reads under one captured owner and
+/// deadline. Neither partial output nor a local journal substitutes for a
+/// failed read. This is not a transactional snapshot; both source coverages
+/// and timestamps remain in the returned envelope.
+async fn capture_session_execution(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    session_id: &str,
+    include_transcript: bool,
+    include_run_events: bool,
+) -> Result<serde_json::Value, String> {
+    const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_CAPTURE_BYTES: usize = 5 * 1024 * 1024;
+    let (_, selected_profile, selected, token) = get_profile_and_token(profile)?;
+    let auth = cli_utils::cli_owner_auth_snapshot();
+    if !auth.is_current()
+        || auth.profile_name.as_deref() != Some(selected_profile.as_str())
+        || auth.server_account_id.is_none()
+        || auth.server_account_id != selected.account_id
+    {
+        return Err("execution capture requires the attached signed-in account".into());
+    }
+    let owner = crate::cli::stream::stream_events_writer::StreamEventOwner::capture(api)?;
+    if owner.account_id != auth.server_account_id || owner.profile_name != auth.profile_name {
+        return Err("execution capture owner changed before dispatch".into());
+    }
+    let api = match &auth.native_binding {
+        Some(binding) => api.clone().with_bearer_provider(binding.clone()),
+        None => api.clone().without_bearer_provider(),
+    };
+    let read = async {
+        let tree: astra_server_types::SessionRunTreeSnapshot = api
+            .get_authed_json_bounded(
+                &token,
+                &format!("{}?limit=200", paths::session_runs(session_id)),
+                MAX_SOURCE_BYTES,
+            )
+            .await
+            .map_err(map_thin_err)?;
+        if !auth.is_current() {
+            return Err("execution capture owner changed between reads".into());
+        }
+        let reflection: astra_services::reflect::ReflectReport = api
+            .get_authed_json_bounded(
+                &token,
+                &format!(
+                    "{}?topic=execution&facet=trace&depth=forensic&horizon=session",
+                    paths::chat_session_reflect(session_id)
+                ),
+                MAX_SOURCE_BYTES,
+            )
+            .await
+            .map_err(map_thin_err)?;
+        if tree.schema_version != astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION
+            || reflection.schema_version != 2
+            || tree.session_id != session_id
+            || reflection.session_id != session_id
+            || !auth.is_current()
+        {
+            return Err("execution capture identity or source schema changed".to_string());
+        }
+        let run_ids: Vec<_> = if include_run_events {
+            tree.runs.iter().map(|run| run.run_id.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        if include_run_events
+            && (tree.truncated
+                || run_ids.len() > 200
+                || run_ids.iter().any(String::is_empty)
+                || run_ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != run_ids.len())
+        {
+            return Err("run event capture requires a complete bounded run tree".into());
+        }
+        let mut capture = serde_json::json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "owner": owner,
+            "run_tree": tree,
+            "reflection": reflection,
+        });
+        if include_run_events {
+            let mut projections = Vec::new();
+            let mut retained_bytes = serde_json::to_vec(&capture)
+                .map_err(|e| e.to_string())?
+                .len();
+            for batch in run_ids.chunks(4) {
+                // The existing projection is an authenticated, sanitized recent
+                // tail. Preserve its watermark; absence is not historical proof.
+                let reads = batch.iter().map(|run_id| async {
+                    if !auth.is_current() {
+                        return Err("execution capture owner changed during run event read".into());
+                    }
+                    let projection: serde_json::Value = api
+                        .get_authed_json_bounded(
+                            &token,
+                            &format!("{}/projection?recent_limit=500", paths::chat_run(run_id)),
+                            MAX_SOURCE_BYTES,
+                        )
+                        .await
+                        .map_err(map_thin_err)?;
+                    if projection["session_id"].as_str() != Some(session_id)
+                        || projection["run_id"].as_str() != Some(run_id.as_str())
+                        || !projection["recent_events"].is_array()
+                        || projection["run_event_high_watermark"].as_i64().is_none()
+                        || !auth.is_current()
+                    {
+                        return Err(
+                            "execution run projection identity or coverage unavailable".into()
+                        );
+                    }
+                    Ok::<_, String>(projection)
+                });
+                for result in futures_util::future::join_all(reads).await {
+                    let projection = result?;
+                    retained_bytes += serde_json::to_vec(&projection)
+                        .map_err(|e| e.to_string())?
+                        .len();
+                    if retained_bytes >= MAX_CAPTURE_BYTES {
+                        return Err(
+                            "execution run projections exceeded the capture byte limit".into()
+                        );
+                    }
+                    projections.push(projection);
+                }
+            }
+            capture["run_projections"] = serde_json::Value::Array(projections);
+        }
+        if include_transcript {
+            let mut items = Vec::new();
+            let mut before = None;
+            let mut retained_bytes = 0usize;
+            loop {
+                if !auth.is_current() {
+                    return Err("execution capture owner changed during transcript read".into());
+                }
+                let mut route = format!("{}?limit=200", paths::session_transcript(session_id));
+                if let Some(cursor) = before {
+                    route.push_str(&format!("&before_seq={cursor}"));
+                }
+                let page: astra_thin_client::SessionTranscriptPage = api
+                    .get_authed_json_bounded(&token, &route, MAX_SOURCE_BYTES)
+                    .await
+                    .map_err(map_thin_err)?;
+                retained_bytes += serde_json::to_vec(&page).map_err(|e| e.to_string())?.len();
+                if page.session_id != session_id
+                    || retained_bytes > MAX_SOURCE_BYTES
+                    || items.len() + page.items.len() > 4096
+                    || !auth.is_current()
+                    || page.items.iter().any(|item| {
+                        item.session_id != session_id
+                            || item.item_seq <= 0
+                            || before.is_some_and(|cursor| item.item_seq >= cursor)
+                    })
+                {
+                    return Err("execution transcript identity or capacity boundary failed".into());
+                }
+                let oldest = page.items.iter().map(|item| item.item_seq).min();
+                items.extend(page.items);
+                if !page.has_more {
+                    if page.next_before_seq.is_some() && page.next_before_seq != oldest {
+                        return Err(
+                            "execution transcript has a contradictory terminal cursor".into()
+                        );
+                    }
+                    break;
+                }
+                let cursor = page
+                    .next_before_seq
+                    .ok_or("execution transcript is missing its cursor")?;
+                if oldest != Some(cursor) || before.is_some_and(|prior| cursor >= prior) {
+                    return Err("execution transcript cursor did not advance".into());
+                }
+                before = Some(cursor);
+            }
+            items.sort_by_key(|item| item.item_seq);
+            if items
+                .windows(2)
+                .any(|pair| pair[0].item_seq == pair[1].item_seq)
+            {
+                return Err("execution transcript has duplicate item identities".into());
+            }
+            capture["transcript"] =
+                serde_json::to_value(astra_thin_client::SessionTranscriptPage {
+                    session_id: session_id.to_string(),
+                    items,
+                    next_before_seq: None,
+                    has_more: false,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        if serde_json::to_vec(&capture)
+            .map_err(|e| e.to_string())?
+            .len()
+            > MAX_CAPTURE_BYTES
+        {
+            return Err("execution capture exceeded its output byte limit".into());
+        }
+        if !auth.is_current() {
+            return Err("execution capture owner changed before publication".into());
+        }
+        Ok(capture)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), read)
+        .await
+        .map_err(|_| "execution capture exceeded its total read deadline".to_string())?
 }
 
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
@@ -752,69 +963,6 @@ fn execute_repl_bridge_command<'a>(
     ))
 }
 
-pub(crate) fn parse_team_bridge_command(arg: &str) -> Result<Command, String> {
-    let words = shell_words::split(arg)
-        .map_err(|error| format!("invalid /team command quoting: {error}"))?;
-    let mut argv = Vec::with_capacity(words.len() + 2);
-    argv.push("astra".to_string());
-    argv.push("team".to_string());
-    argv.extend(words);
-    let parsed = Cli::try_parse_from(argv).map_err(|error| error.to_string())?;
-    match parsed.command {
-        Some(command @ Command::Team(_)) => Ok(command),
-        _ => Err("/team requires a Team subcommand".to_string()),
-    }
-}
-
-fn team_run_chat_args(run: &TeamRunArgs, message: String) -> ChatArgs {
-    let mut chat = ChatArgs::one_shot_message(message);
-    chat.json = run.json;
-    chat.no_resume = run.no_resume;
-    chat.stream_events = run.stream_events.clone();
-    chat.explain = run.explain;
-    chat.max_wall_time_seconds = run.max_wall_time_seconds;
-    chat
-}
-
-#[cfg(test)]
-mod team_run_capture_tests {
-    use super::{parse_team_bridge_command, team_run_chat_args};
-    use crate::cli::cli_config::cli_args::{Command, TeamSubcommand};
-    use std::path::Path;
-
-    #[test]
-    fn team_run_projection_preserves_existing_chat_capture_controls() {
-        let Command::Team(args) = parse_team_bridge_command(
-            "run dev --lead-agent-id lead --json --no-resume --stream-events events.jsonl --explain=verbose --max-wall-time-seconds 90 task",
-        )
-        .expect("Team command") else {
-            panic!("Team command")
-        };
-        let Some(TeamSubcommand::Run(run)) = args.command else {
-            panic!("Run command")
-        };
-
-        let chat = team_run_chat_args(&run, "task".to_string());
-        assert!(chat.json);
-        assert!(chat.no_resume);
-        assert_eq!(
-            chat.explain,
-            Some(crate::cli::session::session_state::ExplainMode::Verbose)
-        );
-        assert_eq!(chat.max_wall_time_seconds, Some(90));
-        assert_eq!(
-            chat.stream_events.as_deref(),
-            Some(Path::new("events.jsonl"))
-        );
-        for (budget, valid) in [("0", false), ("70", false), ("71", true)] {
-            let parsed = parse_team_bridge_command(&format!(
-                "run dev --max-wall-time-seconds {budget} task"
-            ));
-            assert_eq!(parsed.is_ok(), valid, "wall budget {budget}");
-        }
-    }
-}
-
 async fn execute_repl_bridge_command_impl(
     slash_cmd: &str,
     arg: &str,
@@ -823,45 +971,6 @@ async fn execute_repl_bridge_command_impl(
     api: &astra_thin_client::ThinClient,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
-    if slash_cmd == "/team" {
-        let command = parse_team_bridge_command(arg)?;
-        if let Command::Team(args) = &command
-            && let Some(TeamSubcommand::Run(run)) = args.command.as_ref()
-        {
-            let request = slash_team::resolve_team_run_chat_request(
-                api,
-                profile,
-                &run.team,
-                run.lead_agent_id.as_deref(),
-                &run.task.join(" "),
-            )
-            .await?;
-            let mut selected_context = cli_context.clone();
-            selected_context.agent_profile_selection = Some(request.selection);
-            return execute_cli_command(
-                Some(Command::Chat(team_run_chat_args(run, request.message))),
-                profile.map(ToOwned::to_owned),
-                global_model.map(ToOwned::to_owned),
-                false,
-                None,
-                api,
-                false,
-                &selected_context,
-            )
-            .await;
-        }
-        return execute_cli_command(
-            Some(command),
-            profile.map(ToOwned::to_owned),
-            global_model.map(ToOwned::to_owned),
-            false,
-            None,
-            api,
-            false,
-            cli_context,
-        )
-        .await;
-    }
     try_silent_auth(api, profile).await;
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
@@ -963,8 +1072,7 @@ mod permission_mode_display_tests {
 #[cfg(test)]
 mod token_refresh_error_tests {
     use super::{
-        execute_cli_command, execute_repl_bridge_command, repl_bridge_access_token,
-        repl_bridge_command_requires_access_token,
+        execute_cli_command, repl_bridge_access_token, repl_bridge_command_requires_access_token,
     };
     use crate::cli::cli_config::cli_args::Cli;
     use crate::cli::cli_config::cli_context::CliContext;
@@ -1106,138 +1214,306 @@ mod token_refresh_error_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn public_team_run_registers_after_canonical_lead_validation() {
+    async fn execution_capture_keeps_one_owner_and_rejects_partial_or_foreign_sources() {
+        const CHILD: &str = "ASTRA_EXECUTION_CAPTURE_CONTRACT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::command_router::token_refresh_error_tests::execution_capture_keeps_one_owner_and_rejects_partial_or_foreign_sources", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
         use crate::cli::cli_config::cli_utils;
+        use wiremock::matchers::{header, query_param};
 
         let _creds = crate::tests::isolate_credentials();
-        let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "team-token");
-        let _registry = EnvVarGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
         let mut credentials = astra_credentials::CredentialsFile::default();
         credentials.profiles.insert(
             "default".into(),
             astra_credentials::Profile {
                 account_id: Some("owner".into()),
-                access_token: Some("team-token".into()),
+                access_token: Some("inspection-token".into()),
                 ..Default::default()
             },
         );
         cli_utils::save_credentials(&credentials).unwrap();
         let _identity =
             cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut valid_sources = None;
+        for (
+            tree_session,
+            reflect_session,
+            reflect_schema,
+            reflect_status,
+            transcript_fault,
+            valid,
+        ) in [
+            ("session", "session", 2, 200, None, true),
+            ("foreign", "session", 2, 200, None, false),
+            ("session", "foreign", 2, 200, None, false),
+            ("session", "session", 1, 200, None, false),
+            ("session", "session", 2, 503, None, false),
+            ("session", "session", 2, 200, Some("foreign"), false),
+            ("session", "session", 2, 200, Some("cursor"), false),
+        ] {
+            let server = MockServer::start().await;
+            let tree = serde_json::json!({
+                "schema_version": astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION,
+                "session_id": tree_session, "snapshot_revision": "revision",
+                "observed_at": "2026-10-07T00:00:00Z", "node_limit": 200,
+                "truncated": false, "runs": [],
+            });
+            let reflection = serde_json::json!({
+                "schema_version": reflect_schema, "tool": "reflect",
+                "session_id": reflect_session, "analysis_view": "execution_trace",
+                "topic": "execution", "facet": "trace", "depth": "forensic",
+                "horizon": "session", "source_policy": "local_first", "include_context": false,
+                "data_coverage": {"source": "server", "events": 0, "decisions": 0},
+                "model_requests": astra_services::reflect::ModelRequestCapture::default(),
+            });
+            if valid {
+                valid_sources = Some((tree.clone(), reflection.clone()));
+            }
+            for (route, status, body) in [
+                ("/sessions/session/runs", 200, tree),
+                ("/chat/session/session/reflect", reflect_status, reflection),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .and(header("authorization", "Bearer inspection-token"))
+                    .and(query_param(
+                        if route.ends_with("/runs") {
+                            "limit"
+                        } else {
+                            "depth"
+                        },
+                        if route.ends_with("/runs") {
+                            "200"
+                        } else {
+                            "forensic"
+                        },
+                    ))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            if valid || transcript_fault.is_some() {
+                for (before, seq, has_more) in [(None, 2, true), (Some("2"), 1, false)] {
+                    let mut mock = Mock::given(method("GET"))
+                        .and(path("/sessions/session/transcript"))
+                        .and(header("authorization", "Bearer inspection-token"))
+                        .and(query_param("limit", "200"));
+                    if let Some(before) = before {
+                        mock = mock.and(query_param("before_seq", before));
+                    } else {
+                        mock = mock.and(wiremock::matchers::query_param_is_missing("before_seq"));
+                    }
+                    mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "session_id":if transcript_fault == Some("foreign") { "foreign" } else { "session" },
+                        "has_more":has_more,
+                        "next_before_seq":if transcript_fault == Some("cursor") { seq + 1 } else { seq },
+                        "items":[{"session_id":"session", "item_seq":seq, "run_id":"root",
+                            "role":"user", "content":"test", "created_at":"2026-10-07T00:00:00Z"}],
+                    }))).expect(1).mount(&server).await;
+                    if transcript_fault.is_some() {
+                        break;
+                    }
+                }
+            }
+            let api =
+                astra_thin_client::ThinClient::new(&server.uri(), Some("wrong-default".into()))
+                    .unwrap();
+            let result = super::capture_session_execution(
+                &api,
+                Some("default"),
+                "session",
+                valid || transcript_fault.is_some(),
+                false,
+            )
+            .await;
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if let Ok(capture) = result {
+                assert_eq!(capture["owner"]["account_id"], "owner");
+                assert_eq!(capture["owner"]["profile_name"], "default");
+                assert_eq!(capture["transcript"]["has_more"], false);
+                assert_eq!(capture["transcript"]["items"][0]["item_seq"], 1);
+                assert_eq!(capture["transcript"]["items"][1]["item_seq"], 2);
+                assert_eq!(capture["owner"]["api_origin"], api.api_origin());
+                assert_eq!(capture["run_tree"]["session_id"], "session");
+                assert_eq!(capture["reflection"]["schema_version"], 2);
+            }
+            server.verify().await;
+        }
+        let (tree, reflection) = valid_sources.unwrap();
+        for (projection_session, projection_run, truncated, valid) in [
+            ("session", "root", false, true),
+            ("foreign", "root", false, false),
+            ("session", "foreign", false, false),
+            ("session", "root", true, false),
+        ] {
+            let server = MockServer::start().await;
+            let mut event_tree = tree.clone();
+            event_tree["truncated"] = truncated.into();
+            event_tree["runs"] = serde_json::json!([{
+                "run_id":"root", "root_run_id":"root", "depth":0,
+                "status":"completed", "run_event_high_watermark":7,
+                "total_tool_calls":0, "runtime":{}, "available_actions":[],
+                "created_at":"2026-10-07T00:00:00Z", "updated_at":"2026-10-07T00:00:00Z",
+            }]);
+            for (route, body, expected) in [
+                ("/sessions/session/runs", event_tree, 1),
+                ("/chat/session/session/reflect", reflection.clone(), 1),
+                (
+                    "/chat/runs/root/projection",
+                    serde_json::json!({
+                        "run_id":projection_run, "session_id":projection_session,
+                        "run_event_high_watermark":7, "projection_event_idx":7,
+                        "recent_events":[{"index":7,"type":"run_finished"}],
+                    }),
+                    u64::from(!truncated),
+                ),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .and(header("authorization", "Bearer inspection-token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .expect(expected)
+                    .mount(&server)
+                    .await;
+            }
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let result =
+                super::capture_session_execution(&api, Some("default"), "session", false, true)
+                    .await;
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if let Ok(capture) = result {
+                assert_eq!(capture["run_projections"][0]["run_event_high_watermark"], 7);
+                assert_eq!(
+                    capture["run_projections"][0]["recent_events"][0]["index"],
+                    7
+                );
+                assert!(capture.get("transcript").is_none());
+                let requests = server.received_requests().await.unwrap();
+                assert!(
+                    requests
+                        .iter()
+                        .any(|request| request.url.query() == Some("recent_limit=500"))
+                );
+            }
+            server.verify().await;
+        }
         let server = MockServer::start().await;
-        let mut team = astra_services::team_persistence::builtin_teams("owner").remove(0);
-        team.team_id = "server-team-id".into();
-        team.name = "dev".into();
-        team.members[0].agent_id = "lead".into();
         Mock::given(method("GET"))
-            .and(path("/teams/name/dev"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&team))
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/agents/edge"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(2)
-            .mount(&server)
-            .await;
-
-        let parsed = Cli::try_parse_from([
-            "astra",
-            "team",
-            "run",
-            "dev",
-            "--lead-agent-id",
-            "lead",
-            "child task",
-        ])
-        .expect("team run arguments");
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
-        let error = execute_cli_command(
-            parsed.command,
-            None,
-            None,
-            false,
-            None,
-            &api,
-            false,
-            &CliContext::default(),
-        )
-        .await
-        .expect_err("Team root turn must fail when Edge registration is unavailable");
-
-        assert!(
-            error.contains("Edge registration failed before chat"),
-            "{error}"
-        );
-        let requests = server.received_requests().await.expect("requests");
-        assert_eq!(requests.len(), 2, "chat and child admission must not start");
-        assert_eq!(requests[0].url.path(), "/teams/name/dev");
-        assert_eq!(requests[1].url.path(), "/agents/edge");
-
-        let error = execute_repl_bridge_command(
-            "/team",
-            "run dev --lead-agent-id lead \"child task\"",
-            None,
-            None,
-            &api,
-            &CliContext::default(),
-        )
-        .await
-        .expect_err("bridge Team Run must stop when Edge admission fails");
-        assert!(
-            error.contains("Edge registration failed before chat"),
-            "{error}"
-        );
-        let requests = server.received_requests().await.expect("requests");
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[2].url.path(), "/teams/name/dev");
-        assert_eq!(requests[3].url.path(), "/agents/edge");
-
-        server.reset().await;
-        Mock::given(method("POST"))
-            .and(path("/teams"))
-            .respond_with(|request: &wiremock::Request| {
-                let mut accepted: serde_json::Value = request.body_json().unwrap();
-                assert!(!accepted["team_id"].as_str().unwrap().is_empty());
-                accepted["user_id"] = serde_json::json!("owner");
-                accepted["revision"] = serde_json::json!(1);
-                ResponseTemplate::new(200).set_body_json(accepted)
-            })
+            .and(path("/sessions/session/runs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&tree)
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/session/session/reflect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&reflection))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let replace = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while server.received_requests().await.unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            cli_utils::install_cli_profile_identity_for_test("other", Some("other-owner")).unwrap()
+        };
+        let (result, replacement) = tokio::join!(
+            super::capture_session_execution(&api, Some("default"), "session", false, false),
+            replace
+        );
+        assert!(result.unwrap_err().contains("between reads"));
+        server.verify().await;
+        drop(replacement);
 
-        let result = execute_repl_bridge_command(
-            "/team",
-            "create draft description",
-            None,
-            None,
+        // A native binding replaces even a valid but unrelated ambient provider.
+        let server = MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("native"));
+        let mut session = crate::cli::native_auth::test_session();
+        session.environment.astra_url = server.uri();
+        let (mut session, _) = store.publish(session.clone()).unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, session.clone());
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        let _native_identity = cli_utils::install_cli_profile_identity_for_test(
+            &binding.profile_name(),
+            Some("astra-a"),
+        )
+        .unwrap();
+        let other_store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("other"));
+        session.access_token = "wrong-provider".into();
+        let (session, _) = other_store.publish(session).unwrap();
+        let other = crate::cli::native_auth::binding_for_test(other_store, session);
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(other);
+        for (route, body) in [
+            ("/sessions/session/runs", tree),
+            ("/chat/session/session/reflect", reflection),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header("authorization", "Bearer test-access-a"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let capture = super::capture_session_execution(
             &api,
-            &CliContext::default(),
+            Some(&binding.profile_name()),
+            "session",
+            false,
+            false,
         )
         .await
-        .expect("Team configuration command");
-
-        assert_eq!(result, crate::cli::exit_code::ExitCode::Success);
-        let requests = server.received_requests().await.expect("requests");
-        assert_eq!(
-            requests.len(),
-            1,
-            "create must not hydrate or reread a collection"
-        );
-        assert_eq!(requests[0].method.as_str(), "POST");
+        .unwrap();
+        assert_eq!(capture["owner"]["account_id"], "astra-a");
+        server.verify().await;
         assert!(
-            requests
-                .iter()
-                .all(|request| request.url.path() == "/teams")
+            Cli::try_parse_from(["astra", "session", "show", "session", "--execution"]).is_ok()
         );
         assert!(
-            requests
-                .iter()
-                .all(|request| request.url.path() != "/agents/edge"),
-            "configuration commands must not perform Edge registration"
+            Cli::try_parse_from([
+                "astra",
+                "session",
+                "show",
+                "session",
+                "--execution",
+                "--run-events",
+            ])
+            .is_ok()
         );
+        assert!(
+            Cli::try_parse_from(["astra", "session", "show", "session", "--run-events",]).is_err()
+        );
+        for mutation in ["close", "cancel", "delete"] {
+            assert!(
+                Cli::try_parse_from(["astra", "session", mutation, "session", "--execution"])
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -1458,10 +1734,8 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
-            let mut continuation_context = cli_context.clone();
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs(&mut continuation_context)?;
-            let cli_context = &continuation_context;
+                session_routing.continuation_turn_inputs()?;
             let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = PermissionManager::with_load_policy(
                 effective_permission_mode,
@@ -1509,7 +1783,6 @@ async fn execute_cli_command_impl(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
-                profile.as_deref(),
                 &mut pm,
                 turn_options.clone(),
             )
@@ -1532,7 +1805,6 @@ async fn execute_cli_command_impl(
                                 &chat_ctx,
                                 &new_token,
                                 session_id.as_deref(),
-                                profile.as_deref(),
                                 &mut pm,
                                 turn_options.clone(),
                             )
@@ -1700,42 +1972,6 @@ async fn execute_cli_command_impl(
                     ExitCode::ApiError
                 },
             )
-        }
-
-        Some(Command::Team(args)) => {
-            if let Some(TeamSubcommand::Run(run)) = args.command.as_ref() {
-                let request = slash_team::resolve_team_run_chat_request(
-                    api,
-                    profile.as_deref(),
-                    &run.team,
-                    run.lead_agent_id.as_deref(),
-                    &run.task.join(" "),
-                )
-                .await?;
-                let mut selected_context = cli_context.clone();
-                selected_context.agent_profile_selection = Some(request.selection);
-                return execute_cli_command(
-                    Some(Command::Chat(team_run_chat_args(run, request.message))),
-                    profile,
-                    global_model,
-                    auto_approve,
-                    system_prompt,
-                    api,
-                    no_instructions,
-                    &selected_context,
-                )
-                .await;
-            }
-
-            try_silent_auth(api, profile.as_deref()).await;
-            let mut state =
-                initialize_session_state(profile.as_deref(), global_model.as_deref(), cli_context);
-            fresh_access_token_or_error(api, profile.as_deref()).await?;
-            state.team_store = std::sync::Arc::new(
-                crate::cli::http_team_store::HttpTeamStore::new(api, profile.as_deref()),
-            );
-            slash_team::handle_team_command(args, api, profile.as_deref(), &mut state).await?;
-            Ok(ExitCode::Success)
         }
 
         Some(Command::Work(command)) => {
@@ -2049,10 +2285,8 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
-            let mut continuation_context = cli_context.clone();
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs(&mut continuation_context)?;
-            let cli_context = &continuation_context;
+                session_routing.continuation_turn_inputs()?;
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = {
@@ -2080,13 +2314,16 @@ async fn execute_cli_command_impl(
                 args.stream_events.as_deref()
             {
                 let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
-                let handle = crate::cli::stream::stream_events_writer::spawn_file_writer(rx, path)
-                    .map_err(|error| {
-                        format!(
-                            "failed to open stream-event file {}: {error}",
-                            path.display()
-                        )
-                    })?;
+                let owner =
+                    crate::cli::stream::stream_events_writer::StreamEventOwner::capture(api)?;
+                let handle =
+                    crate::cli::stream::stream_events_writer::spawn_file_writer(rx, path, owner)
+                        .map_err(|error| {
+                            format!(
+                                "failed to open stream-event file {}: {error}",
+                                path.display()
+                            )
+                        })?;
                 (Some(tx), Some(handle))
             } else {
                 (None, None)
@@ -2135,7 +2372,6 @@ async fn execute_cli_command_impl(
                 deferred_tool_activations,
                 append_system_prompt: args.append_system_prompt.clone(),
                 execution_time_budget: one_shot_execution_time_budget,
-                disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
                 turn_index: Some(session_routing.next_server_turn_index()),
                 cancel_token: wall_deadline_cancel_token.clone(),
                 incremental_state: wall_deadline_incremental_state.clone(),
@@ -2154,7 +2390,6 @@ async fn execute_cli_command_impl(
                     &chat_ctx,
                     &token,
                     session_id.as_deref(),
-                    profile.as_deref(),
                     &mut pm,
                     turn_options,
                 );
@@ -2424,6 +2659,21 @@ async fn execute_cli_command_impl(
 
         Some(Command::Session(SessionCmd::Show(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
+            if args.execution {
+                let capture = capture_session_execution(
+                    api,
+                    profile.as_deref(),
+                    session_id,
+                    args.transcript,
+                    args.run_events,
+                )
+                .await?;
+                stdout_println!(
+                    "{}",
+                    serde_json::to_string(&capture).map_err(|e| e.to_string())?
+                );
+                return Ok(ExitCode::Success);
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_session_text(&token, session_id)
@@ -3296,10 +3546,8 @@ pub(crate) async fn run_print_mode(
         session_routing.restored_permission_mode(),
         true,
     )?;
-    let mut continuation_context = cli_context.clone();
     let (mut continuation_messages, deferred_tool_activations) =
-        session_routing.continuation_turn_inputs(&mut continuation_context)?;
-    let cli_context = &continuation_context;
+        session_routing.continuation_turn_inputs()?;
     let _pipeline = create_pipeline_modules(api, profile).await;
     // Print mode is non-interactive. Restored session mode wins when present;
     // otherwise Auto is the headless fallback.
@@ -3373,7 +3621,6 @@ pub(crate) async fn run_print_mode(
         &chat_ctx,
         &token,
         session_id.as_deref(),
-        profile,
         &mut pm,
         turn_options,
     )

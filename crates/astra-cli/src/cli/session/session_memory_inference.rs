@@ -261,6 +261,7 @@ fn classify_thin_client_error(error: ThinClientError) -> ClassifiedError {
             );
         }
         ThinClientError::Json(_)
+        | ThinClientError::ResponseTooLarge { .. }
         | ThinClientError::SseParse(_)
         | ThinClientError::SessionCancellationPending { .. }
         | ThinClientError::InvalidSessionCancellationResponse(_)

@@ -1450,6 +1450,19 @@ These rules deliberately keep caches, skill metadata, client requests, and calle
 futures as consumers of lifecycle truth rather than additional lifecycle
 producers.
 
+For a live run paused before provider delivery, admission retains the original
+logical plan and physical request identity. Resume does not replay the Host or
+reset its deadline, retry budget, or one-shot controls. Waiting uses the existing
+run control signal outside the single admission-I/O timeout; it adds no database
+polling. Cancellation, execution-lease loss, and the original total deadline still
+bound the wait. New guidance fences the frozen request and returns control to the
+ordinary input boundary before provider delivery.
+
+Uncertain admission must first recover an authoritative commit/settlement fact.
+A paused scope permits reuse only when recovery proves that the original plan
+is absent. An already-settled identity cannot be revived; it follows the existing
+bounded replacement path. A pause signal alone is not proof of either outcome.
+
 ### Causal verification gates
 
 Offline contract tests cover typed request rejection, inheritance versus explicit

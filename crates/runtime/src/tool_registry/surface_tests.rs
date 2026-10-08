@@ -492,7 +492,6 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("No substitution"));
-    assert!(agent_description.contains("Omit unasked model policy"));
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -504,7 +503,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     );
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
     assert!(summary.contains("Not task/output text"));
-    assert!(summary.contains("omit unless asked"));
+    assert!(summary.contains("inherit unless user picks execution model"));
     let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
@@ -587,9 +586,9 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .unwrap();
     for constraint in [
-        "Directory: exact ID required",
-        "absent: omit (read-only)",
-        "No file discovery",
+        "Omit for read-only",
+        "task/general-purpose",
+        "shell or mutation",
     ] {
         assert!(profile.contains(constraint), "{profile}");
     }
@@ -875,8 +874,7 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     let advanced_memory = json!({
         "action": "remember",
         "content": "durable preference",
-        "visibility": "team",
-        "team_id": "team-1"
+        "trust_tier": "durable",
     });
     assert!(
         astra_tools::schemas::validate_tool_arguments_against_schema(
@@ -892,7 +890,28 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
         &advanced_memory,
         find(&full, "memory"),
     )
-    .expect("the deferred canonical memory contract retains advanced fields");
+    .expect("the deferred canonical memory contract retains generic memory metadata");
+
+    let retired_team_memory = json!({
+        "action": "remember",
+        "content": "durable preference",
+        "visibility": "team",
+        "team_id": "team-1"
+    });
+    for memory in [find(&resident, "memory"), find(&full, "memory")] {
+        let properties = &memory["function"]["parameters"]["properties"];
+        assert!(properties.get("visibility").is_none());
+        assert!(properties.get("team_id").is_none());
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "memory",
+                &retired_team_memory,
+                memory,
+            )
+            .is_err(),
+            "retired Team memory controls must not be advertised or accepted"
+        );
+    }
 
     let forget = json!({"action": "forget", "memory_id": "owned-memory", "reason": "user request"});
     assert!(

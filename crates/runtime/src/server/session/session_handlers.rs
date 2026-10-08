@@ -2134,7 +2134,6 @@ pub(crate) async fn resume_session_handler(
                     provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
                         head.cursor.clone(),
                         astra_turn_types::ResumeProviderProjectionV1 {
-                            agent_profile_selection: snapshot.agent_profile_selection,
                             ..Default::default()
                         },
                     )),

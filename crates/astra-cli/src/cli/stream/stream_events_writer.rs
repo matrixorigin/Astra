@@ -11,9 +11,42 @@ use std::path::Path;
 const THINKING_CHUNK_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const THINKING_CHUNK_FLUSH_BYTES: usize = 8 * 1024;
 
+/// Provenance captured by the CLI that owns this machine-event file.
+/// Credentials and mutable authentication bindings never enter the protocol.
+#[derive(serde::Serialize)]
+pub(crate) struct StreamEventOwner {
+    pub(crate) account_id: Option<String>,
+    pub(crate) profile_name: Option<String>,
+    pub(crate) api_origin: String,
+}
+
+impl StreamEventOwner {
+    pub(crate) fn capture(api: &astra_thin_client::ThinClient) -> Result<Self, String> {
+        let api_origin = api.api_origin();
+        let url = url::Url::parse(&api_origin).map_err(|_| "invalid machine-event API origin")?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "machine-event API origin must not contain credentials, query, or fragment".into(),
+            );
+        }
+        let (profile_name, account_id) =
+            crate::cli::cli_config::cli_utils::installed_cli_owner_metadata();
+        Ok(Self {
+            account_id,
+            profile_name,
+            api_origin,
+        })
+    }
+}
+
 pub(crate) fn spawn_file_writer(
     mut rx: StreamEventRx,
     path: &Path,
+    owner: StreamEventOwner,
 ) -> std::io::Result<tokio::task::JoinHandle<std::io::Result<()>>> {
     let parent = path
         .parent()
@@ -36,7 +69,7 @@ pub(crate) fn spawn_file_writer(
     Ok(tokio::spawn(async move {
         let mut writer = std::io::BufWriter::new(file);
         let mut write_error = None;
-        write_stream_events(&mut rx, |json, flush_after| {
+        write_stream_events(&mut rx, &owner, |json, flush_after| {
             if let Err(error) = writeln!(writer, "{json}") {
                 write_error = Some(error);
                 return false;
@@ -55,7 +88,11 @@ pub(crate) fn spawn_file_writer(
     }))
 }
 
-async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String, bool) -> bool) {
+async fn write_stream_events(
+    rx: &mut StreamEventRx,
+    owner: &StreamEventOwner,
+    mut emit: impl FnMut(String, bool) -> bool,
+) {
     let mut thinking = String::new();
     let mut thinking_model_item_id = None;
     let mut flush = tokio::time::interval_at(
@@ -69,21 +106,21 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
             event = rx.recv() => {
                 let Some(event) = event else {
                     if !thinking.is_empty() {
-                        let _ = emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false);
+                        let _ = emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }, owner), false);
                     }
                     break;
                 };
                 match event {
                     StreamEvent::ThinkingChunk { model_item_id, text } => {
                         if !thinking.is_empty() && thinking_model_item_id != model_item_id {
-                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }, owner), false) {
                                 break;
                             }
                         }
                         thinking_model_item_id = model_item_id;
                         thinking.push_str(&text);
                         if thinking.len() >= THINKING_CHUNK_FLUSH_BYTES {
-                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }, owner), false) {
                                 break;
                             }
                         }
@@ -93,7 +130,7 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
                         // boundary while collapsing only adjacent preview
                         // fragments.
                         if !thinking.is_empty() {
-                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }, owner), false) {
                                 break;
                             }
                         }
@@ -101,14 +138,14 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
                         // to timeout observers without turning token streaming
                         // into one filesystem flush per model delta.
                         let flush_after = !matches!(event, StreamEvent::Token { .. });
-                        if !emit(event_to_json(&event), flush_after) {
+                        if !emit(event_to_json(&event, owner), flush_after) {
                             break;
                         }
                     }
                 }
             }
             _ = flush.tick(), if !thinking.is_empty() => {
-                if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
+                if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }, owner), false) {
                     break;
                 }
             }
@@ -116,13 +153,13 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
     }
 }
 
-fn event_to_json(event: &StreamEvent) -> String {
+fn event_to_json(event: &StreamEvent, owner: &StreamEventOwner) -> String {
     let value = match event {
         StreamEvent::SessionBound(session_id) => {
-            serde_json::json!({"type": "session_bound", "session_id": session_id})
+            serde_json::json!({"type": "session_bound", "session_id": session_id, "owner": owner})
         }
         StreamEvent::RunBound(run_id) => {
-            serde_json::json!({"type": "run_bound", "run_id": run_id})
+            serde_json::json!({"type": "run_bound", "run_id": run_id, "owner": owner})
         }
         StreamEvent::ContextWindowPolicy {
             raw_window_tokens,
@@ -398,9 +435,43 @@ fn event_to_json(event: &StreamEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_to_json, spawn_file_writer, write_stream_events};
+    use super::{StreamEventOwner, spawn_file_writer, write_stream_events};
     use crate::cli::chat_stream::StreamEvent;
     use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
+
+    fn test_owner() -> StreamEventOwner {
+        StreamEventOwner {
+            account_id: Some("owner-a".into()),
+            profile_name: Some("profile-a".into()),
+            api_origin: "https://astra.example".into(),
+        }
+    }
+
+    fn event_to_json(event: &StreamEvent) -> String {
+        super::event_to_json(event, &test_owner())
+    }
+
+    #[test]
+    fn machine_owner_preserves_endpoint_identity_without_serializing_url_secrets() {
+        let _credentials = crate::test_utils::isolate_credentials();
+        let owner = crate::cli::cli_config::cli_utils::installed_cli_owner_metadata();
+        let api = astra_thin_client::ThinClient::new("https://astra.example/api/", None).unwrap();
+        let captured = StreamEventOwner::capture(&api).unwrap();
+        assert_eq!(captured.api_origin, "https://astra.example/api");
+        assert_eq!(captured.account_id, owner.1);
+        assert_eq!(captured.profile_name, owner.0);
+        for endpoint in [
+            "https://private-user:private-password@astra.example",
+            "https://astra.example?token=private-token",
+            "https://astra.example#private-fragment",
+        ] {
+            let api = astra_thin_client::ThinClient::new(endpoint, None).unwrap();
+            let error = StreamEventOwner::capture(&api)
+                .err()
+                .expect("secret-bearing URLs must not enter the machine protocol");
+            assert!(!error.contains("private-"));
+        }
+    }
 
     #[tokio::test]
     async fn adjacent_thinking_chunks_are_coalesced_before_structural_events() {
@@ -422,7 +493,7 @@ mod tests {
             drop(tx);
 
             let mut lines = Vec::new();
-            write_stream_events(&mut rx, |line, _| {
+            write_stream_events(&mut rx, &test_owner(), |line, _| {
                 lines.push(line);
                 true
             })
@@ -463,7 +534,7 @@ mod tests {
         drop(tx);
 
         let mut writes = 0;
-        write_stream_events(&mut rx, |_, _| {
+        write_stream_events(&mut rx, &test_owner(), |_, _| {
             writes += 1;
             false
         })
@@ -836,10 +907,29 @@ mod tests {
 
     #[tokio::test]
     async fn file_writer_drains_only_valid_json_lines() {
+        let _credentials = crate::test_utils::isolate_credentials();
+        let _owner_a = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "profile-a",
+            Some("owner-a"),
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
-        let handle = spawn_file_writer(rx, &path).unwrap();
+        let api = astra_thin_client::ThinClient::new("https://astra.example", None).unwrap();
+        let captured = StreamEventOwner::capture(&api).unwrap();
+        let handle = spawn_file_writer(rx, &path, captured).unwrap();
+        let _owner_b = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "profile-b",
+            Some("owner-b"),
+        )
+        .unwrap();
+        tx.send(StreamEvent::SessionBound("session-a".into()))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::RunBound("run-a".into()))
+            .await
+            .unwrap();
         tx.send(StreamEvent::ToolStarted {
             name: "bash".into(),
             description: "dangerous command warning remains on stderr".into(),
@@ -866,19 +956,30 @@ mod tests {
 
         let contents = std::fs::read_to_string(path).unwrap();
         let lines = contents.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 4);
         for line in &lines {
             let event: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(event.get("type").is_some());
         }
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(lines[0]).unwrap()["tool_use_id"],
+            serde_json::from_str::<serde_json::Value>(lines[2]).unwrap()["tool_use_id"],
             "call-1"
         );
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(lines[1]).unwrap()["tool_use_id"],
+            serde_json::from_str::<serde_json::Value>(lines[3]).unwrap()["tool_use_id"],
             "call-1"
         );
+        for (index, kind, id_key, id) in [
+            (0, "session_bound", "session_id", "session-a"),
+            (1, "run_bound", "run_id", "run-a"),
+        ] {
+            let event: serde_json::Value = serde_json::from_str(lines[index]).unwrap();
+            assert_eq!(event["type"], kind);
+            assert_eq!(event[id_key], id);
+            assert_eq!(event["owner"]["account_id"], "owner-a");
+            assert_eq!(event["owner"]["profile_name"], "profile-a");
+            assert_eq!(event["owner"]["api_origin"], "https://astra.example");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -900,7 +1001,7 @@ mod tests {
         std::fs::write(&path, "user-owned").unwrap();
         let (_tx, rx) = crate::cli::chat_stream::stream_event_channel();
 
-        let error = spawn_file_writer(rx, &path).unwrap_err();
+        let error = spawn_file_writer(rx, &path, test_owner()).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "user-owned");
@@ -916,7 +1017,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).unwrap();
         let (_tx, rx) = crate::cli::chat_stream::stream_event_channel();
 
-        let error = spawn_file_writer(rx, &path).unwrap_err();
+        let error = spawn_file_writer(rx, &path, test_owner()).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(target).unwrap(), "user-owned");

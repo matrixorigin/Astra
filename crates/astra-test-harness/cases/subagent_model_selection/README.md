@@ -75,8 +75,8 @@ fixed selectors require the canonical typed `invalid_request` receipt and zero
 children. A correct parent answer alone never proves correct child execution.
 The spawn receipt exposes `prepared_model` so the parent can identify the
 runtime-selected model without another lookup. That field is pre-execution
-evidence, not proof of a provider call; the child `LlmRoundCompleted` event
-linked by run ID remains the execution check. A subsequent `agent.get_result`
+evidence, not proof of a provider call; the canonical capture requires a
+physical provider request linked to the exact child run. A subsequent `agent.get_result`
 is normal retrieval and must not count as a second spawn.
 
 `flash_model_name_is_output` is a negative intent control: a quoted model name
@@ -175,13 +175,14 @@ events. A passing run is an end-to-end sample, not a reliability claim; run
 several independent trials before quoting a success rate. The task requires
 no files, network access, or diagnostic tools. Inspect unnecessary calls,
 round count, cache usage, and total cost in the trace.
-The adoption criterion's `spawn_match` links each result to its required
-model (or its fixed fanout slot), so swapping the children's tasks cannot pass.
+The adoption criterion binds each complete result to its actual model and,
+where requested, fanout slot; swapping the children's tasks cannot pass.
 
 `flash_reasoning_phrase_is_subject` and `flash_reasoning_correction` test
 interpretation through the primary's typed proposal, without a keyword parser. The former
-asks a child to explain a quoted phrase about high reasoning and verifies that
-no high-effort child is started; the latter changes high to medium before
+asks a child to explain a quoted phrase about high reasoning and verifies exact
+inheritance of the parent's admitted Offering and thinking configuration;
+the latter changes high to medium before
 execution and verifies the actual child configuration. Both require a real
 child model round and zero Bash, grep or file-read probes. These are samples of a
 probabilistic interpretation, not proof that every paraphrase is understood;
@@ -200,37 +201,32 @@ cannot bypass that boundary. This case makes no claim about router quality or
 savings.
 
 `flash_child_question_parent_answer` checks exactly one spawned child, one
-question and answer whose request/message IDs match, completion of that same
-child run, and the marker in the parent's final answer. It accepts either an
-successful, complete `get_result` by the owning parent, with matching returned
-child agent/run identities and exact body, or the
-runtime's correlated adoption evidence: the same spawned and completed child
-has the expected result hash in a `results_adopted` trace, followed by its
-parent’s `finalization_accepted` trace. A queued answer and terminal child
-event alone are insufficient. Ordinary `send_message` text (including
-`message_type=result`) is not terminal-result evidence. The existing
-`session_child_result_adopted` criterion's opt-in `allow_get_result` reuses its
-spawn/model/completion identity relation for foreground retrieval; its default
-still requires canonical adoption and later accepted finalization.
+successful child-owned question and root-owned answer with the exact request
+ID, and typed durable Sent/Received evidence binding both parties and the
+answer message ID. The same child must complete, execute on GLM, and have its
+complete raw result digest adopted before parent finalization. A queued answer
+alone is insufficient. Ordinary `send_message` text (including
+`message_type=result`) is not terminal-result evidence.
 Even with a matching final answer, this proves
 delivery and observation, not that the parent's wording was causally derived
 from the child: the marker also appears in the user prompt. It is not a
 process-restart test. The initial child task must include both possible marker
 outputs but not the chosen format; the later parent answer supplies only the
-choice. The journal checks that both outputs reached the spawned child brief;
+choice. Conjoined canonical predicates check that both outputs reached the
+same successful initial spawn brief;
 this keeps the information needed to produce the exact result available without
 letting the child skip the question. The user request is explicitly read-only,
-and the spawn event must record that workspace scope; this exercises the
-delegated tool-discovery and communication surface under read-only authority.
-The question/answer value-flow check proves exact request-ID correlation but
-does not independently bind both message callers to that child/parent or prove
-the queued answer was applied. Those communication-attribution checks remain
-outside the current oracle; the final child result is checked independently.
+and the spawn fact must record `read_only` mutation intent. This is a recorded
+intent check, not independent proof of the complete sandbox permission ceiling.
+Completion relies on the existing reply-obligation fence, which clears only
+after a successful provider attempt consumes the correlated response; a
+Received event alone does not establish model inclusion.
 
-These cases deliberately do not call `reflect` or add model-request-ledger
-reads. The configured-name case proves provider-call identity from the existing
-typed step-event capture linked to the spawned child run. Save the report and
-structured journal for cost analysis, and report missing usage as unknown
+These tasks do not ask the agent to call `reflect`. The harness separately
+captures the existing Server execution view, including authenticated run tree,
+Reflect facts, complete paged transcript, and optional admitted-control tails.
+Those test-only reads are not part of the agent's ordinary execution overhead.
+Save the report and canonical capture for cost analysis, and report missing usage as unknown
 rather than inferring cost from a passing answer.
 
 Terminal `4/4`, complete journal attribution, and root prompt-cache evidence

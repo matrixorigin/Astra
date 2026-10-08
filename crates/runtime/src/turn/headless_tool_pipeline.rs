@@ -4006,6 +4006,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_work_receipt_survives_durable_artifact_presentation() {
+        use astra_services::session_journal::RuntimeWorkEstablishmentReceipt;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let mut harness = PipelineHarness::new();
+        let call_id = format!("work-receipt-{}", uuid::Uuid::new_v4());
+        let full_result = json!({
+            "status": "started",
+            "task_board_update": {
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "kind": "snapshot",
+                "graph_revision": 1,
+                "criteria_member_count": 0,
+                "tasks": []
+            },
+            "padding": "x".repeat(
+                astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS + 1
+            ),
+        })
+        .to_string();
+        assert!(
+            full_result.chars().count()
+                > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        let executed = ExecutedExecution {
+            execution: HeadlessResolvedExecution {
+                confirmed_invocation: None,
+                accepted_send: None,
+                id: call_id,
+                name: "start_work".to_string(),
+                args: json!({}),
+                result_str: full_result,
+                tool_result_fields: None,
+                authoritative_is_error: Some(false),
+                pending_runtime_completion: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                edge_result_missing: false,
+                edge_terminal_authority: false,
+                early_exit_ms: 0,
+            },
+            idem_key: None,
+            pre_tool_context: None,
+            is_err: false,
+            error_kind: None,
+            executed_ms: 1,
+        };
+        harness.session_id = format!("work-receipt-{}", uuid::Uuid::new_v4());
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        pipeline.record_execution(executed).await;
+
+        let record = pipeline
+            .ctx
+            .tool_call_records
+            .first()
+            .expect("the production recorder should publish the tool record");
+        assert!(record.ok);
+        assert!(record.was_executed());
+        assert!(record.result_artifact.is_some());
+        let durable_display = record.result_full.as_deref().expect("durable result view");
+        assert!(
+            serde_json::from_str::<Value>(durable_display)
+                .ok()
+                .is_none_or(|result| {
+                    !matches!(
+                        result.get("status").and_then(Value::as_str),
+                        Some("started" | "continued" | "deferred")
+                    )
+                }),
+            "the durable display must not carry lifecycle JSON: {durable_display}"
+        );
+        assert_eq!(
+            record.runtime_work_establishment_receipt,
+            Some(RuntimeWorkEstablishmentReceipt::Started)
+        );
+        assert!(
+            serde_json::to_value(record)
+                .unwrap()
+                .get("runtime_work_establishment_receipt")
+                .is_none(),
+            "the runtime receipt must not become journal or provider data"
+        );
+        assert!(
+            !pipeline.ctx.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("artifact://"),
+            "artifact replacement must not change the compact model-facing Work receipt"
+        );
+    }
+
+    #[tokio::test]
     async fn source_bounded_introspect_recording_keeps_journal_and_model_inline() {
         use astra_services::SessionArtifactStore;
         use astra_turn_core::tool_result_storage;
@@ -6893,6 +6990,7 @@ mod tests {
             crate::server::runtime_tool_executor::tests::test_agent_tool_context(dir.path());
         context.fanout_admission.set_direct_child_for_test(
             crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: Vec::new(),
                 agent_id: "general-purpose_demo@123".into(),
                 run_id: "child-run".into(),
                 parent_agent_id: context.agent_id.clone(),

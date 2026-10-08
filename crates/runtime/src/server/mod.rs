@@ -66,7 +66,6 @@ pub(crate) mod session;
 pub(crate) mod session_turn;
 mod state_builder;
 pub mod sweeper_lease;
-pub mod team;
 pub(crate) mod tool_admission;
 pub(crate) mod tool_agent_info;
 pub(crate) mod tool_agent_runtime;

@@ -26,7 +26,7 @@ operators, and kernel contributors to the level of detail they need.
 | --- | --- |
 | [Quick start](quickstart/README.md) | Source and Docker entry points, first health check, and where to go next |
 | [CLI commands](reference/cli-commands.md) | Authentication, chat, sessions, models, skills, and administration |
-| [TUI slash commands](reference/slash-commands.md) | Interactive workspace, planning, observability, memory, MCP, and team commands |
+| [TUI slash commands](reference/slash-commands.md) | Interactive workspace, planning, observability, memory, and MCP commands |
 | [TypeScript SDK](../packages/sdk/README.md) | REST, SSE, WebSocket, React hooks, and browser integration |
 | [HTTP API](reference/api-reference.md) | Authentication and server resource contracts |
 | [Configuration](reference/configuration.md) | Models, authentication, Server, User Runner, and observability settings |

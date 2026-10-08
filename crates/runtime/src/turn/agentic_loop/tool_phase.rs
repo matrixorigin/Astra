@@ -4508,6 +4508,7 @@ mod tests {
             "child-agent",
         );
         owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
             agent_id: "child-agent".into(),
             run_id: "child-run".into(),
             parent_agent_id: "parent-agent".into(),
@@ -4550,6 +4551,7 @@ mod tests {
         assert!(!has_pending_run_dependency(&host, &state));
         state.current_run_id = Some("parent-run".into());
         owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
             agent_id: "child-agent".into(),
             run_id: "child-run".into(),
             parent_agent_id: "parent-agent".into(),

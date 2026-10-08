@@ -140,6 +140,8 @@ pub struct StreamCapture {
     pub session_id: Option<String>,
     pub root_run_id: Option<String>,
     pub identity_verified: bool,
+    pub owner: Option<crate::execution_capture::ExecutionOwner>,
+    pub execution: Option<crate::execution_capture::SessionExecutionCapture>,
     pub records: Vec<StreamCaptureRecord>,
     pub diagnostics: Vec<String>,
     #[serde(skip)]
@@ -172,6 +174,20 @@ impl StreamCapture {
         };
 
         let record = match wire.get("type").and_then(serde_json::Value::as_str) {
+            Some("session_bound" | "run_bound") => {
+                let Ok(owner) = serde_json::from_value::<crate::execution_capture::ExecutionOwner>(
+                    wire["owner"].clone(),
+                ) else {
+                    self.diagnose("execution_owner_unavailable");
+                    return;
+                };
+                if !owner.is_valid() || self.owner.as_ref().is_some_and(|old| old != &owner) {
+                    self.diagnose("execution_owner_conflict");
+                    return;
+                }
+                self.owner = Some(owner);
+                return;
+            }
             Some("agent_live") => {
                 let Ok(event) = serde_json::from_value::<AgentLiveEvent>(wire["event"].clone())
                 else {
@@ -213,7 +229,7 @@ impl StreamCapture {
             .len()
             + 1;
         if self.records.len() >= MAX_STREAM_CAPTURE_RECORDS
-            || self.retained_bytes.saturating_add(bytes) > MAX_STREAM_CAPTURE_BYTES - 1024
+            || self.retained_bytes.saturating_add(bytes) > MAX_STREAM_CAPTURE_BYTES - 4096
         {
             self.diagnose("capture_truncated");
             return;
@@ -1136,7 +1152,6 @@ mod tests {
             description: None,
             prompt: "p".into(),
             prompt_variants: vec![],
-            team: None,
             models: Some(vec!["opus".into()]),
             criteria: vec![],
             debug_log: false,
@@ -1165,7 +1180,6 @@ mod tests {
             description: None,
             prompt: "p".into(),
             prompt_variants: vec![],
-            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,
@@ -1196,7 +1210,6 @@ mod tests {
             description: None,
             prompt: "p".into(),
             prompt_variants: vec![],
-            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,
@@ -1225,7 +1238,6 @@ mod tests {
             description: None,
             prompt: "p".into(),
             prompt_variants: vec![],
-            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,

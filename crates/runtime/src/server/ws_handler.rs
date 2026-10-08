@@ -1256,8 +1256,6 @@ fn build_ws_chat_request(message: WsChatMessage) -> astra_services::runs::ChatRe
     } = message;
     astra_services::runs::ChatRequestData {
         completion_checks,
-        agent_profile_selection: None,
-        admitted_agent_profiles: None,
         model_catalog_reader: None,
         message: content,
         user_intent,

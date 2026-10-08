@@ -148,24 +148,42 @@ impl ReflectReport {
                 self.graph_slice.budget_result = self.budget_result.clone();
                 continue;
             }
-            let Some(spine) = self
+            let victim = self
                 .graph_slice
                 .nodes
-                .iter_mut()
+                .iter()
+                .enumerate()
                 .rev()
-                .filter_map(|node| node.metadata.as_mut()?.get_mut("execution_spine"))
-                .find(|spine| {
-                    spine["facts"]
-                        .as_array()
-                        .is_some_and(|facts| !facts.is_empty())
+                .filter_map(|(node_index, node)| {
+                    Some((
+                        node_index,
+                        node.metadata.as_ref()?["execution_spine"]["facts"].as_array()?,
+                    ))
                 })
-            else {
+                .flat_map(|(node_index, facts)| {
+                    facts.iter().enumerate().map(move |(fact_index, fact)| {
+                        let priority = super::execution_fact_retention_priority(
+                            fact["kind"].as_str().unwrap_or(""),
+                            fact["outcome"].as_str(),
+                            fact["metadata_available"] == true
+                                && fact["metadata_omitted"] == false
+                                && fact["omitted_children"] == 0,
+                        );
+                        (priority, node_index, fact_index)
+                    })
+                })
+                .min_by_key(|(priority, _, _)| *priority);
+            let Some((_, node_index, fact_index)) = victim else {
                 break;
             };
+            let spine = &mut self.graph_slice.nodes[node_index]
+                .metadata
+                .as_mut()
+                .expect("captured metadata")["execution_spine"];
             spine["facts"]
                 .as_array_mut()
                 .expect("nonempty facts")
-                .remove(0);
+                .remove(fact_index);
             spine["omitted_facts"] = (spine["omitted_facts"].as_u64().unwrap_or(0) + 1).into();
             spine["truncated"] = true.into();
             self.budget_result.truncated = true;
@@ -279,6 +297,131 @@ mod tests {
         let fact = event_without_canonical_call_id.execution_fact().unwrap();
         assert!(fact.tool_outcome.is_none());
         assert!(!fact.metadata_available);
+    }
+
+    #[test]
+    fn bounded_projection_keeps_distinct_adoptions_before_transient_phases() {
+        use super::super::EvidenceEvent;
+        use sha2::{Digest, Sha256};
+        let mut events: Vec<_> = (0..24)
+            .map(|index| {
+                let outcome = match index {
+                    0 | 1 => "results_adopted",
+                    23 => "finalization_accepted",
+                    _ => "results_staged",
+                };
+                let children = if index == 23 {
+                    json!([])
+                } else {
+                    json!([{"agent_id":format!("agent-{}", index % 2),
+                        "run_id":format!("child-{}", index % 2), "status":"completed",
+                        "result_sha256":format!("{:x}", Sha256::digest(format!("result-{}", index % 2))),
+                        "result_truncated":false}])
+                };
+                EvidenceEvent {
+                    event_id: format!("boundary-{index}"),
+                    event_type: "trace_span".into(),
+                    run_id: Some("parent-run".into()),
+                    created_at: format!("2026-10-07T00:00:{index:02}.000000"),
+                    metadata: Some(json!({"name":"agent_dependency_boundary", "attrs": {
+                        "parent_run_id":"parent-run", "outcome":outcome,
+                        "children":children.to_string()
+                    }})),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        for index in 0..2 {
+            events.push(EvidenceEvent {
+                event_id: format!("spawn-{index}"),
+                event_type: "agent_spawned".into(),
+                run_id: Some(format!("child-{index}")),
+                parent_run_id: Some("parent-run".into()),
+                agent_id: Some(format!("agent-{index}")),
+                created_at: "2026-10-06T23:59:59.000000".into(),
+                metadata: Some(json!({"status":"spawned","workspace_mutation":"read_only"})),
+                ..Default::default()
+            });
+        }
+        let report = project_events(&events);
+        let spine = &report.graph_slice.nodes[0].metadata.as_ref().unwrap()["execution_spine"];
+        let facts = spine["facts"].as_array().unwrap();
+        for index in 0..2 {
+            assert!(facts.iter().any(|fact| {
+                fact["kind"] == "agent_spawned"
+                    && fact["event_id"] == format!("spawn-{index}")
+                    && fact["run_id"] == format!("child-{index}")
+                    && fact["workspace_mutation"] == "read_only"
+            }));
+            assert!(facts.iter().any(|fact| {
+                fact["outcome"] == "results_adopted"
+                    && fact["event_id"] == format!("boundary-{index}")
+                    && fact["children"][0]["run_id"] == format!("child-{index}")
+                    && fact["children"][0]["result_sha256"]
+                        == format!("{:x}", Sha256::digest(format!("result-{index}")))
+            }));
+        }
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact["outcome"] == "finalization_accepted")
+        );
+        assert!(spine["omitted_facts"].as_u64().unwrap() > 0);
+        assert_eq!(spine["truncated"], true);
+        assert!(facts.len() <= super::super::EXECUTION_SPINE_FACT_LIMIT);
+        assert!(
+            serde_json::to_vec(spine).unwrap().len() <= super::super::EXECUTION_SPINE_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn per_spine_byte_trim_retains_repeated_critical_facts_before_transients() {
+        use super::super::EvidenceEvent;
+        let events: Vec<_> = (0..8).map(|index| {
+            let critical = index == 0 || index == 7;
+            EvidenceEvent {
+                event_id: format!("boundary-{index}"),
+                event_type: "trace_span".into(),
+                run_id: Some("parent-run".into()),
+                created_at: format!("2026-10-07T00:00:{index:02}.000000"),
+                metadata: Some(json!({"name":"agent_dependency_boundary","attrs":{
+                    "parent_run_id":"parent-run",
+                    "outcome":if critical {"finalization_accepted"} else {"results_staged"},
+                    "children":if critical {"[]".to_owned()} else {
+                        serde_json::to_string(&json!([
+                            {"run_id":"child-0","agent_id":"a".repeat(128),"status":"completed"},
+                            {"run_id":"child-1","agent_id":"b".repeat(128),"status":"completed"},
+                            {"run_id":"child-2","agent_id":"c".repeat(128),"status":"completed"}
+                        ])).unwrap()
+                    }
+                }})),
+                ..Default::default()
+            }
+        }).collect();
+        let original: Vec<_> = events
+            .iter()
+            .filter_map(EvidenceEvent::execution_fact)
+            .collect();
+        assert!(
+            serde_json::to_vec(&original).unwrap().len() > super::super::EXECUTION_SPINE_BYTE_LIMIT,
+            "the eight original facts must exercise byte trimming, not count selection"
+        );
+        let (nodes, _) = super::super::execution_spines(&events);
+        let spine = &nodes[0].metadata.as_ref().unwrap()["execution_spine"];
+        let facts = spine["facts"].as_array().unwrap();
+        assert!(facts.len() < 8);
+        assert_eq!(spine["omitted_facts"], 8 - facts.len());
+        for index in [0, 7] {
+            assert!(
+                facts
+                    .iter()
+                    .any(|fact| fact["event_id"] == format!("boundary-{index}"))
+            );
+        }
+        assert!(facts.iter().any(|fact| fact["outcome"] == "results_staged"));
+        assert!(
+            serde_json::to_vec(spine).unwrap().len() <= super::super::EXECUTION_SPINE_BYTE_LIMIT
+        );
     }
 
     #[test]
@@ -625,10 +768,22 @@ mod tests {
     #[test]
     fn retained_run_support_shares_the_serialized_budget() {
         let mut report = large_report("summary");
-        for node in report.graph_slice.nodes.iter_mut().take(4) {
+        // All four facts have explicit support; this isolates final byte
+        // trimming from the earlier observation-count budget.
+        report.observations.truncate(4);
+        report.evidence.truncate(4);
+        report.graph_slice.nodes.truncate(4);
+        report.action_hints.clear();
+        for (index, node) in report.graph_slice.nodes.iter_mut().take(4).enumerate() {
             node.metadata = Some(json!({"execution_spine": {
                 "coverage":"partial", "task_completion":"not_established",
-                "omitted_facts":0, "facts":[{"event_id":"a".repeat(3500)}]
+                "omitted_facts":0, "facts":[
+                    {"event_id":format!("spawn-{index}"),"kind":"agent_spawned",
+                        "metadata_available":true,"metadata_omitted":false,"omitted_children":0,
+                        "run_id":format!("child-{index}"),"parent_run_id":"parent-run",
+                        "agent_id":format!("agent-{index}"),"workspace_mutation":"read_only"},
+                    {"event_id":"a".repeat(3500),"kind":"agent_dependency_boundary","outcome":"wait_started"}
+                ]
             }}));
         }
         let projected = report.project_lightweight();
@@ -639,6 +794,21 @@ mod tests {
                 <= 8192
         );
         assert!(serde_json::to_vec(&projected).unwrap().len() < 20_000);
+        for index in 0..4 {
+            assert!(
+                projected.graph_slice.nodes.iter().any(|node| {
+                    node.metadata.as_ref().unwrap()["execution_spine"]["facts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|fact| {
+                            fact["event_id"] == format!("spawn-{index}")
+                                && fact["workspace_mutation"] == "read_only"
+                        })
+                }),
+                "spawn-{index} survives before transient facts"
+            );
+        }
         assert!(projected.graph_slice.nodes.iter().any(|node| {
             node.metadata.as_ref().unwrap()["execution_spine"]["omitted_facts"]
                 .as_u64()

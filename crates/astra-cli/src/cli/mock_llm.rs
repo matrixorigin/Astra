@@ -1422,7 +1422,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        let stream = reqwest::Client::new()
+        let stream = astra_core::net::client_builder_for_target(&server.base_url)
+            .build()
+            .unwrap()
             .post(format!("{}/chat/stream", server.base_url))
             .json(&serde_json::json!({"agent_id": "astra-cli", "message": "launch the review"}))
             .send()
@@ -1545,7 +1547,9 @@ mod tests {
             let server = super::MockLlmServer::start_inner(scenario, true, axum::Router::new())
                 .await
                 .unwrap();
-            let mut response = reqwest::Client::new()
+            let mut response = astra_core::net::client_builder_for_target(&server.base_url)
+                .build()
+                .unwrap()
                 .post(format!("{}/chat/stream", server.base_url))
                 .json(&serde_json::json!({"agent_id":"astra-cli", "message":"review"}))
                 .send()
@@ -1633,7 +1637,9 @@ mod tests {
     async fn orchestration_stream_waits_for_exact_callbacks_and_closes_real_counts() {
         for scenario in [MockScenario::ToolThenComplete] {
             let server = super::MockLlmServer::start(scenario).await.unwrap();
-            let client = reqwest::Client::new();
+            let client = astra_core::net::client_builder_for_target(&server.base_url)
+                .build()
+                .unwrap();
             let mut response = client
                 .post(format!("{}/chat/stream", server.base_url))
                 .json(&serde_json::json!({"agent_id": "astra-cli", "message": "launch the review"}))

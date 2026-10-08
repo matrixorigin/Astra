@@ -1994,7 +1994,10 @@ mod tests {
         include_str!("../../../services/fixtures/real_session_0ac769_min.jsonl");
 
     fn journal_path_for_test(sid: &str) -> PathBuf {
-        let path = astra_services::session_journal::journal_file_path(sid);
+        let (local_owner, _) = crate::cli::cli_config::cli_utils::attached_journal_owners()
+            .expect("attached journal owner");
+        let path = astra_services::session_journal::journal_file_path_for_owner(&local_owner, sid)
+            .expect("owner-scoped journal path");
         std::fs::create_dir_all(path.parent().expect("journal parent")).expect("journal parent");
         path
     }
@@ -2203,7 +2206,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-linked-owner-00000000-0000-0000-0000-000000000013";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let owner = "account-owner-42";
         let account_owner = astra_services::OwnerScope::user(owner).expect("account owner");
         let child_event = format!(
@@ -2256,7 +2260,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-no-commit-00000000-0000-0000-0000-000000000014";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         write_test_journal(journal_path_for_test(sid),
             format!(r#"{{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"{sid}","turn":1,"tool_calls":[]}}"#) + "\n",
@@ -2284,7 +2289,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-foreign-owner-00000000-0000-0000-0000-000000000015";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         write_test_journal(journal_path_for_test(sid),
             format!(r#"{{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"{sid}","turn":1,"conversation_commit":{{"schema_version":1,"base_root_hash":"base","cursor":{{"schema_version":1,"owner_id":"other-account","session_id":"{sid}","branch_id":"main","completed_turn":1,"journal_event_seq":1,"conversation_seq":1,"canonical_root_hash":"root","projection_schema":1,"compaction_generation":0}},"delta":{{"kind":"append","messages":[]}}}}}}"#) + "\n",
@@ -2302,7 +2308,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-root-usage-00000000-0000-0000-0000-000000000016";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         write_test_journal(journal_path_for_test(sid),
             format!(r#"{{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"{sid}","turn":1,"tokens_in":999,"tokens_out":999,"llm_rounds":1,"metadata":{{"run_id":"root-run"}},"tool_calls":[]}}"#) + "\n",
@@ -2361,7 +2368,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-digest-join-guard-00000000-0000-0000-0000-000000000017";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         write_test_journal(journal_path_for_test(sid), format!(r#"{{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"{sid}","turn":1,"metadata":{{"run_id":"root-run"}},"tool_calls":[]}}"#) + "\n").unwrap();
         let account_path =
@@ -2451,7 +2459,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-observation-join-00000000-0000-0000-0000-000000000019";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         let event = format!(
             r#"{{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"{sid}","producer_scope":{{"run_id":"child-run","agent_id":"child"}},"round":0,"tokens_in":5,"tokens_out":2,"metadata":{{"purpose":"sub_agent"}}}}"#
@@ -2500,7 +2509,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-observation-error-00000000-0000-0000-0000-000000000020";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         let event = format!(
             r#"{{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"{sid}","producer_scope":{{"run_id":"local-run","agent_id":"main"}},"round":0}}"#
@@ -2526,7 +2536,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
         let sid = "test-observation-error-00000000-0000-0000-0000-000000000021";
-        let local_owner = astra_services::local_owner_scope();
+        let (local_owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account_owner = astra_services::OwnerScope::user("account-owner-42").unwrap();
         fs::create_dir_all(journal_path_for_test(sid)).unwrap();
         let account_path =

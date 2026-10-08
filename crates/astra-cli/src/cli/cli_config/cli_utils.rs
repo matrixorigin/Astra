@@ -296,6 +296,15 @@ pub(crate) struct CliOwnerAuthSnapshot {
 }
 
 impl CliOwnerAuthSnapshot {
+    pub(crate) fn is_current(&self) -> bool {
+        self.owner_scope == astra_services::local_owner_scope()
+            && match (&self.native_binding, crate::cli::native_auth::active()) {
+                (Some(bound), Some(active)) => std::sync::Arc::ptr_eq(bound, &active),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     pub(crate) async fn access_token(&self) -> Option<String> {
         let binding = self.legacy_binding.as_ref()?;
         let pair = binding.pair.lock().await;
@@ -362,6 +371,13 @@ fn current_cli_profile_identity() -> Option<CliProfileIdentity> {
             poisoned.into_inner().clone()
         }
     }
+}
+
+/// Atomic presentation provenance; never opens credential storage or builds auth bindings.
+pub(crate) fn installed_cli_owner_metadata() -> (Option<String>, Option<String>) {
+    current_cli_profile_identity()
+        .map(|identity| (Some(identity.profile_name), identity.account_id))
+        .unwrap_or((None, None))
 }
 
 /// Atomically describe which owner a background cloud operation belongs to.
@@ -947,6 +963,7 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
             format!("SSE parse error: {error}")
         }
         error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
+        | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
         | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
         | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)) => {
             error.to_string()

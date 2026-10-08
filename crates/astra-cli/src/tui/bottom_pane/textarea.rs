@@ -486,11 +486,49 @@ impl TextArea {
 
     fn wrapped_line_index(&self, lines: &[Range<usize>], byte_pos: usize) -> usize {
         for (i, range) in lines.iter().enumerate() {
-            if byte_pos < range.end || i + 1 == lines.len() {
+            if byte_pos < range.end
+                || (byte_pos == range.end
+                    && lines.get(i + 1).is_none_or(|next| next.start > range.end))
+                || i + 1 == lines.len()
+            {
                 return i;
             }
         }
         0
+    }
+
+    /// Move within an editor without changing the composer's history keys.
+    pub(super) fn move_vertical(&mut self, down: bool, width: u16) {
+        let lines = self.wrapped_lines(width.max(1));
+        let current = self.wrapped_line_index(&lines, self.cursor_pos);
+        let target = if down {
+            current.checked_add(1).filter(|index| *index < lines.len())
+        } else {
+            current.checked_sub(1)
+        };
+        let Some(target) = target else { return };
+        let column = self.preferred_col.unwrap_or_else(|| {
+            UnicodeWidthStr::width(&self.text[lines[current].start..self.cursor_pos])
+        });
+        self.preferred_col = Some(column);
+        let range = &lines[target];
+        let mut used = 0;
+        self.cursor_pos = range.start;
+        for (offset, grapheme) in self.text[range.clone()].grapheme_indices(true) {
+            used += UnicodeWidthStr::width(grapheme);
+            if used > column {
+                break;
+            }
+            self.cursor_pos = range.start + offset + grapheme.len();
+        }
+        // A soft-wrap boundary belongs to the following displayed row.
+        if self.cursor_pos == range.end
+            && lines
+                .get(target + 1)
+                .is_some_and(|next| next.start == range.end)
+        {
+            self.cursor_pos = self.prev_grapheme_boundary(self.cursor_pos);
+        }
     }
 
     // ─── Rendering ──────────────────────────────────────────────────────
@@ -630,6 +668,29 @@ pub(crate) enum TextAreaAction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vertical_editor_navigation_preserves_columns_and_graphemes() {
+        let mut area = super::TextArea::new();
+        area.set_text("abcd\n你\nabcdef");
+        area.move_vertical(false, 80);
+        assert_eq!(area.cursor_byte(), "abcd\n你".len());
+        area.move_vertical(false, 80);
+        assert_eq!(area.cursor_byte(), 4);
+        area.move_vertical(true, 80);
+        area.move_vertical(true, 80);
+        assert_eq!(area.cursor_byte(), area.text().len());
+        area.set_text("abcdef");
+        area.move_vertical(false, 3);
+        assert_eq!(area.cursor_byte(), 2);
+        assert!(area.text().is_char_boundary(area.cursor_byte()));
+        assert_eq!(
+            area.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            super::TextAreaAction::HistoryPrev
+        );
+    }
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;

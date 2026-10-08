@@ -1,4 +1,4 @@
-//! Tests for owned parent mailboxes in team delegations.
+//! Tests for parent-owned mailboxes in generic delegations.
 //!
 //! All tests are model-free: they use `SubRunExecutor` mocks that exercise
 //! the real `DelegationEngine`, `AgentMailboxRouter`, and `InProcessTransport`.
@@ -18,7 +18,7 @@ mod tests {
     use astra_services::runs::InMemoryRunStateStore;
 
     use crate::server::delegation::engine::{
-        DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
+        DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutionResult, SubRunExecutor,
     };
     use crate::server::run::engine::RunEngine;
     use astra_messaging::in_process::InProcessTransport;
@@ -48,10 +48,7 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for ProgressReportingExecutor {
-        async fn execute(
-            &self,
-            config: SubRunConfig,
-        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
+        async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -72,8 +69,8 @@ mod tests {
                 .await
                 .push((agent_id.clone(), send_result));
 
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id,
                     run_id,
                     status: "completed".into(),
@@ -83,8 +80,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -99,13 +97,13 @@ mod tests {
         ))
         .unwrap();
         reg.register(AgentProfile::new(
-            "team-review-producer",
+            "review-producer",
             "Producer",
             AgentTier::System,
         ))
         .unwrap();
         reg.register(AgentProfile::new(
-            "team-review-reviewer",
+            "review-reviewer",
             "Reviewer",
             AgentTier::System,
         ))
@@ -280,7 +278,7 @@ mod tests {
 
         let request = make_request(
             CoordinationPattern::Sequential {
-                agent_ids: vec!["team-review-producer".into(), "team-review-reviewer".into()],
+                agent_ids: vec!["review-producer".into(), "review-reviewer".into()],
                 stop_on_success: false,
                 timeout_sec: 10,
             },
@@ -420,10 +418,7 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for DelayedProgressExecutor {
-        async fn execute(
-            &self,
-            config: SubRunConfig,
-        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
+        async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -444,8 +439,8 @@ mod tests {
                 .await
                 .push((agent_id.clone(), send_result));
 
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id,
                     run_id,
                     status: "completed".into(),
@@ -455,8 +450,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -702,17 +698,14 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for UncooperativeExecutor {
-        async fn execute(
-            &self,
-            config: SubRunConfig,
-        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
+        async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
             // Ignore cancel_token — block on a channel that never sends.
             let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
             let _ = rx.await;
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id,
                     run_id,
                     status: "completed".into(),
@@ -722,8 +715,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 

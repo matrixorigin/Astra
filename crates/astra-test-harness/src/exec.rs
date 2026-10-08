@@ -118,10 +118,34 @@ impl AstraCliExecutor {
     }
 }
 
+/// One launch boundary for execution and its subsequent inspection command.
+/// An implicit profile must stay implicit, particularly for native MOI auth.
+pub(crate) fn configured_astra_command(cfg: &RunnerConfig, case: &Case) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&cfg.astra_bin);
+    if let Some(profile) = &cfg.profile {
+        command.args(["--profile", profile]);
+    }
+    if let Some(directory) = &cfg.working_dir {
+        command.current_dir(directory);
+    }
+    command.envs(&case.cli_env);
+    command
+}
+
 #[async_trait]
 impl CaseExecutor for AstraCliExecutor {
     async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
-        run_case_subprocess(&self.cfg, case, model).await
+        let mut outcome = run_case_subprocess(&self.cfg, case, model).await;
+        if crate::criteria::requires_execution_capture(&case.criteria) {
+            let capture = crate::execution_capture::load(&self.cfg, case, &outcome).await;
+            if let Some(stream) = outcome.stream_capture.as_mut() {
+                match capture {
+                    Ok(capture) => stream.execution = Some(capture),
+                    Err(_) => stream.diagnose("canonical_execution_capture_failed"),
+                }
+            }
+        }
+        outcome
     }
 
     fn reproducer(&self, case: &Case, model: &str) -> String {
@@ -138,18 +162,10 @@ impl CaseExecutor for AstraCliExecutor {
     }
 }
 
-/// One argument owner for execution and reproductions. Team changes only the
-/// public entrypoint; capture, isolation, deadlines and continuation stay shared.
+/// One argument owner for execution and reproductions.
 fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String> {
     let mut args = vec!["--model".into(), model.into(), "-y".into()];
-    if let Some(team) = &case.team {
-        args.extend(["team".into(), "run".into(), team.name.clone()]);
-        if let Some(lead) = &team.lead_agent_id {
-            args.extend(["--lead-agent-id".into(), lead.clone()]);
-        }
-    } else {
-        args.push("chat".into());
-    }
+    args.push("chat".into());
     args.push("--json".into());
     if !case
         .extra_cli_args
@@ -166,10 +182,7 @@ fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String
         args.extend(["--max-wall-time-seconds".into(), seconds.to_string()]);
     }
     args.extend(case.extra_cli_args.clone());
-    args.extend([
-        if case.team.is_some() { "--" } else { "-m" }.into(),
-        case.prompt.clone(),
-    ]);
+    args.extend(["-m".into(), case.prompt.clone()]);
     args
 }
 
@@ -429,7 +442,10 @@ async fn observe_machine_event_file(
 }
 
 #[cfg(unix)]
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child, group_id: Option<u32>) {
+pub(crate) async fn kill_process_group_and_reap(
+    child: &mut tokio::process::Child,
+    group_id: Option<u32>,
+) {
     if let Some(pid) = group_id
         && pid <= i32::MAX as u32
     {
@@ -453,7 +469,10 @@ async fn wait_for_user_cancel(flag: Option<&Arc<std::sync::atomic::AtomicBool>>)
 }
 
 #[cfg(not(unix))]
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child, _group_id: Option<u32>) {
+pub(crate) async fn kill_process_group_and_reap(
+    child: &mut tokio::process::Child,
+    _group_id: Option<u32>,
+) {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
@@ -572,7 +591,6 @@ async fn finish_failed_evidence_outcome(
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
     use std::process::Stdio;
     use std::time::Duration;
-    use tokio::process::Command;
 
     // Step-event files are append-only for a session. A continuation command
     // must report only the events it added, otherwise SuiteRunner sums the
@@ -596,10 +614,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         }
     };
     let stream_event_path = stream_event_dir.path().join("events.jsonl");
-    let mut cmd = Command::new(&cfg.astra_bin);
-    if let Some(ref profile) = cfg.profile {
-        cmd.arg("--profile").arg(profile);
-    }
+    let mut cmd = configured_astra_command(cfg, case);
     // A missing --session-id deliberately means "create a session".  The
     // server, not the harness, owns session identity: inventing a UUID here
     // turns the first turn into an explicit resume request, which a correctly
@@ -617,12 +632,6 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         model,
         &stream_event_path.to_string_lossy(),
     ));
-    if let Some(ref wd) = cfg.working_dir {
-        cmd.current_dir(wd);
-    }
-    for (k, v) in &case.cli_env {
-        cmd.env(k, v);
-    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -690,7 +699,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     let stdout = child.stdout.take().expect("piped stdout is present");
     let stderr = child.stderr.take().expect("piped stderr is present");
     let machine_observation = Arc::new(Mutex::new(MachineEventObservation {
-        stream: cfg.artifacts_dir.as_ref().map(|_| Default::default()),
+        stream: (cfg.artifacts_dir.is_some()
+            || crate::criteria::requires_execution_capture(&case.criteria))
+        .then(Default::default),
         ..Default::default()
     }));
     let machine_observer_done = tokio_util::sync::CancellationToken::new();
@@ -1059,16 +1070,6 @@ impl ExternalCmdExecutor {
 impl CaseExecutor for ExternalCmdExecutor {
     async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
         use tokio::process::Command;
-
-        if case.team.is_some() {
-            return RunOutcome {
-                model: model.into(),
-                exit_code: 2,
-                text: "Native Team entrypoints require the Astra CLI executor".into(),
-                error_kind: Some("invalid_request".into()),
-                ..Default::default()
-            };
-        }
 
         let input = serde_json::json!({
             "protocol_version": "1.1",
@@ -1504,10 +1505,11 @@ mod tests {
             Arc::clone(&observation),
             done.clone(),
         ));
-        let mut events = concat!(
-                "{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}\n",
-                "{\"type\":\"run_bound\",\"run_id\":\"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85\"}\n",
-            ).to_string();
+        let owner = serde_json::json!({"account_id":"account", "profile_name":"profile", "api_origin":"https://example.invalid"});
+        let mut events = [
+            serde_json::json!({"type":"session_bound", "session_id":"550e8400-e29b-41d4-a716-446655440000", "owner":owner}),
+            serde_json::json!({"type":"run_bound", "run_id":"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85", "owner":owner}),
+        ].iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n") + "\n";
         for (run_id, kind) in [
             (
                 "child-a",
@@ -1757,7 +1759,6 @@ mod tests {
             description: None,
             prompt: "say 'hello'".into(),
             prompt_variants: vec![],
-            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,
@@ -1872,35 +1873,14 @@ mod tests {
             args_path.to_string_lossy().into_owned(),
         );
         let exec = AstraCliExecutor::new(RunnerConfig::new(shim));
-        for team in [
-            None,
-            Some(crate::case::TeamEntrypoint {
-                name: "fixture-team".into(),
-                lead_agent_id: Some("fixture-lead".into()),
-            }),
-        ] {
-            case.team = team;
+        {
             case.extra_cli_args.clear();
             let root = exec.execute(&case, "m").await;
             let root_args = std::fs::read_to_string(&args_path).expect("root args");
             let args: Vec<_> = root_args.lines().collect();
             assert_eq!(&args[..3], &["--model", "m", "-y"]);
-            if case.team.is_some() {
-                assert_eq!(
-                    &args[3..8],
-                    &[
-                        "team",
-                        "run",
-                        "fixture-team",
-                        "--lead-agent-id",
-                        "fixture-lead"
-                    ]
-                );
-                assert_eq!(args[args.len() - 2], "--");
-            } else {
-                assert_eq!(args[3], "chat");
-                assert_eq!(args[args.len() - 2], "-m");
-            }
+            assert_eq!(args[3], "chat");
+            assert_eq!(args[args.len() - 2], "-m");
             assert_eq!(args.last().copied(), Some(case.prompt.as_str()));
             assert_eq!(
                 root.session_id.as_deref(),
@@ -1980,6 +1960,263 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
         assert_eq!(
             crate::classify::classify(&out, &[]),
             crate::classify::FailureClass::BehaviorContractViolation
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_capture_without_archiving_reuses_launch_context_and_checks_account_before_spawn()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("astra-protocol-fixture");
+        let session = "550e8400-e29b-41d4-a716-446655440000";
+        let root = "550e8400-e29b-41d4-a716-446655440001";
+        let mut capture = crate::execution_capture::tests::capture();
+        capture.session_id = session.into();
+        capture.run_tree.session_id = session.into();
+        capture.reflection.session_id = session.into();
+        let page = capture.transcript.as_mut().unwrap();
+        page.session_id = session.into();
+        for item in &mut page.items {
+            item.session_id = session.into();
+        }
+        capture.run_tree.runs[0].run_id = root.into();
+        for run in &mut capture.run_tree.runs {
+            run.root_run_id = Some(root.into());
+            if run.parent_run_id.is_some() {
+                run.parent_run_id = Some(root.into());
+            }
+        }
+        capture
+            .reflection
+            .model_requests
+            .terminal
+            .as_mut()
+            .unwrap()
+            .groups[0]
+            .parent_run_id = Some(root.into());
+        for fact in capture.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if fact["run_id"] == "root" {
+                fact["run_id"] = serde_json::json!(root);
+            }
+            fact["parent_run_id"] = serde_json::json!(root);
+        }
+        let capture_path = tmp.path().join("capture.json");
+        std::fs::write(&capture_path, serde_json::to_vec(&capture).unwrap()).unwrap();
+        let pending_path = tmp.path().join("pending-capture.json");
+        let mut pending = capture.clone();
+        pending.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"] = serde_json::json!([]);
+        std::fs::write(&pending_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        let bindings = [
+            serde_json::json!({"type":"session_bound", "session_id":session, "owner":capture.owner}),
+            serde_json::json!({"type":"run_bound", "run_id":root, "owner":capture.owner}),
+        ].iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        let bindings_path = tmp.path().join("bindings.jsonl");
+        std::fs::write(&bindings_path, bindings).unwrap();
+        let terminal_path = tmp.path().join("terminal.json");
+        std::fs::write(
+            &terminal_path,
+            serde_json::to_vec(&serde_json::json!({
+                "trace_id":null,"request_id":null,"run_id":root,"session_id":session,
+                "text":"observed-value","final_state":"completed","interruption_kind":null,
+                "tool_result_class_counts":{},"prompt_tokens":1,"fresh_prompt_tokens":1,
+                "cache":{"hit":false,"read_tokens":0,"creation_tokens":0},"completion_tokens":1,
+                "llm_rounds":1,"tool_calls_count":0,"tools_used":[],"persistence_error":null,
+                "exit_code":0,"success":true,"error_kind":null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let log = tmp.path().join("inspection-calls");
+        crate::test_support::write_executable_shim(
+            &shim,
+            r#"#!/bin/sh
+test "$PROBE_VALUE" = expected || exit 20
+test "$PWD" = "$EXPECTED_CWD" || exit 21
+test "$1" != --profile || exit 22
+if [ "$1" = session ]; then
+  if [ "$HANG_SECOND" = 1 ]; then
+    printf 'inspection\n' >> "$PROBE_LOG"
+    if [ -f "$HANG_SEEN" ]; then
+      printf '%s' "$$" > "$HANG_SEEN.pid"
+      sleep 60; exit 0
+    fi
+    : > "$HANG_SEEN"
+    cat "$PENDING_CAPTURE_FILE"
+    exit 0
+  fi
+  if [ -f "$PROBE_LOG" ]; then cat "$CAPTURE_FILE";
+  else cat "$PENDING_CAPTURE_FILE"; fi
+  printf 'inspection\n' >> "$PROBE_LOG"
+  exit 0
+fi
+next=0
+for arg in "$@"; do
+  if [ "$next" = 1 ]; then cat "$BINDINGS_FILE" > "$arg"; next=0;
+  elif [ "$arg" = --stream-events ]; then next=1; fi
+done
+cat "$TERMINAL_FILE"
+"#,
+        )
+        .unwrap();
+        let mut case = simple_case();
+        case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
+            children: vec![crate::criteria::ChildExecutionExpectation {
+                expected_result: crate::criteria::ChildResultExpectation::Text(
+                    "observed-value".into(),
+                ),
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        }];
+        for (key, value) in [
+            ("PROBE_VALUE", "expected".to_string()),
+            ("EXPECTED_CWD", tmp.path().display().to_string()),
+            ("PROBE_LOG", log.display().to_string()),
+            ("CAPTURE_FILE", capture_path.display().to_string()),
+            ("PENDING_CAPTURE_FILE", pending_path.display().to_string()),
+            ("BINDINGS_FILE", bindings_path.display().to_string()),
+            ("TERMINAL_FILE", terminal_path.display().to_string()),
+        ] {
+            case.cli_env.insert(key.into(), value);
+        }
+        let mut cfg = RunnerConfig::new(shim);
+        cfg.working_dir = Some(tmp.path().into());
+        cfg.artifact_owner_scopes = vec![astra_services::OwnerScope::user("account").unwrap()];
+        assert!(cfg.profile.is_none() && cfg.artifacts_dir.is_none());
+        let outcome = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.text);
+        let stream = outcome.stream_capture.as_ref().unwrap();
+        assert!(stream.identity_verified);
+        assert!(crate::criteria::evaluate_deterministic(&case.criteria, &outcome)[0].passed);
+        case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
+            children: vec![crate::criteria::ChildExecutionExpectation {
+                expected_result: crate::criteria::ChildResultExpectation::Text(
+                    "wrong-result".into(),
+                ),
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        }];
+        let wrong_result = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        let results = crate::criteria::evaluate_deterministic(&case.criteria, &wrong_result);
+        assert!(!results[0].passed);
+        assert_eq!(
+            crate::classify::classify(&wrong_result, &results),
+            crate::classify::FailureClass::BehaviorContractViolation
+        );
+        let foreign_path = tmp.path().join("foreign-capture.json");
+        let mut foreign = capture.clone();
+        foreign.owner.account_id = "other-account".into();
+        std::fs::write(&foreign_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        case.cli_env
+            .insert("CAPTURE_FILE".into(), foreign_path.display().to_string());
+        let foreign_result = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        assert!(
+            foreign_result
+                .stream_capture
+                .as_ref()
+                .unwrap()
+                .execution
+                .is_none()
+        );
+        cfg.artifact_owner_scopes =
+            vec![astra_services::OwnerScope::user("other-account").unwrap()];
+        let rejected = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        assert!(
+            rejected
+                .stream_capture
+                .as_ref()
+                .unwrap()
+                .execution
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "inspection\ninspection\ninspection\ninspection\n",
+            "pending observation retries once; wrong result and foreign owner do not retry; unauthorized account does not inspect"
+        );
+        cfg.artifact_owner_scopes = vec![astra_services::OwnerScope::user("account").unwrap()];
+        case.cli_env
+            .insert("CAPTURE_FILE".into(), pending_path.display().to_string());
+        case.cli_env.insert("HANG_SECOND".into(), "1".into());
+        case.cli_env.insert(
+            "HANG_SEEN".into(),
+            tmp.path()
+                .join("hanging-observer-started")
+                .display()
+                .to_string(),
+        );
+        // Exercise the same observer with a short absolute deadline, not a
+        // twenty-second wall-clock wait inside a fifteen-second test budget.
+        let partial = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::execution_capture::load_until(
+                &cfg,
+                &case,
+                &outcome,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+            ),
+        )
+        .await
+        .expect("observation deadline must include all retries and waits")
+        .expect("the last owner-bound partial capture must survive");
+        let mut unresolved = outcome.clone();
+        unresolved.stream_capture.as_mut().unwrap().execution = Some(partial);
+        let reader_pid = std::fs::read_to_string(tmp.path().join("hanging-observer-started.pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(reader_pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "the owned inspection process must be reaped before returning"
+        );
+        let stream = unresolved.stream_capture.as_ref().unwrap();
+        assert!(
+            stream
+                .execution
+                .as_ref()
+                .unwrap()
+                .awaiting_completion_evidence(Some(root)),
+            "last partial snapshot must survive the deadline"
+        );
+        let results = crate::criteria::evaluate_deterministic(&case.criteria, &unresolved);
+        assert_eq!(
+            crate::classify::classify(&unresolved, &results),
+            crate::classify::FailureClass::InfraVerificationUnavailable
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().lines().count(),
+            6,
+            "deadline must reap the second reader without launching a third"
         );
     }
 
@@ -2107,7 +2344,6 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             description: None,
             prompt: "ignored by the shim — just needs to be non-empty".into(),
             prompt_variants: vec![],
-            team: None,
             models: Some(vec!["ignored".into()]),
             criteria: vec![],
             debug_log: false,
@@ -2448,7 +2684,6 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             description: None,
             prompt: "p".into(),
             prompt_variants: vec![],
-            team: None,
             models: None,
             criteria: vec![],
             debug_log: false,
@@ -2484,7 +2719,6 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             description: None,
             prompt: "test prompt".into(),
             prompt_variants: vec![],
-            team: None,
             models: Some(vec!["m".into()]),
             criteria: vec![],
             debug_log: false,

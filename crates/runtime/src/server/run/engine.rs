@@ -225,7 +225,9 @@ fn delegation_outcome_transition(status: &str) -> Option<DelegationOutcomeTransi
         },
         // Verification failure is an AgentResult detail, not a separate
         // durable lifecycle state.
-        DurableRunStatusKind::Other if status == "verification_failed" => {
+        DurableRunStatusKind::Other
+            if matches!(status, "verification_failed" | "partial" | "timeout") =>
+        {
             DelegationOutcomeTransition {
                 canonical_status: STATUS_FAILED,
                 expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
@@ -240,14 +242,15 @@ fn delegation_outcome_transition(status: &str) -> Option<DelegationOutcomeTransi
 fn delegation_terminal_events(
     canonical_status: &str,
     error_message: Option<&str>,
+    partial: bool,
 ) -> Vec<serde_json::Value> {
     let mut events = Vec::with_capacity(2);
-    if let Some(error) = error_message {
+    if error_message.is_some() || partial {
         events.push(serde_json::json!({
             "event_type": "run_error",
             "data": {
-                "error": error,
-                "error_code": "delegation_error",
+                "error": error_message,
+                "error_code": if partial { astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE } else { "delegation_error" },
                 "error_kind": "delegation_error",
             }
         }));
@@ -256,6 +259,11 @@ fn delegation_terminal_events(
         "status": canonical_status,
         "error": error_message,
     });
+    if partial {
+        terminal_data["error_code"] = serde_json::json!(
+            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE
+        );
+    }
     if canonical_status == STATUS_CANCELLED {
         terminal_data["cancelled"] = serde_json::Value::Bool(true);
         terminal_data["cancellation_origin"] = serde_json::Value::String(
@@ -539,8 +547,7 @@ impl RunOwnerLeaseHeartbeat {
 /// mode differently from a durable explicit `headless` mode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStartContext {
-    pub(crate) profile_authority: crate::orchestration::ParentProfileAuthority,
-    pub(crate) admitted_agent_profiles: Option<Arc<astra_services::runs::AgentProfileSnapshot>>,
+    pub(crate) delegation_authority: crate::orchestration::DelegationAuthority,
     pub interaction_mode: RequestedTurnInteractionMode,
     pub interactive_client: Option<bool>,
     pub turn_intent_policy: TurnIntentExecutionPolicy,
@@ -614,8 +621,7 @@ impl Default for RunStartContext {
             resolved_model_selection: None,
             generation_controls: None,
             delegated_model_requirements: None,
-            admitted_agent_profiles: None,
-            profile_authority: crate::orchestration::ParentProfileAuthority::Unbound,
+            delegation_authority: crate::orchestration::DelegationAuthority::Allowed,
             model_identity_admitted: false,
             runtime_profile: None,
             provider_request_fingerprint: None,
@@ -668,94 +674,39 @@ pub(crate) fn durable_run_generation_controls(
     Ok(controls)
 }
 
-pub(crate) fn durable_run_agent_profiles(
+pub(crate) fn durable_run_delegation_authority(
     run: &DurableRunRecord,
     owner_user_id: &str,
-) -> Result<Option<Arc<astra_services::runs::AgentProfileSnapshot>>, String> {
-    let admission = run
-        .original_admission_data()
-        .map_err(|error| error.to_string())?;
-    let Some(value) = admission.get("admitted_agent_profiles") else {
-        return Ok(None);
-    };
-    let snapshot: astra_services::runs::AgentProfileSnapshot =
-        serde_json::from_value(value.clone())
-            .map_err(|_| "durable run has invalid agent profiles".to_string())?;
-    snapshot.registry(owner_user_id)?;
-    Ok(Some(Arc::new(snapshot)))
-}
-
-pub(crate) fn durable_run_profile_authority(
-    run: &DurableRunRecord,
-    owner_user_id: &str,
-) -> Result<crate::orchestration::ParentProfileAuthority, String> {
-    use crate::orchestration::ParentProfileAuthority;
+) -> Result<crate::orchestration::DelegationAuthority, String> {
+    use crate::orchestration::DelegationAuthority;
     if run.user_id != owner_user_id {
-        return Err("profile authority belongs to another run owner".into());
+        return Err("delegation authority belongs to another run owner".into());
     }
-    let snapshot = durable_run_agent_profiles(run, owner_user_id)?;
     let admission = run
         .original_admission_data()
         .map_err(|error| error.to_string())?;
-    let authority: ParentProfileAuthority = match admission.get("profile_authority") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| "durable profile authority is malformed")?,
-        None => return Err("durable run is missing profile authority".into()),
-    };
-    if matches!(authority, ParentProfileAuthority::NonDelegating { .. })
-        && (run.depth == 0
-            || matches!(
-                authority.identity(),
-                ParentProfileAuthority::NonDelegating { .. }
-            ))
+    // `profile_authority` is the existing durable admission field. Ordinary
+    // agent runs use `unbound`; a non-delegating child wraps that same generic
+    // authority. Keep this wire contract so a process restart does not change
+    // the authority of already-running work. The generic delegation runtime
+    // accepts only these two generic shapes, not profile-specific identities.
+    let value = admission
+        .get("profile_authority")
+        .ok_or("durable run is missing profile authority")?;
+    let authority = if value == &serde_json::json!({"kind": "unbound"}) {
+        DelegationAuthority::Allowed
+    } else if value
+        == &serde_json::json!({
+            "kind": "non_delegating",
+            "authority": {"kind": "unbound"}
+        })
     {
-        return Err("invalid non-delegating child authority".into());
-    }
-    match (&snapshot, authority.identity()) {
-        (None, ParentProfileAuthority::Unbound) => {}
-        (Some(snapshot), ParentProfileAuthority::OrdinaryRoot)
-            if run.depth == 0 && snapshot.lead_agent_id.is_none() => {}
-        (
-            Some(snapshot),
-            ParentProfileAuthority::AdmittedMember {
-                profile_id,
-                ancestor_profile_ids,
-            },
-        ) => {
-            let expected_ancestors = run
-                .depth
-                .saturating_sub(u32::from(snapshot.lead_agent_id.is_none()));
-            if ancestor_profile_ids.len() as u32 != expected_ancestors
-                || (run.depth > 0
-                    && snapshot
-                        .lead_agent_id
-                        .as_ref()
-                        .is_some_and(|lead| ancestor_profile_ids.first() != Some(lead)))
-            {
-                return Err("durable profile ancestry does not match its run lineage".into());
-            }
-            if ancestor_profile_ids.len() > 64 || ancestor_profile_ids.contains(profile_id) {
-                return Err("durable profile ancestry is invalid".into());
-            }
-            let mut seen = std::collections::HashSet::new();
-            for id in std::iter::once(profile_id).chain(ancestor_profile_ids.iter()) {
-                if !seen.insert(id)
-                    || !snapshot
-                        .profiles
-                        .iter()
-                        .any(|profile| &profile.agent_id == id)
-                {
-                    return Err("durable profile ancestry is unknown or duplicated".into());
-                }
-            }
-            if run.depth == 0
-                && (snapshot.lead_agent_id.as_ref() != Some(profile_id)
-                    || !ancestor_profile_ids.is_empty())
-            {
-                return Err("root profile authority does not match its selected lead".into());
-            }
-        }
-        _ => return Err("durable profile authority conflicts with its admitted roster".into()),
+        DelegationAuthority::Forbidden
+    } else {
+        return Err("durable profile authority is malformed or not generic".into());
+    };
+    if authority == DelegationAuthority::Forbidden && run.depth == 0 {
+        return Err("invalid non-delegating root authority".into());
     }
     Ok(authority)
 }
@@ -1140,22 +1091,24 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
                 && key != "generation_controls"
                 && key != "delegated_model_requirements"
                 && key != "child_runtime_id"
-                && key != "admitted_agent_profiles"
                 && key != "profile_authority"
+                && key != "delegation_authority"
             {
                 data.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
     }
-    if let Some(snapshot) = context.admitted_agent_profiles.as_ref() {
-        data.insert(
-            "admitted_agent_profiles".into(),
-            serde_json::to_value(snapshot.as_ref()).expect("agent profile snapshot serializes"),
-        );
-    }
     data.insert(
         "profile_authority".into(),
-        serde_json::to_value(&context.profile_authority).expect("profile authority serializes"),
+        match context.delegation_authority {
+            crate::orchestration::DelegationAuthority::Allowed => {
+                serde_json::json!({"kind": "unbound"})
+            }
+            crate::orchestration::DelegationAuthority::Forbidden => serde_json::json!({
+                "kind": "non_delegating",
+                "authority": {"kind": "unbound"}
+            }),
+        },
     );
     if let Some(child_runtime_id) = context.child_runtime_id.as_ref() {
         data.insert(
@@ -2193,6 +2146,7 @@ impl RunEngine {
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
+        delivery_events: &[serde_json::Value],
     ) -> Result<bool, String> {
         let transition = delegation_outcome_transition(status).ok_or_else(|| {
             format!("unsupported delegation outcome status '{status}' for run {run_id}")
@@ -2209,12 +2163,17 @@ impl RunEngine {
                     transition.canonical_status,
                     waiting_for,
                     error_message,
-                    &[],
+                    delivery_events,
                 )
                 .await;
         }
 
-        let events = delegation_terminal_events(transition.canonical_status, error_message);
+        let mut events = delivery_events.to_vec();
+        events.extend(delegation_terminal_events(
+            transition.canonical_status,
+            error_message,
+            status == astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL,
+        ));
         match self
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -5213,6 +5172,9 @@ impl UserIntentProvider for RunEngine {
             AtomicRunUserIntentApply::SettlementFenced => Err(format!(
                 "user-intent apply was fenced by settlement for run {run_id}"
             )),
+            AtomicRunUserIntentApply::Inactive { status } if status == STATUS_PAUSED => {
+                Ok(UserIntentApplyAck::Paused)
+            }
             AtomicRunUserIntentApply::Inactive { status } => Err(format!(
                 "cannot apply user intents while run {run_id} is {status}"
             )),
@@ -5479,6 +5441,7 @@ mod tests {
                     STATUS_COMPLETED,
                     None,
                     None,
+                    &[],
                 )
                 .await
                 .unwrap();
@@ -5511,6 +5474,7 @@ mod tests {
                     "verification_failed",
                     None,
                     Some("evidence did not satisfy the gate"),
+                    &[],
                 )
                 .await
                 .unwrap()
@@ -5546,6 +5510,7 @@ mod tests {
                     STATUS_FAILED,
                     None,
                     Some("worker failed"),
+                    &[],
                 )
                 .await
                 .unwrap()
@@ -5562,6 +5527,7 @@ mod tests {
                     STATUS_FAILED,
                     None,
                     Some("worker failed"),
+                    &[],
                 )
                 .await
                 .unwrap(),
@@ -6291,7 +6257,7 @@ mod tests {
                     STATUS_CANCELLED,
                     None,
                     None,
-                    &delegation_terminal_events(STATUS_CANCELLED, None),
+                    &delegation_terminal_events(STATUS_CANCELLED, None, false),
                 )
                 .await
                 .unwrap()
@@ -8002,115 +7968,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_authority_survives_durable_child_restore_without_metadata_override() {
-        use crate::orchestration::ParentProfileAuthority;
-        use astra_services::coordination::{AgentProfile, AgentTier};
+    async fn generic_delegation_authority_survives_durable_restore() {
+        use crate::orchestration::DelegationAuthority;
         let engine = test_engine();
-        let snapshot = Arc::new(astra_services::runs::AgentProfileSnapshot {
-            owner_user_id: "user-1".into(),
-            source_team_id: "team".into(),
-            lead_agent_id: Some("lead".into()),
-            profiles: vec![
-                AgentProfile::new("lead", "Lead", AgentTier::System),
-                AgentProfile::new("member", "Member", AgentTier::User),
-            ],
-        });
-        let root = ParentProfileAuthority::AdmittedMember {
-            profile_id: "lead".into(),
-            ancestor_profile_ids: Vec::new(),
-        };
         engine
             .start_run_with_context(
-                "root-profile",
+                "root-authority",
                 "user-1",
                 "session-1",
-                RunStartContext {
-                    admitted_agent_profiles: Some(snapshot.clone()),
-                    profile_authority: root.clone(),
-                    execution_metadata: Some(
-                        serde_json::json!({"profile_authority":{"kind":"ordinary_root"}})
-                            .as_object()
-                            .unwrap()
-                            .clone(),
-                    ),
-                    ..Default::default()
-                },
+                RunStartContext::default(),
             )
             .await
             .unwrap();
         let parent = engine
-            .load_run("user-1", "root-profile")
+            .load_run("user-1", "root-authority")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            durable_run_profile_authority(&parent, "user-1").unwrap(),
-            root
+            durable_run_delegation_authority(&parent, "user-1").unwrap(),
+            DelegationAuthority::Allowed
         );
-        let child_authority = root.for_child("member").unwrap();
-        engine
-            .start_run_ext_with_context(
-                "child-profile",
-                "user-1",
-                "session-1",
-                Some("root-profile"),
-                Some("delegation"),
-                Some("member"),
-                None,
-                RunStartContext {
-                    admitted_agent_profiles: Some(snapshot),
-                    profile_authority: child_authority.clone(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let child = engine
-            .load_run("user-1", "child-profile")
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            durable_run_profile_authority(&child, "user-1").unwrap(),
-            child_authority
+            parent.events[0]["data"]["profile_authority"],
+            serde_json::json!({"kind": "unbound"})
         );
-        assert!(child_authority.for_child("lead").is_err());
-        assert!(durable_run_profile_authority(&child, "other-owner").is_err());
-        let mut invalid = child.clone();
-        invalid.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("profile_authority");
-        assert!(durable_run_profile_authority(&invalid, "user-1").is_err());
-        for ancestors in [
-            serde_json::json!(["lead", "lead"]),
-            serde_json::json!(["unknown"]),
-            serde_json::json!([]),
-        ] {
+        assert!(
+            parent.events[0]["data"]
+                .get("delegation_authority")
+                .is_none()
+        );
+        for authority in [DelegationAuthority::Allowed, DelegationAuthority::Forbidden] {
+            let run_id = format!("child-{authority:?}");
+            engine
+                .start_run_ext_with_context(
+                    &run_id,
+                    "user-1",
+                    "session-1",
+                    Some("root-authority"),
+                    Some("delegation"),
+                    Some("worker"),
+                    None,
+                    RunStartContext {
+                        delegation_authority: authority,
+                        execution_metadata: Some(
+                            serde_json::json!({
+                                "profile_authority": {"kind":"ordinary_root"}
+                            })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let child = engine.load_run("user-1", &run_id).await.unwrap().unwrap();
+            assert_eq!(
+                durable_run_delegation_authority(&child, "user-1").unwrap(),
+                authority
+            );
+            let expected_profile_authority = match authority {
+                DelegationAuthority::Allowed => serde_json::json!({"kind": "unbound"}),
+                DelegationAuthority::Forbidden => serde_json::json!({
+                    "kind": "non_delegating",
+                    "authority": {"kind": "unbound"}
+                }),
+            };
+            assert_eq!(
+                child.events[0]["data"]["profile_authority"],
+                expected_profile_authority
+            );
+            assert_eq!(
+                authority.require_delegation().is_ok(),
+                authority == DelegationAuthority::Allowed
+            );
+            assert!(durable_run_delegation_authority(&child, "other-owner").is_err());
+            let mut invalid = child.clone();
+            invalid.events[0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("profile_authority");
+            assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             invalid = child.clone();
-            invalid.events[0]["data"]["profile_authority"]["ancestor_profile_ids"] = ancestors;
-            assert!(durable_run_profile_authority(&invalid, "user-1").is_err());
+            invalid.events[0]["data"]["profile_authority"] =
+                serde_json::json!({"kind":"ordinary_root"});
+            assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
+            invalid = child.clone();
+            invalid.events[0]["data"]["profile_authority"] =
+                serde_json::json!({"kind":"non_delegating", "authority":{"kind":"unknown"}});
+            assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
+            if authority == DelegationAuthority::Forbidden {
+                invalid = child;
+                invalid.depth = 0;
+                assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
+            }
         }
-        let restricted = ParentProfileAuthority::NonDelegating {
-            authority: Box::new(child_authority),
-        };
-        let mut recovered = child.clone();
-        recovered.events[0]["data"]["profile_authority"] =
-            serde_json::to_value(&restricted).unwrap();
-        assert_eq!(
-            durable_run_profile_authority(&recovered, "user-1").unwrap(),
-            restricted
-        );
-        assert!(restricted.for_child("another-member").is_err());
-        recovered.depth = 0;
-        assert!(durable_run_profile_authority(&recovered, "user-1").is_err());
-        recovered = child;
-        recovered.events[0]["data"]["profile_authority"] =
-            serde_json::to_value(ParentProfileAuthority::NonDelegating {
-                authority: Box::new(restricted),
-            })
-            .unwrap();
-        assert!(durable_run_profile_authority(&recovered, "user-1").is_err());
     }
 
     #[tokio::test]
@@ -9003,8 +8957,6 @@ mod tests {
         let engine = test_engine();
         let request = astra_services::runs::ChatRequestData {
             completion_checks: None,
-            agent_profile_selection: None,
-            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hello".to_string(),
             conversation_authority: None,
@@ -11314,7 +11266,7 @@ mod tests {
                 .unwrap()
         );
 
-        let error = engine
+        let acknowledgement = engine
             .mark_user_intents_applied(
                 "user-1",
                 "sess-paused",
@@ -11323,8 +11275,8 @@ mod tests {
                 UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
             )
             .await
-            .expect_err("paused execution must not append an applied fact");
-        assert!(error.contains("paused"));
+            .expect("paused input remains pending, not a contract failure");
+        assert_eq!(acknowledgement, UserIntentApplyAck::Paused);
 
         let run = engine
             .load_run("user-1", "run-paused-release")

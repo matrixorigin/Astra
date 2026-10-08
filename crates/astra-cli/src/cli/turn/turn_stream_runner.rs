@@ -46,6 +46,8 @@ pub(crate) struct TurnExecutionRequest<'a> {
 }
 
 pub(crate) enum TurnAttempt {
+    /// Local preflight rejected the input before execution began.
+    NotStarted(Box<crate::TurnFailure>),
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     /// User-cancelled (Ctrl+C / TUI cancel) but the stream was awaited to
     /// completion so partial text + tool records reach the same persistence

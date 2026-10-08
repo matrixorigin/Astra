@@ -1120,18 +1120,36 @@ pub(crate) struct LlmCall<'a> {
     pub thinking: &'a ThinkingConfig,
 }
 
+/// Admission result for one physical provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderAttemptAdmission {
+    Admitted(u32),
+    Paused(u32),
+}
+
 /// Durable observer for physical provider requests.
 ///
-/// `begin_attempt` must commit before the HTTP request is sent. Every returned
-/// index is then completed exactly once, including retryable failures. Logical
-/// invocation lifecycle remains owned by the caller so one invocation can
-/// contain multiple physical attempts.
+/// `begin_attempt` must commit and return `Admitted` before HTTP is sent. A
+/// `Paused` index is retained for re-admission after the pause wait; it grants
+/// no delivery authority. Every admitted index is completed exactly once,
+/// including retryable failures. Logical invocation lifecycle remains owned
+/// by the caller so one invocation can contain multiple physical attempts.
 #[async_trait]
 pub(crate) trait ProviderAttemptObserver: Send + Sync {
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
-    ) -> Result<u32, astra_core::ClassifiedError>;
+        retained_attempt: Option<u32>,
+    ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError>;
+
+    /// Wait for retained admission to become eligible for another check.
+    /// Returning does not itself authorize provider delivery.
+    async fn wait_for_retained_pause(&self) -> Result<(), astra_core::ClassifiedError> {
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "provider attempt observer does not support retained pause waits",
+        ))
+    }
 
     async fn finish_attempt(
         &self,
@@ -1152,6 +1170,26 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
     /// Durable diagnostics use it to distinguish an admitted plan from a
     /// request that actually crossed into transport execution.
     fn note_dispatch_started(&self, _attempt_index: u32) {}
+}
+
+/// Recheck retained admission inside the current physical request frame.
+async fn begin_observed_provider_attempt(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    wire: &ProviderWireRequestIdentity,
+) -> Result<Option<u32>, astra_core::ClassifiedError> {
+    let Some(observer) = observer else {
+        return Ok(None);
+    };
+    let mut retained_attempt = None;
+    loop {
+        match observer.begin_attempt(wire, retained_attempt).await? {
+            ProviderAttemptAdmission::Admitted(index) => return Ok(Some(index)),
+            ProviderAttemptAdmission::Paused(index) => {
+                retained_attempt = Some(index);
+                observer.wait_for_retained_pause().await?;
+            }
+        }
+    }
 }
 
 struct ControlledProviderAttemptObserver<'a> {
@@ -1226,7 +1264,8 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
     async fn begin_attempt(
         &self,
         wire: &ProviderWireRequestIdentity,
-    ) -> Result<u32, astra_core::ClassifiedError> {
+        retained_attempt: Option<u32>,
+    ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
         if self.cancel.is_triggered() {
             return Err(self.cancellation_error("admission"));
         }
@@ -1234,13 +1273,27 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
         if remaining.is_zero() {
             return Err(self.provider_work_deadline_before_admission());
         }
-        let operation = self.inner.begin_attempt(wire);
+        let operation = self.inner.begin_attempt(wire, retained_attempt);
         tokio::pin!(operation);
         tokio::select! {
             biased;
             result = &mut operation => result,
             _ = wait_llm_cancel(self.cancel) => Err(self.cancellation_error("admission")),
             _ = tokio::time::sleep(remaining) => Err(self.ledger_deadline_error("admission", None)),
+        }
+    }
+
+    async fn wait_for_retained_pause(&self) -> Result<(), astra_core::ClassifiedError> {
+        if self.cancel.is_triggered() {
+            return Err(self.cancellation_error("retained pause"));
+        }
+        // The authority owns the pause deadline. Keep the wait outside the
+        // admission I/O timer and preserve the original clock anchor so
+        // begin_attempt rechecks the remaining provider budget on resume.
+        tokio::select! {
+            biased;
+            _ = wait_llm_cancel(self.cancel) => Err(self.cancellation_error("retained pause")),
+            result = self.inner.wait_for_retained_pause() => result,
         }
     }
 
@@ -4987,10 +5040,8 @@ async fn call_llm_and_collect_with_total_budget(
             None
         };
         let client = compatible_client.as_deref().unwrap_or(client);
-        let observed_attempt = match attempt_observer {
-            Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
-            None => None,
-        };
+        let observed_attempt =
+            begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
         let mut req = client.post(&url).header("content-type", "application/json");
         req = apply_provider_auth(req, provider, api_key, header_overrides);
         req = apply_llm_header_overrides(req, header_overrides);
@@ -7310,10 +7361,8 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         None
     };
     let client = compatible_client.as_deref().unwrap_or(client);
-    let observed_attempt = match attempt_observer {
-        Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
-        None => None,
-    };
+    let observed_attempt =
+        begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
     let mut req = client.post(&url).header("content-type", "application/json");
     req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
@@ -11669,7 +11718,7 @@ mod tests {
         .expect("provider request identity");
 
         let error = observer
-            .begin_attempt(prepared.identity())
+            .begin_attempt(prepared.identity(), None)
             .await
             .expect_err("pending durable admission must be bounded");
 
@@ -11885,7 +11934,9 @@ mod tests {
         async fn begin_attempt(
             &self,
             _wire: &ProviderWireRequestIdentity,
-        ) -> Result<u32, astra_core::ClassifiedError> {
+            retained_attempt: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            assert!(retained_attempt.is_none());
             self.began.fetch_add(1, Ordering::SeqCst);
             std::future::pending().await
         }
@@ -11908,8 +11959,10 @@ mod tests {
         async fn begin_attempt(
             &self,
             _wire: &ProviderWireRequestIdentity,
-        ) -> Result<u32, astra_core::ClassifiedError> {
-            Ok(0)
+            retained_attempt: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            assert!(retained_attempt.is_none());
+            Ok(ProviderAttemptAdmission::Admitted(0))
         }
 
         async fn finish_attempt(
@@ -11926,11 +11979,13 @@ mod tests {
         async fn begin_attempt(
             &self,
             wire: &ProviderWireRequestIdentity,
-        ) -> Result<u32, astra_core::ClassifiedError> {
+            retained_attempt: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            assert!(retained_attempt.is_none());
             let attempt = self.next.fetch_add(1, Ordering::SeqCst);
             self.began.lock().expect("began lock").push(attempt);
             self.wires.lock().expect("wires lock").push(wire.clone());
-            Ok(attempt)
+            Ok(ProviderAttemptAdmission::Admitted(attempt))
         }
 
         async fn finish_attempt(
@@ -11943,6 +11998,294 @@ mod tests {
                 .expect("finished lock")
                 .push((attempt_index, terminal.status));
             Ok(())
+        }
+    }
+
+    struct PausingAttemptObserver {
+        pause_checks: usize,
+        began: Mutex<Vec<(Option<u32>, String)>>,
+        waiting: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+        dispatched: AtomicU32,
+        finished: Mutex<Vec<u32>>,
+    }
+
+    impl PausingAttemptObserver {
+        fn new(pause_checks: usize) -> Self {
+            Self {
+                pause_checks,
+                began: Mutex::new(Vec::new()),
+                waiting: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+                dispatched: AtomicU32::new(0),
+                finished: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAttemptObserver for PausingAttemptObserver {
+        async fn begin_attempt(
+            &self,
+            wire: &ProviderWireRequestIdentity,
+            retained_attempt: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            let mut began = self.began.lock().expect("began lock");
+            assert_eq!(retained_attempt, (!began.is_empty()).then_some(7));
+            began.push((retained_attempt, wire.provider_wire_hash.clone()));
+            Ok(if began.len() <= self.pause_checks {
+                ProviderAttemptAdmission::Paused(7)
+            } else {
+                ProviderAttemptAdmission::Admitted(7)
+            })
+        }
+
+        async fn wait_for_retained_pause(&self) -> Result<(), astra_core::ClassifiedError> {
+            self.waiting.notify_one();
+            self.resume.notified().await;
+            Ok(())
+        }
+
+        async fn finish_attempt(
+            &self,
+            attempt_index: u32,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            assert_eq!(
+                terminal.status,
+                astra_services::InferenceTerminalStatus::Succeeded
+            );
+            self.finished
+                .lock()
+                .expect("finished lock")
+                .push(attempt_index);
+            Ok(())
+        }
+
+        fn note_dispatch_started(&self, attempt_index: u32) {
+            assert_eq!(attempt_index, 7);
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn mock_retained_pause_success(
+        State(Hit(hits)): State<Hit>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        hits.fetch_add(1, Ordering::SeqCst);
+        let (content_type, response) = if body["stream"] == true {
+            ("text/event-stream", concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ).to_string())
+        } else {
+            (
+                "application/json",
+                json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]})
+                    .to_string(),
+            )
+        };
+        Response::builder()
+            .header("content-type", content_type)
+            .body(Body::from(response))
+            .expect("mock response")
+    }
+
+    async fn call_retained_pause_client(
+        base: &str,
+        observer: &dyn ProviderAttemptObserver,
+        streaming: bool,
+        cancel: LlmCancel<'_>,
+        budget: Duration,
+    ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+        let messages = [json!({"role":"user","content":"x"})];
+        let call = LlmCall {
+            purpose: astra_turn_types::InferencePurpose::SubAgent,
+            messages: &messages,
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                fixed_temperature: None,
+                thinking_protocol: None,
+                model_name: "retained-pause-test",
+                wire_model_name: None,
+                api_key: "k",
+                base_url: base,
+                provider: "openai",
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: None,
+            temperature: None,
+            thinking: &ThinkingConfig::Off,
+        };
+        if streaming {
+            call_llm_and_collect_with_total_budget(
+                call,
+                cancel,
+                None,
+                Some(observer),
+                RuntimeToolChoice::Auto,
+                budget,
+            )
+            .await
+        } else {
+            call_llm_nonstream_with_attempt_observer(
+                global_llm_client(),
+                call,
+                budget,
+                Some(observer),
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_pause_wait_defaults_to_contract_violation() {
+        let error = RecordingAttemptObserver::default()
+            .wait_for_retained_pause()
+            .await
+            .expect_err("observers without a pause owner must fail closed");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+    }
+
+    #[tokio::test]
+    async fn retained_pause_clients_preserve_index_and_retry_frame_before_http() {
+        for streaming in [false, true] {
+            let hits = Arc::new(AtomicU32::new(0));
+            let base = spawn_local_http_server(
+                Router::new()
+                    .route("/chat/completions", post(mock_retained_pause_success))
+                    .with_state(Hit(hits.clone())),
+            )
+            .await;
+            // More pause checks than transport retries must still deliver once.
+            let pauses = LLM_MAX_RETRIES as usize + 2;
+            let observer = PausingAttemptObserver::new(pauses);
+            let call = call_retained_pause_client(
+                &base,
+                &observer,
+                streaming,
+                LlmCancel::None,
+                Duration::from_secs(5),
+            );
+            tokio::pin!(call);
+            for pause in 0..pauses {
+                tokio::select! {
+                    biased;
+                    result = &mut call => panic!("paused admission returned: {result:?}"),
+                    _ = observer.waiting.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("pause wait not reached"),
+                }
+                assert_eq!(observer.began.lock().unwrap().len(), pause + 1);
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+                assert_eq!(observer.dispatched.load(Ordering::SeqCst), 0);
+                assert!(observer.finished.lock().unwrap().is_empty());
+                observer.resume.notify_one();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut call)
+                .await
+                .expect("resumed client must finish")
+                .expect("admitted delivery");
+            assert_eq!(result.full_text, "ok");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.dispatched.load(Ordering::SeqCst), 1);
+            assert_eq!(*observer.finished.lock().unwrap(), vec![7]);
+            let began = observer.began.lock().unwrap();
+            assert_eq!(began.len(), pauses + 1);
+            assert_eq!(began[0].0, None);
+            assert!(
+                began[1..]
+                    .iter()
+                    .all(|(retained, hash)| *retained == Some(7) && hash == &began[0].1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_pause_streaming_client_cancels_without_http() {
+        for use_flag in [false, true] {
+            let hits = Arc::new(AtomicU32::new(0));
+            let base = spawn_local_http_server(
+                Router::new()
+                    .route("/chat/completions", post(mock_retained_pause_success))
+                    .with_state(Hit(hits.clone())),
+            )
+            .await;
+            let observer = PausingAttemptObserver::new(1);
+            let flag = AtomicBool::new(false);
+            let token = CancellationToken::new();
+            let cancel = if use_flag {
+                LlmCancel::Flag(&flag)
+            } else {
+                LlmCancel::Token(&token)
+            };
+            let call =
+                call_retained_pause_client(&base, &observer, true, cancel, Duration::from_secs(5));
+            tokio::pin!(call);
+            tokio::select! {
+                biased;
+                result = &mut call => panic!("paused admission returned: {result:?}"),
+                _ = observer.waiting.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("pause wait not reached"),
+            }
+            if use_flag {
+                flag.store(true, Ordering::Release);
+            } else {
+                token.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(1), &mut call)
+                .await
+                .expect("pause wait must support cancellation")
+                .expect_err("cancelled pause");
+            assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+            assert_eq!(observer.began.lock().unwrap().len(), 1);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert_eq!(observer.dispatched.load(Ordering::SeqCst), 0);
+            assert!(observer.finished.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_pause_clients_outlive_io_timer_and_recheck_budget_on_resume() {
+        for streaming in [false, true] {
+            let hits = Arc::new(AtomicU32::new(0));
+            let base = spawn_local_http_server(
+                Router::new()
+                    .route("/chat/completions", post(mock_retained_pause_success))
+                    .with_state(Hit(hits.clone())),
+            )
+            .await;
+            let observer = PausingAttemptObserver::new(1);
+            let budget = Duration::from_millis(250);
+            let call =
+                call_retained_pause_client(&base, &observer, streaming, LlmCancel::None, budget);
+            tokio::pin!(call);
+            tokio::select! {
+                biased;
+                result = &mut call => panic!("paused admission returned: {result:?}"),
+                _ = observer.waiting.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("pause wait not reached"),
+            }
+            tokio::select! {
+                biased;
+                result = &mut call => panic!("retained pause consumed an I/O timeout: {result:?}"),
+                _ = tokio::time::sleep(budget) => {}
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert_eq!(observer.began.lock().unwrap().len(), 1);
+            observer.resume.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(1), &mut call)
+                .await
+                .expect("resume must recheck the anchored budget")
+                .expect_err("expired provider work budget");
+            assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+            assert_eq!(observer.began.lock().unwrap().len(), 1);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert_eq!(observer.dispatched.load(Ordering::SeqCst), 0);
+            assert!(observer.finished.lock().unwrap().is_empty());
         }
     }
 
@@ -12605,7 +12948,9 @@ mod tests {
         async fn begin_attempt(
             &self,
             _wire: &ProviderWireRequestIdentity,
-        ) -> Result<u32, astra_core::ClassifiedError> {
+            retained_attempt: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            assert!(retained_attempt.is_none());
             Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::DatabaseError,
                 "durable attempt admission unavailable",

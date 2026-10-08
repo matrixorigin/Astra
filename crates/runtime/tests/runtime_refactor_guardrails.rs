@@ -199,13 +199,6 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     let app = build_test_router(build_guardrail_state());
     let auth_headers = &[("authorization", "Bearer test-token")];
 
-    let teams = request_status(
-        app.clone(),
-        request("GET", "/teams", auth_headers, Body::empty()),
-    )
-    .await;
-    assert_ne!(teams, StatusCode::NOT_FOUND);
-
     let admin_init = request_status(
         app.clone(),
         request("POST", "/admin/init", auth_headers, Body::empty()),

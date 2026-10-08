@@ -1106,67 +1106,6 @@ pub struct SessionAdmissionFacts {
     pub active_plan_id: Option<String>,
 }
 
-pub use astra_turn_types::AgentProfileSelection;
-
-/// Immutable admitted configuration. Runtime registries and credentials are
-/// deliberately not part of the protected run-start facts.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentProfileSnapshot {
-    pub owner_user_id: String,
-    pub source_team_id: String,
-    pub lead_agent_id: Option<String>,
-    pub profiles: Vec<crate::coordination::AgentProfile>,
-}
-
-impl std::fmt::Debug for AgentProfileSnapshot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AgentProfileSnapshot")
-            .field("profile_count", &self.profiles.len())
-            .field("has_selected_lead", &self.lead_agent_id.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl AgentProfileSnapshot {
-    /// Rebuild the existing registry from protected facts, never from a
-    /// client-authored registry or last-writer-wins map.
-    pub fn registry(
-        &self,
-        owner_user_id: &str,
-    ) -> Result<crate::coordination::AgentProfileRegistry, String> {
-        if self.owner_user_id != owner_user_id || self.source_team_id.trim().is_empty() {
-            return Err("agent profile snapshot owner or source is invalid".into());
-        }
-        if self.profiles.is_empty() || self.profiles.len() > 64 {
-            return Err("agent profile snapshot requires between 1 and 64 profiles".into());
-        }
-        if serde_json::to_vec(self)
-            .map_err(|error| error.to_string())?
-            .len()
-            > 262_144
-        {
-            return Err("agent profile snapshot exceeds its byte budget".into());
-        }
-        let mut registry = crate::coordination::AgentProfileRegistry::new();
-        for profile in &self.profiles {
-            if !profile.mcp_servers.is_empty() {
-                return Err("profile MCP selection is not supported by the shared execution binding; inherit the authorized parent MCP scope".into());
-            }
-            registry.register(profile.clone())?;
-        }
-        if self
-            .lead_agent_id
-            .as_ref()
-            .is_some_and(|lead| registry.get(lead).is_none())
-        {
-            return Err("selected lead is not an admitted member".into());
-        }
-        Ok(registry)
-    }
-}
-
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     /// Completion declarations; these never grant tool execution permission.
@@ -1191,9 +1130,6 @@ pub struct ChatRequestData {
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
-    pub agent_profile_selection: Option<AgentProfileSelection>,
-    /// Server-materialized facts; never accepted from client transports.
-    pub admitted_agent_profiles: Option<std::sync::Arc<AgentProfileSnapshot>>,
     pub model: Option<String>,
     /// Optional exact-name assertion for a client-prepared child Offering.
     /// This is not execution authority; the Server freshly admits the
@@ -2709,6 +2645,8 @@ pub enum DurableRunStartClaim {
 pub struct DurableRunEventDelta {
     pub session_id: String,
     pub status: String,
+    /// Derived at the existing metadata read; a pause alone is not an EOF.
+    pub execution_live: bool,
     pub last_event_idx: i64,
     pub events: Vec<serde_json::Value>,
 }
@@ -7884,10 +7822,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 .unwrap_or(position as i64);
             return Ok(AtomicRunGuidanceAdmission::Duplicate { event_index });
         }
-        if !matches!(
-            durable_run_status_kind(&run.status),
-            DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
-        ) {
+        if !durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref()) {
             return Ok(AtomicRunGuidanceAdmission::Inactive {
                 status: run.status.clone(),
             });
@@ -8318,6 +8253,11 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(Some(DurableRunEventDelta {
             session_id: run.session_id.clone(),
             status: run.status.clone(),
+            execution_live: durable_run_status_blocks_session(
+                &run.status,
+                run.waiting_for.as_deref(),
+            ) && run.owner_pod_id.is_some()
+                && in_memory_action_owner_lease_is_active(run).unwrap_or(false),
             last_event_idx: run.last_event_idx,
             events,
         }))
@@ -16780,9 +16720,12 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         after_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
-        let Some((session_id, status, last_event_idx)) =
-            sqlx::query_as::<_, (String, String, i64)>(
-                "SELECT session_id, status, last_event_idx
+        let Some((session_id, status, last_event_idx, execution_live)) =
+            sqlx::query_as::<_, (String, String, i64, i64)>(
+                "SELECT session_id, status, last_event_idx,
+                 CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
+                   AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
+                 THEN 1 ELSE 0 END AS SIGNED)
                  FROM agent_runs WHERE user_id = ? AND run_id = ?",
             )
             .bind(user_id)
@@ -16816,6 +16759,7 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(Some(DurableRunEventDelta {
             session_id,
             status,
+            execution_live: execution_live == 1,
             last_event_idx,
             events,
         }))
@@ -17050,10 +16994,7 @@ impl RunStateStore for DatabaseRunStateStore {
             });
         }
 
-        if !matches!(
-            durable_run_status_kind(&run.status),
-            DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
-        ) {
+        if !durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref()) {
             tx.rollback().await.map_err(|source| {
                 db_error(
                     "admit_run_guidance_rollback_inactive",
@@ -17145,7 +17086,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let updated = sqlx::query(
             "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
              WHERE user_id = ? AND run_id = ? AND last_event_idx = ?
-               AND status IN ('running', 'waiting')
+               AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
                AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)",
         )
         .bind(event_index)
@@ -26475,47 +26416,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn admitted_profile_snapshot_rebuild_preserves_controls_and_rejects_invalid_authority() {
-        use crate::coordination::{AgentProfile, AgentTier};
-        let mut member = AgentProfile::new("member", "Member", AgentTier::System);
-        member.allow_tools = Some(Vec::new());
-        member.read_only = true;
-        member.system_prompt = Some("private member instructions".into());
-        member.max_turns = Some(3);
-        let snapshot = super::AgentProfileSnapshot {
-            owner_user_id: "owner".into(),
-            source_team_id: "team".into(),
-            lead_agent_id: Some("member".into()),
-            profiles: vec![member.clone()],
-        };
-        let restored: super::AgentProfileSnapshot =
-            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
-        assert!(!format!("{restored:?}").contains("private member instructions"));
-        assert_eq!(
-            restored.registry("owner").unwrap().get("member"),
-            Some(&member)
-        );
-        assert!(restored.registry("other-owner").is_err());
-        let mut invalid = restored.clone();
-        invalid.profiles.push(member);
-        assert!(invalid.registry("owner").is_err());
-        invalid = restored.clone();
-        invalid.lead_agent_id = Some("absent".into());
-        assert!(invalid.registry("owner").is_err());
-        invalid = restored.clone();
-        invalid.profiles[0].mcp_servers = vec!["unresolved-binding".into()];
-        assert!(
-            invalid
-                .registry("owner")
-                .err()
-                .unwrap()
-                .contains("MCP selection")
-        );
-        invalid = restored;
-        invalid.profiles[0].max_turns = Some(0);
-        assert!(invalid.registry("owner").is_err());
-    }
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
@@ -29666,9 +29566,9 @@ mod tests {
         delegated.delegation_id = Some("delegation-1".into());
         assert!(!run_requires_session_execution_slot(&delegated));
 
-        let mut team_parent = durable_run_record("team-parent");
-        team_parent.agent_id = Some("orchestrator".into());
-        assert!(!run_requires_session_execution_slot(&team_parent));
+        let mut agent_parent = durable_run_record("agent-parent");
+        agent_parent.agent_id = Some("orchestrator".into());
+        assert!(!run_requires_session_execution_slot(&agent_parent));
     }
 
     #[test]
@@ -32016,23 +31916,11 @@ mod tests {
         child.ancestor_path = Some(format!("{root_id}/{child_id}"));
         child.depth = 1;
         child.agent_id = Some("reviewer".into());
-        let mut profile = crate::coordination::AgentProfile::new(
-            "reviewer",
-            "Reviewer",
-            crate::coordination::AgentTier::System,
-        );
-        profile.system_prompt = Some("x".repeat(200 * 1024));
-        let snapshot = AgentProfileSnapshot {
-            owner_user_id: user_id.clone(),
-            source_team_id: "recovery-team".into(),
-            lead_agent_id: Some("reviewer".into()),
-            profiles: vec![profile],
-        };
-        snapshot.registry(&user_id).unwrap();
+        let admission_notes = "x".repeat(200 * 1024);
         child.events = vec![serde_json::json!({
             "event_type": "run_started",
             "data": {"child_runtime_id": "reviewer", "run_id": child_id,
-                "admitted_agent_profiles": snapshot}
+                "execution_notes": admission_notes}
         })];
         store.insert_run(child).await.unwrap();
         store
@@ -32120,7 +32008,7 @@ mod tests {
             noise.events = vec![serde_json::json!({
                 "event_type": "run_started",
                 "data": {"child_runtime_id": format!("reviewer-{index}"), "run_id": noise_id,
-                    "admitted_agent_profiles": snapshot}
+                    "execution_notes": admission_notes}
             })];
             store.insert_run(noise).await.unwrap();
         }
@@ -32229,8 +32117,8 @@ mod tests {
         }
         let full_child = store.load_run(&user_id, &child_id).await.unwrap().unwrap();
         assert_eq!(
-            full_child.events[0]["data"]["admitted_agent_profiles"],
-            serde_json::json!(snapshot),
+            full_child.events[0]["data"]["execution_notes"],
+            serde_json::json!(admission_notes),
             "the original admission remains fully persisted"
         );
         let wrapped_page = store
@@ -39108,14 +38996,6 @@ mod tests {
                 make_event("custom_event", json!({})),
                 &|o| assert!(o.is_null()),
             ),
-            (
-                "team_prepare→dropped",
-                make_event(
-                    "team_prepare",
-                    json!({"delegation_id": "d1", "phase": "prepare"}),
-                ),
-                &|o| assert!(o.is_null()),
-            ),
             ("no type→dropped", json!({"data": {}}), &|o| {
                 assert!(o.is_null())
             }),
@@ -39356,8 +39236,6 @@ mod tests {
 
         let request = ChatRequestData {
             completion_checks: None,
-            agent_profile_selection: None,
-            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
@@ -39568,8 +39446,6 @@ mod tests {
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
             completion_checks: None,
-            agent_profile_selection: None,
-            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
@@ -39696,8 +39572,6 @@ mod tests {
                 "u1".to_string(),
                 ChatRequestData {
                     completion_checks: None,
-                    agent_profile_selection: None,
-                    admitted_agent_profiles: None,
                     model_catalog_reader: None,
                     message: "hi".to_string(),
                     user_intent: None,
@@ -39875,6 +39749,49 @@ mod tests {
             intent_id,
             event,
             process_local_execution_live,
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_guidance_paused_live_owner_queues_without_resuming() {
+        for (id, live) in [("paused-live", true), ("paused-orphan", false)] {
+            let store = InMemoryRunStateStore::new();
+            let mut run = durable_run_record(id);
+            run.status = STATUS_PAUSED.into();
+            run.waiting_for = Some("user_resume".into());
+            store.insert_run(run).await.unwrap();
+            let event = user_intent_event(id);
+            let result = store
+                .admit_run_guidance(guidance_admission_request(id, id, &event, live))
+                .await
+                .unwrap();
+            if live {
+                assert_eq!(
+                    result,
+                    AtomicRunGuidanceAdmission::Committed { event_index: 0 }
+                );
+                assert_eq!(
+                    store
+                        .admit_run_guidance(guidance_admission_request(id, id, &event, live))
+                        .await
+                        .unwrap(),
+                    AtomicRunGuidanceAdmission::Duplicate { event_index: 0 }
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    AtomicRunGuidanceAdmission::ConsumerNotLive { .. }
+                ));
+            }
+            let run = store.load_run("u1", id).await.unwrap().unwrap();
+            assert_eq!(run.status, STATUS_PAUSED);
+            assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
+            assert_eq!(run.events.len(), usize::from(live));
+            assert!(
+                run.events
+                    .iter()
+                    .all(|event| extract_event_type(event) == "user_intent")
+            );
         }
     }
 
@@ -44934,6 +44851,100 @@ mod tests {
                 .any(|event| event["data"]["intent_id"] == "intent-new"
                     && extract_event_type(event) == "user_intent")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_paused_guidance_and_live_delta_share_the_owner_lease_boundary() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("paused-guide-u-{nonce}");
+        let session = format!("paused-guide-s-{nonce}");
+        let id = format!("paused-guide-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        run.status = "paused".into();
+        run.waiting_for = Some("user_resume".into());
+        store.insert_run(run).await.unwrap();
+        let event = json!({
+            "event_type": "user_intent", "idempotency_key": "user_intent:paused-guide",
+            "data": {"intent_id": "paused-guide", "delivery": "guide_current_run",
+                "input": {"content": "updated requirement"}}
+        });
+        let request = AtomicRunGuidanceAdmissionRequest {
+            user_id: &user,
+            run_id: &id,
+            expected_session_id: &session,
+            intent_id: "paused-guide",
+            event: &event,
+            process_local_execution_live: false,
+        };
+        let initial = store
+            .load_run_event_delta(&user, &id, -1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(initial.execution_live);
+        assert_eq!(
+            initial.last_event_idx, 0,
+            "insert preserves its run-created receipt"
+        );
+        let admission = store.admit_run_guidance(request).await.unwrap();
+        assert!(
+            matches!(
+                admission,
+                AtomicRunGuidanceAdmission::Committed { event_index: 1 }
+            ),
+            "{admission:?}"
+        );
+        assert!(matches!(
+            store.admit_run_guidance(request).await.unwrap(),
+            AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
+        ));
+        let delta = store
+            .load_run_event_delta(&user, &id, initial.last_event_idx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.status, "paused");
+        assert!(delta.execution_live);
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(extract_event_type(&delta.events[0]), "user_intent");
+        sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
+            .bind(&user).bind(&id).execute(pool.get()).await.unwrap();
+        assert!(
+            !store
+                .load_run_event_delta(&user, &id, 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_live
+        );
+        let next = json!({
+            "event_type": "user_intent", "idempotency_key": "user_intent:next-guide",
+            "data": {"intent_id": "next-guide", "delivery": "guide_current_run",
+                "input": {"content": "must not be accepted"}}
+        });
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    intent_id: "next-guide",
+                    event: &next,
+                    ..request
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::ConsumerNotLive { .. }
+        ));
+        cleanup_database_run_fixture(&pool, &user, &id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

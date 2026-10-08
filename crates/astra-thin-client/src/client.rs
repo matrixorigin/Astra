@@ -275,6 +275,12 @@ impl ThinClient {
         self
     }
 
+    /// Explicit token-bound requests must not inherit another provider.
+    pub fn without_bearer_provider(mut self) -> Self {
+        self.bearer_provider = None;
+        self
+    }
+
     /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool surface and ad-hoc calls to other origins (e.g. Memoria health).
     pub fn http_client(&self) -> &Client {
         &self.http
@@ -1523,6 +1529,44 @@ impl ThinClient {
 
     // ── Reflect / decision trace ─────────────────────────────────────────────
 
+    /// Read finite inspection JSON with a byte ceiling, including error bodies.
+    /// Callers own the overall deadline when combining multiple reads.
+    pub async fn get_authed_json_bounded<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        path_with_query: &str,
+        max_bytes: usize,
+    ) -> Result<T, ThinClientError> {
+        let mut resp = self
+            .http
+            .get(self.url(path_with_query)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
+            .timeout(authed_text_request_timeout())
+            .send()
+            .await?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(ThinClientError::ResponseTooLarge { limit: max_bytes });
+        }
+        let status = resp.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+                return Err(ThinClientError::ResponseTooLarge { limit: max_bytes });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(ThinClientError::Api {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// `path_with_query` is relative to origin, e.g. `chat/session/sid/reflect?topic=execution&facet=trace`.
     pub async fn get_authed_path_text(
         &self,
@@ -2580,8 +2624,70 @@ mod tests {
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn inspection_json_has_a_response_byte_ceiling_and_preserves_http_errors() {
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        for (route, status, body, limit, expected) in [
+            ("/valid", 200, "{\"ok\":true}", 11, "ok"),
+            ("/too-large", 200, "{\"ok\":true}", 10, "limit"),
+            ("/error", 403, "denied", 6, "api"),
+            ("/large-error", 403, "denied", 5, "limit"),
+            ("/invalid", 200, "not-json", 8, "json"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header("authorization", "Bearer inspection-token"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = client
+                .get_authed_json_bounded::<serde_json::Value>("inspection-token", route, limit)
+                .await;
+            match (expected, result) {
+                ("ok", Ok(value)) => assert_eq!(value["ok"], true),
+                ("limit", Err(ThinClientError::ResponseTooLarge { limit: actual })) => {
+                    assert_eq!(actual, limit);
+                }
+                ("api", Err(ThinClientError::Api { status, body })) => {
+                    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+                    assert_eq!(body, "denied");
+                }
+                ("json", Err(ThinClientError::Json(_))) => (),
+                (_, result) => panic!("unexpected inspection result: {result:?}"),
+            }
+        }
+        server.verify().await;
+    }
+
     #[derive(Debug, Default)]
     struct RotatingBearer(std::sync::atomic::AtomicUsize);
+
+    #[tokio::test]
+    async fn inspection_chunked_body_enforces_the_accumulated_byte_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+                assert!(request.len() < 4096);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n{\"ok\":\r\n5\r\ntrue}\r\n0\r\n\r\n").await.unwrap();
+        });
+        let client = ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let result = client
+            .get_authed_json_bounded::<Value>("inspection-token", "/", 10)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ThinClientError::ResponseTooLarge { limit: 10 })
+        ));
+        server.await.unwrap();
+    }
 
     impl BearerProvider for RotatingBearer {
         fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>> {
@@ -2593,6 +2699,30 @@ mod tests {
                 Ok(format!("synthetic-fresh-{generation}"))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_token_binding_does_not_inherit_a_provider() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(paths::AUTH_ME))
+            .and(header("authorization", "Bearer captured-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"owner":"captured"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), Some("ambient-default".into()))
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(RotatingBearer::default()))
+            .without_bearer_provider();
+        let response = client.get_auth_me_text("captured-token").await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["owner"],
+            "captured"
+        );
+        server.verify().await;
     }
 
     #[tokio::test]

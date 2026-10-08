@@ -166,10 +166,10 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::ExplainAnalyzeGap => Some(AppEvent::wire(WireEvent::ExplainAnalyzeGap)),
         TuiAppEvent::VerdictReport(items) => Some(AppEvent::wire(WireEvent::VerdictReport(items))),
         TuiAppEvent::Compaction(event) => Some(AppEvent::wire(WireEvent::Compaction(event))),
+        TuiAppEvent::RunBound(run_id) => Some(AppEvent::wire(WireEvent::RunBound(run_id))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ContextWindowPolicy { .. }
         | TuiAppEvent::SessionBound(_)
-        | TuiAppEvent::RunBound(_)
         | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::ContextWindowEstimated(_)
         | TuiAppEvent::ContextSystemPromptTokens(_)

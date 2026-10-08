@@ -696,8 +696,6 @@ fn char_literal() { let slash = '/'; }
             "edge_agent_registry",
             "plans",
             "infra_sandbox_metadata",
-            "team_definitions",
-            "team_snapshots",
         }
         for table in session_workflow_tables:
             with self.subTest(table=table):
@@ -746,14 +744,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "workspace_records track reusable workspaces",
             self.tables["infra_sandbox_metadata"]["merge_guidance"],
-        )
-        self.assertIn(
-            "mutable team config",
-            self.tables["team_definitions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "point-in-time audit records",
-            self.tables["team_snapshots"]["merge_guidance"],
         )
 
 
@@ -921,11 +911,6 @@ fn char_literal() { let slash = '/'; }
             "crates/services/src/storage.rs": [
                 "validate_core_schema_table_claim",
                 "verify_core_schema_shape",
-            ],
-            "crates/services/src/team_persistence.rs": [
-                "team_snapshots",
-                "save_snapshot",
-                "list_snapshots_page",
             ],
         }
 

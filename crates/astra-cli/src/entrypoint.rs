@@ -491,7 +491,7 @@ mod tests {
     };
     use clap::Parser;
     use cli::cli_config::cli_args::{
-        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, SessionCmd, SessionShowArgs,
+        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, SessionCmd, SessionIdArgs,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -564,7 +564,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
         let result = execute_cli_command(
-            Some(Command::Session(SessionCmd::Close(SessionShowArgs {
+            Some(Command::Session(SessionCmd::Close(SessionIdArgs {
                 session_id: "sess-close-1".to_string(),
             }))),
             None,
@@ -613,7 +613,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
         let result = execute_cli_command(
-            Some(Command::Session(SessionCmd::Delete(SessionShowArgs {
+            Some(Command::Session(SessionCmd::Delete(SessionIdArgs {
                 session_id: "sess-delete-1".to_string(),
             }))),
             None,
@@ -639,7 +639,7 @@ mod tests {
     async fn execute_cli_session_close_rejects_invalid_session_id_before_auth() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let error = execute_cli_command(
-            Some(Command::Session(SessionCmd::Close(SessionShowArgs {
+            Some(Command::Session(SessionCmd::Close(SessionIdArgs {
                 session_id: "../escape".to_string(),
             }))),
             None,

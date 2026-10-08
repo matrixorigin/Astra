@@ -1028,6 +1028,17 @@ struct GrepRequest<'a> {
     multiline: bool,
 }
 
+impl GrepRequest<'_> {
+    fn ignores_path(&self, path: &str) -> bool {
+        should_ignore_search_path_in_scope(
+            self.workspace_root,
+            self.target,
+            path,
+            &self.ignore_rules,
+        )
+    }
+}
+
 /// Parse the `timeout` field for `execute_bash`: f64 seconds, defaulting to
 /// [`DEFAULT_BASH_TIMEOUT_SECS`] when missing, clamped to
 /// `[BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS]`.
@@ -2067,14 +2078,7 @@ pub async fn grep_at_authorized_path(
         Ok(paths) => paths,
         Err(e) => return ToolResult::error(e),
     };
-    sort_grep_result_lines(
-        &mut lines,
-        workspace_root,
-        output_mode,
-        sort_mode,
-        &request.ignore_rules,
-        &gitignored_paths,
-    );
+    sort_grep_result_lines(&mut lines, &request, sort_mode, &gitignored_paths);
     if lines.is_empty() {
         return search_process_result(
             no_visible_results_message(
@@ -2255,7 +2259,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
 
     if resolved.is_file() {
         return if glob_matches_path(&pattern, &target)
-            && !should_ignore_search_path(&target, &ignore_rules)
+            && !should_ignore_search_path_in_scope(workspace_root, &target, &target, &ignore_rules)
         {
             ToolResult::text(target)
         } else {
@@ -2306,7 +2310,9 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
         .filter(|line| glob_matches_path(&pattern, line))
-        .filter(|line| !should_ignore_search_path(line, &ignore_rules))
+        .filter(|line| {
+            !should_ignore_search_path_in_scope(workspace_root, &target, line, &ignore_rules)
+        })
         .collect();
     let gitignored_paths = match load_gitignored_search_paths(workspace_root, &files).await {
         Ok(paths) => paths,
@@ -2794,34 +2800,39 @@ fn search_path_mtime_ms(
 
 fn sort_grep_result_lines(
     lines: &mut Vec<String>,
-    workspace_root: &Path,
-    output_mode: SearchOutputMode,
+    request: &GrepRequest<'_>,
     sort_mode: SearchSortMode,
-    ignore_rules: &[SearchIgnoreRule],
     gitignored_paths: &std::collections::HashSet<String>,
 ) {
     if lines.len() < 2 {
         lines.retain(|line| {
-            extract_search_result_path(line, output_mode).is_none_or(|path| {
-                !should_ignore_search_path(&path, ignore_rules) && !gitignored_paths.contains(&path)
+            extract_search_result_path(line, request.output_mode).is_none_or(|path| {
+                !request.ignores_path(&path) && !gitignored_paths.contains(&path)
             })
         });
         return;
     }
 
-    let mut groups = group_grep_result_lines(lines, output_mode);
+    let mut groups = group_grep_result_lines(lines, request.output_mode);
     groups.retain(|group| {
-        group.path.as_ref().is_none_or(|path| {
-            !should_ignore_search_path(path, ignore_rules) && !gitignored_paths.contains(path)
-        })
+        group
+            .path
+            .as_ref()
+            .is_none_or(|path| !request.ignores_path(path) && !gitignored_paths.contains(path))
     });
     let mut cache = std::collections::HashMap::new();
     groups.sort_by(|left, right| match (&left.path, &right.path) {
         (Some(left_path), Some(right_path)) => match sort_mode {
             SearchSortMode::Path => left_path.cmp(right_path),
-            SearchSortMode::Mtime => search_path_mtime_ms(workspace_root, right_path, &mut cache)
-                .cmp(&search_path_mtime_ms(workspace_root, left_path, &mut cache))
-                .then(left_path.cmp(right_path)),
+            SearchSortMode::Mtime => {
+                search_path_mtime_ms(request.workspace_root, right_path, &mut cache)
+                    .cmp(&search_path_mtime_ms(
+                        request.workspace_root,
+                        left_path,
+                        &mut cache,
+                    ))
+                    .then(left_path.cmp(right_path))
+            }
         },
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -2986,7 +2997,37 @@ fn normalize_search_ignore_pattern(pattern: &str) -> Result<String, String> {
 }
 
 fn should_ignore_search_path(path: &str, rules: &[SearchIgnoreRule]) -> bool {
-    if is_default_search_excluded_path(path) {
+    should_ignore_search_path_with_default_scope(path, path, rules)
+}
+
+fn should_ignore_search_path_in_scope(
+    workspace_root: &Path,
+    target: &str,
+    path: &str,
+    rules: &[SearchIgnoreRule],
+) -> bool {
+    if !Path::new(target).is_absolute() {
+        return should_ignore_search_path(path, rules);
+    }
+    // Default exclusions apply within the explicitly authorized external
+    // target, never to its ancestors. Rendering and custom rules stay intact.
+    let target = workspace_root.join(target);
+    let absolute = workspace_root.join(path);
+    let base = if absolute == target {
+        target.parent().unwrap_or(&target)
+    } else {
+        &target
+    };
+    let relative = absolute.strip_prefix(base).unwrap_or(&absolute);
+    should_ignore_search_path_with_default_scope(path, &relative.to_string_lossy(), rules)
+}
+
+fn should_ignore_search_path_with_default_scope(
+    path: &str,
+    default_scope_path: &str,
+    rules: &[SearchIgnoreRule],
+) -> bool {
+    if is_default_search_excluded_path(default_scope_path) {
         return true;
     }
 
@@ -3445,6 +3486,7 @@ async fn enumerate_search_files(
                 .await?;
         return Ok(EnumeratedSearchFiles {
             files: if matches_search_file_filters(&relative, &request.include_globs)
+                && !request.ignores_path(&relative)
                 && !gitignored.contains(&relative)
             {
                 vec![relative]
@@ -3469,7 +3511,7 @@ async fn enumerate_search_files(
         .map(strip_current_dir_prefix)
         .filter(|line| !line.is_empty())
         .filter(|line| matches_search_file_filters(line, &request.include_globs))
-        .filter(|line| !should_ignore_search_path(line, &request.ignore_rules))
+        .filter(|line| !request.ignores_path(line))
         .collect::<Vec<_>>();
     let gitignored = load_gitignored_search_paths(request.workspace_root, &files).await?;
     files.retain(|line| !gitignored.contains(line));
@@ -5366,6 +5408,65 @@ printf 'probe.txt:1:needle\n'
             .await
             .unwrap();
         assert_eq!(ignored, paths.into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn external_search_exclusions_are_scoped_to_the_authorized_target() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let external = dir.path().join(".cache/external");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(external.join("node_modules")).unwrap();
+        std::fs::write(external.join("visible.txt"), "scope-evidence\n").unwrap();
+        std::fs::write(external.join("node_modules/hidden.txt"), "scope-evidence\n").unwrap();
+        let target = external.to_str().unwrap();
+        let request = GrepRequest {
+            workspace_root: &workspace,
+            target,
+            pattern: "scope-evidence",
+            include_globs: Vec::new(),
+            ignore_rules: Vec::new(),
+            case_sensitive: true,
+            fixed_strings: true,
+            word_match: false,
+            before_context_lines: None,
+            after_context_lines: None,
+            max_matches: None,
+            output_mode: SearchOutputMode::Content,
+            multiline: false,
+        };
+        for prefer_rg in [true, false] {
+            let output = run_grep_with_preferred_backend(&request, None, prefer_rg)
+                .await
+                .unwrap();
+            assert_eq!(output.exit_code, 0, "{}", output.stderr);
+            let mut lines = output.stdout.lines().map(str::to_owned).collect();
+            sort_grep_result_lines(
+                &mut lines,
+                &request,
+                SearchSortMode::Path,
+                &std::collections::HashSet::new(),
+            );
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].contains("visible.txt:1:scope-evidence"),
+                "{lines:?}"
+            );
+            assert!(!lines[0].contains("hidden.txt"));
+            let output =
+                run_glob_with_preferred_backend(&workspace, target, "*.txt", None, prefer_rg)
+                    .await
+                    .unwrap();
+            assert_eq!(output.exit_code, 0, "{}", output.stderr);
+            let files: Vec<_> = output
+                .stdout
+                .lines()
+                .filter(|path| !should_ignore_search_path_in_scope(&workspace, target, path, &[]))
+                .collect();
+            assert_eq!(files, vec![external.join("visible.txt").to_str().unwrap()]);
+        }
+        assert!(!request.ignores_path(external.join("visible.txt").to_str().unwrap()));
+        assert!(request.ignores_path(external.join("node_modules/hidden.txt").to_str().unwrap()));
     }
 
     #[tokio::test]

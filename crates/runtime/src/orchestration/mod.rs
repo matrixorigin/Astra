@@ -1,7 +1,7 @@
 //! Dynamic agent orchestration — runtime agent spawning and management.
 //!
 //! This module provides the ability for LLMs to dynamically spawn sub-agents
-//! at runtime without pre-defined team configurations.
+//! at runtime without pre-defined agent configurations.
 
 mod agent_result_status;
 pub mod agent_tool;
@@ -58,12 +58,12 @@ pub(crate) fn workspace_mutation_from_context(
 }
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, CANCELLATION_ORIGIN_UNVERIFIED, CancellationTransferOutcome,
-    DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
+    DelegationAuthority, DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
     FANOUT_GROUP_CANCELLED_EVENT_TYPE, FanoutGroupCancellation, FanoutParentAdmission,
-    InheritedChildPrefix, ParentProfileAuthority, PermissionSummary, PreparedSpawn,
-    PreparedSpawnModelIdentity, ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError,
-    SpawnExecution, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunFrontier,
-    SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
-    SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
-    selector_for_admitted_spawn_input, spawn_completion_status_from_finish_reason,
+    InheritedChildPrefix, PermissionSummary, PreparedSpawn, PreparedSpawnModelIdentity,
+    ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError, SpawnExecution,
+    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunFrontier, SpawnRunResult,
+    SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
+    WaitForAgentOutcome, project_subrun_status_to_spawn, selector_for_admitted_spawn_input,
+    spawn_completion_status_from_finish_reason,
 };

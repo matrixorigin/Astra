@@ -37,7 +37,7 @@ MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable
 `cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
 target triple, and profile. Test processes do not run nested Cargo builds.
 
-The provider fixtures and live Team PTY client use
+The provider fixtures and live child-control PTY client use
 `astra_core::net::client_builder_for_target` so loopback traffic works with or
 without inherited proxies, even when `NO_PROXY` is absent.
 Remote API clients retain environment proxy routing; external provider requests
@@ -180,23 +180,41 @@ targets and requests for an explicit deferred replacement use separate cases.
 - SaaS capability test plan: [`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md) (`make test-saas`; Rust HTTP E2E plus optional remote `@astra/sdk` coverage).
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
 
-The native Team PTY journey is a separate opt-in live lane. Set
+The opt-in live Work PTY journey uses ordinary multiagent conversation. Set
 `ASTRA_TUI_LIVE_API_URL`, `ASTRA_TUI_LIVE_MODEL`, and
-`ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated local Server and account with a
-configured real provider. It creates a temporary lead/builder/reviewer Team,
-checks customer-master and invoice-exception artifacts, child identities, and
-builder-to-reviewer order. Root Work receipts and one task-graph read per round
-must show two dependent primary assignments. It reopens a completed child's
-transcript, restarts the CLI, and requests a duplicate-rule revision through
-ordinary input. Work, branch and task identities remain stable; task revisions
-increase and attempts change after the accepted graph proposal.
-Child projections must replay typed Explain terminals; session audit must retain
-physical-attempt usage and either a finite cost estimate or an explicit unknown.
-It uses real model calls and removes its Team after successful validation.
+`ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated Server and account with a
+configured real provider. Two child agents produce a customer master and
+dependent invoice exceptions through actual Edge file reads and writes.
+Successful launch receipts, durable child identities and typed Explain
+terminals must agree; every invoice child must follow an observed completed
+customer-master child, including corrective runs. Root Work receipts and one
+task-graph read per round verify two dependent primary assignments and exact
+delivered settlements. After a CLI restart and `/resume`, ordinary input
+changes the duplicate rule: Work, branch and task identities stay stable,
+revisions increase, and attempts change through an accepted graph proposal.
+Both versions' JSON artifacts are checked exactly. Session audit must retain
+physical-attempt usage and either a finite cost estimate or an explicit
+unavailable reason. API reads verify execution; the TUI creates the Work and
+launches the children. This journey covers revision between settled runs,
+not recovery of an active run or transfer to another Edge.
 
 ```bash
 cargo test -p astra-cli --test tui_pty_journey \
-  live_team_delivers_dependent_work_items_and_reworks_after_client_restart \
+  live_agent_delivers_dependent_work_items_and_reworks_after_client_restart \
+  -- --ignored --exact
+```
+
+The opt-in live child-control PTY journey uses ordinary conversation and
+an explicitly requested child model. Set `ASTRA_TUI_LIVE_API_URL`,
+`ASTRA_TUI_LIVE_MODEL`, `ASTRA_TUI_LIVE_MEMBER_MODEL` and
+`ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated Server and account. The oracle
+checks the actual child Offering, same-run pause/guidance/resume, successful
+fresh Edge reads and the parent's final adopted answer. API reads verify
+execution; they do not create or substitute a child launch.
+
+```bash
+cargo test -p astra-cli --test tui_pty_journey \
+  live_child_pause_guidance_resume_preserves_execution_identity \
   -- --ignored --exact
 ```
 

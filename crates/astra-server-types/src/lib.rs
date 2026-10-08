@@ -1352,8 +1352,6 @@ pub struct ChatRequest {
     pub work_binding: Option<astra_services::runs::WorkRuntimeBindingRequest>,
     pub agent_id: Option<String>,
     #[serde(default)]
-    pub agent_profile_selection: Option<astra_services::runs::AgentProfileSelection>,
-    #[serde(default)]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
     /// Original model behavior requested by the caller, kept separate from
     /// the exact Offering identity used for Server admission.
@@ -2479,8 +2477,6 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         run_start_idempotency: None,
         full_llm_capture: false,
         agent_id: request.agent_id,
-        agent_profile_selection: request.agent_profile_selection,
-        admitted_agent_profiles: None,
         model: None,
         expected_model_name: request.expected_model_name,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,

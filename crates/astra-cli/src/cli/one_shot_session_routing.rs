@@ -117,10 +117,9 @@ impl OneShotSessionRouting {
     }
 
     /// Resolve continuation once, then keep its prompt messages and durable
-    /// tool-surface state and Team intent on the same causal path.
+    /// tool-surface state on the same causal path.
     pub(crate) fn continuation_turn_inputs(
         &mut self,
-        cli_context: &mut crate::cli::cli_config::cli_context::CliContext,
     ) -> Result<
         (
             Option<Vec<serde_json::Value>>,
@@ -129,15 +128,10 @@ impl OneShotSessionRouting {
         String,
     > {
         Ok(match self.take_continuation()? {
-            Some(continuation) => {
-                if cli_context.agent_profile_selection.is_none() {
-                    cli_context.agent_profile_selection = continuation.agent_profile_selection;
-                }
-                (
-                    Some(continuation.messages),
-                    continuation.deferred_tool_activations,
-                )
-            }
+            Some(continuation) => (
+                Some(continuation.messages),
+                continuation.deferred_tool_activations,
+            ),
             None => (None, Vec::new()),
         })
     }
@@ -684,63 +678,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn selected_local_continuation_does_not_restore_stale_team_intent() {
-        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("routing-local-team-{}", uuid::Uuid::new_v4());
-        let local_messages = vec![
-            serde_json::json!({"role": "user", "content": "current local question"}),
-            serde_json::json!({"role": "assistant", "content": "current local answer"}),
-        ];
-        let local_cursor =
-            typed_resume_bundle(&session_id, 3, local_messages.clone(), Vec::new()).cursor;
-        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
-            &session_id,
-            3,
-            &local_messages,
-            &astra_turn_core::conversation_log::SessionStateCompact {
-                source_cursor: Some(local_cursor),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let mut bundle = typed_resume_bundle(
-            &session_id,
-            1,
-            vec![serde_json::json!({"role": "user", "content": "old remote question"})],
-            Vec::new(),
-        );
-        bundle.projections.provider =
-            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                bundle.cursor.clone(),
-                astra_turn_types::ResumeProviderProjectionV1 {
-                    agent_profile_selection: Some(astra_turn_types::AgentProfileSelection {
-                        team_id: "stale-team".into(),
-                        lead_agent_id: None,
-                    }),
-                    ..Default::default()
-                },
-            ));
-        let mut routing = OneShotSessionRouting {
-            server_session_id: Some(session_id.clone()),
-            history_source_session_id: Some(session_id),
-            resume_metadata: OneShotSessionResumeMetadata {
-                resume_bundle: Some(bundle),
-                ..Default::default()
-            },
-        };
-        let mut context = crate::cli::cli_config::cli_context::CliContext::default();
-        let (messages, _) = routing.continuation_turn_inputs(&mut context).unwrap();
-        assert!(
-            messages
-                .unwrap()
-                .iter()
-                .any(|message| message["content"] == "current local answer")
-        );
-        assert!(context.agent_profile_selection.is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn attached_session_uses_server_canonical_authority_across_journal_clock_domains() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("routing-authority-{}", uuid::Uuid::new_v4());
@@ -787,18 +724,6 @@ mod tests {
         // larger Server event sequence combined with a smaller conversation
         // sequence is not a fork and must never be compared as one clock.
         server_bundle.cursor.journal_event_seq = 100;
-        let selection = astra_turn_types::AgentProfileSelection {
-            team_id: "delivery".into(),
-            lead_agent_id: Some("lead".into()),
-        };
-        server_bundle.projections.provider =
-            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                server_bundle.cursor.clone(),
-                astra_turn_types::ResumeProviderProjectionV1 {
-                    agent_profile_selection: Some(selection.clone()),
-                    ..Default::default()
-                },
-            ));
         let mut routing = OneShotSessionRouting {
             server_session_id: Some(session_id.clone()),
             history_source_session_id: Some(session_id),
@@ -808,15 +733,6 @@ mod tests {
                 ..Default::default()
             },
         };
-
-        assert_eq!(
-            routing
-                .continuation()
-                .unwrap()
-                .unwrap()
-                .agent_profile_selection,
-            Some(selection)
-        );
 
         let continuation = routing
             .continuation()
@@ -836,15 +752,7 @@ mod tests {
                 .all(|message| message["content"] != "unacknowledged local answer")
         );
         assert_eq!(continuation.resume.cursor.journal_event_seq, 100);
-        let mut context = crate::cli::cli_config::cli_context::CliContext::default();
-        routing.continuation_turn_inputs(&mut context).unwrap();
-        assert_eq!(
-            context
-                .agent_profile_selection
-                .as_ref()
-                .map(|value| value.team_id.as_str()),
-            Some("delivery")
-        );
+        routing.continuation_turn_inputs().unwrap();
     }
 
     #[test]

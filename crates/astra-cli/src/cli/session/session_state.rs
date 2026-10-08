@@ -424,9 +424,6 @@ pub(crate) struct SessionState {
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Shared team persistence service (in-memory or API-backed).
-    /// Used for execution history and snapshot persistence.
-    pub team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     pub project_instructions: Option<String>,
@@ -633,9 +630,6 @@ impl Default for SessionState {
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
-            team_store: std::sync::Arc::new(
-                astra_services::team_persistence::InMemoryTeamStore::new(),
-            ),
             project_instructions: None,
             agent_spawner: None, // Installed by session projection initialization
             active_work_registry: std::sync::Arc::new(
@@ -763,7 +757,6 @@ impl SessionState {
     /// Call `prepare_for_session_rebind().await` before using this at a
     /// session boundary to clear the asynchronously shared background-task view.
     pub fn reset_for_new_session(&mut self) {
-        self.cli_context.agent_profile_selection = None;
         self.advance_session_attachment();
         // A registry generation belongs to exactly one session. Old producers
         // may still be retiring after the bounded rebind deadline; replacing
@@ -987,15 +980,10 @@ mod default_tests {
             pending_bg_notifications: vec!["bg".into()],
             ..Default::default()
         };
-        state.cli_context.agent_profile_selection = Some(astra_turn_types::AgentProfileSelection {
-            team_id: "previous-team".into(),
-            lead_agent_id: Some("previous-lead".into()),
-        });
         state.perm_manager.record_approval("bash", None, true);
 
         state.reset_for_new_session();
 
-        assert!(state.cli_context.agent_profile_selection.is_none());
         assert!(state.pending_recovery.is_none());
         assert!(state.run_id.is_none());
         assert_eq!(state.turn, 0);

@@ -6388,6 +6388,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
@@ -6432,6 +6433,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
@@ -6453,8 +6455,7 @@ pub(crate) mod tests {
         spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
     ) -> astra_runtime::orchestration::AgentToolContext {
         astra_runtime::orchestration::AgentToolContext {
-            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
             reply_obligations: Arc::new(Default::default()),
             run_id: "run-parent".into(),

@@ -180,6 +180,9 @@ pub struct SessionTranscriptToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionTranscriptToolResult {
     pub tool_use_id: String,
+    /// Presentation guidance is separate from the executor's result document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_advisories: Vec<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]

@@ -221,7 +221,10 @@ fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
         pane.take_queued_next_turn_submissions()
             .into_iter()
             .collect::<Vec<_>>(),
-        vec!["summarize the findings", "then prepare the patch"],
+        vec![
+            super::NextTurnSubmission::Interactive("summarize the findings".into()),
+            super::NextTurnSubmission::Interactive("then prepare the patch".into())
+        ],
         "the next-turn lane must retain the user's submission order"
     );
 }
@@ -383,12 +386,20 @@ fn locally_accepted_intent_does_not_claim_remote_delivery() {
 fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
     for accepted in [false, true] {
         let mut pane = BottomPane::new();
+        let guide = crate::tui::event_loop::AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "internal-run-id".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "internal-run-id".into(),
+            },
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            None,
+            7,
+        );
         assert!(pane.accept_agent_guide(
             "intent-agent-1".into(),
-            "internal-run-id".into(),
-            "Reviewer".into(),
+            guide.clone(),
             "inspect the failing test".into(),
-            7,
         ));
 
         let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
@@ -417,19 +428,30 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
             super::BottomPaneAction::SubmitInput(text) if text == "ordinary lead input"
         ));
         assert_eq!(pane.pending_user_intent_count(), 1);
+        assert!(
+            pane.apply_user_intent(
+                "intent-agent-1",
+                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                astra_turn_types::UserIntentStatus::Applied,
+                "member-only instruction",
+            )
+            .is_none()
+        );
+        assert!(!pane.return_user_intent(
+            "intent-agent-1",
+            astra_turn_types::UserIntentStatus::Returned,
+            "member-only instruction",
+        ));
+        assert_eq!(pane.pending_user_intent_count(), 1);
         let pending = pane
-            .remove_agent_guide("intent-agent-1", 7, Some("internal-run-id"))
+            .remove_agent_guide("intent-agent-1", None, 7, Some("internal-run-id"))
             .expect("uncertain guidance remains owned by the member lane");
         assert_eq!(pending.intent_id, "intent-agent-1");
         assert_eq!(pending.text, "inspect the failing test");
         assert_eq!(pending.custody, PendingUserIntentCustody::Unconfirmed);
         assert_eq!(
             pending.target,
-            PendingUserIntentTarget::AgentRun {
-                run_id: "internal-run-id".into(),
-                agent_name: "Reviewer".into(),
-                attachment_epoch: 7,
-            }
+            PendingUserIntentTarget::AgentRun { target: guide }
         );
         assert_eq!(
             pending.status,

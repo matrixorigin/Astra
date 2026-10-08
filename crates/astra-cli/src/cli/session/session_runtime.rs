@@ -313,21 +313,8 @@ pub(crate) enum ModelCatalogError {
     InvalidJson(#[from] serde_json::Error),
     #[error("invalid model catalog protocol: {0}")]
     Protocol(String),
-}
-
-impl ModelCatalogError {
-    pub(crate) fn is_authentication_failure(&self) -> bool {
-        matches!(self, Self::NotAuthenticated)
-            || matches!(
-                self,
-                Self::Request(astra_thin_client::ThinClientError::Api { status, .. })
-                    if *status == reqwest::StatusCode::UNAUTHORIZED
-            )
-    }
-
-    pub(crate) fn is_transport_failure(&self) -> bool {
-        matches!(self, Self::Request(error) if error.is_transport())
-    }
+    #[error("Model catalog request timed out")]
+    TimedOut,
 }
 
 /// Fetch the exact public model catalog. Only active Offerings reach the
@@ -346,6 +333,37 @@ pub(crate) async fn fetch_model_catalog(
         .into_iter()
         .filter(|entry| model_list_entry_is_active(entry))
         .collect())
+}
+
+/// Load a catalog for the captured credential owner, including one 401 retry.
+/// The deadline bounds waiting, pagination, and retry; refresh settlement stays
+/// with the credential owner even when this operation stops waiting.
+pub(crate) async fn fetch_owner_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    // The exact owner supplies every bearer. An inherited transport provider
+    // must not replace it with another binding at request dispatch.
+    let api = api.clone().without_bearer_provider();
+    tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
+        let token = owner_access_token(&api, owner, None)
+            .await
+            .ok_or(ModelCatalogError::NotAuthenticated)?;
+        match fetch_model_catalog(&api, Some(&token)).await {
+            Err(ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status,
+                ..
+            })) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                let refreshed = owner_access_token(&api, owner, Some(&token))
+                    .await
+                    .ok_or(ModelCatalogError::NotAuthenticated)?;
+                fetch_model_catalog(&api, Some(&refreshed)).await
+            }
+            result => result,
+        }
+    })
+    .await
+    .map_err(|_| ModelCatalogError::TimedOut)?
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -1074,7 +1092,7 @@ pub(crate) async fn try_refresh_token(
     owner_binding: Option<std::sync::Arc<crate::cli::cli_config::cli_utils::LegacyAuthBinding>>,
 ) -> Result<crate::cli::auth_flow::AuthTokenPayload, SilentRefreshError> {
     // The credential owner retains settlement once refresh starts. A timed-out
-    // Team operation may stop waiting, but cannot abandon a rotated token pair
+    // background operation may stop waiting, but cannot abandon a rotated token pair
     // before checked persistence. Dropping this join handle never resends HTTP.
     let api = api.clone();
     let profile = profile.to_owned();
@@ -1147,7 +1165,7 @@ pub(crate) async fn try_refresh_token(
         save_refreshed_profile_tokens(&profile, &expected, &tokens, &binding, &mut pair)
             .map_err(SilentRefreshError::SaveFailed)?;
         // The same settlement owns both disk persistence and binding progress.
-        // Keep the auth lock here even if its original Team waiter timed out.
+        // Keep the auth lock here even if its original waiter timed out.
         Ok(tokens)
     })
     .await
@@ -1298,6 +1316,7 @@ pub(crate) use astra_credentials::native::AccessMiss;
 pub(crate) async fn owner_access_token(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    rejected_access_token: Option<&str>,
 ) -> Option<String> {
     let account = owner
         .server_account_id
@@ -1308,7 +1327,8 @@ pub(crate) async fn owner_access_token(
         if binding.endpoint().trim_end_matches('/') != api.api_origin().trim_end_matches('/') {
             return None;
         }
-        return binding.access_token().await.ok();
+        let token = binding.access_token().await.ok()?;
+        return (rejected_access_token != Some(token.as_str())).then_some(token);
     }
     let binding = owner.legacy_binding.as_ref()?.clone();
     let pair = binding.pair.clone().lock_owned().await;
@@ -1323,6 +1343,7 @@ pub(crate) async fn owner_access_token(
     })?;
     if let Some(token) = crate::cli::cli_config::cli_utils::bound_profile_access_token(expected)
         && !access_token_needs_refresh(token, chrono::Utc::now().timestamp())
+        && rejected_access_token != Some(token)
     {
         return Some(token.to_owned());
     }
@@ -2573,28 +2594,6 @@ mod tests {
             thinking_capability: None,
             pricing: None,
         }
-    }
-
-    #[test]
-    fn model_catalog_auth_classification_uses_http_status_not_body_text() {
-        let unauthorized =
-            super::ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
-                status: reqwest::StatusCode::UNAUTHORIZED,
-                body: "arbitrary provider response".into(),
-            });
-        assert!(unauthorized.is_authentication_failure());
-
-        let misleading_body =
-            super::ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
-                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                body: "request failed (401): not actually an auth response".into(),
-            });
-        assert!(!misleading_body.is_authentication_failure());
-    }
-
-    #[test]
-    fn missing_token_is_an_authentication_failure() {
-        assert!(super::ModelCatalogError::NotAuthenticated.is_authentication_failure());
     }
 
     #[test]

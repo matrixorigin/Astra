@@ -87,13 +87,14 @@ pub(crate) async fn handle_plan_command(
         plan_request
     );
     crate::cli::turn::turn_entry::handle_chat_input(
-        plan_request.to_string(),
+        crate::cli::turn::turn_entry::ChatInput::Conversation(plan_request.to_string()),
         Some(&token),
         state,
         crate::cli::turn::turn_entry::TurnContext {
             api,
             profile,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         },
     )

@@ -65,185 +65,16 @@ preserve actual terminal outcomes or explicitly unfinished recovery state.
 
 ## Delegation model
 
-### Team configuration ownership
+Children use the existing same-session run tree and execution owner. Built-in
+profiles may narrow tools, skills, read-only access and budgets; they cannot
+grant capabilities the parent or provider lacks. Explicit model requirements
+remain authoritative; omitted child model selection inherits the parent binding.
 
-Team definitions have one owner-scoped persistence contract. CLI commands use
-the existing HTTP adapter directly; no client registry is a second configuration
-store or template authority. An empty roster is a valid draft,
-but execution rejects it before admitting children. Configuration edits retain
-the complete definition, including member profiles, capabilities and shared context.
-Team and member identities are immutable and independent of editable names.
-Creation supplies a caller-generated Team ID outside the reserved `bt-` namespace.
-Public `POST /teams` rejects that prefix with `400 team_validation_failed`, so
-one owner cannot reserve another owner's built-in Team ID before its first
-template initialization. Only the existing owner-scoped builtin factory creates
-these IDs. Their owners can still edit or rename built-in Teams through the
-normal revision-checked update contract; creation restrictions do not prohibit
-those updates. Updates compare the exact Team ID
-and expected positive revision, incrementing the revision on acceptance. A stale
-revision, conflicting name or missing Team rejects the write without upserting
-another definition. The accepted response supplies the exact identity, revision
-and complete configuration without a follow-up read. Transport failures and
-invalid acknowledgements leave the write unconfirmed, not rejected or saved;
-clients retain the requested identity and must inspect it before another write.
-Failed reads or writes must not publish success or a locally committed
-configuration, and standalone commands must return a failing exit status.
-Collection reads are for browsing. Name lookup uses `/teams/name/{name}`;
-`/teams/{team_id}` addresses an immutable identity for reads, updates and deletion.
-Native configuration commands carry typed arguments to this owner rather than
-rendering a command string and parsing it again. Names, context keys, and literal
-descriptions retain their parsed identity; listing is not a help operation.
-The TUI's `/team` and `/team list` open a searchable configuration picker;
-`/team info <name>` inspects one exact definition. Both use the same persistence
-reader as CLI configuration. Inspecting a picker row reuses its loaded definition
-without another read or changing the active agent. These are configuration
-observations, not live execution status. Enter in a populated detail view
-explicitly chooses the Team for future messages in the current conversation;
-it does not start a run or discard existing context. The sole delegation-capable
-member is the default lead; otherwise the TUI presents typed member choices by
-name with delegation permissions visible. Dismissal never accepts a selection.
-Retained views carry the existing attachment epoch and cannot change a different
-conversation after a rebind. `/team leave` clears future selection locally without
-changing history, model, permissions, or running work. It is an interactive TUI
-control, not a standalone command that edits durable conversation state.
-The status line labels the exact selected intent; unavailable friendly labels
-remain generic rather than guessed. Root admission reauthorizes configuration.
-Both native CLI commands and the TUI roster editor use the same configuration
-owner. The editor supports members, responsibilities, exact models and shared
-context; this does not yet establish the complete execution workbench below.
-Team execution remains with ordinary Chat, not the configuration command owner.
-Native `team run` forwards ordinary Explain capture and wall-clock limits.
-Shared Team context is required factual input to the admitted lead and members,
-not system instructions or a source of execution permissions. It is frozen in
-the admitted profile snapshot and uses the existing required-context projection;
-configuration edits affect later admissions, not already running members.
-Snapshot restore uses the complete saved configuration, requires the same owner
-and immutable Team ID, and compares the current revision, not the historical
-revision. Renaming does not detach snapshots or replace member identities. It
-requires the exact returned snapshot ID, publishes only the accepted response,
-and never checks out Git or changes running tasks.
-
-### Team user journey (target, not yet a proven runtime guarantee)
-
-Native CLI and TUI Team tasks must enter the ordinary root-turn owner with a
-selected lead and an authorized member set. Configuration commands and fixed
-fanout alone do not establish the interactive lead journey below; acceptance
-requires the same session, guidance, callbacks and child observations across
-successive turns.
-
-The native entrypoints use the same configuration:
-
-```text
-astra team create delivery
-astra team add-member delivery lead --can-delegate -- Describe the lead's responsibilities
-astra team add-member delivery developer -- Describe the member's responsibilities
-astra team run delivery <task>
-```
-
-In the TUI, use `/team` to inspect or edit configuration and select a lead,
-then enter an objective; `/team run delivery <task>` is also available.
-Selection changes are unavailable during an active turn, while configuration
-can still be inspected or edited for future admissions.
-Subsequent ordinary input retains that selection. Canonical turn commit atomically
-retains the admitted Team/lead selection as intent for the next root.
-Authenticated CLI resume reads the Server-owned generation even when a local
-replica exists; local-only restore is reserved for an unauthenticated session.
-Resume returns it only at the matching canonical cursor; a new root reauthorizes the
-current owner-scoped configuration. Switching or clearing a session drops the
-previous selection, while an explicit Team launch overrides restored intent.
-Same-run recovery continues to use its frozen admitted profiles.
-Native entrypoints select the sole delegation-capable member from the already
-loaded configuration. With zero or multiple such members, the TUI offers a
-member picker; one-shot CLI uses `team info` and `--lead-agent-id <agent_id>` to
-choose explicitly. Role names and member order never choose a lead or grant
-permission. Server admission authorizes and freezes
-the explicit resolved identity. This UI default does not change the protocol's
-`lead_agent_id: null` meaning: an ordinary root with an admitted member directory.
-Native `team run --json` reuses the ordinary turn's terminal JSON; its hidden
-`--stream-events <path>` flag writes the same structured event stream as `chat`.
-For an isolated one-shot task, `team run --no-resume` uses ordinary Chat routing
-to create a new conversation instead of attaching recent history. In the TUI,
-start a fresh conversation with `/clear` before `/team run`; `--no-resume` is
-only applicable to one-shot CLI execution.
-Role names do not grant delegation permission. `--model <available-model-name>`
-on `add-member` is optional; an explicit root model selection takes precedence
-over the lead's configured default. These entrypoints alone do not prove the
-full acceptance criteria below.
-
-Built-in templates declare one delegation-capable coordinator:
-`dev/planner`, `research/synthesizer`, and `review/reviewer`. Each can start
-direct members at depth one; other members retain non-delegating authority.
-Selecting a different lead does not silently promote its permissions.
-
-A Team is a reusable collaboration configuration, not a second execution
-engine. The user addresses one accountable lead with an objective; they need
-not manually invoke every member or understand transport contracts. The lead
-clarifies missing requirements, maintains the plan, assigns work, integrates
-observed results and checks acceptance. Product manager and developer are
-ordinary configured responsibilities, not hard-coded runtime roles.
-
-Profile admission belongs to ordinary root and child execution. Built-in agent
-definitions and owner-authorized Team members normalize to the same effective
-profile, preserving prompt, model intent, skill and MCP selection, tool limits,
-read-only restrictions, initial turn limits and delegation scope. Skills are
-not tool permission aliases. A profile can narrow current execution authority;
-it cannot grant capabilities that the parent or selected provider lacks.
-
-Explicit profile MCP selection is not yet wired to the shared provider binding
-and dispatch owner. Run admission rejects nonempty `mcp_servers` rather than
-silently ignoring it. An empty selection inherits the currently authorized
-parent MCP scope; it does not establish new connections or credentials.
-
-The admitted member set is immutable and scoped to the run, never installed
-into a session-global registry. Ordinary spawn, fanout and coordination consume
-the same preflight facts; all fanout slots must pass before any child starts.
-Protected `run_started` facts retain the effective configuration and its
-owner/source identity. Recovery preserves those facts rather than resolving a
-subsequently edited Team, while revalidating current capability and model
-authorization. Public request metadata cannot establish child-run authority.
-
-Children execute through the existing same-session run tree. Client-side
-ordinary root admissions are not a replacement for internal child admission:
-sharing a parent's session writer causes contention, while opening unrelated
-sessions loses authoritative lineage. Native CLI/TUI must retain the ordinary
-root's authenticated Edge delivery, callback, cancellation and observation
-channels. Team execution uses this ordinary root-turn entrypoint rather than a
-separate batch executor.
-
-Multi-step collaboration uses the existing Work dependency and attempt owner.
-Member execution, messages, user guidance, cancellation, pause and recovery use
-the same child-agent backbone as ordinary delegation. Sequential/FanOut/Fork
-are coordination policies, not independent lifecycle authorities. A member's
-claimed completion is insufficient to settle an attempt or finish the Team.
-Blocked dependencies, questions and failed acceptance may require another
-step; neither a one-shot aggregate nor a transport acknowledgement proves the
-objective has been achieved.
-
-Explicit model choices remain authoritative. Optional model selection may
-choose among authorized candidates within the existing budget and capability
-constraints; it cannot relax a hard requirement. Model choice is not required
-for communication, step tracking or lifecycle correctness.
-
-When a child request omits a model policy, its admitted profile's model default
-is resolved before falling back to the parent binding. An explicit `inherit`
-request selects the parent binding; explicit fixed choices and admitted user
-requirements remain authoritative. This normalization precedes shared model
-admission for both single spawn and fanout, so launch receipts and execution
-use the same prepared Offering rather than changing models after launch.
-An HTTP request with an explicit Offering and omitted model policy has fixed
-selection intent; only explicit inheritance can replace it with the lead default.
-
-The user can inspect progress, blockers and artifacts, change requirements,
-pause or cancel, and drill down into member execution without flooding the
-lead transcript. Execution identity must connect Team, lead, child, Work
-attempt and physical provider calls in existing Trace/Explain/Audit facts.
-CLI root history retains exact-run durable received messages in the existing
-transcript journal, including interrupted turns and one-shot submissions.
-Replayed evidence is deduplicated by typed identity, not message text; it does
-not enter provider-facing conversation history or authorize completion.
-Team summaries are aggregates, not additional billable provider usage;
-unknown usage, cache or price coverage must remain explicit. Acceptance must
-exercise a real multi-step exchange and recovery, not only fixed fanout.
+Users can inspect child progress, send guidance, pause, resume or cancel, and
+open an exact child transcript without flooding the parent conversation.
+Run identity connects launch, Work attempt, messages and physical provider
+calls. Summaries are not additional billable usage, and unknown token, cache
+or price coverage remains explicit.
 
 Session Audit aggregates physical provider attempts across root and child runs
 with `request_usage.scope=session_all_runs`. Missing token, cache or price observations
@@ -307,8 +138,7 @@ CLI agent and fanout requests execute through the Server control plane, includin
 one-shot chat and app-server. The CLI does not launch a second local agent run or
 append local child results after the Server stream terminates. These agent
 entrypoints reject isolated Git workspaces; they do not provision a local
-worktree implicitly. Native Team execution uses this same root-turn and child
-execution boundary.
+worktree implicitly.
 Interactive CLI state retains local recovery projections for historical child
 and fanout queries. It does not install a root delegation engine, capture a
 parent prefix for local children, or register a root agent mailbox.

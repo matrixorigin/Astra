@@ -171,6 +171,23 @@ because guidance arrived. Missing guidance, failed acknowledgement, cancellation
 and owner loss remain fail-closed. Ambiguous admission is reconciled before
 continuation, preserving exact settlement custody.
 
+A paused run that retains its waiting obligation and live execution lease may
+accept guidance without resuming. Acceptance records custody; application waits
+for the existing pause control to clear and retries the same acknowledgement,
+without advancing the input cursor or creating another execution. Released or
+expired owners cannot accept new guidance. The live attachment stays open for a
+retained pause and closes when that owner is released or the run settles.
+Client observation remains cancellable during a pause: detaching the owning
+session retires observation, not the accepted input. Its application timeout
+counts active execution after the matching acceptance event, not paused time.
+
+A paused child remains a nonterminal dependency of its live parent. Waiting
+releases execution capacity but retains both owners; the child's pause alone
+must not publish a parent terminal outcome or remove the child's resume action.
+Observation timeouts do not buy inference while that dependency is paused.
+Parent guidance and messages still use ordinary input admission. Cancellation,
+lease loss, handoff and the original execution deadline remain authoritative.
+
 Turn-evaluation journals report settled `run_status` and separate
 `tool_evaluation_success` from overall `success`. Healthy tools do not promote
 a failed, cancelled, paused, or still-running execution to successful completion.

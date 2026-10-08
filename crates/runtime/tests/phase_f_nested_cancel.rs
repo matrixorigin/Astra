@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use astra_runtime::server::delegation::engine::{
-    DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
+    DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutionResult, SubRunExecutor,
 };
 use astra_runtime::server::run::engine::RunEngine;
 use astra_services::coordination::{
@@ -166,16 +166,7 @@ impl NestedMockExecutor {
 
 #[async_trait]
 impl SubRunExecutor for NestedMockExecutor {
-    async fn execute(
-        &self,
-        config: SubRunConfig,
-    ) -> Result<
-        (
-            AgentResult,
-            Option<astra_runtime::orchestration::SpawnRunFrontier>,
-        ),
-        String,
-    > {
+    async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
         self.started_at_root.fetch_add(1, Ordering::SeqCst);
         let token = config.cancel_token.clone().expect("cancel_token required");
 
@@ -226,8 +217,8 @@ impl SubRunExecutor for NestedMockExecutor {
                 .map_err(|error| format!("depth-1 cancellation task failed: {error}"))?;
         }
 
-        Ok((
-            AgentResult {
+        Ok(SubRunExecutionResult {
+            result: AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: "cancelled".to_string(),
@@ -237,8 +228,9 @@ impl SubRunExecutor for NestedMockExecutor {
                 completion_tokens: 0,
                 tool_calls: 0,
             },
-            None,
-        ))
+            committed_frontier: None,
+            applied_user_intents: Vec::new(),
+        })
     }
 }
 

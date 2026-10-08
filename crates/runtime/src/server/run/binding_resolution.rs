@@ -294,17 +294,7 @@ pub(crate) fn run_start_context_from_request(
         });
     RunStartContext {
         execution_authentication: request.execution_authentication.clone(),
-        profile_authority: match request.admitted_agent_profiles.as_ref() {
-            None => crate::orchestration::ParentProfileAuthority::Unbound,
-            Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
-                Some(profile_id) => crate::orchestration::ParentProfileAuthority::AdmittedMember {
-                    profile_id: profile_id.clone(),
-                    ancestor_profile_ids: Vec::new(),
-                },
-                None => crate::orchestration::ParentProfileAuthority::OrdinaryRoot,
-            },
-        },
-        admitted_agent_profiles: request.admitted_agent_profiles.clone(),
+        delegation_authority: crate::orchestration::DelegationAuthority::Allowed,
         delegated_model_requirements: None,
         child_runtime_id: None,
         interaction_mode: super::engine::effective_requested_interaction_mode(
@@ -644,8 +634,6 @@ mod tests {
     fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
         astra_services::runs::ChatRequestData {
             completion_checks: None,
-            agent_profile_selection: None,
-            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: message.to_string(),
             conversation_authority: None,

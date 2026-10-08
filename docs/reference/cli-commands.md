@@ -118,7 +118,7 @@ astra chat -m "继续" --session-id <session_id> --model gpt-4o
 
 # Sessions
 astra session list [--agent-id AGENT] [--status open] [--limit 20] [--offset 0]
-astra session show <session_id>
+astra session show <session_id> [--execution [--transcript] [--run-events]] # bounded read-only facts; optional transcript and recent run-event tails
 astra session close <session_id>
 astra session delete <session_id>
 astra session judge --model MODEL --message 'Rubric and evidence' [--timeout-seconds 120]

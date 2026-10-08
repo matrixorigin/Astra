@@ -356,10 +356,8 @@ impl AgenticRunLifecycleService {
                 self.model_catalog_cache.clone(),
             ),
         );
-        let profiles = crate::server::run::engine::durable_run_agent_profiles(run, &run.user_id)
-            .map_err(invalid_resume)?;
-        let profile_authority =
-            crate::server::run::engine::durable_run_profile_authority(run, &run.user_id)
+        let delegation_authority =
+            crate::server::run::engine::durable_run_delegation_authority(run, &run.user_id)
                 .map_err(invalid_resume)?;
         let interaction_mode =
             crate::server::run::engine::durable_run_effective_interaction_mode(run)
@@ -418,16 +416,8 @@ impl AgenticRunLifecycleService {
                 PermissionMode::Auto
             });
         inherited.allowed_tools = constraints.allowed_tools.clone();
-        inherited.read_only_execution = bindings.workspace.authority
-            == astra_runtime_env::WorkspaceAuthority::ReadOnly
-            || profiles.as_ref().is_some_and(|profiles| {
-                profiles.lead_agent_id.as_ref().is_some_and(|lead| {
-                    profiles
-                        .profiles
-                        .iter()
-                        .any(|profile| &profile.agent_id == lead && profile.read_only)
-                })
-            });
+        inherited.read_only_execution =
+            bindings.workspace.authority == astra_runtime_env::WorkspaceAuthority::ReadOnly;
         let mut permissions = PermissionSyncContext::new(inherited);
         let hook_root =
             (bindings.workspace.kind != WorkspaceBindingKind::None).then(|| workspace.clone());
@@ -651,8 +641,7 @@ impl AgenticRunLifecycleService {
             .execution_owner_generation
             .publish(run.run_generation);
         let agent_context = AgentToolContext {
-            parent_profile_authority: profile_authority,
-            admitted_agent_profiles: profiles.clone(),
+            parent_delegation_authority: delegation_authority,
             fanout_admission: entry.spawner.fanout_parent(&run.run_id),
             reply_obligations: state.messaging.reply_obligations.clone(),
             delegation_model_admission: None,
@@ -722,12 +711,6 @@ impl AgenticRunLifecycleService {
                 .get("explain_analyze_requested")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            profile_selection: profiles.as_ref().map(|profiles| {
-                astra_turn_types::AgentProfileSelection {
-                    team_id: profiles.source_team_id.clone(),
-                    lead_agent_id: profiles.lead_agent_id.clone(),
-                }
-            }),
             agent_id: run.agent_id.clone(),
             model_name: run.resolved_model_name.clone(),
             user_message: handoff.original_user_message.clone(),

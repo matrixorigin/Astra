@@ -19,7 +19,7 @@ mod tests {
     use astra_services::runs::InMemoryRunStateStore;
 
     use crate::server::delegation::engine::{
-        DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
+        DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutionResult, SubRunExecutor,
     };
     use crate::server::run::engine::RunEngine;
     use astra_messaging::in_process::InProcessTransport;
@@ -37,10 +37,7 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for MailboxTestExecutor {
-        async fn execute(
-            &self,
-            mut config: SubRunConfig,
-        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
+        async fn execute(&self, mut config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -85,8 +82,8 @@ mod tests {
                     .send_progress(0, 0, "completed", Some(format!("{agent_id} done")))
                     .await;
 
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id,
                         run_id,
                         status: "completed".to_string(),
@@ -96,11 +93,12 @@ mod tests {
                         completion_tokens: 5,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             } else {
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id,
                         run_id,
                         status: "completed".to_string(),
@@ -110,8 +108,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
     }

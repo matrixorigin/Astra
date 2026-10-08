@@ -40,7 +40,7 @@ use astra_turn_core::orchestration_fanout_group::{
     AgentFanoutGroupProjection, AgentFanoutSlot, AgentFanoutSlotStatus,
 };
 
-use super::spawner::ParentProfileAuthority;
+use super::spawner::DelegationAuthority;
 use super::{
     AgentStatus, CancellationOrigin, DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput,
     SpawnAgentOutput, SpawnContext, SpawnError, WaitForAgentOutcome,
@@ -62,7 +62,7 @@ const AGENT_RESULT_OBSERVE_GRACE: Duration = Duration::from_secs(1);
 /// Total aggregate byte limit for the combined `results[]` array in
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
-const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
+pub(crate) const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
 pub(crate) const MAX_FANOUT_TARGET_COUNT: usize = AGENT_FANOUT_MAX_TARGET_COUNT as usize;
 /// A failed child admission must not turn one fanout slot into an unbounded
 /// aggregate result. The full error remains in runtime logs/transcript; the
@@ -373,8 +373,7 @@ fn is_timeout_fanout_finish_reason(reason: &str) -> bool {
 #[derive(Clone)]
 pub struct AgentToolContext {
     /// Exact admitted configuration identity, separate from runtime agent ID.
-    pub parent_profile_authority: ParentProfileAuthority,
-    pub admitted_agent_profiles: Option<Arc<astra_services::runs::AgentProfileSnapshot>>,
+    pub parent_delegation_authority: DelegationAuthority,
     /// Invocation-local frozen user model requirement, installed only by the
     /// trusted tool metadata path. Shared lifecycle contexts keep this empty.
     pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
@@ -1530,8 +1529,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .map(|(_, _, input)| input.clone())
         .collect();
     let spawn_context = SpawnContext {
-        parent_profile_authority: ctx.parent_profile_authority.clone(),
-        admitted_agent_profiles: ctx.admitted_agent_profiles.clone(),
+        parent_delegation_authority: ctx.parent_delegation_authority,
         delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
@@ -2905,8 +2903,7 @@ async fn handle_agent_spawn_input_with_controls(
     // The resolved Offering is runtime-owned; keep the user's optional policy
     // unchanged for durable provenance and nested delegation.
     let mut spawn_ctx = SpawnContext {
-        parent_profile_authority: ctx.parent_profile_authority.clone(),
-        admitted_agent_profiles: ctx.admitted_agent_profiles.clone(),
+        parent_delegation_authority: ctx.parent_delegation_authority,
         delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
@@ -3347,7 +3344,7 @@ async fn enrich_collected_agent_result(
     rendered: String,
     ctx: &AgentToolContext,
     agent_id: &str,
-    retained_run_id: Option<&str>,
+    retained: Option<&crate::orchestration::spawner::DirectChildCompletion>,
 ) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(&rendered) else {
         return rendered;
@@ -3355,11 +3352,28 @@ async fn enrich_collected_agent_result(
     let Some(object) = value.as_object_mut() else {
         return rendered;
     };
-    if let Some(run_id) = retained_run_id {
-        object.insert("run_id".into(), json!(run_id));
+    if let Some(child) = retained {
+        object.insert("run_id".into(), json!(child.run_id));
+        object.insert(
+            "applied_user_intents".into(),
+            json!(child.applied_user_intents),
+        );
+        let projection = serde_json::to_value(child).expect("direct child must serialize");
+        object.insert(
+            "status_fingerprint".into(),
+            projection["status_fingerprint"].clone(),
+        );
     }
-    if let Some(state) = ctx.spawner.get_agent_state_any(agent_id).await {
+    if let Some(state) = ctx.spawner.get_agent_state_any(agent_id).await
+        && retained.is_none_or(|child| child.run_id == state.run_id)
+    {
         object.insert("run_id".into(), json!(state.run_id));
+        if retained.is_none() {
+            object.insert(
+                "applied_user_intents".into(),
+                json!(state.applied_user_intents),
+            );
+        }
         object.insert("tool_calls".into(), json!(state.metrics.tool_calls));
         if let Some(model) = state.prepared_model {
             object.insert(
@@ -3439,7 +3453,6 @@ async fn handle_agent_get_result_action_inner(
     }
 
     let timeout = AGENT_RESULT_OBSERVE_GRACE;
-    let retained_run_id = retained.as_ref().map(|child| child.run_id.clone());
     let outcome = match retained.as_ref() {
         Some(child) => WaitForAgentOutcome::Status(child.status.clone()),
         None => ctx.spawner.wait_for_agent_outcome(agent_id, timeout).await,
@@ -3460,8 +3473,7 @@ async fn handle_agent_get_result_action_inner(
             let group = ctx.spawner.fanout_group_for_agent(agent_id).await;
             let rendered = render_wait_for_agent_status(agent_id, &status);
             let rendered =
-                enrich_collected_agent_result(rendered, ctx, agent_id, retained_run_id.as_deref())
-                    .await;
+                enrich_collected_agent_result(rendered, ctx, agent_id, retained.as_ref()).await;
             attach_fanout_to_agent_result(rendered, group)
         }
         WaitForAgentOutcome::TimedOut => {
@@ -4024,6 +4036,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4118,6 +4131,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4156,6 +4170,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "interrupted".into(),
                 finish_reason: "budget_exhausted".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4209,6 +4224,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "interrupted".into(),
                 finish_reason: "budget_exhausted".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4267,6 +4283,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "interrupted".into(),
                 finish_reason: "execution_incomplete".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4305,6 +4322,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "failed".into(),
                 finish_reason: "error".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4343,6 +4361,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "interrupted".into(),
                 finish_reason: "empty_completion".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4381,6 +4400,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "failed".into(),
                 finish_reason: "executor_dropped".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4488,6 +4508,7 @@ pub(crate) mod tests {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4512,20 +4533,19 @@ pub(crate) mod tests {
         Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
     }
 
-    fn test_spawner_without_executor() -> Arc<DynamicAgentSpawner> {
+    pub(crate) fn test_spawner_without_executor() -> Arc<DynamicAgentSpawner> {
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         Arc::new(DynamicAgentSpawner::new(router))
     }
 
-    fn test_spawn_context(
+    pub(crate) fn test_spawn_context(
         spawner: Arc<DynamicAgentSpawner>,
         current_model: Option<&str>,
     ) -> AgentToolContext {
         AgentToolContext {
-            parent_profile_authority: ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority: DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
@@ -4566,10 +4586,9 @@ pub(crate) mod tests {
         ctx.fanout_admission = ctx.spawner.fanout_parent(&ctx.run_id);
         ctx.recursion_depth = u8::try_from(run.depth).unwrap();
         ctx.is_fork_child = inherited_prefix;
-        ctx.parent_profile_authority =
-            crate::server::run::engine::durable_run_profile_authority(run, &run.user_id).unwrap();
-        ctx.admitted_agent_profiles =
-            crate::server::run::engine::durable_run_agent_profiles(run, &run.user_id).unwrap();
+        ctx.parent_delegation_authority =
+            crate::server::run::engine::durable_run_delegation_authority(run, &run.user_id)
+                .unwrap();
         ctx.trace_context = Some(astra_turn_core::trace_event::TraceContext {
             session_id: run.session_id.clone(),
             user_id: run.user_id.clone(),
@@ -4714,171 +4733,6 @@ pub(crate) mod tests {
                 .take_captured_model_selection()
                 .map(|selection| selection.offering_id),
             Some("offer-parent-test".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn admitted_profile_model_is_used_by_spawn_and_fanout_handlers() {
-        use astra_services::coordination::{AgentProfile, AgentTier};
-        use astra_turn_core::trace_event::TraceContext;
-        use astra_turn_types::{
-            DelegationModelAdmission, DelegationModelAdmissionOutcome,
-            DelegationModelInstructionSource, DelegationModelSlotConstraint,
-            DelegationRequirementStrength,
-        };
-
-        let executor = Arc::new(CapturingModelExecutor::new());
-        let spawner = test_spawner(executor.clone());
-        let mut ctx = test_spawn_context(spawner, Some("Flash"));
-        ctx.current_model_selection = Some(astra_turn_types::ModelSelection {
-            offering_id: "offering-flash".into(),
-        });
-        let mut lead = AgentProfile::new("lead", "Lead", AgentTier::Orchestrator);
-        lead.can_delegate = true;
-        lead.max_delegation_depth = 3;
-        lead.delegate_to = vec!["profile-glm".into()];
-        let mut profile = AgentProfile::new("profile-glm", "GLM", AgentTier::User);
-        profile.model_selection = Some(astra_turn_types::ModelSelection {
-            offering_id: "offering-glm".into(),
-        });
-        ctx.parent_profile_authority = ParentProfileAuthority::AdmittedMember {
-            profile_id: "lead".into(),
-            ancestor_profile_ids: Vec::new(),
-        };
-        ctx.admitted_agent_profiles = Some(Arc::new(astra_services::runs::AgentProfileSnapshot {
-            owner_user_id: "user-1".into(),
-            source_team_id: "team-1".into(),
-            lead_agent_id: Some("lead".into()),
-            profiles: vec![lead, profile],
-        }));
-        ctx.trace_context = Some(TraceContext {
-            session_id: "session-1".into(),
-            user_id: "user-1".into(),
-            turn_id: "turn-1".into(),
-            turn_seq: 1,
-            causal_chain_id: "chain-1".into(),
-            root_event_id: "event-1".into(),
-        });
-
-        let spawn = handle_agent_spawn_action(
-            &json!({
-                "description": "Profile-default child",
-                "prompt": "Use the admitted profile model",
-                "agent_type": "profile-glm"
-            }),
-            Some(&ctx),
-        )
-        .await;
-        assert_eq!(
-            collect_spawn_receipt(&spawn, &ctx).await["status"],
-            "completed"
-        );
-        assert_eq!(
-            executor
-                .take_captured_model_selection()
-                .map(|selection| selection.offering_id),
-            Some("offering-glm".into())
-        );
-
-        let fanout = handle_agent_fanout_tool(
-            &json!({
-                "action": "start",
-                "target_count": 1,
-                "slots": [{
-                    "id": "profile-default",
-                    "agent_type": "profile-glm",
-                    "description": "Profile-default fanout",
-                    "prompt": "Use the admitted profile model"
-                }]
-            }),
-            Some(&ctx),
-        )
-        .await;
-        assert_eq!(
-            collect_fanout_start(&fanout, &ctx).await["status"],
-            "completed"
-        );
-        assert_eq!(
-            executor
-                .take_captured_model_selection()
-                .map(|selection| selection.offering_id),
-            Some("offering-glm".into())
-        );
-
-        // A parent that chose fanout cannot later switch to bare spawn.
-        // Model overrides belong to a fresh parent execution.
-        ctx.run_id = "run-parent-model-overrides".into();
-        ctx.fanout_admission = ctx.spawner.fanout_parent(&ctx.run_id);
-        let inherit = handle_agent_spawn_action(
-            &json!({
-                "description": "Explicit parent model",
-                "prompt": "Use the parent Offering",
-                "agent_type": "profile-glm",
-                "requested_model_policy": {"mode": "inherit"}
-            }),
-            Some(&ctx),
-        )
-        .await;
-        let inherited_result = collect_spawn_receipt(&inherit, &ctx).await;
-        assert_eq!(
-            inherited_result["status"], "completed",
-            "{inherited_result}"
-        );
-        assert_eq!(
-            executor
-                .take_captured_model_selection()
-                .map(|selection| selection.offering_id),
-            Some("offering-flash".into())
-        );
-
-        ctx.delegation_model_admission = Some(DelegationModelAdmission {
-            source: DelegationModelInstructionSource {
-                user_id: "user-1".into(),
-                session_id: "session-1".into(),
-                run_id: ctx.run_id.clone(),
-                turn_chain_id: "chain-1".into(),
-                owner_generation: 1,
-                control_epoch: 1,
-                applied_intent_id: None,
-                session_turn: 1,
-                user_intent_digest: "sha256:test".into(),
-            },
-            invocation_id: "hard-model-call".into(),
-            arguments_digest: "sha256:args".into(),
-            child_requirements: vec![Default::default()],
-            outcome: DelegationModelAdmissionOutcome::Constrained {
-                slots: vec![DelegationModelSlotConstraint {
-                    slot_index: 0,
-                    model_selection: Some(astra_turn_types::ModelSelection {
-                        offering_id: "offering-hard".into(),
-                    }),
-                    requested_model_policy: None,
-                    model_strength: Some(DelegationRequirementStrength::Hard),
-                    reasoning: None,
-                    reasoning_strength: None,
-                    task_scope_quote: None,
-                }],
-            },
-        });
-        let hard = handle_agent_spawn_action(
-            &json!({
-                "_tool_call_id": "hard-model-call",
-                "description": "Hard model child",
-                "prompt": "Use the admitted hard Offering",
-                "agent_type": "profile-glm"
-            }),
-            Some(&ctx),
-        )
-        .await;
-        assert_eq!(
-            collect_spawn_receipt(&hard, &ctx).await["status"],
-            "completed"
-        );
-        assert_eq!(
-            executor
-                .take_captured_model_selection()
-                .map(|selection| selection.offering_id),
-            Some("offering-hard".into())
         );
     }
 
@@ -5984,6 +5838,7 @@ pub(crate) mod tests {
         assert!(!fanout_nonterminal_receipt_superseded(&state, &started));
         state.stall.tool_call_records.clear();
         let completion = crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
             agent_id: result["results"][0]["agent_id"].as_str().unwrap().into(),
             run_id: result["results"][0]["run_id"].as_str().unwrap().into(),
             parent_agent_id: "parent".into(),
@@ -8483,6 +8338,7 @@ pub(crate) mod tests {
         let output = format!("{}TAIL", "界".repeat(6000));
         ctx.fanout_admission
             .set_direct_child_for_test(DirectChildCompletion {
+                applied_user_intents: Vec::new(),
                 agent_id: "retained-child".into(),
                 run_id: "retained-child-run".into(),
                 parent_agent_id: ctx.agent_id.clone(),

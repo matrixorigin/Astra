@@ -270,11 +270,6 @@ pub fn resolve_spawned_agentic_turn_budget(
     )
 }
 
-/// Cloud API returned no such session (case-insensitive substring match).
-pub fn is_session_not_found_error(error: &str) -> bool {
-    error.to_lowercase().contains("session not found")
-}
-
 // ── Shared prompt text normalization ───────────────────────────────────────
 //
 /// Trim trailing punctuation, ellipsis markers, and Chinese tone particles
@@ -442,14 +437,6 @@ mod tests {
             NonZeroUsize::new(80),
         );
         assert_eq!(child.hard_turn_limit, NonZeroUsize::new(50));
-    }
-
-    #[test]
-    fn session_not_found_detection() {
-        assert!(is_session_not_found_error("Session not found"));
-        assert!(is_session_not_found_error("error: SESSION NOT FOUND"));
-        assert!(!is_session_not_found_error("authentication failed"));
-        assert!(!is_session_not_found_error(""));
     }
 
     // ── trim_trailing_punctuation ────────────────────────────────────────

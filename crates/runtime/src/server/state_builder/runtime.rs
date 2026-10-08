@@ -155,8 +155,6 @@ pub(super) async fn build_runtime_wiring(
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
 
-    let team_store = initialize_team_store(shared_pool);
-    let run_lifecycle = run_lifecycle.with_team_store(team_store.clone());
     // Reconciliation must follow complete service composition. A checkpoint
     // cannot be dispatched while model, policy, mailbox or tool owners are
     // still absent; classification itself does not establish dispatch readiness.
@@ -168,7 +166,6 @@ pub(super) async fn build_runtime_wiring(
         matrix_rt,
         run_lifecycle,
         delegation_engine,
-        team_store,
         resource_governor,
     })
 }
@@ -233,14 +230,6 @@ async fn initialize_resource_governor(
         astra_services::resource_governor::DatabaseResourceGovernor::new(shared_pool.clone());
     resource_governor.ensure_tables().await?;
     Ok(std::sync::Arc::new(resource_governor))
-}
-
-fn initialize_team_store(
-    shared_pool: &SharedPool,
-) -> Arc<dyn astra_services::team_persistence::TeamPersistenceService> {
-    Arc::new(astra_services::team_persistence::MatrixOneTeamStore::new(
-        shared_pool.get().clone(),
-    ))
 }
 
 pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRegistry {

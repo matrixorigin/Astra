@@ -224,7 +224,7 @@ mod tests {
 
         node.parent_run_id = None;
         node.depth = 0;
-        node.agent_id = Some("team-orchestrator".into());
+        node.agent_id = Some("delegation-parent".into());
         assert!(node.is_agent_run());
     }
 }

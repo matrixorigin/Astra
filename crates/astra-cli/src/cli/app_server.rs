@@ -594,7 +594,6 @@ async fn run_turn(
         &chat_ctx,
         &token,
         Some(&thread_id),
-        None,
         &mut pm,
         turn_options,
     )

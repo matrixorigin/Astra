@@ -5,5 +5,4 @@ pub mod slash_memory;
 pub mod slash_plan;
 pub mod slash_session;
 pub mod slash_state;
-pub mod slash_team;
 pub mod slash_telemetry;

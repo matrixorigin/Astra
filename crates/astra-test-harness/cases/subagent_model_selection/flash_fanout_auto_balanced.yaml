@@ -16,38 +16,26 @@ timeout_seconds: 180
 criteria:
   - type: exit_code
     code: 0
-  - type: session_event_count
-    event_type: agent_spawned
+  - type: execution_child_count
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: agent_fanout
     min: 1
     max: 1
-    document: arguments
-    path: /action
-    equals: start
-  - type: journal_tool_json
-    name: agent_fanout
-    document: arguments
-    path: /defaults/requested_model_policy/mode
-    equals: auto
-  - type: journal_tool_json
-    name: agent_fanout
-    document: arguments
-    path: /defaults/requested_model_policy/strategy
-    equals: balanced
-  - type: journal_tool_outcome_count
+    root_only: true
+  - type: execution_tool_count
     name: agent_fanout
     ok: false
     min: 1
     max: 1
-  - type: journal_tool_json_contains
-    name: agent_fanout
-    document: error
-    path: ""
-    contains: "automatic model routing is not available yet"
-  - type: journal_tool_call_count
+    root_only: true
+    predicates:
+      - {document: arguments, path: /action, equals: start}
+      - {document: arguments, path: /defaults/requested_model_policy/mode, equals: auto}
+      - {document: arguments, path: /defaults/requested_model_policy/strategy, equals: balanced}
+    error_contains: "automatic model routing is not available yet"
+  - type: execution_tool_count
     name: reflect
     min: 0
     max: 0

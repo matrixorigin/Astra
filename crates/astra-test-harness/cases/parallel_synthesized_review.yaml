@@ -55,11 +55,6 @@ criteria:
       path: /metadata/fanout_slot/target_count
       equals: 3
       unique_by: /metadata/run_id
-      result_ids_match:
-        tool_name: agent_fanout
-        event_parent_run_id_path: /metadata/parent_run_id
-        result_array_path: /agents
-        item_id_path: /run_id
   - type: journal_tool_json
     name: agent_fanout
     document: result
@@ -67,6 +62,7 @@ criteria:
     equals: 3
   # Start returns a launch receipt. Prove each exact slot's complete result
   # passed from staging into its owning parent's request before finalization.
+  # Adoption also requires the exact launch receipt and spawn identity sets.
   - type: session_child_result_adopted
     allow_get_result: true
     spawn_match:

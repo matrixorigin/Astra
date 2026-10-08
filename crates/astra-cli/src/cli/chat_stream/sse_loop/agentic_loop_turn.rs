@@ -562,7 +562,6 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
         "plan_subtask_id",
         "is_plan_subtask",
         "requested_model_policy",
-        "agent_profile_selection",
         "completion_checks",
     ] {
         if let Some(value) = source.remove(field) {
@@ -651,16 +650,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         }
         _ => requested_model_policy,
     };
-    let profile_selection = ctx
-        .cli_context
-        .and_then(|context| context.agent_profile_selection.as_ref());
-    let profile_default = matches!(
-        requested_model_policy,
-        astra_turn_types::RequestedModelPolicy::Inherit
-    ) && profile_selection
-        .is_some_and(|selection| selection.lead_agent_id.is_some());
     let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
-    let thinking_config = match requested_model.filter(|_| !profile_default) {
+    let thinking_config = match requested_model {
         Some(m) => {
             let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking_request(m);
             cfg
@@ -693,10 +684,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     }
     payload["requested_model_policy"] =
         serde_json::to_value(requested_model_policy).expect("model policy serializes");
-    if let Some(selection) = profile_selection {
-        payload["agent_profile_selection"] =
-            serde_json::to_value(selection).expect("profile selection serializes");
-    }
 
     if let Some(checks) = ctx.completion_checks {
         payload["completion_checks"] = serde_json::to_value(checks)
@@ -2230,7 +2217,12 @@ mod tests {
         // assembled policy JSON. The same resolved model can be a default or
         // an explicit choice, including explicitly disabled thinking.
         for (explicit, expected_thinking) in [
-            (None, ThinkingConfig::ModelDefault),
+            (
+                None,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                },
+            ),
             (
                 Some("model-a(thinking:high)"),
                 ThinkingConfig::Adaptive {
@@ -2241,10 +2233,6 @@ mod tests {
         ] {
             let mut context = crate::cli::cli_config::cli_context::CliContext::default();
             context.select_model(explicit);
-            context.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
-                team_id: "roster".into(),
-                lead_agent_id: Some("lead".into()),
-            });
             let (payload, _) = prepare_payload_with_reasoning_for_test(
                 vec![json!({"role":"user", "content":"Explain this."})],
                 &[],
@@ -2267,10 +2255,6 @@ mod tests {
             .unwrap();
             assert_eq!(admitted["model_selection"]["offering_id"], "offer-parent");
             assert_eq!(
-                admitted["agent_profile_selection"],
-                serde_json::to_value(context.agent_profile_selection.as_ref().unwrap()).unwrap()
-            );
-            assert_eq!(
                 admitted["requested_model_policy"],
                 if explicit.is_some() {
                     json!({"mode":"fixed", "selector":{"kind":"offering_id", "offering_id":"offer-parent"}})
@@ -2282,33 +2266,6 @@ mod tests {
                 admitted["context"]["thinking"],
                 expected_thinking.to_payload_value()
             );
-            if explicit.is_none() {
-                // The TUI owner tests its Leave action separately. Verify the
-                // actual preparation/projection of the resulting absent intent
-                // here without exposing private UI internals to the CLI layer.
-                context.agent_profile_selection = None;
-                let (payload, _) = prepare_payload_with_reasoning_for_test(
-                    vec![json!({"role":"user", "content":"Explain this."})],
-                    &[],
-                    &[],
-                    "Explain this.",
-                    None,
-                    Some(("offer-parent", "model-a(thinking:high)", Some(&context))),
-                )
-                .await;
-                let admitted = server_loop_admission_payload_with_execution_time_budget(
-                    payload,
-                    "Explain this.",
-                    false,
-                    None,
-                )
-                .unwrap();
-                assert!(
-                    admitted["agent_profile_selection"].is_null(),
-                    "leaving must reach actual root admission, not only UI state"
-                );
-                assert_eq!(admitted["model_selection"]["offering_id"], "offer-parent");
-            }
         }
     }
 

@@ -195,10 +195,6 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     ));
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(Some("test-model"));
-    cli_context.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
-        team_id: "selected-roster".into(),
-        lead_agent_id: Some("selected-lead".into()),
-    });
     let mut context = BasicCliChatContext {
         mcp_manager: Some(mcp_manager.clone()),
         api: &api,
@@ -275,11 +271,6 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
                 "offering_id": request["model_selection"]["offering_id"] }
         })
     );
-    assert_eq!(
-        request["agent_profile_selection"],
-        serde_json::to_value(cli_context.agent_profile_selection.as_ref().unwrap()).unwrap()
-    );
-    assert!(request["context"].get("agent_profile_selection").is_none());
     let injections = request["context"]["edge_profile"]
         [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS]
         .as_array()
@@ -299,9 +290,9 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         "running"
     );
 
-    // Ordinary follow-up input retains the selected roster without issuing a
-    // second Team lookup or requiring the user to repeat the selection.
-    context.message = "Continue with the same team";
+    // Ordinary follow-up input retains the active Work context without
+    // requiring the user to repeat it.
+    context.message = "Continue with the same work";
     let follow_up = ChatTurnParams::basic_cli(
         &context,
         "fake-token",
@@ -312,10 +303,6 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     let follow_up = captured_request.lock().unwrap().clone().unwrap();
     assert_eq!(request["session_id"], "sess-active-fanout");
     assert_eq!(follow_up["session_id"], request["session_id"]);
-    assert_eq!(
-        follow_up["agent_profile_selection"],
-        request["agent_profile_selection"]
-    );
 }
 
 fn mock_mcp_server_binary() -> std::path::PathBuf {

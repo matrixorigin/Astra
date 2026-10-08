@@ -5236,12 +5236,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
             try_write_heavy_checkpoint(state);
             if !outcome.should_continue() {
-                if let super::execution_phase::RuntimeActivityOutcome::ExecutionPaused(reason) =
-                    outcome
-                {
-                    finalize_turn_trace(state).await;
-                    return Ok(AgenticLoopOutcome::Waiting(reason));
-                }
                 finalize_and_render(host, state).await;
                 return Ok(AgenticLoopOutcome::Completed);
             }
@@ -7478,6 +7472,7 @@ pub(crate) mod tests {
                     );
                 owner.set_direct_child_for_test(
                     crate::orchestration::spawner::DirectChildCompletion {
+                        applied_user_intents: Vec::new(),
                         agent_id: "working-child".into(),
                         run_id: "child-run".into(),
                         parent_agent_id: "parent".into(),
@@ -9023,6 +9018,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn replay_tool_churn_preserves_bounded_evidence_then_completes_with_synthesis() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let large_bash_diff = format!(
             "diff --git a/src/lib.rs b/src/lib.rs\n{}",
             "+ changed from bash git diff\n".repeat(4_000)
@@ -9076,6 +9073,9 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["bash"]);
         let mut state = make_state();
+        state.context_manifest_user_id = Some("replay-owner".into());
+        state.current_session_id = Some("replay-session".into());
+        state.current_run_id = Some("replay-run".into());
         state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(
             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
         ));
@@ -11002,6 +11002,7 @@ pub(crate) mod tests {
             "child",
         );
         let child = |status| crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
             agent_id: "child".into(),
             run_id: "child-run".into(),
             parent_agent_id: "parent-agent".into(),
@@ -11014,14 +11015,9 @@ pub(crate) mod tests {
         let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
         host.provider_call_counter = Some(Arc::clone(&calls));
         host.direct_child_owner = Some(Arc::clone(&owner));
-        assert!(matches!(
-            run_agentic_loop_with_host(&mut host, &mut state)
-                .await
-                .unwrap(),
-            AgenticLoopOutcome::Waiting(_),
-        ));
+        let mut execution = Box::pin(run_agentic_loop_with_host(&mut host, &mut state));
+        assert!(futures_util::poll!(&mut execution).is_pending());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!((state.charged_iterations, state.remaining_turns), (3, 5));
         #[cfg(feature = "harness")]
         assert_eq!(
             trace
@@ -11031,16 +11027,18 @@ pub(crate) mod tests {
                 .len(),
             0
         );
-        assert!(matches!(
-            state.loop_entry,
-            LoopEntry::InputWait { next_index: 7, .. }
-        ));
+        owner.set_direct_child_for_test(child(crate::orchestration::AgentStatus::Running {
+            activity: "resumed".into(),
+        }));
+        assert!(futures_util::poll!(&mut execution).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         owner.set_direct_child_for_test(child(crate::orchestration::AgentStatus::Completed {
             result: "child result".into(),
             finish_reason: None,
         }));
-        run_agentic_loop_with_host(&mut host, &mut state)
+        tokio::time::timeout(Duration::from_secs(1), execution)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.current_round_index, 7);

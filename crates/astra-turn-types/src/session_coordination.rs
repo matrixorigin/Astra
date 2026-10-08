@@ -574,18 +574,8 @@ pub enum CanonicalDeltaModeV1 {
     Replace,
 }
 
-/// Configuration selection only; the Server resolves owner-scoped authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentProfileSelection {
-    pub team_id: String,
-    pub lead_agent_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CanonicalTurnDeltaV1 {
-    /// Selection intent for the next root, not execution authority.
-    pub agent_profile_selection: Option<AgentProfileSelection>,
     pub schema_version: u32,
     pub completed_turn: u32,
     pub journal_event_seq: u64,

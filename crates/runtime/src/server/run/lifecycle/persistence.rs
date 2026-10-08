@@ -2051,17 +2051,11 @@ fn transcript_items_from_server_loop(
         });
         let result_content =
             transcript_tool_text(record.result_full.as_ref(), record.result_preview.as_ref());
-        let mut result_content = if result_content.is_empty() && !record.ok {
+        let result_content = if result_content.is_empty() && !record.ok {
             transcript_tool_text(record.error.as_ref(), None)
         } else {
             result_content
         };
-        // Transcript tool rows are display-only. Prompt recovery uses canonical
-        // history; keep the journal's result_full document unmodified.
-        astra_turn_core::tool::result::advisory::append_display_guidance(
-            &mut result_content,
-            &record.runtime_advisories,
-        );
         core_items.push(TranscriptPersistItem {
             run_id: Some(run_id.to_string()),
             role: "tool",
@@ -2069,6 +2063,7 @@ fn transcript_items_from_server_loop(
             payload: Some(TranscriptPersistPayload {
                 tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
                     tool_use_id: call_id.clone(),
+                    runtime_advisories: record.runtime_advisories.clone(),
                     name: Some(tool_name),
                     status: Some(
                         record
@@ -5186,6 +5181,12 @@ mod tests {
     #[test]
     fn canonical_run_transcript_preserves_rejected_tool_error_evidence() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let result_document = serde_json::json!({
+            "status": "failed",
+            "error_kind": "invalid_request",
+            "error": "Unknown tool 'web_search' for the current capability binding"
+        })
+        .to_string();
         state
             .stall
             .tool_call_records
@@ -5193,6 +5194,8 @@ mod tests {
                 tool_call_id: Some("call-rejected".to_string()),
                 name: "web_search".to_string(),
                 ok: false,
+                result_full: Some(result_document.clone()),
+                runtime_advisories: vec!["Use the authorized tool surface.".into()],
                 error: Some("Unknown tool 'web_search' for the current capability binding".into()),
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
                 ..Default::default()
@@ -5213,6 +5216,26 @@ mod tests {
             .expect("rejected tool result");
 
         assert!(tool_result.content.contains("Unknown tool 'web_search'"));
+        assert_eq!(tool_result.content, result_document);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap()["error_kind"],
+            "invalid_request"
+        );
+        assert_eq!(
+            tool_result
+                .payload
+                .as_ref()
+                .unwrap()
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .runtime_advisories,
+            vec!["Use the authorized tool surface."]
+        );
+        assert_eq!(
+            state.stall.tool_call_records[0].result_full.as_deref(),
+            Some(result_document.as_str())
+        );
         assert_eq!(
             tool_result
                 .payload

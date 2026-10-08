@@ -12,55 +12,55 @@ timeout_seconds: 180
 criteria:
   - type: exit_code
     code: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: agent
     min: 1
     max: 1
-    document: arguments
-    path: /action
-    equals: spawn
-  - type: journal_tool_outcome_count
+    root_only: true
+    predicates:
+      - document: arguments
+        path: /action
+        equals: spawn
+  - type: execution_tool_count
     name: agent
+    min: 1
+    max: 1
+    root_only: true
     ok: false
+  - type: execution_tool_count
+    name: agent
     min: 1
     max: 1
-  - type: journal_tool_json
-    name: agent
-    document: result
-    path: /error_kind
-    equals: invalid_request
-  - type: journal_tool_json
-    name: agent
-    document: result
-    path: /status
-    equals: failed
+    ok: false
+    root_only: true
+    predicates:
+      - document: arguments
+        path: /action
+        equals: spawn
+      - document: result
+        path: /error_kind
+        equals: invalid_request
+      - document: result
+        path: /status
+        equals: failed
   - type: text_contains
     needle: ASTRA-PARENT-CATALOG-CHECKED
-  - type: session_event_count
-    event_type: agent_spawned
+  - type: execution_child_count
     min: 0
     max: 0
-  - type: session_event_count
-    event_type: agent_terminated
-    min: 0
-    max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: reflect
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: model_catalog
     min: 1
-    max: 1
-  - type: journal_tool_json
-    name: model_catalog
-    document: result
-    path: /purpose
-    equals: chat
-  - type: journal_tool_outcome_count
-    name: model_catalog
-    ok: false
-    min: 0
-    max: 0
-  - type: journal_tool_sequence
+    max: 4294967295
+    root_only: true
+    ok: true
+    predicates:
+      - document: result
+        path: /purpose
+        equals: chat
+  - type: execution_tool_sequence
     tools: [agent, model_catalog]

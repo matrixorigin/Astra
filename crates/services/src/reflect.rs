@@ -1149,6 +1149,32 @@ struct ExecutionFact {
     omitted_children: usize,
     metadata_available: bool,
     metadata_omitted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_mutation: Option<astra_config::user_profile::WorkspaceMutationIntent>,
+}
+
+/// Both per-run selection and final report trimming protect the same facts.
+/// Incomplete observations remain useful, but cannot displace scoped evidence.
+fn execution_fact_retention_priority(kind: &str, outcome: Option<&str>, complete: bool) -> u8 {
+    if !complete {
+        return 0;
+    }
+    match (kind, outcome) {
+        ("agent_dependency_boundary", Some("finalization_accepted")) => 3,
+        ("agent_dependency_boundary", Some("results_adopted")) => 2,
+        ("agent_spawned", _) => 1,
+        _ => 0,
+    }
+}
+
+impl ExecutionFact {
+    fn retention_priority(&self) -> u8 {
+        execution_fact_retention_priority(
+            &self.kind,
+            self.outcome.as_deref(),
+            self.metadata_available && !self.metadata_omitted && self.omitted_children == 0,
+        )
+    }
 }
 
 fn execution_string(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -1343,6 +1369,12 @@ impl EvidenceEvent {
                 && (!dependency
                     || (raw_children.is_some() && execution_string(attrs, "outcome").is_some())),
             metadata_omitted: self.metadata_omitted,
+            workspace_mutation: (scope_valid
+                && !self.metadata_omitted
+                && self.event_type == "agent_spawned")
+                .then(|| metadata.get("workspace_mutation"))
+                .flatten()
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
             tool_outcome,
             children,
         })
@@ -1430,9 +1462,39 @@ fn execution_spines(
         for fact in &facts {
             event_refs.insert(fact.event_id.clone(), ref_id.clone());
         }
-        // Retain phase diversity before repeated observations of the same phase.
         let mut phases = BTreeSet::new();
         let mut selected = Vec::new();
+        // Finalization, distinct results and launch configuration outrank transient
+        // waiting/staging phases. Keep original facts, never merge observations.
+        let mut adopted = BTreeSet::new();
+        let mut spawned = BTreeSet::new();
+        for priority in (1..=3).rev() {
+            for fact in &facts {
+                if selected.len() == EXECUTION_SPINE_FACT_LIMIT {
+                    break;
+                }
+                if fact.retention_priority() != priority {
+                    continue;
+                }
+                let new_evidence = match priority {
+                    2 => fact.children.iter().any(|child| {
+                        !adopted.contains(&(&child.run_id, &child.agent_id, &child.result_sha256))
+                    }),
+                    1 => spawned.insert((&fact.run_id, &fact.agent_id)),
+                    _ => !phases.contains(&(&fact.kind, &fact.outcome)),
+                };
+                if new_evidence {
+                    selected.push(*fact);
+                    phases.insert((&fact.kind, &fact.outcome));
+                    adopted.extend(
+                        fact.children
+                            .iter()
+                            .map(|child| (&child.run_id, &child.agent_id, &child.result_sha256)),
+                    );
+                }
+            }
+        }
+        // Fill the remaining budget with phase diversity, then repeated facts.
         for fact in &facts {
             if phases.insert((&fact.kind, &fact.outcome))
                 && selected.len() < EXECUTION_SPINE_FACT_LIMIT
@@ -1447,6 +1509,14 @@ fn execution_spines(
                 selected.push(*fact);
             }
         }
+        // Repeated critical facts may have filled the tail. Byte trimming must
+        // remove low-priority observations first, not merely the last addition.
+        selected.sort_by(|a, b| {
+            b.retention_priority()
+                .cmp(&a.retention_priority())
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.event_id.cmp(&a.event_id))
+        });
         let mut metadata = serde_json::json!({"execution_spine": {
             "run_id": facts.iter().any(|fact| fact.run_id.is_some() || fact.parent_run_id.is_some()).then_some(run_id),
             "coverage": "partial", "missing_facts": "unknown",
@@ -3050,6 +3120,61 @@ mod tests {
         ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
         ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
     };
+
+    #[test]
+    fn spawn_fact_projects_only_scoped_typed_mutation_intent() {
+        let original = EvidenceEvent {
+            event_id: "spawn".into(),
+            event_type: "agent_spawned".into(),
+            run_id: Some("child".into()),
+            agent_id: Some("member".into()),
+            metadata: Some(serde_json::json!({
+                "run_id":"child","agent_id":"member","workspace_mutation":"read_only"
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(original.execution_fact().unwrap()).unwrap()["workspace_mutation"],
+            "read_only"
+        );
+        for fault in [
+            "missing",
+            "malformed",
+            "foreign-run",
+            "wrong-kind",
+            "omitted",
+        ] {
+            let mut altered = original.clone();
+            match fault {
+                "missing" => {
+                    altered
+                        .metadata
+                        .as_mut()
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("workspace_mutation");
+                }
+                "malformed" => {
+                    altered.metadata.as_mut().unwrap()["workspace_mutation"] =
+                        serde_json::json!({"read_only":true})
+                }
+                "foreign-run" => {
+                    altered.metadata.as_mut().unwrap()["run_id"] = serde_json::json!("foreign")
+                }
+                "wrong-kind" => altered.event_type = "agent_terminated".into(),
+                "omitted" => altered.metadata_omitted = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                serde_json::to_value(altered.execution_fact().unwrap())
+                    .unwrap()
+                    .get("workspace_mutation")
+                    .is_none(),
+                "{fault}"
+            );
+        }
+    }
 
     #[test]
     fn judgment_rollup_uses_physical_attempts_and_preserves_missing_usage() {

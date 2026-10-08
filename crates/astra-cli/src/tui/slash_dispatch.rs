@@ -81,11 +81,6 @@ impl SlashResult {
 /// can complete after the user keeps composing without borrowing UI state
 /// across a network wait.
 pub(crate) enum SlashBackgroundRead {
-    Team {
-        store: crate::cli::http_team_store::HttpTeamStore,
-        name: Option<String>,
-        attachment_epoch: u64,
-    },
     Clipboard {
         text: String,
         success_message: String,
@@ -365,71 +360,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
     }
 
     match resolved {
-        "/team" => {
-            let parsed = crate::cli::command_router::parse_team_bridge_command(args);
-            match parsed {
-                Ok(crate::cli::cli_config::cli_args::Command::Team(command)) => {
-                    let name = match command.command {
-                        None | Some(crate::cli::cli_config::cli_args::TeamSubcommand::List) => None,
-                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Info(command)) => {
-                            Some(command.name)
-                        }
-                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Leave) => {
-                            handle_view_result(
-                                ViewResult::TeamLeave {
-                                    attachment_epoch: ctx.state.session_attachment_epoch,
-                                },
-                                ctx.state,
-                                ctx.bottom_pane,
-                                ctx.chat_widget,
-                            );
-                            return SlashResult::Handled;
-                        }
-                        Some(crate::cli::cli_config::cli_args::TeamSubcommand::Create(command)) => {
-                            let owner = crate::tui::bottom_pane::team_editor_view::TeamEditorOwner(
-                                std::sync::Arc::new(
-                                    crate::cli::http_team_store::HttpTeamStore::new(
-                                        ctx.api,
-                                        ctx.profile,
-                                    ),
-                                ),
-                            );
-                            if !owner.0.is_attached_owner() {
-                                ctx.show_error("Sign in before creating a Team.".into());
-                                return SlashResult::Handled;
-                            }
-                            let mut editor =
-                                crate::tui::bottom_pane::team_editor_view::TeamEditorView::new(
-                                    None,
-                                    owner,
-                                    ctx.state.session_attachment_epoch,
-                                );
-                            editor.set_initial_name(command.name, command.description.join(" "));
-                            ctx.bottom_pane.push_view(Box::new(editor));
-                            return SlashResult::Handled;
-                        }
-                        _ => {
-                            ctx.show_info("Open /team, choose a roster, then E to edit members and models. Use /team run <team> <task> to start work.".into());
-                            return SlashResult::Handled;
-                        }
-                    };
-                    ctx.show_response("Loading Team configuration…".into());
-                    SlashResult::background_read(SlashBackgroundRead::Team {
-                        store: crate::cli::http_team_store::HttpTeamStore::new(
-                            ctx.api,
-                            ctx.profile,
-                        ),
-                        name,
-                        attachment_epoch: ctx.state.session_attachment_epoch,
-                    })
-                }
-                Err(error) => {
-                    ctx.show_error(error);
-                    SlashResult::Handled
-                }
-                Ok(_) => unreachable!("the Team parser only returns Team commands"),
-            }
-        }
         // ── Exit ────────────────────────────────────────────────────
         "/exit" => SlashResult::Exit,
         "/stop" => {
@@ -1647,153 +1577,38 @@ pub(crate) fn looks_like_session_id(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
-/// Observe saved configuration; accepting selects intent, not execution.
-pub(crate) fn team_configuration_view(
-    team: std::sync::Arc<crate::cli::slash::slash_team::Team>,
-    attachment_epoch: u64,
-    owner: crate::tui::bottom_pane::team_editor_view::TeamEditorOwner,
-) -> crate::tui::bottom_pane::team_editor_view::TeamEditorView {
-    crate::tui::bottom_pane::team_editor_view::TeamEditorView::new(
-        Some((*team).clone()),
-        owner,
-        attachment_epoch,
-    )
-    .with_reopen("/team")
-}
-
-fn apply_team_lead_selection(
-    team: &crate::cli::slash::slash_team::Team,
-    lead: Result<astra_services::coordination::AgentProfile, String>,
-    state: &mut SessionState,
-    bottom_pane: &mut BottomPane,
-    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
-) {
-    match lead {
-        Ok(lead) => {
-            state.cli_context.agent_profile_selection =
-                Some(astra_turn_types::AgentProfileSelection {
-                    team_id: team.team_id.clone(),
-                    lead_agent_id: Some(lead.agent_id),
-                });
-            bottom_pane.footer.set_team_selection(
-                state
-                    .cli_context
-                    .agent_profile_selection
-                    .clone()
-                    .expect("selection just installed"),
-                format!("{} · {}", team.name, lead.name),
-            );
-            chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::response(
-                format!(
-                    "Using {} · {} in this conversation. Enter an objective to start; /team leave returns to the default agent.",
-                    team.name, lead.name
-                ),
+/// Interpret typed view intent; root admission still owns execution authority.
+/// Apply display/composer actions without borrowing an executing session.
+pub(crate) fn handle_display_view_result(result: ViewResult, bottom_pane: &mut BottomPane) {
+    match result {
+        ViewResult::Memory(memory) => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            bottom_pane.push_view(Box::new(
+                InfoView::from_plain(
+                    "Memory detail",
+                    vec![
+                        format!("id: {}", memory.memory_id),
+                        String::new(),
+                        memory.content,
+                    ],
+                )
+                .with_reopen("/memory"),
             ));
         }
-        Err(error) => {
-            chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::error(error))
+        ViewResult::InsertCommand(command) => {
+            bottom_pane.composer.set_text(&format!("{command} "));
         }
+        _ => {}
     }
 }
 
-/// Configuration views can complete while the lead is running. They never
-/// borrow or modify its SessionState, model, or admitted Team selection.
-pub(crate) fn handle_team_editor_result(
-    result: &ViewResult,
-    attachment_epoch: u64,
-    selection_available: bool,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    match result {
-        ViewResult::TeamConfiguration {
-            team,
-            attachment_epoch: epoch,
-            owner,
-        } => {
-            if *epoch == attachment_epoch && owner.0.is_attached_owner() {
-                bottom_pane.push_view(Box::new(
-                    team_configuration_view(team.clone(), *epoch, owner.clone())
-                        .with_selection_available(selection_available),
-                ));
-            }
-        }
-        ViewResult::CreateTeam {
-            attachment_epoch: epoch,
-            owner,
-        } => {
-            if *epoch == attachment_epoch && owner.0.is_attached_owner() {
-                bottom_pane.push_view(Box::new(
-                    crate::tui::bottom_pane::team_editor_view::TeamEditorView::new(
-                        None,
-                        owner.clone(),
-                        *epoch,
-                    )
-                    .with_selection_available(selection_available),
-                ));
-            }
-        }
-        ViewResult::TeamMemberModel {
-            target,
-            operation_id,
-            agent_id,
-            selection,
-        } => {
-            if target.attachment_epoch == attachment_epoch && target.owner.0.is_attached_owner() {
-                bottom_pane.select_team_member_model(
-                    target,
-                    *operation_id,
-                    agent_id,
-                    selection.clone(),
-                );
-            }
-        }
-        _ => return false,
-    }
-    true
-}
-
-/// Interpret typed view intent; root admission still owns execution authority.
 pub(crate) fn handle_view_result(
     result: ViewResult,
     state: &mut SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
-    if handle_team_editor_result(&result, state.session_attachment_epoch, true, bottom_pane) {
-        return;
-    }
-    let attachment_epoch = match &result {
-        ViewResult::UseTeam {
-            attachment_epoch, ..
-        }
-        | ViewResult::TeamLead {
-            attachment_epoch, ..
-        }
-        | ViewResult::TeamLeave { attachment_epoch } => Some(*attachment_epoch),
-        _ => None,
-    };
-    if attachment_epoch.is_some_and(|epoch| epoch != state.session_attachment_epoch) {
-        chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::error(
-            "This Team view belongs to a previous conversation. Reopen /team.",
-        ));
-        return;
-    }
-    if matches!(&result, ViewResult::UseTeam { owner, .. } | ViewResult::TeamLead { owner, .. }
-        if !owner.0.is_attached_owner())
-    {
-        chat_widget.commit_system(SystemCell::error(
-            "Sign-in changed. Reopen /team with the intended account.",
-        ));
-        return;
-    }
     match result {
-        ViewResult::TeamLeave { .. } => {
-            state.cli_context.agent_profile_selection = None;
-            bottom_pane.footer.sync_team_selection(None);
-            chat_widget.commit_system(crate::tui::history_cell::system::SystemCell::response(
-                "Using the default agent for future messages. Conversation and running tasks are unchanged.",
-            ));
-        }
         ViewResult::Stats(panel) => {
             let sub = match panel {
                 StatsPanel::Overview => "",
@@ -1850,96 +1665,13 @@ pub(crate) fn handle_view_result(
         ViewResult::PermissionConfirmation {
             confirmed: false, ..
         } => {}
-        ViewResult::Memory(memory) => {
-            use crate::tui::bottom_pane::info_view::InfoView;
-            bottom_pane.push_view(Box::new(
-                InfoView::from_plain(
-                    "Memory detail",
-                    vec![
-                        format!("id: {}", memory.memory_id),
-                        String::new(),
-                        memory.content,
-                    ],
-                )
-                .with_reopen("/memory"),
-            ));
-        }
-        ViewResult::UseTeam {
-            team,
-            attachment_epoch,
-            owner,
-        } => {
-            let lead = crate::cli::slash::slash_team::resolve_team_lead_profile(&team, None);
-            if team.members.is_empty() || lead.is_ok() {
-                apply_team_lead_selection(&team, lead, state, bottom_pane, chat_widget);
-            } else {
-                use crate::tui::bottom_pane::list_selection_view::{
-                    ListSelectionView, SelectionItem,
-                };
-                let profiles: Vec<_> = team
-                    .members
-                    .iter()
-                    .map(|member| {
-                        astra_services::team_persistence::resolve_member_to_profile(member, &team)
-                    })
-                    .collect();
-                let items = profiles
-                    .iter()
-                    .map(|profile| SelectionItem {
-                        name: profile.name.clone(),
-                        description: Some(
-                            if profile.can_delegate {
-                                "Can coordinate members"
-                            } else {
-                                "Cannot delegate"
-                            }
-                            .into(),
-                        ),
-                        is_current: false,
-                    })
-                    .collect();
-                let results = profiles
-                    .into_iter()
-                    .map(|profile| ViewResult::TeamLead {
-                        team: team.clone(),
-                        lead_agent_id: profile.agent_id,
-                        attachment_epoch,
-                        owner: owner.clone(),
-                    })
-                    .collect();
-                bottom_pane.push_view(Box::new(
-                    ListSelectionView::new(items, Some(format!("{} · choose a lead", team.name)))
-                        .with_results(results)
-                        .with_footer_hint("Type to filter · Enter use lead · Esc cancel"),
-                ));
-            }
-        }
-        ViewResult::TeamLead {
-            team,
-            lead_agent_id,
-            ..
-        } => {
-            apply_team_lead_selection(
-                &team,
-                crate::cli::slash::slash_team::resolve_team_lead_profile(
-                    &team,
-                    Some(&lead_agent_id),
-                ),
-                state,
-                bottom_pane,
-                chat_widget,
-            );
-        }
-        ViewResult::InsertCommand(command) => {
-            bottom_pane.composer.set_text(&format!("{command} "));
+        result @ (ViewResult::Memory(_) | ViewResult::InsertCommand(_)) => {
+            handle_display_view_result(result, bottom_pane);
         }
         // These results have async or state-transition handling in the event
         // loop. Keeping them explicit prevents a future picker from silently
         // falling through based on its rendered label.
         ViewResult::Login { .. }
-        | ViewResult::TeamConfiguration { .. }
-        | ViewResult::CreateTeam { .. }
-        | ViewResult::TeamMemberModel { .. }
         | ViewResult::Register { .. }
         | ViewResult::ConfigEdit { .. }
         | ViewResult::Model { .. }
@@ -3247,7 +2979,7 @@ pub(crate) fn is_model_picker_request(text: &str) -> bool {
 /// Build the model picker view from a fetched model list and push it.
 ///
 /// This is deliberately a synchronous UI projection: networking belongs to
-/// [`load_model_catalog`], so callers never have to hold the TUI loop while
+/// the captured auth transport, so callers never have to hold the TUI loop while
 /// waiting for a remote catalog.
 pub(crate) fn push_model_picker(
     state: &SessionState,
@@ -3296,63 +3028,91 @@ pub(crate) fn push_model_picker(
     }
 }
 
-fn model_catalog_error_message(
-    error: &crate::cli::session::session_runtime::ModelCatalogError,
-) -> String {
-    if error.is_authentication_failure() {
-        "Not authorized — try /login first".into()
-    } else if error.is_transport_failure() {
-        "Cannot reach server — check connection".into()
-    } else {
-        format!(
-            "Failed to fetch models: {}",
-            error.to_string().lines().next().unwrap_or("unknown error")
-        )
-    }
-}
-
-/// Fetch the full active model catalog, including provider and thinking
-/// metadata. The caller owns scheduling; this function is free of TUI
-/// references so it can run outside the input event loop.
-pub(crate) async fn load_model_catalog(
-    api: astra_thin_client::ThinClient,
-    profile: Option<String>,
-) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
-    let token =
-        crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()).await;
-    match crate::cli::session::session_runtime::fetch_model_catalog(&api, token.as_deref()).await {
-        Ok(models) => Ok(models),
-        Err(error) => {
-            if !error.is_authentication_failure() {
-                return Err(model_catalog_error_message(&error));
-            }
-
-            if crate::cli::session::session_runtime::attempt_token_refresh(&api, profile.as_deref())
-                .await
-            {
-                let refreshed =
-                    crate::cli::session::session_runtime::current_access_token(profile.as_deref());
-                match crate::cli::session::session_runtime::fetch_model_catalog(
-                    &api,
-                    refreshed.as_deref(),
-                )
-                .await
-                {
-                    Ok(models) => return Ok(models),
-                    Err(retry_error) => {
-                        if !retry_error.is_authentication_failure() {
-                            return Err(model_catalog_error_message(&retry_error));
-                        }
-                    }
-                }
-            }
-            Err("Not authorized — try /login first".into())
+/// Consume both picker stages against the current authorized snapshot.
+/// `Some(true)` keeps a thinking picker open; `Some(false)` settles the modal.
+pub(crate) fn apply_model_picker_result(
+    result: &ViewResult,
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) -> Option<bool> {
+    let (base_model, config) = match result {
+        ViewResult::Model { name } => (name, None),
+        ViewResult::ModelThinking { base_model, config } => (base_model, Some(config)),
+        _ => return None,
+    };
+    let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
+        bottom_pane.current_model_catalog(),
+        base_model,
+    );
+    let resolved = entry.and_then(|entry| {
+        crate::cli::session::session_runtime::model_selection_from_list_entry(entry)
+            .map(|selection| (entry, selection))
+    });
+    let Some((entry, mut selection)) = resolved else {
+        chat_widget.commit_system(SystemCell::error(
+            "Selected model is no longer available in this account's catalog. Reopen /model.",
+        ));
+        return Some(false);
+    };
+    let opts = astra_turn_core::thinking_config::thinking_options(
+        (!entry.provider.trim().is_empty()).then_some(entry.provider.trim()),
+        entry.thinking_capability.map(|value| value.as_str()),
+        entry.thinking_protocol.unwrap_or_default(),
+    );
+    if let Some(config) = config {
+        if !opts.iter().any(|option| &option.config == config) {
+            chat_widget.commit_system(SystemCell::error(
+                "Selected thinking mode is no longer supported. Reopen /model.",
+            ));
+            return Some(false);
         }
+    } else if !opts.is_empty() {
+        let items = opts
+            .iter()
+            .map(|option| SelectionItem {
+                name: option.label.into(),
+                description: None,
+                is_current: option.is_default,
+            })
+            .collect();
+        bottom_pane.push_view(Box::new(
+            ListSelectionView::new(
+                items,
+                Some(format!("Select thinking mode for {base_model}:")),
+            )
+            .with_footer_hint(MODEL_THINKING_PICKER_FOOTER_HINT)
+            .with_results(
+                opts.into_iter()
+                    .map(|option| ViewResult::ModelThinking {
+                        base_model: base_model.clone(),
+                        config: option.config,
+                    })
+                    .collect(),
+            ),
+        ));
+        return Some(true);
     }
+    let suffix = config
+        .map(astra_turn_core::thinking_config::thinking_suffix_for)
+        .unwrap_or_default();
+    let name = format!("{base_model}{suffix}");
+    selection.name = name.clone();
+    state.cli_context.select_model(Some(&name));
+    state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
+    bottom_pane.footer.model = Some(name.clone());
+    chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
+    Some(false)
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string)).await {
+    let Some(token) =
+        crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile).await
+    else {
+        ctx.show_error("Not logged in. Use /login.".into());
+        return SlashResult::Handled;
+    };
+    match crate::cli::session::session_runtime::fetch_model_catalog(ctx.api, Some(&token)).await {
         Ok(models) => {
             let names = models
                 .iter()
@@ -3363,7 +3123,7 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
                 return SlashResult::Deferred;
             }
         }
-        Err(error) => ctx.show_error(error),
+        Err(error) => ctx.show_error(error.to_string()),
     }
     SlashResult::Handled
 }
@@ -3429,16 +3189,25 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     };
     let selection = match selection {
         Some(selection) => Some(selection),
-        None => load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string))
-            .await
-            .ok()
-            .and_then(|models| {
-                crate::cli::session::session_runtime::find_model_entry_by_name(
+        None => {
+            match crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile)
+                .await
+            {
+                Some(token) => {
+                    crate::cli::session::session_runtime::fetch_model_catalog(ctx.api, Some(&token))
+                        .await
+                        .ok()
+                        .and_then(|models| {
+                            crate::cli::session::session_runtime::find_model_entry_by_name(
                     &models,
                     astra_turn_core::thinking_config::resolve_model_thinking(&name).0,
                 )
                 .and_then(crate::cli::session::session_runtime::model_selection_from_list_entry)
-            }),
+                        })
+                }
+                None => None,
+            }
+        }
     };
     let pricing = selection
         .as_ref()
@@ -3603,18 +3372,10 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
 pub(crate) fn active_run_concurrent_read(
     text: &str,
     session_snapshot: &SessionHubSnapshot,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    attachment_epoch: u64,
 ) -> Option<SlashBackgroundRead> {
     match text.trim() {
         "/session" => Some(SlashBackgroundRead::SessionHub {
             snapshot: Box::new(session_snapshot.clone()),
-        }),
-        "/team" => Some(SlashBackgroundRead::Team {
-            store: crate::cli::http_team_store::HttpTeamStore::new(api, profile),
-            name: None,
-            attachment_epoch,
         }),
         _ => None,
     }
@@ -4960,14 +4721,32 @@ mod stats_view_tests {
 
 #[cfg(test)]
 mod model_catalog_loading_tests {
-    use super::load_model_catalog;
     use crate::cli::cli_config::cli_utils::{
-        CredentialsFile, Profile, load_credentials, save_credentials,
+        CredentialsFile, Profile, cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        load_credentials, save_credentials,
     };
+    use crate::cli::session::session_runtime::{ModelCatalogError, fetch_owner_model_catalog};
     use crate::test_utils::ProcessEnvGuard;
     use crate::tests::isolate_credentials;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Debug)]
+    struct UnrelatedBearer;
+
+    impl astra_thin_client::client::BearerProvider for UnrelatedBearer {
+        fn token(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<String, astra_thin_client::ThinClientError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { panic!("catalog must use its captured credential owner") })
+        }
+    }
 
     fn save_profile(access_token: &str, refresh_token: &str) {
         let mut credentials = CredentialsFile {
@@ -4992,6 +4771,29 @@ mod model_catalog_loading_tests {
         let _credentials = isolate_credentials();
         let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         save_profile("stale-access", "refresh-old");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("user-id-1"),
+        )
+        .unwrap();
+        let owner = cli_owner_auth_snapshot();
+
+        // A queued catalog retains its owner when selection and environment
+        // credentials change before the worker starts.
+        let mut credentials = load_credentials();
+        credentials.current_profile = Some("other".into());
+        let other = Profile {
+            account_id: Some("other-user".into()),
+            access_token: Some("other-access".into()),
+            refresh_token: Some("other-refresh".into()),
+            ..Default::default()
+        };
+        credentials.profiles.insert("other".into(), other.clone());
+        save_credentials(&credentials).unwrap();
+        let _selected = install_cli_profile_identity_for_test("other", Some("other-user")).unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "unrelated-env-access");
+        }
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -5003,6 +4805,9 @@ mod model_catalog_loading_tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "refresh_token": "refresh-old"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "user_id": "user-id-1",
                 "access_token": "fresh-access",
@@ -5038,9 +4843,11 @@ mod model_catalog_loading_tests {
             .expect(1)
             .mount(&server)
             .await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(UnrelatedBearer));
 
-        let models = load_model_catalog(api, None)
+        let models = fetch_owner_model_catalog(&api, &owner)
             .await
             .expect("refreshed catalog");
 
@@ -5050,6 +4857,159 @@ mod model_catalog_loading_tests {
         let profile = credentials.profiles.get("default").unwrap();
         assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
         assert_eq!(profile.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(credentials.current_profile.as_deref(), Some("other"));
+        let saved_other = &credentials.profiles["other"];
+        assert_eq!(saved_other.account_id, other.account_id);
+        assert_eq!(saved_other.access_token, other.access_token);
+        assert_eq!(saved_other.refresh_token, other.refresh_token);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| (request.method.as_str(), request.url.path()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("GET", "/models"),
+                ("POST", "/auth/refresh"),
+                ("GET", "/models")
+            ]
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_retries_only_http_401_and_only_once() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        for status in [401, 403, 500] {
+            save_profile("stale-access", "refresh-old");
+            let _identity =
+                install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer stale-access"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("401 expired"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/auth/refresh"))
+                .and(wiremock::matchers::body_json(serde_json::json!({
+                    "refresh_token": "refresh-old"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "user-id-1",
+                    "access_token": "fresh-access",
+                    "refresh_token": "refresh-new"
+                })))
+                .expect(u64::from(status == 401))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer fresh-access"))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(u64::from(status == 401))
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+            let error = fetch_owner_model_catalog(&api, &cli_owner_auth_snapshot())
+                .await
+                .expect_err("catalog failure must remain visible");
+            assert!(matches!(
+                error,
+                ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                    status: actual,
+                    ..
+                }) if actual.as_u16() == status
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if status == 401 { 3 } else { 1 }
+            );
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_401_never_borrows_a_replacement_login() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        // Re-login with identical account/tokens still replaces the generation.
+        for account in ["user-id-1", "replacement-user"] {
+            save_profile("stale-access", "refresh-old");
+            let _identity =
+                install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+            let owner = cli_owner_auth_snapshot();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer stale-access"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    crate::cli::auth_flow::save_profile_auth_tokens(
+                        Some("default"),
+                        "replacement-login",
+                        &crate::cli::auth_flow::AuthTokenPayload {
+                            user_id: account.into(),
+                            access_token: "stale-access".into(),
+                            refresh_token: "refresh-old".into(),
+                        },
+                    )
+                    .unwrap();
+                    ResponseTemplate::new(401)
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+            let error = fetch_owner_model_catalog(&api, &owner)
+                .await
+                .expect_err("replaced login must not authorize catalog retry");
+            assert!(matches!(error, ModelCatalogError::NotAuthenticated));
+            assert!(!owner.legacy_binding.as_ref().unwrap().is_active());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let credentials = load_credentials();
+            let saved = &credentials.profiles["default"];
+            assert_eq!(saved.account_id.as_deref(), Some(account));
+            assert_eq!(saved.access_token.as_deref(), Some("stale-access"));
+            assert_eq!(saved.refresh_token.as_deref(), Some("refresh-old"));
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_deadline_bounds_credential_wait_before_dispatch() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let owner = cli_owner_auth_snapshot();
+        let _pending_rotation = owner.legacy_binding.as_ref().unwrap().pair.lock().await;
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let catalog = fetch_owner_model_catalog(&api, &owner);
+        tokio::pin!(catalog);
+        tokio::select! {
+            biased;
+            result = &mut catalog => panic!("catalog escaped pending rotation: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(
+            astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        let error = catalog.await.expect_err("credential wait must be bounded");
+        tokio::time::resume();
+        assert!(matches!(error, ModelCatalogError::TimedOut));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
@@ -5058,6 +5018,11 @@ mod model_catalog_loading_tests {
         let _credentials = isolate_credentials();
         let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         save_profile("valid-access", "refresh-unused");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("user-id-1"),
+        )
+        .unwrap();
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -5071,9 +5036,11 @@ mod model_catalog_loading_tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        load_model_catalog(api, None)
+        let error = fetch_owner_model_catalog(&api, &cli_owner_auth_snapshot())
             .await
             .expect_err("invalid catalog shape must fail visibly");
+        assert!(matches!(error, ModelCatalogError::InvalidJson(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(
             load_credentials()
                 .profiles
@@ -5081,6 +5048,7 @@ mod model_catalog_loading_tests {
                 .and_then(|profile| profile.access_token.as_deref()),
             Some("valid-access")
         );
+        server.verify().await;
     }
 }
 
@@ -5137,33 +5105,20 @@ mod session_hub_tests {
     fn active_run_executes_only_snapshot_safe_local_reads() {
         let state = SessionState::default();
         let snapshot = super::session_hub_snapshot(&state);
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         assert!(matches!(
-            active_run_concurrent_read(" /session ", &snapshot, &api, None, 7),
+            active_run_concurrent_read(" /session ", &snapshot),
             Some(SlashBackgroundRead::SessionHub { .. })
-        ));
-        assert!(matches!(
-            active_run_concurrent_read(" /team ", &snapshot, &api, None, 7),
-            Some(SlashBackgroundRead::Team {
-                name: None,
-                attachment_epoch: 7,
-                ..
-            })
         ));
         for command in [
             "/session list",
             "/session history",
             "/session export",
             "/model",
-            "/team create NewTeam",
-            "/team run Reviewers task",
-            "/team leave",
-            "/team list",
-            "show the team",
+            "show the current work",
             "/unknown",
         ] {
             assert!(
-                active_run_concurrent_read(command, &snapshot, &api, None, 7).is_none(),
+                active_run_concurrent_read(command, &snapshot).is_none(),
                 "stateful or unknown commands must wait for idle dispatch: {command}"
             );
         }

@@ -91,9 +91,41 @@ pub(crate) struct RootTranscriptView {
 }
 
 #[derive(Debug, Clone)]
-struct LocalLiveItem {
-    item: TranscriptItem,
-    settled: bool,
+pub(crate) struct LocalLiveItem {
+    pub(crate) item: TranscriptItem,
+    pub(crate) settled: bool,
+}
+
+impl LocalLiveItem {
+    pub(crate) fn is_represented(
+        &self,
+        items: &[astra_thin_client::SessionTranscriptItem],
+    ) -> bool {
+        if self.item.tool_identity().is_some_and(|call_id| {
+            items.iter().any(|item| {
+                item.tool_result
+                    .as_ref()
+                    .is_some_and(|result| result.tool_use_id == call_id)
+            })
+        }) {
+            return true;
+        }
+        self.item.model_identity().is_some_and(|(id, kind)| {
+            items.iter().any(|item| {
+                item.model_item_id.as_deref() == Some(id)
+                    && item.role == "assistant"
+                    && match kind {
+                        super::transcript_view::TranscriptItemKind::Assistant => {
+                            !item.content.is_empty()
+                        }
+                        super::transcript_view::TranscriptItemKind::Reasoning => {
+                            item.reasoning.as_ref().is_some_and(|text| !text.is_empty())
+                        }
+                        _ => false,
+                    }
+            })
+        })
+    }
 }
 
 impl RootTranscriptView {
@@ -242,23 +274,11 @@ impl RootTranscriptView {
     }
 
     fn reconcile_local_live(&mut self) {
-        if self.local_live.as_ref().is_some_and(|live| {
-            live.item.model_identity().is_some_and(|(id, kind)| {
-                self.items.iter().any(|item| {
-                    item.model_item_id.as_deref() == Some(id)
-                        && item.role == "assistant"
-                        && match kind {
-                            super::transcript_view::TranscriptItemKind::Assistant => {
-                                !item.content.is_empty()
-                            }
-                            super::transcript_view::TranscriptItemKind::Reasoning => {
-                                item.reasoning.as_ref().is_some_and(|text| !text.is_empty())
-                            }
-                            _ => false,
-                        }
-                })
-            })
-        }) {
+        if self
+            .local_live
+            .as_ref()
+            .is_some_and(|live| live.is_represented(&self.items))
+        {
             self.local_live = None;
         }
     }
@@ -378,12 +398,12 @@ impl RootTranscriptView {
             (Some(item), _) => {
                 // A resumed root run may reuse its session identity. Its next
                 // completion must be allowed to refresh canonical history.
-                self.terminal_refresh_requested = false;
-                self.local_live = Some(LocalLiveItem {
-                    item,
-                    settled: false,
-                });
-                false
+                let settled = item.is_settled_tool();
+                if !settled {
+                    self.terminal_refresh_requested = false;
+                }
+                self.local_live = Some(LocalLiveItem { item, settled });
+                settled
             }
             (None, Some(local_live)) if !local_live.settled => {
                 local_live.settled = true;
@@ -434,13 +454,18 @@ impl BottomPaneView for RootTranscriptView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.transcript.is_search_active() {
+            self.transcript.handle_key(key);
+            return;
+        }
         match key.code {
-            KeyCode::Left if self.transcript.is_search_active() => self.transcript.handle_key(key),
-            KeyCode::Left if !self.transcript.collapse_current_item() => {
-                self.pending_action = Some(ViewActionRequest {
-                    action: BottomPaneViewAction::ReturnToConversationNavigator,
-                    disposition: ViewActionDisposition::KeepOpen,
-                });
+            KeyCode::Left => {
+                if !self.transcript.collapse_current_item() {
+                    self.pending_action = Some(ViewActionRequest {
+                        action: BottomPaneViewAction::ReturnToConversationNavigator,
+                        disposition: ViewActionDisposition::KeepOpen,
+                    });
+                }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.pending_action = Some(ViewActionRequest {
@@ -529,7 +554,14 @@ impl BottomPaneView for RootTranscriptView {
         true
     }
 
-    fn refresh_root_transcript_live(&mut self, item: Option<TranscriptItem>) -> bool {
+    fn refresh_root_transcript_live(
+        &mut self,
+        binding: Option<(&str, &str)>,
+        item: Option<TranscriptItem>,
+    ) -> bool {
+        if binding.is_some_and(|(session_id, _)| session_id != self.session_id) {
+            return false;
+        }
         self.refresh_local_live(item);
         true
     }
@@ -664,6 +696,18 @@ mod tests {
             view.conversation_tab_label().as_deref(),
             Some("Main · session-1")
         );
+        view.has_more = true;
+        view.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for ch in "qros".chars() {
+            view.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        view.render(ratatui::layout::Rect::new(0, 0, 80, 20), &mut buffer);
+        assert!(crate::tui::testing::render::buffer_to_string(&buffer).contains("Search: /qros"));
+        assert!(view.take_action_request().is_none());
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!view.transcript.is_search_active());
+        assert!(!view.is_complete());
+        assert!(view.take_action_request().is_none());
     }
 
     #[test]
@@ -714,11 +758,14 @@ mod tests {
             replace: true,
             source: RootTranscriptSource::DurableServer,
         });
-        view.refresh_root_transcript_live(Some(TranscriptItem::rendered(
-            TranscriptItemId::from_widget_id(44),
-            vec![Line::from("live model output")],
-            1,
-        )));
+        view.refresh_root_transcript_live(
+            None,
+            Some(TranscriptItem::rendered(
+                TranscriptItemId::from_widget_id(44),
+                vec![Line::from("live model output")],
+                1,
+            )),
+        );
 
         let area = ratatui::layout::Rect::new(0, 0, 80, 20);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -730,7 +777,7 @@ mod tests {
         );
         assert!(text.contains("live model output"), "{text}");
 
-        view.refresh_root_transcript_live(None);
+        view.refresh_root_transcript_live(None, None);
         let mut settled = ratatui::buffer::Buffer::empty(area);
         view.render(area, &mut settled);
         let settled_text = crate::tui::testing::render::buffer_to_string(&settled);
@@ -761,7 +808,7 @@ mod tests {
             replace: true,
             source: RootTranscriptSource::DurableServer,
         });
-        view.refresh_root_transcript_live(None);
+        view.refresh_root_transcript_live(None, None);
         assert!(view.take_action_request().is_none());
         let mut after_refresh = ratatui::buffer::Buffer::empty(area);
         view.render(area, &mut after_refresh);
@@ -832,7 +879,7 @@ mod tests {
                     1,
                 );
                 if !page_first {
-                    view.refresh_root_transcript_live(Some(live.clone()));
+                    view.refresh_root_transcript_live(None, Some(live.clone()));
                 }
                 view.refresh_root_transcript(RootTranscriptUpdate::Loaded {
                     session_id: "session-1".into(),
@@ -840,7 +887,7 @@ mod tests {
                     replace: true,
                     source: RootTranscriptSource::DurableServer,
                 });
-                view.refresh_root_transcript_live(Some(live));
+                view.refresh_root_transcript_live(None, Some(live));
                 let area = ratatui::layout::Rect::new(0, 0, 80, 24);
                 let mut buffer = ratatui::buffer::Buffer::empty(area);
                 view.render(area, &mut buffer);

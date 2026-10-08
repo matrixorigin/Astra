@@ -52,36 +52,6 @@ code is correct. Branch acceptance requires the deterministic HTTP system
 matrix against the current binary/DB wiring; a deployment smoke additionally
 needs the target Server revision recorded by the release workflow.
 
-Cases may select the native `team run` entrypoint with `team: {name: my-team}`
-and an optional exact `lead_agent_id`. The owner must already have that Team
-definition; fixture provisioning uses the ordinary authenticated Team API/CLI.
-The model matrix selects the lead's model, not every member's model. Follow-up
-turns retain the same Team selection and server-issued session. Capture,
-watchdogs, criteria, Explain and cache accounting are shared with ordinary Chat;
-no separate Team executor or lifecycle is installed by the harness. External
-command executors reject these native cases rather than silently running Chat.
-A completed lead turn alone does not prove child launch, result adoption, or whole-Team cost
-coverage: require the corresponding child evidence and retain unknown coverage.
-
-The opt-in `cases/team_shared_agent_journey/native_member_context.yaml` uses a
-small shared-context handoff, not an expensive code-review task. Provision its
-definition through the same authenticated CLI and profile used by the harness:
-
-```sh
-astra --profile "$ASTRA_PROFILE" team create harness-shared-agent
-astra --profile "$ASTRA_PROFILE" team add-member harness-shared-agent lead --can-delegate -- Coordinate the configured members and adopt their observed results
-astra --profile "$ASTRA_PROFILE" team add-member harness-shared-agent reader --model glm-5.2 -- Read requested values from the team shared context and return them faithfully
-astra --profile "$ASTRA_PROFILE" team context harness-shared-agent delivery_code BLUE-17
-```
-
-Use a dedicated test owner and an available `glm-5.2` offering. Select the lead's
-model through the harness model matrix, for example `deepseek-v4-flash`. Do not
-repeat provisioning blindly after an uncertain write. This case requires a
-physical GLM child round linked to the launch, completed child state, exact result
-adoption and the final value. Missing Server child evidence fails the case; a
-manual observation or parent-only journal cannot substitute for it. Cache and
-cost coverage remain separate reported measurements, not inferred from this
-behavioral pass. Remove only this owner's fixture when finished.
 
 For a revision-bound comparison, set `ASTRA_EXPECTED_BUILD_GIT_SHA` to the full
 40-character commit SHA. Before any model probe, preflight requires the harness,
@@ -587,6 +557,83 @@ Case/model path components use UTF-8 byte percent encoding to avoid collisions.
 Archive failure retains the owned sessions and reports a separate cleanup error.
 These events are diagnostic evidence, not an authoritative final-result oracle;
 missing gaps do not prove complete delivery. Review/redact sidecars before sharing.
+
+`execution_child_results_adopted` acquires `astra session show <id> --execution`
+before cleanup, using the same binary, environment, account and profile as the
+run. The private sidecar also retains the typed Server run tree and Reflect
+response. Its `children` list specifies the complete direct-child set. Every
+child requires an exact model and offering with successful physical provider
+evidence, and its result digest adopted before the same parent finalization.
+It never falls back to local journal
+events. The run tree must be complete; partial reflection can prove positive
+facts but cannot prove absence. Capture is bounded to 5 MiB and one total
+20-second observation window. Because trace ingestion is asynchronous, a
+completed root/children snapshot without the root's finalization fact is sampled
+again at most every two seconds. This waits for observation settlement, not a
+matching answer: settled failures are not retried. An unsettled final snapshot
+is retained and classified as verification unavailable. Each snapshot's two
+Server reads are not transactional and do not enter model usage; unrelated
+cases and normal conversations do not pay this observation cost.
+
+`execution_tool_count` and `execution_tool_sequence` additionally request
+`--transcript`. They join typed requests and terminal results by exact run and
+call identity, and reconcile the count with the authoritative run tree. The
+explicit inspection reads at most 4,096 transcript items and 2 MiB across pages,
+within the same CLI inspection deadline. Missing pages, conflicting identities,
+unknown statuses and count mismatches fail verification; an empty local journal
+cannot prove that a tool was not called. JSON predicates inspect the retained
+Server projection, not a reconstructed legacy journal or model-authored prose.
+Runtime advisories travel separately in the typed tool receipt; TUI rendering
+adds them to a disposable display copy, never to the result document. Truncated
+or malformed result documents remain unavailable to JSON predicates.
+Negative JSON-document predicates require raw evidence and are rejected here;
+display projection cannot certify that a field was absent from the original.
+`execution_child_count` uses the complete run tree to prove admission cardinality.
+`execution_tool_count.error_contains` checks a positive diagnostic substring
+only in that exact joined call's failed/rejected result body. It requires
+`ok: false`, a positive minimum and a nonempty needle of at most 4,096 bytes.
+Arguments, runtime advisories, successful results and another call's output
+cannot satisfy it. This accepts plain-text errors without fabricating JSON;
+the typed terminal disposition remains the failure authority.
+Each child's `expected_result` is either `{text: "literal"}`
+or `{json: <JSON value>}`. Both expectations require that exact child's bounded,
+unambiguous terminal transcript document. Text compares the actual bytes;
+JSON compares the parsed value. In both cases the untouched observed bytes must
+match the adopted digest; parent output is checked separately.
+Expected serialization and observed raw terminal content are each limited to
+4,096 bytes.
+Whitespace equivalence never excuses a wrong digest, foreign run, missing
+document, or premature finalization. Scalar expectations are not supported.
+Natural parallel children are matched bijectively by distinct model identities,
+never by their output. For same-model children or explicit fanout, specify
+`fanout_group` and each child's `slot_index`. One successful root start receipt
+must bind unique slot indexes, agent and run IDs to exactly the authoritative children;
+optional slot labels are not execution identities.
+array position and aggregate counts are insufficient. A successful `get_results`
+or collection receipt alone does not prove model observation: both mailbox and
+explicit-read delivery require the same `results_adopted` digest boundary.
+Known cardinality, model, slot or result contradictions fail the contract;
+missing bounded physical/adoption evidence is verification unavailable, and
+cannot hide another child's known contradiction.
+The optional per-child `initial_thinking` uses the shared `ThinkingConfig` contract and
+additionally requests `--run-events`. It compares the complete admitted initial
+thinking object from that exact child's `run_started`, after proving physical
+execution and result adoption. This is not proof of provider consumption.
+Run projections are bounded recent tails, read in batches of at most four under
+the same captured owner, 15-second CLI deadline and 5 MiB envelope limit.
+Optional per-child `logical_rounds` also requests these projections. It compares
+the existing execution owner's cumulative `llm_rounds_completed`, published as
+`run_finished.turn_evaluation.metadata.llm_rounds` with matching producer and
+owner generation. This includes failed logical calls, is not a physical-attempt
+count, and is not the length of a bounded diagnostics ring. Missing or ambiguous
+terminal counters are unavailable, not zero. The fixed two-model fanout requires
+one logical call per child; an extra failed call followed by success is not one.
+Missing initial admission, conflicting identities or incomplete thinking make
+verification unavailable; a valid different control fails the behavior check.
+An absent tail event never proves that an event did not occur.
+Catalog recovery and pagination are not failed delivery solely because they
+require multiple calls. The parent-tools rejection case requires successful
+authorized Chat discovery; all calls and their failures remain in the report.
 
 ## CLI reference
 

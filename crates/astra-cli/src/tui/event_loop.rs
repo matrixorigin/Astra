@@ -29,7 +29,9 @@ use tokio_stream::StreamExt;
 
 use super::app_event::{RestoreInputQueue, RestoreInputRequest, TuiAppEvent};
 use super::bottom_pane::view::BottomPaneViewAction;
-use super::bottom_pane::{BottomPane, BottomPaneAction, UserIntentRejectReason};
+use super::bottom_pane::{
+    BottomPane, BottomPaneAction, NextTurnSubmission, UserIntentRejectReason,
+};
 use super::chat_widget::UserEvent;
 use super::draw::{active_viewport, do_draw};
 use super::event::{TuiEvent, TuiEventStream};
@@ -112,7 +114,11 @@ enum StartupUiEffect {
 /// structured through the handoff so picking a model does not trigger a
 /// second remote fetch just to recover provider/thinking metadata.
 enum ModelCatalogEffect {
-    Ready(Result<Vec<astra_services::ModelListItemResponse>, String>),
+    Ready {
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        attachment_epoch: u64,
+        result: Result<Vec<astra_services::ModelListItemResponse>, String>,
+    },
 }
 
 enum LoginEffect {
@@ -173,12 +179,6 @@ async fn restore_login_identity_services(
 /// reaches the workbench, so the UI decides how to present an empty result,
 /// a load failure, or an interactive view without parsing display strings.
 enum SlashBackgroundReadEffect {
-    Team {
-        result: Result<Vec<crate::cli::slash::slash_team::Team>, String>,
-        detail: bool,
-        attachment_epoch: u64,
-        owner: bottom_pane::team_editor_view::TeamEditorOwner,
-    },
     Clipboard {
         success_message: String,
         result: Result<(), String>,
@@ -1025,10 +1025,10 @@ fn should_queue_work_start_submission(
         return false;
     }
 
-    // `/plan <goal>` is a conversational submit despite its slash prefix.
+    // Commands that launch a turn are conversational despite a slash prefix.
     // Other slash commands are local controls and should stay responsive so
     // the user can inspect or explicitly switch Sessions while Work starts.
-    !trimmed.starts_with('/') || slash_plan_goal(trimmed).is_some()
+    !trimmed.starts_with('/') || submission_starts_conversation(trimmed)
 }
 
 /// Returns whether a pristine Work start still owns the sessionless identity.
@@ -1054,7 +1054,7 @@ fn work_start_identity_pending(
 fn release_work_start_submissions(
     pending: &mut VecDeque<String>,
     bottom_pane: &mut BottomPane,
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
 ) -> bool {
     if pending.is_empty() {
         return false;
@@ -1062,7 +1062,8 @@ fn release_work_start_submissions(
     if bottom_pane.composer.is_empty() {
         if let Some(first) = pending.pop_front() {
             bottom_pane.composer.set_text(&first);
-            queued_followup_submissions.extend(pending.drain(..));
+            queued_followup_submissions
+                .extend(pending.drain(..).map(NextTurnSubmission::Interactive));
             return true;
         }
     }
@@ -1136,19 +1137,26 @@ fn apply_model_catalog_effect(
     state: &crate::cli::session::session_state::SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
-    cached_catalog: &mut Option<Vec<astra_services::ModelListItemResponse>>,
 ) -> bool {
-    match effect {
-        ModelCatalogEffect::Ready(Ok(catalog)) => {
+    let ModelCatalogEffect::Ready {
+        owner,
+        attachment_epoch,
+        result,
+    } = effect;
+    if attachment_epoch != state.session_attachment_epoch || !owner.is_current() {
+        return false;
+    }
+    match result {
+        Ok(catalog) => {
             let names = catalog
                 .iter()
                 .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
-            *cached_catalog = Some(catalog);
+            bottom_pane.cache_model_catalog(catalog);
             slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names)
         }
-        ModelCatalogEffect::Ready(Err(error)) => {
+        Err(error) => {
             chat_widget.commit_system(history_cell::system::SystemCell::error(error));
             false
         }
@@ -1363,14 +1371,6 @@ fn dispatch_slash_background_read(
 ) {
     tasks.spawn(async move {
         let effect = match action {
-            slash_dispatch::SlashBackgroundRead::Team { store, name, attachment_epoch } => {
-                SlashBackgroundReadEffect::Team {
-                    result: crate::cli::slash::slash_team::load_team_configurations(&store, "", name.as_deref()).await,
-                    detail: name.is_some(),
-                    attachment_epoch,
-                    owner: bottom_pane::team_editor_view::TeamEditorOwner(Arc::new(store)),
-                }
-            }
             slash_dispatch::SlashBackgroundRead::Clipboard {
                 text,
                 success_message,
@@ -1861,86 +1861,13 @@ fn apply_memory_read_effect(
 }
 
 fn apply_slash_background_read_effect(
-    selection_available: bool,
-    current_attachment_epoch: u64,
+    _selection_available: bool,
+    _current_attachment_epoch: u64,
     effect: SlashBackgroundReadEffect,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) {
     match effect {
-        SlashBackgroundReadEffect::Team {
-            result,
-            detail,
-            attachment_epoch,
-            owner,
-        } => {
-            if attachment_epoch != current_attachment_epoch || !owner.0.is_attached_owner() {
-                return;
-            }
-            match result {
-                Ok(mut teams) if detail => {
-                    chat_widget.commit_system(history_cell::system::SystemCell::response(
-                        "Opened Team configuration",
-                    ));
-                    if let Some(team) = teams.pop() {
-                        bottom_pane.push_view(Box::new(
-                            slash_dispatch::team_configuration_view(
-                                std::sync::Arc::new(team),
-                                attachment_epoch,
-                                owner,
-                            )
-                            .with_selection_available(selection_available),
-                        ));
-                    }
-                }
-                Ok(teams) => {
-                    use crate::tui::bottom_pane::list_selection_view::{
-                        ListSelectionView, SelectionItem,
-                    };
-                    let mut items: Vec<_> = teams
-                        .iter()
-                        .map(|team| SelectionItem {
-                            name: team.name.clone(),
-                            description: Some(format!(
-                                "{} · {} members",
-                                team.description,
-                                team.members.len()
-                            )),
-                            is_current: false,
-                        })
-                        .collect();
-                    let mut results: Vec<_> = teams
-                        .into_iter()
-                        .map(
-                            |team| crate::tui::bottom_pane::view::ViewResult::TeamConfiguration {
-                                team: std::sync::Arc::new(team),
-                                attachment_epoch,
-                                owner: owner.clone(),
-                            },
-                        )
-                        .collect();
-                    items.push(SelectionItem {
-                        name: "Create a team".into(),
-                        description: Some("Build a reusable roster".into()),
-                        is_current: false,
-                    });
-                    results.push(crate::tui::bottom_pane::view::ViewResult::CreateTeam {
-                        attachment_epoch,
-                        owner,
-                    });
-                    bottom_pane.push_view(Box::new(
-                        ListSelectionView::new(items, Some("Teams · configuration".into()))
-                            .with_results(results)
-                            .with_footer_hint("Type to filter · Enter inspect · Esc back"),
-                    ));
-                    chat_widget
-                        .commit_system(history_cell::system::SystemCell::response("Opened Teams"));
-                }
-                Err(error) => {
-                    chat_widget.commit_system(history_cell::system::SystemCell::error(error))
-                }
-            }
-        }
         SlashBackgroundReadEffect::Clipboard {
             success_message,
             result,
@@ -2630,24 +2557,20 @@ fn is_ctrl_b_background_key(key: &crossterm::event::KeyEvent) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
     Agents,
-    Team,
 }
 
 impl ReopenTarget {
     const AGENTS: &'static str = "agents";
-    const TEAM: &'static str = "/team";
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Agents => Self::AGENTS,
-            Self::Team => Self::TEAM,
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             Self::AGENTS => Some(Self::Agents),
-            Self::TEAM => Some(Self::Team),
             _ => None,
         }
     }
@@ -2804,21 +2727,52 @@ fn request_active_run_cancel(
 /// the caller; only local follow-ups receive a deterministic next-turn route.
 /// An interrupted or failed turn returns every locally owned byte for recovery.
 fn settle_followup_submissions(
-    queued_followups: &mut VecDeque<String>,
+    queued_followups: &mut VecDeque<NextTurnSubmission>,
     unapplied_current_turn: impl IntoIterator<Item = String>,
-    post_output_current_turn: &mut VecDeque<String>,
+    post_output_current_turn: &mut VecDeque<NextTurnSubmission>,
     should_start_followups: bool,
-) -> Option<String> {
+) -> Option<VecDeque<NextTurnSubmission>> {
     if should_start_followups {
-        queued_followups.extend(unapplied_current_turn);
+        queued_followups.extend(
+            unapplied_current_turn
+                .into_iter()
+                .map(NextTurnSubmission::Interactive),
+        );
         queued_followups.append(post_output_current_turn);
         return None;
     }
 
     let mut restored = std::mem::take(queued_followups);
-    restored.extend(unapplied_current_turn);
+    restored.extend(
+        unapplied_current_turn
+            .into_iter()
+            .map(NextTurnSubmission::Interactive),
+    );
     restored.append(post_output_current_turn);
-    (!restored.is_empty()).then(|| restored.into_iter().collect::<Vec<_>>().join("\n\n"))
+    (!restored.is_empty()).then_some(restored)
+}
+
+/// Returning input must preserve its purpose and captured authority. Only
+/// interactive entries may return to the command-aware composer.
+fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut BottomPane) {
+    let mut interactive = Vec::new();
+    for entry in entries {
+        match entry {
+            NextTurnSubmission::Interactive(text) => interactive.push(text),
+            NextTurnSubmission::Conversation { target, content } => {
+                bottom_pane.push_workbench_input(Box::new(
+                    bottom_pane::agent_guide_view::AgentGuideView::for_continuation(
+                        target,
+                        content,
+                        Some("This instruction was not sent. Review it before continuing.".into()),
+                    ),
+                ));
+            }
+        }
+    }
+    if !interactive.is_empty() {
+        bottom_pane.restore_into_composer(&interactive.join("\n\n"));
+    }
 }
 
 fn submission_belongs_to_next_turn(
@@ -2939,10 +2893,11 @@ fn should_start_queued_followups(
         && !exit_after_turn_settlement
 }
 
-fn model_facing_followup_backlog(queued: &VecDeque<String>) -> bool {
-    queued
-        .iter()
-        .any(|text| !text.trim_start().starts_with('/'))
+fn model_facing_followup_backlog(queued: &VecDeque<NextTurnSubmission>) -> bool {
+    queued.iter().any(|entry| {
+        matches!(entry, NextTurnSubmission::Conversation { .. })
+            || !entry.text().trim_start().starts_with('/')
+    })
 }
 
 fn slash_result_releases_followups(result: &slash_dispatch::SlashResult) -> bool {
@@ -2960,33 +2915,39 @@ fn local_slash_releases_followups(
     synchronous_completion && !session_changed && !has_active_view
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum QueuedFollowupRelease {
     SubmitNext,
+    Conversation {
+        target: SessionContinuationTarget,
+        content: String,
+    },
     HeldWithDraft,
     Idle,
 }
 
 fn release_next_queued_followup(
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> QueuedFollowupRelease {
     if !queued_followup_submissions.is_empty() && !bottom_pane.composer.is_empty() {
-        let restored = std::mem::take(queued_followup_submissions)
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let preview = user_intent_preview(&restored);
-        bottom_pane.restore_into_composer(&restored);
-        chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-            "Queued follow-up kept with your current draft: {preview}",
-        )));
+        restore_queued_input(std::mem::take(queued_followup_submissions), bottom_pane);
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            "Queued input kept for editing; nothing was sent.",
+        ));
         return QueuedFollowupRelease::HeldWithDraft;
     }
     if let Some(next_turn_submission) = queued_followup_submissions.pop_front() {
-        bottom_pane.composer.set_text(&next_turn_submission);
-        return QueuedFollowupRelease::SubmitNext;
+        return match next_turn_submission {
+            NextTurnSubmission::Interactive(text) => {
+                bottom_pane.composer.set_text(&text);
+                QueuedFollowupRelease::SubmitNext
+            }
+            NextTurnSubmission::Conversation { target, content } => {
+                QueuedFollowupRelease::Conversation { target, content }
+            }
+        };
     }
     QueuedFollowupRelease::Idle
 }
@@ -3006,6 +2967,10 @@ struct FollowupReleaseGate {
 #[derive(Debug, PartialEq, Eq)]
 enum QueuedFollowupHandoff {
     SubmitNext,
+    Conversation {
+        target: SessionContinuationTarget,
+        content: String,
+    },
     HeldWithDraft,
     RestoredAfterSessionChange,
     Held,
@@ -3013,7 +2978,7 @@ enum QueuedFollowupHandoff {
 }
 
 fn handoff_queued_followups(
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     gate: FollowupReleaseGate,
@@ -3022,11 +2987,7 @@ fn handoff_queued_followups(
         if queued_followup_submissions.is_empty() {
             return QueuedFollowupHandoff::Idle;
         }
-        let restored = std::mem::take(queued_followup_submissions)
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        bottom_pane.restore_into_composer(&restored);
+        restore_queued_input(std::mem::take(queued_followup_submissions), bottom_pane);
         chat_widget.commit_system(history_cell::system::SystemCell::info(
             "A message queued for the previous Session was kept in the composer after the Session changed. Review it before sending.".to_string(),
         ));
@@ -3040,13 +3001,16 @@ fn handoff_queued_followups(
     }
     match release_next_queued_followup(queued_followup_submissions, bottom_pane, chat_widget) {
         QueuedFollowupRelease::SubmitNext => QueuedFollowupHandoff::SubmitNext,
+        QueuedFollowupRelease::Conversation { target, content } => {
+            QueuedFollowupHandoff::Conversation { target, content }
+        }
         QueuedFollowupRelease::HeldWithDraft => QueuedFollowupHandoff::HeldWithDraft,
         QueuedFollowupRelease::Idle => QueuedFollowupHandoff::Idle,
     }
 }
 
 fn resume_queued_followups_after_modal(
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     event_stream: &mut TuiEventStream,
@@ -3055,37 +3019,58 @@ fn resume_queued_followups_after_modal(
 ) -> QueuedFollowupHandoff {
     let handoff =
         handoff_queued_followups(queued_followup_submissions, bottom_pane, chat_widget, gate);
-    if handoff == QueuedFollowupHandoff::SubmitNext {
-        // The injected Enter is the queued item itself. The next idle
-        // submission must run it, not append it behind whatever remains.
-        *followup_replay_armed = true;
-        event_stream.push_front(TuiEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
-        )));
-    }
+    schedule_queued_handoff(
+        &handoff,
+        |event| event_stream.push_front(event),
+        followup_replay_armed,
+    );
     handoff
 }
 
+fn schedule_queued_handoff(
+    handoff: &QueuedFollowupHandoff,
+    deliver: impl FnOnce(TuiEvent),
+    followup_replay_armed: &mut bool,
+) {
+    let event = match handoff {
+        QueuedFollowupHandoff::SubmitNext => TuiEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+        QueuedFollowupHandoff::Conversation { target, content } => TuiEvent::SessionContinuation {
+            target: target.clone(),
+            content: content.clone(),
+        },
+        _ => return,
+    };
+    *followup_replay_armed = true;
+    deliver(event);
+}
+
 /// A model-facing message typed while an older backlog is still held must
-/// join that FIFO. Slash commands and the one injected replay may proceed.
+/// join that FIFO. Local controls and the one injected replay may proceed.
 fn admit_idle_followup(
     text: &str,
     followup_replay_armed: &mut bool,
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
+    bottom_pane: &mut BottomPane,
 ) -> bool {
+    queued_followup_submissions.extend(bottom_pane.take_queued_next_turn_submissions());
     if *followup_replay_armed {
         *followup_replay_armed = false;
         return false;
     }
-    let trimmed = text.trim_start();
-    let model_facing =
-        !trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('!');
-    if !model_facing || queued_followup_submissions.is_empty() {
+    if !submission_starts_conversation(text) || queued_followup_submissions.is_empty() {
         return false;
     }
-    queued_followup_submissions.push_back(text.to_string());
+    queued_followup_submissions.push_back(NextTurnSubmission::Interactive(text.to_string()));
     true
+}
+
+fn submission_starts_conversation(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    slash_plan_goal(trimmed).is_some()
+        || (!trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('!'))
 }
 
 fn followup_release_gate(
@@ -3100,7 +3085,7 @@ fn followup_release_gate(
 }
 
 fn turn_settlement_followup_handoff(
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     model_catalog_loading: bool,
@@ -3113,7 +3098,10 @@ fn turn_settlement_followup_handoff(
         chat_widget,
         followup_release_gate(model_catalog_loading, background_reads_in_flight),
     );
-    if handoff == QueuedFollowupHandoff::SubmitNext {
+    if matches!(
+        handoff,
+        QueuedFollowupHandoff::SubmitNext | QueuedFollowupHandoff::Conversation { .. }
+    ) {
         *followup_replay_armed = true;
     }
     handoff
@@ -3137,7 +3125,7 @@ fn followup_gate_after_auth(
 /// The remaining FIFO will not get a later completion, so put it back
 /// in the composer.
 fn recover_followups_after_rejected_authentication(
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> bool {
@@ -3151,18 +3139,14 @@ fn recover_followups_after_rejected_authentication(
 /// A cancelled read will not reach the completion handoff. Put the held
 /// backlog back in the composer so a later manual submit cannot pass it.
 fn recover_queued_followups_after_cancelled_read(
-    queued_followup_submissions: &mut VecDeque<String>,
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> bool {
     if queued_followup_submissions.is_empty() {
         return false;
     }
-    let restored = std::mem::take(queued_followup_submissions)
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    bottom_pane.restore_into_composer(&restored);
+    restore_queued_input(std::mem::take(queued_followup_submissions), bottom_pane);
     chat_widget.commit_system(history_cell::system::SystemCell::info(
         "A queued message was kept in the composer after the background action was stopped. Review it before sending.".to_string(),
     ));
@@ -3761,6 +3745,7 @@ impl GuidanceSubmissionError {
             astra_thin_client::ThinClientError::Http(_)
             | astra_thin_client::ThinClientError::Api { .. }
             | astra_thin_client::ThinClientError::Json(_)
+            | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
             | astra_thin_client::ThinClientError::SseParse(_)
             | astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
             | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
@@ -3969,18 +3954,12 @@ fn active_root_transcript_item(
     chat_widget: &chat_widget::ChatWidget,
     width: u16,
 ) -> Option<bottom_pane::transcript_view::TranscriptItem> {
-    let active = chat_widget.active_cell()?;
-    let id = bottom_pane::transcript_view::TranscriptItemId::from_widget_id(
-        chat_widget
-            .active_cell_id()
-            .expect("active transcript cell must have an identity"),
-    );
-    Some(transcript_item_for_cell(
-        id,
-        active,
-        history_cell::trailing_blank_rows(active),
-        width,
-    ))
+    let (cell_id, active, tool_use_id) = chat_widget.root_suffix_cell()?;
+    let id = bottom_pane::transcript_view::TranscriptItemId::from_widget_id(cell_id);
+    Some(
+        transcript_item_for_cell(id, active, history_cell::trailing_blank_rows(active), width)
+            .with_tool_use_id(tool_use_id, !active.is_live()),
+    )
 }
 
 fn pending_root_transcript_context(
@@ -4126,8 +4105,7 @@ fn toggle_local_root_transcript_fallback(
 
 /// Open the canonical root-conversation workspace.
 ///
-/// A bound session always reads its durable typed transcript, regardless of
-/// whether the user arrived through Ctrl+O or the agent navigator. Before the
+/// Ctrl+O reads a bound session's durable typed transcript. Before the
 /// session exists, the in-memory conversation is the only truthful source and
 /// remains an explicitly local fallback.
 fn open_root_transcript_workspace(
@@ -4156,7 +4134,10 @@ fn open_root_transcript_workspace(
         open_transcript_view(chat_widget, bottom_pane, width, terminal_height);
     }
     let runtime_context = pending_root_transcript_context(bottom_pane);
-    bottom_pane.refresh_root_transcript_live(active_root_transcript_item(chat_widget, width));
+    bottom_pane.refresh_root_transcript_live(
+        chat_widget.active_root_binding(),
+        active_root_transcript_item(chat_widget, width),
+    );
     bottom_pane.refresh_root_transcript_context(runtime_context);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
@@ -4422,12 +4403,14 @@ fn refresh_open_transcript_view(
     bottom_pane: &mut BottomPane,
     width: u16,
 ) -> bool {
-    if !bottom_pane.has_root_transcript_tab() {
+    if !bottom_pane.has_root_transcript_tab() && !bottom_pane.has_agent_transcript_tab() {
         return false;
     }
     let pending_context = pending_root_transcript_context(bottom_pane);
-    let durable_live =
-        bottom_pane.refresh_root_transcript_live(active_root_transcript_item(chat_widget, width));
+    let durable_live = bottom_pane.refresh_root_transcript_live(
+        chat_widget.active_root_binding(),
+        active_root_transcript_item(chat_widget, width),
+    );
     let runtime_context = bottom_pane.refresh_root_transcript_context(pending_context.clone());
     let local_snapshot = if bottom_pane.uses_local_root_transcript_snapshot() {
         bottom_pane.refresh_transcript_snapshot(
@@ -4643,11 +4626,14 @@ fn apply_agent_communication_event(
     }
     if let Some(intent) = bottom_pane.remove_agent_guide(
         &event.message_id,
+        Some(chat_widget.session_id()).filter(|id| !id.is_empty()),
         attachment_epoch,
         Some(&event.observed_by.run_id),
     ) {
         let agent_name = match intent.target {
-            bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } => agent_name,
+            bottom_pane::PendingUserIntentTarget::AgentRun { target } => {
+                target.agent_name().to_owned()
+            }
             bottom_pane::PendingUserIntentTarget::ActiveRun => return,
         };
         chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
@@ -4819,7 +4805,6 @@ fn sync_explain_presentation(
 
 #[derive(Debug)]
 enum AgentWorkbenchOutcome {
-    TeamEditor(bottom_pane::team_editor_view::TeamEditorUpdate),
     Clipboard {
         success_message: String,
         result: Result<(), String>,
@@ -4828,132 +4813,30 @@ enum AgentWorkbenchOutcome {
         session_id: String,
         runs: Vec<crate::tui::local_agent_journal::LocalJournalAgentRun>,
     },
-    ControlAccepted {
-        publication: Option<astra_turn_types::ArtifactPublicationV1>,
-        agent_id: String,
-        action: astra_thin_client::SessionRunAction,
-    },
-    ControlContinuationRequired {
-        agent_id: String,
-        session_id: String,
-        source_run_id: String,
-    },
-    ControlRejected {
-        agent_id: String,
-        action: astra_thin_client::SessionRunAction,
-        reason: String,
+    Control {
+        context: Box<AgentControlContext>,
+        result: Result<AgentControlExecution, String>,
     },
     GuideAccepted {
-        attachment_epoch: u64,
+        target: AgentGuideTarget,
         intent_id: String,
     },
     GuideApplied {
-        attachment_epoch: u64,
+        target: AgentGuideTarget,
         intent_id: String,
     },
     GuideRejected {
-        attachment_epoch: u64,
+        target: AgentGuideTarget,
         intent_id: String,
-        agent_id: String,
-        agent_name: String,
-        run_id: String,
-        target: crate::tui::agent_run_projection::AgentControlTarget,
         reason: String,
     },
     GuideUnconfirmed {
-        attachment_epoch: u64,
+        target: AgentGuideTarget,
         intent_id: String,
-        agent_name: String,
         reason: String,
     },
     TranscriptUpdate(bottom_pane::agent_transcript_view::AgentTranscriptUpdate),
     RootTranscriptUpdate(bottom_pane::root_transcript_view::RootTranscriptUpdate),
-}
-
-fn dispatch_team_editor_request(
-    request: bottom_pane::team_editor_view::TeamEditorRequest,
-    attachment_epoch: u64,
-    bottom_pane: &mut BottomPane,
-    outcome_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
-) -> bool {
-    use bottom_pane::team_editor_view::{
-        TeamEditorOperation, TeamEditorResponse, TeamEditorUpdate,
-    };
-    if request.target.attachment_epoch != attachment_epoch
-        || !bottom_pane.team_editor_pending(&request)
-    {
-        return false;
-    }
-    if !request.target.owner.0.is_attached_owner() {
-        let reason = "Sign-in changed. Reopen the editor with the intended account.".to_string();
-        let response = match &request.operation {
-            TeamEditorOperation::Save { .. } => TeamEditorResponse::Saved(Err(
-                astra_services::team_persistence::TeamWriteError::Rejected,
-            )),
-            TeamEditorOperation::Refresh { .. } => TeamEditorResponse::Refreshed(Err(reason)),
-            TeamEditorOperation::Models { .. } => TeamEditorResponse::Models(Err(reason)),
-        };
-        // Local pre-delivery rejection, not a late observation from another
-        // account. Retire only this exact pending action and keep its draft.
-        bottom_pane.update_team_editor(&TeamEditorUpdate { request, response });
-        return false;
-    }
-    tokio::spawn(async move {
-        use astra_services::team_persistence::{
-            CreateTeam, TeamPersistenceService, TeamWriteError, UpdateTeam,
-        };
-        let store = &request.target.owner.0;
-        let response = match &request.operation {
-            TeamEditorOperation::Save { definition, create } => {
-                let result = if !store.is_attached_owner() {
-                    Err(TeamWriteError::Rejected)
-                } else if *create {
-                    store
-                        .create_team(
-                            &definition.user_id,
-                            &CreateTeam {
-                                team_id: definition.team_id.clone(),
-                                name: definition.name.clone(),
-                                description: definition.description.clone(),
-                                members: definition.members.clone(),
-                                context: definition.context.clone(),
-                            },
-                        )
-                        .await
-                } else {
-                    store
-                        .update_team(
-                            &definition.user_id,
-                            &definition.team_id,
-                            &UpdateTeam::from(definition.as_ref()),
-                        )
-                        .await
-                };
-                TeamEditorResponse::Saved(result)
-            }
-            TeamEditorOperation::Refresh { team_id } => {
-                TeamEditorResponse::Refreshed(if store.is_attached_owner() {
-                    store.load_team_by_id("", team_id).await
-                } else {
-                    Err("Sign-in changed. Reopen the editor with the intended account.".into())
-                })
-            }
-            TeamEditorOperation::Models { .. } => {
-                TeamEditorResponse::Models(if store.is_attached_owner() {
-                    store.model_catalog().await
-                } else {
-                    Err("Sign-in changed. Reopen the editor with the intended account.".into())
-                })
-            }
-        };
-        let _ = outcome_tx
-            .send(AgentWorkbenchOutcome::TeamEditor(TeamEditorUpdate {
-                request,
-                response,
-            }))
-            .await;
-    });
-    true
 }
 
 /// Load the durable local-agent index without delaying input or rendering.
@@ -4988,12 +4871,127 @@ fn dispatch_local_agent_journal_load(
 
 const AGENT_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug)]
 enum AgentControlExecution {
     Applied(Option<astra_turn_types::ArtifactPublicationV1>),
     SessionContinuationRequired {
         session_id: String,
         source_run_id: String,
     },
+}
+
+#[derive(Debug)]
+struct AgentControlContext {
+    attachment_epoch: u64,
+    session_id: Option<String>,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    agent_id: String,
+    target: crate::tui::agent_run_projection::AgentControlTarget,
+    action: astra_thin_client::SessionRunAction,
+    request_id: uuid::Uuid,
+}
+
+/// The exact owner-bound receipt retained while the user edits a continuation.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionContinuationTarget(Arc<AgentControlContext>);
+
+impl PartialEq for SessionContinuationTarget {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SessionContinuationTarget {}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentGuideTarget(Arc<AgentGuideContext>);
+
+#[derive(Debug)]
+struct AgentGuideContext {
+    attachment_epoch: u64,
+    session_id: Option<String>,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    api: astra_thin_client::ThinClient,
+    agent_name: String,
+    run_id: String,
+    target: crate::tui::agent_run_projection::AgentControlTarget,
+    observation: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for AgentGuideContext {
+    fn drop(&mut self) {
+        self.observation.cancel();
+    }
+}
+
+impl PartialEq for AgentGuideTarget {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AgentGuideTarget {}
+
+impl AgentGuideTarget {
+    pub(crate) fn capture(
+        agent_name: String,
+        run_id: String,
+        target: crate::tui::agent_run_projection::AgentControlTarget,
+        api: astra_thin_client::ThinClient,
+        session_id: Option<String>,
+        attachment_epoch: u64,
+    ) -> Self {
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let api = match &owner.native_binding {
+            Some(binding) => api.with_bearer_provider(binding.clone()),
+            None => api.without_bearer_provider(),
+        };
+        Self(Arc::new(AgentGuideContext {
+            attachment_epoch,
+            session_id,
+            owner,
+            api,
+            agent_name,
+            run_id,
+            target,
+            observation: tokio_util::sync::CancellationToken::new(),
+        }))
+    }
+
+    pub(crate) fn agent_name(&self) -> &str {
+        &self.0.agent_name
+    }
+
+    pub(crate) fn run_id(&self) -> &str {
+        &self.0.run_id
+    }
+
+    pub(crate) fn is_attached(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
+        self.0.attachment_epoch == attachment_epoch
+            && self.0.session_id.as_deref() == session_id
+            && self.0.owner.is_current()
+    }
+
+    pub(crate) fn retire_observation(&self) {
+        self.0.observation.cancel();
+    }
+}
+
+impl AgentControlContext {
+    fn is_attached(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
+        self.attachment_epoch == attachment_epoch
+            && self.session_id.as_deref() == session_id
+            && self.owner.is_current()
+    }
+
+    fn is_pending(&self, chat_widget: &chat_widget::ChatWidget) -> bool {
+        chat_widget.agent_control_request_matches(
+            &self.agent_id,
+            &self.target,
+            self.action,
+            self.request_id,
+        )
+    }
 }
 
 fn project_agent_control_execution(
@@ -5051,10 +5049,27 @@ fn dispatch_agent_control(
         api,
         profile,
         agent_workbench_tx: outcome_tx,
+        session_id,
+        session_attachment_epoch,
         ..
     } = backends;
     let agent_id_owned = agent_id.to_string();
-    if !chat_widget.mark_agent_control_pending(&agent_id_owned, action) {
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    if profile
+        .as_deref()
+        .is_some_and(|profile| owner.profile_name.as_deref() != Some(profile))
+    {
+        chat_widget.commit_system(history_cell::system::SystemCell::error(
+            "Sign-in changed. Reopen the conversation controls with the intended account.",
+        ));
+        frame_requester.schedule_frame();
+        return;
+    }
+    let api = match &owner.native_binding {
+        Some(binding) => api.with_bearer_provider(binding.clone()),
+        None => api,
+    };
+    let Some(request_id) = chat_widget.begin_agent_control(&agent_id_owned, &target, action) else {
         chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
             "{} is no longer available for {agent_id}.",
             agent_control_action_label(action)
@@ -5062,44 +5077,40 @@ fn dispatch_agent_control(
         bottom_pane.sync_popups();
         frame_requester.schedule_frame();
         return;
-    }
+    };
+    let context = AgentControlContext {
+        attachment_epoch: session_attachment_epoch,
+        session_id,
+        owner,
+        agent_id: agent_id_owned,
+        target,
+        action,
+        request_id,
+    };
     tokio::spawn(async move {
         let result = tokio::time::timeout(
             AGENT_CONTROL_TIMEOUT,
-            execute_agent_control(target, action, spawner, &api, profile.as_deref()),
+            execute_agent_control(
+                context.target.clone(),
+                action,
+                spawner,
+                &api,
+                &context.owner,
+            ),
         )
-        .await;
-        let outcome = match result {
-            Ok(Ok(AgentControlExecution::Applied(publication))) => {
-                AgentWorkbenchOutcome::ControlAccepted {
-                    publication,
-                    agent_id: agent_id_owned,
-                    action,
-                }
-            }
-            Ok(Ok(AgentControlExecution::SessionContinuationRequired {
-                session_id,
-                source_run_id,
-            })) => AgentWorkbenchOutcome::ControlContinuationRequired {
-                agent_id: agent_id_owned,
-                session_id,
-                source_run_id,
-            },
-            Ok(Err(reason)) => AgentWorkbenchOutcome::ControlRejected {
-                agent_id: agent_id_owned,
-                action,
-                reason,
-            },
-            Err(_) => AgentWorkbenchOutcome::ControlRejected {
-                agent_id: agent_id_owned,
-                action,
-                reason: format!(
-                    "the control backend did not acknowledge {} in time",
-                    agent_control_action_label(action).to_lowercase()
-                ),
-            },
-        };
-        let _ = outcome_tx.send(outcome).await;
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "the control backend did not acknowledge {} in time",
+                agent_control_action_label(action).to_lowercase()
+            ))
+        });
+        let _ = outcome_tx
+            .send(AgentWorkbenchOutcome::Control {
+                context: Box::new(context),
+                result,
+            })
+            .await;
     });
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
@@ -5110,7 +5121,7 @@ async fn execute_agent_control(
     action: astra_thin_client::SessionRunAction,
     spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> Result<AgentControlExecution, String> {
     match target {
         crate::tui::agent_run_projection::AgentControlTarget::LocalAgent { agent_id } => {
@@ -5131,7 +5142,7 @@ async fn execute_agent_control(
             }
         }
         crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id } => {
-            let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+            let token = crate::cli::session::session_runtime::owner_access_token(api, owner, None)
                 .await
                 .ok_or_else(|| "authentication is unavailable".to_string())?;
             let result = match action {
@@ -5175,24 +5186,18 @@ fn drain_agent_workbench_outcomes(
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
 ) {
+    bottom_pane.retire_detached_agent_observations(active_session_id, attachment_epoch);
     while let Ok(outcome) = outcome_rx.try_recv() {
         if matches!(&outcome,
-            AgentWorkbenchOutcome::GuideAccepted { attachment_epoch: epoch, .. }
-                | AgentWorkbenchOutcome::GuideApplied { attachment_epoch: epoch, .. }
-                | AgentWorkbenchOutcome::GuideRejected { attachment_epoch: epoch, .. }
-                | AgentWorkbenchOutcome::GuideUnconfirmed { attachment_epoch: epoch, .. }
-                if *epoch != attachment_epoch
+            AgentWorkbenchOutcome::GuideAccepted { target, .. }
+                | AgentWorkbenchOutcome::GuideApplied { target, .. }
+                | AgentWorkbenchOutcome::GuideRejected { target, .. }
+                | AgentWorkbenchOutcome::GuideUnconfirmed { target, .. }
+                if !target.is_attached(active_session_id, attachment_epoch)
         ) {
             continue;
         }
         match outcome {
-            AgentWorkbenchOutcome::TeamEditor(update) => {
-                if update.request.target.attachment_epoch == attachment_epoch
-                    && update.request.target.owner.0.is_attached_owner()
-                {
-                    bottom_pane.update_team_editor(&update);
-                }
-            }
             AgentWorkbenchOutcome::Clipboard {
                 success_message,
                 result,
@@ -5208,67 +5213,100 @@ fn drain_agent_workbench_outcomes(
                     chat_widget.reconcile_local_agent_journal_runs(&runs);
                 }
             }
-            AgentWorkbenchOutcome::ControlAccepted {
-                agent_id,
-                action,
-                publication,
-            } => {
-                if let Some(outcome) = publication {
-                    let cell = match outcome.result {
-                        astra_turn_types::ArtifactPublicationResult::Published { .. } => {
-                            history_cell::system::SystemCell::info(outcome.user_notice())
-                        }
-                        astra_turn_types::ArtifactPublicationResult::Unavailable { .. } => {
-                            history_cell::system::SystemCell::warning(outcome.user_notice())
-                        }
-                    };
-                    chat_widget.commit_system(cell);
+            AgentWorkbenchOutcome::Control { context, result } => {
+                if !context.is_attached(active_session_id, attachment_epoch) {
+                    continue;
                 }
-                tracing::debug!(agent_id, ?action, "agent control accepted");
-            }
-            AgentWorkbenchOutcome::ControlContinuationRequired {
-                agent_id,
-                session_id,
-                source_run_id,
-            } => {
-                chat_widget.reject_agent_control(&agent_id);
-                tracing::info!(
-                    %agent_id,
-                    %session_id,
-                    %source_run_id,
-                    "agent requires session continuation"
-                );
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "{agent_id}'s previous executor is no longer running. Continue in the main conversation; Astra will restore its durable history and checkpoint evidence without pretending the old process resumed."
-                )));
-            }
-            AgentWorkbenchOutcome::ControlRejected {
-                agent_id,
-                action,
-                reason,
-            } => {
-                if chat_widget.reject_agent_control(&agent_id) {
-                    chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                        "Could not {} {agent_id}: {reason}. Its last confirmed state remains visible.",
-                        agent_control_action_label(action).to_lowercase()
+                match result {
+                    Ok(AgentControlExecution::Applied(publication)) => {
+                        if let Some(outcome) = publication {
+                            if !matches!(&context.target,
+                                crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id }
+                                if run_id == &outcome.run_id
+                            ) {
+                                continue;
+                            }
+                            let cell = match outcome.result {
+                                astra_turn_types::ArtifactPublicationResult::Published {
+                                    ..
+                                } => history_cell::system::SystemCell::info(outcome.user_notice()),
+                                astra_turn_types::ArtifactPublicationResult::Unavailable {
+                                    ..
+                                } => {
+                                    history_cell::system::SystemCell::warning(outcome.user_notice())
+                                }
+                            };
+                            chat_widget.commit_system(cell);
+                        }
+                        tracing::debug!(agent_id = context.agent_id, action = ?context.action, "agent control accepted");
+                    }
+                    Ok(AgentControlExecution::SessionContinuationRequired {
+                        session_id,
+                        source_run_id,
+                    }) => {
+                        if !context.is_pending(chat_widget)
+                            || context.session_id.as_deref() != Some(session_id.as_str())
+                            || !matches!(&context.target,
+                                crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id }
+                                if run_id == &source_run_id
+                            )
+                        {
+                            continue;
+                        }
+                        chat_widget.reject_agent_control(
+                            &context.agent_id,
+                            &context.target,
+                            context.action,
+                            context.request_id,
+                        );
+                        tracing::info!(
+                            agent_id = context.agent_id,
+                            %session_id,
+                            %source_run_id,
+                            "agent requires session continuation"
+                        );
+                        bottom_pane.push_workbench_input(Box::new(
+                            bottom_pane::agent_guide_view::AgentGuideView::for_continuation(
+                                SessionContinuationTarget(Arc::new(*context)),
+                                String::new(),
+                                None,
+                            ),
+                        ));
+                    }
+                    Err(reason) => {
+                        if chat_widget.reject_agent_control(
+                            &context.agent_id,
+                            &context.target,
+                            context.action,
+                            context.request_id,
+                        ) {
+                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                        "Could not {} {}: {reason}. Its last confirmed state remains visible.",
+                        agent_control_action_label(context.action).to_lowercase(), context.agent_id
                     )));
-                } else {
-                    tracing::debug!(
-                        agent_id,
-                        reason,
-                        "agent control rejection arrived after authoritative state changed"
-                    );
+                        } else {
+                            tracing::debug!(
+                                agent_id = context.agent_id,
+                                reason,
+                                "agent control rejection arrived after authoritative state changed"
+                            );
+                        }
+                    }
                 }
             }
             AgentWorkbenchOutcome::GuideAccepted { intent_id, .. } => {
                 bottom_pane.promote_agent_guide_accepted(&intent_id);
             }
             AgentWorkbenchOutcome::GuideApplied { intent_id, .. } => {
-                if let Some(intent) =
-                    bottom_pane.remove_agent_guide(&intent_id, attachment_epoch, None)
-                    && let bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } =
-                        intent.target
+                if let Some(intent) = bottom_pane.remove_agent_guide(
+                    &intent_id,
+                    active_session_id,
+                    attachment_epoch,
+                    None,
+                ) && let bottom_pane::PendingUserIntentTarget::AgentRun { target } =
+                    intent.target
                 {
+                    let agent_name = target.agent_name();
                     chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
                         "Guidance applied to {agent_name}"
                     )));
@@ -5276,23 +5314,21 @@ fn drain_agent_workbench_outcomes(
             }
             AgentWorkbenchOutcome::GuideRejected {
                 intent_id,
-                agent_id,
-                agent_name,
-                run_id,
                 target,
                 reason,
                 ..
             } => {
-                let Some(intent) =
-                    bottom_pane.remove_agent_guide(&intent_id, attachment_epoch, Some(&run_id))
-                else {
+                let Some(intent) = bottom_pane.remove_agent_guide(
+                    &intent_id,
+                    active_session_id,
+                    attachment_epoch,
+                    Some(&target.0.run_id),
+                ) else {
                     continue;
                 };
+                let agent_name = target.agent_name().to_owned();
                 bottom_pane.push_view(Box::new(
                     bottom_pane::agent_guide_view::AgentGuideView::with_draft(
-                        agent_id,
-                        agent_name.clone(),
-                        run_id,
                         target,
                         intent.text,
                         format!("Not sent: {reason}"),
@@ -5304,10 +5340,11 @@ fn drain_agent_workbench_outcomes(
             }
             AgentWorkbenchOutcome::GuideUnconfirmed {
                 intent_id,
-                agent_name,
+                target,
                 reason,
                 ..
             } => {
+                let agent_name = target.agent_name();
                 if bottom_pane.mark_user_intent_unconfirmed(&intent_id) {
                     chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
                         "Guidance to {agent_name} is unconfirmed: {reason}. Its stable identity is retained; it was not resent."
@@ -5510,6 +5547,9 @@ fn local_transcript_tool_result(
 ) -> Option<astra_thin_client::SessionTranscriptToolResult> {
     (message.get("role").and_then(serde_json::Value::as_str) == Some("tool")).then(|| {
         astra_thin_client::SessionTranscriptToolResult {
+            runtime_advisories: astra_turn_core::tool::result::advisory::advisories(
+                message.as_object(),
+            ),
             tool_use_id: message
                 .get("tool_call_id")
                 .or_else(|| message.get("call_id"))
@@ -5752,6 +5792,7 @@ fn local_root_tool_observations(
                 reasoning_status: None,
                 tool_calls,
                 tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
+                    runtime_advisories: record.runtime_advisories.clone(),
                     tool_use_id: call_id.to_string(),
                     name: Some(record.name.clone()),
                     status: Some(status.into()),
@@ -6374,18 +6415,28 @@ fn dispatch_root_transcript_load(
 
 async fn submit_agent_guide(
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     run_id: &str,
     request: &astra_thin_client::RunUserIntentRequest,
 ) -> Result<String, GuidanceSubmissionError> {
     // Use the same bounded acknowledgement protocol as root guidance, but
     // do not couple a member's lifetime to the foreground turn or retry it.
     tokio::time::timeout(ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT, async {
-        let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+        if !owner.is_current() {
+            return Err(GuidanceSubmissionError::Rejected(
+                "Sign-in changed. Reopen guidance with the intended account.".into(),
+            ));
+        }
+        let token = crate::cli::session::session_runtime::owner_access_token(api, owner, None)
             .await
             .ok_or_else(|| {
                 GuidanceSubmissionError::Rejected("authentication is unavailable".into())
             })?;
+        if !owner.is_current() {
+            return Err(GuidanceSubmissionError::Rejected(
+                "Sign-in changed. Reopen guidance with the intended account.".into(),
+            ));
+        }
         let response = api
             .submit_run_user_intent(Some(&token), run_id, request)
             .await
@@ -6413,37 +6464,116 @@ async fn submit_agent_guide(
     })?
 }
 
+async fn observe_agent_guide(
+    mut stream: impl tokio_stream::Stream<
+        Item = Result<astra_thin_client::StreamEvent, astra_thin_client::ThinClientError>,
+    > + Unpin,
+    run_id: &str,
+    intent_id: &str,
+    observation: &tokio_util::sync::CancellationToken,
+    outcome_tx: &tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
+) -> Result<(), String> {
+    use astra_thin_client::StreamEvent;
+    let mut deadline = tokio::time::Instant::now() + AGENT_GUIDE_APPLICATION_TIMEOUT;
+    let mut paused_remaining = None;
+    let mut replay_paused = false;
+    let mut accepted_seen = false;
+    loop {
+        let next = tokio::select! {
+            _ = observation.cancelled() => return Ok(()),
+            _ = outcome_tx.closed() => return Ok(()),
+            next = async {
+                if paused_remaining.is_some() {
+                    Ok(stream.next().await)
+                } else {
+                    tokio::time::timeout_at(deadline, stream.next()).await
+                        .map_err(|_| "no matching applied event arrived within 60 seconds of active execution".to_string())
+                }
+            } => next?,
+        };
+        let Some(event) = next else {
+            return Err("the agent event stream ended before application was observed".into());
+        };
+        match event {
+            Ok(StreamEvent::RunPaused { run_id: Some(id) }) if id == run_id => {
+                replay_paused = true;
+                if accepted_seen {
+                    paused_remaining.get_or_insert_with(|| {
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    });
+                }
+            }
+            Ok(StreamEvent::RunResumed { run_id: Some(id) }) if id == run_id => {
+                replay_paused = false;
+                if let Some(remaining) = paused_remaining.take() {
+                    deadline = tokio::time::Instant::now() + remaining;
+                }
+            }
+            Ok(StreamEvent::RunUserIntentAccepted {
+                run_id: id,
+                intent_id: intent,
+                ..
+            }) if id == run_id && intent == intent_id && !accepted_seen => {
+                accepted_seen = true;
+                deadline = tokio::time::Instant::now() + AGENT_GUIDE_APPLICATION_TIMEOUT;
+                paused_remaining = replay_paused.then_some(AGENT_GUIDE_APPLICATION_TIMEOUT);
+            }
+            Ok(StreamEvent::RunUserIntentApplied {
+                run_id: id,
+                intent_id: intent,
+                ..
+            }) if id == run_id && intent == intent_id => return Ok(()),
+            Ok(StreamEvent::RunUserIntentReturned {
+                run_id: id,
+                intent_id: intent,
+                ..
+            }) if id == run_id && intent == intent_id => {
+                return Err("the agent run ended before applying the guidance; delivery ownership was returned".into());
+            }
+            Ok(StreamEvent::RunFinished { .. }) | Ok(StreamEvent::RunCancelled { .. }) => {
+                return Err("the agent run ended before a matching applied event".into());
+            }
+            Ok(StreamEvent::RunError { message, .. }) => {
+                return Err(format!("the agent run reported an error: {message}"));
+            }
+            Err(error) => return Err(error.to_string()),
+            _ => {}
+        }
+    }
+}
+
 // This is a one-shot UI-to-runtime command boundary; identity, routing, and
 // repaint capabilities remain explicit and independently testable.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_agent_guide(
-    agent_id: String,
-    agent_name: String,
-    run_id: String,
-    target: crate::tui::agent_run_projection::AgentControlTarget,
+    receipt: AgentGuideTarget,
     content: String,
     backends: ViewActionBackends,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     frame_requester: &FrameRequester,
 ) {
+    let run_id = receipt.0.run_id.clone();
+    let target = receipt.0.target.clone();
+    let owner = receipt.0.owner.clone();
+    let api = receipt.0.api.clone();
     let intent_id = uuid::Uuid::new_v4().to_string();
-    if !bottom_pane.accept_agent_guide(
-        intent_id.clone(),
-        run_id.clone(),
-        agent_name.clone(),
-        content.clone(),
+    if !receipt.is_attached(
+        backends.session_id.as_deref(),
         backends.session_attachment_epoch,
-    ) {
+    ) || !chat_widget
+        .agent_workbench_snapshot()
+        .rows
+        .iter()
+        .any(|row| row.guide_target() == Some((&receipt.0.target, receipt.0.run_id.as_str())))
+        || !bottom_pane.accept_agent_guide(intent_id.clone(), receipt.clone(), content.clone())
+    {
         chat_widget.commit_system(history_cell::system::SystemCell::error(
             "Could not stage agent guidance. The draft was not sent.",
         ));
         bottom_pane.push_view(Box::new(
             bottom_pane::agent_guide_view::AgentGuideView::with_draft(
-                agent_id,
-                agent_name,
-                run_id,
-                target,
+                receipt,
                 content,
                 "Not sent: local validation failed",
             ),
@@ -6454,10 +6584,7 @@ fn dispatch_agent_guide(
 
     let ViewActionBackends {
         agent_spawner: spawner,
-        api,
-        profile,
         agent_workbench_tx: outcome_tx,
-        session_attachment_epoch: attachment_epoch,
         ..
     } = backends;
     tokio::spawn(async move {
@@ -6465,15 +6592,22 @@ fn dispatch_agent_guide(
             agent_id: local_agent_id,
         } = &target
         {
+            if !owner.is_current() {
+                let _ = outcome_tx
+                    .send(AgentWorkbenchOutcome::GuideRejected {
+                        target: receipt.clone(),
+                        intent_id,
+                        reason: "Sign-in changed. Reopen guidance with the intended account."
+                            .into(),
+                    })
+                    .await;
+                return;
+            }
             let Some(spawner) = spawner else {
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::GuideRejected {
-                        attachment_epoch,
+                        target: receipt.clone(),
                         intent_id,
-                        agent_id,
-                        agent_name,
-                        run_id,
-                        target,
                         reason: "the local runtime that owns this agent is unavailable".into(),
                     })
                     .await;
@@ -6485,9 +6619,8 @@ fn dispatch_agent_guide(
             {
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::GuideUnconfirmed {
-                        attachment_epoch,
+                        target: receipt.clone(),
                         intent_id,
-                        agent_name,
                         reason,
                     })
                     .await;
@@ -6495,16 +6628,15 @@ fn dispatch_agent_guide(
             }
             let _ = outcome_tx
                 .send(AgentWorkbenchOutcome::GuideAccepted {
-                    attachment_epoch,
+                    target: receipt.clone(),
                     intent_id: intent_id.clone(),
                 })
                 .await;
             tokio::time::sleep(AGENT_GUIDE_APPLICATION_TIMEOUT).await;
             let _ = outcome_tx
                 .send(AgentWorkbenchOutcome::GuideUnconfirmed {
-                    attachment_epoch,
+                    target: receipt.clone(),
                     intent_id,
-                    agent_name,
                     reason: "no matching mailbox-received event arrived within 60 seconds".into(),
                 })
                 .await;
@@ -6520,12 +6652,8 @@ fn dispatch_agent_guide(
         if target_run_id != &run_id {
             let _ = outcome_tx
                 .send(AgentWorkbenchOutcome::GuideRejected {
-                    attachment_epoch,
+                    target: receipt.clone(),
                     intent_id,
-                    agent_id,
-                    agent_name,
-                    run_id,
-                    target,
                     reason: "the selected run identity changed before guidance dispatch".into(),
                 })
                 .await;
@@ -6536,7 +6664,7 @@ fn dispatch_agent_guide(
             delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             input: serde_json::json!({ "content": content }),
         };
-        let token = match submit_agent_guide(&api, profile.as_deref(), &run_id, &request).await {
+        let token = match submit_agent_guide(&api, &owner, &run_id, &request).await {
             Ok(token) => token,
             Err(error) => {
                 let reason = match error {
@@ -6547,9 +6675,8 @@ fn dispatch_agent_guide(
                     GuidanceSubmissionError::Unconfirmed(reason) => {
                         let _ = outcome_tx
                             .send(AgentWorkbenchOutcome::GuideUnconfirmed {
-                                attachment_epoch,
+                                target: receipt.clone(),
                                 intent_id,
-                                agent_name,
                                 reason,
                             })
                             .await;
@@ -6558,73 +6685,52 @@ fn dispatch_agent_guide(
                 };
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::GuideRejected {
-                        attachment_epoch,
+                        target: receipt.clone(),
                         intent_id,
-                        agent_id,
-                        agent_name,
-                        run_id,
-                        target,
                         reason,
                     })
                     .await;
                 return;
             }
         };
-        let _ = outcome_tx
+        if outcome_tx
             .send(AgentWorkbenchOutcome::GuideAccepted {
-                attachment_epoch,
+                target: receipt.clone(),
                 intent_id: intent_id.clone(),
             })
-            .await;
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let observation = receipt.0.observation.clone();
+        let weak_receipt = Arc::downgrade(&receipt.0);
+        drop(receipt);
 
-        let observed = tokio::time::timeout(AGENT_GUIDE_APPLICATION_TIMEOUT, async {
-            let mut stream = api.stream_run(&run_id, 0, Some(&token));
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(astra_thin_client::StreamEvent::RunUserIntentApplied {
-                        run_id: event_run_id,
-                        intent_id: event_intent_id,
-                        ..
-                    }) if event_run_id == run_id && event_intent_id == intent_id => {
-                        return Ok(());
-                    }
-                    Ok(astra_thin_client::StreamEvent::RunUserIntentReturned {
-                        run_id: event_run_id,
-                        intent_id: event_intent_id,
-                        ..
-                    }) if event_run_id == run_id && event_intent_id == intent_id => {
-                        return Err("the agent run ended before applying the guidance; delivery ownership was returned".into());
-                    }
-                    Ok(astra_thin_client::StreamEvent::RunFinished { .. })
-                    | Ok(astra_thin_client::StreamEvent::RunCancelled { .. }) => {
-                        return Err("the agent run ended before a matching applied event".into());
-                    }
-                    Ok(astra_thin_client::StreamEvent::RunError { message, .. }) => {
-                        return Err(format!("the agent run reported an error: {message}"));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                    _ => {}
-                }
-            }
-            Err("the agent event stream ended before application was observed".into())
-        })
+        let observed = observe_agent_guide(
+            api.stream_run(&run_id, 0, Some(&token)),
+            &run_id,
+            &intent_id,
+            &observation,
+            &outcome_tx,
+        )
         .await;
+        if observation.is_cancelled() || outcome_tx.is_closed() {
+            return;
+        }
+        let Some(context) = weak_receipt.upgrade() else {
+            return;
+        };
+        let receipt = AgentGuideTarget(context);
         let outcome = match observed {
-            Ok(Ok(())) => AgentWorkbenchOutcome::GuideApplied {
-                attachment_epoch,
+            Ok(()) => AgentWorkbenchOutcome::GuideApplied {
+                target: receipt.clone(),
                 intent_id,
             },
-            Ok(Err(reason)) => AgentWorkbenchOutcome::GuideUnconfirmed {
-                attachment_epoch,
+            Err(reason) => AgentWorkbenchOutcome::GuideUnconfirmed {
+                target: receipt.clone(),
                 intent_id,
-                agent_name,
                 reason,
-            },
-            Err(_) => AgentWorkbenchOutcome::GuideUnconfirmed {
-                attachment_epoch,
-                intent_id,
-                agent_name,
-                reason: "no matching applied event arrived within 60 seconds".into(),
             },
         };
         let _ = outcome_tx.send(outcome).await;
@@ -6723,24 +6829,6 @@ async fn dispatch_bottom_pane_view_action(
     terminal_height: u16,
 ) {
     match action {
-        BottomPaneViewAction::TeamEditor(request) => {
-            dispatch_team_editor_request(
-                request,
-                backends.session_attachment_epoch,
-                bottom_pane,
-                backends.agent_workbench_tx,
-            );
-        }
-        BottomPaneViewAction::OpenRootTranscript => {
-            open_root_transcript_workspace(
-                chat_widget,
-                bottom_pane,
-                viewport_width,
-                terminal_height,
-                backends,
-                frame_requester,
-            );
-        }
         BottomPaneViewAction::ReturnToConversationNavigator => {
             // A transcript tab remains alive when the user goes back to the
             // run tree, preserving its live suffix, scroll, search and
@@ -6879,33 +6967,28 @@ async fn dispatch_bottom_pane_view_action(
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::BeginAgentGuide {
-            agent_id,
             agent_name,
             run_id,
             target,
         } => {
             bottom_pane.push_view(Box::new(
-                bottom_pane::agent_guide_view::AgentGuideView::new(
-                    agent_id, agent_name, run_id, target,
-                ),
+                bottom_pane::agent_guide_view::AgentGuideView::new(AgentGuideTarget::capture(
+                    agent_name,
+                    run_id,
+                    target,
+                    backends.api.clone(),
+                    backends.session_id.clone(),
+                    backends.session_attachment_epoch,
+                )),
             ));
             frame_requester.schedule_frame();
         }
-        BottomPaneViewAction::SubmitAgentGuide {
-            agent_id,
-            agent_name,
-            run_id,
-            target,
-            content,
-        } => {
+        BottomPaneViewAction::SubmitAgentGuide { target, content } => {
             // The guide input was popped by its typed Close disposition. Close
             // the monitor beneath it as well so delivery status is immediately
             // visible in the normal pending-intent band.
             bottom_pane.dismiss_active_agent_monitor();
             dispatch_agent_guide(
-                agent_id,
-                agent_name,
-                run_id,
                 target,
                 content,
                 backends,
@@ -6913,6 +6996,31 @@ async fn dispatch_bottom_pane_view_action(
                 chat_widget,
                 frame_requester,
             );
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::SubmitSessionContinuation { target, content } => {
+            if target.0.is_attached(
+                backends.session_id.as_deref(),
+                backends.session_attachment_epoch,
+            ) {
+                bottom_pane.dismiss_active_agent_monitor();
+                if bottom_pane.queue_session_continuation(target, content) {
+                    chat_widget.commit_system(history_cell::system::SystemCell::info(
+                        "Continuation queued for the next main-conversation turn.",
+                    ));
+                }
+            } else {
+                bottom_pane.push_workbench_input(Box::new(
+                    bottom_pane::agent_guide_view::AgentGuideView::for_continuation(
+                        target,
+                        content,
+                        Some(
+                            "The account or conversation changed. This instruction was not sent."
+                                .into(),
+                        ),
+                    ),
+                ));
+            }
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::LoadAgentTranscript {
@@ -7287,7 +7395,17 @@ fn apply_restore_input_request(
         );
         return false;
     }
-    bottom_pane.restore_into_composer(&request.text);
+    if let Some(target) = &request.continuation {
+        restore_queued_input(
+            VecDeque::from([NextTurnSubmission::Conversation {
+                target: target.clone(),
+                content: request.text.clone(),
+            }]),
+            bottom_pane,
+        );
+    } else {
+        bottom_pane.restore_into_composer(&request.text);
+    }
     true
 }
 
@@ -7297,9 +7415,6 @@ fn refresh_footer_from_state(
 ) {
     bottom_pane.footer.model = state.model.as_deref().map(str::to_string);
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
-    bottom_pane
-        .footer
-        .sync_team_selection(state.cli_context.agent_profile_selection.as_ref());
     if let Some(trace) = latest_context_trace(state)
         && let Some(usage) = context_window_from_trace(&trace)
     {
@@ -7592,7 +7707,6 @@ pub(crate) async fn run_tui_session(
     let login_phase = Arc::new(super::login_control::LoginControl::default());
     let mut login_view_open = false;
     let mut model_catalog_loading = false;
-    let mut model_catalog_cache = None;
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     // Work progress is intentionally separate from the reliable completion
@@ -7756,7 +7870,7 @@ pub(crate) async fn run_tui_session(
     // normally completed turn. They are real user submissions, so preserve
     // FIFO order and re-enter the ordinary submit path rather than presenting
     // an "accepted" acknowledgement that never produces a response.
-    let mut queued_followup_submissions = VecDeque::<String>::new();
+    let mut queued_followup_submissions = VecDeque::<NextTurnSubmission>::new();
     let mut followup_replay_armed = false;
     let mut runtime_notification_turn_pending = false;
     let mut runtime_notification_wake_at: Option<std::time::Instant> = None;
@@ -7826,6 +7940,11 @@ pub(crate) async fn run_tui_session(
 
     frame_requester.schedule_frame();
 
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(50),
+        Duration::from_millis(50),
+    );
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result: Result<(), String> = 'main: loop {
         guard
             .ensure_tui_modes()
@@ -7842,9 +7961,6 @@ pub(crate) async fn run_tui_session(
             }
             continue;
         }
-        let tick = tokio::time::sleep(Duration::from_millis(50));
-        tokio::pin!(tick);
-
         tokio::select! {
             _ = session_shutdown_token.cancelled() => {
                 break 'main Ok(());
@@ -7905,7 +8021,7 @@ pub(crate) async fn run_tui_session(
                         model_catalog_tasks.abort_all();
                         while model_catalog_tasks.join_next().await.is_some() {}
                         while model_catalog_rx.try_recv().is_ok() {}
-                        model_catalog_cache = None;
+                        bottom_pane.clear_model_catalog();
                         model_catalog_loading = false;
                         slash_background_read_tasks.abort_all();
                         slash_background_read_count = 0;
@@ -8213,12 +8329,11 @@ pub(crate) async fn run_tui_session(
                         false
                     };
                     if scheduled {
-                        event_stream.push_front(TuiEvent::Key(
-                            crossterm::event::KeyEvent::new(
-                                crossterm::event::KeyCode::Enter,
-                                crossterm::event::KeyModifiers::NONE,
-                            ),
-                        ));
+                        schedule_queued_handoff(
+                            &QueuedFollowupHandoff::SubmitNext,
+                            |event| event_stream.push_front(event),
+                            &mut followup_replay_armed,
+                        );
                         if !queued_followup_submissions.is_empty() {
                             chat_widget.commit_system(history_cell::system::SystemCell::info(
                                 "Your messages are queued and will be sent in order.".to_string(),
@@ -8270,7 +8385,6 @@ pub(crate) async fn run_tui_session(
                     &state,
                     &mut bottom_pane,
                     &mut chat_widget,
-                    &mut model_catalog_cache,
                 );
                 if !pending_deferred_slash_flush {
                     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
@@ -8312,12 +8426,15 @@ pub(crate) async fn run_tui_session(
                 let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
                 if runtime_notification_event
                     && runtime_notification_turn_pending
-                    && work_start_identity_pending(
+                    && (followup_replay_armed
+                        || !queued_followup_submissions.is_empty()
+                        || bottom_pane.queued_next_turn_submission_count() > 0
+                        || work_start_identity_pending(
                         work_start_in_flight,
                         state.session_id.as_deref(),
                         work_start_attachment_epoch,
                         state.session_attachment_epoch,
-                    )
+                    ))
                 {
                     // Keep the durable notification facts in SessionState,
                     // but do not let this synthetic Enter materialize a
@@ -8343,7 +8460,24 @@ pub(crate) async fn run_tui_session(
                     event => event,
                 };
                 match ev {
-                    TuiEvent::Key(key) => {
+                    event @ (TuiEvent::Key(_) | TuiEvent::SessionContinuation { .. }) => {
+                        let runtime_notification_submission =
+                            runtime_notification_event && runtime_notification_turn_pending;
+                        let (continuation, bottom_pane_action) = match event {
+                            TuiEvent::SessionContinuation { target, content } => {
+                                followup_replay_armed = false;
+                                if !target.0.is_attached(state.session_id.as_deref(), state.session_attachment_epoch)
+                                    || bottom_pane.has_active_view()
+                                    || !bottom_pane.composer.is_empty()
+                                    || !login_tasks.is_empty()
+                                {
+                                    restore_queued_input(VecDeque::from([NextTurnSubmission::Conversation { target, content }]), &mut bottom_pane);
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                }
+                                (Some(target), BottomPaneAction::SubmitInput(content))
+                            }
+                            TuiEvent::Key(key) => {
                         if !login_tasks.is_empty() {
                             if let Some(cancelled) = cancel_login_on_key(key, &login_phase, &mut login_tasks) {
                                 if !cancelled {
@@ -8355,8 +8489,6 @@ pub(crate) async fn run_tui_session(
                             }
                             continue;
                         }
-                        let runtime_notification_submission =
-                            runtime_notification_event && runtime_notification_turn_pending;
                         if runtime_notification_event && !runtime_notification_submission {
                             // A real user submission may have consumed and re-armed the
                             // scheduled wake before this queued event was observed.
@@ -8491,6 +8623,10 @@ pub(crate) async fn run_tui_session(
                         } else {
                             bottom_pane.handle_key(key)
                         };
+                                (None, bottom_pane_action)
+                            }
+                            _ => unreachable!("only submission events enter this branch"),
+                        };
                         match bottom_pane_action {
                             BottomPaneAction::CyclePermissionMode => {
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -8530,7 +8666,7 @@ pub(crate) async fn run_tui_session(
                                 };
                                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
 
-                                match classify_local_shell_submission(&text) {
+                                match if continuation.is_some() { LocalShellSubmission::NotShell } else { classify_local_shell_submission(&text) } {
                                     LocalShellSubmission::NotShell => {}
                                     LocalShellSubmission::Empty => {
                                         chat_widget.commit_system(
@@ -8618,7 +8754,7 @@ pub(crate) async fn run_tui_session(
                                     }
                                 }
 
-                                if should_queue_work_start_submission(
+                                if continuation.is_none() && should_queue_work_start_submission(
                                     &text,
                                     runtime_notification_submission,
                                     work_start_in_flight,
@@ -8647,10 +8783,11 @@ pub(crate) async fn run_tui_session(
                                     continue;
                                 }
 
-                                if admit_idle_followup(
+                                if continuation.is_none() && admit_idle_followup(
                                     &text,
                                     &mut followup_replay_armed,
                                     &mut queued_followup_submissions,
+                                    &mut bottom_pane,
                                 ) {
                                     let preview = user_intent_preview(&text);
                                     chat_widget.commit_system(
@@ -8667,14 +8804,18 @@ pub(crate) async fn run_tui_session(
                                     continue;
                                 }
 
-                                let flush_submission_immediately =
-                                    should_flush_submission_immediately(&text);
+                                let flush_submission_immediately = continuation.is_some()
+                                    || should_flush_submission_immediately(&text);
                                 // Persist the semantic submission, not merely the
                                 // composer bytes: local slash actions belong to the
                                 // durable workbench transcript, while only actual
                                 // conversational input becomes a User turn.
                                 if !runtime_notification_submission {
-                                    commit_submission_projection(&mut chat_widget, &text);
+                                    if continuation.is_some() {
+                                        chat_widget.handle_event(chat_widget::AppEvent::User(UserEvent::Submit(text.clone())));
+                                    } else {
+                                        commit_submission_projection(&mut chat_widget, &text);
+                                    }
                                 }
                                 begin_submission_dispatch_feedback(
                                     &mut bottom_pane,
@@ -8704,7 +8845,7 @@ pub(crate) async fn run_tui_session(
                                 // let the main loop keep accepting keys while the catalog is
                                 // fetched. The structured result below retains thinking and
                                 // provider metadata for the eventual picker.
-                                if slash_dispatch::is_model_picker_request(&text) {
+                                if continuation.is_none() && slash_dispatch::is_model_picker_request(&text) {
                                     if model_catalog_loading {
                                         chat_widget.commit_system(
                                             history_cell::system::SystemCell::info(
@@ -8718,13 +8859,24 @@ pub(crate) async fn run_tui_session(
                                                 "Loading model catalog…",
                                             ),
                                         );
+                                        let owner =
+                                            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                                        let attachment_epoch = state.session_attachment_epoch;
                                         let api = api.clone();
-                                        let profile = profile.map(str::to_string);
                                         let model_catalog_tx = model_catalog_tx.clone();
                                         model_catalog_tasks.spawn(async move {
-                                            let result = slash_dispatch::load_model_catalog(api, profile).await;
+                                            let result = crate::cli::session::session_runtime::fetch_owner_model_catalog(
+                                                &api,
+                                                &owner,
+                                            )
+                                            .await
+                                            .map_err(|error| error.to_string());
                                             let _ = model_catalog_tx
-                                                .send(ModelCatalogEffect::Ready(result))
+                                                .send(ModelCatalogEffect::Ready {
+                                                    owner,
+                                                    attachment_epoch,
+                                                    result,
+                                                })
                                                 .await;
                                         });
                                     }
@@ -8739,35 +8891,7 @@ pub(crate) async fn run_tui_session(
                                 }
 
                                 let mut inline_chat_submit = None;
-                                let mut pending_team_run = None;
-                                let (slash_command, slash_args) = text.trim().split_once(char::is_whitespace)
-                                    .unwrap_or((text.trim(), ""));
-                                if matches!(crate::cli::command_registry::resolve_command(slash_command), Ok("/team"))
-                                    && slash_args.split_whitespace().next() == Some("run")
-                                {
-                                    let parsed = match crate::cli::command_router::parse_team_bridge_command(slash_args) {
-                                        Ok(crate::cli::cli_config::cli_args::Command::Team(args)) => match args.command {
-                                            Some(crate::cli::cli_config::cli_args::TeamSubcommand::Run(run)) if run.no_resume => {
-                                                Err("--no-resume is only supported for one-shot CLI runs. Use /clear, confirm the new session was created, then run /team run without --no-resume.".to_string())
-                                            }
-                                            Some(crate::cli::cli_config::cli_args::TeamSubcommand::Run(run)) => Ok(run),
-                                            _ => Err("Use /team run to start a lead turn.".to_string()),
-                                        },
-                                        Ok(_) => Err("Use /team run to start a lead turn.".to_string()),
-                                        Err(error) => Err(error),
-                                    };
-                                    match parsed {
-                                        Ok(run) => pending_team_run = Some(run),
-                                        Err(error) => {
-                                            chat_widget.commit_system(history_cell::system::SystemCell::error(error));
-                                            finish_submission_feedback(&mut bottom_pane, &mut status_indicator);
-                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            frame_requester.schedule_frame();
-                                            continue;
-                                        }
-                                    }
-                                }
-                                if let Some(plan_goal) = slash_plan_goal(&text) {
+                                if let Some(plan_goal) = continuation.is_none().then(|| slash_plan_goal(&text)).flatten() {
                                     let before = capture_plan_mode_ui_snapshot(&state);
                                     crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(
                                         &mut state,
@@ -8796,9 +8920,8 @@ pub(crate) async fn run_tui_session(
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 }
 
-                                if text.trim_start().starts_with('/')
+                                if continuation.is_none() && text.trim_start().starts_with('/')
                                     && inline_chat_submit.is_none()
-                                    && pending_team_run.is_none()
                                 {
                                     // Snapshot the session identity before a
                                     // native slash action so the existing
@@ -9073,8 +9196,9 @@ pub(crate) async fn run_tui_session(
                                     }
                                     frame_requester.schedule_frame();
                                 } else {
+                                    let literal_submission = continuation.is_some()
+                                        || inline_chat_submit.is_some();
                                     let submit_text = inline_chat_submit.unwrap_or(text);
-                                    let pending_team_run = pending_team_run;
                                     if !runtime_notification_submission
                                         && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(
                                             &state,
@@ -9158,6 +9282,7 @@ pub(crate) async fn run_tui_session(
                                     let explain_analyze_terminal_degraded =
                                         Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+                                    chat_widget.begin_root_stream();
                                     let (turn_tx, turn_stream_bridge_control) =
                                         stream_bridge::create_controlled_per_turn_bridge(
                                             tui_tx.clone(),
@@ -9228,9 +9353,19 @@ pub(crate) async fn run_tui_session(
                                         let turn_session_attachment_epoch = state.session_attachment_epoch;
                                         let turn_submission_id =
                                             uuid::Uuid::now_v7().to_string();
+                                        let bound_turn_api = continuation.as_ref().map(|target| match &target.0.owner.native_binding {
+                                            Some(binding) => api.clone().with_bearer_provider(binding.clone()),
+                                            None => api.clone().without_bearer_provider(),
+                                        });
+                                        let turn_api = bound_turn_api.as_ref().unwrap_or(api);
                                         let ctx = crate::cli::turn::turn_entry::TurnContext {
-                                            api,
+                                            api: turn_api,
                                             profile,
+                                            admission: continuation.as_ref().map(|target| crate::cli::turn::turn_entry::TurnAdmission {
+                                                owner: &target.0.owner,
+                                                session_id: target.0.session_id.as_deref(),
+                                                attachment_epoch: target.0.attachment_epoch,
+                                            }),
                                             post_commit_tx: Some(turn_post_commit_tx.clone()),
                                             explain_analyze_terminal_degraded: Some(
                                                 explain_analyze_terminal_degraded.as_ref(),
@@ -9240,40 +9375,19 @@ pub(crate) async fn run_tui_session(
                                             tui_tx.clone(),
                                             restore_input_queue.clone(),
                                             turn_submission_id.clone(),
+                                            continuation.clone(),
                                         );
-                                        let team_run_cancel_token = tui_cancel_token.clone();
                                         // Authentication is part of the polled turn future, not
                                         // an await in the UI event handler. Slow refreshes therefore
                                         // leave transcript, composer, resize, and interrupt input
                                         // responsive while the visible state remains `Sending`.
                                         let fut = async {
-                                            let pending_team_request = if let Some(run) = pending_team_run {
-                                                if team_run_cancel_token.is_cancelled() {
-                                                    return Err("Team run cancelled before admission".to_string());
-                                                }
-                                                let team_name = run.team;
-                                                let lead_agent_id = run.lead_agent_id;
-                                                let task = run.task.join(" ");
-                                                let request = tokio::select! {
-                                                    _ = team_run_cancel_token.cancelled() => {
-                                                        return Err("Team run cancelled before admission".to_string());
-                                                    }
-                                                    request = crate::cli::slash::slash_team::resolve_team_run_chat_request(
-                                                        api,
-                                                        profile,
-                                                        &team_name,
-                                                        lead_agent_id.as_deref(),
-                                                        &task,
-                                                    ) => request?,
-                                                };
-                                                if team_run_cancel_token.is_cancelled() {
-                                                    return Err("Team run cancelled before admission".to_string());
-                                                }
-                                                Some(request)
+                                            let access = if let Some(target) = &continuation {
+                                                crate::cli::session::session_runtime::owner_access_token(turn_api, &target.0.owner, None)
+                                                    .await.ok_or(crate::cli::session::session_runtime::AccessMiss::NotLoggedIn)
                                             } else {
-                                                None
+                                                crate::cli::session::session_runtime::presented_access_token(turn_api, profile).await
                                             };
-                                            let access = crate::cli::session::session_runtime::presented_access_token(api, profile).await;
                                             let (token, missing_access) = match access {
                                                 Ok(token) => (Some(token), crate::cli::session::session_runtime::AccessMiss::NotLoggedIn),
                                                 Err(missing) => (None, missing),
@@ -9287,17 +9401,12 @@ pub(crate) async fn run_tui_session(
                                                 )
                                                 .await
                                             } else {
-                                                let submit_text = if let Some(request) = pending_team_request {
-                                                    if team_run_cancel_token.is_cancelled() {
-                                                        return Err("Team run cancelled before admission".to_string());
-                                                    }
-                                                    state.cli_context.agent_profile_selection = Some(request.selection);
-                                                    request.message
-                                                } else {
-                                                    submit_text
-                                                };
                                                 crate::cli::turn::turn_entry::handle_chat_input_with_ui(
-                                                    submit_text,
+                                                    if literal_submission {
+                                                        crate::cli::turn::turn_entry::ChatInput::Conversation(submit_text)
+                                                    } else {
+                                                        crate::cli::turn::turn_entry::ChatInput::Interactive(submit_text)
+                                                    },
                                                     token.as_deref(),
                                                     missing_access,
                                                     &mut state,
@@ -9316,6 +9425,11 @@ pub(crate) async fn run_tui_session(
                                             >,
                                         > = None;
                                         let mut terminal_mode_closure_started = false;
+                                        let mut itick = tokio::time::interval_at(
+                                            tokio::time::Instant::now() + Duration::from_millis(80),
+                                            Duration::from_millis(80),
+                                        );
+                                        itick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                                         let r: Result<
                                             crate::cli::turn::turn_entry::InteractiveTurnOutcome,
                                             String,
@@ -9407,8 +9521,6 @@ pub(crate) async fn run_tui_session(
                                                     continue;
                                                 }
                                             }
-                                            let itick = tokio::time::sleep(Duration::from_millis(80));
-                                            tokio::pin!(itick);
                                             tokio::select! {
                                                 _ = session_shutdown_token.cancelled() => {
                                                     break 'main Ok(());
@@ -9797,9 +9909,6 @@ pub(crate) async fn run_tui_session(
                                                                             slash_dispatch::active_run_concurrent_read(
                                                                                 &queued_text,
                                                                                 &active_session_hub_snapshot,
-                                                                                api,
-                                                                                profile,
-                                                                                turn_session_attachment_epoch,
                                                                             )
                                                                         {
                                                                             commit_submission_projection(
@@ -10065,22 +10174,9 @@ pub(crate) async fn run_tui_session(
                                                                         ..
                                                                     } => {}
                                                                     BottomPaneAction::ViewCompleted { result: Some(result), reopen: _ } => {
-                                                                        slash_dispatch::handle_team_editor_result(&result, turn_session_attachment_epoch, false, &mut bottom_pane);
-                                                                        frame_requester.schedule_frame();
-                                                                    }
-                                                                    BottomPaneAction::ViewCompleted {
-                                                                        result: None,
-                                                                        reopen: Some(cmd),
-                                                                    } if ReopenTarget::parse(&cmd) == Some(ReopenTarget::Team) => {
-                                                                        let Some(action) = slash_dispatch::active_run_concurrent_read(
-                                                                            &cmd, &active_session_hub_snapshot, api, profile, turn_session_attachment_epoch,
-                                                                        ) else { continue; };
-                                                                        slash_background_read_count += 1;
-                                                                        dispatch_slash_background_read(
-                                                                            action,
-                                                                            slash_background_read_generation,
-                                                                            slash_background_read_tx.clone(),
-                                                                            &mut slash_background_read_tasks,
+                                                                        slash_dispatch::handle_display_view_result(
+                                                                            result,
+                                                                            &mut bottom_pane,
                                                                         );
                                                                         frame_requester.schedule_frame();
                                                                     }
@@ -10190,6 +10286,10 @@ pub(crate) async fn run_tui_session(
                                     board_expanded = frame.resolved_board_expanded;
                                                             let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
+                                                        }
+                                                        TuiEvent::SessionContinuation { target, content } => {
+                                                            followup_replay_armed = false;
+                                                            bottom_pane.queue_session_continuation(target, content);
                                                         }
                                                         TuiEvent::RuntimeNotificationTurn => {
                                                             // Runtime-notification wakes are only scheduled by
@@ -10490,7 +10590,7 @@ pub(crate) async fn run_tui_session(
                                                         chat_widget.handle_event(new_ev);
                                                         refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                                                     }
-                                                    if matches!(&ae, TuiAppEvent::AgentLiveGap(_))
+                                                    if matches!(&ae, TuiAppEvent::AgentLiveGap(_) | TuiAppEvent::RunBound(_))
                                                         && server_agent_observer.request_refresh()
                                                     {
                                                         reconcile_server_agent_observer(
@@ -10701,7 +10801,7 @@ pub(crate) async fn run_tui_session(
                                                     flush_chat_widget(&mut guard, &mut chat_widget, width);
                                                     frame_requester.schedule_frame();
                                                 }
-                                                _ = &mut itick => {
+                                                _ = itick.tick() => {
                                                     let background_commands_mutated = drain_background_task_commands(
                                                         &bg_task_commands_for_turn,
                                                         &mut background_registry,
@@ -10710,9 +10810,10 @@ pub(crate) async fn run_tui_session(
                                                         &bg_task_list_cache_for_turn,
                                                     )
                                                     .await;
+                                                    let workbench_session_id = chat_widget.session_id().to_string();
                                                     drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
-                                                        background_registry_session_id.as_deref(),
+                                                        (!workbench_session_id.is_empty()).then_some(workbench_session_id.as_str()),
                                                         turn_session_attachment_epoch,
                                                         &mut chat_widget,
                                                         &mut bottom_pane,
@@ -11011,12 +11112,11 @@ pub(crate) async fn run_tui_session(
                                         &mut post_output_submissions,
                                         should_start_followups,
                                     ) {
-                                        let preview = user_intent_preview(&restored);
-                                        bottom_pane.restore_into_composer(&restored);
+                                        restore_queued_input(restored, &mut bottom_pane);
                                         chat_widget.commit_system(
-                                            history_cell::system::SystemCell::info(format!(
-                                                "Queued input was not started because the run did not settle normally; draft restored: {preview}",
-                                            )),
+                                            history_cell::system::SystemCell::info(
+                                                "Queued input was not started because the run did not settle normally; input kept for editing.",
+                                            ),
                                         );
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
@@ -11201,14 +11301,7 @@ pub(crate) async fn run_tui_session(
                                         slash_background_read_count,
                                         &mut followup_replay_armed,
                                     );
-                                    if handoff == QueuedFollowupHandoff::SubmitNext {
-                                        event_stream.push_front(TuiEvent::Key(
-                                            crossterm::event::KeyEvent::new(
-                                                crossterm::event::KeyCode::Enter,
-                                                crossterm::event::KeyModifiers::NONE,
-                                            ),
-                                        ));
-                                    }
+                                    schedule_queued_handoff(&handoff, |event| event_stream.push_front(event), &mut followup_replay_armed);
                                     if matches!(
                                         handoff,
                                         QueuedFollowupHandoff::HeldWithDraft
@@ -11473,124 +11566,19 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
 
-                                    // `/model` picker → check thinking capability.
-                                    if let bottom_pane::view::ViewResult::Model { name: base_model } = &result {
-                                        let base_model = base_model.clone();
-                                        let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
-                                            &raw,
-                                            &base_model,
-                                        );
-                                        let thinking_cap = entry
-                                            .and_then(|model| model.thinking_capability.map(|value| value.as_str()));
-                                        let provider = entry.and_then(|model| {
-                                            let provider = model.provider.trim();
-                                            (!provider.is_empty()).then_some(provider)
-                                        });
-                                        let opts = astra_turn_core::thinking_config::thinking_options(
-                                            provider,
-                                            thinking_cap,
-                                            entry.and_then(|model| model.thinking_protocol).unwrap_or_default(),
-                                        );
-                                        if opts.is_empty() {
-                                            state.cli_context.select_model(Some(&base_model));
-                                            state.model = Some((base_model.clone()).into());
-                                            if let Some(mut selection) = entry.and_then(crate::cli::session::session_runtime::model_selection_from_list_entry) {
-                                                selection.name = state.model.as_deref().unwrap().to_string();
-                                                state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
-                                            }
-                                            bottom_pane.footer.model = Some(base_model.clone());
-                                            chat_widget.commit_system(
-                                                history_cell::system::SystemCell::response(
-                                                    format!("Set model to {base_model}"),
-                                                ),
-                                            );
-                                            pending_deferred_slash_flush = false;
+                                    if let Some(picker_open) = slash_dispatch::apply_model_picker_result(
+                                        &result, &mut state, &mut bottom_pane, &mut chat_widget,
+                                    ) {
+                                        pending_deferred_slash_flush = picker_open;
+                                        if !picker_open {
                                             let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                             flush_chat_widget(&mut guard, &mut chat_widget, w);
                                             resume_queued_followups_after_modal(
-                                                &mut queued_followup_submissions,
-                                                &mut bottom_pane,
-                                                &mut chat_widget,
-                                                &mut event_stream,
-                    &mut followup_replay_armed,
-                                                followup_release_gate(
-                                                    model_catalog_loading,
-                                                    slash_background_read_count,
-                                                ),
+                                                &mut queued_followup_submissions, &mut bottom_pane,
+                                                &mut chat_widget, &mut event_stream, &mut followup_replay_armed,
+                                                followup_release_gate(model_catalog_loading, slash_background_read_count),
                                             );
-                                        } else {
-                                            use crate::tui::bottom_pane::list_selection_view::{
-                                                ListSelectionView, SelectionItem,
-                                            };
-                                            let items: Vec<SelectionItem> = opts
-                                                .iter()
-                                                .map(|o| SelectionItem {
-                                                    name: o.label.to_string(),
-                                                    description: None,
-                                                    is_current: o.is_default,
-                                                })
-                                                .collect();
-                                            let view = ListSelectionView::new(
-                                                items,
-                                                Some(format!("Select thinking mode for {base_model}:")),
-                                            )
-                                            .with_footer_hint(
-                                                slash_dispatch::MODEL_THINKING_PICKER_FOOTER_HINT,
-                                            )
-                                            .with_results(
-                                                opts.into_iter()
-                                                    .map(|option| bottom_pane::view::ViewResult::ModelThinking {
-                                                        base_model: base_model.clone(),
-                                                        config: option.config,
-                                                    })
-                                                    .collect(),
-                                            );
-                                            bottom_pane.push_view(Box::new(view));
                                         }
-                                        bottom_pane.sync_popups();
-                                        frame_requester.schedule_frame();
-                                        continue;
-                                    }
-
-                                    // `/model` thinking-mode picker.
-                                    if let bottom_pane::view::ViewResult::ModelThinking {
-                                        base_model,
-                                        config,
-                                    } = &result {
-                                        let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
-                                            &raw,
-                                            &base_model,
-                                        );
-                                        let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
-                                        let composed = format!("{base_model}{suffix}");
-                                        state.cli_context.select_model(Some(&composed));
-                                        state.model = Some((composed.clone()).into());
-                                        if let Some(mut selection) = entry.and_then(crate::cli::session::session_runtime::model_selection_from_list_entry) {
-                                                selection.name = state.model.as_deref().unwrap().to_string();
-                                                state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
-                                            }
-                                        bottom_pane.footer.model = Some(composed.clone());
-                                        chat_widget.commit_system(
-                                            history_cell::system::SystemCell::response(format!(
-                                                "Set model to {composed}"
-                                            )),
-                                        );
-                                        pending_deferred_slash_flush = false;
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                        resume_queued_followups_after_modal(
-                                            &mut queued_followup_submissions,
-                                            &mut bottom_pane,
-                                            &mut chat_widget,
-                                            &mut event_stream,
-                    &mut followup_replay_armed,
-                                            followup_release_gate(
-                                                model_catalog_loading,
-                                                slash_background_read_count,
-                                            ),
-                                        );
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;
@@ -12063,10 +12051,10 @@ pub(crate) async fn run_tui_session(
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
                 frame_requester.schedule_frame();
             }
-            _ = &mut tick => {
+            _ = tick.tick() => {
                 drain_agent_workbench_outcomes(
                     &mut agent_workbench_rx,
-                    background_registry_session_id.as_deref(),
+                    state.session_id.as_deref(),
                     state.session_attachment_epoch,
                     &mut chat_widget,
                     &mut bottom_pane,
@@ -12101,6 +12089,17 @@ pub(crate) async fn run_tui_session(
                     terminal_size.map(|size| size.height).unwrap_or(0),
                 )
                 .await;
+                queued_followup_submissions.extend(bottom_pane.take_queued_next_turn_submissions());
+                if !followup_replay_armed {
+                    resume_queued_followups_after_modal(
+                        &mut queued_followup_submissions,
+                        &mut bottom_pane,
+                        &mut chat_widget,
+                        &mut event_stream,
+                        &mut followup_replay_armed,
+                        followup_release_gate(model_catalog_loading, slash_background_read_count),
+                    );
+                }
                 if bottom_pane.pre_draw_tick(std::time::Instant::now()) {
                     frame_requester.schedule_frame();
                 }
@@ -12112,9 +12111,6 @@ pub(crate) async fn run_tui_session(
                 // happens to call `refresh_footer_from_state`. Cheap:
                 // a string format and an Option<u64> compare per 50ms.
                 let live_mode_enum = state.perm_manager.mode();
-                if bottom_pane.footer.sync_team_selection(state.cli_context.agent_profile_selection.as_ref()) {
-                    frame_requester.schedule_frame();
-                }
                 if bottom_pane.footer.permission_mode != Some(live_mode_enum) {
                     bottom_pane.footer.permission_mode = Some(live_mode_enum);
                     // The manager's active mode just shifted (for example,
@@ -12450,6 +12446,9 @@ pub(crate) async fn run_tui_session(
                     && bottom_pane.composer.is_empty()
                     && !bottom_pane.has_active_view()
                     && !runtime_notification_turn_pending
+                    && !followup_replay_armed
+                    && queued_followup_submissions.is_empty()
+                    && bottom_pane.queued_next_turn_submission_count() == 0
                     && !work_start_identity_pending(
                         work_start_in_flight,
                         state.session_id.as_deref(),
@@ -12912,6 +12911,221 @@ fn apply_terminal_explain_analyze_degraded_marker(
 
 #[cfg(test)]
 mod tests {
+    fn interactive_queue<const N: usize>(items: [String; N]) -> VecDeque<NextTurnSubmission> {
+        items
+            .into_iter()
+            .map(NextTurnSubmission::Interactive)
+            .collect()
+    }
+
+    fn interactive_texts(items: VecDeque<NextTurnSubmission>) -> Vec<String> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                NextTurnSubmission::Interactive(text) => text,
+                NextTurnSubmission::Conversation { .. } => panic!("expected interactive custody"),
+            })
+            .collect()
+    }
+
+    fn restored_interactive_text(items: &VecDeque<NextTurnSubmission>) -> String {
+        interactive_texts(items.clone()).join("\n\n")
+    }
+
+    fn continuation_target(
+        state: &crate::cli::session::session_state::SessionState,
+    ) -> SessionContinuationTarget {
+        SessionContinuationTarget(Arc::new(AgentControlContext {
+            attachment_epoch: state.session_attachment_epoch,
+            session_id: state.session_id.clone(),
+            owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            agent_id: "root-run".into(),
+            target: crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "root-run".into(),
+            },
+            action: astra_thin_client::SessionRunAction::ContinueSession,
+            request_id: uuid::Uuid::new_v4(),
+        }))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn continuation_confirmation_cannot_be_overtaken_before_the_next_tick() {
+        for later in ["instruction B", "/plan instruction B"] {
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            state.set_session_id("session-a");
+            let target = continuation_target(&state);
+            let mut pane = BottomPane::new();
+            pane.queue_session_continuation(target.clone(), "instruction A".into());
+            let mut queue = VecDeque::new();
+            let mut armed = false;
+            assert!(admit_idle_followup(
+                later, &mut armed, &mut queue, &mut pane
+            ));
+            assert_eq!(
+                queue,
+                VecDeque::from([
+                    NextTurnSubmission::Conversation {
+                        target,
+                        content: "instruction A".into()
+                    },
+                    NextTurnSubmission::Interactive(later.into()),
+                ])
+            );
+            assert!(pane.take_queued_next_turn_submissions().is_empty());
+            assert!(pane.composer.is_empty());
+            let before = queue.clone();
+            for control in ["/help", "/agent", "/agent list"] {
+                assert!(!admit_idle_followup(
+                    control, &mut armed, &mut queue, &mut pane
+                ));
+                assert_eq!(queue, before);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn continuation_fifo_preserves_literal_input_and_attachment_without_composer_replay() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("session-a");
+        let target = continuation_target(&state);
+        let content = "!! This is an instruction, not a shell command.";
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session-a");
+        pane.queue_next_turn_submission("first".into());
+        pane.queue_session_continuation(target.clone(), content.into());
+        pane.queue_next_turn_submission("last".into());
+        let mut queue = pane.take_queued_next_turn_submissions();
+        assert_eq!(
+            release_next_queued_followup(&mut queue, &mut pane, &mut widget),
+            QueuedFollowupRelease::SubmitNext
+        );
+        assert_eq!(pane.composer.text(), "first");
+        pane.composer.set_text("");
+        assert_eq!(
+            release_next_queued_followup(&mut queue, &mut pane, &mut widget),
+            QueuedFollowupRelease::Conversation {
+                target,
+                content: content.into()
+            }
+        );
+        assert!(pane.composer.is_empty());
+        assert_eq!(queue, interactive_queue(["last".into()]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn continuation_recovery_keeps_typed_editable_input_across_failure_boundaries() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("session-a");
+        let target = continuation_target(&state);
+        let content = "/model is part of this instruction";
+        for boundary in ["draft", "scope", "cancel", "failed_turn"] {
+            let mut pane = BottomPane::new();
+            let mut widget = chat_widget::ChatWidget::new("session-a");
+            pane.composer.set_text("manual draft");
+            pane.queue_session_continuation(target.clone(), content.into());
+            let mut queue = pane.take_queued_next_turn_submissions();
+            match boundary {
+                "draft" => {
+                    assert_eq!(
+                        release_next_queued_followup(&mut queue, &mut pane, &mut widget),
+                        QueuedFollowupRelease::HeldWithDraft
+                    );
+                }
+                "scope" => {
+                    assert_eq!(
+                        handoff_queued_followups(
+                            &mut queue,
+                            &mut pane,
+                            &mut widget,
+                            FollowupReleaseGate {
+                                model_catalog_loading: false,
+                                background_reads_in_flight: false,
+                                session_rebound: true
+                            }
+                        ),
+                        QueuedFollowupHandoff::RestoredAfterSessionChange
+                    );
+                }
+                "cancel" => {
+                    assert!(recover_queued_followups_after_cancelled_read(
+                        &mut queue,
+                        &mut pane,
+                        &mut widget
+                    ));
+                }
+                _ => {
+                    let restored = settle_followup_submissions(
+                        &mut queue,
+                        std::iter::empty(),
+                        &mut VecDeque::new(),
+                        false,
+                    )
+                    .unwrap();
+                    restore_queued_input(restored, &mut pane);
+                }
+            }
+            assert!(queue.is_empty());
+            assert_eq!(pane.composer.text(), "manual draft");
+            assert!(render_bottom_pane_text(&pane, 100, 20).contains(content));
+            assert!(
+                matches!(pane.handle_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE)), BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitSessionContinuation { target: returned, content: text }) if returned == target && text == content)
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn continuation_restore_channel_backpressure_preserves_purpose_once() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("session-a");
+        let target = continuation_target(&state);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(TuiAppEvent::StatusLine("occupied".into()))
+            .unwrap();
+        let queue: RestoreInputQueue = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let mut adapter = ui_adapter::TuiUiAdapter::new(
+            tx,
+            queue.clone(),
+            "continuation-submission",
+            Some(target.clone()),
+        );
+        assert!(ui_adapter::ReplUiAdapter::restore_input(
+            &mut adapter,
+            "! literal",
+            Some("session-a")
+        ));
+        assert!(ui_adapter::ReplUiAdapter::restore_input(
+            &mut adapter,
+            "! literal",
+            Some("session-a")
+        ));
+        let request = take_restore_input_request(&queue).unwrap();
+        assert!(take_restore_input_request(&queue).is_none());
+        let mut pane = BottomPane::new();
+        let mut applied = std::collections::HashSet::new();
+        assert!(apply_restore_input_request(
+            &request,
+            Some("session-a"),
+            Some("continuation-submission"),
+            &mut pane,
+            &mut applied
+        ));
+        assert!(!apply_restore_input_request(
+            &request,
+            Some("session-a"),
+            Some("continuation-submission"),
+            &mut pane,
+            &mut applied
+        ));
+        assert!(pane.composer.is_empty());
+        assert!(
+            matches!(pane.handle_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE)), BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitSessionContinuation { target: returned, content }) if returned == target && content == "! literal")
+        );
+    }
+
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -13216,6 +13430,7 @@ mod tests {
         let mut applied = std::collections::HashSet::new();
         let request = RestoreInputRequest {
             text: "rejected message".into(),
+            continuation: None,
             session_id: Some("session-a".into()),
             submission_id: "submission-a".into(),
         };
@@ -13242,6 +13457,7 @@ mod tests {
 
         let stale = RestoreInputRequest {
             text: "stale session message".into(),
+            continuation: None,
             session_id: Some("session-old".into()),
             submission_id: "submission-old".into(),
         };
@@ -13257,6 +13473,7 @@ mod tests {
         pane.composer.set_text("new draft");
         let later = RestoreInputRequest {
             text: "another rejected message".into(),
+            continuation: None,
             session_id: Some("session-a".into()),
             submission_id: "submission-b".into(),
         };
@@ -13278,6 +13495,7 @@ mod tests {
         let mut applied = std::collections::HashSet::new();
         let request = RestoreInputRequest {
             text: "first message".into(),
+            continuation: None,
             session_id: Some("server-assigned-session".into()),
             submission_id: "active-submission".into(),
         };
@@ -14357,6 +14575,16 @@ mod tests {
 
     #[test]
     fn pristine_work_start_queues_conversation_but_keeps_local_controls_responsive() {
+        for control in ["/agent", "/agent list"] {
+            assert!(!should_queue_work_start_submission(
+                control,
+                false,
+                true,
+                None,
+                Some(4),
+                4,
+            ));
+        }
         assert!(should_queue_work_start_submission(
             "inspect the branch",
             false,
@@ -14461,10 +14689,25 @@ mod tests {
         ));
         assert_eq!(pane.composer.text(), "first instruction");
         assert!(pending.is_empty());
-        assert_eq!(
-            followups.into_iter().collect::<Vec<_>>(),
-            vec!["second instruction"]
+        let mut scheduled = None;
+        let mut armed = false;
+        schedule_queued_handoff(
+            &QueuedFollowupHandoff::SubmitNext,
+            |event| scheduled = Some(event),
+            &mut armed,
         );
+        assert!(armed);
+        assert!(
+            matches!(scheduled, Some(TuiEvent::Key(key)) if key.code == crossterm::event::KeyCode::Enter)
+        );
+        assert!(!admit_idle_followup(
+            "first instruction",
+            &mut armed,
+            &mut followups,
+            &mut pane
+        ));
+        assert!(!armed);
+        assert_eq!(interactive_texts(followups), vec!["second instruction"]);
 
         let mut switched_pane = BottomPane::new();
         switched_pane.composer.set_text("new Session draft");
@@ -14621,9 +14864,338 @@ mod tests {
             "disposition": "session_continuation_required",
             "continuation": {"session_id": "session-1"}
         }))
-        .err()
-        .expect("missing source run must be explicit");
+        .expect_err("missing source run must be explicit");
         assert_eq!(error, "server omitted continuation source_run_id");
+    }
+
+    fn running_control_projection() -> crate::tui::server_agent_observer::ServerAgentProjection {
+        let child: astra_thin_client::SessionRunNode = serde_json::from_value(serde_json::json!({
+            "run_id": "child-run", "parent_run_id": "root-run", "root_run_id": "root-run", "agent_id": "member", "depth": 1,
+            "status": "running", "run_event_high_watermark": 1, "total_tool_calls": 0,
+            "available_actions": ["pause"], "created_at": "2026-10-07T00:00:00Z", "updated_at": "2026-10-07T00:00:00Z"
+        })).unwrap();
+        let mut root = child.clone();
+        root.run_id = "root-run".into();
+        root.parent_run_id = None;
+        root.agent_id = None;
+        root.depth = 0;
+        crate::tui::server_agent_observer::ServerAgentProjection {
+            sequence: 1,
+            truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            snapshot: Some(astra_thin_client::SessionRunTreeSnapshot {
+                schema_version: astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION,
+                session_id: "session-control".into(),
+                snapshot_revision: "one".into(),
+                observed_at: "2026-10-07T00:00:00Z".into(),
+                node_limit: 2,
+                truncated: false,
+                runs: vec![root, child],
+            }),
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn agent_control_outcomes_require_the_captured_attachment_and_request() {
+        use crate::tui::agent_run_projection::{AgentControlTarget, AgentRunStatus};
+        use astra_thin_client::SessionRunAction;
+        let _creds = crate::tests::isolate_credentials();
+        let _owner = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        let target = AgentControlTarget::DurableRun {
+            run_id: "child-run".into(),
+        };
+        let projection = running_control_projection();
+        let publication = astra_turn_types::ArtifactPublicationV1 {
+            schema_version: 1,
+            run_id: "child-run".into(),
+            turn_id: "turn".into(),
+            execution_owner_generation: 1,
+            artifact_type: "explain_analyze_snapshot".into(),
+            recorded: true,
+            result: astra_turn_types::ArtifactPublicationResult::Unavailable {
+                reason_code: "not_captured".into(),
+                message: "No report was captured".into(),
+            },
+        };
+        for mismatch in [
+            "none",
+            "attachment",
+            "owner",
+            "request",
+            "target",
+            "terminal",
+        ] {
+            for disposition in ["rejected", "continuation", "publication"] {
+                let mut state = crate::cli::session::session_state::SessionState::default();
+                state.set_session_id("session-control");
+                let epoch = state.session_attachment_epoch;
+                let mut widget = chat_widget::ChatWidget::new("session-control");
+                widget.reconcile_server_agent_projection(&projection);
+                let request_id = widget
+                    .begin_agent_control("child-run", &target, SessionRunAction::Pause)
+                    .unwrap();
+                let mut context = AgentControlContext {
+                    attachment_epoch: epoch,
+                    session_id: state.session_id.clone(),
+                    owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                    agent_id: "child-run".into(),
+                    target: target.clone(),
+                    action: SessionRunAction::Pause,
+                    request_id,
+                };
+                if mismatch == "attachment" {
+                    state.reset_for_new_session();
+                    state.set_session_id("session-control");
+                }
+                if mismatch == "terminal" {
+                    let mut completed = projection.clone();
+                    completed.sequence += 1;
+                    let node = completed
+                        .snapshot
+                        .as_mut()
+                        .unwrap()
+                        .runs
+                        .last_mut()
+                        .unwrap();
+                    node.status = astra_thin_client::SessionRunLifecycleStatus::Completed;
+                    node.run_event_high_watermark += 1;
+                    node.available_actions.clear();
+                    widget.reconcile_server_agent_projection(&completed);
+                }
+                let _replacement = (mismatch == "owner").then(|| {
+                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                        "other",
+                        Some("other-owner"),
+                    )
+                    .unwrap()
+                });
+                if mismatch == "request" {
+                    context.request_id = uuid::Uuid::new_v4();
+                }
+                if mismatch == "target" {
+                    context.target = AgentControlTarget::DurableRun {
+                        run_id: "other-run".into(),
+                    };
+                }
+                let result = match disposition {
+                    "rejected" => Err("rejected".into()),
+                    "continuation" => Ok(AgentControlExecution::SessionContinuationRequired {
+                        session_id: "session-control".into(),
+                        source_run_id: "child-run".into(),
+                    }),
+                    _ => Ok(AgentControlExecution::Applied(Some(publication.clone()))),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(AgentWorkbenchOutcome::Control {
+                    context: Box::new(context),
+                    result,
+                })
+                .unwrap();
+                let mut pane = BottomPane::new();
+                pane.composer.set_text("unsent draft");
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    state.session_id.as_deref(),
+                    state.session_attachment_epoch,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                let applied = mismatch == "none"
+                    || (matches!(mismatch, "request" | "terminal") && disposition == "publication");
+                assert_eq!(
+                    !widget.history().is_empty(),
+                    applied && disposition != "continuation",
+                    "{mismatch}/{disposition}"
+                );
+                assert_eq!(
+                    pane.has_active_view(),
+                    applied && disposition == "continuation"
+                );
+                let pending = mismatch != "terminal" && (!applied || disposition == "publication");
+                assert_eq!(
+                    widget.agent_control_request_matches(
+                        "child-run",
+                        &target,
+                        SessionRunAction::Pause,
+                        request_id
+                    ),
+                    pending,
+                    "{mismatch}/{disposition}"
+                );
+                assert_eq!(
+                    widget.agent_run_state("child-run").unwrap().status,
+                    if mismatch == "terminal" {
+                        AgentRunStatus::Completed
+                    } else if pending {
+                        AgentRunStatus::Pausing
+                    } else {
+                        AgentRunStatus::Running
+                    }
+                );
+                assert_eq!(pane.composer.text(), "unsent draft");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_control_dispatch_uses_the_captured_native_binding() {
+        const CHILD: &str = "ASTRA_NATIVE_CONTROL_BINDING_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tui::event_loop::tests::agent_control_dispatch_uses_the_captured_native_binding", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use crate::cli::{cli_config::cli_utils, native_auth};
+        use astra_credentials::native::NativeStore;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::test_utils::isolate_credentials();
+        assert!(cli_utils::load_credentials().profiles.is_empty());
+        for scenario in ["new_generation", "replaced_after_dispatch", "wrong_origin"] {
+            let server = MockServer::start().await;
+            let foreign = MockServer::start().await;
+            let root = tempfile::tempdir().unwrap();
+            let store = NativeStore::with_directory(root.path().join("auth"));
+            let mut original = native_auth::test_session();
+            original.environment.astra_url = server.uri();
+            let (session, _) = store.publish(original.clone()).unwrap();
+            let binding_a = native_auth::binding_for_test(store.clone(), session);
+            let _active_a = native_auth::install_active_for_test(binding_a.clone());
+            let profile = binding_a.profile_name();
+            let _identity =
+                cli_utils::install_cli_profile_identity_for_test(&profile, Some("astra-a"))
+                    .unwrap();
+            let api = astra_thin_client::ThinClient::new(
+                &if scenario == "wrong_origin" {
+                    foreign.uri()
+                } else {
+                    server.uri()
+                },
+                None,
+            )
+            .unwrap()
+            .with_bearer_provider(binding_a);
+            let mut replacement = original;
+            replacement.access_token = "test-access-b".into();
+            replacement.refresh_token = "test-refresh-b".into();
+            let mut active_b = None;
+            if scenario == "new_generation" {
+                let (session, _) = store.publish(replacement.clone()).unwrap();
+                active_b = Some(native_auth::install_active_for_test(
+                    native_auth::binding_for_test(store.clone(), session),
+                ));
+            }
+            Mock::given(method("POST"))
+                .and(path("/chat/runs/child-run/pause"))
+                .and(header("authorization", "Bearer test-access-b"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"disposition": "applied"})),
+                )
+                .expect(u64::from(scenario == "new_generation"))
+                .mount(&server)
+                .await;
+            let mut widget = chat_widget::ChatWidget::new("session-control");
+            widget.reconcile_server_agent_projection(&running_control_projection());
+            let mut pane = BottomPane::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let guide = AgentGuideTarget::capture(
+                "Member".into(),
+                "child-run".into(),
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "child-run".into(),
+                },
+                api.clone(),
+                Some("session-control".into()),
+                1,
+            );
+            Mock::given(method("POST"))
+                .and(path("/chat/runs/child-run/intents"))
+                .and(header("authorization", "Bearer test-access-b"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id": "child-run", "intent_id": "native-guide",
+                    "status": "accepted_remote", "duplicate": false, "event_index": 2,
+                })))
+                .expect(u64::from(scenario == "new_generation"))
+                .mount(&server)
+                .await;
+            dispatch_agent_control(
+                "child-run",
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "child-run".into(),
+                },
+                astra_thin_client::SessionRunAction::Pause,
+                ViewActionBackends {
+                    agent_spawner: None,
+                    api,
+                    profile: Some(profile),
+                    session_id: Some("session-control".into()),
+                    session_attachment_epoch: 1,
+                    file_writer: None,
+                    agent_workbench_tx: tx,
+                },
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            if scenario == "replaced_after_dispatch" {
+                // Current-thread scheduling holds the real worker until the
+                // replacement is published, without sleeps or test RPC logic.
+                let (session, _) = store.publish(replacement).unwrap();
+                active_b = Some(native_auth::install_active_for_test(
+                    native_auth::binding_for_test(store.clone(), session),
+                ));
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    AgentWorkbenchOutcome::Control {
+                        result: Ok(AgentControlExecution::Applied(None)),
+                        ..
+                    }
+                ) == (scenario == "new_generation"),
+                "{scenario}: {outcome:?}"
+            );
+            let guide_request = astra_thin_client::RunUserIntentRequest {
+                intent_id: "native-guide".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: serde_json::json!({"content": "Use the updated requirement"}),
+            };
+            let guide_result = submit_agent_guide(
+                &guide.0.api,
+                &guide.0.owner,
+                &guide.0.run_id,
+                &guide_request,
+            )
+            .await;
+            assert_eq!(guide_result.is_ok(), scenario == "new_generation");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                2 * usize::from(scenario == "new_generation")
+            );
+            assert!(foreign.received_requests().await.unwrap().is_empty());
+            server.verify().await;
+            drop(active_b);
+        }
     }
 
     #[test]
@@ -14703,8 +15275,8 @@ mod tests {
 
     #[test]
     fn normal_settlement_replays_unapplied_and_post_output_input_in_fifo_order() {
-        let mut queued = VecDeque::from(["already queued".to_string()]);
-        let mut post_output = VecDeque::from(["submitted after output settled".to_string()]);
+        let mut queued = interactive_queue(["already queued".to_string()]);
+        let mut post_output = interactive_queue(["submitted after output settled".to_string()]);
 
         let restored = settle_followup_submissions(
             &mut queued,
@@ -14715,7 +15287,7 @@ mod tests {
 
         assert!(restored.is_none());
         assert_eq!(
-            queued.into_iter().collect::<Vec<_>>(),
+            interactive_texts(queued),
             vec![
                 "already queued",
                 "missed the last model boundary",
@@ -14727,8 +15299,8 @@ mod tests {
 
     #[test]
     fn failed_settlement_restores_every_queued_submission_without_replaying() {
-        let mut queued = VecDeque::from(["earlier follow-up".to_string()]);
-        let mut post_output = VecDeque::from(["post-output input".to_string()]);
+        let mut queued = interactive_queue(["earlier follow-up".to_string()]);
+        let mut post_output = interactive_queue(["post-output input".to_string()]);
 
         let restored = settle_followup_submissions(
             &mut queued,
@@ -14738,7 +15310,7 @@ mod tests {
         );
 
         assert_eq!(
-            restored.as_deref(),
+            restored.as_ref().map(restored_interactive_text).as_deref(),
             Some("earlier follow-up\n\nunapplied guidance\n\npost-output input"),
         );
         assert!(queued.is_empty());
@@ -14946,9 +15518,9 @@ mod tests {
             "  /model",
             "/unknown-command",
             "/plan inspect it",
-            "/team create NewTeam",
-            "/team run Reviewers task",
-            "/team leave",
+            "/agent",
+            "/work status",
+            "/instructions",
         ] {
             assert!(
                 active_submission_belongs_to_next_turn(command, false, false),
@@ -15059,7 +15631,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            followups.into_iter().collect::<Vec<_>>(),
+            interactive_texts(followups),
             vec!["用 Python 写".to_string(), "再加测试".to_string()]
         );
         assert!(!UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("HTTP"));
@@ -15067,7 +15639,7 @@ mod tests {
 
         // A is replayed as the next turn while B is still queued. C must stay
         // behind B even after that turn's run id binds.
-        let mut replayed = VecDeque::from(["用 Python 写".to_string(), "再加测试".to_string()]);
+        let mut replayed = interactive_queue(["用 Python 写".to_string(), "再加测试".to_string()]);
         let mut replay_pane = BottomPane::new();
         let mut replay_chat = chat_widget::ChatWidget::new("");
         assert!(matches!(
@@ -15100,11 +15672,11 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            replayed.into_iter().collect::<Vec<_>>(),
+            interactive_texts(replayed),
             vec!["再加测试".to_string(), "第三句".to_string()]
         );
 
-        let mut slash_queue = VecDeque::from(["/model gpt".to_string(), "plain A".to_string()]);
+        let mut slash_queue = interactive_queue(["/model gpt".to_string(), "plain A".to_string()]);
         assert!(local_slash_releases_followups(true, false, false));
         assert!(!local_slash_releases_followups(true, false, true));
         assert!(!local_slash_releases_followups(false, false, false));
@@ -15123,7 +15695,7 @@ mod tests {
         assert_eq!(slash_pane.composer.text().trim(), "plain A");
         assert!(slash_queue.is_empty());
 
-        let mut auth_queue = VecDeque::from(["queued during refresh".to_string()]);
+        let mut auth_queue = interactive_queue(["queued during refresh".to_string()]);
         let mut auth_post = VecDeque::new();
         let restored = settle_followup_submissions(
             &mut auth_queue,
@@ -15131,10 +15703,13 @@ mod tests {
             &mut auth_post,
             should_start_queued_followups(true, false, false, false, true),
         );
-        assert_eq!(restored.as_deref(), Some("queued during refresh"));
+        assert_eq!(
+            restored.as_ref().map(restored_interactive_text).as_deref(),
+            Some("queued during refresh")
+        );
         assert!(auth_queue.is_empty());
 
-        let mut failed_queue = VecDeque::from(["after failed turn".to_string()]);
+        let mut failed_queue = interactive_queue(["after failed turn".to_string()]);
         let mut failed_post = VecDeque::new();
         let restored = settle_followup_submissions(
             &mut failed_queue,
@@ -15142,9 +15717,12 @@ mod tests {
             &mut failed_post,
             should_start_queued_followups(false, false, false, false, false),
         );
-        assert_eq!(restored.as_deref(), Some("after failed turn"));
+        assert_eq!(
+            restored.as_ref().map(restored_interactive_text).as_deref(),
+            Some("after failed turn")
+        );
 
-        let mut closed_view = VecDeque::from(["plain A".to_string()]);
+        let mut closed_view = interactive_queue(["plain A".to_string()]);
         let mut closed_pane = BottomPane::new();
         let mut closed_chat = chat_widget::ChatWidget::new("");
         assert!(!closed_pane.has_active_view());
@@ -15160,7 +15738,7 @@ mod tests {
         use bottom_pane::help_view::HelpView;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         pane.push_view(Box::new(HelpView::new()));
@@ -15182,7 +15760,7 @@ mod tests {
             handoff_queued_followups(&mut queued, &mut pane, &mut chat, loading),
             QueuedFollowupHandoff::Held
         );
-        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+        assert_eq!(queued, interactive_queue(["plain A".to_string()]));
 
         let ready = FollowupReleaseGate {
             model_catalog_loading: false,
@@ -15201,7 +15779,7 @@ mod tests {
         use bottom_pane::config_edit_view::ConfigEditView;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         pane.push_view(Box::new(ConfigEditView::new(RuntimeConfig::default())));
@@ -15243,7 +15821,7 @@ mod tests {
 
     #[test]
     fn background_read_in_flight_holds_followup_until_it_finishes() {
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         let in_flight = FollowupReleaseGate {
@@ -15255,7 +15833,7 @@ mod tests {
             handoff_queued_followups(&mut queued, &mut pane, &mut chat, in_flight),
             QueuedFollowupHandoff::Held
         );
-        assert!(queued.iter().eq(["plain A".to_string()].iter()));
+        assert_eq!(queued, interactive_queue(["plain A".to_string()]));
         assert_eq!(
             handoff_queued_followups(
                 &mut queued,
@@ -15273,7 +15851,7 @@ mod tests {
 
     #[test]
     fn session_rebind_restores_followup_instead_of_submitting() {
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         assert_eq!(
@@ -15297,7 +15875,7 @@ mod tests {
     fn turn_settlement_keeps_followup_queued_while_tasks_view_is_open() {
         use bottom_pane::background_task_view::BackgroundTaskView;
 
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         pane.push_view(Box::new(BackgroundTaskView::new(Vec::new())));
@@ -15315,13 +15893,13 @@ mod tests {
             QueuedFollowupHandoff::Held
         );
         assert!(!replay_armed);
-        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+        assert_eq!(queued, interactive_queue(["plain A".to_string()]));
         assert!(pane.composer.is_empty());
     }
 
     #[test]
     fn turn_settlement_replay_does_not_reorder_a_two_message_backlog() {
-        let mut queued = VecDeque::from(["plain A".to_string(), "plain B".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string(), "plain B".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         let mut replay_armed = false;
@@ -15341,10 +15919,11 @@ mod tests {
         assert!(!admit_idle_followup(
             &replayed,
             &mut replay_armed,
-            &mut queued
+            &mut queued,
+            &mut BottomPane::new(),
         ));
         assert!(!replay_armed);
-        assert_eq!(queued, VecDeque::from(["plain B".to_string()]));
+        assert_eq!(queued, interactive_queue(["plain B".to_string()]));
         assert!(slash_result_releases_followups(
             &slash_dispatch::SlashResult::OpenWorkTasks
         ));
@@ -15359,7 +15938,7 @@ mod tests {
     #[test]
     fn rejected_login_and_register_restore_the_following_message() {
         for _register in [false, true] {
-            let mut queued = VecDeque::from(["plain A".to_string()]);
+            let mut queued = interactive_queue(["plain A".to_string()]);
             let mut pane = BottomPane::new();
             let mut chat = chat_widget::ChatWidget::new("");
             assert!(recover_followups_after_rejected_authentication(
@@ -15374,7 +15953,7 @@ mod tests {
 
     #[test]
     fn cancelled_background_read_restores_the_held_followup() {
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         assert!(recover_queued_followups_after_cancelled_read(
@@ -15395,7 +15974,7 @@ mod tests {
     fn auth_session_change_restores_followup_and_same_session_can_submit() {
         let changed = followup_gate_after_auth(Some("old"), 1, Some("new"), 2, false, 0);
         assert!(changed.session_rebound);
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut pane = BottomPane::new();
         let mut chat = chat_widget::ChatWidget::new("");
         assert_eq!(
@@ -15407,7 +15986,7 @@ mod tests {
 
         let same = followup_gate_after_auth(Some("same"), 4, Some("same"), 4, false, 0);
         assert!(!same.session_rebound);
-        let mut queued = VecDeque::from(["plain B".to_string()]);
+        let mut queued = interactive_queue(["plain B".to_string()]);
         let mut pane = BottomPane::new();
         assert_eq!(
             handoff_queued_followups(&mut queued, &mut pane, &mut chat, same),
@@ -15418,36 +15997,39 @@ mod tests {
 
     #[test]
     fn idle_submission_waits_behind_a_held_backlog_unless_it_is_the_replay() {
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut replay_armed = false;
         assert!(admit_idle_followup(
             "manual B",
             &mut replay_armed,
-            &mut queued
+            &mut queued,
+            &mut BottomPane::new(),
         ));
         assert_eq!(
-            queued.into_iter().collect::<Vec<_>>(),
+            interactive_texts(queued),
             vec!["plain A".to_string(), "manual B".to_string()]
         );
 
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut replay_armed = true;
         assert!(!admit_idle_followup(
             "/model gpt",
             &mut replay_armed,
-            &mut queued
+            &mut queued,
+            &mut BottomPane::new(),
         ));
         assert!(!replay_armed);
-        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+        assert_eq!(queued, interactive_queue(["plain A".to_string()]));
 
-        let mut queued = VecDeque::from(["plain A".to_string()]);
+        let mut queued = interactive_queue(["plain A".to_string()]);
         let mut replay_armed = false;
         assert!(!admit_idle_followup(
             "/help",
             &mut replay_armed,
-            &mut queued
+            &mut queued,
+            &mut BottomPane::new(),
         ));
-        assert_eq!(queued, VecDeque::from(["plain A".to_string()]));
+        assert_eq!(queued, interactive_queue(["plain A".to_string()]));
     }
 
     #[test]
@@ -16623,8 +17205,7 @@ mod tests {
 
     fn test_spawn_context() -> astra_runtime::orchestration::SpawnContext {
         astra_runtime::orchestration::SpawnContext {
-            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
             resolved_model_name: None,
@@ -16693,7 +17274,7 @@ mod tests {
     /// round-trip check covers it.
     #[test]
     fn reopen_target_round_trips_through_string() {
-        let variants: &[ReopenTarget] = &[ReopenTarget::Agents, ReopenTarget::Team];
+        let variants: &[ReopenTarget] = &[ReopenTarget::Agents];
         for &target in variants {
             let encoded = target.as_str();
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
@@ -18011,7 +18592,7 @@ mod tests {
                 .take_queued_next_turn_submissions()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec!["queued follow-up".to_string()],
+            vec![NextTurnSubmission::Interactive("queued follow-up".into())],
             "opening `/tasks` must leave the next-turn FIFO untouched"
         );
 
@@ -18797,19 +19378,21 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            followups.into_iter().collect::<Vec<_>>(),
+            interactive_texts(followups),
             vec!["list my workspaces".to_string()]
         );
 
-        let mut restored_queue =
-            std::collections::VecDeque::from(["list my workspaces".to_string()]);
+        let mut restored_queue = interactive_queue(["list my workspaces".to_string()]);
         let restored = settle_followup_submissions(
             &mut std::collections::VecDeque::new(),
             std::iter::empty(),
             &mut restored_queue,
             false,
         );
-        assert_eq!(restored.as_deref(), Some("list my workspaces"));
+        assert_eq!(
+            restored.as_ref().map(restored_interactive_text).as_deref(),
+            Some("list my workspaces")
+        );
     }
 
     /// Terminal-guidance rejection (`run_intent_run_terminal`) reuses the exact
@@ -18862,7 +19445,7 @@ mod tests {
                 "delivered followups must not also be reported as a restored draft"
             );
             assert_eq!(
-                followups.into_iter().collect::<Vec<_>>(),
+                interactive_texts(followups),
                 vec![
                     "earlier message".to_string(),
                     "rejected by completed run".to_string(),
@@ -18909,7 +19492,7 @@ mod tests {
                 should_start,
             );
             assert_eq!(
-                restored.as_deref(),
+                restored.as_ref().map(restored_interactive_text).as_deref(),
                 Some("earlier message\n\nrejected by cancelled run")
             );
             assert!(
@@ -18953,7 +19536,7 @@ mod tests {
                 should_start,
             );
             assert_eq!(
-                restored.as_deref(),
+                restored.as_ref().map(restored_interactive_text).as_deref(),
                 Some("earlier message\n\nrejected by failed run")
             );
             assert!(followups.is_empty());
@@ -18989,18 +19572,21 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            followups.into_iter().collect::<Vec<_>>(),
+            interactive_texts(followups),
             vec!["message A".to_string(), "message B".to_string()]
         );
         let mut restored_queue =
-            std::collections::VecDeque::from(["message A".to_string(), "message B".to_string()]);
+            interactive_queue(["message A".to_string(), "message B".to_string()]);
         let restored = settle_followup_submissions(
             &mut std::collections::VecDeque::new(),
             std::iter::empty(),
             &mut restored_queue,
             false,
         );
-        assert_eq!(restored.as_deref(), Some("message A\n\nmessage B"));
+        assert_eq!(
+            restored.as_ref().map(restored_interactive_text).as_deref(),
+            Some("message A\n\nmessage B")
+        );
 
         let mut bottom_pane = BottomPane::new();
         assert!(bottom_pane.queue_next_turn_submission("/session".to_string()));
@@ -19031,7 +19617,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            followups.into_iter().collect::<Vec<_>>(),
+            interactive_texts(followups),
             vec![
                 "/session".to_string(),
                 "message A".to_string(),
@@ -19039,7 +19625,7 @@ mod tests {
             ]
         );
 
-        let mut restored_queue = std::collections::VecDeque::from([
+        let mut restored_queue = interactive_queue([
             "/session".to_string(),
             "message A".to_string(),
             "message B".to_string(),
@@ -19051,56 +19637,57 @@ mod tests {
             false,
         );
         assert_eq!(
-            restored.as_deref(),
+            restored.as_ref().map(restored_interactive_text).as_deref(),
             Some("/session\n\nmessage A\n\nmessage B")
         );
     }
 
-    #[test]
-    fn member_guidance_outcomes_cannot_cross_a_real_session_reset() {
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        let attachment_epoch = state.session_attachment_epoch;
-        let mut pane = BottomPane::new();
-        assert!(pane.accept_agent_guide(
-            "guide".into(),
-            "member-run".into(),
+    fn test_member_guide_target(session_id: Option<String>, epoch: u64) -> AgentGuideTarget {
+        AgentGuideTarget::capture(
             "Reviewer".into(),
-            "private guidance".into(),
-            attachment_epoch
-        ));
-        let before = render_bottom_pane_text(&pane, 100, 20);
-        state.reset_for_new_session();
-        assert_ne!(attachment_epoch, state.session_attachment_epoch);
-        let mut widget = chat_widget::ChatWidget::new("new-session");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        for outcome in [
-            AgentWorkbenchOutcome::GuideAccepted {
-                attachment_epoch,
-                intent_id: "guide".into(),
-            },
-            AgentWorkbenchOutcome::GuideApplied {
-                attachment_epoch,
-                intent_id: "guide".into(),
-            },
-            AgentWorkbenchOutcome::GuideRejected {
-                attachment_epoch,
-                intent_id: "guide".into(),
-                agent_id: "reviewer".into(),
-                agent_name: "Reviewer".into(),
+            "member-run".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
                 run_id: "member-run".into(),
-                target: crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
-                    run_id: "member-run".into(),
-                },
-                reason: "closed".into(),
             },
-            AgentWorkbenchOutcome::GuideUnconfirmed {
-                attachment_epoch,
-                intent_id: "guide".into(),
-                agent_name: "Reviewer".into(),
-                reason: "lost acknowledgement".into(),
-            },
-        ] {
-            tx.try_send(outcome).unwrap();
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            session_id,
+            epoch,
+        )
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn member_guidance_outcomes_cannot_cross_session_or_owner_replacement() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("guide-owner"),
+        )
+        .unwrap();
+        let last_receipt = test_member_guide_target(None, 0);
+        let observation = last_receipt.0.observation.clone();
+        let retained_receipt = last_receipt.clone();
+        drop(last_receipt);
+        assert!(!observation.is_cancelled());
+        drop(retained_receipt);
+        assert!(
+            observation.is_cancelled(),
+            "last receipt retires observation"
+        );
+        for replace_owner in [false, true] {
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            let attachment_epoch = state.session_attachment_epoch;
+            let guide = test_member_guide_target(state.session_id.clone(), attachment_epoch);
+            let mut pane = BottomPane::new();
+            assert!(pane.accept_agent_guide(
+                "guide".into(),
+                guide.clone(),
+                "private guidance".into(),
+            ));
+            let before = render_bottom_pane_text(&pane, 100, 20);
+            let observation = guide.0.observation.clone();
+            let mut widget = chat_widget::ChatWidget::new("new-session");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             drain_agent_workbench_outcomes(
                 &mut rx,
                 state.session_id.as_deref(),
@@ -19109,57 +19696,110 @@ mod tests {
                 &mut pane,
                 &FrameRequester::test_dummy(),
             );
+            assert!(
+                !observation.is_cancelled(),
+                "an attached child survives an idle drain"
+            );
+            let _replacement = if replace_owner {
+                Some(
+                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                        "default",
+                        Some("other-owner"),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                state.reset_for_new_session();
+                assert_ne!(attachment_epoch, state.session_attachment_epoch);
+                None
+            };
+            // Retirement must work on a quiet tick, not require a late result.
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                state.session_id.as_deref(),
+                state.session_attachment_epoch,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert!(observation.is_cancelled());
+            assert_eq!(pane.pending_user_intent_count(), 1);
             assert_eq!(render_bottom_pane_text(&pane, 100, 20), before);
-            assert!(!pane.has_active_view());
-            assert!(widget.history().is_empty());
+            for outcome in [
+                AgentWorkbenchOutcome::GuideAccepted {
+                    target: guide.clone(),
+                    intent_id: "guide".into(),
+                },
+                AgentWorkbenchOutcome::GuideApplied {
+                    target: guide.clone(),
+                    intent_id: "guide".into(),
+                },
+                AgentWorkbenchOutcome::GuideRejected {
+                    target: guide.clone(),
+                    intent_id: "guide".into(),
+                    reason: "closed".into(),
+                },
+                AgentWorkbenchOutcome::GuideUnconfirmed {
+                    target: guide.clone(),
+                    intent_id: "guide".into(),
+                    reason: "lost acknowledgement".into(),
+                },
+            ] {
+                tx.try_send(outcome).unwrap();
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    state.session_id.as_deref(),
+                    state.session_attachment_epoch,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                assert_eq!(render_bottom_pane_text(&pane, 100, 20), before);
+                assert!(!pane.has_active_view());
+                assert!(widget.history().is_empty());
+            }
+            assert!(
+                pane.remove_agent_guide(
+                    "guide",
+                    state.session_id.as_deref(),
+                    state.session_attachment_epoch,
+                    Some("member-run"),
+                )
+                .is_none()
+            );
+            assert_eq!(pane.pending_user_intent_count(), 1);
         }
-        let pending = pane
-            .remove_agent_guide("guide", attachment_epoch, Some("member-run"))
-            .unwrap();
-        assert_eq!(
-            pending.status,
-            astra_turn_types::UserIntentStatus::AcceptedLocal
-        );
-        assert_eq!(pending.text, "private guidance");
     }
 
     #[test]
     fn member_guidance_settles_once_and_uncertain_application_keeps_custody() {
         // Definitive rejection, unknown POST, and accepted-but-unconfirmed application.
         for (applied, accepted) in [(false, false), (true, false), (true, true)] {
+            let guide = test_member_guide_target(Some("session".into()), 3);
             let mut pane = BottomPane::new();
             let mut widget = chat_widget::ChatWidget::new("session");
             assert!(pane.accept_agent_guide(
                 "guide".into(),
-                "member-run".into(),
-                "Reviewer".into(),
+                guide.clone(),
                 "private guidance".into(),
-                3
             ));
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             let reject = || AgentWorkbenchOutcome::GuideRejected {
-                attachment_epoch: 3,
+                target: guide.clone(),
                 intent_id: "guide".into(),
-                agent_id: "reviewer".into(),
-                agent_name: "Reviewer".into(),
-                run_id: "member-run".into(),
-                target: crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
-                    run_id: "member-run".into(),
-                },
                 reason: "closed".into(),
             };
             if applied {
                 if accepted {
                     tx.try_send(AgentWorkbenchOutcome::GuideAccepted {
-                        attachment_epoch: 3,
+                        target: guide.clone(),
                         intent_id: "guide".into(),
                     })
                     .unwrap();
                 }
                 tx.try_send(AgentWorkbenchOutcome::GuideUnconfirmed {
-                    attachment_epoch: 3,
+                    target: guide.clone(),
                     intent_id: "guide".into(),
-                    agent_name: "Reviewer".into(),
                     reason: "acknowledgement timeout".into(),
                 })
                 .unwrap();
@@ -19183,7 +19823,7 @@ mod tests {
                 assert!(render_bottom_pane_text(&pane, 100, 20).contains(phase));
                 for _ in 0..2 {
                     tx.try_send(AgentWorkbenchOutcome::GuideApplied {
-                        attachment_epoch: 3,
+                        target: guide.clone(),
                         intent_id: "guide".into(),
                     })
                     .unwrap();
@@ -19224,6 +19864,115 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn member_guidance_observation_preserves_active_budget_and_releases_the_stream() {
+        use astra_thin_client::StreamEvent;
+        use futures_util::poll;
+        use std::task::Poll;
+
+        let accepted = || StreamEvent::RunUserIntentAccepted {
+            run_id: "member".into(),
+            intent_id: "guide".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            index: 1,
+        };
+        let paused = || StreamEvent::RunPaused {
+            run_id: Some("member".into()),
+        };
+        let resumed = || StreamEvent::RunResumed {
+            run_id: Some("member".into()),
+        };
+        let applied = || StreamEvent::RunUserIntentApplied {
+            run_id: "member".into(),
+            intent_id: "guide".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            event_index: 1,
+            content: "updated requirement".into(),
+            index: 2,
+        };
+        // Exercise the production observer, not a second clock model. Every
+        // scope owns its event stream and checks that retirement drops it.
+        for case in [
+            "resume",
+            "cancel",
+            "receiver_closed",
+            "replay_stalled",
+            "replay_resumed",
+            "active_timeout",
+            "remaining_timeout",
+        ] {
+            let (events, rx) = tokio::sync::mpsc::channel(8);
+            let (outcomes, output_rx) = tokio::sync::mpsc::channel(1);
+            let observation = tokio_util::sync::CancellationToken::new();
+            let mut future = std::pin::pin!(observe_agent_guide(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+                "member",
+                "guide",
+                &observation,
+                &outcomes,
+            ));
+            if case != "remaining_timeout" {
+                events.send(Ok(paused())).await.unwrap();
+            }
+            if case == "replay_resumed" {
+                events.send(Ok(resumed())).await.unwrap();
+            }
+            if case != "replay_stalled" {
+                events.send(Ok(accepted())).await.unwrap();
+            }
+            assert!(poll!(&mut future).is_pending(), "{case}");
+            if matches!(case, "replay_stalled" | "replay_resumed") {
+                tokio::time::advance(AGENT_GUIDE_APPLICATION_TIMEOUT).await;
+                assert!(matches!(poll!(&mut future), Poll::Ready(Err(_))));
+            } else {
+                if case == "remaining_timeout" {
+                    tokio::time::advance(Duration::from_secs(20)).await;
+                    events.send(Ok(paused())).await.unwrap();
+                    assert!(poll!(&mut future).is_pending());
+                }
+                tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+                assert!(
+                    poll!(&mut future).is_pending(),
+                    "a retained pause must not expire: {case}"
+                );
+                match case {
+                    "cancel" => {
+                        observation.cancel();
+                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(()))));
+                    }
+                    "receiver_closed" => {
+                        drop(output_rx);
+                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(()))));
+                    }
+                    "resume" => {
+                        events.send(Ok(resumed())).await.unwrap();
+                        assert!(poll!(&mut future).is_pending());
+                        tokio::time::advance(Duration::from_secs(59)).await;
+                        events.send(Ok(applied())).await.unwrap();
+                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(()))));
+                    }
+                    "active_timeout" | "remaining_timeout" => {
+                        events.send(Ok(paused())).await.unwrap(); // Duplicate Pause cannot replenish time.
+                        assert!(poll!(&mut future).is_pending());
+                        events.send(Ok(resumed())).await.unwrap();
+                        assert!(poll!(&mut future).is_pending());
+                        let remaining = if case == "remaining_timeout" { 39 } else { 59 };
+                        tokio::time::advance(Duration::from_secs(remaining)).await;
+                        events.send(Ok(accepted())).await.unwrap(); // Duplicate cannot renew the budget.
+                        assert!(poll!(&mut future).is_pending());
+                        tokio::time::advance(Duration::from_secs(1)).await;
+                        assert!(matches!(poll!(&mut future), Poll::Ready(Err(_))));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                events.is_closed(),
+                "completed observer must release its stream: {case}"
+            );
+        }
+    }
+
     #[serial_test::serial]
     #[tokio::test]
     async fn member_guidance_post_failures_are_bounded_and_single_attempt() {
@@ -19235,11 +19984,18 @@ mod tests {
         credentials.profiles.insert(
             "default".into(),
             Profile {
+                account_id: Some("guidance-owner".into()),
                 access_token: Some("test-token".into()),
                 ..Default::default()
             },
         );
         crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("guidance-owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
         let request = astra_thin_client::RunUserIntentRequest {
             intent_id: "stable-guide".into(),
             delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -19282,7 +20038,7 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&url, None).unwrap();
             let error = tokio::time::timeout(
                 ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT + Duration::from_secs(2),
-                submit_agent_guide(&api, None, "member-run", &request),
+                submit_agent_guide(&api, &owner, "member-run", &request),
             ).await.unwrap().unwrap_err();
             assert!(match error {
                 GuidanceSubmissionError::Rejected(_) | GuidanceSubmissionError::GuidanceClosed(_) => rejected,
@@ -19297,25 +20053,71 @@ mod tests {
             };
             assert_eq!(received, serde_json::to_value(&request).unwrap());
         }
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let _replacement =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default",
+                Some("replacement-owner"),
+            )
+            .unwrap();
+        assert!(matches!(
+            submit_agent_guide(&api, &owner, "member-run", &request).await,
+            Err(GuidanceSubmissionError::Rejected(_))
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn member_guidance_local_absence_is_rejected_but_untyped_failure_is_uncertain() {
-        for spawner in [
-            None,
-            Some(test_agent_spawner(Arc::new(PendingAgentExecutor))),
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("local-guide-owner"),
+        )
+        .unwrap();
+        for (spawner, replace_owner) in [
+            (None, false),
+            (
+                Some(test_agent_spawner(Arc::new(PendingAgentExecutor))),
+                false,
+            ),
+            (
+                Some(test_agent_spawner(Arc::new(PendingAgentExecutor))),
+                true,
+            ),
         ] {
-            let rejected = spawner.is_none();
+            let rejected = spawner.is_none() || replace_owner;
             let mut pane = BottomPane::new();
             let mut widget = chat_widget::ChatWidget::new("session");
+            let mut member = agent_info(
+                "unavailable-member",
+                AgentStatus::Running {
+                    activity: "working".into(),
+                },
+            );
+            member.run_id = "member-run".into();
+            widget.reconcile_local_agent_snapshot(
+                &crate::tui::local_agent_snapshot::LocalAgentSnapshot {
+                    available: true,
+                    agents: vec![member],
+                    ..Default::default()
+                },
+                &[],
+            );
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             dispatch_agent_guide(
-                "unavailable-member".into(),
-                "Reviewer".into(),
-                "member-run".into(),
-                crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
-                    agent_id: "unavailable-member".into(),
-                },
+                AgentGuideTarget::capture(
+                    "Reviewer".into(),
+                    "member-run".into(),
+                    crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+                        agent_id: "unavailable-member".into(),
+                    },
+                    astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+                    Some("session".into()),
+                    9,
+                ),
                 "private guidance".into(),
                 ViewActionBackends {
                     agent_spawner: spawner,
@@ -19330,6 +20132,13 @@ mod tests {
                 &mut widget,
                 &FrameRequester::test_dummy(),
             );
+            let _replacement = replace_owner.then(|| {
+                crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                    "default",
+                    Some("replacement-owner"),
+                )
+                .unwrap()
+            });
             let outcome = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .unwrap()
@@ -19344,18 +20153,32 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
     #[test]
     fn local_agent_mailbox_received_event_closes_guidance_delivery_once() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("mailbox-owner"),
+        )
+        .unwrap();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
         let mut state = crate::cli::session::session_state::SessionState::default();
         let attachment_epoch = state.session_attachment_epoch;
         assert!(bottom_pane.accept_agent_guide(
             "guide-7".into(),
-            "run-reviewer".into(),
-            "Reviewer".into(),
+            AgentGuideTarget::capture(
+                "Reviewer".into(),
+                "run-reviewer".into(),
+                crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+                    agent_id: "reviewer".into(),
+                },
+                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+                None,
+                attachment_epoch,
+            ),
             "inspect the storage race".into(),
-            attachment_epoch,
         ));
         assert!(bottom_pane.promote_agent_guide_accepted("guide-7"));
         let event = TuiAppEvent::AgentCommunication(astra_turn_types::AgentCommunicationEvent {
@@ -19408,13 +20231,24 @@ mod tests {
         assert_eq!(bottom_pane.pending_user_intent_count(), 1);
         assert!(!rendered_transcript_overlay(&chat_widget, 100).contains("Guidance received"));
 
-        // The receipt settles only its original attachment and exact member run.
+        {
+            let _replacement =
+                crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                    "default",
+                    Some("replacement-owner"),
+                )
+                .unwrap();
+            apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, attachment_epoch);
+            assert_eq!(bottom_pane.pending_user_intent_count(), 1);
+            assert!(!rendered_transcript_overlay(&chat_widget, 100).contains("Guidance received"));
+        }
+        // The receipt settles only its original account, attachment and exact member run.
         apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, attachment_epoch);
         apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget, attachment_epoch);
 
         assert!(
             bottom_pane
-                .remove_agent_guide("guide-7", attachment_epoch, None)
+                .remove_agent_guide("guide-7", None, attachment_epoch, None)
                 .is_none()
         );
         let rendered = rendered_transcript_overlay(&chat_widget, 100);
@@ -19599,6 +20433,340 @@ mod tests {
 
         toggle_local_root_transcript_fallback(&chat_widget, &mut bottom_pane, 80, 24);
         assert!(!bottom_pane.has_active_view());
+    }
+
+    #[tokio::test]
+    async fn durable_member_inspection_accepts_only_its_bound_live_run() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        use bottom_pane::view::BottomPaneView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut widget = chat_widget::ChatWidget::new("session-control");
+        widget.reconcile_server_agent_projection(&running_control_projection());
+        let mut monitor = bottom_pane::in_flight_agents_view::InFlightAgentsView::new(
+            widget.agent_monitor_snapshot(5),
+        );
+        monitor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = monitor
+            .take_action_request()
+            .expect("member inspection")
+            .action;
+        assert!(matches!(&action, BottomPaneViewAction::InspectAgent {
+            agent_id, run_id: Some(run_id), ..
+        } if agent_id == "child-run" && run_id == "child-run"));
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
+            api.clone(),
+            None,
+            Some("session-control"),
+        );
+        let output = tempfile::tempdir().unwrap();
+        let mut background =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(output.path().to_path_buf());
+        let (agent_workbench_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut pane = BottomPane::new();
+        dispatch_bottom_pane_view_action(
+            action,
+            &mut background,
+            &observer,
+            &mut None,
+            ViewActionBackends {
+                agent_spawner: None,
+                api,
+                profile: None,
+                session_id: Some("session-control".into()),
+                session_attachment_epoch: 0,
+                file_writer: None,
+                agent_workbench_tx,
+            },
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        for (run_id, text) in [
+            ("child-run", "member_live_evidence"),
+            ("other-run", "wrong_run_evidence"),
+        ] {
+            let event = TuiAppEvent::AgentLive(AgentLiveEvent {
+                run_id: run_id.into(),
+                agent_id: "member".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: text.into(),
+                },
+            });
+            let translated =
+                chat_widget::translate(event.clone(), chat_widget::TurnContext::default()).unwrap();
+            widget.handle_event(translated);
+            refresh_open_agent_views_for_event(&event, &widget, &mut pane);
+            apply_tui_control_event(&event, &mut pane, &mut widget, 0);
+        }
+        let rendered = render_bottom_pane_text(&pane, 100, 24);
+        assert!(rendered.contains("member_live_evidence"), "{rendered}");
+        assert!(!rendered.contains("wrong_run_evidence"), "{rendered}");
+        assert!(!rendered_transcript_overlay(&widget, 100).contains("member_live_evidence"));
+        assert!(pane.activate_agent_transcript("child-run", "child-run"));
+        pane.refresh_agent_transcript(
+            bottom_pane::agent_transcript_view::AgentTranscriptUpdate::Failed {
+                agent_id: "child-run".into(),
+                run_id: "child-run".into(),
+                message: "History is temporarily unavailable".into(),
+            },
+        );
+        for run_id in ["other-run", "child-run", "child-run"] {
+            let event = TuiAppEvent::AgentLive(AgentLiveEvent {
+                run_id: run_id.into(),
+                agent_id: "member".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    duration_ms: 1,
+                    reason: None,
+                },
+            });
+            widget.handle_event(
+                chat_widget::translate(event.clone(), chat_widget::TurnContext::default()).unwrap(),
+            );
+            refresh_open_agent_views_for_event(&event, &widget, &mut pane);
+            apply_tui_control_event(&event, &mut pane, &mut widget, 0);
+            if run_id == "other-run" {
+                assert!(pane.take_projection_action().is_none());
+            }
+        }
+        assert!(matches!(pane.take_projection_action(), Some(
+            BottomPaneViewAction::LoadAgentTranscript {
+                agent_id, run_id, session_id,
+                transcript_target: crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+                before_seq: None,
+            }
+        ) if agent_id == "child-run" && run_id == "child-run" && session_id == "session-control"));
+        assert!(pane.take_projection_action().is_none());
+        assert!(render_bottom_pane_text(&pane, 100, 24).contains("member_live_evidence"));
+    }
+
+    #[test]
+    fn exact_root_tabs_receive_only_their_bound_stream_without_a_ctrl_o_tab() {
+        let mut widget = chat_widget::ChatWidget::new("session-1");
+        let mut pane = BottomPane::new();
+        for run_id in ["historical-root", "child-run", "current-root"] {
+            pane.push_view(Box::new(
+                bottom_pane::agent_transcript_view::AgentTranscriptView::loading(
+                    run_id.into(),
+                    run_id.into(),
+                    "session-1".into(),
+                    run_id.into(),
+                    crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+                    "agents",
+                    100,
+                    24,
+                ),
+            ));
+        }
+        assert!(!pane.has_root_transcript_tab());
+        for event in [
+            TuiAppEvent::RunBound("current-root".into()),
+            TuiAppEvent::Token {
+                model_item_id: Some("model-root-1".into()),
+                text: "exact_root_live_evidence".into(),
+            },
+        ] {
+            widget.handle_event(
+                chat_widget::translate(event, chat_widget::TurnContext::default()).unwrap(),
+            );
+        }
+        assert!(refresh_open_transcript_view(&widget, &mut pane, 100));
+        assert!(render_bottom_pane_text(&pane, 100, 24).contains("exact_root_live_evidence"));
+        for run_id in ["historical-root", "child-run"] {
+            assert!(pane.activate_agent_transcript(run_id, run_id));
+            assert!(!render_bottom_pane_text(&pane, 100, 24).contains("exact_root_live_evidence"));
+        }
+        // A second binding in one stream cannot relabel already observed output.
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::RunBound("historical-root".into()),
+        ));
+        assert_eq!(
+            widget.active_root_binding(),
+            Some(("session-1", "current-root"))
+        );
+        widget.handle_event(chat_widget::AppEvent::User(UserEvent::Submit(
+            "next turn".into(),
+        )));
+        widget.begin_root_stream();
+        assert!(widget.active_root_binding().is_none());
+        assert!(!refresh_open_transcript_view(&widget, &mut pane, 100));
+        assert!(pane.activate_agent_transcript("current-root", "current-root"));
+        assert!(render_bottom_pane_text(&pane, 100, 24).contains("exact_root_live_evidence"));
+        for (input, run_id) in [(None, "historical-root"), (Some("/agent"), "child-run")] {
+            if let Some(input) = input {
+                commit_submission_projection(&mut widget, input);
+            }
+            widget.begin_root_stream();
+            widget.handle_event(chat_widget::AppEvent::wire(
+                chat_widget::WireEvent::RunBound(run_id.into()),
+            ));
+            widget.handle_event(chat_widget::AppEvent::wire(
+                chat_widget::WireEvent::AnswerDelta {
+                    model_item_id: Some(run_id.into()),
+                    text: "new_stream_body".into(),
+                },
+            ));
+            refresh_open_transcript_view(&widget, &mut pane, 100);
+            assert_eq!(widget.active_root_binding(), Some(("session-1", run_id)));
+            assert!(pane.activate_agent_transcript("current-root", "current-root"));
+            assert!(!render_bottom_pane_text(&pane, 100, 24).contains("new_stream_body"));
+        }
+    }
+
+    #[test]
+    fn root_tool_completion_replaces_running_suffix_and_reconciles_by_call_identity() {
+        let mut widget = chat_widget::ChatWidget::new("session-1");
+        widget.begin_root_stream();
+        let mut pane = BottomPane::new();
+        pane.push_view(Box::new(
+            bottom_pane::agent_transcript_view::AgentTranscriptView::loading(
+                "root".into(),
+                "Main conversation".into(),
+                "session-1".into(),
+                "root".into(),
+                crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+                "agents",
+                100,
+                24,
+            ),
+        ));
+        for event in [
+            TuiAppEvent::RunBound("root".into()),
+            TuiAppEvent::ToolStarted {
+                name: "bash".into(),
+                description: "inspect files".into(),
+                tool_use_id: "exact-call".into(),
+                parent_tool_use_id: None,
+            },
+            TuiAppEvent::ToolCompleted {
+                name: "bash".into(),
+                description: "inspect files".into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: Some("tool_terminal_body".into()),
+                output: None,
+                tool_use_id: "exact-call".into(),
+                parent_tool_use_id: None,
+            },
+        ] {
+            widget.handle_event(
+                chat_widget::translate(event, chat_widget::TurnContext::default()).unwrap(),
+            );
+            refresh_open_transcript_view(&widget, &mut pane, 100);
+        }
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::TurnError("provider stopped".into()),
+        ));
+        refresh_open_transcript_view(&widget, &mut pane, 100);
+        let suffix = active_root_transcript_item(&widget, 100).unwrap();
+        assert_eq!(suffix.tool_identity(), Some("exact-call"));
+        assert!(suffix.is_settled_tool());
+        let rendered = render_bottom_pane_text(&pane, 100, 24);
+        assert!(rendered.contains("tool_terminal_body"), "{rendered}");
+        let durable = astra_thin_client::SessionTranscriptPage {
+            session_id: "session-1".into(),
+            next_before_seq: None,
+            has_more: false,
+            items: vec![astra_thin_client::SessionTranscriptItem {
+                session_id: "session-1".into(),
+                run_id: Some("root".into()),
+                model_item_id: None,
+                item_seq: 1,
+                role: "tool".into(),
+                content: "tool_terminal_body".into(),
+                reasoning: None,
+                reasoning_status: None,
+                tool_calls: vec![],
+                tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
+                    runtime_advisories: vec![],
+                    tool_use_id: "exact-call".into(),
+                    name: Some("bash".into()),
+                    status: Some("completed".into()),
+                    duration_ms: Some(1),
+                }),
+                evidence: None,
+                source_event_id: None,
+                created_at: "2026-10-07T00:00:00Z".into(),
+            }],
+        };
+        let mut unrelated = durable.clone();
+        unrelated.items[0].tool_result.as_mut().unwrap().tool_use_id = "unrelated-call".into();
+        pane.refresh_agent_transcript(
+            bottom_pane::agent_transcript_view::AgentTranscriptUpdate::Loaded {
+                agent_id: "root".into(),
+                run_id: "root".into(),
+                page: unrelated,
+                replace: true,
+                source: bottom_pane::agent_transcript_view::AgentTranscriptSource::DurableServer,
+            },
+        );
+        assert!(matches!(
+            pane.take_projection_action(),
+            Some(BottomPaneViewAction::LoadAgentTranscript { run_id, before_seq: None, .. })
+                if run_id == "root"
+        ));
+        assert!(pane.take_projection_action().is_none());
+        assert!(
+            render_bottom_pane_text(&pane, 100, 24).contains("awaiting durable reconciliation"),
+            "equal content from another call cannot retire the real local tool"
+        );
+        pane.refresh_agent_transcript(
+            bottom_pane::agent_transcript_view::AgentTranscriptUpdate::Loaded {
+                agent_id: "root".into(),
+                run_id: "root".into(),
+                page: durable,
+                replace: true,
+                source: bottom_pane::agent_transcript_view::AgentTranscriptSource::DurableServer,
+            },
+        );
+        assert_eq!(
+            render_bottom_pane_text(&pane, 100, 24)
+                .matches("tool_terminal_body")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn root_control_task_suffix_uses_its_canonical_terminal_cell() {
+        let mut widget = chat_widget::ChatWidget::new("session-1");
+        widget.begin_root_stream();
+        for event in [
+            TuiAppEvent::RunBound("root".into()),
+            TuiAppEvent::ToolStarted {
+                name: "agent".into(),
+                description: "Run child task".into(),
+                tool_use_id: "control-call".into(),
+                parent_tool_use_id: None,
+            },
+            TuiAppEvent::ToolCompleted {
+                name: "agent".into(),
+                description: "Run child task".into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: None,
+                output: None,
+                tool_use_id: "control-call".into(),
+                parent_tool_use_id: None,
+            },
+        ] {
+            widget.handle_event(
+                chat_widget::translate(event, chat_widget::TurnContext::default()).unwrap(),
+            );
+        }
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::TurnError("provider stopped".into()),
+        ));
+        let suffix = active_root_transcript_item(&widget, 100).unwrap();
+        assert_eq!(suffix.tool_identity(), Some("control-call"));
+        assert!(suffix.is_settled_tool());
     }
 
     #[tokio::test]
@@ -20421,7 +21589,7 @@ mod tests {
         ));
 
         let unrelated = TuiAppEvent::AgentLive(AgentLiveEvent {
-            run_id: "test-run".into(),
+            run_id: "agent-b-run".into(),
             agent_id: "agent-b".into(),
             kind: AgentLiveEventKind::OutputDelta {
                 model_item_id: Some("test-model-item".into()),
@@ -20430,7 +21598,7 @@ mod tests {
         });
         assert!(
             !refresh_open_agent_transcript_for_event(&unrelated, &chat_widget, &mut bottom_pane),
-            "non-open agent events must not rebuild the open transcript"
+            "events from another execution must not rebuild the open transcript"
         );
 
         let wrong_run = TuiAppEvent::AgentLive(AgentLiveEvent {
@@ -20508,6 +21676,7 @@ mod tests {
         let chat_widget = chat_widget::ChatWidget::new(String::new());
         let mut bottom_pane = BottomPane::new();
         bottom_pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+            kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
             agent_id: "agent-a".into(),
             name: "agent-a".into(),
             spawn_tool_call_id: None,
@@ -20578,6 +21747,7 @@ mod tests {
 
         let mut open = BottomPane::new();
         open.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+            kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
             agent_id: "agent-a".into(),
             name: "agent-a".into(),
             spawn_tool_call_id: None,
@@ -20635,12 +21805,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn model_catalog_completion_opens_picker_and_retains_structured_metadata() {
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.model = Some("gpt-5".into());
         let mut bottom_pane = BottomPane::new();
         let mut widget = chat_widget::ChatWidget::new("session-1");
-        let mut cached_catalog = None;
         let catalog = serde_json::from_value(serde_json::json!([{
             "offering_id": "offer-gpt-5",
             "access_id": "self-hosted",
@@ -20650,6 +21820,7 @@ mod tests {
             "name": "gpt-5",
             "provider": "openai",
             "thinking_capability": "both",
+            "thinking_protocol": "enable_thinking",
             "is_active": true,
             "context_window": 128000,
             "max_completion_tokens": null,
@@ -20658,17 +21829,21 @@ mod tests {
         .expect("canonical model catalog");
 
         assert!(apply_model_catalog_effect(
-            ModelCatalogEffect::Ready(Ok(catalog)),
+            ModelCatalogEffect::Ready {
+                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                attachment_epoch: state.session_attachment_epoch,
+                result: Ok(catalog)
+            },
             &state,
             &mut bottom_pane,
             &mut widget,
-            &mut cached_catalog,
         ));
         assert!(bottom_pane.has_active_view());
         assert_eq!(
-            cached_catalog
-                .as_ref()
-                .map(|models| models[0].offering_id.as_str()),
+            bottom_pane
+                .current_model_catalog()
+                .first()
+                .map(|model| model.offering_id.as_str()),
             Some("offer-gpt-5")
         );
         assert!(matches!(
@@ -20679,9 +21854,121 @@ mod tests {
                 ..
             }) if text == "Opened model picker"
         ));
+        let rows = bottom_pane.current_model_catalog().to_vec();
+
+        let picked = bottom_pane::view::ViewResult::Model {
+            name: "gpt-5".into(),
+        };
+        let initial_model = state.model.clone();
+        let initial_footer = bottom_pane.footer.model.clone();
+        let initial_policy = state.cli_context.requested_model_policy.clone();
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &picked,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget,
+            ),
+            Some(true)
+        );
+        assert_eq!(state.model, initial_model);
+        assert_eq!(bottom_pane.footer.model, initial_footer);
+        assert_eq!(state.cli_context.requested_model_policy, initial_policy);
+        let entry = &rows[0];
+        let config = astra_turn_core::thinking_config::thinking_options(
+            Some(&entry.provider),
+            entry.thinking_capability.map(|value| value.as_str()),
+            entry.thinking_protocol.unwrap_or_default(),
+        )
+        .remove(1)
+        .config;
+        let thinking = bottom_pane::view::ViewResult::ModelThinking {
+            base_model: "gpt-5".into(),
+            config: config.clone(),
+        };
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &thinking,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget,
+            ),
+            Some(false)
+        );
+        let before_model = state.model.clone();
+        let before_footer = bottom_pane.footer.model.clone();
+        let before_policy = state.cli_context.requested_model_policy.clone();
+        assert!(
+            matches!(&before_model, Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection))
+            if selection.offering_id == "offer-gpt-5")
+        );
+        let mut changed_controls = rows.clone();
+        changed_controls[0].thinking_capability = None;
+        bottom_pane.cache_model_catalog(changed_controls);
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &thinking,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget,
+            ),
+            Some(false)
+        );
+        assert_eq!(state.model, before_model);
+        assert_eq!(bottom_pane.footer.model, before_footer);
+        assert_eq!(state.cli_context.requested_model_policy, before_policy);
+        let mut unrelated = rows.clone();
+        unrelated[0].name = "Unrelated model".into();
+        unrelated[0].offering_id = "offer-unrelated".into();
+        unrelated[0].thinking_capability = None;
+        bottom_pane.cache_model_catalog(unrelated);
+        for result in [
+            picked,
+            bottom_pane::view::ViewResult::ModelThinking {
+                base_model: "gpt-5".into(),
+                config,
+            },
+        ] {
+            assert_eq!(
+                slash_dispatch::apply_model_picker_result(
+                    &result,
+                    &mut state,
+                    &mut bottom_pane,
+                    &mut widget,
+                ),
+                Some(false),
+                "rejection settles the same modal path as success"
+            );
+            assert_eq!(state.model, before_model);
+            assert_eq!(bottom_pane.footer.model, before_footer);
+            assert_eq!(state.cli_context.requested_model_policy, before_policy);
+        }
+        assert!(matches!(
+            widget.history().last().unwrap().to_persist(),
+            Some(crate::tui::turn_event::TurnEvent::System {
+                level: crate::tui::turn_event::SystemLevel::Error,
+                ..
+            })
+        ));
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &bottom_pane::view::ViewResult::Model {
+                    name: "Unrelated model".into()
+                },
+                &mut state,
+                &mut bottom_pane,
+                &mut widget,
+            ),
+            Some(false)
+        );
+        assert!(
+            matches!(&state.model, Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection))
+            if selection.offering_id == "offer-unrelated")
+        );
     }
 
     #[test]
+    #[serial_test::serial]
     fn model_catalog_failure_is_visible_and_does_not_open_a_stale_picker() {
         let state = crate::cli::session::session_state::SessionState::default();
         let mut bottom_pane = BottomPane::new();
@@ -20702,17 +21989,20 @@ mod tests {
             "thinking_capability": null
         }]))
         .expect("canonical stale catalog");
-        let mut cached_catalog = Some(stale);
+        bottom_pane.cache_model_catalog(stale);
 
         assert!(!apply_model_catalog_effect(
-            ModelCatalogEffect::Ready(Err("Cannot reach server — check connection".into())),
+            ModelCatalogEffect::Ready {
+                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                attachment_epoch: state.session_attachment_epoch,
+                result: Err("Cannot reach server — check connection".into())
+            },
             &state,
             &mut bottom_pane,
             &mut widget,
-            &mut cached_catalog,
         ));
         assert!(!bottom_pane.has_active_view());
-        assert_eq!(cached_catalog.as_ref().map(Vec::len), Some(1));
+        assert_eq!(bottom_pane.current_model_catalog().len(), 1);
         assert!(matches!(
             widget.history()[0].to_persist(),
             Some(crate::tui::turn_event::TurnEvent::System {
@@ -20721,945 +22011,6 @@ mod tests {
                 ..
             }) if text == "Cannot reach server — check connection"
         ));
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn team_browser_reads_once_and_inspects_without_changing_execution() {
-        use astra_credentials::{CredentialsFile, Profile};
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-        let _creds = crate::tests::isolate_credentials();
-        let mut credentials = CredentialsFile::default();
-        credentials.profiles.insert(
-            "default".into(),
-            Profile {
-                account_id: Some("owner-1".into()),
-                access_token: Some("test-token".into()),
-                ..Default::default()
-            },
-        );
-        credentials.profiles.insert(
-            "other".into(),
-            Profile {
-                account_id: Some("owner-2".into()),
-                access_token: Some("other-token".into()),
-                ..Default::default()
-            },
-        );
-        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
-        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-            "default",
-            Some("owner-1"),
-        )
-        .unwrap();
-        let server = MockServer::start().await;
-        let definition = serde_json::json!({
-            "team_id": "team-1", "user_id": "owner-1", "name": "Product team",
-            "description": "Ship a small feature", "members": [],
-            "context": {}, "revision": 1
-        });
-        for (endpoint, status, body) in [
-            (
-                "/teams",
-                200,
-                serde_json::json!({"teams": [definition.clone()]}),
-            ),
-            ("/teams/name/Product%20team", 200, definition.clone()),
-            (
-                "/teams/name/missing",
-                404,
-                serde_json::json!({"error": "not found"}),
-            ),
-            (
-                "/teams/name/offline",
-                503,
-                serde_json::json!({"error": "unavailable"}),
-            ),
-        ] {
-            Mock::given(method("GET"))
-                .and(path(endpoint))
-                .and(wiremock::matchers::header(
-                    "authorization",
-                    "Bearer test-token",
-                ))
-                .respond_with(ResponseTemplate::new(status).set_body_json(body))
-                .expect(1)
-                .mount(&server)
-                .await;
-        }
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        state.model = Some("parent-model".into());
-        for name in [None, Some("Product team"), Some("missing"), Some("offline")] {
-            let mut pane = BottomPane::new();
-            let mut widget = chat_widget::ChatWidget::new("session-team");
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-            let mut tasks = tokio::task::JoinSet::new();
-            let action = slash_dispatch::SlashBackgroundRead::Team {
-                store: crate::cli::http_team_store::HttpTeamStore::new(&api, None),
-                name: name.map(str::to_owned),
-                attachment_epoch: state.session_attachment_epoch,
-            };
-            // Selection changes after the action is queued must not change
-            // which account supplies the background read's credentials.
-            let _other = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-                "other",
-                Some("owner-2"),
-            )
-            .unwrap();
-            dispatch_slash_background_read(action, 7, tx, &mut tasks);
-            let completion = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(completion.generation, 7);
-            if let SlashBackgroundReadEffect::Team {
-                result,
-                detail,
-                attachment_epoch,
-                owner,
-            } = &completion.effect
-            {
-                apply_slash_background_read_effect(
-                    true,
-                    state.session_attachment_epoch,
-                    SlashBackgroundReadEffect::Team {
-                        result: result.clone(),
-                        detail: *detail,
-                        attachment_epoch: *attachment_epoch,
-                        owner: owner.clone(),
-                    },
-                    &mut pane,
-                    &mut widget,
-                );
-                assert!(
-                    !pane.has_active_view(),
-                    "another account must not receive this browser"
-                );
-                assert!(widget.history().is_empty());
-            }
-            drop(_other);
-            // A detail read admitted while idle may complete after execution
-            // starts. Availability belongs to the consuming loop, not dispatch.
-            if let SlashBackgroundReadEffect::Team {
-                result: Ok(teams),
-                detail: true,
-                attachment_epoch,
-                owner,
-            } = &completion.effect
-            {
-                let mut teams = teams.clone();
-                teams[0]
-                    .members
-                    .push(astra_services::team_persistence::TeamMemberDef {
-                        agent_id: "member".into(),
-                        role: "Lead".into(),
-                        ..Default::default()
-                    });
-                let mut active_pane = BottomPane::new();
-                apply_slash_background_read_effect(
-                    false,
-                    state.session_attachment_epoch,
-                    SlashBackgroundReadEffect::Team {
-                        result: Ok(teams),
-                        detail: true,
-                        attachment_epoch: *attachment_epoch,
-                        owner: owner.clone(),
-                    },
-                    &mut active_pane,
-                    &mut widget,
-                );
-                assert!(matches!(
-                    active_pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                    BottomPaneAction::Consumed
-                ));
-                assert!(active_pane.has_active_view());
-                assert!(
-                    render_bottom_pane_text(&active_pane, 100, 24)
-                        .contains("reopen /team to choose a lead")
-                );
-            }
-            apply_slash_background_read_effect(
-                true,
-                state.session_attachment_epoch,
-                completion.effect,
-                &mut pane,
-                &mut widget,
-            );
-            tasks.join_next().await.unwrap().unwrap();
-            if matches!(name, Some("missing" | "offline")) {
-                assert!(!pane.has_active_view());
-                assert!(matches!(
-                    widget.history()[0].to_persist(),
-                    Some(crate::tui::turn_event::TurnEvent::System {
-                        level: crate::tui::turn_event::SystemLevel::Error,
-                        ..
-                    })
-                ));
-                continue;
-            }
-            if name.is_none() {
-                assert!(render_bottom_pane_text(&pane, 60, 15).contains("Product team"));
-                let BottomPaneAction::ViewCompleted {
-                    result: Some(result),
-                    ..
-                } = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                else {
-                    panic!("Enter should inspect the selected definition")
-                };
-                assert!(matches!(&result,
-                    crate::tui::bottom_pane::view::ViewResult::TeamConfiguration { team, .. }
-                    if team.team_id == "team-1"));
-                slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
-            }
-            let rendered = render_bottom_pane_text(&pane, 80, 24);
-            assert!(rendered.contains("Draft"), "{rendered}");
-            assert!(rendered.contains("E edit roster"), "{rendered}");
-            assert!(!rendered.contains("Start:"), "an empty draft cannot run");
-            assert_eq!(state.model.as_deref(), Some("parent-model"));
-            if name.is_none() {
-                assert!(matches!(
-                    pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-                    BottomPaneAction::ViewCompleted {
-                        result: None,
-                        reopen: Some(command)
-                    } if command == "/team"
-                ));
-            }
-        }
-        server.verify().await;
-        server.reset().await;
-        let queued = slash_dispatch::SlashBackgroundRead::Team {
-            store: crate::cli::http_team_store::HttpTeamStore::new(&api, None),
-            name: None,
-            attachment_epoch: state.session_attachment_epoch,
-        };
-        credentials
-            .profiles
-            .get_mut("default")
-            .unwrap()
-            .access_token = Some("replacement-login-token".into());
-        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let mut tasks = tokio::task::JoinSet::new();
-        dispatch_slash_background_read(queued, 8, tx, &mut tasks);
-        let completion = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            completion.effect,
-            SlashBackgroundReadEffect::Team { result: Err(_), .. }
-        ));
-        tasks.join_next().await.unwrap().unwrap();
-        assert!(
-            server.received_requests().await.unwrap().is_empty(),
-            "a queued Team read cannot borrow a replacement login"
-        );
-
-        // Continue the same real browser fixture through native editor actions
-        // and its actual HTTP writer. No new editor/test transport is involved.
-        use bottom_pane::team_editor_view::{
-            TeamEditorOperation, TeamEditorOwner, TeamEditorResponse,
-        };
-        use bottom_pane::view::ViewResult;
-        fn apply_editor_outcome(
-            outcome: AgentWorkbenchOutcome,
-            epoch: u64,
-            widget: &mut chat_widget::ChatWidget,
-            pane: &mut BottomPane,
-        ) {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(outcome).unwrap();
-            drain_agent_workbench_outcomes(
-                &mut rx,
-                Some("session-team"),
-                epoch,
-                widget,
-                pane,
-                &FrameRequester::test_dummy(),
-            );
-        }
-        credentials
-            .profiles
-            .get_mut("default")
-            .unwrap()
-            .access_token = Some("test-token".into());
-        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        for (create, status) in [
-            (true, 200),
-            (false, 200),
-            (false, 409),
-            (false, 503),
-            (true, 503),
-        ] {
-            server.reset().await;
-            let owner = TeamEditorOwner(Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
-                &api, None,
-            )));
-            let mut pane = BottomPane::new();
-            let mut widget = chat_widget::ChatWidget::new("session-team");
-            pane.composer.set_text("Unsent objective");
-            let mut loaded: astra_services::team_persistence::TeamDefinition =
-                serde_json::from_value(definition.clone()).unwrap();
-            loaded
-                .members
-                .push(astra_services::team_persistence::TeamMemberDef {
-                    agent_id: "member-stable".into(),
-                    role: "Reviewer".into(),
-                    system_prompt: Some("Review the implementation".into()),
-                    ..Default::default()
-                });
-            let result = if create {
-                ViewResult::CreateTeam {
-                    attachment_epoch: state.session_attachment_epoch,
-                    owner,
-                }
-            } else {
-                ViewResult::TeamConfiguration {
-                    team: Arc::new(loaded),
-                    attachment_epoch: state.session_attachment_epoch,
-                    owner,
-                }
-            };
-            slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
-            if !create {
-                pane.handle_key(key(KeyCode::Char('e')));
-            }
-            pane.handle_key(key(KeyCode::Enter));
-            pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-            pane.handle_paste("Renamed 团队");
-            pane.handle_key(key(KeyCode::Enter));
-            if create {
-                // An empty roster is editable, not an executable fake lead.
-                for _ in 0..2 {
-                    pane.handle_key(key(KeyCode::Down));
-                }
-                pane.handle_key(key(KeyCode::Enter));
-                pane.handle_paste("Coordinator");
-                pane.handle_key(key(KeyCode::Enter));
-                pane.handle_key(key(KeyCode::Down));
-                pane.handle_key(key(KeyCode::Enter));
-                pane.handle_paste("Coordinate the members and keep evidence.");
-                pane.handle_key(key(KeyCode::Enter));
-                for _ in 0..2 {
-                    pane.handle_key(key(KeyCode::Down));
-                }
-                pane.handle_key(key(KeyCode::Enter));
-            }
-            let pick_model = !create && status == 200;
-            if pick_model {
-                Mock::given(method("GET")).and(path("/models"))
-                    .and(wiremock::matchers::header("authorization", "Bearer test-token"))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "items": [{ "offering_id": "exact-member-offering", "access_id": "self-hosted", "access_kind": "self_hosted",
-                            "access_label": "Self-hosted", "execution_placement": "server", "name": "Friendly model",
-                            "provider": "openai", "is_active": true, "context_window": 8192, "max_completion_tokens": null,
-                            "architecture": null, "thinking_capability": null }],
-                        "next_cursor": null, "limit": 50, "total": 1, "catalog_revision": "sha256:test"
-                    }))).expect(1).mount(&server).await;
-                for _ in 0..4 {
-                    pane.handle_key(key(KeyCode::Down));
-                }
-                let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(model_request)) =
-                    pane.handle_key(key(KeyCode::Enter))
-                else {
-                    panic!("member model action")
-                };
-                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                assert!(dispatch_team_editor_request(
-                    model_request,
-                    state.session_attachment_epoch,
-                    &mut pane,
-                    tx.clone()
-                ));
-                let outcome = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                apply_editor_outcome(
-                    outcome,
-                    state.session_attachment_epoch,
-                    &mut widget,
-                    &mut pane,
-                );
-                pane.handle_key(key(KeyCode::Down));
-                let BottomPaneAction::ViewCompleted {
-                    result: Some(result),
-                    ..
-                } = pane.handle_key(key(KeyCode::Enter))
-                else {
-                    panic!("exact member result")
-                };
-                assert!(slash_dispatch::handle_team_editor_result(
-                    &result,
-                    state.session_attachment_epoch,
-                    true,
-                    &mut pane
-                ));
-                assert_eq!(state.model.as_deref(), Some("parent-model"));
-            }
-            let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(request)) =
-                pane.handle_key(save)
-            else {
-                panic!("Save keeps the editor and emits its typed request")
-            };
-            let TeamEditorOperation::Save {
-                definition: draft,
-                create: requested_create,
-            } = &request.operation
-            else {
-                panic!("save")
-            };
-            assert_eq!(*requested_create, create);
-            assert_eq!(draft.name, "Renamed 团队");
-            assert_eq!(draft.revision, 1);
-            if create {
-                assert_eq!(draft.members.len(), 1);
-                assert!(!draft.members[0].agent_id.is_empty());
-                assert_eq!(draft.members[0].role, "Coordinator");
-                assert!(draft.members[0].can_delegate);
-                assert_eq!(draft.members[0].max_delegation_depth, 1);
-                assert_eq!(
-                    draft.members[0].system_prompt.as_deref(),
-                    Some("Coordinate the members and keep evidence.")
-                );
-            }
-            if pick_model {
-                assert_eq!(
-                    draft.members[0]
-                        .model_selection
-                        .as_ref()
-                        .unwrap()
-                        .offering_id,
-                    "exact-member-offering"
-                );
-            }
-            let mut accepted = draft.as_ref().clone();
-            accepted.revision = if create { 1 } else { 2 };
-            let endpoint = if create {
-                "/teams".into()
-            } else {
-                format!("/teams/{}", draft.team_id)
-            };
-            Mock::given(method(if create { "POST" } else { "PUT" }))
-                .and(path(endpoint))
-                .and(wiremock::matchers::header(
-                    "authorization",
-                    "Bearer test-token",
-                ))
-                .respond_with(ResponseTemplate::new(status).set_body_json(&accepted))
-                .expect(1)
-                .mount(&server)
-                .await;
-            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-            // Identity fencing is independent of create/update and HTTP status.
-            // Exercise it on accepted and unconfirmed writes, not every matrix cell.
-            let check_fences = !create && matches!(status, 200 | 503);
-            if check_fences {
-                assert!(!dispatch_team_editor_request(
-                    request.clone(),
-                    state.session_attachment_epoch + 1,
-                    &mut pane,
-                    tx.clone()
-                ));
-                let _other =
-                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-                        "other",
-                        Some("owner-2"),
-                    )
-                    .unwrap();
-                assert!(!dispatch_team_editor_request(
-                    request.clone(),
-                    state.session_attachment_epoch,
-                    &mut pane,
-                    tx.clone()
-                ));
-            }
-            let request = if check_fences {
-                assert!(
-                    !pane.team_editor_pending(&request),
-                    "local credential rejection must not leave a false Saving status"
-                );
-                let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(retry)) =
-                    pane.handle_key(save)
-                else {
-                    panic!("explicit save after restoring the original owner")
-                };
-                retry
-            } else {
-                request.clone()
-            };
-            assert!(dispatch_team_editor_request(
-                request.clone(),
-                state.session_attachment_epoch,
-                &mut pane,
-                tx.clone()
-            ));
-            let AgentWorkbenchOutcome::TeamEditor(update) =
-                tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            else {
-                panic!("editor outcome")
-            };
-            assert!(
-                matches!(&update.response, TeamEditorResponse::Saved(result) if result.is_ok() == (status == 200))
-            );
-            let requests = server.received_requests().await.unwrap();
-            assert_eq!(
-                requests.len(),
-                if pick_model { 2 } else { 1 },
-                "one write, optional requested catalog, no readback or auth probe"
-            );
-            let body: serde_json::Value = requests.last().unwrap().body_json().unwrap();
-            assert_eq!(body["name"], "Renamed 团队");
-            if !create {
-                assert_eq!(body["expected_revision"], 1);
-            }
-            if check_fences {
-                let mut stale_editor = update.clone();
-                stale_editor.request.target.editor_id = uuid::Uuid::new_v4();
-                let mut stale_operation = update.clone();
-                stale_operation.request.operation_id += 1;
-                for (stale, epoch) in [
-                    (update.clone(), state.session_attachment_epoch + 1),
-                    (stale_editor, state.session_attachment_epoch),
-                    (stale_operation, state.session_attachment_epoch),
-                ] {
-                    apply_editor_outcome(
-                        AgentWorkbenchOutcome::TeamEditor(stale),
-                        epoch,
-                        &mut widget,
-                        &mut pane,
-                    );
-                    assert!(pane.team_editor_pending(&request));
-                }
-                let _other =
-                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-                        "other",
-                        Some("owner-2"),
-                    )
-                    .unwrap();
-                apply_editor_outcome(
-                    AgentWorkbenchOutcome::TeamEditor(update.clone()),
-                    state.session_attachment_epoch,
-                    &mut widget,
-                    &mut pane,
-                );
-                assert!(pane.team_editor_pending(&request));
-            }
-            apply_editor_outcome(
-                AgentWorkbenchOutcome::TeamEditor(update.clone()),
-                state.session_attachment_epoch,
-                &mut widget,
-                &mut pane,
-            );
-            assert!(!pane.team_editor_pending(&request));
-            let rendered = render_bottom_pane_text(&pane, 100, 24);
-            assert!(rendered.starts_with("Renamed "), "{rendered}");
-            let area = ratatui::layout::Rect::new(0, 0, 100, 24);
-            let mut buffer = ratatui::buffer::Buffer::empty(area);
-            pane.render(area, &mut buffer);
-            assert_eq!(buffer[(8, 0)].symbol(), "团");
-            assert_eq!(buffer[(10, 0)].symbol(), "队");
-            if status == 200 {
-                assert!(rendered.contains("Saved."), "{rendered}");
-            } else {
-                assert!(
-                    !matches!(pane.handle_key(save), BottomPaneAction::ViewAction(_)),
-                    "unconfirmed/conflicting saves are not replayed"
-                );
-                assert!(
-                    rendered.contains(if create { "Draft" } else { "Revision 1" }),
-                    "failed saves keep original revision"
-                );
-                if create {
-                    for _ in 0..5 {
-                        pane.handle_key(key(KeyCode::Up));
-                    }
-                }
-                if status == 503 {
-                    pane.handle_key(key(KeyCode::Enter));
-                    pane.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-                    pane.handle_paste("Later local edit");
-                    pane.handle_key(key(KeyCode::Enter));
-                }
-                let mut latest = accepted.clone();
-                latest.description = "Concurrent server purpose".into();
-                for _ in 0..10 {
-                    pane.handle_key(key(KeyCode::Down));
-                }
-                let observations = if status == 503 {
-                    vec![
-                        if create {
-                            None
-                        } else {
-                            Some(draft.as_ref().clone())
-                        },
-                        Some(latest),
-                        Some(accepted.clone()),
-                    ]
-                } else {
-                    vec![Some(latest)]
-                };
-                for (index, observation) in observations.iter().enumerate() {
-                    let reply = observation.as_ref().map_or_else(
-                        || ResponseTemplate::new(404),
-                        |definition| ResponseTemplate::new(200).set_body_json(definition),
-                    );
-                    Mock::given(method("GET"))
-                        .and(path(format!("/teams/{}", accepted.team_id)))
-                        .and(wiremock::matchers::header(
-                            "authorization",
-                            "Bearer test-token",
-                        ))
-                        .respond_with(reply)
-                        .up_to_n_times(1)
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                    let BottomPaneAction::ViewAction(BottomPaneViewAction::TeamEditor(refresh)) =
-                        pane.handle_key(key(KeyCode::Enter))
-                    else {
-                        panic!("explicit Refresh")
-                    };
-                    assert!(
-                        matches!(&refresh.operation, TeamEditorOperation::Refresh { team_id } if team_id == &accepted.team_id)
-                    );
-                    assert!(dispatch_team_editor_request(
-                        refresh,
-                        state.session_attachment_epoch,
-                        &mut pane,
-                        tx.clone()
-                    ));
-                    let refreshed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    apply_editor_outcome(
-                        refreshed,
-                        state.session_attachment_epoch,
-                        &mut widget,
-                        &mut pane,
-                    );
-                    let rendered = render_bottom_pane_text(&pane, 100, 24);
-                    if status == 409 {
-                        assert!(
-                            rendered.contains("Revision 1")
-                                && rendered.contains("Concurrent server purpose"),
-                            "{rendered}"
-                        );
-                    } else if index == 2 {
-                        assert!(
-                            rendered.contains("Earlier save confirmed")
-                                && rendered.contains("Later local edit"),
-                            "{rendered}"
-                        );
-                        assert!(
-                            rendered.contains(&format!("Revision {}", accepted.revision)),
-                            "{rendered}"
-                        );
-                    } else {
-                        assert!(rendered.contains("Later local edit"), "{rendered}");
-                        assert!(
-                            !rendered.contains("Keep my complete draft"),
-                            "unknown cannot offer rebase"
-                        );
-                    }
-                    if status == 409 || index < 2 {
-                        assert!(
-                            !matches!(pane.handle_key(save), BottomPaneAction::ViewAction(_)),
-                            "unknown/conflict is not replayed after a read"
-                        );
-                    }
-                    assert_eq!(
-                        server.received_requests().await.unwrap().len(),
-                        index + 2,
-                        "one failed write plus explicit exact-ID reads only; no write replay"
-                    );
-                }
-            }
-            pane.handle_key(key(KeyCode::Esc));
-            apply_editor_outcome(
-                AgentWorkbenchOutcome::TeamEditor(update),
-                state.session_attachment_epoch,
-                &mut widget,
-                &mut pane,
-            );
-            assert!(
-                !pane.has_active_view(),
-                "late acknowledgement never reopens a closed editor"
-            );
-            assert_eq!(pane.composer.text(), "Unsent objective");
-            assert_eq!(state.model.as_deref(), Some("parent-model"));
-            assert!(state.cli_context.agent_profile_selection.is_none());
-            assert!(
-                widget.history().is_empty(),
-                "configuration details stay out of the lead transcript"
-            );
-            server.verify().await;
-        }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn team_lead_picker_preserves_draft_and_changes_only_explicit_intent() {
-        use crate::tui::bottom_pane::view::ViewResult;
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        let _creds = crate::tests::isolate_credentials();
-        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-            "default",
-            Some("owner"),
-        )
-        .unwrap();
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
-        let owner = bottom_pane::team_editor_view::TeamEditorOwner(Arc::new(
-            crate::cli::http_team_store::HttpTeamStore::new(&api, None),
-        ));
-        for delegation in [[false, false], [true, false], [true, true]] {
-            let team = std::sync::Arc::new(astra_services::team_persistence::TeamDefinition {
-                team_id: "exact-team".into(),
-                user_id: "owner".into(),
-                name: "Product team".into(),
-                description: "A reusable team".into(),
-                context: Default::default(),
-                revision: 1,
-                members: ["Research", "Delivery"]
-                    .into_iter()
-                    .enumerate()
-                    .map(
-                        |(index, role)| astra_services::team_persistence::TeamMemberDef {
-                            role: role.into(),
-                            agent_id: format!("opaque-member-{index}"),
-                            can_delegate: delegation[index],
-                            ..Default::default()
-                        },
-                    )
-                    .collect(),
-            });
-            let mut state = crate::cli::session::session_state::SessionState::default();
-            state.model = Some("parent-model".into());
-            let previous = Some(astra_turn_types::AgentProfileSelection {
-                team_id: "previous-team".into(),
-                lead_agent_id: Some("previous-lead".into()),
-            });
-            state.cli_context.agent_profile_selection = previous.clone();
-            let permission = state.perm_manager.mode();
-            let mut pane = BottomPane::new();
-            pane.composer.set_text("My unfinished objective");
-            let mut widget = chat_widget::ChatWidget::new("session-team");
-            slash_dispatch::handle_view_result(
-                ViewResult::TeamConfiguration {
-                    team: team.clone(),
-                    attachment_epoch: state.session_attachment_epoch,
-                    owner: owner.clone(),
-                },
-                &mut state,
-                &mut pane,
-                &mut widget,
-            );
-            let BottomPaneAction::ViewCompleted {
-                result: Some(old_use),
-                ..
-            } = pane.handle_key(enter)
-            else {
-                panic!("editor carries the captured owner into Team intent")
-            };
-            {
-                let _other =
-                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-                        "other",
-                        Some("other-owner"),
-                    )
-                    .unwrap();
-                slash_dispatch::handle_view_result(
-                    old_use.clone(),
-                    &mut state,
-                    &mut pane,
-                    &mut widget,
-                );
-                assert_eq!(state.cli_context.agent_profile_selection, previous);
-                assert!(
-                    !pane.has_active_view(),
-                    "old owner cannot open a lead picker"
-                );
-            }
-            if delegation != [true, false] {
-                slash_dispatch::handle_view_result(old_use, &mut state, &mut pane, &mut widget);
-                let BottomPaneAction::ViewCompleted {
-                    result: Some(old_lead),
-                    ..
-                } = pane.handle_key(enter)
-                else {
-                    panic!("ambiguous lead result keeps the same captured owner")
-                };
-                let _other =
-                    crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
-                        "other",
-                        Some("other-owner"),
-                    )
-                    .unwrap();
-                slash_dispatch::handle_view_result(old_lead, &mut state, &mut pane, &mut widget);
-                assert_eq!(state.cli_context.agent_profile_selection, previous);
-                assert!(!pane.has_active_view());
-            }
-            assert_eq!(state.model.as_deref(), Some("parent-model"));
-            assert_eq!(state.perm_manager.mode(), permission);
-            assert_eq!(pane.composer.text(), "My unfinished objective");
-            for dismiss in [
-                escape,
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            ] {
-                slash_dispatch::handle_view_result(
-                    ViewResult::TeamConfiguration {
-                        team: team.clone(),
-                        attachment_epoch: state.session_attachment_epoch,
-                        owner: owner.clone(),
-                    },
-                    &mut state,
-                    &mut pane,
-                    &mut widget,
-                );
-                assert!(render_bottom_pane_text(&pane, 60, 30).contains("Enter use team"));
-                let action = pane.handle_key(dismiss);
-                if dismiss == escape {
-                    assert!(matches!(
-                        action,
-                        BottomPaneAction::ViewCompleted {
-                            result: None, reopen: Some(command),
-                        } if command == "/team"
-                    ));
-                } else {
-                    assert!(matches!(action, BottomPaneAction::Consumed));
-                    assert!(!pane.has_active_view(), "Ctrl+C closes the focused view");
-                }
-                assert_eq!(state.cli_context.agent_profile_selection, previous);
-            }
-            slash_dispatch::handle_view_result(
-                ViewResult::TeamConfiguration {
-                    team: team.clone(),
-                    attachment_epoch: state.session_attachment_epoch,
-                    owner: owner.clone(),
-                },
-                &mut state,
-                &mut pane,
-                &mut widget,
-            );
-            let BottomPaneAction::ViewCompleted {
-                result: Some(result),
-                reopen: None,
-            } = pane.handle_key(enter)
-            else {
-                panic!("explicit Enter should choose Team intent")
-            };
-            slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
-            let expected_lead = if delegation == [true, false] {
-                "opaque-member-0"
-            } else {
-                assert_eq!(state.cli_context.agent_profile_selection, previous);
-                assert!(matches!(
-                    pane.handle_key(escape),
-                    BottomPaneAction::ViewCompleted { result: None, .. }
-                ));
-                assert_eq!(state.cli_context.agent_profile_selection, previous);
-                slash_dispatch::handle_view_result(
-                    ViewResult::UseTeam {
-                        team: team.clone(),
-                        attachment_epoch: state.session_attachment_epoch,
-                        owner: owner.clone(),
-                    },
-                    &mut state,
-                    &mut pane,
-                    &mut widget,
-                );
-                for character in "Delivery".chars() {
-                    pane.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-                }
-                let BottomPaneAction::ViewCompleted {
-                    result: Some(result),
-                    ..
-                } = pane.handle_key(enter)
-                else {
-                    panic!("filtered row must retain its exact member identity")
-                };
-                slash_dispatch::handle_view_result(result, &mut state, &mut pane, &mut widget);
-                "opaque-member-1"
-            };
-            let selected = state.cli_context.agent_profile_selection.clone();
-            assert_eq!(
-                selected,
-                Some(astra_turn_types::AgentProfileSelection {
-                    team_id: "exact-team".into(),
-                    lead_agent_id: Some(expected_lead.into()),
-                })
-            );
-            assert_eq!(pane.composer.text(), "My unfinished objective");
-            assert_eq!(state.model.as_deref(), Some("parent-model"));
-            assert_eq!(state.perm_manager.mode(), permission);
-            assert!(render_bottom_pane_text(&pane, 80, 15).contains("Product team"));
-            assert!(
-                state.run_id.is_none(),
-                "selecting a team is not starting a run"
-            );
-            slash_dispatch::handle_view_result(
-                ViewResult::TeamLead {
-                    team: team.clone(),
-                    lead_agent_id: "foreign-member".into(),
-                    attachment_epoch: state.session_attachment_epoch,
-                    owner: owner.clone(),
-                },
-                &mut state,
-                &mut pane,
-                &mut widget,
-            );
-            assert_eq!(state.cli_context.agent_profile_selection, selected);
-            slash_dispatch::handle_view_result(
-                ViewResult::TeamLeave {
-                    attachment_epoch: state.session_attachment_epoch,
-                },
-                &mut state,
-                &mut pane,
-                &mut widget,
-            );
-            assert!(state.cli_context.agent_profile_selection.is_none());
-            assert_eq!(pane.composer.text(), "My unfinished objective");
-            assert_eq!(state.model.as_deref(), Some("parent-model"));
-            assert_eq!(state.perm_manager.mode(), permission);
-            assert!(!render_bottom_pane_text(&pane, 80, 15).contains("Product team"));
-            // Keep an old detail view open across an actual session rebind.
-            slash_dispatch::handle_view_result(
-                ViewResult::TeamConfiguration {
-                    team,
-                    attachment_epoch: state.session_attachment_epoch,
-                    owner: owner.clone(),
-                },
-                &mut state,
-                &mut pane,
-                &mut widget,
-            );
-            state.reset_for_new_session();
-            refresh_footer_from_state(&mut pane, &state);
-            let BottomPaneAction::ViewCompleted {
-                result: Some(stale),
-                ..
-            } = pane.handle_key(enter)
-            else {
-                panic!("retained view emits its original scope")
-            };
-            slash_dispatch::handle_view_result(stale, &mut state, &mut pane, &mut widget);
-            assert!(state.cli_context.agent_profile_selection.is_none());
-            assert!(
-                !pane.has_active_view(),
-                "stale Team intent cannot open a fresh picker"
-            );
-        }
     }
 
     #[test]

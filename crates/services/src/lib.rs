@@ -69,7 +69,6 @@ pub mod state_projection;
 pub mod state_sync;
 pub mod storage;
 pub mod sync_outbox;
-pub mod team_persistence;
 pub mod tool_invocation_ledger;
 pub mod tuning;
 pub mod turn_intent_judge;

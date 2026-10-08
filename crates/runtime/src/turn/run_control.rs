@@ -160,6 +160,8 @@ pub struct UserIntentPollIssue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserIntentApplyAck {
     Applied,
+    /// Input retains its pending custody until this execution is resumed.
+    Paused,
     /// The run terminated before application and durably returned delivery
     /// ownership to the submitting client.
     RunTerminalReturned,

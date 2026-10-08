@@ -67,37 +67,6 @@ pub(crate) enum ViewResult {
         cursor: astra_thin_client::WorkCatalogCursorV1,
     },
     InsertCommand(String),
-    /// Inspect the loaded definition without a second read or execution change.
-    TeamConfiguration {
-        team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
-        attachment_epoch: u64,
-        owner: super::team_editor_view::TeamEditorOwner,
-    },
-    CreateTeam {
-        attachment_epoch: u64,
-        owner: super::team_editor_view::TeamEditorOwner,
-    },
-    TeamMemberModel {
-        target: super::team_editor_view::TeamEditorTarget,
-        operation_id: u64,
-        agent_id: String,
-        selection: Option<astra_turn_types::ModelSelection>,
-    },
-    /// Begin choosing a lead, without starting execution or changing selection.
-    UseTeam {
-        team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
-        attachment_epoch: u64,
-        owner: super::team_editor_view::TeamEditorOwner,
-    },
-    TeamLead {
-        team: std::sync::Arc<astra_services::team_persistence::TeamDefinition>,
-        lead_agent_id: String,
-        attachment_epoch: u64,
-        owner: super::team_editor_view::TeamEditorOwner,
-    },
-    TeamLeave {
-        attachment_epoch: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,11 +140,6 @@ pub(crate) struct ViewCompletion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BottomPaneViewAction {
-    TeamEditor(super::team_editor_view::TeamEditorRequest),
-    /// Open the root conversation in the same transcript browser used for
-    /// delegated runs. The run navigator owns selection only; it never
-    /// substitutes its summary for this conversation.
-    OpenRootTranscript,
     /// Return from a focused conversation to the run navigator while keeping
     /// the conversation tab alive. If no navigator exists, the dispatcher
     /// closes the current transcript instead of inventing a parent surface.
@@ -192,16 +156,16 @@ pub(crate) enum BottomPaneViewAction {
         action: astra_thin_client::SessionRunAction,
     },
     BeginAgentGuide {
-        agent_id: String,
         agent_name: String,
         run_id: String,
         target: AgentControlTarget,
     },
     SubmitAgentGuide {
-        agent_id: String,
-        agent_name: String,
-        run_id: String,
-        target: AgentControlTarget,
+        target: crate::tui::event_loop::AgentGuideTarget,
+        content: String,
+    },
+    SubmitSessionContinuation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
         content: String,
     },
     LoadAgentTranscript {
@@ -255,27 +219,6 @@ pub(crate) trait BottomPaneView: Send {
     fn desired_height(&self, width: u16) -> u16;
     fn handle_key(&mut self, key: KeyEvent);
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
-
-    fn team_editor_pending(&self, _request: &super::team_editor_view::TeamEditorRequest) -> bool {
-        false
-    }
-
-    fn update_team_editor(
-        &mut self,
-        _update: &super::team_editor_view::TeamEditorUpdate,
-    ) -> Option<Box<dyn BottomPaneView>> {
-        None
-    }
-
-    fn select_team_member_model(
-        &mut self,
-        _target: &super::team_editor_view::TeamEditorTarget,
-        _operation_id: u64,
-        _agent_id: &str,
-        _selection: Option<astra_turn_types::ModelSelection>,
-    ) -> bool {
-        false
-    }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         CancellationEvent::Escalate
@@ -348,10 +291,11 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     /// Refresh the current local root suffix without promoting it to durable
-    /// history. Only the durable root transcript browser consumes this; the
-    /// local fallback browser already receives the full live snapshot.
+    /// history. The whole-session browser and exact-run tabs consume the same
+    /// update; exact-run tabs require its matching session/run binding.
     fn refresh_root_transcript_live(
         &mut self,
+        _binding: Option<(&str, &str)>,
         _item: Option<crate::tui::bottom_pane::transcript_view::TranscriptItem>,
     ) -> bool {
         false

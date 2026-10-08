@@ -1297,22 +1297,28 @@ mod tests {
                     assert!(source.get("x-astra-discovery-summary").is_none());
                 }
                 let profiles = if selected["name"] == "agent" {
-                    vec![&parameters["agent_type"]]
+                    vec![("/properties/agent_type", &parameters["agent_type"])]
                 } else {
                     vec![
-                        &parameters["defaults"]["properties"]["agent_type"],
-                        &parameters["slots"]["items"]["properties"]["agent_type"],
+                        (
+                            "/properties/defaults/properties/agent_type",
+                            &parameters["defaults"]["properties"]["agent_type"],
+                        ),
+                        (
+                            "/properties/slots/items/properties/agent_type",
+                            &parameters["slots"]["items"]["properties"]["agent_type"],
+                        ),
                     ]
                 };
-                for profile in profiles {
-                    let description = profile["description"].as_str().unwrap();
-                    for constraint in [
-                        "Directory: exact ID required",
-                        "absent: omit (read-only)",
-                        "No file discovery",
-                    ] {
-                        assert!(description.contains(constraint), "{query}: {description}");
-                    }
+                let source = schemas
+                    .iter()
+                    .find(|schema| super::tool_schema_name(schema) == selected["name"].as_str())
+                    .unwrap();
+                let source_parameters = &source["function"]["parameters"];
+                for (path, profile) in profiles {
+                    let mut expected = source_parameters.pointer(path).unwrap().clone();
+                    super::compact_parameter_descriptions(&mut expected, false);
+                    assert_eq!(profile, &expected, "{query}: {path}");
                     assert!(profile.get("x-astra-discovery-summary").is_none());
                 }
             }

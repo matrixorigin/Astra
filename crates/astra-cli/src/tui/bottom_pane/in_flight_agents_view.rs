@@ -1,8 +1,7 @@
 //! Interactive agent-run navigator.
 //!
-//! When multiple sub-agents are running in parallel (the model spawned
-//! N agent spawn actions in one turn), the user presses `Ctrl+G` to
-//! open this view: a vertical list of every run with its description, lineage,
+//! For observed conversation roots and delegated runs, `Ctrl+G` opens
+//! a vertical list of every run with its description, lineage,
 //! typed activity counts, and elapsed time. ↑↓ navigates, Enter opens the
 //! selected run's complete conversation in the shared `TranscriptView`,
 //! Esc/← closes.
@@ -27,7 +26,7 @@ use super::view::{
 };
 use crate::tui::agent_run_projection::{
     AgentActivityCounts, AgentControlTarget, AgentProjectionConfidence, AgentProjectionSource,
-    AgentRunState, AgentRunStatus, AgentTranscriptTarget,
+    AgentRunKind, AgentRunState, AgentRunStatus, AgentTranscriptTarget,
 };
 use crate::tui::server_agent_observer::ServerAgentTruthState;
 
@@ -42,6 +41,7 @@ pub(crate) struct AgentFanoutMembership {
 
 #[derive(Clone)]
 pub(crate) struct AgentRow {
+    pub kind: AgentRunKind,
     pub agent_id: String,
     pub name: String,
     pub spawn_tool_call_id: Option<String>,
@@ -66,9 +66,6 @@ pub(crate) struct AgentRow {
 #[derive(Clone, Default)]
 pub(crate) struct AgentMonitorSnapshot {
     pub rows: Vec<AgentRow>,
-    /// The full workbench navigator includes the main conversation as the
-    /// root of the run tree. Compact activity strips intentionally omit it.
-    pub show_root_conversation: bool,
     /// Health of the durable-server observation lane. This is independent of
     /// local rows: an empty failed read must not masquerade as "no agents".
     pub server_truth_state: crate::tui::server_agent_observer::ServerAgentTruthState,
@@ -82,15 +79,13 @@ impl AgentMonitorSnapshot {
     pub(crate) fn complete(rows: Vec<AgentRow>) -> Self {
         Self {
             rows,
-            show_root_conversation: false,
             server_truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Unbound,
             durable_snapshot_truncated: false,
         }
     }
 
     pub(crate) fn should_open(&self) -> bool {
-        self.show_root_conversation
-            || !self.rows.is_empty()
+        !self.rows.is_empty()
             || matches!(
                 self.server_truth_state,
                 crate::tui::server_agent_observer::ServerAgentTruthState::Loading
@@ -147,16 +142,22 @@ impl AgentRow {
         self.control_target.as_ref()
     }
 
-    fn guide_target(&self) -> Option<(&AgentControlTarget, &str)> {
-        if !self.state.is_actionable_active()
-            || !matches!(
-                self.state.status,
-                AgentRunStatus::Running | AgentRunStatus::Waiting
-            )
-        {
+    pub(crate) fn guide_target(&self) -> Option<(&AgentControlTarget, &str)> {
+        if !self.state.is_actionable_active() {
             return None;
         }
         let target = self.control_target.as_ref()?;
+        let accepts_guidance = matches!(
+            self.state.status,
+            AgentRunStatus::Running | AgentRunStatus::Waiting
+        ) || (self.state.status == AgentRunStatus::Paused
+            && matches!(target, AgentControlTarget::DurableRun { .. })
+            && self
+                .target_for_action(astra_thin_client::SessionRunAction::Resume)
+                .is_some());
+        if !accepts_guidance {
+            return None;
+        }
         let run_id = match target {
             AgentControlTarget::DurableRun { run_id } => run_id.as_str(),
             AgentControlTarget::LocalAgent { .. } => self.run_id.as_deref()?,
@@ -169,34 +170,29 @@ pub(crate) struct InFlightAgentsView {
     rows: Vec<AgentRow>,
     hidden_terminal_rows: Vec<(usize, AgentRow)>,
     show_history: bool,
-    show_root_conversation: bool,
     server_truth_state: crate::tui::server_agent_observer::ServerAgentTruthState,
     durable_snapshot_truncated: bool,
     live_count: usize,
     failed_count: usize,
     uncertain_count: usize,
-    /// `ROOT_SELECTION` means the main conversation. Every other value is a
-    /// stable index into `rows` for the duration of a snapshot.
+    /// Stable index into the current visible rows.
     selected: usize,
     completed: bool,
     pending_action: Option<ViewActionRequest>,
 }
 
 impl InFlightAgentsView {
-    const ROOT_SELECTION: usize = usize::MAX;
-
     pub fn new(snapshot: impl Into<AgentMonitorSnapshot>) -> Self {
         let mut view = Self {
             rows: Vec::new(),
             hidden_terminal_rows: Vec::new(),
             show_history: false,
-            show_root_conversation: false,
             server_truth_state: ServerAgentTruthState::Unbound,
             durable_snapshot_truncated: false,
             live_count: 0,
             failed_count: 0,
             uncertain_count: 0,
-            selected: Self::ROOT_SELECTION,
+            selected: 0,
             completed: false,
             pending_action: None,
         };
@@ -213,7 +209,6 @@ impl InFlightAgentsView {
         }
         self.replace_snapshot(AgentMonitorSnapshot {
             rows,
-            show_root_conversation: self.show_root_conversation,
             server_truth_state: self.server_truth_state,
             durable_snapshot_truncated: self.durable_snapshot_truncated,
         });
@@ -227,11 +222,9 @@ impl InFlightAgentsView {
     fn replace_snapshot(&mut self, snapshot: AgentMonitorSnapshot) {
         let AgentMonitorSnapshot {
             rows,
-            show_root_conversation,
             server_truth_state,
             durable_snapshot_truncated,
         } = snapshot;
-        let preserve_root_selection = self.selected == Self::ROOT_SELECTION;
         let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
         // Keep terminal ancestors of live/uncertain descendants so filtering
         // history never severs the visible run tree. This is presentation only.
@@ -275,19 +268,10 @@ impl InFlightAgentsView {
         self.hidden_terminal_rows = hidden;
         let rows: Vec<_> = rows.into_iter().map(|(_, row)| row).collect();
         let (live_count, failed_count, uncertain_count) = count_rows(&rows);
-        self.selected = if preserve_root_selection && show_root_conversation {
-            Self::ROOT_SELECTION
-        } else {
-            selected_id
-                .and_then(|id| rows.iter().position(|row| row.agent_id == id))
-                .unwrap_or(if show_root_conversation {
-                    Self::ROOT_SELECTION
-                } else {
-                    0
-                })
-        };
+        self.selected = selected_id
+            .and_then(|id| rows.iter().position(|row| row.agent_id == id))
+            .unwrap_or(0);
         self.rows = rows;
-        self.show_root_conversation = show_root_conversation;
         self.server_truth_state = server_truth_state;
         self.durable_snapshot_truncated = durable_snapshot_truncated;
         self.live_count = live_count;
@@ -299,11 +283,7 @@ impl InFlightAgentsView {
         if self.rows.is_empty() {
             return;
         }
-        self.selected = if self.selected == Self::ROOT_SELECTION {
-            self.rows.len() - 1
-        } else if self.selected == 0 && self.show_root_conversation {
-            Self::ROOT_SELECTION
-        } else if self.selected == 0 {
+        self.selected = if self.selected == 0 {
             self.rows.len() - 1
         } else {
             self.selected - 1
@@ -314,28 +294,15 @@ impl InFlightAgentsView {
         if self.rows.is_empty() {
             return;
         }
-        self.selected = if self.selected == Self::ROOT_SELECTION {
-            0
-        } else if self.selected + 1 >= self.rows.len() && self.show_root_conversation {
-            Self::ROOT_SELECTION
-        } else {
-            (self.selected + 1) % self.rows.len()
-        };
+        self.selected = (self.selected + 1) % self.rows.len();
     }
 
     fn move_page_up(&mut self) {
-        if self.selected == Self::ROOT_SELECTION {
-            return;
-        }
         self.selected = self.selected.saturating_sub(PAGE_STEP);
     }
 
     fn move_page_down(&mut self) {
         if self.rows.is_empty() {
-            return;
-        }
-        if self.selected == Self::ROOT_SELECTION {
-            self.selected = PAGE_STEP.min(self.rows.len().saturating_sub(1));
             return;
         }
         self.selected = self
@@ -352,16 +319,6 @@ impl InFlightAgentsView {
     }
 
     fn accept(&mut self) {
-        if self.selected == Self::ROOT_SELECTION {
-            self.pending_action = Some(ViewActionRequest {
-                action: BottomPaneViewAction::OpenRootTranscript,
-                // Keep the navigator below the conversation. Left/Esc
-                // returns to the exact tree selection rather than treating
-                // this transcript as an expanded task detail.
-                disposition: ViewActionDisposition::KeepOpen,
-            });
-            return;
-        }
         if let Some(row) = self.rows.get(self.selected) {
             self.pending_action = Some(ViewActionRequest {
                 action: BottomPaneViewAction::InspectAgent {
@@ -435,7 +392,6 @@ impl InFlightAgentsView {
         };
         self.pending_action = Some(ViewActionRequest {
             action: BottomPaneViewAction::BeginAgentGuide {
-                agent_id: row.agent_id.clone(),
                 agent_name: row.name.clone(),
                 run_id: run_id.to_string(),
                 target: target.clone(),
@@ -473,12 +429,13 @@ impl InFlightAgentsView {
 fn count_rows(rows: &[AgentRow]) -> (usize, usize, usize) {
     let live_count = rows
         .iter()
-        .filter(|row| row.state.is_actionable_active())
+        .filter(|row| row.kind == AgentRunKind::Agent && row.state.is_actionable_active())
         .count();
     let failed_count = rows
         .iter()
         .filter(|row| {
-            row.state.status.is_failure()
+            row.kind == AgentRunKind::Agent
+                && row.state.status.is_failure()
                 && !matches!(
                     row.state.confidence,
                     AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
@@ -488,10 +445,11 @@ fn count_rows(rows: &[AgentRow]) -> (usize, usize, usize) {
     let uncertain_count = rows
         .iter()
         .filter(|row| {
-            matches!(
-                row.state.confidence,
-                AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
-            )
+            row.kind == AgentRunKind::Agent
+                && matches!(
+                    row.state.confidence,
+                    AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+                )
         })
         .count();
     (live_count, failed_count, uncertain_count)
@@ -511,7 +469,6 @@ struct FanoutHeader {
 }
 
 enum AgentListEntry<'a> {
-    RootConversation,
     FanoutHeader(FanoutHeader),
     Row {
         row_idx: usize,
@@ -523,17 +480,14 @@ enum AgentListEntry<'a> {
 impl AgentListEntry<'_> {
     fn row_index(&self) -> Option<usize> {
         match self {
-            AgentListEntry::RootConversation | AgentListEntry::FanoutHeader(_) => None,
+            AgentListEntry::FanoutHeader(_) => None,
             AgentListEntry::Row { row_idx, .. } => Some(*row_idx),
         }
     }
 }
 
-fn agent_list_entries(rows: &[AgentRow], show_root_conversation: bool) -> Vec<AgentListEntry<'_>> {
-    let mut entries = Vec::with_capacity(rows.len() + usize::from(show_root_conversation));
-    if show_root_conversation {
-        entries.push(AgentListEntry::RootConversation);
-    }
+fn agent_list_entries(rows: &[AgentRow]) -> Vec<AgentListEntry<'_>> {
+    let mut entries = Vec::with_capacity(rows.len());
     let mut rendered = vec![false; rows.len()];
 
     for idx in 0..rows.len() {
@@ -659,12 +613,17 @@ impl BottomPaneView for InFlightAgentsView {
         let live = self.live_count;
         let failed = self.failed_count;
         let uncertain = self.uncertain_count;
-        let attention = self.rows.iter().filter(|row| row.has_attention()).count();
+        let attention = self
+            .rows
+            .iter()
+            .filter(|row| row.kind == AgentRunKind::Agent && row.has_attention())
+            .count();
         let waiting = self
             .rows
             .iter()
             .filter(|row| {
-                row.state.status == AgentRunStatus::Waiting
+                row.kind == AgentRunKind::Agent
+                    && row.state.status == AgentRunStatus::Waiting
                     && !matches!(
                         row.state.confidence,
                         AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
@@ -675,7 +634,8 @@ impl BottomPaneView for InFlightAgentsView {
             .rows
             .iter()
             .filter(|row| {
-                row.state.status == AgentRunStatus::Paused
+                row.kind == AgentRunKind::Agent
+                    && row.state.status == AgentRunStatus::Paused
                     && !matches!(
                         row.state.confidence,
                         AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
@@ -687,7 +647,8 @@ impl BottomPaneView for InFlightAgentsView {
             .rows
             .iter()
             .filter(|row| {
-                row.state.status == AgentRunStatus::Completed
+                row.kind == AgentRunKind::Agent
+                    && row.state.status == AgentRunStatus::Completed
                     && !matches!(
                         row.state.confidence,
                         AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
@@ -698,13 +659,15 @@ impl BottomPaneView for InFlightAgentsView {
             .rows
             .iter()
             .filter(|row| {
-                matches!(
-                    row.state.status,
-                    AgentRunStatus::Interrupted | AgentRunStatus::Cancelled
-                ) && !matches!(
-                    row.state.confidence,
-                    AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
-                )
+                row.kind == AgentRunKind::Agent
+                    && matches!(
+                        row.state.status,
+                        AgentRunStatus::Interrupted | AgentRunStatus::Cancelled
+                    )
+                    && !matches!(
+                        row.state.confidence,
+                        AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+                    )
             })
             .count();
         let mut counts = Vec::new();
@@ -741,7 +704,11 @@ impl BottomPaneView for InFlightAgentsView {
             ServerAgentTruthState::Unavailable => counts.push("server unavailable".to_string()),
             ServerAgentTruthState::Unbound | ServerAgentTruthState::Confirmed => {}
         }
-        let header_label = if self.show_root_conversation {
+        let header_label = if self
+            .rows
+            .iter()
+            .any(|row| row.kind == AgentRunKind::ConversationRoot)
+        {
             "Conversations"
         } else {
             "Agent runs"
@@ -754,7 +721,7 @@ impl BottomPaneView for InFlightAgentsView {
         let header = Line::from(Span::styled(header_text, title_style));
         buf.set_line(area.x, area.y, &header, area.width);
 
-        if self.rows.is_empty() && !self.show_root_conversation {
+        if self.rows.is_empty() {
             let (message, style) = match self.server_truth_state {
                 ServerAgentTruthState::Loading => (
                     "  Loading durable agent state…",
@@ -791,46 +758,14 @@ impl BottomPaneView for InFlightAgentsView {
             .height
             .saturating_sub(1)
             .saturating_sub(detail_h as u16) as usize;
-        let entries = agent_list_entries(&self.rows, self.show_root_conversation);
+        let entries = agent_list_entries(&self.rows);
         let selected_entry = entries
             .iter()
-            .position(|entry| {
-                matches!(entry, AgentListEntry::RootConversation)
-                    .then_some(Self::ROOT_SELECTION)
-                    .or_else(|| entry.row_index())
-                    == Some(self.selected)
-            })
+            .position(|entry| entry.row_index() == Some(self.selected))
             .unwrap_or(0);
         let window_start = selected_entry.saturating_add(1).saturating_sub(body_h);
         for (i, entry) in entries.iter().skip(window_start).take(body_h).enumerate() {
             let line = match entry {
-                AgentListEntry::RootConversation => {
-                    let selected = self.selected == Self::ROOT_SELECTION;
-                    let marker = if selected { "› " } else { "  " };
-                    Line::from(vec![
-                        Span::styled(
-                            marker.to_string(),
-                            if selected {
-                                Style::default()
-                                    .fg(theme.accent)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                dim
-                            },
-                        ),
-                        Span::styled(
-                            "Main conversation".to_string(),
-                            if selected {
-                                Style::default()
-                                    .fg(theme.accent)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(theme.accent)
-                            },
-                        ),
-                        Span::styled(" · root · transcript".to_string(), dim),
-                    ])
-                }
                 AgentListEntry::FanoutHeader(header) => fanout_header_line(header, dim),
                 AgentListEntry::Row {
                     row_idx,
@@ -845,7 +780,8 @@ impl BottomPaneView for InFlightAgentsView {
                     } else {
                         format!("{}. {}", row_idx + 1, row.name)
                     };
-                    let label = format!("{}{label}", lineage_prefix(row.depth));
+                    let label =
+                        format!("{}{label}", lineage_prefix(visible_depth(row, &self.rows)));
                     let content_width = usize::from(area.width).saturating_sub(2);
                     let meta_budget = content_width.saturating_sub(11);
                     let meta = row_meta_for_width(row, meta_budget);
@@ -890,20 +826,7 @@ impl BottomPaneView for InFlightAgentsView {
             };
             buf.set_line(area.x, body_y + i as u16, &line, area.width);
         }
-        if detail_h > 0 && self.selected == Self::ROOT_SELECTION {
-            let detail_y = body_y + body_h as u16;
-            for (offset, text) in root_conversation_detail().into_iter().enumerate() {
-                let line = Line::from(Span::styled(
-                    truncate_to_width(&text, usize::from(area.width)),
-                    if offset == 0 {
-                        Style::default().fg(theme.accent)
-                    } else {
-                        dim
-                    },
-                ));
-                buf.set_line(area.x, detail_y + offset as u16, &line, area.width);
-            }
-        } else if detail_h > 0
+        if detail_h > 0
             && let Some(row) = self.rows.get(self.selected)
         {
             let detail_y = body_y + body_h as u16;
@@ -923,10 +846,8 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        let rows = agent_list_entries(&self.rows, self.show_root_conversation)
-            .len()
-            .max(1);
-        (rows as u16).saturating_add(3).min(12)
+        let rows = agent_list_entries(&self.rows).len().max(1);
+        (rows as u16).saturating_add(3).clamp(5, 12)
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -937,11 +858,7 @@ impl BottomPaneView for InFlightAgentsView {
             KeyCode::PageUp => self.move_page_up(),
             KeyCode::PageDown => self.move_page_down(),
             KeyCode::Home => {
-                self.selected = if self.show_root_conversation {
-                    Self::ROOT_SELECTION
-                } else {
-                    0
-                }
+                self.selected = 0;
             }
             KeyCode::End if !self.rows.is_empty() => self.selected = self.rows.len() - 1,
             KeyCode::Char(ch) if ('1'..='9').contains(&ch) => self.select_number(ch as u8 - b'0'),
@@ -998,7 +915,7 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        if self.rows.is_empty() && !self.show_root_conversation {
+        if self.rows.is_empty() {
             let hint = if self.server_truth_state != ServerAgentTruthState::Unbound {
                 "R refresh · ←/Esc close"
             } else {
@@ -1052,6 +969,23 @@ impl BottomPaneView for InFlightAgentsView {
 }
 
 use crate::cli::effects::truncate_label;
+
+fn visible_depth(row: &AgentRow, rows: &[AgentRow]) -> u32 {
+    let mut depth = 1;
+    let mut parent = row.parent_run_id.as_deref();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(id) = parent {
+        if !visited.insert(id) {
+            return 1;
+        }
+        let Some(ancestor) = rows.iter().find(|row| row.run_id.as_deref() == Some(id)) else {
+            break;
+        };
+        depth += 1;
+        parent = ancestor.parent_run_id.as_deref();
+    }
+    depth
+}
 
 fn lineage_prefix(depth: u32) -> String {
     if depth <= 1 {
@@ -1213,20 +1147,6 @@ fn transcript_run_id(row: &AgentRow) -> Option<&str> {
         Some(AgentControlTarget::DurableRun { run_id }) if !run_id.is_empty() => Some(run_id),
         _ => row.run_id.as_deref().filter(|run_id| !run_id.is_empty()),
     }
-}
-
-fn root_conversation_detail() -> [String; 2] {
-    let glyphs = crate::tui::glyphs::current();
-    [
-        format!(
-            "  {} root conversation · current session",
-            glyphs.detail_branch
-        ),
-        format!(
-            "  {} Enter opens the same transcript browser as every delegated run",
-            glyphs.detail_last
-        ),
-    ]
 }
 
 fn provenance_label(source: AgentProjectionSource) -> &'static str {
@@ -1421,6 +1341,7 @@ mod tests {
     fn rows(n: usize) -> Vec<AgentRow> {
         (0..n)
             .map(|i| AgentRow {
+                kind: AgentRunKind::Agent,
                 agent_id: format!("agent-{i}"),
                 name: format!("task {i}"),
                 spawn_tool_call_id: None,
@@ -1530,7 +1451,7 @@ mod tests {
         assert_eq!(view.rows[0].agent_id, "agent-1");
         view.handle_key(key(KeyCode::Char('h')));
         assert_eq!(
-            agent_list_entries(&view.rows, false)
+            agent_list_entries(&view.rows)
                 .iter()
                 .filter(|entry| matches!(entry, AgentListEntry::FanoutHeader(_)))
                 .count(),
@@ -1554,30 +1475,95 @@ mod tests {
     }
 
     #[test]
-    fn workbench_root_is_a_transcript_entry_not_a_status_summary() {
+    fn workbench_root_is_an_exact_run_not_a_synthetic_navigation_entry() {
+        let mut root = rows(1).remove(0);
+        root.kind = AgentRunKind::ConversationRoot;
+        root.name = "Main conversation".into();
+        root.parent_run_id = None;
+        root.depth = 0;
+        root.state = AgentRunState::confirmed_server(AgentRunStatus::Running);
+        root.control_target = Some(AgentControlTarget::DurableRun {
+            run_id: "run-0".into(),
+        });
+        root.transcript_target = Some(AgentTranscriptTarget::DurableServer);
+        root.available_actions = vec![
+            astra_thin_client::SessionRunAction::Pause,
+            astra_thin_client::SessionRunAction::Cancel,
+        ];
+        assert_eq!(count_rows(std::slice::from_ref(&root)), (0, 0, 0));
         let snapshot = AgentMonitorSnapshot {
-            show_root_conversation: true,
+            rows: vec![root],
             ..AgentMonitorSnapshot::default()
         };
         assert!(snapshot.should_open());
         let mut view = InFlightAgentsView::new(snapshot);
-        assert_eq!(view.selected, InFlightAgentsView::ROOT_SELECTION);
+        assert_eq!(view.selected, 0);
         let rendered = render(&view, 90, 5);
         assert!(rendered.contains("Conversations"), "{rendered}");
         assert!(rendered.contains("Main conversation"), "{rendered}");
-        assert!(rendered.contains("same transcript browser"), "{rendered}");
-        assert_eq!(
-            view.hint_keys().as_deref(),
-            Some("↑↓ move · Enter/→ transcript · ←/Esc close")
-        );
 
         view.handle_key(key(KeyCode::Enter));
         assert_eq!(
             view.take_action_request(),
             Some(ViewActionRequest {
-                action: BottomPaneViewAction::OpenRootTranscript,
+                action: BottomPaneViewAction::InspectAgent {
+                    agent_id: "agent-0".into(),
+                    agent_name: "Main conversation".into(),
+                    run_id: Some("run-0".into()),
+                    transcript_target: Some(AgentTranscriptTarget::DurableServer),
+                },
                 disposition: ViewActionDisposition::KeepOpen,
             })
+        );
+        for (key_code, action) in [
+            (
+                KeyCode::Char('p'),
+                astra_thin_client::SessionRunAction::Pause,
+            ),
+            (
+                KeyCode::Char('x'),
+                astra_thin_client::SessionRunAction::Cancel,
+            ),
+        ] {
+            view.handle_key(key(key_code));
+            assert_eq!(
+                view.take_action_request(),
+                Some(ViewActionRequest {
+                    action: BottomPaneViewAction::ControlAgent {
+                        agent_id: "agent-0".into(),
+                        target: AgentControlTarget::DurableRun {
+                            run_id: "run-0".into()
+                        },
+                        action,
+                    },
+                    disposition: ViewActionDisposition::KeepOpen,
+                })
+            );
+        }
+        for action in [
+            astra_thin_client::SessionRunAction::Resume,
+            astra_thin_client::SessionRunAction::ContinueSession,
+        ] {
+            view.rows[0].state = AgentRunState::confirmed_server(AgentRunStatus::Paused);
+            view.rows[0].available_actions = vec![action];
+            view.handle_key(key(KeyCode::Char('p')));
+            assert!(
+                matches!(view.take_action_request(), Some(ViewActionRequest {
+                action: BottomPaneViewAction::ControlAgent {
+                    target: AgentControlTarget::DurableRun { run_id }, action: selected, ..
+                }, ..
+            }) if run_id == "run-0" && selected == action)
+            );
+        }
+        view.rows[0].state.mark_stale_if_active();
+        view.handle_key(key(KeyCode::Char('p')));
+        assert!(view.take_action_request().is_none());
+        // Observation remains possible when controls are stale.
+        view.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(view.take_action_request(), Some(ViewActionRequest {
+            action: BottomPaneViewAction::InspectAgent { run_id: Some(run_id), .. }, ..
+        }) if run_id == "run-0")
         );
     }
 
@@ -1806,7 +1792,6 @@ mod tests {
             view.take_action_request(),
             Some(ViewActionRequest {
                 action: BottomPaneViewAction::BeginAgentGuide {
-                    agent_id: "agent-0".into(),
                     agent_name: "Reviewer".into(),
                     run_id: "durable-run-1".into(),
                     target: AgentControlTarget::DurableRun {
@@ -1861,7 +1846,7 @@ mod tests {
             }) if agent_id == "agent-0"
         ));
 
-        // Paused durable runs still cannot apply a new model-boundary intent.
+        // Only a retained, resumable durable executor can queue paused guidance.
         let mut paused_rows = rows(1);
         paused_rows[0].state = AgentRunState::confirmed_server(AgentRunStatus::Paused);
         paused_rows[0].control_target = Some(AgentControlTarget::DurableRun {
@@ -1871,6 +1856,20 @@ mod tests {
         assert!(!paused.hint_keys().unwrap().contains("guide"));
         paused.handle_key(key(KeyCode::Char('g')));
         assert!(paused.take_action_request().is_none());
+        paused.rows[0].available_actions = vec![astra_thin_client::SessionRunAction::Resume];
+        assert!(paused.hint_keys().unwrap().contains("G guide"));
+        paused.handle_key(key(KeyCode::Char('g')));
+        assert!(
+            matches!(paused.take_action_request(), Some(ViewActionRequest {
+            action: BottomPaneViewAction::BeginAgentGuide {
+                target: AgentControlTarget::DurableRun { run_id }, ..
+            }, ..
+        }) if run_id == "durable-run-1")
+        );
+        paused.rows[0].available_actions =
+            vec![astra_thin_client::SessionRunAction::ContinueSession];
+        assert!(!paused.hint_keys().unwrap().contains("guide"));
+        assert!(paused.rows[0].guide_target().is_none());
     }
 
     #[test]
@@ -2186,6 +2185,15 @@ mod tests {
         hierarchy[1].parent_run_id = parent_run_id;
         hierarchy[1].depth = 2;
 
+        assert_eq!(visible_depth(&hierarchy[0], &hierarchy), 1);
+        assert_eq!(visible_depth(&hierarchy[1], &hierarchy), 2);
+        hierarchy[1].depth = 7;
+        assert_eq!(visible_depth(&hierarchy[1], &hierarchy), 2);
+        assert_eq!(
+            hierarchy[1].depth, 7,
+            "presentation does not rewrite canonical metadata"
+        );
+
         let out = render(&InFlightAgentsView::new(hierarchy), 100, 6);
 
         assert!(out.contains("3 tools"), "{out}");
@@ -2215,6 +2223,7 @@ mod tests {
     fn selected_runtime_detail_lists_only_the_selected_runs_actionable_controls() {
         let mut row = rows(1).remove(0);
         row.state = AgentRunState::confirmed_server(AgentRunStatus::Running);
+        row.run_id = Some("durable-run-1".into());
         row.control_target = Some(AgentControlTarget::DurableRun {
             run_id: "durable-run-1".into(),
         });
@@ -2223,8 +2232,11 @@ mod tests {
             astra_thin_client::SessionRunAction::Cancel,
         ];
 
-        let detail = selected_runtime_detail(&row).join("\n");
+        let view = InFlightAgentsView::new(vec![row]);
+        let detail = render(&view, 120, view.desired_height(120));
 
+        assert!(detail.contains("task 0"), "{detail}");
+        assert!(detail.contains("run durable-run-1"), "{detail}");
         assert!(detail.contains("pause available (P)"), "{detail}");
         assert!(detail.contains("stop available (X)"), "{detail}");
         assert!(detail.contains("guide available (G)"), "{detail}");
@@ -2245,7 +2257,6 @@ mod tests {
         };
         let snapshot = AgentMonitorSnapshot {
             rows: partial,
-            show_root_conversation: false,
             server_truth_state: ServerAgentTruthState::Confirmed,
             durable_snapshot_truncated: true,
         };

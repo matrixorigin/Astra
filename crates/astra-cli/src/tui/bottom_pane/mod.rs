@@ -16,7 +16,6 @@ pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
-pub(crate) mod team_editor_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
@@ -72,6 +71,28 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+enum ModelCatalogState {
+    Ready(Vec<astra_services::ModelListItemResponse>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NextTurnSubmission {
+    Interactive(String),
+    Conversation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        content: String,
+    },
+}
+
+impl NextTurnSubmission {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Interactive(text) => text,
+            Self::Conversation { content, .. } => content,
+        }
+    }
+}
+
 pub(crate) struct BottomPane {
     pub composer: ChatComposer,
     pub footer: Footer,
@@ -100,12 +121,13 @@ pub(crate) struct BottomPane {
     /// User messages accepted after visible output ended but before the
     /// current turn has committed its canonical boundary. These are next-turn
     /// submissions, not guidance for the previous run.
-    queued_next_turn_submissions: std::collections::VecDeque<String>,
+    queued_next_turn_submissions: std::collections::VecDeque<NextTurnSubmission>,
     applied_user_intent_ids: std::collections::HashSet<String>,
     /// Typed actions emitted while a retained projection refreshes. These are
     /// not user-input events: for example, a live agent transcript upgrades
     /// itself once a later receipt supplies its durable history location.
     projection_actions: std::collections::VecDeque<BottomPaneViewAction>,
+    model_catalog: Option<ModelCatalogState>,
     /// True when the user pressed Esc/Ctrl+C to interrupt the current
     /// run and terminal settlement is pending. The queue panel reflects
     /// this intermediate state so the user isn't stuck wondering why
@@ -178,9 +200,7 @@ enum PendingUserIntentCustody {
 pub(crate) enum PendingUserIntentTarget {
     ActiveRun,
     AgentRun {
-        run_id: String,
-        agent_name: String,
-        attachment_epoch: u64,
+        target: crate::tui::event_loop::AgentGuideTarget,
     },
 }
 
@@ -190,7 +210,8 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             PendingUserIntentTarget::ActiveRun => {
                 "Guidance delivery uncertain · stable identity retained".to_string()
             }
-            PendingUserIntentTarget::AgentRun { agent_name, .. } => {
+            PendingUserIntentTarget::AgentRun { target } => {
+                let agent_name = target.agent_name();
                 let phase = if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote {
                     "application"
                 } else {
@@ -202,21 +223,21 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
     }
     match (&intent.target, intent.status) {
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::AcceptedLocal,
-        ) => format!("Sending guidance to {agent_name}"),
+        ) => format!("Sending guidance to {}", target.agent_name()),
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::AcceptedRemote,
-        ) => format!("Guidance accepted by {agent_name} · awaiting application"),
+        ) => format!("Guidance accepted by {} · awaiting application", target.agent_name()),
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::Applied,
-        ) => format!("Guidance applied by {agent_name}"),
+        ) => format!("Guidance applied by {}", target.agent_name()),
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::Returned,
-        ) => format!("Guidance returned by {agent_name}"),
+        ) => format!("Guidance returned by {}", target.agent_name()),
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::AcceptedLocal) => {
             "Sending guidance · awaiting server acceptance".to_string()
         }
@@ -278,6 +299,7 @@ impl BottomPane {
             queued_next_turn_submissions: std::collections::VecDeque::new(),
             applied_user_intent_ids: std::collections::HashSet::new(),
             projection_actions: std::collections::VecDeque::new(),
+            model_catalog: None,
             interrupt_pending: false,
             staged_permission_mode: None,
         }
@@ -399,21 +421,15 @@ impl BottomPane {
     pub fn accept_agent_guide(
         &mut self,
         intent_id: String,
-        run_id: String,
-        agent_name: String,
+        target: crate::tui::event_loop::AgentGuideTarget,
         text: String,
-        attachment_epoch: u64,
     ) -> bool {
         self.accept_user_intent_for_target(
             intent_id,
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
             text,
-            PendingUserIntentTarget::AgentRun {
-                run_id,
-                agent_name,
-                attachment_epoch,
-            },
+            PendingUserIntentTarget::AgentRun { target },
         )
         .is_ok()
     }
@@ -476,9 +492,18 @@ impl BottomPane {
         true
     }
 
-    /// Record an ownership ambiguity after the request crossed the transport
-    /// boundary. It is neither safe to claim remote acceptance nor safe to
-    /// replay the content as a new turn.
+    /// Stop detached observation without changing the run's delivery custody.
+    pub(crate) fn retire_detached_agent_observations(&self, session_id: Option<&str>, epoch: u64) {
+        for intent in &self.pending_user_intents {
+            if let PendingUserIntentTarget::AgentRun { target } = &intent.target
+                && !target.is_attached(session_id, epoch)
+            {
+                target.retire_observation();
+            }
+        }
+    }
+
+    /// Record transport ambiguity without reclaiming or resending the input.
     pub fn mark_user_intent_unconfirmed(&mut self, intent_id: &str) -> bool {
         let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
             intent.intent_id == intent_id
@@ -529,15 +554,16 @@ impl BottomPane {
     pub fn remove_agent_guide(
         &mut self,
         intent_id: &str,
+        session_id: Option<&str>,
         attachment_epoch: u64,
         receiver_run_id: Option<&str>,
     ) -> Option<PendingUserIntent> {
         let index = self.pending_user_intents.iter().position(|intent| {
             intent.intent_id == intent_id
                 && matches!(&intent.target,
-                    PendingUserIntentTarget::AgentRun { run_id, attachment_epoch: bound_epoch, .. }
-                        if *bound_epoch == attachment_epoch
-                            && receiver_run_id.is_none_or(|receiver| receiver == run_id)
+                    PendingUserIntentTarget::AgentRun { target }
+                        if target.is_attached(session_id, attachment_epoch)
+                            && receiver_run_id.is_none_or(|receiver| receiver == target.run_id())
                 )
         })?;
         self.pending_user_intents.remove(index)
@@ -569,6 +595,12 @@ impl BottomPane {
             .iter()
             .position(|pending| pending.intent_id == intent_id)
         {
+            if matches!(
+                self.pending_user_intents[index].target,
+                PendingUserIntentTarget::AgentRun { .. }
+            ) {
+                return None;
+            }
             self.pending_user_intents
                 .remove(index)
                 .map(|pending| pending.target)
@@ -689,7 +721,21 @@ impl BottomPane {
         if text.trim().is_empty() {
             return false;
         }
-        self.queued_next_turn_submissions.push_back(text);
+        self.queued_next_turn_submissions
+            .push_back(NextTurnSubmission::Interactive(text));
+        true
+    }
+
+    pub(crate) fn queue_session_continuation(
+        &mut self,
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        content: String,
+    ) -> bool {
+        if content.trim().is_empty() {
+            return false;
+        }
+        self.queued_next_turn_submissions
+            .push_back(NextTurnSubmission::Conversation { target, content });
         true
     }
 
@@ -704,11 +750,14 @@ impl BottomPane {
             return false;
         }
         let index = index.min(self.queued_next_turn_submissions.len());
-        self.queued_next_turn_submissions.insert(index, text);
+        self.queued_next_turn_submissions
+            .insert(index, NextTurnSubmission::Interactive(text));
         true
     }
 
-    pub fn take_queued_next_turn_submissions(&mut self) -> std::collections::VecDeque<String> {
+    pub(crate) fn take_queued_next_turn_submissions(
+        &mut self,
+    ) -> std::collections::VecDeque<NextTurnSubmission> {
         std::mem::take(&mut self.queued_next_turn_submissions)
     }
 
@@ -770,45 +819,28 @@ impl BottomPane {
         self.view_stack.push(view);
     }
 
-    pub(crate) fn team_editor_pending(
-        &self,
-        request: &team_editor_view::TeamEditorRequest,
-    ) -> bool {
-        self.view_stack
-            .iter()
-            .any(|view| view.team_editor_pending(request))
-    }
-
-    pub(crate) fn update_team_editor(&mut self, update: &team_editor_view::TeamEditorUpdate) {
-        let Some(index) = self
-            .view_stack
-            .iter()
-            .rposition(|view| view.team_editor_pending(&update.request))
-        else {
-            return;
-        };
-        let picker = self.view_stack[index].update_team_editor(update);
-        // A background catalog must not cover an approval or another focused
-        // view. Its owner retains the draft even when the picker is dismissed.
-        if let Some(picker) = picker
-            && index + 1 == self.view_stack.len()
-        {
-            self.push_view(picker);
+    /// A delayed control receipt must not steal focus from another form.
+    pub(crate) fn push_workbench_input(&mut self, view: Box<dyn BottomPaneView>) {
+        if self.has_active_view() && !self.agent_monitor_is_open() {
+            self.view_stack.insert(0, view);
+        } else {
+            self.push_view(view);
         }
     }
 
-    pub(crate) fn select_team_member_model(
-        &mut self,
-        target: &team_editor_view::TeamEditorTarget,
-        operation_id: u64,
-        agent_id: &str,
-        selection: Option<astra_turn_types::ModelSelection>,
-    ) {
-        for view in self.view_stack.iter_mut().rev() {
-            if view.select_team_member_model(target, operation_id, agent_id, selection.clone()) {
-                break;
-            }
+    pub(crate) fn current_model_catalog(&self) -> &[astra_services::ModelListItemResponse] {
+        match &self.model_catalog {
+            Some(ModelCatalogState::Ready(rows)) => rows,
+            _ => &[],
         }
+    }
+
+    pub(crate) fn clear_model_catalog(&mut self) {
+        self.model_catalog = None;
+    }
+
+    pub(crate) fn cache_model_catalog(&mut self, rows: Vec<astra_services::ModelListItemResponse>) {
+        self.model_catalog = Some(ModelCatalogState::Ready(rows));
     }
 
     pub fn enqueue_ask_user(
@@ -895,6 +927,11 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_agent_transcript(update.clone());
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -906,6 +943,11 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_root_transcript(update.clone());
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -915,11 +957,17 @@ impl BottomPane {
     /// evidence and never merges it into durable history by presentation text.
     pub(crate) fn refresh_root_transcript_live(
         &mut self,
+        binding: Option<(&str, &str)>,
         item: Option<transcript_view::TranscriptItem>,
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
-            refreshed |= view.refresh_root_transcript_live(item.clone());
+            refreshed |= view.refresh_root_transcript_live(binding, item.clone());
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -958,6 +1006,11 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_agent_live_event(event);
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -1028,6 +1081,15 @@ impl BottomPane {
         self.view_stack
             .iter()
             .any(|view| view.is_root_transcript_view())
+    }
+
+    pub(crate) fn has_agent_transcript_tab(&self) -> bool {
+        self.view_stack.iter().any(|view| {
+            matches!(
+                view.conversation_tab_id(),
+                Some(view::ConversationTabId::Run { .. })
+            )
+        })
     }
 
     /// Conversation tabs are navigable surfaces, not focus-stealing modals.
@@ -2430,7 +2492,7 @@ impl BottomPane {
         {
             let prefix = format!("{}  queued · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let line = format!("{prefix}{}", deferred_followup_preview(text, budget));
+            let line = format!("{prefix}{}", deferred_followup_preview(text.text(), budget));
             let style = if idx == 0 { head_style } else { tail_style };
             Widget::render(
                 Line::from(Span::styled(

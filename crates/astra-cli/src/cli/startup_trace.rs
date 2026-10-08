@@ -67,8 +67,11 @@ mod tests {
 
         tracer.finish(Some("session-123"));
 
+        let (local_owner, _) = crate::cli::cli_config::cli_utils::attached_journal_owners()
+            .expect("attached journal owner");
         let events =
-            astra_services::session_journal::read_journal("session-123").expect("read journal");
+            astra_services::session_journal::read_journal_for_owner(&local_owner, "session-123")
+                .expect("read journal");
         let bootstrap_count = events
             .iter()
             .filter(|event| {

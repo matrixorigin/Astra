@@ -3954,8 +3954,6 @@ pub(super) async fn post_work_branch_turn_handler(
     let request = ChatRequestData {
         completion_checks: None,
         execution_authentication: principal.execution_authentication_provenance(),
-        agent_profile_selection: None,
-        admitted_agent_profiles: None,
         model_catalog_reader: Some(
             astra_services::models::AuthorizedModelCatalogReader::with_cache(
                 state.model_service.clone(),

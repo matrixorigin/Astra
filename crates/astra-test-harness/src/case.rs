@@ -30,11 +30,6 @@ pub struct Case {
     /// what a developer would paste into `astra chat -m "..."`.
     pub prompt: String,
 
-    /// Exercise the native Team entrypoint using the ordinary turn capture,
-    /// criteria and watchdog. The definition must already exist for this owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team: Option<TeamEntrypoint>,
-
     /// Meaning-preserving rewrites of one user turn. They are dormant unless
     /// the runner enables prompt-variant expansion, then each rewrite is
     /// evaluated with the exact same typed criteria as the canonical journey.
@@ -142,14 +137,6 @@ pub struct Case {
     /// tests that intentionally ban memory actions leave this false.
     #[serde(default)]
     pub requires_memoria: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TeamEntrypoint {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lead_agent_id: Option<String>,
 }
 
 /// A follow-up turn in a multi-turn case.
@@ -570,20 +557,6 @@ impl Case {
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
-        if let Some(team) = &case.team
-            && std::iter::once(team.name.as_str())
-                .chain(team.lead_agent_id.as_deref())
-                .any(|identity| {
-                    identity.is_empty()
-                        || identity.trim() != identity
-                        || identity.chars().any(char::is_control)
-                })
-        {
-            anyhow::bail!(
-                "case {}: Team name and explicit lead identity must be nonempty, unpadded and contain no control characters",
-                path.display()
-            );
-        }
         // `timeout_seconds: 0` collapses `Duration::from_secs(0)` —
         // every case would instantly report synthetic exit 124 before
         // the child even runs. A YAML typo turns the whole suite into
@@ -740,32 +713,11 @@ mod tests {
         let c = Case::from_path(&path).unwrap();
         assert_eq!(c.name, "hello");
         assert_eq!(c.prompt, "just say ok");
-        assert!(c.team.is_none());
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
         assert_eq!(c.cli_wall_time_seconds, None);
         assert_eq!(c.cli_wall_time_override_for(c.timeout_seconds), None);
         assert!(!c.debug_log);
-    }
-
-    #[test]
-    fn native_team_entrypoint_is_explicit_and_strict() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("team.yaml");
-        for (selection, valid) in [
-            ("{name: fixture-team, lead_agent_id: fixture-lead}", true),
-            ("{name: fixture-team}", true),
-            ("{name: ''}", false),
-            ("{name: fixture-team, lead_agent_id: ''}", false),
-            ("{name: fixture-team, lead: guessed-role}", false),
-        ] {
-            std::fs::write(
-                &path,
-                format!("name: native-team\nprompt: finish\nteam: {selection}\n"),
-            )
-            .unwrap();
-            assert_eq!(Case::from_path(&path).is_ok(), valid, "{selection}");
-        }
     }
 
     #[test]
@@ -1161,25 +1113,25 @@ criteria:
                         && producer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/action"
-                                && filter.equals == serde_json::json!("remember")
+                                && filter.equals == Some(serde_json::json!("remember"))
                         })
                         && producer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/memory_type"
-                                && filter.equals == serde_json::json!("working")
+                                && filter.equals == Some(serde_json::json!("working"))
                         })
                     && *actual_consumer_document == consumer_document
                     && *actual_consumer_paths == consumer_paths
                         && consumer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/action"
-                                && filter.equals == serde_json::json!(action)
+                                && filter.equals == Some(serde_json::json!(action))
                         })
                         && (action != "recall"
                             || consumer_filters.iter().any(|filter| {
                                 filter.document == crate::criteria::JournalToolDocument::Arguments
                                     && filter.path == "/scope"
-                                    && filter.equals == serde_json::json!("session")
+                                    && filter.equals == Some(serde_json::json!("session"))
                             }))
                 )
             })

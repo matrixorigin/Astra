@@ -10,31 +10,9 @@ timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: deepseek-v4-flash
-  - type: session_event_count
-    event_type: LlmRoundCompleted
-    min: 1
-    json_match:
-      path: /payload/model
-      equals: deepseek-v4-flash
-      same_run_as:
-        event_type: agent_spawned
-        run_id_path: /metadata/run_id
-  - type: session_child_result_adopted
-    expected_result: glm-5.2
-    spawn_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: deepseek-v4-flash
-    allow_get_result: true
+  - type: execution_child_results_adopted
+    children:
+      - expected_result: {text: glm-5.2}
+        model: deepseek-v4-flash
   - type: text_equals
     expected: glm-5.2

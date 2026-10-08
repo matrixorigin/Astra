@@ -14,65 +14,13 @@ timeout_seconds: 180
 criteria:
   - type: exit_code
     code: 0
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: glm-5.2
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: deepseek-v4-flash
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/model_configuration/thinking/effort
-      equals: high
-  - type: session_event_count
-    event_type: LlmRoundCompleted
-    min: 1
-    json_match:
-      path: /payload/model
-      equals: glm-5.2
-      same_run_as:
-        event_type: agent_spawned
-        run_id_path: /metadata/run_id
-        related_match:
-          path: /metadata/model_configuration/prepared_selection/model_name
-          equals: glm-5.2
-  - type: session_event_count
-    event_type: LlmRoundCompleted
-    min: 1
-    json_match:
-      path: /payload/model
-      equals: deepseek-v4-flash
-      same_run_as:
-        event_type: agent_spawned
-        run_id_path: /metadata/run_id
-        related_match:
-          path: /metadata/model_configuration/thinking/effort
-          equals: high
-  - type: session_event_count
-    event_type: agent_terminated
-    min: 2
-    max: 2
-  - type: session_child_result_adopted
-    expected_result: NATURAL-GLM-MARKER-OK
-    spawn_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: glm-5.2
-  - type: session_child_result_adopted
-    expected_result: NATURAL-FLASH-HIGH-MARKER-OK
-    spawn_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: deepseek-v4-flash
+  - type: execution_child_results_adopted
+    children:
+      - expected_result: {text: NATURAL-GLM-MARKER-OK}
+        model: glm-5.2
+      - expected_result: {text: NATURAL-FLASH-HIGH-MARKER-OK}
+        model: deepseek-v4-flash
+        initial_thinking: {kind: exact, config: {mode: adaptive, effort: high}}
   - type: text_contains
     needle: NATURAL-GLM-MARKER-OK
   - type: text_contains

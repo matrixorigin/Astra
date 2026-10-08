@@ -60,14 +60,14 @@ use astra_core::{
 };
 
 use crate::orchestration::spawner::{
-    ChildCancellationGrace, ChildCapacityAdmission, ChildExecutionReceipt, DynamicAgentSpawner,
-    ParentProfileAuthority, PreparedSpawnModelIdentity, SpawnExecutionOutcome, SpawnRunFrontier,
+    ChildCancellationGrace, ChildCapacityAdmission, ChildExecutionReceipt, DelegationAuthority,
+    DynamicAgentSpawner, PreparedSpawnModelIdentity, SpawnExecutionOutcome, SpawnRunFrontier,
     SpawnRunResult, SpawnedAgentState, project_subrun_status_to_spawn,
 };
 use crate::server::run::engine::{RunEngine, RunExecutionAuthority};
 use astra_messaging::router::AgentMailboxRouter;
 use astra_messaging::router::MailboxLifetime;
-use astra_prompts::team_prompts;
+use astra_prompts::coordination_prompts;
 
 fn clone_delegation_context(
     site: astra_core::history_work::HistoryWorkSite,
@@ -282,7 +282,13 @@ pub struct PreparedSubRunModel {
     pub admitted_execution: Option<AdmittedModelExecution>,
 }
 
-pub type SubRunExecutionResult = (AgentResult, Option<SpawnRunFrontier>);
+/// Producer-owned result and the child-scoped user changes applied to it.
+#[derive(Debug, Clone)]
+pub struct SubRunExecutionResult {
+    pub result: AgentResult,
+    pub committed_frontier: Option<SpawnRunFrontier>,
+    pub applied_user_intents: Vec<crate::turn::agentic_loop::host::AppliedUserIntent>,
+}
 
 fn child_runtime_id(profile_id: &str, run_id: &str) -> String {
     format!("{profile_id}@{run_id}")
@@ -631,14 +637,15 @@ fn cancelled_agent_result(agent_id: &str, run_id: &str) -> AgentResult {
 }
 
 fn delegated_spawn_projection(
-    execution: &(AgentResult, Option<SpawnRunFrontier>),
+    execution: &SubRunExecutionResult,
 ) -> std::borrow::Cow<'_, SpawnRunResult> {
-    let (result, frontier) = execution;
+    let result = &execution.result;
     let projection = project_subrun_status_to_spawn(&result.status, result.error.clone());
     std::borrow::Cow::Owned(SpawnRunResult {
         agent_id: result.agent_id.clone(),
         run_id: result.run_id.clone(),
-        committed_frontier: frontier.clone(),
+        committed_frontier: execution.committed_frontier.clone(),
+        applied_user_intents: execution.applied_user_intents.clone(),
         status: projection.status.into(),
         finish_reason: projection.finish_reason,
         cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
@@ -730,9 +737,10 @@ fn reconcile_preserving_mailbox_cleanup<'a>(
                     disposition,
                     result,
                     Some(&mailbox),
+                    &[],
                 )
                 .await
-                .0
+                .result
             }))
         }
         None => Started::Inline(result),
@@ -759,9 +767,10 @@ fn reconcile_preserving_mailbox_cleanup<'a>(
                     disposition,
                     result,
                     None,
+                    &[],
                 )
                 .await
-                .0
+                .result
             }
         }
     }
@@ -908,30 +917,38 @@ async fn reconcile_agent_result_with_durable_authority(
     disposition: DurableLifecycleDisposition,
     mut result: AgentResult,
     mailbox: Option<&MailboxRetirement>,
-) -> (AgentResult, Option<SpawnRunFrontier>) {
+    applied_user_intents: &[crate::turn::agentic_loop::host::AppliedUserIntent],
+) -> SubRunExecutionResult {
     let attempted_status = durable_status_for_agent_result(&result.status);
-    let persistence = match disposition {
-        DurableLifecycleDisposition::ExecutorOwned { .. }
-        | DurableLifecycleDisposition::ReadOnly => {
-            // The executor already committed with its exact owner generation.
-            // A second outer write would allow a stale executor to overwrite
-            // the owner that recovered an expired lease.
-            Ok(false)
-        }
-        DurableLifecycleDisposition::SchedulerOwned { owner_generation } => {
-            run_engine
-                .persist_delegation_outcome_status_if_current_owner(
-                    user_id,
-                    expected_session_id,
-                    &result.run_id,
-                    owner_generation,
-                    attempted_status,
-                    None,
-                    result.error.as_deref(),
-                )
-                .await
-        }
-    };
+    let persistence =
+        match disposition {
+            DurableLifecycleDisposition::ExecutorOwned { .. }
+            | DurableLifecycleDisposition::ReadOnly => {
+                // The executor already committed with its exact owner generation.
+                // A second outer write would allow a stale executor to overwrite
+                // the owner that recovered an expired lease.
+                Ok(false)
+            }
+            DurableLifecycleDisposition::SchedulerOwned { owner_generation } => {
+                let delivery_events = result.output.as_ref().map(|output| vec![serde_json::json!({
+                "event_type": "text_done",
+                "data": {"full_text": output, "applied_user_intents": applied_user_intents,
+                    "partial": attempted_status != STATUS_COMPLETED},
+            })]).unwrap_or_default();
+                run_engine
+                    .persist_delegation_outcome_status_if_current_owner(
+                        user_id,
+                        expected_session_id,
+                        &result.run_id,
+                        owner_generation,
+                        &result.status,
+                        None,
+                        result.error.as_deref(),
+                        &delivery_events,
+                    )
+                    .await
+            }
+        };
     if matches!(persistence, Ok(true)) {
         if let Some(mailbox) = mailbox {
             mailbox.request_if_terminal(attempted_status);
@@ -946,7 +963,11 @@ async fn reconcile_agent_result_with_durable_authority(
             }
             _ => None,
         };
-        return (result, frontier);
+        return SubRunExecutionResult {
+            result,
+            committed_frontier: frontier,
+            applied_user_intents: applied_user_intents.to_vec(),
+        };
     }
 
     let persistence_detail = match &persistence {
@@ -972,7 +993,11 @@ async fn reconcile_agent_result_with_durable_authority(
                 "{persistence_detail}; durable run {} is missing",
                 result.run_id
             ));
-            return (result, None);
+            return SubRunExecutionResult {
+                result,
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            };
         }
         Err(load_error) => {
             result.status = STATUS_WAITING.to_string();
@@ -981,31 +1006,54 @@ async fn reconcile_agent_result_with_durable_authority(
                 "{persistence_detail}; failed to load durable winner for run {}: {load_error}",
                 result.run_id
             ));
-            return (result, None);
+            return SubRunExecutionResult {
+                result,
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            };
         }
     };
     let frontier = Some(SpawnRunFrontier::from_durable(&durable));
     if let Some(mailbox) = mailbox {
         mailbox.request_if_terminal(&durable.status);
     }
-
-    // A replay can lose its CAS because the exact same terminal fact is
-    // already durable. Status equality alone is insufficient: a recovered
-    // generation can independently reach the same terminal status with a
-    // different output. Preserve local output only when the durable winner is
-    // the exact execution generation that produced it. Read-only projections
-    // carry no such proof and therefore never retain local output.
-    let expected_owner_generation = match disposition {
-        DurableLifecycleDisposition::ExecutorOwned { owner_generation }
-        | DurableLifecycleDisposition::SchedulerOwned { owner_generation } => {
-            Some(owner_generation)
-        }
-        DurableLifecycleDisposition::ReadOnly => None,
-    };
-    if durable.status == attempted_status
-        && expected_owner_generation == Some(durable.run_generation)
+    let durable_partial = durable.status == STATUS_FAILED
+        && astra_services::coordination::durable_agent_result_is_partial(
+            durable.error_code.as_deref(),
+        );
+    if durable_partial
+        || matches!(
+            durable_run_status_kind(&durable.status),
+            DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated
+        )
     {
-        return (result, frontier);
+        let output = crate::orchestration::spawner::durable_run_output(&durable);
+        let applied_user_intents = crate::orchestration::spawner::durable_child_delivery(&durable)
+            .map(|(_, intents)| intents)
+            .unwrap_or_default();
+        if let Some(output) = output {
+            result.status = if durable_partial {
+                astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL.into()
+            } else {
+                durable.status.clone()
+            };
+            result.output = Some(output);
+            result.error = durable_partial
+                .then(|| durable.error_message.clone())
+                .flatten();
+        } else {
+            result.status = STATUS_WAITING.to_string();
+            result.output = None;
+            result.error = Some("durable child output is unavailable".into());
+        }
+        result.prompt_tokens = durable.total_prompt_tokens;
+        result.completion_tokens = durable.total_completion_tokens;
+        result.tool_calls = durable.total_tool_calls;
+        return SubRunExecutionResult {
+            result,
+            committed_frontier: frontier,
+            applied_user_intents,
+        };
     }
 
     tracing::info!(
@@ -1046,7 +1094,11 @@ async fn reconcile_agent_result_with_durable_authority(
             result.error = durable.error_message.or(Some(persistence_detail));
         }
     }
-    (result, frontier)
+    SubRunExecutionResult {
+        result,
+        committed_frontier: frontier,
+        applied_user_intents: Vec::new(),
+    }
 }
 
 fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
@@ -1191,9 +1243,8 @@ impl Drop for ExecutionOwnerGenerationGuard {
 
 /// Configuration for a sub-run spawned by delegation.
 pub struct SubRunConfig {
-    /// Exact admitted profile lineage, distinct from runtime routing IDs.
-    /// Unbound is valid only when the parent has no admitted profile roster.
-    pub profile_authority: ParentProfileAuthority,
+    /// Execution-owned delegation restriction retained through admission and recovery.
+    pub delegation_authority: DelegationAuthority,
     /// Explicit ceiling for the first model round, including retries.
     pub max_output_tokens: Option<u32>,
     /// Unique ID for this sub-run.
@@ -1282,8 +1333,7 @@ pub struct SubRunConfig {
         astra_turn_types::StopHookObligations,
     )>,
     pub execution_metadata: Option<serde_json::Value>,
-    /// Existing parent execution/routing chain. Admitted profile ancestry
-    /// lives in `profile_authority`; runtime instance IDs are not profile IDs.
+    /// Existing parent execution/routing chain for generic delegation checks.
     pub delegation_chain: Vec<String>,
     /// Exact canonical WorkItem revision assigned to this run. It remains a
     /// typed sideband value and is validated before durable run creation.
@@ -1337,7 +1387,7 @@ impl std::fmt::Debug for SubRunConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubRunConfig")
             .field("run_id", &self.run_id)
-            .field("profile_authority", &self.profile_authority)
+            .field("delegation_authority", &self.delegation_authority)
             .field("agent_profile", &self.agent_profile)
             .field("task", &self.task)
             .field("session_id", &self.session_id)
@@ -1421,8 +1471,8 @@ pub struct StubSubRunExecutor;
 #[async_trait]
 impl SubRunExecutor for StubSubRunExecutor {
     async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
-        Ok((
-            AgentResult {
+        Ok(SubRunExecutionResult {
+            result: AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: STATUS_COMPLETED.to_string(),
@@ -1432,8 +1482,9 @@ impl SubRunExecutor for StubSubRunExecutor {
                 completion_tokens: 0,
                 tool_calls: 0,
             },
-            None,
-        ))
+            committed_frontier: None,
+            applied_user_intents: Vec::new(),
+        })
     }
 }
 
@@ -2428,8 +2479,7 @@ impl DelegationEngine {
         request_constraints: &RequestConstraints,
         execution_restrictions: astra_services::runs::DurableExecutionRestrictions,
         execution_metadata: Option<&serde_json::Value>,
-        admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
-        profile_authority: &ParentProfileAuthority,
+        delegation_authority: &DelegationAuthority,
         thinking: &astra_turn_core::thinking_config::ThinkingConfig,
         prepared_model: Option<&PreparedSubRunModel>,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2462,8 +2512,7 @@ impl DelegationEngine {
                     execution_metadata: execution_metadata
                         .and_then(serde_json::Value::as_object)
                         .cloned(),
-                    admitted_agent_profiles: admitted_agent_profiles.cloned(),
-                    profile_authority: profile_authority.clone(),
+                    delegation_authority: *delegation_authority,
                     child_runtime_id: Some(child_runtime_id(agent_id, run_id)),
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: thinking.clone(),
@@ -2908,66 +2957,13 @@ impl DelegationEngine {
             } else {
                 astra_turn_types::CompletionCheckPhase::Stop
             };
-        let admitted_agent_profiles =
-            crate::server::run::engine::durable_run_agent_profiles(&parent_run, &request.user_id)?;
-        let parent_profile_authority = crate::server::run::engine::durable_run_profile_authority(
-            &parent_run,
-            &request.user_id,
-        )?;
-        parent_profile_authority.require_delegation()?;
-        let mut execution = self.clone();
-        if let Some(snapshot) = admitted_agent_profiles.as_ref() {
-            let registry = snapshot.registry(&request.user_id)?;
-            if request.depth != parent_run.depth {
-                return Err("delegation depth does not match its durable parent".into());
-            }
-            let parent_profile = match &parent_profile_authority {
-                ParentProfileAuthority::OrdinaryRoot => None,
-                ParentProfileAuthority::AdmittedMember { profile_id, .. } => Some(
-                    registry
-                        .get(profile_id)
-                        .ok_or("admitted parent profile is missing")?,
-                ),
-                ParentProfileAuthority::Unbound | ParentProfileAuthority::NonDelegating { .. } => {
-                    return Err("admitted roster requires parent profile authority".into());
-                }
-            };
-            let target_ids = match &request.pattern {
-                CoordinationPattern::FanOut { agent_ids, .. }
-                | CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.as_slice(),
-                CoordinationPattern::Fork { agent_id, .. } => std::slice::from_ref(agent_id),
-            };
-            if target_ids.is_empty() {
-                return Err("delegation pattern has no agents".into());
-            }
-            // Validate the entire fixed batch before model preparation or any
-            // child start. Runtime routing names never supply profile ancestry.
-            for target_id in target_ids {
-                let target = registry
-                    .get(target_id)
-                    .ok_or_else(|| format!("target profile '{target_id}' is not admitted"))?;
-                parent_profile_authority.for_child(target_id)?;
-                if let Some(parent) = parent_profile {
-                    if !parent.can_delegate_to_agent(target) {
-                        return Err(format!(
-                            "admitted profile '{}' cannot delegate to '{target_id}'",
-                            parent.agent_id
-                        ));
-                    }
-                    if parent_run.depth >= parent.max_delegation_depth {
-                        return Err(format!(
-                            "admitted profile '{}' delegation depth {} exceeds max {}",
-                            parent.agent_id, parent_run.depth, parent.max_delegation_depth
-                        ));
-                    }
-                }
-            }
-            // Reuse the execution-bound engine; never publish run-scoped
-            // profiles into the mutable global registry or re-read their source.
-            execution.registry = Arc::new(RwLock::new(registry));
-        } else {
-            self.validate(&request, source_agent_id).await?;
-        }
+        let parent_delegation_authority =
+            crate::server::run::engine::durable_run_delegation_authority(
+                &parent_run,
+                &request.user_id,
+            )?;
+        parent_delegation_authority.require_delegation()?;
+        self.validate(&request, source_agent_id).await?;
         // The parent lookup is already required for delegation admission. Use
         // its immutable start event as the provider-scope authority and pass
         // the result through the existing typed child context. This keeps
@@ -3058,50 +3054,44 @@ impl DelegationEngine {
                 aggregation,
                 timeout_sec,
             } => {
-                execution
-                    .execute_fan_out(
-                        &request,
-                        agent_ids,
-                        aggregation,
-                        &forward_headers,
-                        admitted_model_execution.as_ref(),
-                        effective_parent_model_reasoning.as_ref(),
-                        &request_constraints,
-                        admitted_agent_profiles.as_ref(),
-                        &parent_profile_authority,
-                        &execution_contract,
-                        child_recursion_depth,
-                        interaction_mode,
-                        *timeout_sec,
-                        cancel_token.as_ref(),
-                        live_event_sink.as_ref(),
-                    )
-                    .await
+                self.execute_fan_out(
+                    &request,
+                    agent_ids,
+                    aggregation,
+                    &forward_headers,
+                    admitted_model_execution.as_ref(),
+                    effective_parent_model_reasoning.as_ref(),
+                    &request_constraints,
+                    &execution_contract,
+                    child_recursion_depth,
+                    interaction_mode,
+                    *timeout_sec,
+                    cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
+                )
+                .await
             }
             CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
                 timeout_sec,
             } => {
-                execution
-                    .execute_sequential(
-                        &request,
-                        agent_ids,
-                        *stop_on_success,
-                        &forward_headers,
-                        admitted_model_execution.as_ref(),
-                        effective_parent_model_reasoning.as_ref(),
-                        &request_constraints,
-                        admitted_agent_profiles.as_ref(),
-                        &parent_profile_authority,
-                        &execution_contract,
-                        child_recursion_depth,
-                        interaction_mode,
-                        *timeout_sec,
-                        cancel_token.as_ref(),
-                        live_event_sink.as_ref(),
-                    )
-                    .await
+                self.execute_sequential(
+                    &request,
+                    agent_ids,
+                    *stop_on_success,
+                    &forward_headers,
+                    admitted_model_execution.as_ref(),
+                    effective_parent_model_reasoning.as_ref(),
+                    &request_constraints,
+                    &execution_contract,
+                    child_recursion_depth,
+                    interaction_mode,
+                    *timeout_sec,
+                    cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
+                )
+                .await
             }
             CoordinationPattern::Fork {
                 tasks,
@@ -3109,26 +3099,23 @@ impl DelegationEngine {
                 aggregation,
                 timeout_sec,
             } => {
-                execution
-                    .execute_fork(
-                        &request,
-                        tasks,
-                        agent_id,
-                        aggregation,
-                        &forward_headers,
-                        admitted_model_execution.as_ref(),
-                        effective_parent_model_reasoning.as_ref(),
-                        &request_constraints,
-                        admitted_agent_profiles.as_ref(),
-                        &parent_profile_authority,
-                        &execution_contract,
-                        child_recursion_depth,
-                        interaction_mode,
-                        *timeout_sec,
-                        cancel_token.as_ref(),
-                        live_event_sink.as_ref(),
-                    )
-                    .await
+                self.execute_fork(
+                    &request,
+                    tasks,
+                    agent_id,
+                    aggregation,
+                    &forward_headers,
+                    admitted_model_execution.as_ref(),
+                    effective_parent_model_reasoning.as_ref(),
+                    &request_constraints,
+                    &execution_contract,
+                    child_recursion_depth,
+                    interaction_mode,
+                    *timeout_sec,
+                    cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
+                )
+                .await
             }
         };
 
@@ -3230,6 +3217,7 @@ impl DelegationEngine {
                 agent_type: agent_id.clone(),
                 description: config.task.clone(),
                 status: crate::orchestration::AgentStatus::Initializing,
+                applied_user_intents: Vec::new(),
                 committed_frontier: Some(SpawnRunFrontier {
                     run_id: run_id.clone(),
                     run_generation: owner_generation,
@@ -3268,7 +3256,11 @@ impl DelegationEngine {
                 let _runtime_binding_guard = runtime_binding_guard;
                 let queued_execution = async {
                     if cancel.is_cancelled() {
-                        return Ok((cancelled_agent_result(&execution_agent_id, &execution_run_id), None));
+                        return Ok(SubRunExecutionResult {
+                            result: cancelled_agent_result(&execution_agent_id, &execution_run_id),
+                            committed_frontier: None,
+                            applied_user_intents: Vec::new(),
+                        });
                     }
                     if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                         return Err("agent execution timeout: shared deadline exceeded".into());
@@ -3280,7 +3272,11 @@ impl DelegationEngine {
                     // Publication can await: only the actual dispatch transfers
                     // durable settlement authority from scheduler to executor.
                     if cancel.is_cancelled() {
-                        return Ok((cancelled_agent_result(&execution_agent_id, &execution_run_id), None));
+                        return Ok(SubRunExecutionResult {
+                            result: cancelled_agent_result(&execution_agent_id, &execution_run_id),
+                            committed_frontier: None,
+                            applied_user_intents: Vec::new(),
+                        });
                     }
                     if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                         return Err("agent execution timeout: shared deadline exceeded".into());
@@ -3298,7 +3294,7 @@ impl DelegationEngine {
                         cancel.cancel();
                         match tokio::time::timeout(FANOUT_CANCELLATION_DRAIN_TIMEOUT, &mut queued_execution).await {
                             Ok(Ok(result)) => Ok(result),
-                            failed => Ok((AgentResult {
+                            failed => Ok(SubRunExecutionResult { result: AgentResult {
                                 agent_id: execution_agent_id.clone(),
                                 run_id: execution_run_id.clone(),
                                 status: match stop {
@@ -3316,7 +3312,7 @@ impl DelegationEngine {
                                 prompt_tokens: 0,
                                 completion_tokens: 0,
                                 tool_calls: 0,
-                            }, None)),
+                            }, committed_frontier: None, applied_user_intents: Vec::new() }),
                         }
                     }
                 }
@@ -3331,8 +3327,8 @@ impl DelegationEngine {
             let runtime_executor = runtime_executor.clone();
             let cancel = Arc::clone(&child_cancel);
             let settlement = move |outcome: SpawnExecutionOutcome<SubRunExecutionResult>| async move {
-                let (attempted, producer_frontier) = match outcome {
-                    Ok(result) => result,
+                let (attempted, producer_frontier, applied_user_intents) = match outcome {
+                    Ok(receipt) => (receipt.result, receipt.committed_frontier, receipt.applied_user_intents),
                     Err((error, _)) => (AgentResult {
                         agent_id: settlement_agent_id,
                         run_id: settlement_run_id.clone(),
@@ -3342,31 +3338,36 @@ impl DelegationEngine {
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         tool_calls: 0,
-                    }, None),
+                    }, None, Vec::new()),
                 };
                 let pending = durable_reconciliation_pending_result(&attempted, "child outcome");
                 let disposition = durable_lifecycle_disposition_after_dispatch(
                     settlement_executor.as_ref(), owner_generation, entered.load(Ordering::Acquire),
                 );
-                let (result, frontier) = tokio::time::timeout(
+                let mut receipt = tokio::time::timeout(
                     DELEGATION_RECONCILIATION_TIMEOUT,
                     reconcile_agent_result_with_durable_authority(
                         &run_engine, &settlement_user_id, &settlement_session_id, disposition, attempted, None,
+                        &applied_user_intents,
                     ),
-                ).await.unwrap_or((pending, None));
-                let frontier = frontier.map(|winner| {
+                ).await.unwrap_or(SubRunExecutionResult {
+                    result: pending,
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                });
+                receipt.committed_frontier = receipt.committed_frontier.map(|winner| {
                     producer_frontier.filter(|producer| {
                         producer.run_id == winner.run_id
                             && producer.run_generation == winner.run_generation
                             && winner.last_event_idx.is_none()
                     }).unwrap_or(winner)
                 });
-                if frontier.is_some() && let Some(executor) = runtime_executor {
+                if receipt.committed_frontier.is_some() && let Some(executor) = runtime_executor {
                     executor.settle_admitted_child_runtime(
-                        &settlement_run_id, &settlement_binding_id, &result.status,
+                        &settlement_run_id, &settlement_binding_id, &receipt.result.status,
                     ).await;
                 }
-                Ok((result, frontier))
+                Ok(receipt)
             };
             spawner.supervise_child(
                 None,
@@ -3385,7 +3386,7 @@ impl DelegationEngine {
                     Some(child_cancel.as_ref()),
                 );
                 let pending = durable_reconciliation_pending_result(&attempted, "unlaunched child");
-                let (result, frontier) = tokio::time::timeout(
+                let receipt = tokio::time::timeout(
                     DELEGATION_RECONCILIATION_TIMEOUT,
                     reconcile_agent_result_with_durable_authority(
                         &self.run_engine,
@@ -3394,25 +3395,29 @@ impl DelegationEngine {
                         DurableLifecycleDisposition::SchedulerOwned { owner_generation },
                         attempted,
                         mailbox.as_ref(),
+                        &[],
                     ),
                 )
                 .await
-                .unwrap_or((pending, None));
-                if frontier.is_some()
+                .unwrap_or(SubRunExecutionResult {
+                    result: pending,
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                });
+                if receipt.committed_frontier.is_some()
                     && let Some(executor) = runtime_executor
                 {
                     executor
-                        .settle_admitted_child_runtime(&run_id, &binding_id, &result.status)
+                        .settle_admitted_child_runtime(&run_id, &binding_id, &receipt.result.status)
                         .await;
                 }
                 if adopted {
-                    let projection =
-                        delegated_spawn_projection(&(result.clone(), frontier)).into_owned();
+                    let projection = delegated_spawn_projection(&receipt).into_owned();
                     spawner
                         .finalize_background_agent(&instance_id, Ok(&projection))
                         .await;
                 }
-                Err(result)
+                Err(receipt.result)
             }
         }
     }
@@ -3429,7 +3434,7 @@ impl DelegationEngine {
         let (result, frontier) = match receipt {
             Err(result) => (result, None),
             Ok(receipt) => match receipt.await {
-                Ok((Ok(result), _)) => result,
+                Ok((Ok(receipt), _)) => (receipt.result, receipt.committed_frontier),
                 failed => {
                     let error = match failed {
                         Ok((Err((error, _)), _)) => error,
@@ -3492,8 +3497,6 @@ impl DelegationEngine {
             &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         request_constraints: &RequestConstraints,
-        admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
-        parent_profile_authority: &ParentProfileAuthority,
         execution_contract: &(
             crate::server::tool_transport::ExecutionBindingSnapshot,
             astra_turn_types::StopHookObligations,
@@ -3526,7 +3529,7 @@ impl DelegationEngine {
         let execution_deadline = delegation_deadline(timeout_sec)?;
         let reg = self.registry.read().await;
 
-        // Compute aggregation strategy name and budget info for team prompts
+        // Compute aggregation strategy name for coordination prompts.
         let aggregation_name = match aggregation {
             AggregationStrategy::FirstSuccess => "FirstSuccess",
             AggregationStrategy::AllResults => "AllResults",
@@ -3552,11 +3555,7 @@ impl DelegationEngine {
                     request_constraints,
                     request.execution_metadata.as_ref(),
                 )?;
-                let delegation_chain = if admitted_agent_profiles.is_some() {
-                    request.delegation_chain.clone()
-                } else {
-                    Self::delegation_chain_for_child(request, agent_id)?
-                };
+                let delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
                 Ok((
                     agent_id.clone(),
                     profile,
@@ -3621,10 +3620,7 @@ impl DelegationEngine {
                 break;
             }
             let sub_run_id = uuid::Uuid::new_v4().to_string();
-            let profile_authority = match parent_profile_authority {
-                ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
-                _ => parent_profile_authority.for_child(&agent_id)?,
-            };
+            let delegation_authority = DelegationAuthority::Allowed;
             let execution_authority = match self
                 .start_delegated_run(
                     &sub_run_id,
@@ -3646,8 +3642,7 @@ impl DelegationEngine {
                         ),
                     ),
                     execution_metadata.as_ref(),
-                    admitted_agent_profiles,
-                    &profile_authority,
+                    &delegation_authority,
                     &thinking,
                     prepared_model.as_ref(),
                     cancel_token,
@@ -3751,11 +3746,16 @@ impl DelegationEngine {
                 .expect("admitted child generation")
                 .1 = MailboxRetirement::from_mailbox(&self.mailbox_router, mailbox.as_ref());
 
-            // Inject team coordination prompt into task
-            let coordination_prompt =
-                team_prompts::fan_out_agent_prompt(&agent_id, &agent_id_strs, aggregation_name);
-            let enhanced_task =
-                team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
+            // Inject coordination prompt into task.
+            let coordination_prompt = coordination_prompts::fan_out_agent_prompt(
+                &agent_id,
+                &agent_id_strs,
+                aggregation_name,
+            );
+            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
+                &coordination_prompt,
+                &request.task,
+            );
 
             let inherited_prefix = prepared_model.as_ref().and_then(|model| {
                 self.resolve_inherited_prefix_for_delegate(
@@ -3765,7 +3765,7 @@ impl DelegationEngine {
             });
             configs.push(SubRunConfig {
                 execution_contract: Some(execution_contract.clone()),
-                profile_authority,
+                delegation_authority,
                 max_output_tokens: None,
                 run_id: sub_run_id,
                 parent_run_id: request.parent_run_id.clone(),
@@ -3908,8 +3908,6 @@ impl DelegationEngine {
             &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         request_constraints: &RequestConstraints,
-        admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
-        parent_profile_authority: &ParentProfileAuthority,
         execution_contract: &(
             crate::server::tool_transport::ExecutionBindingSnapshot,
             astra_turn_types::StopHookObligations,
@@ -4010,10 +4008,7 @@ impl DelegationEngine {
                 }
             };
 
-            let profile_authority = match parent_profile_authority {
-                ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
-                _ => parent_profile_authority.for_child(agent_id)?,
-            };
+            let delegation_authority = DelegationAuthority::Allowed;
             let execution_authority = match self
                 .start_delegated_run(
                     &sub_run_id,
@@ -4035,8 +4030,7 @@ impl DelegationEngine {
                         ),
                     ),
                     execution_metadata.as_ref(),
-                    admitted_agent_profiles,
-                    &profile_authority,
+                    &delegation_authority,
                     &thinking,
                     prepared_model.as_ref(),
                     cancel_token,
@@ -4157,11 +4151,7 @@ impl DelegationEngine {
                 .register_cancel_token(&sub_run_id, child_cancel.clone())
                 .await;
 
-            let delegation_chain = if admitted_agent_profiles.is_some() {
-                request.delegation_chain.clone()
-            } else {
-                Self::delegation_chain_for_child(request, agent_id)?
-            };
+            let delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
 
             let mailbox = if let Some(router) = &self.mailbox_router {
                 let addr = astra_messaging::types::AgentAddress {
@@ -4186,19 +4176,21 @@ impl DelegationEngine {
 
             // Inject sequential coordination prompt
             let has_prev = previous_output.is_some();
-            let coordination_prompt = team_prompts::sequential_stage_prompt(
+            let coordination_prompt = coordination_prompts::sequential_stage_prompt(
                 stage_index,
                 total_stages,
                 agent_id,
                 has_prev,
                 stop_on_success,
             );
-            let enhanced_task =
-                team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
+            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
+                &coordination_prompt,
+                &request.task,
+            );
 
             let config = SubRunConfig {
                 execution_contract: Some(execution_contract.clone()),
-                profile_authority,
+                delegation_authority,
                 max_output_tokens: None,
                 run_id: sub_run_id.clone(),
                 parent_run_id: request.parent_run_id.clone(),
@@ -4294,8 +4286,6 @@ impl DelegationEngine {
             &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
         >,
         request_constraints: &RequestConstraints,
-        admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
-        parent_profile_authority: &ParentProfileAuthority,
         execution_contract: &(
             crate::server::tool_transport::ExecutionBindingSnapshot,
             astra_turn_types::StopHookObligations,
@@ -4333,17 +4323,8 @@ impl DelegationEngine {
             request_constraints,
             request.execution_metadata.as_ref(),
         )?;
-        let fork_delegation_chain = if admitted_agent_profiles.is_some() {
-            request.delegation_chain.clone()
-        } else {
-            Self::delegation_chain_for_child(request, agent_id)?
-        };
-        let profile_authority = ParentProfileAuthority::NonDelegating {
-            authority: Box::new(match parent_profile_authority {
-                ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
-                _ => parent_profile_authority.for_child(agent_id)?,
-            }),
-        };
+        let fork_delegation_chain = Self::delegation_chain_for_child(request, agent_id)?;
+        let delegation_authority = DelegationAuthority::Forbidden;
         drop(reg);
 
         // Extract parent messages for context inheritance (if provided)
@@ -4424,8 +4405,7 @@ impl DelegationEngine {
                         ),
                     ),
                     execution_metadata.as_ref(),
-                    admitted_agent_profiles,
-                    &profile_authority,
+                    &delegation_authority,
                     &thinking,
                     prepared_model.as_ref(),
                     cancel_token,
@@ -4571,8 +4551,10 @@ impl DelegationEngine {
             fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
 
             let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
-            let fork_coordination = team_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx);
-            let fork_task = team_prompts::wrap_task_with_coordination(&fork_coordination, task);
+            let fork_coordination =
+                coordination_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx);
+            let fork_task =
+                coordination_prompts::wrap_task_with_coordination(&fork_coordination, task);
 
             let mut fork_profile = profile.clone();
             fork_profile.can_delegate = false;
@@ -4587,7 +4569,7 @@ impl DelegationEngine {
 
             let config = SubRunConfig {
                 execution_contract: Some(execution_contract.clone()),
-                profile_authority: profile_authority.clone(),
+                delegation_authority,
                 max_output_tokens: None,
                 run_id: run_id.clone(),
                 parent_run_id: request.parent_run_id.clone(),
@@ -5198,8 +5180,8 @@ mod tests {
                 prepared.offering_id.clone(),
                 prepared.model_name.clone(),
             ));
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: STATUS_COMPLETED.to_string(),
@@ -5209,8 +5191,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -5368,8 +5351,7 @@ mod tests {
                 &RequestConstraints::default(),
                 RequestConstraints::default().durable_execution_restrictions(None, None),
                 None,
-                None,
-                &ParentProfileAuthority::Unbound,
+                &DelegationAuthority::Allowed,
                 &astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
                 None,
                 None,
@@ -5744,8 +5726,7 @@ mod tests {
                 &constraints,
                 restrictions.clone(),
                 None,
-                None,
-                &ParentProfileAuthority::Unbound,
+                &DelegationAuthority::Allowed,
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
                 None,
                 None,
@@ -6652,8 +6633,8 @@ mod tests {
             } else {
                 format!("[{}] {}", config.agent_profile.agent_id, config.task)
             };
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: "completed".to_string(),
@@ -6663,8 +6644,9 @@ mod tests {
                     completion_tokens: 20,
                     tool_calls: 1,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -6688,7 +6670,7 @@ mod tests {
     }
 
     struct CapturedRunBinding {
-        profile_authority: ParentProfileAuthority,
+        delegation_authority: DelegationAuthority,
         parent_run_id: Option<String>,
         session_id: String,
         task_context: HashMap<String, serde_json::Value>,
@@ -6711,7 +6693,7 @@ mod tests {
     impl SubRunExecutor for CaptureRunBindingExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             self.bindings.lock().unwrap().push(CapturedRunBinding {
-                profile_authority: config.profile_authority.clone(),
+                delegation_authority: config.delegation_authority,
                 parent_run_id: Some(config.parent_run_id.clone()),
                 session_id: config.session_id.clone(),
                 task_context: config.context.clone(),
@@ -6725,8 +6707,8 @@ mod tests {
                 initial_turns: config.initial_turns,
                 execution_metadata: config.execution_metadata.clone(),
             });
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: "completed".into(),
@@ -6736,13 +6718,14 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
     #[tokio::test]
-    async fn precreated_child_controls_and_profile_snapshot_are_admitted_together() {
+    async fn precreated_child_controls_and_delegation_restrictions_are_admitted_together() {
         for pattern in [
             CoordinationPattern::FanOut {
                 agent_ids: vec!["coder".into()],
@@ -6762,11 +6745,10 @@ mod tests {
             },
         ] {
             let (registry, run_engine, tracker) = setup();
-            // Exercise an explicit same-tier lead as well as an ordinary root
-            // without introducing a second fixture or execution path.
-            let selected_lead = !matches!(&pattern, CoordinationPattern::Sequential { .. });
-            let mut lead = AgentProfile::new("lead", "Lead", AgentTier::System);
-            lead.delegate_to = vec!["coder".into()];
+            let mut parent_profile = registry.write().await.remove("orch").unwrap();
+            parent_profile.delegate_to = vec!["coder".into()];
+            parent_profile.max_delegation_depth = 1;
+            registry.write().await.register(parent_profile).unwrap();
             let mut profile = registry.write().await.remove("coder").unwrap();
             profile.allow_tools = Some(vec!["read_file".into(), "write_file".into()]);
             profile.skill_filter = vec!["analysis".into()];
@@ -6777,39 +6759,11 @@ mod tests {
             profile.initial_turns = Some(2);
             profile.max_turns = Some(5);
             registry.write().await.register(profile.clone()).unwrap();
-            let snapshot = Arc::new(astra_services::runs::AgentProfileSnapshot {
-                owner_user_id: "user-1".into(),
-                source_team_id: "owner-team".into(),
-                lead_agent_id: selected_lead.then(|| "lead".into()),
-                profiles: vec![
-                    profile.clone(),
-                    lead,
-                    AgentProfile::new("outside", "Outside", AgentTier::System),
-                ],
-            });
-            let parent_authority = if selected_lead {
-                ParentProfileAuthority::AdmittedMember {
-                    profile_id: "lead".into(),
-                    ancestor_profile_ids: Vec::new(),
-                }
-            } else {
-                ParentProfileAuthority::OrdinaryRoot
-            };
-            let expected_child_authority = ParentProfileAuthority::AdmittedMember {
-                profile_id: "coder".into(),
-                ancestor_profile_ids: if selected_lead {
-                    vec!["lead".into()]
-                } else {
-                    Vec::new()
-                },
-            };
             let is_fork = matches!(&pattern, CoordinationPattern::Fork { .. });
             let expected_child_authority = if is_fork {
-                ParentProfileAuthority::NonDelegating {
-                    authority: Box::new(expected_child_authority),
-                }
+                DelegationAuthority::Forbidden
             } else {
-                expected_child_authority
+                DelegationAuthority::Allowed
             };
             let mut request = fan_out_request(vec!["coder"]);
             request.pattern = pattern;
@@ -6831,8 +6785,7 @@ mod tests {
                     &request.user_id,
                     &request.session_id,
                     crate::server::run::engine::RunStartContext {
-                        profile_authority: parent_authority,
-                        admitted_agent_profiles: Some(snapshot.clone()),
+                        delegation_authority: DelegationAuthority::Allowed,
                         ..Default::default()
                     },
                 )
@@ -6850,7 +6803,7 @@ mod tests {
             let engine = bind_test_engine(&engine);
             if matches!(&request.pattern, CoordinationPattern::FanOut { .. }) {
                 for (invalid_target, depth) in
-                    [("lead", 0), ("missing", 0), ("outside", 0), ("coder", 1)]
+                    [("writer", 0), ("missing", 0), ("reviewer", 0), ("coder", 1)]
                 {
                     let mut invalid = request.clone();
                     invalid.depth = depth;
@@ -6859,12 +6812,7 @@ mod tests {
                         aggregation: AggregationStrategy::AllResults,
                         timeout_sec: 0,
                     };
-                    assert!(
-                        engine
-                            .execute(invalid, "opaque-parent-instance", None)
-                            .await
-                            .is_err()
-                    );
+                    assert!(engine.execute(invalid, "orch", None).await.is_err());
                     assert!(bindings.lock().unwrap().is_empty());
                     assert!(
                         tracker
@@ -6888,16 +6836,13 @@ mod tests {
             persist_parent_contract_fixture(&run_engine, &request)
                 .await
                 .unwrap();
-            let result = engine
-                .execute(request.clone(), "opaque-parent-instance", None)
-                .await
-                .unwrap();
+            let result = engine.execute(request.clone(), "orch", None).await.unwrap();
             assert_eq!(result.status, STATUS_COMPLETED);
             {
                 let bindings = bindings.lock().unwrap();
                 assert_eq!(bindings.len(), result.agent_results.len());
                 for binding in bindings.iter() {
-                    assert_eq!(binding.profile_authority, expected_child_authority);
+                    assert_eq!(binding.delegation_authority, expected_child_authority);
                     assert_eq!(binding.profile.allow_tools, Some(vec!["read_file".into()]));
                     assert_eq!(
                         binding.request_constraints.allowed_tools,
@@ -6941,27 +6886,19 @@ mod tests {
                 assert!(restrictions["execution_deadline_unix_ms"].is_null());
                 assert!(restrictions["execution_work_deadline_unix_ms"].is_null());
                 assert_eq!(
-                    crate::server::run::engine::durable_run_profile_authority(
+                    crate::server::run::engine::durable_run_delegation_authority(
                         &child,
                         &request.user_id
                     )
                     .unwrap(),
                     expected_child_authority,
                 );
-                assert_eq!(
-                    crate::server::run::engine::durable_run_agent_profiles(
-                        &child,
-                        &request.user_id
-                    )
-                    .unwrap(),
-                    Some(snapshot.clone())
-                );
                 if is_fork {
                     for inherited_prefix in [false, true] {
                         crate::orchestration::agent_tool::tests::assert_restricted_child_handlers(
                             &child,
                             inherited_prefix,
-                            "outside",
+                            "explore",
                         )
                         .await;
                     }
@@ -7001,8 +6938,8 @@ mod tests {
             cancel_token.cancelled().await;
             self.cancel_observed.notify_one();
             self.release.notified().await;
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: STATUS_CANCELLED.into(),
@@ -7012,8 +6949,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -7362,8 +7300,8 @@ mod tests {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 self.0.send(config.run_id.clone()).unwrap();
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: STATUS_COMPLETED.to_string(),
@@ -7373,8 +7311,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -7436,8 +7375,8 @@ mod tests {
     #[async_trait]
     impl SubRunExecutor for StatusExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
                     status: self.status.to_string(),
@@ -7447,8 +7386,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -7461,8 +7401,8 @@ mod tests {
     impl SubRunExecutor for FailingExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             if self.fail_agents.contains(&config.agent_profile.agent_id) {
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "failed".to_string(),
@@ -7472,11 +7412,12 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             } else {
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id.clone(),
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -7486,8 +7427,9 @@ mod tests {
                         completion_tokens: 20,
                         tool_calls: 1,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
     }
@@ -7789,8 +7731,8 @@ mod tests {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 self.parent_cancel.cancel();
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: STATUS_COMPLETED.to_string(),
@@ -7800,8 +7742,9 @@ mod tests {
                         completion_tokens: 3,
                         tool_calls: 1,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -7907,8 +7850,8 @@ mod tests {
         impl SubRunExecutor for ContextCheckExecutor {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 let has_key = config.context.contains_key("test_key");
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -7918,8 +7861,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -7967,8 +7911,8 @@ mod tests {
                 let has_context_key = config
                     .context
                     .contains_key(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -7980,8 +7924,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -8050,8 +7995,8 @@ mod tests {
                         )
                     })
                     .unwrap_or_else(|| "none".to_string());
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -8061,8 +8006,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -8149,8 +8095,8 @@ mod tests {
                     .agent_profile
                     .model_selection
                     .map(|selection| selection.offering_id);
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -8166,8 +8112,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -8271,8 +8218,8 @@ mod tests {
                 let has_context_key = config
                     .context
                     .contains_key(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -8284,8 +8231,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -8440,8 +8388,8 @@ mod tests {
                     .and_then(|v| v.as_str())
                     .unwrap_or("none")
                     .to_string();
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -8451,8 +8399,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -8698,6 +8647,7 @@ mod tests {
                     STATUS_WAITING,
                     Some("user_input"),
                     None,
+                    &[],
                 )
                 .await
                 .unwrap()
@@ -8739,6 +8689,7 @@ mod tests {
                         durable_status,
                         None,
                         Some("control-plane"),
+                        &[],
                     )
                     .await
                     .unwrap();
@@ -8777,9 +8728,10 @@ mod tests {
                     tool_calls: 1,
                 },
                 None,
+                &[],
             )
             .await
-            .0;
+            .result;
 
             assert_eq!(authoritative.status, durable_status);
             assert!(authoritative.output.is_none());
@@ -8788,6 +8740,175 @@ mod tests {
             } else {
                 assert!(authoritative.error.is_none());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_collector_preserves_result_without_guidance_and_rejects_stale_text() {
+        for (run_id, events, expected_status, expected_output) in [
+            (
+                "legacy-result",
+                vec![serde_json::json!({
+                    "event_type": "text_done",
+                    "data": {"full_text": "legacy completed answer"}
+                })],
+                STATUS_COMPLETED,
+                Some("legacy completed answer"),
+            ),
+            (
+                "invalid-guidance",
+                vec![serde_json::json!({
+                    "event_type": "text_done",
+                    "data": {"full_text": "answer", "applied_user_intents": {}}
+                })],
+                STATUS_COMPLETED,
+                Some("answer"),
+            ),
+            (
+                "malformed-newer-result",
+                vec![
+                    serde_json::json!({
+                        "event_type": "text_done",
+                        "data": {"full_text": "stale answer"}
+                    }),
+                    serde_json::json!({
+                        "event_type": "text_done",
+                        "data": {"full_text": " "}
+                    }),
+                ],
+                STATUS_WAITING,
+                None,
+            ),
+        ] {
+            let (_, engine, _) = setup();
+            let authority = engine
+                .start_run(run_id, "user-1", "session-1")
+                .await
+                .unwrap();
+            assert!(
+                engine
+                    .persist_delegation_outcome_status_if_current_owner(
+                        "user-1",
+                        "session-1",
+                        run_id,
+                        authority.owner_generation,
+                        STATUS_COMPLETED,
+                        None,
+                        None,
+                        &events,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let receipt = reconcile_agent_result_with_durable_authority(
+                &engine,
+                "user-1",
+                "session-1",
+                DurableLifecycleDisposition::ExecutorOwned {
+                    owner_generation: authority.owner_generation,
+                },
+                AgentResult {
+                    agent_id: "coder".into(),
+                    run_id: run_id.into(),
+                    status: STATUS_FAILED.into(),
+                    output: Some("stale executor result".into()),
+                    error: Some("stale executor error".into()),
+                    prompt_tokens: 3,
+                    completion_tokens: 5,
+                    tool_calls: 1,
+                },
+                None,
+                &[],
+            )
+            .await;
+
+            assert_eq!(receipt.result.status, expected_status);
+            assert_eq!(receipt.result.output.as_deref(), expected_output);
+            assert!(receipt.applied_user_intents.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_replay_uses_the_committed_receipt_not_matching_generation() {
+        for typed_partial in [false, true] {
+            let store = Arc::new(InMemoryRunStateStore::new());
+            let engine = RunEngine::new(store);
+            let authority = engine
+                .start_run("partial-race", "user-1", "session-1")
+                .await
+                .unwrap();
+            let winner_guidance = vec![crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "winner-guidance".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 1,
+                content: "Keep the verified portion".into(),
+            }];
+            assert!(
+                engine
+                    .persist_delegation_outcome_status_if_current_owner(
+                        "user-1",
+                        "session-1",
+                        "partial-race",
+                        authority.owner_generation,
+                        if typed_partial {
+                            "partial"
+                        } else {
+                            STATUS_FAILED
+                        },
+                        None,
+                        Some("committed outcome"),
+                        &[serde_json::json!({"event_type":"text_done", "data": {
+                            "full_text":"committed output", "applied_user_intents": winner_guidance,
+                        }})],
+                    )
+                    .await
+                    .unwrap()
+            );
+            let local = AgentResult {
+                agent_id: "coder".into(),
+                run_id: "partial-race".into(),
+                status: "partial".into(),
+                output: Some("uncommitted output".into()),
+                error: Some("local error".into()),
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+            };
+            let receipt = reconcile_agent_result_with_durable_authority(
+                &engine,
+                "user-1",
+                "session-1",
+                DurableLifecycleDisposition::ExecutorOwned {
+                    owner_generation: authority.owner_generation,
+                },
+                local,
+                None,
+                &[],
+            )
+            .await;
+            assert_eq!(
+                receipt.result.status,
+                if typed_partial {
+                    "partial"
+                } else {
+                    STATUS_FAILED
+                }
+            );
+            assert_eq!(receipt.result.error.as_deref(), Some("committed outcome"));
+            assert_eq!(
+                receipt.result.output.as_deref(),
+                typed_partial.then_some("committed output")
+            );
+            assert_eq!(
+                receipt.applied_user_intents,
+                if typed_partial {
+                    winner_guidance
+                } else {
+                    vec![]
+                }
+            );
         }
     }
 
@@ -8826,9 +8947,10 @@ mod tests {
                 tool_calls: 1,
             },
             None,
+            &[],
         )
         .await
-        .0;
+        .result;
 
         assert_eq!(authoritative.status, STATUS_WAITING);
         assert!(authoritative.output.is_none());
@@ -8866,6 +8988,9 @@ mod tests {
                     STATUS_COMPLETED,
                     None,
                     None,
+                    &[serde_json::json!({"event_type":"text_done", "data":{
+                        "full_text":"recovered generation output", "applied_user_intents":[]
+                    }})],
                 )
                 .await
                 .expect("recovered owner commits its completed result")
@@ -8889,12 +9014,16 @@ mod tests {
                 tool_calls: 1,
             },
             None,
+            &[],
         )
         .await
-        .0;
+        .result;
 
         assert_eq!(authoritative.status, STATUS_COMPLETED);
-        assert!(authoritative.output.is_none());
+        assert_eq!(
+            authoritative.output.as_deref(),
+            Some("recovered generation output")
+        );
         assert_eq!(authoritative.prompt_tokens, 0);
         assert_eq!(authoritative.completion_tokens, 0);
         assert_eq!(authoritative.tool_calls, 0);
@@ -8923,6 +9052,9 @@ mod tests {
                     STATUS_COMPLETED,
                     None,
                     None,
+                    &[serde_json::json!({"event_type":"text_done", "data":{
+                        "full_text":"recovered owner output", "applied_user_intents":[]
+                    }})],
                 )
                 .await
                 .expect("recovered owner commits its completed result")
@@ -8946,12 +9078,16 @@ mod tests {
                 tool_calls: 2,
             },
             None,
+            &[],
         )
         .await
-        .0;
+        .result;
 
         assert_eq!(authoritative.status, STATUS_COMPLETED);
-        assert!(authoritative.output.is_none());
+        assert_eq!(
+            authoritative.output.as_deref(),
+            Some("recovered owner output")
+        );
         assert_eq!(authoritative.prompt_tokens, 0);
         assert_eq!(authoritative.completion_tokens, 0);
         assert_eq!(authoritative.tool_calls, 0);
@@ -8997,9 +9133,10 @@ mod tests {
                     tool_calls: 1,
                 },
                 None,
+                &[],
             )
             .await
-            .0;
+            .result;
 
             assert_eq!(authoritative.status, status);
             let durable = engine.load_run("user-1", run_id).await.unwrap().unwrap();
@@ -9032,6 +9169,9 @@ mod tests {
                     STATUS_COMPLETED,
                     None,
                     None,
+                    &[serde_json::json!({"event_type":"text_done", "data":{
+                        "full_text":"full answer", "applied_user_intents":[]
+                    }})],
                 )
                 .await
                 .unwrap()
@@ -9055,9 +9195,10 @@ mod tests {
                 tool_calls: 1,
             },
             None,
+            &[],
         )
         .await
-        .0;
+        .result;
 
         assert_eq!(replayed.status, STATUS_COMPLETED);
         assert_eq!(replayed.output.as_deref(), Some("full answer"));
@@ -9073,6 +9214,22 @@ mod tests {
         #[async_trait]
         impl SubRunExecutor for CancelAfterCompletion {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
+                assert!(
+                    self.run_engine
+                        .persist_usage_if_current_owner(
+                            &config.user_id,
+                            &config.session_id,
+                            &config.run_id,
+                            config
+                                .execution_owner_generation
+                                .expect("child owner generation"),
+                            7,
+                            3,
+                            1,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                );
                 let committed = self
                     .run_engine
                     .persist_delegation_outcome_status_if_current_owner(
@@ -9085,6 +9242,9 @@ mod tests {
                         STATUS_COMPLETED,
                         None,
                         None,
+                        &[serde_json::json!({"event_type":"text_done", "data": {
+                            "full_text":"completed before parent cancellation", "applied_user_intents": []
+                        }})],
                     )
                     .await
                     .map_err(|error| error.to_string())?;
@@ -9092,8 +9252,8 @@ mod tests {
                     return Err("child completion lost durable authority".into());
                 }
                 self.parent_cancel.cancel();
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: STATUS_COMPLETED.into(),
@@ -9103,8 +9263,9 @@ mod tests {
                         completion_tokens: 3,
                         tool_calls: 1,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
 
             fn owns_durable_run_lifecycle(&self) -> bool {
@@ -9174,8 +9335,8 @@ mod tests {
 
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 self.executions.fetch_add(1, Ordering::Relaxed);
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: STATUS_COMPLETED.to_string(),
@@ -9185,8 +9346,9 @@ mod tests {
                         completion_tokens: 1,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -9311,7 +9473,7 @@ mod tests {
             .unwrap();
 
         let output = result.agent_results[0].output.as_deref().unwrap_or("");
-        assert!(output.contains("## Team Coordination: Sequential Execution"));
+        assert!(output.contains("## Agent Coordination: Sequential Execution"));
     }
 
     #[tokio::test]
@@ -10087,8 +10249,8 @@ mod tests {
                 if fork_index == 1 {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: STATUS_COMPLETED.to_string(),
@@ -10098,8 +10260,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -10257,8 +10420,8 @@ mod tests {
                     .get("fork_index")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(999);
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: "completed".to_string(),
@@ -10268,8 +10431,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
         }
 
@@ -10702,8 +10866,8 @@ mod tests {
     impl SubRunExecutor for SlowExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             tokio::time::sleep(self.delay).await;
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id.clone(),
                     run_id: config.run_id.clone(),
                     status: "completed".into(),
@@ -10713,8 +10877,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -10725,8 +10890,8 @@ mod tests {
     #[async_trait::async_trait]
     impl SubRunExecutor for MailboxEchoExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
-            Ok((
-                AgentResult {
+            Ok(SubRunExecutionResult {
+                result: AgentResult {
                     agent_id: config.agent_profile.agent_id.clone(),
                     run_id: config.run_id.clone(),
                     status: "completed".into(),
@@ -10736,8 +10901,9 @@ mod tests {
                     completion_tokens: 0,
                     tool_calls: 0,
                 },
-                None,
-            ))
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
+            })
         }
     }
 
@@ -10813,8 +10979,8 @@ mod tests {
                     .expect("deadline mutex is not poisoned")
                     .push(config.execution_deadline);
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                Ok((
-                    AgentResult {
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
                         agent_id: config.agent_profile.agent_id,
                         run_id: config.run_id,
                         status: STATUS_COMPLETED.to_string(),
@@ -10824,8 +10990,9 @@ mod tests {
                         completion_tokens: 0,
                         tool_calls: 0,
                     },
-                    None,
-                ))
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
+                })
             }
 
             fn owns_durable_run_lifecycle(&self) -> bool {
@@ -10959,7 +11126,7 @@ mod tests {
             agent_id: "worker".into(),
             run_id: run_id.into(),
             status: status.into(),
-            output: None,
+            output: (status == STATUS_COMPLETED).then(|| "committed delivery".into()),
             error: None,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -10983,23 +11150,27 @@ mod tests {
             },
             result_for("completed", STATUS_COMPLETED),
             Some(&retirement),
+            &[],
         )
         .await
-        .0;
+        .result;
         assert_eq!(result.status, STATUS_COMPLETED);
 
         let reread = engine.start_run("reread", "u", "s").await.unwrap();
         assert!(
             engine
-                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
-                    user_id: "u",
-                    expected_session_id: "s",
-                    run_id: "reread",
-                    status: STATUS_COMPLETED,
-                    waiting_for: None,
-                    error_message: None,
-                    expected_statuses: &["running"],
-                })
+                .persist_delegation_outcome_status_if_current_owner(
+                    "u",
+                    "s",
+                    "reread",
+                    reread.owner_generation,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[serde_json::json!({"event_type":"text_done", "data": {
+                        "full_text":"committed delivery", "applied_user_intents": []
+                    }})],
+                )
                 .await
                 .unwrap()
         );
@@ -11016,9 +11187,10 @@ mod tests {
             },
             result_for("reread", STATUS_COMPLETED),
             Some(&reread_retirement),
+            &[],
         )
         .await
-        .0;
+        .result;
         assert_eq!(result.status, STATUS_COMPLETED);
 
         let waiting = engine.start_run("waiting", "u", "s").await.unwrap();
@@ -11035,9 +11207,10 @@ mod tests {
             },
             result_for("waiting", STATUS_WAITING),
             Some(&waiting_retirement),
+            &[],
         )
         .await
-        .0;
+        .result;
         assert_eq!(result.status, STATUS_WAITING);
 
         let mailbox = router.register(mailbox_for("missing"), None).await.unwrap();
@@ -11051,9 +11224,10 @@ mod tests {
             DurableLifecycleDisposition::ReadOnly,
             result_for("missing", STATUS_FAILED),
             Some(&missing_retirement),
+            &[],
         )
         .await
-        .0;
+        .result;
         assert_eq!(result.status, STATUS_WAITING);
         assert!(result.is_unfinished());
 
@@ -11578,10 +11752,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(config.inherited_prefix.is_some());
-                if matches!(
-                    config.profile_authority,
-                    ParentProfileAuthority::NonDelegating { .. }
-                ) {
+                if matches!(config.delegation_authority, DelegationAuthority::Forbidden) {
                     let child = self
                         .run_engine
                         .load_run(&config.user_id, &config.run_id)
@@ -11590,7 +11761,7 @@ mod tests {
                     crate::orchestration::agent_tool::tests::assert_restricted_child_handlers(
                         &child,
                         config.inherited_prefix.is_some(),
-                        "coder",
+                        "explore",
                     )
                     .await;
                 }

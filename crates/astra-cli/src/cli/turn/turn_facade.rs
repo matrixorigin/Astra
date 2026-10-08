@@ -1,15 +1,7 @@
 //! Thin facade for one-shot/headless chat turns.
 //!
-//! This centralizes two invariants that used to be duplicated at multiple
-//! call sites in `command_router.rs`:
-//! 1. the first attempt may include preloaded continuation messages, but a
-//!    session-not-found retry must preserve them so local continuation is not lost;
-//! 2. a session-not-found retry must clear the persisted "last session"
-//!    pointer before retrying without a session id.
-
-use super::turn_session_retry::{
-    clear_stale_last_session_pointer, should_retry_after_session_not_found,
-};
+//! One admitted conversation stays bound to its selected session. A missing
+//! session is a failure, not authority to create another and replay its input.
 use crate::cli::chat_stream::{
     ApprovalRequestTx, BasicCliChatContext, ChatTurnParams, stream_chat_sse,
 };
@@ -291,205 +283,47 @@ pub(crate) struct BasicCliTurnOptions {
         std::sync::Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>,
     >,
     pub(crate) approval_request_tx: Option<ApprovalRequestTx>,
-    pub(crate) disable_session_not_found_retry: bool,
     /// Authoritative 1-based outer-session turn restored before any auxiliary
     /// inference or main bridge request is admitted.
     pub(crate) turn_index: Option<u32>,
-}
-
-struct BasicCliTurnAttempt<'a> {
-    pre_loaded_messages: Option<Vec<serde_json::Value>>,
-    deferred_tool_activations: &'a mut Vec<astra_turn_types::DeferredToolActivation>,
-}
-
-fn build_basic_cli_turn_params<'a>(
-    ctx: &'a BasicCliChatContext<'a>,
-    token: &'a str,
-    session_id: Option<&'a str>,
-    perm_manager: &'a mut PermissionManager,
-    options: &BasicCliTurnOptions,
-    attempt: BasicCliTurnAttempt<'a>,
-) -> ChatTurnParams<'a> {
-    let mut params = ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager);
-    params.pre_loaded_messages = attempt.pre_loaded_messages;
-    params.deferred_tool_activations = Some(attempt.deferred_tool_activations);
-    params.append_system_prompt = options.append_system_prompt.clone();
-    params.cancel_token = options.cancel_token.clone();
-    params.execution_time_budget = options.execution_time_budget.clone();
-    params.incremental_state = options.incremental_state.clone();
-    params.request_session_execution_lease = options.request_session_execution_lease.clone();
-    params.approval_request_tx = options.approval_request_tx.clone();
-    if let Some(turn_index) = options.turn_index {
-        params.turn_index = turn_index.max(1);
-    }
-    params
-}
-
-fn should_retry_without_session(
-    error: &str,
-    session_id: Option<&str>,
-    retry_disabled: bool,
-    request_lease_present: bool,
-) -> bool {
-    !retry_disabled
-        && !request_lease_present
-        && should_retry_after_session_not_found(error, session_id.is_some())
-}
-
-fn retry_pre_loaded_messages(
-    pre_loaded_messages: &Option<Vec<serde_json::Value>>,
-) -> Option<Vec<serde_json::Value>> {
-    pre_loaded_messages.as_deref().map(|messages| {
-        crate::cli::history_work::clone_json_history(
-            astra_core::history_work::HistoryWorkSite::CliTurnRetryHistoryClone,
-            messages,
-        )
-    })
 }
 
 pub(crate) async fn execute_basic_cli_turn<'a>(
     ctx: &'a BasicCliChatContext<'a>,
     token: &'a str,
     session_id: Option<&'a str>,
-    profile: Option<&str>,
     perm_manager: &'a mut PermissionManager,
     mut options: BasicCliTurnOptions,
 ) -> Result<StreamResult, TurnFailure> {
-    let pre_loaded_messages = options.pre_loaded_messages.take();
-    let retry_messages = retry_pre_loaded_messages(&pre_loaded_messages);
-    let mut deferred_tool_activations = std::mem::take(&mut options.deferred_tool_activations);
-    let params = build_basic_cli_turn_params(
-        ctx,
-        token,
-        session_id,
-        perm_manager,
-        &options,
-        BasicCliTurnAttempt {
-            pre_loaded_messages,
-            deferred_tool_activations: &mut deferred_tool_activations,
-        },
-    );
-    let first = settle_request_session_binding_failure(
+    let mut params = ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager);
+    params.pre_loaded_messages = options.pre_loaded_messages;
+    params.deferred_tool_activations = Some(&mut options.deferred_tool_activations);
+    params.append_system_prompt = options.append_system_prompt;
+    params.cancel_token = options.cancel_token;
+    params.execution_time_budget = options.execution_time_budget;
+    params.incremental_state = options.incremental_state.clone();
+    params.request_session_execution_lease = options.request_session_execution_lease.clone();
+    params.approval_request_tx = options.approval_request_tx;
+    if let Some(turn_index) = options.turn_index {
+        params.turn_index = turn_index.max(1);
+    }
+    settle_request_session_binding_failure(
         ctx.api,
         token,
         options.request_session_execution_lease.as_deref(),
         options.incremental_state.as_deref(),
         stream_chat_sse(params).await,
     )
-    .await;
-    match first {
-        Err(err)
-            if should_retry_without_session(
-                &err.error,
-                session_id,
-                options.disable_session_not_found_retry,
-                options.request_session_execution_lease.is_some(),
-            ) =>
-        {
-            if let Some(stale_session_id) = session_id
-                && let Err(clear_error) =
-                    clear_stale_last_session_pointer(profile, stale_session_id)
-            {
-                tracing::warn!(
-                    error = %clear_error,
-                    session_id = ?stale_session_id,
-                    "failed to clear stale last-session pointer before retrying without session id"
-                );
-            }
-            let retry = stream_chat_sse(build_basic_cli_turn_params(
-                ctx,
-                token,
-                None,
-                perm_manager,
-                &options,
-                BasicCliTurnAttempt {
-                    pre_loaded_messages: retry_messages,
-                    deferred_tool_activations: &mut deferred_tool_activations,
-                },
-            ))
-            .await;
-            settle_request_session_binding_failure(
-                ctx.api,
-                token,
-                options.request_session_execution_lease.as_deref(),
-                options.incremental_state.as_deref(),
-                retry,
-            )
-            .await
-        }
-        other => other,
-    }
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BasicCliTurnOptions, cancel_exact_run_until_settled, is_settled_stdout_closure,
-        retry_pre_loaded_messages, settle_request_session_binding_failure,
-        settle_request_session_binding_failure_with_cancel_deadline, should_retry_without_session,
+        cancel_exact_run_until_settled, is_settled_stdout_closure,
+        settle_request_session_binding_failure,
+        settle_request_session_binding_failure_with_cancel_deadline,
     };
-
-    #[test]
-    fn first_attempt_consumes_preloaded_messages_once() {
-        let mut options = BasicCliTurnOptions {
-            pre_loaded_messages: Some(vec![serde_json::json!({"role": "user", "content": "hi"})]),
-            ..Default::default()
-        };
-
-        let first = options.pre_loaded_messages.take();
-        let second = options.pre_loaded_messages.take();
-
-        assert_eq!(first.as_ref().map(Vec::len), Some(1));
-        assert!(
-            second.is_none(),
-            "preloaded messages should only be sent once"
-        );
-    }
-
-    #[test]
-    fn retry_without_session_requires_not_found_error_and_session_id() {
-        assert!(should_retry_without_session(
-            "session not found: 1234",
-            Some("1234"),
-            false,
-            false,
-        ));
-        assert!(!should_retry_without_session(
-            "session not found: 1234",
-            None,
-            false,
-            false,
-        ));
-        assert!(!should_retry_without_session(
-            "session not found: 1234",
-            Some("1234"),
-            true,
-            false,
-        ));
-        assert!(!should_retry_without_session(
-            "rate limited",
-            Some("1234"),
-            false,
-            false,
-        ));
-        assert!(!should_retry_without_session(
-            "session not found: 1234",
-            Some("1234"),
-            false,
-            true,
-        ));
-    }
-
-    #[test]
-    fn session_not_found_retry_replays_preloaded_messages() {
-        let original = Some(vec![
-            serde_json::json!({"role": "assistant", "content": "previous answer"}),
-        ]);
-
-        let retry = retry_pre_loaded_messages(&original);
-
-        assert_eq!(retry, original);
-    }
 
     #[tokio::test]
     async fn binding_cleanup_failure_preserves_cumulative_stream_telemetry() {

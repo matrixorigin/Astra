@@ -12,8 +12,6 @@ use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
 
 pub(crate) struct Footer {
     pub model: Option<String>,
-    /// Friendly label bound to the exact current selection, never authority.
-    team_selection: Option<(astra_turn_types::AgentProfileSelection, String)>,
     pub cwd: Option<String>,
     pub is_turn_active: bool,
     pub permission_mode: Option<PermissionMode>,
@@ -52,7 +50,6 @@ impl Footer {
     pub fn new() -> Self {
         Self {
             model: None,
-            team_selection: None,
             cwd: current_cwd_display(),
             is_turn_active: false,
             permission_mode: None,
@@ -79,25 +76,6 @@ impl Footer {
     pub fn refresh_env(&mut self) {
         self.cwd = current_cwd_display();
         self.git_branch = detect_git_branch();
-    }
-
-    pub(crate) fn set_team_selection(
-        &mut self,
-        selection: astra_turn_types::AgentProfileSelection,
-        label: String,
-    ) {
-        self.team_selection = Some((selection, label));
-    }
-
-    pub(crate) fn sync_team_selection(
-        &mut self,
-        selection: Option<&astra_turn_types::AgentProfileSelection>,
-    ) -> bool {
-        if self.team_selection.as_ref().map(|(identity, _)| identity) == selection {
-            return false;
-        }
-        self.team_selection = selection.map(|identity| (identity.clone(), "Team selected".into()));
-        true
     }
 
     /// Install a lock-free mirror so every frame reads the *current*
@@ -133,7 +111,6 @@ impl Footer {
     fn to_context(&self) -> StatusContext {
         StatusContext {
             model: self.model.clone(),
-            team: self.team_selection.as_ref().map(|(_, label)| label.clone()),
             cwd: self.cwd.clone(),
             permission_mode: self.live_mode(),
             pending_permission_mode: self.pending_permission_mode,

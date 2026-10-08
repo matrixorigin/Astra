@@ -350,6 +350,34 @@ pub(crate) async fn logout() -> Result<(), String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_session() -> native::NativeSession {
+    let issuer = "https://uc.example.test/realms/moi";
+    native::NativeSession {
+        environment: native::Environment {
+            issuer: issuer.into(),
+            astra_url: "https://astra.example.test".into(),
+            moi_url: "https://moi.example.test/newmoi".into(),
+            authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
+            token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+            revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+            jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+        },
+        generation: String::new(),
+        subject: "account-a".into(),
+        session_id: "session-a".into(),
+        astra_user_id: "astra-a".into(),
+        moi_principal_id: "moi-a".into(),
+        catalog_user_id: "catalog-a".into(),
+        access_token: "test-access-a".into(),
+        refresh_token: "test-refresh-a".into(),
+        expires_at: native::unix_now().unwrap() + 3600,
+        workspace_id: None,
+        role_id: None,
+        refresh_pending: false,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -384,33 +412,6 @@ mod tests {
         }
     }
 
-    fn test_session() -> native::NativeSession {
-        let issuer = "https://uc.example.test/realms/moi";
-        native::NativeSession {
-            environment: native::Environment {
-                issuer: issuer.into(),
-                astra_url: "https://astra.example.test".into(),
-                moi_url: "https://moi.example.test/newmoi".into(),
-                authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
-                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
-                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
-                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
-            },
-            generation: String::new(),
-            subject: "account-a".into(),
-            session_id: "session-a".into(),
-            astra_user_id: "astra-a".into(),
-            moi_principal_id: "moi-a".into(),
-            catalog_user_id: "catalog-a".into(),
-            access_token: "test-access-a".into(),
-            refresh_token: "test-refresh-a".into(),
-            expires_at: native::unix_now().unwrap() + 3600,
-            workspace_id: None,
-            role_id: None,
-            refresh_pending: false,
-        }
-    }
-
     #[tokio::test]
     async fn login_rebinding_does_not_retarget_existing_bearer_provider() {
         let root = tempfile::tempdir().unwrap();
@@ -433,193 +434,6 @@ mod tests {
         assert!(old.access_token().await.is_err());
         assert_eq!(new.access_token().await.unwrap(), "test-access-b");
         assert_ne!(old.profile_name(), new.profile_name());
-    }
-
-    #[tokio::test]
-    async fn queued_team_transport_pins_native_generation_and_endpoint() {
-        // Global native selection must not leak into concurrent legacy tests.
-        const CHILD: &str = "ASTRA_NATIVE_TEAM_BINDING_TEST";
-        if std::env::var_os(CHILD).is_none() {
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "cli::native_auth::tests::queued_team_transport_pins_native_generation_and_endpoint", "--nocapture"])
-                .env(CHILD, "1").output().unwrap();
-            assert!(
-                result.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            return;
-        }
-        use crate::cli::{
-            cli_config::cli_utils::install_cli_profile_identity_for_test,
-            http_team_store::HttpTeamStore,
-        };
-        use astra_services::team_persistence::{
-            CreateTeam, TeamPersistenceService, TeamWriteError,
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let _home = crate::test_utils::HomeGuard::temp();
-        let _credentials = crate::test_utils::isolate_credentials();
-        for scenario in [
-            "unchanged",
-            "account",
-            "same_account_generation",
-            "endpoint",
-            "refresh",
-        ] {
-            let accepted = astra_services::team_persistence::builtin_teams("astra-a").remove(0);
-            let input = CreateTeam {
-                team_id: accepted.team_id.clone(),
-                name: accepted.name.clone(),
-                description: accepted.description.clone(),
-                members: accepted.members.clone(),
-                context: accepted.context.clone(),
-            };
-            let (entered, release) = (
-                Arc::new(tokio::sync::Notify::new()),
-                Arc::new(tokio::sync::Notify::new()),
-            );
-            let (rotations, writes) =
-                (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-            let requests = Arc::new(AtomicUsize::new(0));
-            let requests_seen = requests.clone();
-            let (started, proceed, rotations_seen) =
-                (entered.clone(), release.clone(), rotations.clone());
-            let writes_seen = writes.clone();
-            let expected = accepted.clone();
-            let app = axum::Router::new()
-                .route(
-                    "/realms/moi/protocol/openid-connect/token",
-                    axum::routing::post(
-                        move |axum::Form(body): axum::Form<
-                            std::collections::HashMap<String, String>,
-                        >| {
-                            let (started, proceed, calls) =
-                                (started.clone(), proceed.clone(), rotations_seen.clone());
-                            async move {
-                                assert_eq!(body["refresh_token"], "test-refresh-a");
-                                calls.fetch_add(1, Ordering::SeqCst);
-                                started.notify_one();
-                                proceed.notified().await;
-                                axum::http::StatusCode::SERVICE_UNAVAILABLE
-                            }
-                        },
-                    ),
-                )
-                .route(
-                    "/teams",
-                    axum::routing::post(move |headers: axum::http::HeaderMap| {
-                        let (calls, expected) = (writes_seen.clone(), expected.clone());
-                        async move {
-                            assert_eq!(headers["authorization"], "Bearer test-access-a");
-                            calls.fetch_add(1, Ordering::SeqCst);
-                            axum::Json(expected)
-                        }
-                    }),
-                )
-                .layer(axum::middleware::from_fn(
-                    move |request: axum::extract::Request, next: axum::middleware::Next| {
-                        let requests = requests_seen.clone();
-                        async move {
-                            requests.fetch_add(1, Ordering::SeqCst);
-                            next.run(request).await
-                        }
-                    },
-                ));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let root = tempfile::tempdir().unwrap();
-            let store = NativeStore::with_directory(root.path().join("auth"));
-            let mut original = test_session();
-            let issuer = format!("{origin}/realms/moi");
-            original.environment = native::Environment {
-                astra_url: origin.clone(),
-                moi_url: format!("{origin}/moi"),
-                authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
-                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
-                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
-                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
-                issuer,
-            };
-            if scenario == "refresh" {
-                original.expires_at = native::unix_now().unwrap();
-            }
-            let (session, _) = store.publish(original.clone()).unwrap();
-            let binding = binding_for_test(store.clone(), session);
-            let _active = install_active_for_test(binding.clone());
-            let _identity =
-                install_cli_profile_identity_for_test(&binding.profile_name(), Some("astra-a"))
-                    .unwrap();
-            let foreign = wiremock::MockServer::start().await;
-            let endpoint = if scenario == "endpoint" {
-                foreign.uri()
-            } else {
-                origin.clone()
-            };
-            let api = astra_thin_client::ThinClient::new(&endpoint, None).unwrap();
-            let team_store = HttpTeamStore::new(&api, None);
-            let write = team_store.create_team("astra-a", &input);
-            tokio::pin!(write);
-            if scenario == "refresh" {
-                tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    tokio::select! {
-                        result = &mut write => panic!("write settled before refresh: {result:?}"),
-                        () = entered.notified() => {}
-                    }
-                })
-                .await
-                .expect("native refresh entered");
-            }
-            if matches!(scenario, "account" | "same_account_generation" | "refresh") {
-                let mut replacement = original;
-                if scenario != "same_account_generation" {
-                    replacement.subject = "account-b".into();
-                    replacement.astra_user_id = "astra-b".into();
-                }
-                replacement.access_token = "test-access-b".into();
-                replacement.refresh_token = "test-refresh-b".into();
-                replacement.expires_at = native::unix_now().unwrap() + 3600;
-                let (session, _) = store.publish(replacement).unwrap();
-                let replacement = binding_for_test(store.clone(), session);
-                let _new_identity = install_cli_profile_identity_for_test(
-                    &replacement.profile_name(),
-                    Some(&replacement.account_id().unwrap()),
-                )
-                .unwrap();
-                let _new_active = install_active_for_test(replacement);
-                release.notify_one();
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut write)
-                        .await
-                        .unwrap(),
-                    Err(TeamWriteError::Rejected)
-                );
-                assert_eq!(store.current().unwrap().access_token, "test-access-b");
-            } else if scenario == "unchanged" {
-                assert_eq!(write.await.unwrap(), accepted);
-            } else {
-                assert_eq!(write.await, Err(TeamWriteError::Rejected));
-            }
-            assert_eq!(
-                rotations.load(Ordering::SeqCst),
-                usize::from(scenario == "refresh")
-            );
-            assert_eq!(
-                writes.load(Ordering::SeqCst),
-                usize::from(scenario == "unchanged")
-            );
-            assert_eq!(
-                requests.load(Ordering::SeqCst),
-                usize::from(matches!(scenario, "unchanged" | "refresh")),
-                "no extra HTTP requests"
-            );
-            assert!(foreign.received_requests().await.unwrap().is_empty());
-            server.abort();
-        }
     }
 
     #[tokio::test]

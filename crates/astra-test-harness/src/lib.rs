@@ -47,6 +47,7 @@ pub mod dashboard;
 pub mod digest;
 pub mod eval;
 pub mod exec;
+pub(crate) mod execution_capture;
 pub mod explain_capture;
 pub mod judger;
 pub mod model_profiles;

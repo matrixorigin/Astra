@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 pub(crate) struct CliContext {
     /// Caller intent, distinct from the resolved/default model used for UI and budgets.
     pub(crate) requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
-    /// Configuration selection only; authority is materialized by Server admission.
-    pub(crate) agent_profile_selection: Option<astra_services::runs::AgentProfileSelection>,
     pub(crate) no_journal_content: bool,
     pub(crate) allowed_tools: Vec<String>,
     pub(crate) disallowed_tools: Vec<String>,
@@ -40,7 +38,6 @@ impl CliContext {
 
         Ok(Self {
             requested_model_policy: None,
-            agent_profile_selection: None,
             no_journal_content,
             allowed_tools: resolve_tool_list(allowed_tools, "ASTRA_CLI_ALLOWED_TOOLS"),
             disallowed_tools: resolve_tool_list(disallowed_tools, "ASTRA_CLI_DISALLOWED_TOOLS"),

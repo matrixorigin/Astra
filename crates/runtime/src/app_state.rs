@@ -223,9 +223,6 @@ pub struct AppState {
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
-    /// Team persistence store — definitions and immutable snapshots.
-    pub(crate) team_store:
-        Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
     /// Per-user resource governor for limit checking and usage tracking (Phase 5).
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Canonical branch authority. Production always wires the database
@@ -333,7 +330,6 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             delegation_engine: None,
-            team_store: None,
             resource_governor: std::sync::Arc::new(
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
@@ -829,14 +825,6 @@ impl AppState {
         engine: Arc<crate::server::delegation::engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
-        self
-    }
-
-    pub fn with_team_store(
-        mut self,
-        store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
-    ) -> Self {
-        self.team_store = Some(store);
         self
     }
 

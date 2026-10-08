@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RestoreInputRequest {
     pub(crate) text: String,
+    pub(crate) continuation: Option<crate::tui::event_loop::SessionContinuationTarget>,
     pub(crate) session_id: Option<String>,
     /// Stable identity for one rejected submission. The event loop uses it
     /// to make delivery idempotent when a queued event and the fallback lane

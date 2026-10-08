@@ -167,6 +167,23 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if judger_unavailable {
         return FailureClass::InfraVerificationUnavailable;
     }
+    if criteria_results.iter().any(|result| {
+        !result.passed && crate::criteria::execution_verification_unavailable(result, outcome)
+    }) {
+        return FailureClass::InfraVerificationUnavailable;
+    }
+    if criteria_results.iter().any(|result| {
+        !result.passed
+            && crate::criteria::requires_execution_capture(std::slice::from_ref(&result.criterion))
+    }) && outcome.stream_capture.as_ref().is_none_or(|stream| {
+        stream
+            .execution
+            .as_ref()
+            .is_none_or(|capture| capture.awaiting_completion_evidence(outcome.run_id.as_deref()))
+    }) {
+        return FailureClass::InfraVerificationUnavailable;
+    }
+
     let hard_oracle_failed = criteria_results.iter().any(|result| {
         !result.passed
             && result.severity == crate::criteria::CriterionSeverity::Hard
@@ -468,6 +485,71 @@ mod tests {
 
     fn make_outcome() -> RunOutcome {
         RunOutcome::new("test-model")
+    }
+
+    #[test]
+    fn execution_verification_classification_follows_composed_criteria() {
+        let proof = Criterion::ExecutionChildResultsAdopted {
+            children: vec![crate::criteria::ChildExecutionExpectation {
+                expected_result: crate::criteria::ChildResultExpectation::Text(
+                    "missing-result".into(),
+                ),
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        };
+        for criterion in [
+            proof.clone(),
+            Criterion::AllOf {
+                criteria: vec![proof.clone()],
+            },
+            Criterion::AnyOf {
+                criteria: vec![proof],
+            },
+        ] {
+            let mut outcome = make_outcome().with_exit_code(0);
+            let criteria = [criterion];
+            let results = crate::criteria::evaluate_deterministic(&criteria, &outcome);
+            assert!(!results[0].passed);
+            assert_eq!(
+                classify(&outcome, &results),
+                FailureClass::InfraVerificationUnavailable
+            );
+
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(crate::execution_capture::tests::capture());
+            outcome.stream_capture = Some(stream);
+            outcome.session_id = Some("session".into());
+            outcome.run_id = Some("root".into());
+            let results = crate::criteria::evaluate_deterministic(&criteria, &outcome);
+            assert!(!results[0].passed);
+            assert_eq!(
+                classify(&outcome, &results),
+                FailureClass::BehaviorContractViolation
+            );
+            let matching = Criterion::ExecutionChildResultsAdopted {
+                children: vec![crate::criteria::ChildExecutionExpectation {
+                    expected_result: crate::criteria::ChildResultExpectation::Text(
+                        "observed-value".into(),
+                    ),
+                    model: "test-model".into(),
+                    initial_thinking: None,
+                    answered_question: false,
+                    workspace_mutation: None,
+                    logical_rounds: None,
+                    slot_index: None,
+                }],
+                fanout_group: None,
+            };
+            let results = crate::criteria::evaluate_deterministic(&[matching], &outcome);
+            assert!(results[0].passed);
+        }
     }
 
     fn cr(criterion: Criterion, passed: bool) -> CriterionResult {

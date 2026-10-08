@@ -203,9 +203,6 @@ pub(crate) enum Command {
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
     Doctor,
-    /// Team orchestration and shared context management
-    #[command(alias = "teams")]
-    Team(TeamArgs),
     /// Start, inspect, and continue durable Work
     #[command(subcommand)]
     Work(WorkSubcommand),
@@ -498,131 +495,6 @@ impl ChatArgs {
     }
 }
 
-#[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra team list\n  astra team create dev Frontend delivery team\n  astra team add-member dev planner Break work into steps\n  astra team run review --lead-agent-id team-review-reviewer 在/tmp下实现一个登录页面"
-)]
-pub(crate) struct TeamArgs {
-    #[command(subcommand)]
-    pub command: Option<TeamSubcommand>,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum TeamSubcommand {
-    /// List defined teams
-    List,
-    /// Interactive workbench only: return future messages to the default agent
-    #[command(hide = true)]
-    Leave,
-    /// Create a team
-    Create(TeamCreateArgs),
-    #[command(name = "add-member")]
-    /// Add a role/member to a team
-    AddMember(TeamAddMemberArgs),
-    /// Show team details
-    Info(TeamNameArgs),
-    /// Delete a team
-    Delete(TeamNameArgs),
-    /// Set shared team context
-    Context(TeamContextArgs),
-    /// Execute a task with a team
-    Run(TeamRunArgs),
-    /// Save a team snapshot
-    Snapshot(TeamSnapshotArgs),
-    /// Restore a team snapshot
-    Restore(TeamRestoreArgs),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamCreateArgs {
-    /// Team name
-    pub name: String,
-    /// Optional description
-    #[arg(trailing_var_arg = true)]
-    pub description: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamAddMemberArgs {
-    /// Team name
-    pub team: String,
-    /// Member role
-    pub role: String,
-    /// Allow this member to delegate within the authorized Team roster.
-    #[arg(long)]
-    pub can_delegate: bool,
-    /// Absolute nested delegation depth ceiling for this member.
-    #[arg(long, requires = "can_delegate", value_parser = clap::value_parser!(u32).range(1..))]
-    pub max_delegation_depth: Option<u32>,
-    /// Available model name selected for this member.
-    #[arg(long)]
-    pub model: Option<String>,
-    /// Optional description for the member
-    #[arg(trailing_var_arg = true)]
-    pub description: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamNameArgs {
-    /// Team name
-    pub name: String,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamContextArgs {
-    /// Team name
-    pub team: String,
-    /// Context key
-    pub key: String,
-    /// Context value
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub value: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamRunArgs {
-    /// Team name
-    pub team: String,
-    /// Lead agent ID; defaults to the sole delegation-capable member.
-    #[arg(long = "lead-agent-id", value_name = "AGENT_ID")]
-    pub lead_agent_id: Option<String>,
-    /// Output the completed root turn as JSON (implies quiet output).
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-    /// Start an isolated one-shot conversation instead of resuming recent history.
-    #[arg(long)]
-    pub no_resume: bool,
-    /// Write the existing structured JSONL turn events to this machine-event file.
-    #[arg(long = "stream-events", hide = true, value_name = "PATH")]
-    pub stream_events: Option<PathBuf>,
-    /// Capture the ordinary Chat execution explanation.
-    #[arg(long, num_args = 0..=1, default_missing_value = "on", value_name = "MODE", value_parser = parse_explain_mode_arg)]
-    pub explain: Option<crate::cli::session::session_state::ExplainMode>,
-    /// Bound execution using the ordinary Chat wall-clock budget.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(71..))]
-    pub max_wall_time_seconds: Option<u64>,
-    /// Task description
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub task: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamSnapshotArgs {
-    /// Team name
-    pub team: String,
-    /// Optional snapshot label
-    #[arg(trailing_var_arg = true)]
-    pub label: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamRestoreArgs {
-    /// Team name
-    pub team: String,
-    /// Snapshot identifier
-    pub snapshot_id: String,
-}
-
 #[derive(Subcommand, Debug)]
 pub(crate) enum WorkSubcommand {
     /// Create a Work and start its server-owned developer loop
@@ -833,7 +705,7 @@ pub(crate) struct DebugArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra agent list\n  astra agent status team-dev-planner\n  astra agent logs team-dev-planner"
+    after_help = "Examples:\n  astra agent list\n  astra agent status dev-planner\n  astra agent logs dev-planner"
 )]
 pub(crate) struct AgentArgs {
     #[command(subcommand)]
@@ -928,11 +800,11 @@ pub(crate) enum SessionCmd {
     /// Show session details
     Show(SessionShowArgs),
     /// Close an active session
-    Close(SessionShowArgs),
+    Close(SessionIdArgs),
     /// Cancel active runs in a session and mark it cancelled
-    Cancel(SessionShowArgs),
+    Cancel(SessionIdArgs),
     /// Delete a session record
-    Delete(SessionShowArgs),
+    Delete(SessionIdArgs),
     /// Inspect or download session-scoped LLM captures
     #[command(subcommand)]
     Capture(SessionCaptureCmd),
@@ -1078,6 +950,20 @@ pub(crate) struct SessionListArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct SessionShowArgs {
+    pub session_id: String,
+    /// Capture the Server run tree and reflection together for execution inspection
+    #[arg(long)]
+    pub execution: bool,
+    /// Include the complete bounded Server transcript in execution inspection
+    #[arg(long, requires = "execution")]
+    pub transcript: bool,
+    /// Include bounded recent Server events for each run; not complete event history
+    #[arg(long, requires = "execution")]
+    pub run_events: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SessionIdArgs {
     pub session_id: String,
 }
 

@@ -12,32 +12,10 @@ timeout_seconds: 120
 criteria:
   - type: exit_code
     code: 0
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-  - type: session_event_count
-    event_type: agent_spawned
-    min: 1
-    max: 1
-    json_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: glm-5.2
-  - type: session_event_count
-    event_type: LlmRoundCompleted
-    min: 1
-    json_match:
-      path: /payload/model
-      equals: glm-5.2
-      same_run_as:
-        event_type: agent_spawned
-        run_id_path: /metadata/run_id
-  - type: session_child_result_adopted
-    expected_result: "323"
-    spawn_match:
-      path: /metadata/model_configuration/prepared_selection/model_name
-      equals: glm-5.2
-    allow_get_result: true
+  - type: execution_child_results_adopted
+    children:
+      - expected_result: {text: "323"}
+        model: glm-5.2
   - type: text_contains
     needle: "323"
   - type: text_contains
@@ -45,43 +23,43 @@ criteria:
   - type: turn_rounds_between
     min: 2
     max: 3
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: model_catalog
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: tool_search
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: bash
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: read_file
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: list_dir
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: grep
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: web_fetch
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: web_search
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: write_file
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: str_replace
     min: 0
     max: 0

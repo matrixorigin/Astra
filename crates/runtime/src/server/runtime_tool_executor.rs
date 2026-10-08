@@ -2805,17 +2805,6 @@ impl RuntimeToolExecutor {
         }
     }
 
-    pub async fn wait_for_direct_child_pause(
-        &self,
-        owner: &crate::orchestration::FanoutParentAdmission,
-    ) {
-        if let Some(context) = self.agent_tool_context_snapshot() {
-            context.spawner.wait_for_direct_child_pause(owner).await;
-        } else {
-            owner.wait_for_direct_child_pause().await;
-        }
-    }
-
     /// Publish the root semantic effect boundary to the already-wired dynamic
     /// agent context before a spawn/fanout call can execute.
     pub fn set_workspace_mutation_intent(
@@ -9868,9 +9857,8 @@ pub(crate) mod tests {
             std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = std::sync::Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         AgentToolContext {
-            parent_profile_authority:
-                crate::orchestration::spawner::ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority:
+                crate::orchestration::spawner::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("test-run"),
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
@@ -9906,6 +9894,7 @@ pub(crate) mod tests {
         context
             .fanout_admission
             .set_direct_child_for_test(DirectChildCompletion {
+                applied_user_intents: Vec::new(),
                 agent_id: "child".into(),
                 run_id: "child-run".into(),
                 parent_agent_id: context.agent_id.clone(),
@@ -9918,6 +9907,7 @@ pub(crate) mod tests {
         context
             .fanout_admission
             .set_direct_child_for_test(DirectChildCompletion {
+                applied_user_intents: Vec::new(),
                 agent_id: "child".into(),
                 run_id: "child-run".into(),
                 parent_agent_id: context.agent_id.clone(),
@@ -11701,114 +11691,6 @@ pub(crate) mod tests {
             .await;
 
         assert_tool_invalid_args(&result);
-    }
-
-    #[tokio::test]
-    async fn admitted_nonbuiltin_profile_reaches_child_executor_through_public_tool_boundary() {
-        use crate::orchestration::spawner::{
-            ParentProfileAuthority, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
-        };
-
-        struct RecordingSpawn(tokio::sync::mpsc::UnboundedSender<SpawnRunConfig>);
-        #[async_trait]
-        impl SpawnAgentExecutor for RecordingSpawn {
-            async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-                self.0.send(config).expect("test retains the receiver");
-                // Exercise dispatch without inventing a provider completion or
-                // durable frontier. The shared supervisor settles this failure.
-                Err("recorded child dispatch".into())
-            }
-        }
-
-        let (mut executor, dir) = test_executor();
-        let mut context = test_agent_tool_context(dir.path());
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let spawner = Arc::new(
-            crate::orchestration::DynamicAgentSpawner::new(context.spawner.mailbox_router())
-                .with_executor(Arc::new(RecordingSpawn(tx))),
-        );
-        let mut profile = astra_services::coordination::AgentProfile::new(
-            "member-x7",
-            "Configured member",
-            astra_services::coordination::AgentTier::User,
-        );
-        profile.read_only = true;
-        profile.allow_tools = Some(vec!["read_file".into()]);
-        let snapshot = Arc::new(astra_services::runs::AgentProfileSnapshot {
-            owner_user_id: "test-user".into(),
-            source_team_id: "configuration-1".into(),
-            lead_agent_id: None,
-            profiles: vec![profile],
-        });
-        context.admitted_agent_profiles = Some(snapshot.clone());
-        context.parent_profile_authority = ParentProfileAuthority::OrdinaryRoot;
-        context.trace_context = Some(astra_turn_core::trace_event::TraceContext {
-            user_id: "test-user".into(),
-            session_id: "test-session".into(),
-            turn_id: "turn-1".into(),
-            turn_seq: 1,
-            causal_chain_id: "chain-1".into(),
-            root_event_id: "event-1".into(),
-        });
-        context.fanout_admission = spawner.fanout_parent(&context.run_id);
-        context.spawner = spawner.clone();
-        executor.set_agent_tool_context(context);
-        let arguments = json!({
-            "action": "spawn",
-            "agent_type": "member-x7",
-            "description": "Inspect assigned material",
-            "prompt": "Report the requested observation"
-        });
-        for invalid in [json!(""), json!(["member-x7"])] {
-            let mut malformed = arguments.clone();
-            malformed["agent_type"] = invalid;
-            let result = executor.execute_with_metadata("agent", &malformed).await;
-            assert_tool_invalid_args(&result);
-            assert!(rx.try_recv().is_err(), "schema rejection must not dispatch");
-        }
-        for unauthorized in ["unknown-member", "task"] {
-            let mut outside_roster = arguments.clone();
-            outside_roster["agent_type"] = json!(unauthorized);
-            let result = executor
-                .execute_with_metadata("agent", &outside_roster)
-                .await;
-            assert!(result.is_error, "{result:?}");
-            assert_eq!(
-                result.metadata.as_ref().and_then(|metadata| metadata.get("result_class")).and_then(Value::as_str),
-                Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_AGENT_INCOMPLETE),
-                "{result:?}"
-            );
-            assert!(
-                rx.try_recv().is_err(),
-                "unadmitted profiles must not dispatch"
-            );
-            assert!(spawner.list_all_agents().await.is_empty());
-            assert_eq!(spawner.background_task_count(), 0);
-        }
-        let result = executor.execute_with_metadata("agent", &arguments).await;
-        assert!(
-            !result.is_error,
-            "spawn must return its launch receipt: {result:?}"
-        );
-        let child = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("the admitted child must reach its executor")
-            .expect("recorded child configuration");
-        spawner.shutdown_and_wait(Duration::from_secs(2)).await;
-        assert_eq!(child.admitted_agent_profiles, Some(snapshot));
-        assert_eq!(
-            child.profile_authority,
-            ParentProfileAuthority::AdmittedMember {
-                profile_id: "member-x7".into(),
-                ancestor_profile_ids: Vec::new(),
-            }
-        );
-        assert!(child.read_only);
-        assert_eq!(child.allowed_tools, vec!["read_file".to_string()]);
-        assert!(
-            rx.try_recv().is_err(),
-            "one call must dispatch only one child"
-        );
     }
 
     #[tokio::test]

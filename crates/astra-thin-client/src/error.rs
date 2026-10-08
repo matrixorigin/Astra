@@ -25,6 +25,8 @@ pub enum ThinClientError {
     IncompatibleRuntime { expected: String, actual: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("HTTP response exceeded the {limit} byte capture limit")]
+    ResponseTooLarge { limit: usize },
     #[error("Server admission deadline expired before request dispatch")]
     AdmissionDeadlineExpired,
     #[error(

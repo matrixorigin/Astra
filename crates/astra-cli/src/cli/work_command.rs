@@ -750,7 +750,12 @@ mod tests {
             let error = run_work_turn(&api, "token", "work-1", "branch-1", "Ship the feature")
                 .await
                 .expect_err("server failure must not become a successful Work turn");
-            assert!(error.contains("server-reported error"));
+            let expected = if event_type == "error" {
+                "provider failed"
+            } else {
+                "Work turn ended with a server-reported error"
+            };
+            assert_eq!(error, expected);
             server.verify().await;
         }
     }

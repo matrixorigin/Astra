@@ -1126,7 +1126,6 @@ async fn commit_test_conversation_turn(
         .commit_turn(
             &reservation,
             CanonicalTurnDeltaV1 {
-                agent_profile_selection: None,
                 schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
                 completed_turn: turn,
                 journal_event_seq: u64::from(turn),

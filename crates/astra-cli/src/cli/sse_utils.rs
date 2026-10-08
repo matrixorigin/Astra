@@ -1,7 +1,7 @@
 //! Work CLI SSE text rendering and error summaries.
 //!
 //! Work turns use this parser to display streamed output and surface transport
-//! failures. The Work caller owns controller release and terminal error events.
+//! failures and Server error events. The Work caller owns controller release.
 
 use crate::cli::theme;
 use futures_util::StreamExt;
@@ -35,7 +35,7 @@ pub struct SseTextResult {
     pub event_count: usize,
     /// Distinct event types seen (e.g. `["text_delta", "error"]`).
     pub event_types: Vec<String>,
-    /// Transport-level failure while reading the SSE body.
+    /// First Server error event or transport failure while reading the body.
     pub stream_error: Option<String>,
     /// True when we had to truncate an oversized malformed SSE buffer.
     pub truncated: bool,
@@ -48,6 +48,50 @@ impl SseTextResult {
                 format!("SSE buffer exceeded {MAX_SSE_BUFFER} bytes before a complete event")
             })
         })
+    }
+}
+
+fn ingest_text_event(
+    data: &str,
+    result: &mut SseTextResult,
+    md: &mut Option<crate::cli::stream::streaming_md::StreamingMarkdown>,
+) {
+    result.event_count += 1;
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+    let kind = json
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if !result.event_types.iter().any(|seen| seen == kind) {
+        result.event_types.push(kind.to_string());
+    }
+    match kind {
+        "text_delta" => {
+            if let Some(content) = json.get("content").and_then(serde_json::Value::as_str) {
+                result.text.push_str(content);
+                if let Some(renderer) = md {
+                    renderer.push(content);
+                } else {
+                    eprint!("{content}");
+                }
+            }
+        }
+        "error" => {
+            let message = json
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| json.get("error").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .unwrap_or_else(|| json.to_string());
+            eprintln!("\r  {} Server error: {message}", theme::icon_err());
+            trace_sse_server_error_event(&message);
+            result
+                .stream_error
+                .get_or_insert_with(|| message.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -83,7 +127,9 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(target: "astra_cli::sse", error = %e, "sse stream read failed");
-                result.stream_error = Some(format!("SSE stream read failed: {e}"));
+                result
+                    .stream_error
+                    .get_or_insert_with(|| format!("SSE stream read failed: {e}"));
                 break;
             }
         };
@@ -108,47 +154,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
 
             for line in event_str.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
-                    result.event_count += 1;
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = json
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-
-                        if !result.event_types.contains(&event_type.to_string()) {
-                            result.event_types.push(event_type.to_string());
-                        }
-
-                        match event_type {
-                            "text_delta" => {
-                                if let Some(content) = json.get("content").and_then(|v| v.as_str())
-                                {
-                                    result.text.push_str(content);
-                                    if let Some(ref mut renderer) = md {
-                                        renderer.push(content);
-                                    } else {
-                                        eprint!("{}", content);
-                                    }
-                                }
-                            }
-                            "error" => {
-                                if let Some(msg) = json
-                                    .get("message")
-                                    .or_else(|| json.get("error"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
-                                    trace_sse_server_error_event(msg);
-                                    if result.stream_error.is_none()
-                                        && astra_turn_core::chat_turn_heuristics::is_session_not_found_error(msg)
-                                    {
-                                        result.stream_error = Some(msg.to_string());
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    ingest_text_event(data, &mut result, &mut md);
                 }
             }
         }
@@ -157,18 +163,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
     // Drain remaining buffer
     for line in buffer.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
-            result.event_count += 1;
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
-                && json.get("type").and_then(|v| v.as_str()) == Some("text_delta")
-                && let Some(content) = json.get("content").and_then(|v| v.as_str())
-            {
-                result.text.push_str(content);
-                if let Some(ref mut renderer) = md {
-                    renderer.push(content);
-                } else {
-                    eprint!("{}", content);
-                }
-            }
+            ingest_text_event(data, &mut result, &mut md);
         }
     }
 
@@ -188,10 +183,10 @@ mod tests {
     use super::{MAX_SSE_BUFFER, stream_sse_markdown};
     use http::Response;
 
-    fn sse_response(body: &'static str) -> reqwest::Response {
+    fn sse_response(body: &str) -> reqwest::Response {
         let r = Response::builder()
             .status(200)
-            .body(reqwest::Body::from(body))
+            .body(reqwest::Body::from(body.to_owned()))
             .expect("test response");
         reqwest::Response::from(r)
     }
@@ -251,7 +246,7 @@ mod tests {
         let r = stream_sse_markdown(sse_response(body)).await;
         assert!(r.event_types.contains(&"error".to_string()));
         assert!(r.text.is_empty());
-        assert!(r.completion_error().is_none());
+        assert_eq!(r.completion_error().as_deref(), Some("bad"));
     }
 
     #[tokio::test]
@@ -273,27 +268,41 @@ mod tests {
         assert_eq!(streamed.text, "ab");
         assert_eq!(streamed.event_types, ["text_delta", "error"]);
         assert_eq!(streamed.event_count, 3);
-        assert!(streamed.completion_error().is_none());
+        assert_eq!(streamed.completion_error().as_deref(), Some("x"));
     }
 
     #[tokio::test]
-    async fn stream_sse_markdown_session_not_found_promotes_to_stream_error() {
-        let body = "data: {\"type\":\"error\",\"message\":\"Session not found\"}\n\n";
-        let r = stream_sse_markdown(sse_response(body)).await;
-        assert!(
-            r.completion_error().is_some(),
-            "Session not found should be promoted to stream_error"
-        );
-        assert!(r.completion_error().unwrap().contains("Session not found"),);
-    }
-
-    #[tokio::test]
-    async fn stream_sse_markdown_generic_error_does_not_promote_to_stream_error() {
-        let body = "data: {\"type\":\"error\",\"message\":\"rate limit exceeded\"}\n\n";
-        let r = stream_sse_markdown(sse_response(body)).await;
-        assert!(
-            r.completion_error().is_none(),
-            "generic errors should not be promoted to stream_error"
-        );
+    async fn typed_error_events_preserve_text_and_reason_including_the_eof_tail() {
+        for ending in ["\n\n", ""] {
+            for (event, expected) in [
+                (
+                    serde_json::json!({"type":"error", "message":"Session not found"}),
+                    "Session not found",
+                ),
+                (
+                    serde_json::json!({"type":"error", "error":"rate limit exceeded"}),
+                    "rate limit exceeded",
+                ),
+                (
+                    serde_json::json!({"type":"error", "message":null}),
+                    "{\"message\":null,\"type\":\"error\"}",
+                ),
+                (
+                    serde_json::json!({"type":"error", "error":{"code":"unavailable"}}),
+                    "{\"error\":{\"code\":\"unavailable\"},\"type\":\"error\"}",
+                ),
+            ] {
+                let body = format!(
+                    "data: {{\"type\":\"text_delta\",\"content\":\"Observed text\"}}\n\ndata: {event}{ending}"
+                );
+                let result = stream_sse_markdown(sse_response(&body)).await;
+                assert_eq!(result.text, "Observed text");
+                assert_eq!(result.completion_error().as_deref(), Some(expected));
+                assert_eq!(result.event_types, ["text_delta", "error"]);
+            }
+        }
+        let body = "data: {\"type\":\"error\",\"message\":\"first failure\"}\n\ndata: {\"type\":\"error\",\"message\":\"later failure\"}";
+        let result = stream_sse_markdown(sse_response(body)).await;
+        assert_eq!(result.completion_error().as_deref(), Some("first failure"));
     }
 }

@@ -270,10 +270,6 @@ fn attach_transport_success_usage(
         json!(result.usage_presence.measured_input_tokens),
     );
     object.insert(
-        "qualified_usage".to_string(),
-        json!(qualified_usage.map(|usage| usage.to_json())),
-    );
-    object.insert(
         "provider_response".to_string(),
         json!({"transport_success": true}),
     );
@@ -288,6 +284,28 @@ fn attach_transport_success_usage(
             })
         })),
     );
+    attach_qualified_error_usage(
+        error.with_details_json(details.to_string()),
+        qualified_usage,
+    )
+}
+
+/// The shared loop receives one host outcome, including usage paid by earlier
+/// logical continuations. This is a caller projection, not invocation billing.
+fn attach_qualified_error_usage(
+    error: astra_core::ClassifiedError,
+    qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+) -> astra_core::ClassifiedError {
+    let Some(usage) = qualified_usage else {
+        return error;
+    };
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    details["qualified_usage"] = usage.to_json();
     error.with_details_json(details.to_string())
 }
 
@@ -4921,8 +4939,14 @@ impl crate::turn::llm::client::ProviderAttemptObserver
     async fn begin_attempt(
         &self,
         wire: &crate::turn::llm::client::ProviderWireRequestIdentity,
-    ) -> Result<u32, astra_core::ClassifiedError> {
-        self.inner.begin_attempt(wire).await
+        retained_attempt: Option<u32>,
+    ) -> Result<crate::turn::llm::client::ProviderAttemptAdmission, astra_core::ClassifiedError>
+    {
+        self.inner.begin_attempt(wire, retained_attempt).await
+    }
+
+    async fn wait_for_retained_pause(&self) -> Result<(), astra_core::ClassifiedError> {
+        self.inner.wait_for_retained_pause().await
     }
 
     async fn finish_attempt(
@@ -9785,26 +9809,22 @@ impl ServerAgenticLoopHost {
                 && record.was_executed()
                 && record.ok
                 && record
-                    .result_full
-                    .as_deref()
-                    .or(record.result_preview.as_deref())
-                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                    .map(|result| match pending.control {
-                        WorkEstablishmentCarrierControl::Establish => result
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .is_some_and(|status| matches!(status, "started" | "continued")),
-                        WorkEstablishmentCarrierControl::DeferPending => {
-                            result.get("status").and_then(Value::as_str) == Some("deferred")
-                                && result.get("operation_id").and_then(Value::as_str)
-                                    == pending.operation_id.as_deref()
-                                && result.get("operation_state").and_then(Value::as_str)
-                                    == Some("cancelled")
-                                && result.get("assignment_created").and_then(Value::as_bool)
-                                    == Some(false)
-                        }
+                    .runtime_work_establishment_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| match (pending.control, receipt) {
+                        (
+                            WorkEstablishmentCarrierControl::Establish,
+                            astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started
+                            | astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Continued,
+                        ) => true,
+                        (
+                            WorkEstablishmentCarrierControl::DeferPending,
+                            astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Deferred {
+                                operation_id,
+                            },
+                        ) => pending.operation_id.as_deref() == Some(operation_id.as_str()),
+                        _ => false,
                     })
-                    == Some(true)
         });
         if !settled {
             return false;
@@ -11665,6 +11685,10 @@ impl ServerAgenticLoopHost {
                 state.cancellation.flag.clone(),
                 state.cancellation.token.clone(),
                 state.cancellation.execution_lease_lost.clone(),
+            )
+            .with_retained_pause_control(
+                state.cancellation.pause_flag.clone(),
+                self.execution_time_budget,
             ),
         ))
     }
@@ -20316,8 +20340,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // only selects deterministic execution behavior after that decision.
         let canonical_work_establishment_pending =
             !final_answer_settlement_text_only && self.canonical_work_establishment_pending(state);
-        let force_provider_convergence =
-            std::mem::take(&mut state.provider_adaptation.force_next_thinking_off);
+        let force_provider_convergence = state.provider_adaptation.force_next_thinking_off;
         let provider_attempt_boundary =
             ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
         let primary_thinking = primary_thinking_for_attempt(
@@ -21196,6 +21219,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             record_provider_attempt_cache_observations(state, &provider_attempts);
             if durable_invocation.provider_dispatch_started() {
+                if force_provider_convergence {
+                    state.provider_adaptation.force_next_thinking_off = false;
+                }
                 durable_canonical_cursor = state.messages.len();
                 record_full_llm_request_event(
                     state,
@@ -22148,19 +22174,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         })
         }
         .await;
-        let outcome = outcome.map_err(|error| {
-            let Some(usage) = qualified_attempt_usage else {
-                return error;
-            };
-            let mut details = error
-                .details_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({}));
-            details["qualified_usage"] = usage.to_json();
-            error.with_details_json(details.to_string())
-        });
+        let outcome =
+            outcome.map_err(|error| attach_qualified_error_usage(error, qualified_attempt_usage));
         self.finalize_work_admission_usage_at_turn_exit(state, outcome)
             .await
     }
@@ -32828,9 +32843,8 @@ mod tests {
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         executor.set_agent_tool_context(crate::orchestration::AgentToolContext {
-            parent_profile_authority:
-                crate::orchestration::spawner::ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority:
+                crate::orchestration::spawner::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run1"),
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
@@ -40318,7 +40332,9 @@ mod tests {
                 tool_call_id: Some(retry_id),
                 name: "start_work".to_string(),
                 ok: true,
-                result_full: Some(r#"{"status":"started"}"#.to_string()),
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started,
+                ),
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
                 ..Default::default()
             });
@@ -40704,8 +40720,49 @@ mod tests {
             .push(astra_services::session_journal::ToolCallRecord {
                 tool_call_id: retry_call["id"].as_str().map(str::to_string),
                 name: "start_work".to_string(),
+                ok: false,
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started,
+                ),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        host.reconcile_pending_work_establishment(&state);
+        assert!(
+            host.pending_work_establishment.is_some(),
+            "a failed execution cannot settle even if a receipt was produced"
+        );
+
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("different-provider-call".to_string()),
+                name: "start_work".to_string(),
                 ok: true,
-                result_full: Some(r#"{"status":"started"}"#.to_string()),
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started,
+                ),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        host.reconcile_pending_work_establishment(&state);
+        assert!(
+            host.pending_work_establishment.is_some(),
+            "a typed receipt from another provider call cannot settle this establishment"
+        );
+
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: retry_call["id"].as_str().map(str::to_string),
+                name: "start_work".to_string(),
+                ok: true,
+                result_full: Some("artifact://session/tool-result/start-work".to_string()),
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started,
+                ),
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
                 ..Default::default()
             });
@@ -41871,9 +41928,27 @@ mod tests {
                 tool_call_id: Some("defer-call".to_string()),
                 name: "start_work".to_string(),
                 ok: true,
-                result_full: Some(
-                    r#"{"status":"deferred","operation_id":"defer-operation","operation_state":"cancelled","assignment_created":false}"#
-                        .to_string(),
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Deferred {
+                        operation_id: "another-operation".to_string(),
+                    },
+                ),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        assert!(!host.reconcile_pending_work_establishment(&state));
+        assert!(host.pending_work_establishment.is_some());
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("defer-call".to_string()),
+                name: "start_work".to_string(),
+                ok: true,
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Deferred {
+                        operation_id: "defer-operation".to_string(),
+                    },
                 ),
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
                 ..Default::default()
@@ -42653,7 +42728,9 @@ mod tests {
                 tool_call_id: Some("old-call".to_string()),
                 name: "start_work".to_string(),
                 ok: true,
-                result_full: Some(r#"{"status":"started"}"#.to_string()),
+                runtime_work_establishment_receipt: Some(
+                    astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started,
+                ),
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
                 ..Default::default()
             });
@@ -49907,6 +49984,37 @@ mod tests {
 
         inference_ledger.assert_quiescent();
         provider.assert_complete();
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn unadmitted_request_preserves_one_shot_provider_constraint() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderScript, loop_state,
+            server_host_builder,
+        };
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "admission must prohibit all provider delivery",
+            |_| true,
+            Vec::new(),
+        )])
+        .await;
+        let ledger = InferenceLedgerFixture::default();
+        let session = "session-unadmitted-one-shot";
+        let mut host =
+            server_host_builder(&gateway, &ledger, session, "openai", "fixture-model", None)
+                .build();
+        let mut state = loop_state(session, Vec::new(), "Describe the supplied information.");
+        host.prepare_model_selection(&mut state).await.unwrap();
+        state.provider_adaptation.force_next_thinking_off = true;
+        state.current_run_owner_generation = None;
+        let error = host.execute_turn(&mut state).await.err().unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(gateway.requests.lock().await.is_empty());
+        assert!(ledger.admissions().is_empty());
+        ledger.assert_quiescent();
+        gateway.assert_complete();
     }
 
     #[cfg(feature = "e2e-hooks")]

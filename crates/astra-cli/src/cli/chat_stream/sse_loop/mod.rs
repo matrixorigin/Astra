@@ -314,9 +314,8 @@ pub(crate) async fn stream_chat_sse(
                 reply_obligations: Arc::new(Default::default()),
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
-                parent_profile_authority:
-                    astra_runtime::orchestration::ParentProfileAuthority::Unbound,
-                admitted_agent_profiles: None,
+                parent_delegation_authority:
+                    astra_runtime::orchestration::DelegationAuthority::Allowed,
                 delegation_chain: Vec::new(),
                 current_model: p.model.map(str::to_string),
                 delegation_model_admission: None,
@@ -1332,8 +1331,7 @@ mod tests {
             .set_durable_agent_reconciler(Arc::new(NoDurableReads))
             .await;
         let context = SpawnContext {
-            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
+            parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             delegation_model_admission: None,
             parent_model_reasoning: None,
             parent_run_id: "root".into(),

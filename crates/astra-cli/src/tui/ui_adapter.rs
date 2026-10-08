@@ -8,6 +8,7 @@ pub(crate) struct TuiUiAdapter {
     tx: crate::tui::stream_bridge::TuiAppEventTx,
     restore_input_queue: RestoreInputQueue,
     submission_id: String,
+    continuation: Option<crate::tui::event_loop::SessionContinuationTarget>,
 }
 
 impl TuiUiAdapter {
@@ -15,11 +16,13 @@ impl TuiUiAdapter {
         tx: crate::tui::stream_bridge::TuiAppEventTx,
         restore_input_queue: RestoreInputQueue,
         submission_id: impl Into<String>,
+        continuation: Option<crate::tui::event_loop::SessionContinuationTarget>,
     ) -> Self {
         Self {
             tx,
             restore_input_queue,
             submission_id: submission_id.into(),
+            continuation,
         }
     }
 
@@ -58,6 +61,7 @@ impl ReplUiAdapter for TuiUiAdapter {
     fn restore_input(&mut self, text: &str, session_id: Option<&str>) -> bool {
         let request = RestoreInputRequest {
             text: text.to_string(),
+            continuation: self.continuation.clone(),
             session_id: session_id.map(str::to_string),
             submission_id: self.submission_id.clone(),
         };
@@ -114,7 +118,7 @@ mod tests {
         tx.try_send(TuiAppEvent::StatusLine("occupy the queue".into()))
             .expect("the first event should fit");
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let mut adapter = TuiUiAdapter::new(tx, queue.clone(), "submission-a");
+        let mut adapter = TuiUiAdapter::new(tx, queue.clone(), "submission-a", None);
 
         assert!(adapter.restore_input("draft", Some("session-a")));
         // A duplicate callback for the same turn must not enqueue another
@@ -133,7 +137,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let mut adapter = TuiUiAdapter::new(tx, queue.clone(), "submission-a");
+        let mut adapter = TuiUiAdapter::new(tx, queue.clone(), "submission-a", None);
 
         assert!(!adapter.restore_input("draft", Some("session-a")));
         assert!(queue.lock().unwrap().is_empty());

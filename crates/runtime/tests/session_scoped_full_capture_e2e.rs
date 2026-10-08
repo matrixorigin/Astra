@@ -316,6 +316,7 @@ impl RunLifecycleService for RecordingLifecycle {
         let replay_at = *self.replay_event_at_index.lock().await;
         Ok(astra_services::runs::DurableRunEventDelta {
             session_id: String::new(),
+            execution_live: active,
             status: if active {
                 "running"
             } else if failed {

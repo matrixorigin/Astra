@@ -614,8 +614,10 @@ mod tests {
             &self,
             plan: &astra_services::InferenceInvocationPlan,
             terminal: &astra_services::InferenceInvocationTerminal,
-        ) -> astra_services::ServiceResult<astra_services::InferenceInvocationAdmissionResolution>
-        {
+        ) -> astra_services::ServiceResult<(
+            astra_services::InferenceInvocationAdmissionResolution,
+            Option<astra_services::InferenceScopeRejection>,
+        )> {
             self.inner.settle_uncertain_admission(plan, terminal).await
         }
 
