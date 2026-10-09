@@ -5867,6 +5867,19 @@ pub(crate) const MAX_STREAM_ACCUMULATION_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of tool calls per LLM stream response.
 pub(crate) const MAX_STREAM_TOOL_CALLS: usize = 128;
 
+/// Decode the two supported OpenAI-chat reasoning field spellings once.
+/// Prefer nonempty `reasoning_content` when a provider mirrors both fields.
+fn openai_reasoning_text(message: &Map<String, Value>) -> Option<&str> {
+    ["reasoning_content", "reasoning"]
+        .into_iter()
+        .find_map(|field| {
+            message
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        })
+}
+
 /// Parse an OpenAI-compatible SSE stream and collect into `LlmCallResult`.
 #[cfg(test)]
 async fn collect_llm_stream(
@@ -6250,9 +6263,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         }
 
         // Reasoning
-        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
-            && !r.is_empty()
-        {
+        if let Some(r) = openai_reasoning_text(delta) {
             accumulated_bytes += r.len();
             if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
                 return Err(StreamCollectError::Transport {
@@ -7765,7 +7776,7 @@ fn parse_openai_compatible_nonstream_response(v: &Value, model_name: &str) -> Ll
         if let Some(content) = msg.get("content").and_then(Value::as_str) {
             full_text = content.to_string();
         }
-        if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
+        if let Some(r) = openai_reasoning_text(msg) {
             reasoning = r.to_string();
         }
         if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
@@ -9549,6 +9560,182 @@ mod tests {
         let r = LlmCallResult::default();
         assert!(r.full_text.is_empty());
         assert!(r.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn openai_reasoning_fields_share_stream_and_nonstream_semantics() {
+        for (message, expected) in [
+            (json!({"reasoning": "think"}), "think"),
+            (json!({"reasoning_content": "think"}), "think"),
+            (
+                json!({"reasoning_content": null, "reasoning": "think"}),
+                "think",
+            ),
+            (
+                json!({"reasoning_content": "", "reasoning": "think"}),
+                "think",
+            ),
+            (
+                json!({"reasoning_content": "think", "reasoning": "think"}),
+                "think",
+            ),
+            (
+                json!({"reasoning_content": "canonical", "reasoning": "alias"}),
+                "canonical",
+            ),
+            (json!({"reasoning": {"text": "not a string"}}), ""),
+        ] {
+            let response = json!({"choices": [{"message": message.clone()}]});
+            let result = parse_nonstream_response_for_provider(&response, "openai", "test-model");
+            assert_eq!(result.reasoning, expected, "{response}");
+            let chunk = json!({"choices": [{"delta": message, "finish_reason": "stop"}]});
+            let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(format!(
+                "data: {chunk}\n\ndata: [DONE]\n\n"
+            )))]);
+            let streamed = collect_llm_stream(
+                source,
+                "test-model",
+                Instant::now(),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                None,
+            )
+            .await
+            .expect("completed response must decode both reasoning field spellings");
+            assert_eq!(streamed.reasoning, expected, "{chunk}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_reasoning_alias_stream_outlives_semantic_deadline_and_delivers() {
+        for field in ["reasoning", "reasoning_content"] {
+            for tool_delivery in [false, true] {
+                let source = Box::pin(async_stream::stream! {
+                    for _ in 0..5 {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        let chunk = json!({"choices": [{"delta": {field: "thinking"}}]});
+                        let frame = format!("data: {chunk}\n\n");
+                        // Exercise the real SSE parser with fragmented wire bytes.
+                        for part in frame.as_bytes().chunks(17) {
+                            yield Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(part));
+                        }
+                    }
+                    let chunk = if tool_delivery {
+                        json!({"choices": [{"delta": {"tool_calls": [{
+                            "index": 0, "id": "call-1", "type": "function",
+                            "function": {"name": "bash", "arguments": "{}"}
+                        }]}, "finish_reason": "tool_calls"}]})
+                    } else {
+                        json!({"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]})
+                    };
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")));
+                });
+                let mut observed_reasoning = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Reasoning(text) = update {
+                        observed_reasoning.push_str(&text);
+                    }
+                };
+                let authorized = HashSet::from(["bash".to_string()]);
+                let result = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                    source,
+                    "test-model",
+                    TokioInstant::now().into_std(),
+                    std::time::Duration::from_secs(300),
+                    LlmCancel::None,
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(120),
+                    Some(&authorized),
+                    Some(&mut callback),
+                )
+                .await
+                .expect("150 seconds of actual reasoning must refresh the 120-second watchdog");
+                assert_eq!(result.reasoning, "thinking".repeat(5));
+                assert_eq!(observed_reasoning, result.reasoning);
+                assert_eq!(result.tool_calls.len(), usize::from(tool_delivery));
+                assert_eq!(result.full_text, if tool_delivery { "" } else { "answer" });
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_reasoning_alias_keepalives_do_not_refresh_semantic_deadline() {
+        for delta in [
+            json!({}),
+            json!({"reasoning": ""}),
+            json!({"reasoning": " \n\t"}),
+        ] {
+            let frame = format!("data: {}\n\n", json!({"choices": [{"delta": delta}]}));
+            let source = Box::pin(async_stream::stream! {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(frame.clone()));
+                }
+            });
+            let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                TokioInstant::now().into_std(),
+                std::time::Duration::from_secs(300),
+                LlmCancel::None,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(120),
+                None,
+                None,
+            )
+            .await
+            .expect_err("physical keepalives without meaningful reasoning must still time out");
+            assert!(matches!(
+                error,
+                StreamCollectError::SemanticProgressTimeout {
+                    elapsed_ms: 120000,
+                    made_semantic_progress: false,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_reasoning_alias_retains_idle_and_provider_work_deadlines() {
+        for stalled in [true, false] {
+            let source = Box::pin(async_stream::stream! {
+                loop {
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n\n",
+                    ));
+                    if stalled {
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            });
+            let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                Instant::now(),
+                std::time::Duration::from_millis(50),
+                LlmCancel::None,
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await
+            .expect_err("recognized reasoning cannot disable idle or provider-work limits");
+            let partial = match (stalled, error) {
+                (true, StreamCollectError::IdleTimeout { partial, .. })
+                | (false, StreamCollectError::ProviderWorkDeadline { partial, .. }) => partial,
+                (_, other) => panic!("unexpected deadline: {other:?}"),
+            };
+            assert!(partial.reasoning.starts_with("thinking"));
+            assert!(partial.full_text.is_empty());
+            assert!(partial.tool_calls.is_empty());
+        }
     }
 
     #[test]

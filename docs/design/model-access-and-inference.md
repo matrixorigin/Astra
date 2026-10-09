@@ -812,6 +812,14 @@ enum InferenceStreamEvent {
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
 
+OpenAI-compatible response decoding accepts string `reasoning_content` and
+`reasoning` fields in both streamed deltas and non-streaming assistant messages.
+The first nonempty string in that order is used once; mirrored fields are not
+concatenated. Both feed the existing reasoning result and stream event contract.
+Meaningful reasoning refreshes semantic activity but is not an actionable
+answer. Empty/whitespace reasoning does not refresh that deadline; idle,
+provider-work, cancellation and response-size limits remain authoritative.
+
 ## Provider request capability contract
 
 ### Problem and invariant
