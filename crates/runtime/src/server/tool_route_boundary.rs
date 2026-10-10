@@ -249,6 +249,17 @@ pub(crate) fn tool_call_end_event(
     copy_result_structured_output_metadata(&mut event, result);
     copy_result_artifacts_metadata(&mut event, result);
     copy_result_routing_metadata(&mut event, result);
+    if let Some(observation) = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY))
+        .and_then(astra_turn_types::project_native_collaborator_observation)
+    {
+        event.insert(
+            astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+            observation,
+        );
+    }
     Some(event)
 }
 
@@ -298,12 +309,60 @@ mod invocation_identity_tests {
         let request = ExecutionBindingState::server_sandbox(".")
             .tool_execution_request_for_invocation(&identity, "reflect", &args);
         let boundary = ToolRouteBoundary::new(request, ToolExecutionRouteKind::ServerRuntime);
-        let result = astra_tools::ToolResult::text("ok".to_string());
+        let mut result = astra_tools::ToolResult::text("ok".to_string());
+        let observation = json!({
+            "native_session_id": "thread", "native_turn_id": "turn",
+            "dispatch_state": "acknowledged", "native_terminal": "completed",
+            "settlement_authoritative": true, "stage_inclusive_input_tokens": 30,
+            "stage_usage": {"cached_input_tokens": 10, "output_tokens": 5},
+            "last_request_input_tokens": 12, "model_context_window": 100,
+            "acknowledged_model": "model", "provider_error_code": null,
+            "provider_error_class": null,
+        });
+        result.metadata = Some(Map::from_iter([
+            (
+                astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                observation.clone(),
+            ),
+            (
+                "native_collaborator".into(),
+                json!({"raw_provider_payload":"private"}),
+            ),
+        ]));
 
         let routing = boundary.routing_decision_event().unwrap();
         let started = boundary.transport_started_event().unwrap();
         let finished = boundary.transport_finished_event(&result, 7).unwrap();
         let ended = boundary.tool_call_end_event(&result, 7).unwrap();
+        let projected =
+            astra_services::runs::transform_run_event_for_client(Value::Object(ended.clone()));
+        assert_eq!(
+            projected[astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY],
+            observation
+        );
+        assert!(projected.get("native_collaborator").is_none());
+        let mut large = Value::Object(ended.clone());
+        large["result"] = json!("r".repeat(48 * 1024 - 2));
+        large["arguments"] = json!("a".repeat(8 * 1024 - 2));
+        for field in [
+            "call_id",
+            "tool",
+            "status",
+            "success",
+            "disposition",
+            "duration_ms",
+            "error_kind",
+        ] {
+            large[field] = json!("\u{1}".repeat(1024));
+        }
+        let large = astra_services::runs::transform_run_event_for_client(large);
+        assert!(serde_json::to_vec(&large).unwrap().len() <= 64 * 1024);
+        assert_eq!(
+            large[astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY],
+            observation
+        );
+        assert_eq!(large["result_omitted"], true);
+        assert_eq!(large["arguments_omitted"], true);
 
         for event in [&routing, &started, &finished, &ended] {
             assert_eq!(event["call_id"], "call-1");

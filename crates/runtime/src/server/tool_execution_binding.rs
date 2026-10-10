@@ -200,6 +200,9 @@ pub struct ToolPolicySnapshot {
     /// run authority. Never a provider permission or a serialized deadline.
     #[serde(skip)]
     pub admission_deadline: Option<std::time::Instant>,
+    /// Same admitted work cutoff as admission_deadline, for remote transport.
+    #[serde(skip)]
+    pub execution_deadline_unix_ms: Option<u64>,
     pub allowed_tools: Vec<String>,
     pub approval_policy: Option<String>,
     pub network_policy: Option<String>,
@@ -419,6 +422,10 @@ pub struct ExecutionBindingSnapshot {
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_binding_generation: Option<u64>,
+    /// Stable physical checkout identity for native Edge execution. The live
+    /// executor id may change after a CLI restart; this identity must not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_workspace_id: Option<String>,
 }
 
 impl ExecutionBindingSnapshot {
@@ -432,6 +439,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: Some(runtime),
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 
@@ -441,6 +449,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: None,
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 }

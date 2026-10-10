@@ -87,6 +87,7 @@ pub(crate) async fn execute_tool_pure(
                             durable_dispatch_admission,
                             delegation_model_admission,
                             runtime_control_kind,
+                            false,
                         )
                         .await;
                     dispatch_control = deferred.dispatch_control;

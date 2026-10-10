@@ -4,7 +4,7 @@
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test context_manifest_db_it -- --ignored --nocapture --test-threads=1
 //! ```
 
-use astra_core::SharedPool;
+use astra_core::{SharedPool, is_duplicate_key_error};
 use astra_services::{
     ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
     DatabaseContextManifestStore,
@@ -354,17 +354,14 @@ fn assert_duplicate_item_insert(error: ContextManifestError) {
             let database_error = source
                 .as_database_error()
                 .expect("duplicate item order must be a database error");
-            assert_eq!(
-                database_error.code().as_deref(),
-                Some("23000"),
-                "expected integrity-constraint SQLSTATE"
-            );
+            // MySQL reports this as SQLSTATE 23000, while MatrixOne may use
+            // the generic HY000 state for the same duplicate-key condition.
+            // The shared classifier is the contract we use in production;
+            // keep this test focused on the semantic constraint failure.
             assert!(
-                database_error
-                    .message()
-                    .to_ascii_lowercase()
-                    .contains("duplicate"),
-                "expected duplicate-key message, got {}",
+                is_duplicate_key_error(&source),
+                "expected duplicate-key database error, got code={:?}, message={}",
+                database_error.code(),
                 database_error.message()
             );
         }

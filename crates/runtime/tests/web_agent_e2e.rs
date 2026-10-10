@@ -4618,9 +4618,9 @@ async fn a1_run_status_all_fields_text_only() {
         events_count > 0,
         "events_count should be > 0, got {events_count}"
     );
-    assert!(body["workspace"].is_null());
-    assert!(body["executor"].is_null());
-    assert!(body["transport"].is_null());
+    assert_eq!(body["workspace"]["kind"], "none");
+    assert_eq!(body["executor"]["kind"], "server_local");
+    assert_eq!(body["transport"], "server_local");
     gateway.assert_complete();
     inference.assert_quiescent();
     assert_eq!(inference.attempt_count(), 1);

@@ -658,6 +658,36 @@ struct MailboxRecord {
     lifetime: MailboxLifetime,
     subscription: MailboxSubscription,
     attached: bool,
+    capabilities: MailboxCapabilities,
+}
+
+/// Message forms that a mailbox can accept while it is running.
+///
+/// Most agent loops own the full structured-message protocol. Native provider
+/// stages are different: while their provider invocation is active, they can
+/// only inject bounded text into the provider protocol. Keeping this fact on
+/// the existing registration record lets senders reject an unsupported
+/// request before creating a reply obligation; it does not add another
+/// lifecycle or delivery state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MailboxCapabilities {
+    pub accepts_structured_requests: bool,
+}
+
+impl Default for MailboxCapabilities {
+    fn default() -> Self {
+        Self {
+            accepts_structured_requests: true,
+        }
+    }
+}
+
+impl MailboxCapabilities {
+    pub const fn provider_stage_text_only() -> Self {
+        Self {
+            accepts_structured_requests: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -772,6 +802,19 @@ impl AgentMailboxRouter {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<AgentMailbox, MailboxError> {
+        self.register_with_capabilities(addr, delegation_id, MailboxCapabilities::default())
+            .await
+    }
+
+    /// Register an agent with the message forms its current loop can consume.
+    /// Capabilities are fixed for a mailbox lifetime; a reattachment that
+    /// changes them is rejected instead of widening an existing route.
+    pub async fn register_with_capabilities(
+        self: &Arc<Self>,
+        addr: AgentAddress,
+        delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
+    ) -> Result<AgentMailbox, MailboxError> {
         let gate = self.registration_gate(&addr.run_id);
         let held = gate.lock_owned().await;
 
@@ -781,7 +824,7 @@ impl AgentMailboxRouter {
         let router = Arc::clone(self);
         let task = tokio::spawn(async move {
             router
-                .register_inner(addr, delegation_id)
+                .register_inner(addr, delegation_id, capabilities)
                 .await
                 .map(|(mailbox, fresh_lifetime)| RegistrationHandoff {
                     mailbox: Some(mailbox),
@@ -799,6 +842,7 @@ impl AgentMailboxRouter {
         self: &Arc<Self>,
         addr: AgentAddress,
         delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
     ) -> Result<(AgentMailbox, bool), MailboxError> {
         let previous = self
             .address_registry
@@ -811,6 +855,14 @@ impl AgentMailboxRouter {
         {
             return Err(MailboxError::Protocol(format!(
                 "run '{}' is already bound to another mailbox address",
+                addr.run_id
+            )));
+        }
+        if let Some(record) = &previous
+            && record.capabilities != capabilities
+        {
+            return Err(MailboxError::Protocol(format!(
+                "run '{}' is already bound to a mailbox with different message capabilities",
                 addr.run_id
             )));
         }
@@ -874,6 +926,7 @@ impl AgentMailboxRouter {
                 lifetime,
                 subscription,
                 attached: true,
+                capabilities,
             },
         );
         Ok((mailbox, fresh_lifetime))
@@ -1071,6 +1124,22 @@ impl AgentMailboxRouter {
             .await
             .get(run_id)
             .is_some_and(|record| record.attached)
+    }
+
+    /// Return whether a resolved direct target accepts structured requests.
+    /// `None` means the target was resolved by a remote transport without a
+    /// local capability record; callers must retain the transport's existing
+    /// behavior in that case.
+    pub async fn target_accepts_structured_requests(&self, target: &MessageTarget) -> Option<bool> {
+        let MessageTarget::Direct { address } = target else {
+            return Some(false);
+        };
+        self.address_registry
+            .read()
+            .await
+            .get(&address.run_id)
+            .filter(|record| record.lifetime.address() == address)
+            .map(|record| record.capabilities.accepts_structured_requests)
     }
 
     /// Resolve the address of a parent run.
@@ -1376,6 +1445,54 @@ mod tests {
         assert_eq!(display, "worker@child-run");
         assert!(!display.contains("@child-run@child-run"));
         parent.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mailbox_capabilities_are_scoped_to_one_lifetime_and_target() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let address = addr("native-run", "worker");
+        let _mailbox = router
+            .register_with_capabilities(
+                address.clone(),
+                Some("parent-run".into()),
+                MailboxCapabilities::provider_stage_text_only(),
+            )
+            .await
+            .unwrap();
+
+        let target = MessageTarget::Direct {
+            address: address.clone(),
+        };
+        assert_eq!(
+            router.target_accepts_structured_requests(&target).await,
+            Some(false)
+        );
+        assert!(
+            router
+                .register(address, Some("parent-run".into()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_mailboxes_accept_structured_requests_by_default() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let address = addr("ordinary-run", "worker");
+        let _mailbox = router.register(address.clone(), None).await.unwrap();
+
+        assert_eq!(
+            router
+                .target_accepts_structured_requests(&MessageTarget::Direct { address })
+                .await,
+            Some(true)
+        );
     }
 
     #[tokio::test]

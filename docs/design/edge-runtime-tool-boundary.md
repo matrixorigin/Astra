@@ -243,6 +243,30 @@ no-options observation wrapper are retired from the Rust source API. Process
 coordination, generation watches, diagnostic paths, and guard cleanup remain
 shared; tests exercise the same acquisition paths as executors.
 
+Native collaborator delivery delegates workspace serialization to the CLI tool
+executor. It does not hold a workspace lease while asking for approval or acquire
+the executor's lease a second time. After acquiring the lease, the executor checks
+the current permission attachment, workspace and executable identity before
+dispatch; queueing cannot preserve revoked authority. Lease waits respect the
+invocation deadline and cancellation. The Linux CI composition test drives the
+authenticated WebSocket owner through this executor and the production process
+supervisor, including contention, cancellation, expiry and changed admission.
+
+Native discovery's physical process lifetime covers its complete caller budget;
+handshake/authentication and model-list waits cannot renew that cutoff. A typed
+collaborator uses its admitted whole-stage deadline, or the transport's existing
+bounded stage fallback when none exists, independently of each command's limit.
+An explicit model request cannot be replaced by a provider default merely because
+discovery is unavailable; only unconstrained or explicitly accepted defaults may
+omit the selector.
+
+Linux runtime authorization remains canonical. The native sparse filesystem
+also exposes a platform bootstrap alias only when its current resolved target
+is in the approved runtime requirements. Sensitive-path rules cover both views;
+Codex's explicit minimal bootstrap preserves the logical loader paths only when
+all existing platform runtime roots are approved. Its additional `/etc` and
+inherited `/proc` views remain denied; filesystem-root read is never granted.
+
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
 receipts: an escaped descendant could write later. That uncertainty quarantines

@@ -84,6 +84,12 @@ mod fs_tools;
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
+#[path = "edge_tools/native_claude.rs"]
+pub mod native_claude;
+#[path = "edge_tools/native_codex.rs"]
+pub mod native_codex;
+#[path = "edge_tools/native_opencode.rs"]
+pub mod native_opencode;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
@@ -103,6 +109,13 @@ pub fn all_tool_schemas() -> Vec<Value> {
     // unsupported arguments are never advertised.
     astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
     schemas
+}
+
+pub(crate) fn is_native_collaborator_tool(name: &str) -> bool {
+    matches!(
+        name,
+        native_codex::TOOL_NAME | native_claude::TOOL_NAME | native_opencode::TOOL_NAME
+    )
 }
 
 const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -274,6 +287,17 @@ pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
+
+/// Permission admission for one provider-owned collaborator declaration.
+/// This is a receipt from the existing CLI permission owner; it is not a
+/// session registry and cannot be constructed from model-visible arguments.
+pub(crate) struct ApprovedNativeRuntime {
+    pub(crate) protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
+    pub(crate) snapshot: astra_turn_types::ProviderDiscoverySnapshot,
+    pub(crate) requirements: astra_turn_types::ProviderRuntimeRequirements,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) admission_source: astra_tools::tool_engine::ToolInvocationAdmissionSource,
+}
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
 #[path = "edge_tools/memoria.rs"]
@@ -4510,7 +4534,92 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> EdgeToolRun {
-        let argument_validation = if runtime_env_builtin_registry().get(name).is_none() {
+        self.execute_run_with_native_interaction(
+            name,
+            args,
+            invocation,
+            cancel_token,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Selected-provider entrypoint. Its per-invocation gate must route the
+    /// exact authenticated callback identity/generation to the existing
+    /// DurableRunUserPromptGate. Never store a mutable global question gate:
+    /// foreground and child invocations may share this edge executor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_native_provider_invocation(
+        &self,
+        protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
+        tool_name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+        gate: &dyn astra_tools::ProviderInteractionGate,
+        execution_ceiling: &astra_server_types::edge_ws_protocol::EdgeExecutionCeiling,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>,
+        validate_dispatch: &(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync),
+    ) -> ToolExecutionOutcome {
+        self.execute_run_with_native_interaction(
+            tool_name,
+            args,
+            invocation,
+            cancel_token,
+            Some(gate),
+            Some(execution_ceiling),
+            Some(protocol),
+            runtime_approval,
+            Some(input_rx),
+            Some(validate_dispatch),
+        )
+        .await
+        .into_outcome()
+    }
+
+    // Independent invocation controls are checked together, not inferred from tool arguments.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_run_with_native_interaction(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+        native_gate: Option<&dyn astra_tools::ProviderInteractionGate>,
+        execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
+        validate_dispatch: Option<&(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync)>,
+    ) -> EdgeToolRun {
+        let canonical_native = runtime_approval.filter(|approval| {
+            native_protocol.is_none_or(|protocol| protocol == approval.protocol)
+        });
+        if runtime_approval.is_some() && canonical_native.is_none() {
+            return EdgeToolRun::failure_evidence(
+                "native collaborator protocol and admission receipt do not match".into(),
+                astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolBinding,
+                ),
+            );
+        }
+        let argument_validation = if let Some(approved) = canonical_native {
+            let declaration = &approved.snapshot.tool_declarations[0];
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                name,
+                args,
+                &json!({"type": "function", "function": {
+                    "name": declaration.native_tool_name,
+                    "parameters": declaration.input_schema,
+                }}),
+            )
+        } else if runtime_env_builtin_registry().get(name).is_none() {
             rwlock_read_project_or_default(
                 &self.cli_local_provider_schemas,
                 "provider_owned_schema_argument_validation",
@@ -4550,8 +4659,13 @@ impl ToolExecutor {
             let evidence = error.failure_evidence();
             return EdgeToolRun::failure_evidence(error.output(), evidence);
         }
-        if let Some(error) = self.tool_admission_denial(name, args) {
-            return error;
+        // Executor-only native capacity is admitted by the authenticated
+        // delivery grant plus its local frozen approval, not model visibility.
+        // Ordinary/root dispatch cannot supply this receipt.
+        if canonical_native.is_none() {
+            if let Some(error) = self.tool_admission_denial(name, args) {
+                return error;
+            }
         }
         // Edge-owned typed writers share the same per-workspace lease as the
         // Bash pre/post observer. Bash acquires it inside its shell boundary;
@@ -4595,6 +4709,11 @@ impl ToolExecutor {
         let mcp_workspace_effect = mcp_prepared
             .as_ref()
             .map(|(_, prepared)| prepared.policy().effect);
+        let execution_root = if native_protocol.is_some() {
+            self.effective_project_root()
+        } else {
+            self.project_root.clone()
+        };
         if matches!(
             mcp_workspace_effect,
             Some(astra_turn_types::ResolvedToolEffect::Unknown)
@@ -4607,15 +4726,20 @@ impl ToolExecutor {
             && name != "run_script"
             // MCP effects are resolved once from the discovered provider
             // declaration; typed tools use the shared built-in predicate.
-            && (mcp_workspace_effect == Some(astra_turn_types::ResolvedToolEffect::Mutating)
+            && (native_protocol.is_some()
+                || mcp_workspace_effect == Some(astra_turn_types::ResolvedToolEffect::Mutating)
                 || astra_tools::executor::requires_workspace_serialization(name, args)
                 || targeted_observer)
             && !nested_run_script_callback
         {
             match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                &self.project_root,
+                &execution_root,
                 cancel_token,
-                std::time::Duration::from_secs(120),
+                invocation
+                    .admission_deadline
+                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(std::time::Duration::from_secs(120))
+                    .min(std::time::Duration::from_secs(120)),
             )
             .await
             {
@@ -4635,6 +4759,11 @@ impl ToolExecutor {
         } else {
             None
         };
+        if let Some(validate) = validate_dispatch
+            && let Err(result) = validate()
+        {
+            return EdgeToolRun::from_tool_result(result);
+        }
         // Structured writers have no trustworthy success fact in their
         // display string. Capture an owner-side bounded preimage while the
         // workspace lease is held, then stamp the result only if the bound
@@ -4689,28 +4818,38 @@ impl ToolExecutor {
                 cancel_token,
                 &mut facts,
                 mcp_prepared,
+                &execution_root,
+                native_gate,
+                execution_ceiling,
+                native_protocol,
+                runtime_approval,
+                input_rx,
             )
             .await;
         let ToolExecutionFacts {
             fields: mut tool_result_fields,
             is_error: mut source_is_error,
         } = facts;
-        if matches!(
-            mcp_workspace_effect,
-            Some(astra_turn_types::ResolvedToolEffect::Mutating)
-        ) {
+        if native_protocol.is_some()
+            || matches!(
+                mcp_workspace_effect,
+                Some(astra_turn_types::ResolvedToolEffect::Mutating)
+            )
+        {
             let result = astra_tools::ToolResult {
                 output,
                 metadata: tool_result_fields,
                 is_error: source_is_error.unwrap_or(false),
                 exit_semantics: None,
             };
-            let dispatched = result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("mcp_call_dispatched"))
-                .and_then(Value::as_bool)
-                == Some(true);
+            let dispatched = result.metadata.as_ref().is_some_and(|fields| {
+                fields.get("mcp_call_dispatched").and_then(Value::as_bool) == Some(true)
+                    || (native_protocol.is_some()
+                        && fields
+                            .get("native_collaborator")
+                            .and_then(|native| native.get("target_released"))
+                            != Some(&Value::Bool(false)))
+            });
             let settled = result
                 .metadata
                 .as_ref()
@@ -4719,7 +4858,7 @@ impl ToolExecutor {
                 == Some(true);
             let result = if dispatched && !settled {
                 astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    &self.project_root,
+                    &execution_root,
                 );
                 astra_tools::workspace_effect_unsettled_tool_result(name, result)
             } else {
@@ -4909,6 +5048,8 @@ impl ToolExecutor {
         .with_tool_result_fields(tool_result_fields)
     }
 
+    // This execution boundary receives prepared capability and authority facts explicitly.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_raw(
         &self,
         name: &str,
@@ -4920,14 +5061,63 @@ impl ToolExecutor {
             std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
             astra_mcp::PreparedMcpToolCall,
         )>,
+        execution_root: &Path,
+        native_gate: Option<&dyn astra_tools::ProviderInteractionGate>,
+        execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
     ) -> String {
         let ToolExecutionFacts {
             fields: tool_result_fields,
             is_error: source_is_error,
         } = facts;
-        let output = if is_plan_mode_blocked_tool(name, args)
-            && self.plan_mode_authoring_active().await
-        {
+        let output = if let Some(protocol) = native_protocol {
+            let result = match protocol {
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
+                    self.execute_native_codex(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        runtime_approval,
+                        input_rx,
+                    )
+                    .await
+                }
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::ClaudeStreamJson => {
+                    self.execute_native_claude(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        runtime_approval,
+                        input_rx,
+                    )
+                    .await
+                }
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::OpenCodeAcp => {
+                    self.execute_native_opencode(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        runtime_approval,
+                        input_rx,
+                    )
+                    .await
+                }
+            };
+            *source_is_error = Some(result.is_error);
+            *tool_result_fields = result.metadata;
+            result.output
+        } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
                  Use read-only tools to finish the plan, then call \

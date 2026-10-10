@@ -438,6 +438,9 @@ pub(crate) async fn stream_chat_sse(
     );
     let mcp_runtime_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
+    // Native collaborators are internal child execution capacity. A binary
+    // probe does not install an authenticated consumer and must not expose a
+    // standalone root tool that cannot honor canonical child admission.
     executor.set_cli_local_provider_schemas(all_schemas.clone());
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve MCP tool schemas by name.

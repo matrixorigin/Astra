@@ -814,7 +814,7 @@ async fn direct_child_parent_cancelled(cancellation: &super::host::CancellationS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderBoundaryGate {
+pub(crate) enum ProviderBoundaryGate {
     Authorized,
     Paused,
 }
@@ -1059,7 +1059,7 @@ async fn continue_after_user_intent_settlement_fence(
     Ok(TurnExecutionControl::ContinueLoop)
 }
 
-async fn authorize_provider_boundary(
+pub(crate) async fn authorize_provider_boundary(
     state: &mut AgenticLoopState,
 ) -> Result<ProviderBoundaryGate, astra_core::ClassifiedError> {
     let (Some(run_control), Some(user_id), Some(run_id)) = (
@@ -3816,7 +3816,7 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
 /// normal empty-poll cadence has not elapsed. This is the ownership handoff
 /// that prevents a remotely accepted intent from falling between the final
 /// model response and terminal run settlement.
-async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
+pub(crate) async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
@@ -4072,114 +4072,50 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
                 .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
             return Ok(applied_model_guidance);
         } else {
-            let apply_authority = state
-                .current_run_owner_generation
-                .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
-                .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
-            // Resume retries the same acknowledgement, not the snapshot page:
-            // pause must not spend pagination capacity or advance its cursor.
-            loop {
-                match run_control
-                    .mark_user_intents_applied(
-                        &user_id,
-                        &expected_session_id,
-                        &run_id,
-                        &release_event_indices,
-                        apply_authority,
-                    )
-                    .await
-                {
-                    Ok(crate::turn::run_control::UserIntentApplyAck::Paused) => {
-                        let pause_flag =
-                            state.cancellation.pause_flag.as_ref().ok_or_else(|| {
-                                astra_core::ClassifiedError::new(
-                                    astra_core::ErrorKind::ContractViolation,
-                                    "paused input consumer has no shared execution pause control",
-                                )
-                            })?;
-                        pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if wait_for_pause_clear_or_cancel(host, state).await? {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "run cancelled while accepted guidance was awaiting resume",
-                            ));
-                        }
-                        continue;
+            if let Some((ack, model_context_changed)) = apply_pending_user_intents(
+                host,
+                state,
+                run_control.as_ref(),
+                &user_id,
+                &expected_session_id,
+                &run_id,
+                &release_event_indices,
+                Some(observed.next_cursor),
+                force_poll,
+            )
+            .await?
+            {
+                applied_model_guidance |= model_context_changed;
+                if ack == crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned {
+                    state.user_intents.note_user_intent_poll_finished(
+                        poll_started,
+                        USER_INTENT_EMPTY_POLL_INTERVAL,
+                    );
+                    tracing::debug!(
+                        run_id = %run_id,
+                        ?release_event_indices,
+                        "terminal run won user intent application race"
+                    );
+                    if force_poll {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "run terminated while applying authoritative user guidance; stale provider actions were discarded",
+                        ));
                     }
-                    Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
-                        let acknowledged = state
-                            .user_intents
-                            .acknowledge_apply_events(&release_event_indices);
-                        applied_model_guidance |=
-                            apply_acknowledged_user_intents(host, state, &acknowledged);
-                        for event in &acknowledged {
-                            if crate::turn::run_control::runtime_notification_content(&event.input)
-                                .is_none()
-                            {
-                                host.on_user_intent_applied(event).await;
-                            }
-                        }
-                        state
-                            .user_intents
-                            .commit_observed_cursor(observed.next_cursor);
-                    }
-                    Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned) => {
-                        let returned = state
-                            .user_intents
-                            .return_pending_apply_events(&release_event_indices);
-                        for event in &returned {
-                            if crate::turn::run_control::runtime_notification_content(&event.input)
-                                .is_none()
-                            {
-                                host.on_user_intent_returned(event).await;
-                            }
-                        }
-                        state
-                            .user_intents
-                            .commit_observed_cursor(observed.next_cursor);
-                        state.user_intents.note_user_intent_poll_finished(
-                            poll_started,
-                            USER_INTENT_EMPTY_POLL_INTERVAL,
-                        );
-                        tracing::debug!(
-                            run_id = %run_id,
-                            ?release_event_indices,
-                            "terminal run won user intent application race"
-                        );
-                        if force_poll {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "run terminated while applying authoritative user guidance; stale provider actions were discarded",
-                            ));
-                        }
-                        return Ok(applied_model_guidance);
-                    }
-                    Err(error) => {
-                        state
-                            .user_intents
-                            .note_apply_ack_failure(tokio::time::Instant::now());
-                        state.user_intents.note_user_intent_poll_finished(
-                            poll_started,
-                            USER_INTENT_EMPTY_POLL_INTERVAL,
-                        );
-                        tracing::warn!(
-                            run_id = %run_id,
-                            ?release_event_indices,
-                            error = %error,
-                            "failed to durably acknowledge user intent application"
-                        );
-                        if force_poll {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::ContractViolation,
-                                format!(
-                                    "authoritative user guidance could not be durably acknowledged before the action boundary: {error}"
-                                ),
-                            ));
-                        }
-                        return Ok(applied_model_guidance);
-                    }
+                    return Ok(applied_model_guidance);
                 }
-                break;
+            } else if force_poll {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!(
+                        "authoritative user guidance could not be durably acknowledged before the action boundary for run {run_id}"
+                    ),
+                ));
+            } else {
+                state
+                    .user_intents
+                    .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
+                return Ok(applied_model_guidance);
             }
         }
 
@@ -4300,6 +4236,109 @@ fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
         );
     }
     !model_guidance.is_empty()
+}
+
+/// Complete the durable acknowledgement for events that have already been
+/// staged by the canonical user-intent owner. This function deliberately does
+/// not poll for new input: a native provider may have rejected or ambiguously
+/// delivered a different event, and that event must not become applied merely
+/// because a settlement boundary was reached.
+pub(crate) async fn apply_pending_user_intents<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    run_control: &dyn RunControlProvider,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    event_indices: &[usize],
+    commit_cursor: Option<usize>,
+    strict: bool,
+) -> Result<Option<(crate::turn::run_control::UserIntentApplyAck, bool)>, astra_core::ClassifiedError>
+{
+    let authority = state
+        .current_run_owner_generation
+        .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
+        .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
+    loop {
+        match run_control
+            .mark_user_intents_applied(user_id, session_id, run_id, event_indices, authority)
+            .await
+        {
+            Ok(crate::turn::run_control::UserIntentApplyAck::Paused) => {
+                let pause_flag = state.cancellation.pause_flag.as_ref().ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "paused input consumer has no shared execution pause control",
+                    )
+                })?;
+                pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                if wait_for_pause_clear_or_cancel(host, state).await? {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::Cancelled,
+                        "run cancelled while accepted guidance was awaiting resume",
+                    ));
+                }
+            }
+            Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
+                let acknowledged = state.user_intents.acknowledge_apply_events(event_indices);
+                let model_context_changed =
+                    apply_acknowledged_user_intents(host, state, &acknowledged);
+                for event in &acknowledged {
+                    if crate::turn::run_control::runtime_notification_content(&event.input)
+                        .is_none()
+                    {
+                        host.on_user_intent_applied(event).await;
+                    }
+                }
+                if let Some(cursor) = commit_cursor {
+                    state.user_intents.commit_observed_cursor(cursor);
+                }
+                return Ok(Some((
+                    crate::turn::run_control::UserIntentApplyAck::Applied,
+                    model_context_changed,
+                )));
+            }
+            Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned) => {
+                let returned = state
+                    .user_intents
+                    .return_pending_apply_events(event_indices);
+                for event in &returned {
+                    if crate::turn::run_control::runtime_notification_content(&event.input)
+                        .is_none()
+                    {
+                        host.on_user_intent_returned(event).await;
+                    }
+                }
+                if let Some(cursor) = commit_cursor {
+                    state.user_intents.commit_observed_cursor(cursor);
+                }
+                return Ok(Some((
+                    crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned,
+                    false,
+                )));
+            }
+            Err(error) => {
+                state
+                    .user_intents
+                    .note_apply_ack_failure(tokio::time::Instant::now());
+                tracing::warn!(
+                    run_id,
+                    ?event_indices,
+                    error = %error,
+                    "failed to durably acknowledge user intent application"
+                );
+                if strict {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        format!(
+                            "authoritative user guidance could not be durably acknowledged before the action boundary: {error}"
+                        ),
+                    ));
+                }
+                return Ok(None);
+            }
+        }
+    }
 }
 
 fn runtime_feedback_run_usage(

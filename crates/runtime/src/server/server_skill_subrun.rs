@@ -2333,6 +2333,7 @@ mod tests {
                 ),
                 None,
                 None,
+                false,
             )
             .await;
         assert!(
@@ -2376,6 +2377,7 @@ mod tests {
                 ),
                 None,
                 None,
+                false,
             )
             .await;
         assert!(stale.pending.is_none());

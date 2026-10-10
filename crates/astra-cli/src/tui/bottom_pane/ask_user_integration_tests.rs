@@ -47,6 +47,32 @@ fn choice(label: &str, description: Option<&str>) -> AskUserChoice {
 }
 
 #[test]
+fn ask_user_closed_request_does_not_keep_a_modal_open() {
+    let mut bp = BottomPane::new();
+    let prompt = AskUserPrompt {
+        context: None,
+        questions: vec![AskUserQuestion {
+            header: "Direction".into(),
+            question: "Choose a direction".into(),
+            options: vec![],
+            multi_select: false,
+            allow_freeform: true,
+        }],
+        timeout_ms: None,
+    };
+    let (tx, rx) = oneshot::channel();
+    drop(rx);
+    bp.enqueue_ask_user(prompt.clone(), tx);
+    assert!(!bp.has_active_view());
+
+    let rx = enqueue(&mut bp, prompt);
+    assert!(bp.has_active_view());
+    drop(rx);
+    assert!(bp.pre_draw_tick(std::time::Instant::now()));
+    assert!(!bp.has_active_view());
+}
+
+#[test]
 fn ask_user_single_question_digit_submits_answer() {
     let mut bp = BottomPane::new();
     let mut rx = enqueue(

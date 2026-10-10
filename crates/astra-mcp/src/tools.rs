@@ -697,6 +697,7 @@ mod tests {
                 request_id,
                 payload,
                 timeout_ms: Some(1000),
+                provider_stage_input_id: None,
             }) if request_id == "call-1:select" && payload == serde_json::json!({"provider_owned": true})
         ));
     }

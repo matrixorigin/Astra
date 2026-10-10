@@ -62,6 +62,26 @@ pub struct HeadlessToolCallViews<'a> {
     pub logical: &'a [Value],
 }
 
+/// Return the canonical parent-approval wait for the current execution
+/// context. Native provider stages use the same permission gate as ordinary
+/// headless tools, so their approval budget must come from this owner rather
+/// than maintaining a provider-specific timeout.
+pub(crate) async fn effective_permission_timeout(
+    permission_context: Option<&PermissionSyncHandle>,
+) -> Duration {
+    const FOREGROUND: Duration = Duration::from_secs(30);
+    const BACKGROUND: Duration = Duration::from_secs(5);
+
+    let Some(permission_context) = permission_context else {
+        return FOREGROUND;
+    };
+    if permission_context.read().await.inherited.is_background {
+        BACKGROUND
+    } else {
+        FOREGROUND
+    }
+}
+
 impl<'a> HeadlessToolCallViews<'a> {
     pub fn validate(self) -> Result<Self, String> {
         if self.physical.len() != self.logical.len() {
@@ -182,19 +202,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     step_recorder: &mut StepRecorder,
     llm_round: u32,
 ) -> HeadlessPreparedRound<'a> {
-    const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-    const PERMISSION_REQUEST_TIMEOUT_BACKGROUND: Duration = Duration::from_secs(5);
-
-    let effective_permission_timeout = if let Some(ctx) = permission_context {
-        let guard = ctx.read().await;
-        if guard.inherited.is_background {
-            PERMISSION_REQUEST_TIMEOUT_BACKGROUND
-        } else {
-            PERMISSION_REQUEST_TIMEOUT
-        }
-    } else {
-        PERMISSION_REQUEST_TIMEOUT
-    };
+    let effective_permission_timeout = effective_permission_timeout(permission_context).await;
 
     tool_results.clear();
 
@@ -632,10 +640,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::{InheritedPermissions, PermissionMode, PermissionSyncContext};
     use serde_json::json;
 
     fn server_idx(i: usize) -> usize {
         i
+    }
+
+    #[tokio::test]
+    async fn permission_timeout_uses_the_shared_foreground_background_policy() {
+        let foreground = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            ..Default::default()
+        });
+        let background = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            is_background: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            effective_permission_timeout(Some(&foreground)).await,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            effective_permission_timeout(Some(&background)).await,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            effective_permission_timeout(None).await,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

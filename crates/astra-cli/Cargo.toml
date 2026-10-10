@@ -35,6 +35,7 @@ astra-services.workspace = true
 astra-runtime-env.workspace = true
 astra-runtime.workspace = true
 astra-server-types.workspace = true
+astra-edge = { path = "../astra-edge" }
 astra-sandbox.workspace = true
 astra-pipeline.workspace = true
 astra-messaging.workspace = true
@@ -107,6 +108,7 @@ fs2 = "0.4"
 shell-words = "1.1.1"
 
 [dev-dependencies]
+globset = "0.4"
 astra-runtime = { workspace = true, features = ["e2e-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }
 itertools = "0.13"

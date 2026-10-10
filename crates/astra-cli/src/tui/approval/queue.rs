@@ -12,12 +12,34 @@ use astra_turn_core::permission::scope::AllowScope;
 /// the non-Clone `oneshot::Sender`.
 pub(crate) type ApprovalId = u64;
 
+/// Host-bound dependency approval for one physical invocation. Display text
+/// is not authority, and this context never grants a remembered permission.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeDependencyApprovalContext {
+    pub invocation: astra_turn_types::ToolInvocationIdentity,
+    pub attachment_epoch: u64,
+    pub execution_binding_generation: u64,
+    pub deadline: std::time::Instant,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl RuntimeDependencyApprovalContext {
+    pub(crate) fn is_current(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
+        session_id == Some(self.invocation.session_id.as_str())
+            && attachment_epoch == self.attachment_epoch
+            && self.execution_binding_generation > 0
+            && !self.cancel.is_cancelled()
+            && std::time::Instant::now() < self.deadline
+    }
+}
+
 /// One pending approval. The `response_txs` vec lets dedup
 /// merge multiple in-flight requests with byte-identical
 /// `ApprovalRequestKey`s under one user-facing prompt — when
 /// the user resolves, all stored senders receive the same
 /// response (issue #326 P4 / R2 Critical 1).
 pub(crate) struct PendingApproval {
+    pub runtime_dependencies: Option<RuntimeDependencyApprovalContext>,
     pub id: ApprovalId,
     pub tool: String,
     pub header: String,
@@ -109,6 +131,7 @@ pub(crate) struct PendingApproval {
 /// extend without churning the whole call signature.
 #[derive(Default, Debug, Clone)]
 pub(crate) struct ApprovalMetadata {
+    pub runtime_dependencies: Option<RuntimeDependencyApprovalContext>,
     pub source_agent: Option<String>,
     pub mcp_capability: Option<astra_turn_core::permission::engine::ToolCapabilityMetadata>,
     pub host: Option<String>,
@@ -253,6 +276,7 @@ impl std::fmt::Debug for PendingApproval {
 /// View-only projection safe to store in `State` (no oneshot).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovalView {
+    pub invocation_scoped: bool,
     pub id: ApprovalId,
     pub tool: String,
     pub header: String,
@@ -281,6 +305,7 @@ pub(crate) struct ApprovalView {
 impl From<&PendingApproval> for ApprovalView {
     fn from(p: &PendingApproval) -> Self {
         Self {
+            invocation_scoped: p.runtime_dependencies.is_some(),
             id: p.id,
             tool: p.tool.clone(),
             header: p.header.clone(),
@@ -300,6 +325,14 @@ impl From<&PendingApproval> for ApprovalView {
 }
 
 impl PendingApproval {
+    fn accepts_response(&self, response: &ApprovalResponse) -> bool {
+        self.runtime_dependencies.as_ref().is_none_or(|context| {
+            *response == ApprovalResponse::Deny
+                || (*response == ApprovalResponse::AllowOnce
+                    && !context.cancel.is_cancelled()
+                    && std::time::Instant::now() < context.deadline)
+        })
+    }
     fn scope_context(&self) -> astra_turn_core::permission::scope::ScopeAvailabilityContext {
         astra_turn_core::permission::scope::ScopeAvailabilityContext {
             risk_tags: self.risk_tags.clone(),
@@ -322,6 +355,9 @@ impl PendingApproval {
     }
 
     fn scope_available(&self, scope: astra_turn_core::permission::scope::AllowScope) -> bool {
+        if self.runtime_dependencies.is_some() {
+            return scope == AllowScope::OnceThisCall;
+        }
         astra_turn_core::permission::scope::permitted_scopes(&self.scope_context())
             .into_iter()
             .any(|entry| entry.scope == scope && entry.available)
@@ -344,6 +380,11 @@ impl PendingApproval {
     }
 
     fn selection_hint(&self) -> Option<String> {
+        if self.runtime_dependencies.is_some() {
+            return Some(
+                "This approval applies only to this invocation; it cannot be remembered.".into(),
+            );
+        }
         if self.always_uses_session_fallback() {
             if self.workspace_untrusted {
                 return Some(
@@ -439,6 +480,7 @@ impl ApprovalQueue {
             ButtonRow::primary_with_batch()
         };
         self.entries.push_back(PendingApproval {
+            runtime_dependencies: metadata.runtime_dependencies,
             id,
             tool,
             header,
@@ -526,6 +568,12 @@ impl ApprovalQueue {
                 idx += 1;
                 continue;
             };
+            if !self.entries[idx].accepts_response(&response)
+                || (self.entries[idx].runtime_dependencies.is_some() && response.is_approved())
+            {
+                idx += 1;
+                continue;
+            }
             // Take this entry out and broadcast the policy response to its waiters.
             let mut entry = self.entries.remove(idx).expect("index in range");
             for tx in entry.response_txs.drain(..) {
@@ -592,6 +640,9 @@ impl ApprovalQueue {
         let Some(entry) = self.entries.get_mut(idx) else {
             return false;
         };
+        if !entry.accepts_response(&response) {
+            return false;
+        }
         // Issue #326 P4 / R2 Critical 1: broadcast the
         // response to every waiting sender. Drop dead
         // senders silently — recv-side may have cancelled
@@ -736,6 +787,91 @@ impl ApprovalQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_context() -> RuntimeDependencyApprovalContext {
+        RuntimeDependencyApprovalContext {
+            invocation: astra_turn_types::ToolInvocationIdentity::new("u", "s", "r", "r", "i")
+                .unwrap(),
+            attachment_epoch: 7,
+            execution_binding_generation: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_dependency_approval_fences_attachment_and_choices() {
+        let context = runtime_context();
+        assert!(context.is_current(Some("s"), 7));
+        assert!(!context.is_current(Some("s"), 8));
+        assert!(!context.is_current(Some("other"), 7));
+        for response in [
+            ApprovalResponse::AllowOnce,
+            ApprovalResponse::AlwaysAllow,
+            ApprovalResponse::Deny,
+        ] {
+            let mut queue = ApprovalQueue::new();
+            let (tx, mut rx) = oneshot::channel();
+            queue.push_with_metadata(
+                "sandbox_expand:native".into(),
+                "runtime".into(),
+                None,
+                "exact dependency reads".into(),
+                serde_json::json!({"directory":"/runtime"}),
+                tx,
+                ApprovalMetadata {
+                    runtime_dependencies: Some(context.clone()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !queue
+                    .focused()
+                    .unwrap()
+                    .scope_available(AllowScope::RestOfSession)
+            );
+            assert!(queue.focused_view().unwrap().invocation_scoped);
+            assert_eq!(
+                queue.drain_resolved(|_| Some(ApprovalResponse::AlwaysAllow)),
+                0
+            );
+            assert_eq!(
+                queue.drain_resolved(|_| Some(ApprovalResponse::AllowOnce)),
+                0
+            );
+            assert!(rx.try_recv().is_err());
+            let expected = response != ApprovalResponse::AlwaysAllow;
+            assert_eq!(queue.respond_focused(response.clone()), expected);
+            if expected {
+                assert_eq!(rx.try_recv().unwrap(), response);
+            } else {
+                assert!(rx.try_recv().is_err());
+            }
+        }
+        context.cancel.cancel();
+        assert!(!context.is_current(Some("s"), 7));
+        let mut queue = ApprovalQueue::new();
+        let (tx, mut rx) = oneshot::channel();
+        queue.push_with_metadata(
+            "sandbox_expand:native".into(),
+            "runtime".into(),
+            None,
+            "cancelled request".into(),
+            serde_json::Value::Null,
+            tx,
+            ApprovalMetadata {
+                runtime_dependencies: Some(context),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            queue.drain_resolved(|_| Some(ApprovalResponse::AllowOnce)),
+            0
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(queue.drain_resolved(|_| Some(ApprovalResponse::Deny)), 1);
+        assert_eq!(rx.try_recv().unwrap(), ApprovalResponse::Deny);
+    }
 
     #[test]
     fn push_records_no_source_agent_by_default() {

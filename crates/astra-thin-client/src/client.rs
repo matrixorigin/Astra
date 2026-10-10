@@ -29,7 +29,8 @@ use crate::protocol::{
     ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeHeartbeatResponse,
     EdgeRegisterRequest, ProviderInteractionRespondRequest, RunUserIntentRequest,
     RunUserIntentResponse, SessionCreateRequest, SessionTranscriptPage, SessionTranscriptReadScope,
-    SessionUpdateRequest, StreamEvent, ToolResultRequest, UserPromptRespondRequest,
+    SessionUpdateRequest, StreamEvent, ToolInteractionRequest, ToolResultRequest,
+    UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
 use crate::work::{WorkCatalogCursorV1, WorkCatalogPageV1, WorkTaskGraphPageV2};
@@ -2510,6 +2511,155 @@ impl ThinClient {
         unreachable!("at least one callback attempt is required")
     }
 
+    /// Register and await a native question through its canonical invocation.
+    /// The timeout is the admitted remaining stage budget, not a short callback
+    /// ACK timeout. Retrying a submitted question belongs to its durable owner.
+    pub async fn post_tool_interaction_request(
+        &self,
+        bearer_override: Option<&str>,
+        edge_transport_id: &str,
+        body: &ToolInteractionRequest,
+        timeout: Duration,
+        required_events: tokio::sync::mpsc::Sender<Value>,
+    ) -> Result<astra_turn_types::ProviderInteractionResponse, ThinClientError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                ThinClientError::InvalidInput("interaction deadline is outside clock range".into())
+            })?;
+        let response = tokio::time::timeout_at(deadline, async {
+            self.http
+                .post(self.url(paths::TOOL_INTERACTION_REQUEST)?)
+                .headers(self.auth_headers_for(bearer_override).await?)
+                .header(ASTRA_EDGE_ID_HEADER, edge_transport_id)
+                .timeout(timeout)
+                .json(body)
+                .send()
+                .await
+                .map_err(ThinClientError::from)
+        })
+        .await
+        .map_err(|_| ThinClientError::AdmissionDeadlineExpired)??;
+        if !response.status().is_success() {
+            return Self::typed_json_or_error(response).await;
+        }
+        let receive = async {
+            let mut parser = SseParser::with_max_frame_bytes(256 * 1024);
+            let mut chunks = response.bytes_stream();
+            let mut required_index = None;
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk?;
+                for feed in chunk.chunks(16 * 1024) {
+                    for event in parser.push_bytes(feed)? {
+                        let (event_type, raw) = match event {
+                            StreamEvent::Other { event_type, raw } => (event_type, raw),
+                            StreamEvent::Error { raw, .. } => {
+                                let status = raw
+                                    .get("status")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|status| u16::try_from(status).ok())
+                                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                                    .filter(|status| {
+                                        status.is_client_error() || status.is_server_error()
+                                    })
+                                    .unwrap_or(reqwest::StatusCode::CONFLICT);
+                                return Err(ThinClientError::Api {
+                                    status,
+                                    body: "native interaction request rejected".into(),
+                                });
+                            }
+                            _ => {
+                                return Err(ThinClientError::InvalidProviderInteractionResponse(
+                                    "unexpected interaction stream event".into(),
+                                ));
+                            }
+                        };
+                        match event_type.as_str() {
+                            "provider_interaction_required" => {
+                                let identity: astra_turn_types::ToolInvocationIdentity =
+                                    serde_json::from_value(
+                                        raw.pointer("/tool_invocation_origin/identity")
+                                            .cloned()
+                                            .ok_or_else(|| {
+                                                ThinClientError::InvalidProviderInteractionResponse(
+                                                    "required event has no invocation origin"
+                                                        .into(),
+                                                )
+                                            })?,
+                                    )?;
+                                let interaction: astra_turn_types::ProviderInteractionRequest =
+                                    serde_json::from_value(
+                                        raw.get("interaction").cloned().ok_or_else(|| {
+                                            ThinClientError::InvalidProviderInteractionResponse(
+                                                "required event has no interaction".into(),
+                                            )
+                                        })?,
+                                    )?;
+                                let index =
+                                    raw.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                                        ThinClientError::InvalidProviderInteractionResponse(
+                                            "required event has no durable index".into(),
+                                        )
+                                    })?;
+                                if identity != body.identity
+                                    || interaction != body.interaction
+                                    || raw.get("run_id").and_then(Value::as_str)
+                                        != Some(body.identity.run_id.as_str())
+                                    || raw
+                                        .pointer("/tool_invocation_origin/edge_agent_id")
+                                        .and_then(Value::as_str)
+                                        != Some(body.edge_agent_id.as_str())
+                                    || required_index.is_some_and(|previous| previous != index)
+                                {
+                                    return Err(
+                                        ThinClientError::InvalidProviderInteractionResponse(
+                                            "required event changed interaction identity".into(),
+                                        ),
+                                    );
+                                }
+                                if required_index.is_none() {
+                                    required_events.send(raw).await.map_err(|_| {
+                                        ThinClientError::InvalidProviderInteractionResponse(
+                                            "interaction consumer closed".into(),
+                                        )
+                                    })?;
+                                    required_index = Some(index);
+                                }
+                            }
+                            "tool_interaction_response" => {
+                                let response: astra_turn_types::ProviderInteractionResponse =
+                                    serde_json::from_value(
+                                        raw.get("response").cloned().ok_or_else(|| {
+                                            ThinClientError::InvalidProviderInteractionResponse(
+                                                "missing terminal interaction response".into(),
+                                            )
+                                        })?,
+                                    )?;
+                                response.validate_for(&body.interaction).map_err(|error| {
+                                    ThinClientError::InvalidProviderInteractionResponse(
+                                        error.to_string(),
+                                    )
+                                })?;
+                                return Ok(response);
+                            }
+                            _ => {
+                                return Err(ThinClientError::InvalidProviderInteractionResponse(
+                                    "unexpected interaction stream event".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(ThinClientError::InvalidProviderInteractionResponse(
+                "interaction stream ended without a terminal response".into(),
+            ))
+        };
+        tokio::time::timeout_at(deadline, receive)
+            .await
+            .map_err(|_| ThinClientError::AdmissionDeadlineExpired)?
+    }
+
     /// Submit a response to a durable provider interaction.
     pub async fn post_provider_interaction_response(
         &self,
@@ -2623,6 +2773,101 @@ mod tests {
     use crate::work::WorkCatalogAttentionV1;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn tool_interaction_response_preserves_identity_and_rejects_mismatch() {
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let body = ToolInteractionRequest {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "user", "session", "run", "chain", "call",
+            )
+            .unwrap(),
+            edge_agent_id: "edge".into(),
+            physical_workspace_id: "physical-test".into(),
+            interaction: astra_turn_types::ProviderInteractionRequest {
+                request_id: "question".into(),
+                payload: serde_json::json!({"question": "Choose a direction"}),
+                timeout_ms: Some(10_000),
+                provider_stage_input_id: None,
+            },
+        };
+        for (case, terminal_id, required_run, expected_ok) in [
+            ("resolved", Some("question"), None, true),
+            ("wrong-final", Some("other-question"), None, false),
+            ("required", Some("question"), Some("run"), true),
+            ("wrong-origin", Some("question"), Some("other-run"), false),
+            ("eof", None, Some("run"), false),
+        ] {
+            server.reset().await;
+            let mut frames = Vec::new();
+            if let Some(run_id) = required_run {
+                let mut identity = body.identity.clone();
+                identity.run_id = run_id.into();
+                let required = serde_json::json!({
+                    "type":"provider_interaction_required", "index":3,
+                    "run_id":run_id, "request_id":body.interaction.request_id,
+                    "interaction":body.interaction,
+                    "tool_invocation_origin":{"identity":identity,"edge_agent_id":body.edge_agent_id}
+                });
+                frames.push(required.clone());
+                frames.push(required); // An exact replay must not open twice.
+            }
+            if let Some(request_id) = terminal_id {
+                frames.push(serde_json::json!({
+                    "type":"tool_interaction_response",
+                    "response":{"request_id":request_id,"outcome":"submitted","payload":{"answer":"A"}}
+                }));
+            }
+            let stream_body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            Mock::given(method("POST"))
+                .and(path(paths::TOOL_INTERACTION_REQUEST))
+                .and(header("authorization", "Bearer test-token"))
+                .and(header(ASTRA_EDGE_ID_HEADER, "edge-transport"))
+                .and(body_json(serde_json::to_value(&body).unwrap()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(stream_body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (required_tx, mut required_rx) = tokio::sync::mpsc::channel(1);
+            let result = client
+                .post_tool_interaction_request(
+                    Some("test-token"),
+                    "edge-transport",
+                    &body,
+                    Duration::from_secs(10),
+                    required_tx,
+                )
+                .await;
+            let observed = required_rx.try_recv().ok();
+            assert_eq!(observed.is_some(), required_run == Some("run"), "{case}");
+            assert!(
+                required_rx.try_recv().is_err(),
+                "duplicate required must not reopen: {case}"
+            );
+            if expected_ok {
+                assert_eq!(
+                    result.unwrap().payload,
+                    Some(serde_json::json!({"answer": "A"}))
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error,
+                    ThinClientError::InvalidProviderInteractionResponse(_)
+                ));
+                assert!(!error.is_transport(), "{case}");
+            }
+            server.verify().await;
+        }
+    }
 
     #[tokio::test]
     async fn inspection_json_has_a_response_byte_ceiling_and_preserves_http_errors() {

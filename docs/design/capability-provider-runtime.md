@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-07-16.
+> Last updated: 2026-10-09.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -230,6 +230,41 @@ Snapshot construction must:
 - preserve optional versus explicitly false claims;
 - derive versions/hashes from semantic content, not timestamps or process IDs;
 - exclude volatile health samples and call statistics from descriptor hashes.
+
+### Authenticated local-runtime discovery
+
+Runtime advertisements use schema version 2 and carry an explicit
+`provider_discovery` array, including an empty array when no dynamic provider is
+declared. Missing discovery is not inferred from public tool schemas. Local
+snapshots use the `cli-local` discovery protocol, the authenticated executor as
+provider identity, and the materialization/root physical identity as binding.
+
+Server admission resolves the selected authenticated registration through the
+same conservative resolver as other providers and installs one combined policy
+index. Authentication proves provenance, not claim trust or permission. Recovery
+retains the admitted snapshot through the existing checkpoint; current dispatch
+must still reject a changed descriptor, capability or materialization.
+
+The qualified `astra.runtimeRequirements` extension declares an executable and
+a bounded set of runtime read dependencies. It does not grant access. A frozen
+execution ceiling limits workspace, network and runtime reads; local approval
+and sensitive-path denials still apply independently. The current ceiling cannot
+represent restricted filesystem allowlists or stronger isolation guarantees and
+must reject them rather than project them into unrestricted workspace reads.
+
+CLI runtime dependency admission reads the existing session permission writer
+through an immutable subscription. Requests carry the canonical session
+attachment epoch; reset, rebind or writer closure invalidates retained policy.
+One invocation-scoped approval covers the frozen dependency set, with every
+dependency checked again after policy changes and before dispatch. An automatic
+policy release is not recorded as a user approval. The existing TUI approval
+queue is reused; mode-only queue reevaluation cannot authorize this bundle.
+Remembered dependency grants require acknowledgement from that same permission
+writer and are not currently supported by this admission path.
+
+These contracts do not imply that a particular external collaborator is ready
+for end-user use; its production entrypoint and complete journey need separate
+verification.
 
 ### Provider claims
 
@@ -705,6 +740,51 @@ degraded, quarantine and fallback facts
 
 Observation records decisions and outcomes. It must not implement alternate
 fallback, retry, or cache control flow.
+
+Provider-owned child selection uses the authenticated directory already supplied
+to the model. Human references are interpreted against its provider/model names;
+execution still requires exact selectors. Registration transport is distinct from
+the native protocol. Chat `model_catalog` is not a provider-model directory.
+An authorized provider's default execution does not require a model catalog;
+resolving an explicit model does.
+Unavailable or ambiguous requirements need clarification, not workspace discovery
+or substitution. A completed child's inline `result` is usable output; only
+explicit artifact/window references require retrieval.
+
+Current-run guidance retains the ordinary agent's character contract. The native
+route additionally validates its complete serialized input, including correlation,
+before durable acceptance, using the same constructor as mailbox delivery. Invalid
+native text produces observable non-delivery feedback and retains existing custody
+for settlement; it is not applied or automatically retried as a transport failure.
+
+Native stages carry a bounded `native_stage_observation` through the existing
+tool terminal event and its external projection. Its checked stage delta is
+separate from the last native request snapshot and model context capacity;
+neither is a measurement of current context occupancy. Missing cache lanes or
+resume baselines remain unknown. The runtime invocation count and health do
+not describe provider-internal tools. Observation does not authorize completion
+or retry and requires no additional run, ledger, or artifact lookup.
+
+Native receipts use the existing host terminal custody even when no live
+observer is attached. Terminal presentation is bounded after execution metadata
+and again after generation/idempotency attachment, within the existing durable
+observation-window budget. Arguments are discarded before usable control
+results; exact routing is retained or replaced by an explicit repair gap.
+Canonical results and answers are not shortened. Native terminals use the
+existing exact-generation, idempotent precommit, including pause/cancel
+reconciliation. Later atomic settlement does not insert the same terminal
+again. Correcting missing native custody adds one semantic row and its existing
+precommit transaction; it is not zero additional storage. Observation requires
+no additional lookup or separate lifecycle.
+
+Codex permission masks project the shared sensitive-path rules into two
+deterministic brace globs per admitted directory, retaining literal credential
+file denies and existing logical aliases. Grant selection is unchanged; roots
+containing glob syntax fail before dispatch. This reduces prompt overhead, not
+the isolation boundary, and does not claim protection for arbitrary future
+files beyond the native client's existing mask semantics.
+Canonical workspace roots must also pass the shared never-readable predicate
+before any grant: descendant masks cannot make a sensitive grant root safe.
 
 ## Required invariants and tests
 

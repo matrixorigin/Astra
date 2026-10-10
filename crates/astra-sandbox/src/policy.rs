@@ -262,6 +262,36 @@ const SENSITIVE_CRED_FILE_NAMES: &[&str] = &[
 /// devices, character devices, USB endpoints) remain sensitive.
 const SAFE_DEVICE_FILES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
 
+/// Read-only view of the existing matcher rules for execution-provider
+/// projections. This is not an executable grant or a second path validator.
+/// The canonical matcher remains authoritative; consumers must reject or
+/// explicitly narrow rules their execution boundary cannot represent.
+#[derive(Debug, Clone, Copy)]
+pub struct SensitivePathRules {
+    /// Case-sensitive substrings of the complete path, not glob patterns.
+    pub path_substrings: &'static [&'static str],
+    /// ASCII-case-insensitive exact directories and their descendants.
+    pub system_directories: &'static [&'static str],
+    /// ASCII-case-insensitive directory components and their descendants;
+    /// markers include the leading separator used by the canonical matcher.
+    pub credential_directories: &'static [&'static str],
+    /// Case-sensitive exact final path components.
+    pub credential_file_names: &'static [&'static str],
+    /// ASCII-case-insensitive exact exceptions to system-directory denial.
+    /// These do not override substring or final-component rules.
+    pub safe_device_files: &'static [&'static str],
+}
+
+pub fn sensitive_path_rules() -> SensitivePathRules {
+    SensitivePathRules {
+        path_substrings: SENSITIVE_PATH_SUBSTRINGS,
+        system_directories: SENSITIVE_SYSTEM_DIR_PREFIXES,
+        credential_directories: SENSITIVE_CRED_DIR_MARKERS,
+        credential_file_names: SENSITIVE_CRED_FILE_NAMES,
+        safe_device_files: SAFE_DEVICE_FILES,
+    }
+}
+
 /// True if `path` is a system-sensitive **directory** subtree (`/etc`, `/boot`,
 /// `/proc`, `/sys`, `/dev`, credential dirs under `$HOME`).
 ///

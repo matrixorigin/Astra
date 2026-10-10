@@ -58,6 +58,18 @@ pub enum MessageTarget {
     Parent,
 }
 
+/// Durable run-control provenance carried by a message that was accepted for
+/// an already-running provider stage.  This is a transport reference, not a
+/// second intent ledger: the run store remains authoritative for application
+/// and terminal disposition.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DurableUserIntentReference {
+    pub intent_id: String,
+    pub event_index: usize,
+    pub delivery: astra_turn_types::UserIntentDelivery,
+    pub input: serde_json::Value,
+}
+
 // ─── Message Payload ────────────────────────────────────────────────────────
 
 /// The content of an agent message.
@@ -160,6 +172,10 @@ pub struct AgentMessage {
     /// Time-to-live in milliseconds. `None` = no expiry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<i64>,
+    /// Optional durable run-control provenance. Ordinary agent messages do
+    /// not carry it; native provider-stage guidance does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_user_intent: Option<DurableUserIntentReference>,
 }
 
 const AGENT_COMMUNICATION_SUMMARY_CHARS: usize = 1_000;
@@ -297,12 +313,18 @@ impl AgentMessage {
             timestamp_ms,
             correlation_id: None,
             ttl_ms: None,
+            durable_user_intent: None,
         }
     }
 
     /// Attach a correlation ID (for request–response).
     pub fn with_correlation(mut self, id: impl Into<String>) -> Self {
         self.correlation_id = Some(id.into());
+        self
+    }
+
+    pub fn with_durable_user_intent(mut self, reference: DurableUserIntentReference) -> Self {
+        self.durable_user_intent = Some(reference);
         self
     }
 

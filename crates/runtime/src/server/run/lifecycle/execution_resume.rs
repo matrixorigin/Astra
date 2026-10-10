@@ -375,6 +375,13 @@ impl AgenticRunLifecycleService {
         let (bindings, _) =
             crate::server::run::binding_resolution::durable_run_execution_contract(run)
                 .map_err(invalid_resume)?;
+        if let Some(discovery) = &handoff.authenticated_edge_discovery {
+            PreparedRuntimeCapabilities::validate_edge_discovery_binding(
+                discovery,
+                &run.user_id,
+                &bindings,
+            )?;
+        }
         let original_workspace = &bindings.workspace;
         let workspace = if original_workspace.kind == WorkspaceBindingKind::ServerSandbox {
             let store = self
@@ -450,7 +457,7 @@ impl AgenticRunLifecycleService {
             thinking: controls.thinking.clone(),
             interaction_mode,
         };
-        let runtime = self
+        let mut runtime = self
             .prepare_authorized_runtime_capabilities(
                 &run.user_id,
                 &[],
@@ -461,6 +468,9 @@ impl AgenticRunLifecycleService {
                 &constraints,
             )
             .await?;
+        // Reuse the original authenticated checkpoint facts, never model-visible
+        // schemas. Existing dispatch admission rechecks the live registration.
+        runtime.bind_edge_discovery(handoff.authenticated_edge_discovery.clone())?;
         self.validate_optional_tool_availability(&run.user_id, &constraints, Some(&bindings))
             .await?;
         let now_unix_ms = SystemTime::now()
@@ -597,6 +607,7 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .map_err(|error| invalid_resume(error.clone()))?;
         let runtime_context = ServerSpawnRuntimeContext {
+            tool_executor: Arc::new(Default::default()),
             model_catalog_reader: catalog,
             parent_run_id: run.run_id.clone(),
             runtime_context_id: Uuid::new_v4().to_string(),
@@ -698,6 +709,12 @@ impl AgenticRunLifecycleService {
         )
         .await;
         wire_executor_into_state(executor, &mut state);
+        if let Some(executor) = state.runtime_tool_executor.as_ref() {
+            let _ = wiring
+                .root_runtime_context_guard
+                .tool_executor
+                .set(Arc::downgrade(executor));
+        }
         Ok(OwnedBackgroundExecution {
             resumed: true,
             user_id: run.user_id.clone(),

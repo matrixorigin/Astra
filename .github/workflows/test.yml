@@ -71,6 +71,11 @@ jobs:
         run: cargo build --locked -p astra-cli --bin mock_mcp_server
       - name: Test complete CLI inventory
         run: cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+      - name: Verify native delivery through the production supervisor
+        run: |
+          cargo build --locked -p astra-cli --bin astra
+          ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN="$PWD/target/debug/astra" cargo test --locked -p astra-cli --lib authenticated_shared_ws_executes_native_provider_through_cli_entrypoint -- --ignored
+          ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN="$PWD/target/debug/astra" cargo test --locked -p astra-cli --lib discovery_preserves_the_whole_budget_across_protocol_phases -- --ignored
       - name: Retain CLI test timings
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

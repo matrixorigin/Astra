@@ -1342,6 +1342,104 @@ pub(crate) async fn post_user_prompt_respond_handler(
 /// This boundary authenticates the run and validates only Astra's generic
 /// envelope. Business payload validation remains the provider's
 /// responsibility when the suspended tool invocation resumes.
+/// Intermediate request, not a terminal `/tools/result` callback. The
+/// authenticated Edge supplies correlation only; Run/ledger own authority.
+pub(crate) async fn post_tool_interaction_request_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<astra_thin_client::ToolInteractionRequest>,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if body.identity.user_id != user.user_id {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Tool interaction crosses authenticated owner",
+        ));
+    }
+    let edge_id = headers
+        .get(astra_thin_client::ASTRA_EDGE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty() && *value == value.trim())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "Tool interaction requires an Edge identity header",
+            )
+        })?;
+    let edge = state
+        .execution
+        .edge_registry_service
+        .find_by_user_agent_and_workspace(&user.user_id, &body.edge_agent_id, None)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?
+        .filter(|edge| edge.edge_id == edge_id)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "Tool interaction is not from the selected registered Edge",
+            )
+        })?;
+    let (Some(materialization_id), Some(worktree_path)) = (
+        edge.materialization_id.as_deref(),
+        edge.worktree_path.as_deref(),
+    ) else {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Tool interaction requires a registered physical workspace",
+        ));
+    };
+    let physical_workspace_id =
+        astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+            materialization_id,
+            worktree_path,
+        );
+    if body.physical_workspace_id != physical_workspace_id {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Tool interaction is not from the selected physical workspace",
+        ));
+    }
+    validate_session_id(&body.identity.session_id)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    body.interaction
+        .validate()
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Value>(8);
+    let lifecycle = state.execution.run_lifecycle_service.clone();
+    // The response body owns this task. Disconnect aborts only the callback
+    // waiter, never the durable Run or its actual invocation owner.
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let result = lifecycle
+            .request_tool_interaction(
+                user.user_id,
+                body.identity,
+                edge.edge_agent_id,
+                body.physical_workspace_id,
+                body.interaction,
+                Some(tx.clone()),
+            )
+            .await;
+        let final_event = match result {
+            Ok(response) => {
+                serde_json::json!({"type":"tool_interaction_response", "response":response})
+            }
+            Err((status, _)) => serde_json::json!({
+                "type":"error", "code":"tool_interaction_rejected", "status":status.as_u16(),
+                "message":"Tool interaction could not be completed"
+            }),
+        };
+        let _ = tx.send(final_event).await;
+    }));
+    let stream = futures_util::stream::unfold((rx, task), |(mut rx, task)| async move {
+        rx.recv().await.map(|event| {
+            let event = axum::response::sse::Event::default().data(event.to_string());
+            (Ok::<_, std::convert::Infallible>(event), (rx, task))
+        })
+    });
+    use axum::response::IntoResponse;
+    Ok(axum::response::Sse::new(stream).into_response())
+}
+
 pub(crate) async fn post_provider_interaction_respond_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
@@ -1363,21 +1461,6 @@ pub(crate) async fn post_provider_interaction_respond_handler(
             ),
         )
         .await?;
-    let callback_owner = match &principal.origin {
-        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
-            astra_services::runs::ProviderRunOwner {
-                provider_id: context.provider_id.clone(),
-                provider_scope_id: context.provider_scope_id.clone(),
-            }
-        }
-        astra_services::AuthPrincipalOrigin::Internal
-        | astra_services::AuthPrincipalOrigin::VerifiedProvider { .. } => {
-            return Err(error_response(
-                StatusCode::FORBIDDEN,
-                "Provider interaction responses require provider authorization",
-            ));
-        }
-    };
     let body =
         serde_json::from_slice::<astra_thin_client::ProviderInteractionRespondRequest>(&body)
             .map_err(|error| {
@@ -1386,7 +1469,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
                     format!("Provider interaction response payload is invalid: {error}"),
                 )
             })?;
-    let user = principal.user;
+    let user = &principal.user;
     let run_id = body.run_id.as_str();
     let session_id = body.session_id.as_str();
     let request_id = body.request_id.as_str();
@@ -1490,23 +1573,73 @@ pub(crate) async fn post_provider_interaction_respond_handler(
             "Provider interaction request identity does not match its durable event",
         ));
     }
-    let required_owner: astra_services::runs::ProviderRunOwner = serde_json::from_value(
-        required
-            .pointer("/data/provider_run_owner")
-            .cloned()
-            .unwrap_or(Value::Null),
-    )
-    .map_err(|error| {
-        error_response(
-            StatusCode::CONFLICT,
-            format!("Provider interaction has an invalid owner boundary: {error}"),
-        )
-    })?;
-    if required_owner != callback_owner {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "Provider interaction is owned by a different provider scope",
-        ));
+    match (
+        required.pointer("/data/provider_run_owner"),
+        required.pointer("/data/tool_invocation_origin"),
+    ) {
+        (Some(owner), None) => {
+            let astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
+                &principal.origin
+            else {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Provider interaction responses require provider authorization",
+                ));
+            };
+            let required_owner: astra_services::runs::ProviderRunOwner =
+                serde_json::from_value(owner.clone()).map_err(|error| {
+                    error_response(
+                        StatusCode::CONFLICT,
+                        format!("Provider interaction has an invalid owner boundary: {error}"),
+                    )
+                })?;
+            if required_owner
+                != (astra_services::runs::ProviderRunOwner {
+                    provider_id: context.provider_id.clone(),
+                    provider_scope_id: context.provider_scope_id.clone(),
+                })
+            {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Provider interaction is owned by a different provider scope",
+                ));
+            }
+        }
+        (None, Some(origin)) => {
+            if !matches!(
+                &principal.origin,
+                astra_services::AuthPrincipalOrigin::Internal
+            ) {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Remote tool interaction requires its authenticated user",
+                ));
+            }
+            let origin: astra_services::runs::ToolInvocationInteractionOrigin =
+                serde_json::from_value(origin.clone()).map_err(|error| {
+                    error_response(
+                        StatusCode::CONFLICT,
+                        format!("Tool interaction has an invalid durable origin: {error}"),
+                    )
+                })?;
+            if origin.identity.user_id != user.user_id
+                || origin.identity.session_id != session_id
+                || origin.identity.run_id != run_id
+            {
+                return Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "Tool interaction crosses its durable owner boundary",
+                ));
+            }
+            // Active invocation/binding/generation are rechecked by the
+            // existing store resolution transaction, not this observation.
+        }
+        _ => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Provider interaction must have exactly one durable origin",
+            ));
+        }
     }
     let expected_session_id = required
         .pointer("/data/session_id")
@@ -1627,73 +1760,120 @@ pub(crate) async fn post_agents_edge_register_handler(
             "edge_agent_id required",
         ));
     }
-    let edge_id = edge_id_from_headers(&headers);
-    let rec = if body.materialization_id.is_some() {
-        let lease = state
-            .execution
-            .edge_registry_service
-            .register_or_update_with_lease_and_materialization(
-                &user.user_id,
-                &body.edge_agent_id,
-                &edge_id,
-                body.hostname.as_deref(),
-                body.worktree_path.as_deref(),
-                body.capabilities,
-                None, // workspace_id not available via REST callback path
-                body.materialization_id.as_deref(),
-            )
-            .await
-            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        let finalized = state
-            .execution
-            .edge_registry_service
-            .finalize_registration(&lease)
-            .await
-            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        if !finalized {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                "edge registration was superseded before publication",
-            ));
+    let requested_edge_id = edge_id_from_headers(&headers);
+    let registration_lock = state
+        .edge_connection_pool
+        .registration_lock(&user.user_id, &body.edge_agent_id);
+    let registration_guard = registration_lock.lock().await;
+    let result = async {
+        let connected = state
+            .edge_connection_pool
+            .get_all_user_edges(&user.user_id)
+            .into_iter()
+            .find(|connection| connection.edge_agent_id == body.edge_agent_id);
+        // A live WebSocket owns a connection-scoped registry edge ID (usually
+        // `ws-*`). Native CLI publication arrives over REST after that socket
+        // is ready. Reusing the caller-supplied agent label here would replace
+        // the socket's durable owner and make its next heartbeat look stale.
+        // Update the same generation when it is already connected; standalone
+        // REST registrations retain their authenticated header identity.
+        let registration_edge_id = connected
+            .as_ref()
+            .and_then(|connection| connection.registry_edge_id.as_deref())
+            .unwrap_or(requested_edge_id.as_str())
+            .to_owned();
+        let refresh = |rec: &astra_services::EdgeAgentRecord| {
+            if let Some(connection) = connected.as_ref().filter(|connection| {
+                connection.registry_id.as_deref() == Some(rec.registry_id.as_str())
+                    && connection.materialization_id == rec.materialization_id
+                    && connection.workspace_dir == rec.worktree_path
+                    && connection.workspace_id == rec.workspace_id
+            }) {
+                state.edge_connection_pool.refresh_capabilities(
+                    &user.user_id,
+                    &rec.edge_agent_id,
+                    connection,
+                    rec.capabilities.clone(),
+                );
+            }
+        };
+        let materialized = body.materialization_id.is_some();
+        let rec = if materialized {
+            let lease = state
+                .execution
+                .edge_registry_service
+                .register_or_update_with_lease_and_materialization(
+                    &user.user_id,
+                    &body.edge_agent_id,
+                    &registration_edge_id,
+                    body.hostname.as_deref(),
+                    body.worktree_path.as_deref(),
+                    body.capabilities,
+                    None, // workspace_id not available via REST callback path
+                    body.materialization_id.as_deref(),
+                )
+                .await
+                .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+            let finalized = state
+                .execution
+                .edge_registry_service
+                .finalize_registration(&lease)
+                .await
+                .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+            if !finalized {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "edge registration was superseded before publication",
+                ));
+            }
+            // Synchronize the local socket while the durable registration
+            // claim still fences another node's competing publication.
+            refresh(&lease.current);
+            // REST registration has no long-lived socket publication phase. Move
+            // the finalized generation into the published state before returning,
+            // otherwise native execution lookup correctly excludes the setup-only
+            // state even though the request supplied a valid materialization.
+            let released = state
+                .execution
+                .edge_registry_service
+                .release_registration(&lease)
+                .await
+                .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+            if lease.claim_id.is_some() && !released {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "edge registration was superseded before publication was released",
+                ));
+            }
+            lease.current
+        } else {
+            state
+                .execution
+                .edge_registry_service
+                .register_or_update(
+                    &user.user_id,
+                    &body.edge_agent_id,
+                    &registration_edge_id,
+                    body.hostname.as_deref(),
+                    body.worktree_path.as_deref(),
+                    body.capabilities,
+                    None, // workspace_id not available via REST callback path
+                )
+                .await
+                .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?
+        };
+        if !materialized {
+            refresh(&rec);
         }
-        // REST registration has no long-lived socket publication phase. Move
-        // the finalized generation into the published state before returning,
-        // otherwise native execution lookup correctly excludes the setup-only
-        // state even though the request supplied a valid materialization.
-        let released = state
-            .execution
-            .edge_registry_service
-            .release_registration(&lease)
-            .await
-            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        if lease.claim_id.is_some() && !released {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                "edge registration was superseded before publication was released",
-            ));
-        }
-        lease.current
-    } else {
-        state
-            .execution
-            .edge_registry_service
-            .register_or_update(
-                &user.user_id,
-                &body.edge_agent_id,
-                &edge_id,
-                body.hostname.as_deref(),
-                body.worktree_path.as_deref(),
-                body.capabilities,
-                None, // workspace_id not available via REST callback path
-            )
-            .await
-            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?
-    };
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "registered": true,
-        "record": rec,
-    })))
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "registered": true,
+            "record": rec,
+        })))
+    }
+    .await;
+    drop(registration_guard);
+    result
 }
 
 pub(crate) async fn post_agents_edge_heartbeat_handler(

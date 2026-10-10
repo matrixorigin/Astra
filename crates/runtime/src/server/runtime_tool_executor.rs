@@ -1367,6 +1367,13 @@ impl RuntimeToolExecutor {
         }
     }
 
+    pub(crate) fn provider_is_collaborator_stage(&self, public_alias: &str) -> bool {
+        self.provider_policy_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_collaborator_stage(public_alias)
+    }
+
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
         let allowed = self.provider_visible_runtime_tool_names();
         let conflicts = prompt_schema_conflicting_tool_names(schemas);
@@ -1430,6 +1437,16 @@ impl RuntimeToolExecutor {
         *guard = schemas;
     }
 
+    /// Return the exact provider contract currently admitted for one public
+    /// name. Native stages carry this immutable schema into their child
+    /// executor so argument validation and readiness use the same contract as
+    /// the parent admission boundary.
+    pub(crate) fn current_edge_provider_schema(&self, name: &str) -> Option<Value> {
+        self.current_edge_provider_schemas_snapshot()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+    }
+
     /// Install the host's current deferred contract projection. This is a
     /// private discovery/execution catalog, not a provider-visible schema
     /// surface; it may contain action branches narrowed by current typed
@@ -1464,6 +1481,26 @@ impl RuntimeToolExecutor {
             "current_selected_tool_offers",
         );
         *guard = offers;
+    }
+
+    /// Install one provider offer that was already resolved by canonical
+    /// admission. Native collaborator stages execute before the normal model
+    /// loop installs its wire surface, so they use this same selected-offer
+    /// store rather than falling back to a public tool name.
+    pub(crate) fn set_current_selected_provider_offer(
+        &self,
+        tool_name: &str,
+        policy: &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        route: crate::server::tool_route_selection::ToolExecutionRouteKind,
+    ) {
+        let offer = SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+            tool_name,
+            policy.descriptor.identity.provider_binding.as_str(),
+            route,
+            Some(policy.descriptor.descriptor_version.to_string()),
+            policy.descriptor.identity.native_tool_id.as_str(),
+        );
+        self.set_current_selected_tool_offers(HashMap::from([(tool_name.to_string(), offer)]));
     }
 
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
@@ -2230,6 +2267,7 @@ impl RuntimeToolExecutor {
                     self.execution_binding.executor().transport,
                     ToolTransportKind::EdgeLedger
                 )
+                && !self.edge_admitted_tools.contains(name)
             {
                 return ExecutorToolReadiness::UnknownTool;
             }
@@ -3062,6 +3100,9 @@ impl RuntimeToolExecutor {
         request.policy.admission_deadline = self
             .admitted_execution_deadline
             .map(|deadline| deadline.monotonic_work_deadline());
+        request.policy.execution_deadline_unix_ms = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.work_deadline_unix_ms);
         if let Some(offer) = self.selected_offer_for_request(&request, None) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3081,7 +3122,7 @@ impl RuntimeToolExecutor {
         request
     }
 
-    fn tool_execution_request_for_invocation(
+    pub(crate) fn tool_execution_request_for_invocation(
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
         name: &str,
@@ -3096,6 +3137,9 @@ impl RuntimeToolExecutor {
         request.policy.admission_deadline = self
             .admitted_execution_deadline
             .map(|deadline| deadline.monotonic_work_deadline());
+        request.policy.execution_deadline_unix_ms = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.work_deadline_unix_ms);
         if let Some(offer) = self.selected_offer_for_request(&request, resolved_provider_policy) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3358,6 +3402,7 @@ impl RuntimeToolExecutor {
         runtime_control_kind: Option<
             astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
         >,
+        force_read_only_workspace: bool,
     ) -> GovernableRuntimeToolResult {
         if runtime_control_kind.is_some_and(|kind| kind.tool_name() != name) {
             return GovernableRuntimeToolResult::completed(
@@ -3396,6 +3441,13 @@ impl RuntimeToolExecutor {
         request.policy.permission_grant = permission_grant.cloned();
         request.policy.delegation_model_admission =
             delegation_model_admission.map(|prepared| prepared.admission.clone());
+        if force_read_only_workspace && request.workspace.authority == WorkspaceAuthority::ReadWrite
+        {
+            // Plan mode is a capability ceiling, not a prompt hint. Apply the
+            // downgrade to the canonical request before transport derives its
+            // Edge execution ceiling; no later policy may widen it.
+            request.workspace.authority = WorkspaceAuthority::ReadOnly;
+        }
         if runtime_control_kind
             == Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement)
         {
@@ -5903,6 +5955,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
 
@@ -7248,6 +7301,8 @@ pub(crate) mod tests {
         cache: astra_turn_types::ResolvedSemanticCacheBaseline,
     ) -> astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
         astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+            runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
@@ -8770,6 +8825,14 @@ pub(crate) mod tests {
         .unwrap();
         let mut request =
             exec.tool_execution_request_for_invocation(&identity, "write_file", &args, None);
+        assert_eq!(
+            request.policy.execution_deadline_unix_ms,
+            Some(deadline.work_deadline_unix_ms)
+        );
+        assert_eq!(
+            request.policy.admission_deadline,
+            Some(deadline.monotonic_work_deadline())
+        );
         request.policy.permission_grant = Some(grant.clone());
         request.policy.admission_snapshot = Some(
             exec.tool_execution_service
@@ -9196,7 +9259,7 @@ pub(crate) mod tests {
         ] {
             let outcome = exec
                 .execute_invocation_before_governance(
-                    "run", "chain", "call", name, args, None, None, None, None, kind,
+                    "run", "chain", "call", name, args, None, None, None, None, kind, false,
                 )
                 .await;
             assert_eq!(
@@ -9227,6 +9290,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
             )
             .await;
         assert_eq!(
@@ -9254,6 +9318,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
             )
             .await;
         assert_eq!(

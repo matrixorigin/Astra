@@ -1089,7 +1089,7 @@ impl BottomPaneView for AskUserView {
     }
 
     fn is_complete(&self) -> bool {
-        self.completed
+        self.completed || self.response_tx.as_ref().is_some_and(|tx| tx.is_closed())
     }
 
     fn completion(&self) -> Option<ViewCompletion> {

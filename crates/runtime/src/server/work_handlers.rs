@@ -5271,6 +5271,7 @@ async fn attest_edge_workspace(
             .edge_connection_pool
             .execute_durably_admitted_invocation_on_connection_with_cancel(
                 astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                    execution_ceiling: None,
                     connection_user_id: &record.user_id,
                     identity: &identity,
                     edge_agent_id: &record.edge_agent_id,
@@ -5278,6 +5279,9 @@ async fn attest_edge_workspace(
                     args: &args,
                     runtime_process_authorization: None,
                     timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+                    execution_deadline_unix_ms: None,
+                    execution_timeout_ms: None,
+                    command_timeout_cap_ms: None,
                     cancel_token: None,
                 },
             )
@@ -5315,6 +5319,7 @@ async fn attest_edge_workspace(
             request_id.clone(),
         );
         let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            execution_ceiling: None,
             request_id: request_id.clone(),
             identity: Box::new(identity.clone()),
             delivery_generation: 1,
@@ -5323,6 +5328,9 @@ async fn attest_edge_workspace(
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         };
         let payload_json =
             serde_json::to_string(&payload).map_err(|_| "attestation_payload_invalid")?;

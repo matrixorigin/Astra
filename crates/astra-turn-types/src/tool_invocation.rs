@@ -1387,6 +1387,12 @@ fn validate_result_metadata(
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ToolInvocationContractError {
+    #[error(
+        "provider execution ceiling requires an admitted descriptor, workspace and binding generation"
+    )]
+    InvalidExecutionCeiling,
+    #[error("tool invocation execution budget is incomplete, expired, or outside clock range")]
+    InvalidExecutionBudget,
     #[error("tool invocation identity field '{field}' must not be empty")]
     EmptyIdentityField { field: &'static str },
     #[error("tool invocation policy decision id must not be empty")]

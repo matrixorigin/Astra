@@ -664,7 +664,7 @@ pub async fn run_product_matrix_full_journey(
                 "edge_agent_id": edge_agent_id,
                 "hostname": "matrix-e2e-host",
                 "worktree_path": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
-                "capabilities": { "tools": ["read_file"] }
+                "capabilities": astra_thin_client::edge_runtime_environment_capabilities(&edge_agent_id, MATRIX_E2E_EDGE_WORKSPACE_ROOT)
             })
             .to_string(),
         ))

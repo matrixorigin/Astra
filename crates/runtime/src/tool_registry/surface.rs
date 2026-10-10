@@ -34,15 +34,17 @@ use std::sync::LazyLock;
 /// Maximum compact-JSON bytes for the built-in default T1 schema set.
 ///
 /// This is a regression budget, not a runtime truncation rule. Config-pinned
-/// tools may intentionally exceed it. The default must remain below 8 KiB:
+/// tools may intentionally exceed it. The default must remain below 9 KiB:
 /// it is the cacheable prefix sent on every agentic provider request, not a
 /// general catalog. Deferred discovery keeps the complete capability catalog
 /// reachable without quietly turning that repeated prefix back into a second
 /// system prompt. Resident schemas retain their executable types, constraints,
 /// enums, and required fields, while verbose per-parameter prose remains in
-/// the canonical catalog selected through `tool_search`.
+/// the canonical catalog selected through `tool_search`. The extra headroom
+/// covers direct provider-stage and exact collaborator-resume fields; those
+/// are part of the normal spawn contract, not a second discovery path.
 #[cfg(test)]
-pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 8 * 1024;
+pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 9 * 1024;
 
 /// Default T1 always_load candidate tool names, derived from the single
 /// authority [`astra_runtime_env::ToolSpec`] classification.
@@ -423,6 +425,13 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 // “use high reasoning” cannot produce a valid canonical field
                 // that the model's visible schema rejects.
                 "reasoning",
+                // Provider execution is an optional capability selected by the
+                // runtime. Keep its shape resident so a valid provider-backed
+                // spawn does not require a second schema-discovery round.
+                "execution",
+                // A resumed native collaborator is still the same spawn
+                // contract; the runtime validates the exact identity.
+                "collaborator_id",
                 "max_output_tokens",
                 "agent_id",
                 "timeout_ms",
@@ -431,7 +440,10 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "No substitution. launch≠done. Wait",
+            concat!(
+                astra_tools::agent_parent_scope_guidance!(),
+                " No substitution. launch≠done. Wait. Mailbox:send_message;provider follow-up:exact collaborator_id."
+            ),
         ),
         "introspect" => (
             &[

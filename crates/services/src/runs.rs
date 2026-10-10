@@ -325,6 +325,24 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
+    /// Intermediate interaction from the exact selected remote invocation.
+    /// This does not finish the tool dispatch or grant execution authority.
+    async fn request_tool_interaction(
+        &self,
+        _user_id: String,
+        _identity: astra_turn_types::ToolInvocationIdentity,
+        _edge_agent_id: String,
+        _physical_workspace_id: String,
+        _interaction: astra_turn_types::ProviderInteractionRequest,
+        _stream_event_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    ) -> Result<astra_turn_types::ProviderInteractionResponse, (StatusCode, Json<ErrorResponse>)>
+    {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Remote tool interactions are unavailable",
+        ))
+    }
+
     async fn resolve_run_interaction(
         &self,
         _run_id: String,
@@ -2115,6 +2133,22 @@ where
             return Err(db_error("admit_session_scoped_run_write", run_id, source));
         }
     }
+    load_run_metadata_after_session_admission_tx(tx, user_id, expected_session_id, run_id).await
+}
+
+/// Load a run after the caller has already admitted and locked the session
+/// execution slot in this transaction.  Keeping this separate from the
+/// public exact-session helper avoids reacquiring the same session and slot
+/// locks for every related run in one collaborator admission/read.
+async fn load_run_metadata_after_session_admission_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<DurableRunRecord>>
+where
+    T: TransactionConnection,
+{
     let sql = format!(
         "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
@@ -2127,6 +2161,69 @@ where
         .await
         .map_err(|source| db_error("load_run_metadata_for_exact_session_tx", run_id, source))?;
     row.map(run_record_from_row).transpose()
+}
+
+async fn load_run_metadata_with_lease_after_session_admission_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<(DurableRunRecord, bool)>>
+where
+    T: TransactionConnection,
+{
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS},
+                CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
+                    AS owner_lease_live
+         FROM agent_runs
+         WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+    );
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(expected_session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "load_run_metadata_with_lease_after_session_admission_tx",
+                run_id,
+                source,
+            )
+        })?;
+    row.map(|row| {
+        let owner_lease_live = row
+            .try_get::<i64, _>("owner_lease_live")
+            .map_err(|source| db_error("decode_run_metadata_owner_lease_live", run_id, source))?;
+        Ok((run_record_from_row(row)?, owner_lease_live == 1))
+    })
+    .transpose()
+}
+
+async fn load_run_metadata_with_lease_for_exact_session_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<(DurableRunRecord, bool)>>
+where
+    T: TransactionConnection,
+{
+    match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => return Ok(None),
+        Err(source) => {
+            return Err(db_error("admit_session_scoped_run_write", run_id, source));
+        }
+    }
+    load_run_metadata_with_lease_after_session_admission_tx(
+        tx,
+        user_id,
+        expected_session_id,
+        run_id,
+    )
+    .await
 }
 
 async fn lock_work_interaction_attachment_tx(
@@ -3626,6 +3723,51 @@ pub struct AtomicRunInteractionBatchRegistrationRequest<'a> {
     pub expected_control_epoch: i64,
     pub expected_owner_generation: u64,
     pub events: &'a [serde_json::Value],
+}
+
+/// Credential-free correlation facts, not an execution or provider owner.
+/// Registration and resolution revalidate these under the existing Run lock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInvocationInteractionOrigin {
+    pub identity: astra_turn_types::ToolInvocationIdentity,
+    pub edge_agent_id: String,
+    /// Stable checkout identity used across Edge reconnects. The executor
+    /// label above remains audit context, but is connection-scoped and cannot
+    /// authorize a resumed interaction on its own.
+    pub physical_workspace_id: String,
+    pub descriptor: astra_turn_types::ResolvedToolDescriptorRef,
+    pub execution_binding_generation: u64,
+    pub owner_generation: u64,
+    pub control_epoch: i64,
+    /// Copied from the run-start restrictions while the origin is derived.
+    /// Interaction callers must not reload and decode the full run journal
+    /// just to recover this immutable admission fact.
+    pub execution_work_deadline_unix_ms: Option<u64>,
+}
+
+fn tool_interaction_origin(
+    event: &serde_json::Value,
+) -> Result<Option<ToolInvocationInteractionOrigin>, ToolInteractionAdmissionError> {
+    event
+        .pointer("/data/tool_invocation_origin")
+        .map(|origin| {
+            serde_json::from_value(origin.clone())
+                .map_err(|_| ToolInteractionAdmissionError::Unproven)
+        })
+        .transpose()
+}
+
+#[derive(Debug, Error)]
+pub enum ToolInteractionAdmissionError {
+    #[error("durable tool interaction authority is unavailable")]
+    Unsupported,
+    #[error("native stage execution deadline expired")]
+    DeadlineExpired,
+    #[error("remote interaction is not bound to the exact active invocation and selected Edge")]
+    Unproven,
+    #[error(transparent)]
+    Store(#[from] DatabaseRunStateStoreError),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5188,6 +5330,303 @@ pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
     })
 }
 
+/// Association facts live on the first real child run, not on a second
+/// collaborator lifecycle or a process-local registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaboratorProvider {
+    InternalModel,
+    Claude,
+    OpenCode,
+    Codex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+// Credential-free association locator only. It cannot admit execution or
+// replace SessionExecutionBindingV1 / a provider descriptor or decision.
+pub enum CollaboratorExecutionBoundary {
+    ServerManaged,
+    Cli { runner_id: String },
+    UserRunner { runner_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorNativeExecutionLocator {
+    pub descriptor: astra_turn_types::ResolvedToolDescriptorRef,
+    pub public_tool_name: String,
+    pub requested_model: Option<String>,
+    /// Descriptor semantic baseline, not an invocation decision or authority.
+    pub policy_content_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorAssociation {
+    pub provider: CollaboratorProvider,
+    pub execution_boundary: CollaboratorExecutionBoundary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorStageAdmission {
+    pub anchor_run_id: String,
+    pub source_message_id: String,
+    /// Immutable intent digest, excluding the newly proposed child run ID.
+    pub request_fingerprint: String,
+    /// Digest of this stage's current execution admission. It is deliberately
+    /// stage-scoped: replacing a compatible local client must not invalidate
+    /// the stable collaborator association, but the new stage still records
+    /// the exact descriptor and policy that admitted it.
+    pub execution_identity_fingerprint: String,
+    /// Credential-free native selection for this stage. Internal agents do
+    /// not have an external native execution locator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_execution: Option<CollaboratorNativeExecutionLocator>,
+    pub expected_previous_stage_run_id: Option<String>,
+    pub expected_parent_generation: u64,
+    pub association: CollaboratorAssociation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorStageReceipt {
+    pub anchor_run_id: String,
+    pub source_message_id: String,
+    pub run_id: String,
+    pub owner_generation: u64,
+    /// Observation of an already committed source message. Never convert
+    /// this to fresh RunExecutionAuthority; reconcile the returned run ID.
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+/// An acknowledged native session is independent of task success. Only an
+/// exact dispatched, settled success/failure invocation carrying this typed
+/// metadata can establish the association; rejection/unknown cannot.
+pub const COLLABORATOR_NATIVE_SESSION_METADATA_KEY: &str = "collaborator_native_session";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorNativeSession {
+    pub anchor_run_id: String,
+    pub provider: CollaboratorProvider,
+    pub native_session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableCollaboratorAssociation {
+    pub association: CollaboratorAssociation,
+    pub latest_stage: CollaboratorStageReceipt,
+    pub latest_native_execution: Option<CollaboratorNativeExecutionLocator>,
+    pub native_session: Option<CollaboratorNativeSession>,
+}
+
+#[derive(Debug, Error)]
+pub enum CollaboratorStoreError {
+    #[error("collaborator admission is unsupported by this store")]
+    Unsupported,
+    #[error("collaborator admission deadline expired before creation")]
+    DeadlineExpired,
+    #[error("invalid collaborator admission field: {field}")]
+    InvalidAdmission { field: &'static str },
+    #[error("collaborator session is unavailable or not owned by this tenant")]
+    SessionUnavailable,
+    #[error("collaborator run is unavailable in the authorized session: {run_id}")]
+    RunUnavailable { run_id: String },
+    #[error("collaborator association conflicts: {anchor_run_id}")]
+    AssociationConflict { anchor_run_id: String },
+    #[error("collaborator source message conflicts: {source_message_id}")]
+    SourceMessageConflict { source_message_id: String },
+    #[error("collaborator previous stage changed: {anchor_run_id}")]
+    PreviousStageChanged { anchor_run_id: String },
+    #[error("collaborator previous stage is not terminal: {run_id}")]
+    PreviousStageActive { run_id: String },
+    #[error("collaborator stage has an unsettled invocation: {run_id}")]
+    UnsettledDispatch { run_id: String },
+    #[error("collaborator parent execution is no longer current: {run_id}")]
+    ParentNotCurrent { run_id: String },
+    #[error("collaborator native session has no acknowledged durable binding: {anchor_run_id}")]
+    NativeSessionUnbound { anchor_run_id: String },
+    #[error("collaborator native session acknowledgement is unproven")]
+    NativeSessionUnproven,
+    #[error(
+        "collaborator creation outcome is unknown: {anchor_run_id}, source_message_id={source_message_id}"
+    )]
+    CommitUnknown {
+        anchor_run_id: String,
+        source_message_id: String,
+    },
+    #[error(transparent)]
+    Store(#[from] DatabaseRunStateStoreError),
+    // Existing run/event helpers still expose String errors. Preserve them as
+    // opaque diagnostics; never classify or retry by matching their text.
+    #[error("existing run persistence operation failed: {0}")]
+    Persistence(String),
+}
+
+impl From<String> for CollaboratorStoreError {
+    fn from(error: String) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+const COLLABORATOR_ASSOCIATED_EVENT: &str = "collaborator_associated";
+const COLLABORATOR_STAGE_EVENT: &str = "collaborator_stage_admitted";
+const COLLABORATOR_NATIVE_SESSION_EVENT: &str = "collaborator_native_session_bound";
+
+fn validate_collaborator_admission(
+    record: &DurableRunRecord,
+    admission: &CollaboratorStageAdmission,
+) -> Result<(), CollaboratorStoreError> {
+    match (&admission.association.provider, &admission.native_execution) {
+        (CollaboratorProvider::InternalModel, None) => {}
+        (CollaboratorProvider::InternalModel, Some(_)) | (_, None) => {
+            return Err(CollaboratorStoreError::InvalidAdmission {
+                field: "native_execution",
+            });
+        }
+        (_, Some(locator)) => {
+            let valid = |value: &str| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.trim() == value
+                    && !value.chars().any(char::is_control)
+            };
+            if !valid(&locator.public_tool_name)
+                || !valid(&locator.policy_content_id)
+                || locator
+                    .requested_model
+                    .as_deref()
+                    .is_some_and(|model| !valid(model))
+            {
+                return Err(CollaboratorStoreError::InvalidAdmission {
+                    field: "native_execution",
+                });
+            }
+        }
+    }
+    for (field, value) in [
+        ("anchor_run_id", admission.anchor_run_id.as_str()),
+        ("source_message_id", admission.source_message_id.as_str()),
+        (
+            "request_fingerprint",
+            admission.request_fingerprint.as_str(),
+        ),
+        (
+            "execution_identity_fingerprint",
+            admission.execution_identity_fingerprint.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() || value.len() > 512 {
+            return Err(CollaboratorStoreError::InvalidAdmission { field });
+        }
+    }
+    if record.parent_run_id.is_none()
+        || record.retry_of.is_some()
+        || record.status != STATUS_RUNNING
+        || record.run_generation > i64::MAX as u64
+        || admission.expected_parent_generation > i64::MAX as u64
+    {
+        return Err(CollaboratorStoreError::InvalidAdmission { field: "child_run" });
+    }
+    match &admission.association.execution_boundary {
+        CollaboratorExecutionBoundary::ServerManaged
+            if admission.association.provider != CollaboratorProvider::InternalModel =>
+        {
+            return Err(CollaboratorStoreError::InvalidAdmission {
+                field: "external_execution_boundary",
+            });
+        }
+        CollaboratorExecutionBoundary::Cli { runner_id }
+        | CollaboratorExecutionBoundary::UserRunner { runner_id }
+            if runner_id.trim().is_empty() || runner_id.len() > 512 =>
+        {
+            return Err(CollaboratorStoreError::InvalidAdmission { field: "runner_id" });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collaborator_source_key(source_message_id: &str) -> String {
+    format!(
+        "collaborator-stage:{:x}",
+        Sha256::digest(source_message_id.as_bytes())
+    )
+}
+
+fn collaborator_replay_receipt(
+    event: &serde_json::Value,
+    admission: &CollaboratorStageAdmission,
+) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+    let original: CollaboratorStageAdmission = decode_collaborator_fact(event, "admission")?;
+    if original.anchor_run_id != admission.anchor_run_id
+        || original.association != admission.association
+        || original.source_message_id != admission.source_message_id
+        || original.request_fingerprint != admission.request_fingerprint
+        || original.execution_identity_fingerprint != admission.execution_identity_fingerprint
+        || original.native_execution != admission.native_execution
+        || original.expected_previous_stage_run_id != admission.expected_previous_stage_run_id
+    {
+        return Err(CollaboratorStoreError::SourceMessageConflict {
+            source_message_id: admission.source_message_id.clone(),
+        });
+    }
+    let mut receipt: CollaboratorStageReceipt = decode_collaborator_fact(event, "receipt")?;
+    if receipt.anchor_run_id != admission.anchor_run_id
+        || receipt.source_message_id != admission.source_message_id
+    {
+        return Err(CollaboratorStoreError::AssociationConflict {
+            anchor_run_id: admission.anchor_run_id.clone(),
+        });
+    }
+    receipt.replayed = true;
+    Ok(receipt)
+}
+
+async fn admit_collaborator_session_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), CollaboratorStoreError> {
+    crate::storage::admit_session_execution_write_with_facts(tx, session_id, user_id)
+        .await
+        .map(|_| ())
+        .map_err(|source| match source {
+            sqlx::Error::RowNotFound => CollaboratorStoreError::SessionUnavailable,
+            source => db_error("admit_collaborator_session", session_id, source).into(),
+        })
+}
+
+fn collaborator_json<T: Serialize>(value: &T) -> Result<serde_json::Value, CollaboratorStoreError> {
+    serde_json::to_value(value).map_err(|source| {
+        DatabaseRunStateStoreError::Json {
+            operation: "encode_collaborator_fact",
+            entity: "agent_run_events".into(),
+            source,
+        }
+        .into()
+    })
+}
+
+fn decode_collaborator_fact<T: serde::de::DeserializeOwned>(
+    event: &serde_json::Value,
+    field: &str,
+) -> Result<T, CollaboratorStoreError> {
+    serde_json::from_value(event.get(field).cloned().unwrap_or(serde_json::Value::Null)).map_err(
+        |source| {
+            DatabaseRunStateStoreError::Json {
+                operation: "decode_collaborator_fact",
+                entity: field.into(),
+                source,
+            }
+            .into()
+        },
+    )
+}
+
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
     async fn request_permission_mode(
@@ -5229,6 +5668,61 @@ pub trait RunStateStore: Send + Sync {
 
     /// Insert a new run record.
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
+
+    /// Derive correlation from the real dispatched invocation and original
+    /// Run admission, never from a client's generation or decision snapshot.
+    /// The interaction commit must independently revalidate this observation.
+    async fn derive_tool_interaction_origin(
+        &self,
+        _identity: &astra_turn_types::ToolInvocationIdentity,
+        _edge_agent_id: &str,
+        _physical_workspace_id: &str,
+        _provider_stage_input_id: Option<&str>,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        Err(ToolInteractionAdmissionError::Unsupported)
+    }
+
+    /// RunEngine's alternative to ordinary insert, not an additional child
+    /// creation call. The child and association receipt commit together.
+    async fn insert_run_with_collaborator_stage(
+        &self,
+        _record: DurableRunRecord,
+        _admission: CollaboratorStageAdmission,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    async fn load_collaborator_association(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _anchor_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    /// Resolve the stable association for its current stage run. The
+    /// association is deliberately stored on the stable anchor, while user
+    /// guidance is addressed to the latest stage run. This control-plane
+    /// lookup is not part of ordinary turn assembly.
+    async fn load_collaborator_association_for_stage(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _stage_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    async fn confirm_collaborator_native_session(
+        &self,
+        _identity: &astra_turn_types::ToolInvocationIdentity,
+        _native_session: &CollaboratorNativeSession,
+        _expected_owner_generation: u64,
+    ) -> Result<(), CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
 
     /// Insert a run without allowing durable admission to exceed the caller's
     /// execution deadline. Implementations with an authoritative store should
@@ -8676,6 +9170,13 @@ impl RunStateStore for InMemoryRunStateStore {
         request: AtomicRunInteractionBatchRegistrationRequest<'_>,
     ) -> Result<AtomicRunInteractionBatchRegistration, String> {
         let kind = validate_interaction_batch_registration(request)?;
+        if request
+            .events
+            .iter()
+            .any(|event| event.pointer("/data/tool_invocation_origin").is_some())
+        {
+            return Err(ToolInteractionAdmissionError::Unproven.to_string());
+        }
         let updated = {
             let action_fence = self.action_fence_for(request.user_id, request.run_id);
             let _action_fence = action_fence.lock_owned().await;
@@ -14509,13 +15010,856 @@ impl DatabaseRunStateStore {
         Ok(durable_run_start_receipt_matches(expected, &actual).then_some(actual.run_generation))
     }
 
+    /// Called only while holding the canonical Session/Run locks. No local
+    /// callback expectation, caller ACK or provider owner substitutes for
+    /// the live invocation, its admitted control epoch and selected binding.
+    async fn validate_tool_interaction_origin_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        event: &serde_json::Value,
+        require_live_budget: bool,
+    ) -> Result<bool, ToolInteractionAdmissionError> {
+        let Some(origin) = tool_interaction_origin(event)? else {
+            return Ok(false);
+        };
+        if extract_event_type(event) != DurableRunInteractionKind::Provider.required_event_type()
+            || event.pointer("/data/provider_run_owner").is_some()
+        {
+            return Err(ToolInteractionAdmissionError::Unproven);
+        }
+        let provider_stage_input_id =
+            match event.pointer("/data/interaction/provider_stage_input_id") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or(ToolInteractionAdmissionError::Unproven)?,
+                ),
+            };
+        let actual = Self::load_tool_interaction_origin_tx(
+            tx,
+            run,
+            &origin.identity,
+            &origin.edge_agent_id,
+            &origin.physical_workspace_id,
+            require_live_budget,
+            provider_stage_input_id,
+        )
+        .await?;
+        if actual != origin {
+            return Err(ToolInteractionAdmissionError::Unproven);
+        }
+        Ok(true)
+    }
+
+    async fn load_tool_interaction_origin_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        edge_agent_id: &str,
+        physical_workspace_id: &str,
+        require_live_budget: bool,
+        provider_stage_input_id: Option<&str>,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+        };
+        let rejected = || ToolInteractionAdmissionError::Unproven;
+        if identity.user_id != run.user_id
+            || identity.session_id != run.session_id
+            || identity.run_id != run.run_id
+            || edge_agent_id.trim().is_empty()
+            || physical_workspace_id.trim().is_empty()
+        {
+            return Err(rejected());
+        }
+        let row: Option<(String, String, u64)> = sqlx::query_as(
+            "SELECT JSON_UNQUOTE(fingerprint_json), JSON_UNQUOTE(decision_json),
+                    CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS UNSIGNED)
+             FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state = 'dispatched' AND dispatch_certainty = 'dispatched'
+               AND dispatch_owner IS NOT NULL AND dispatch_lease_expires_at >= NOW(6)
+               AND outcome_json IS NULL AND completion_source_json IS NULL
+               AND EXISTS (SELECT 1 FROM agent_runs active_run
+                 WHERE active_run.user_id = tool_invocation_ledger.user_id
+                   AND active_run.session_id = tool_invocation_ledger.session_id
+                   AND active_run.run_id = tool_invocation_ledger.run_id
+                   AND active_run.run_generation = ?
+                   AND active_run.owner_pod_id IS NOT NULL
+                   AND active_run.owner_lease_expires_at >= NOW(6)
+                   AND active_run.status IN ('running', 'waiting')
+                   AND active_run.cancellation_requested_at IS NULL) FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .bind(run.run_generation)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("validate_tool_interaction_invocation", &run.run_id, source))?;
+        let (fingerprint, decision, now_unix_ms) = row.ok_or_else(rejected)?;
+        let fingerprint: ToolInvocationFingerprint =
+            serde_json::from_str(&fingerprint).map_err(|_| rejected())?;
+        let decision: ToolInvocationDecision =
+            serde_json::from_str(&decision).map_err(|_| rejected())?;
+        let DurableToolReference::Provider { descriptor } = fingerprint.tool else {
+            return Err(rejected());
+        };
+        let admitted_executor_id = decision
+            .snapshot
+            .pointer("/executor/executor_id")
+            .and_then(serde_json::Value::as_str);
+        if fingerprint.policy_decision_id != decision.decision_id
+            || admitted_executor_id.is_none()
+            || admitted_executor_id.is_some_and(|executor_id| executor_id.trim().is_empty())
+        {
+            return Err(rejected());
+        }
+        let kind: ExecutorBindingRequestKind = serde_json::from_value(
+            decision
+                .snapshot
+                .pointer("/executor/kind")
+                .cloned()
+                .ok_or_else(rejected)?,
+        )
+        .map_err(|_| rejected())?;
+        let transport: ToolTransportKindRequest = serde_json::from_value(
+            decision
+                .snapshot
+                .pointer("/executor/transport")
+                .cloned()
+                .ok_or_else(rejected)?,
+        )
+        .map_err(|_| rejected())?;
+        if kind != ExecutorBindingRequestKind::EdgeAgent
+            || !matches!(
+                transport,
+                ToolTransportKindRequest::EdgeWs
+                    | ToolTransportKindRequest::EdgeLedger
+                    | ToolTransportKindRequest::EdgeWsAuthorized
+            )
+        {
+            return Err(rejected());
+        }
+        let action_id = format!("tool_invocation:{}", identity.storage_key());
+        let grant: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND event_type = 'action_admission_granted' AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(action_admission_granted_idempotency_key(&action_id))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("validate_tool_interaction_grant", &run.run_id, source))?;
+        let grant: serde_json::Value =
+            serde_json::from_str(&grant.ok_or_else(rejected)?).map_err(|_| rejected())?;
+        let owner_generation = grant
+            .pointer("/data/owner_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(rejected)?;
+        let grant_control_epoch = grant
+            .pointer("/data/expected_control_epoch")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(rejected)?;
+        if owner_generation != run.run_generation
+            || grant_control_epoch < -1
+            || grant
+                .pointer("/data/action_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(action_id.as_str())
+            || grant
+                .pointer("/data/session_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(identity.session_id.as_str())
+        {
+            return Err(rejected());
+        }
+        // A long-lived provider stage can accept and durably apply user
+        // guidance without creating a new tool invocation grant. Advance the
+        // interaction frontier through the *source* intent coordinates, not
+        // the later journal coordinates of the applied facts. An applied fact
+        // is appended after all intents that were already accepted; using its
+        // own event_idx could therefore jump over a newer, still-unapplied
+        // intent that was appended before the applied fact. The source
+        // coordinate keeps that intent visible to the fence below.
+        let mut control_epoch = Self::load_applied_user_intent_source_frontier_tx(
+            tx,
+            &identity.user_id,
+            &identity.session_id,
+            &identity.run_id,
+            grant_control_epoch,
+        )
+        .await?;
+        if let Some(provider_stage_input_id) = provider_stage_input_id {
+            // A question may arrive while the corresponding steer is still
+            // awaiting its provider response. The source intent is then a
+            // provisional fence only; it becomes an applied frontier only
+            // after the transport reports an accepted steer.
+            let source = sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_type = 'user_intent' AND idempotency_key = ?
+                 ORDER BY event_idx DESC LIMIT 1",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(format!("user_intent:{provider_stage_input_id}"))
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| {
+                ToolInteractionAdmissionError::Store(db_error(
+                    "load_tool_interaction_provider_stage_source",
+                    &run.run_id,
+                    source,
+                ))
+            })?;
+            if let Some(source) = source {
+                let payload_json: String = source.try_get("payload_json").map_err(|error| {
+                    ToolInteractionAdmissionError::Store(db_error(
+                        "decode_tool_interaction_provider_stage_source_payload",
+                        &run.run_id,
+                        error,
+                    ))
+                })?;
+                let payload: serde_json::Value = serde_json::from_str(&payload_json)
+                    .map_err(|_| ToolInteractionAdmissionError::Unproven)?;
+                if payload
+                    .pointer("/data/intent_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(provider_stage_input_id)
+                    || payload
+                        .pointer("/data/delivery")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("guide_current_run")
+                {
+                    return Err(ToolInteractionAdmissionError::Unproven);
+                }
+                let source_index: i64 = source.try_get("event_idx").map_err(|error| {
+                    ToolInteractionAdmissionError::Store(db_error(
+                        "decode_tool_interaction_provider_stage_source_index",
+                        &run.run_id,
+                        error,
+                    ))
+                })?;
+                control_epoch = control_epoch.max(source_index);
+            }
+        }
+        let started: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_started'
+             ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("load_tool_interaction_run_binding", &run.run_id, source))?;
+        let started: serde_json::Value =
+            serde_json::from_str(&started.ok_or_else(rejected)?).map_err(|_| rejected())?;
+        let execution_binding_generation = started
+            .pointer("/data/execution_binding_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(rejected)?;
+        let mut execution_work_deadline_unix_ms = None;
+        if let Some(restrictions) = started.pointer("/data/execution_restrictions") {
+            let restrictions: DurableExecutionRestrictions =
+                serde_json::from_value(restrictions.clone()).map_err(|_| rejected())?;
+            restrictions.validate().map_err(|_| rejected())?;
+            let DurableExecutionRestrictions::V1 {
+                execution_work_deadline_unix_ms: work_deadline,
+                ..
+            } = restrictions;
+            execution_work_deadline_unix_ms = work_deadline;
+            if require_live_budget && work_deadline.is_some_and(|deadline| deadline <= now_unix_ms)
+            {
+                return Err(ToolInteractionAdmissionError::DeadlineExpired);
+            }
+        }
+        // Same non-locking Session binding read as dispatch admission: the
+        // live unresolved invocation fences a provider-selection change.
+        let key = SessionKeyV1::owner_session(
+            "server",
+            &identity.user_id,
+            &identity.session_id,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let binding: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation, binding_json FROM session_execution_bindings
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("validate_tool_interaction_binding", &run.run_id, source))?;
+        let (generation, binding) = binding.ok_or_else(rejected)?;
+        let binding: crate::SessionExecutionBindingV1 =
+            serde_json::from_str(&binding).map_err(|_| rejected())?;
+        binding.validate().map_err(|_| rejected())?;
+        if u64::try_from(generation).ok() != Some(execution_binding_generation)
+            || binding.generation != execution_binding_generation
+            || binding.state != crate::SessionExecutionBindingStateV1::Ready
+            || binding.executor.kind != ExecutorBindingRequestKind::EdgeAgent
+            || binding.physical_workspace_id.as_deref() != Some(physical_workspace_id)
+        {
+            return Err(rejected());
+        }
+        let dispatched: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM edge_pending_dispatch
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ?
+               AND request_id = ?
+               AND status = 'dispatched' AND result_json IS NULL FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(identity.storage_key())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "validate_tool_interaction_edge_dispatch",
+                &run.run_id,
+                source,
+            )
+        })?;
+        if dispatched.is_none() {
+            return Err(rejected());
+        }
+        Ok(ToolInvocationInteractionOrigin {
+            identity: identity.clone(),
+            edge_agent_id: edge_agent_id.to_string(),
+            physical_workspace_id: physical_workspace_id.to_string(),
+            descriptor,
+            execution_binding_generation,
+            owner_generation,
+            control_epoch,
+            execution_work_deadline_unix_ms,
+        })
+    }
+
+    /// Return the greatest source `user_intent` coordinate durably applied
+    /// after the caller's original control epoch. Applied facts are appended
+    /// later than their source intents, so their journal `event_idx` is not a
+    /// valid interaction frontier: it can skip a newer source intent that is
+    /// still waiting to be applied.
+    async fn load_applied_user_intent_source_frontier_tx(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        lower_bound: i64,
+    ) -> Result<i64, ToolInteractionAdmissionError> {
+        let frontier: String = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(
+                    MAX(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.event_index')) AS SIGNED)),
+                    ?
+             ) AS CHAR)
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND event_type = 'user_intent_applied' AND event_idx > ?",
+        )
+        .bind(lower_bound.to_string())
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(lower_bound)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| {
+            ToolInteractionAdmissionError::Store(db_error(
+                "load_tool_interaction_applied_guidance_frontier",
+                run_id,
+                source,
+            ))
+        })?;
+        frontier.trim().parse().map_err(|_| {
+            ToolInteractionAdmissionError::Store(db_error(
+                "load_tool_interaction_applied_guidance_frontier",
+                run_id,
+                sqlx::Error::Protocol("applied guidance frontier is not an integer".into()),
+            ))
+        })
+    }
+
+    async fn collaborator_event_tx(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+        event_type: &str,
+        source_key: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, CollaboratorStoreError> {
+        let row = if let Some(source_key) = source_key {
+            sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?
+                   AND idempotency_key = ? LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(anchor_run_id)
+            .bind(event_type)
+            .bind(source_key)
+            .fetch_optional(&mut **tx)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 FORCE INDEX (idx_agent_run_events_control_type_idx)
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?
+                 ORDER BY event_idx DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(anchor_run_id)
+            .bind(event_type)
+            .fetch_optional(&mut **tx)
+            .await
+        }
+        .map_err(|source| db_error("load_collaborator_event", anchor_run_id, source))?;
+        row.as_ref()
+            .map(|row| decode_run_event_payload(row, anchor_run_id))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn collaborator_association_tx(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        let Some(event) = Self::collaborator_event_tx(
+            tx,
+            user_id,
+            session_id,
+            anchor_run_id,
+            COLLABORATOR_ASSOCIATED_EVENT,
+            None,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let association = decode_collaborator_fact(&event, "association")?;
+        let latest = Self::collaborator_event_tx(
+            tx,
+            user_id,
+            session_id,
+            anchor_run_id,
+            COLLABORATOR_STAGE_EVENT,
+            None,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
+            anchor_run_id: anchor_run_id.into(),
+        })?;
+        let latest_admission: CollaboratorStageAdmission =
+            decode_collaborator_fact(&latest, "admission")?;
+        let native_session = Self::collaborator_event_tx(
+            tx,
+            user_id,
+            session_id,
+            anchor_run_id,
+            COLLABORATOR_NATIVE_SESSION_EVENT,
+            None,
+        )
+        .await?
+        .map(|event| decode_collaborator_fact(&event, "native_session"))
+        .transpose()?;
+        Ok(Some(DurableCollaboratorAssociation {
+            association,
+            latest_stage: decode_collaborator_fact(&latest, "receipt")?,
+            latest_native_execution: latest_admission.native_execution,
+            native_session,
+        }))
+    }
+
+    /// Called only after insert_run_record's session/lifecycle/slot fence.
+    /// The anchor row serializes all stage writers across nodes and restarts.
+    async fn prepare_collaborator_stage_tx(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        record: &mut DurableRunRecord,
+        admission: &CollaboratorStageAdmission,
+    ) -> Result<
+        (
+            CollaboratorStageReceipt,
+            Option<DurableRunRecord>,
+            Vec<serde_json::Value>,
+        ),
+        CollaboratorStoreError,
+    > {
+        validate_collaborator_admission(record, admission)?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            tx,
+            &record.user_id,
+            &record.session_id,
+            &admission.anchor_run_id,
+        )
+        .await?;
+        let existing = if anchor.is_some() {
+            Self::collaborator_association_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Some(existing) = &existing {
+            if existing.association != admission.association {
+                return Err(CollaboratorStoreError::AssociationConflict {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                });
+            }
+            if let Some(event) = Self::collaborator_event_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+                COLLABORATOR_STAGE_EVENT,
+                Some(&collaborator_source_key(&admission.source_message_id)),
+            )
+            .await?
+            {
+                let receipt = collaborator_replay_receipt(&event, admission)?;
+                return Ok((receipt, anchor, vec![]));
+            }
+            if admission.expected_previous_stage_run_id.as_deref()
+                != Some(&existing.latest_stage.run_id)
+            {
+                return Err(CollaboratorStoreError::PreviousStageChanged {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                });
+            }
+            let previous = load_run_metadata_after_session_admission_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &existing.latest_stage.run_id,
+            )
+            .await?
+            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+                run_id: existing.latest_stage.run_id.clone(),
+            })?;
+            if !durable_run_status_is_terminal(&previous.status) {
+                return Err(CollaboratorStoreError::PreviousStageActive {
+                    run_id: previous.run_id,
+                });
+            }
+            // Terminal run status alone is not evidence that a dispatched
+            // native operation has settled. Ledger preparation/dispatch also
+            // takes this session/run fence, so no new attempt can race here.
+            let unsettled: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND (state IN ('prepared', 'dispatched', 'outcome_unknown')
+                        OR dispatch_certainty = 'unknown') LIMIT 1 FOR UPDATE",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&previous.run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("fence_collaborator_dispatch", &previous.run_id, source))?;
+            if unsettled.is_some() {
+                return Err(CollaboratorStoreError::UnsettledDispatch {
+                    run_id: previous.run_id,
+                });
+            }
+            if admission.association.provider != CollaboratorProvider::InternalModel
+                && existing.native_session.is_none()
+            {
+                return Err(CollaboratorStoreError::NativeSessionUnbound {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                });
+            }
+        } else if anchor.is_some()
+            || admission.anchor_run_id != record.run_id
+            || admission.expected_previous_stage_run_id.is_some()
+        {
+            return Err(CollaboratorStoreError::AssociationConflict {
+                anchor_run_id: admission.anchor_run_id.clone(),
+            });
+        }
+        let parent_id =
+            record
+                .parent_run_id
+                .as_deref()
+                .ok_or(CollaboratorStoreError::InvalidAdmission {
+                    field: "parent_run_id",
+                })?;
+        let parent = load_run_metadata_after_session_admission_tx(
+            tx,
+            &record.user_id,
+            &record.session_id,
+            parent_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: parent_id.into(),
+        })?;
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND run_generation = ? AND owner_pod_id = ?
+               AND owner_lease_expires_at > NOW(6)
+               AND status IN ('running', 'waiting', 'paused'))",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(parent_id)
+        .bind(admission.expected_parent_generation as i64)
+        .bind(&self.owner_pod_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| db_error("fence_collaborator_parent", parent_id, source))?;
+        if !live
+            || lock_durable_lineage_cancellation_markers_tx(tx, &parent)
+                .await?
+                .any()
+        {
+            return Err(CollaboratorStoreError::ParentNotCurrent {
+                run_id: parent_id.into(),
+            });
+        }
+        let root = parent
+            .root_run_id
+            .as_ref()
+            .ok_or(CollaboratorStoreError::InvalidAdmission {
+                field: "parent_root",
+            })?;
+        let path = format!(
+            "{}/{}",
+            parent
+                .ancestor_path
+                .as_deref()
+                .ok_or(CollaboratorStoreError::InvalidAdmission {
+                    field: "parent_lineage"
+                },)?,
+            record.run_id
+        );
+        let depth = parent
+            .depth
+            .checked_add(1)
+            .ok_or(CollaboratorStoreError::InvalidAdmission { field: "depth" })?;
+        if record
+            .root_run_id
+            .as_ref()
+            .is_some_and(|value| value != root)
+            || record
+                .ancestor_path
+                .as_ref()
+                .is_some_and(|value| value != &path)
+            || (record.depth != 0 && record.depth != depth)
+        {
+            return Err(CollaboratorStoreError::InvalidAdmission {
+                field: "child_lineage",
+            });
+        }
+        record.root_run_id = Some(root.clone());
+        record.ancestor_path = Some(path);
+        record.depth = depth;
+        let receipt = CollaboratorStageReceipt {
+            anchor_run_id: admission.anchor_run_id.clone(),
+            source_message_id: admission.source_message_id.clone(),
+            run_id: record.run_id.clone(),
+            owner_generation: record.run_generation,
+            replayed: false,
+        };
+        let mut events = vec![];
+        if existing.is_none() {
+            events.push(serde_json::json!({
+                "event_type": COLLABORATOR_ASSOCIATED_EVENT,
+                "idempotency_key": "collaborator-association",
+                "association": collaborator_json(&admission.association)?,
+            }));
+        }
+        events.push(serde_json::json!({
+            "event_type": COLLABORATOR_STAGE_EVENT,
+            "idempotency_key": collaborator_source_key(&admission.source_message_id),
+            "admission": collaborator_json(admission)?,
+            "receipt": collaborator_json(&receipt)?,
+        }));
+        Ok((receipt, anchor, events))
+    }
+
+    async fn append_collaborator_events_tx(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        anchor: &DurableRunRecord,
+        events: &[serde_json::Value],
+    ) -> Result<Vec<RunEventInsertRow>, CollaboratorStoreError> {
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            let idx = anchor
+                .last_event_idx
+                .checked_add(rows.len() as i64 + 1)
+                .ok_or(CollaboratorStoreError::InvalidAdmission { field: "event_idx" })?;
+            rows.push(build_run_event_insert_row(
+                &anchor.user_id,
+                &anchor.run_id,
+                &anchor.session_id,
+                anchor.agent_id.as_deref(),
+                idx,
+                &self.owner_pod_id,
+                event,
+            )?);
+        }
+        if let Some(last) = rows.last() {
+            let updated = sqlx::query(
+                "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND last_event_idx = ?",
+            )
+            .bind(last.event_idx)
+            .bind(&anchor.user_id)
+            .bind(&anchor.session_id)
+            .bind(&anchor.run_id)
+            .bind(anchor.last_event_idx)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| db_error("advance_collaborator_events", &anchor.run_id, source))?;
+            if updated.rows_affected() != 1 {
+                return Err(CollaboratorStoreError::AssociationConflict {
+                    anchor_run_id: anchor.run_id.clone(),
+                });
+            }
+            Self::insert_run_event_rows_tx(tx, &anchor.run_id, &rows, "insert_collaborator_events")
+                .await?;
+        }
+        Ok(rows)
+    }
+
     async fn insert_run_record_transaction(
+        &self,
+        record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+        initial_event_rows: &[RunEventInsertRow],
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record_transaction_with_collaborator(
+            record,
+            claim_existing,
+            requested_session_id,
+            initial_event_rows,
+            None,
+        )
+        .await
+        .map(|(claim, _)| claim)
+        .map_err(|error| match error {
+            CollaboratorStoreError::SessionUnavailable => "session is not active".to_owned(),
+            CollaboratorStoreError::Persistence(reason) => reason,
+            error => error.to_string(),
+        })
+    }
+
+    async fn reconcile_collaborator_admission(
+        &self,
+        record: &DurableRunRecord,
+        admission: &CollaboratorStageAdmission,
+    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+        let proof = tokio::time::timeout(RUN_START_TIMEOUT_RECEIPT_TIMEOUT, async {
+            let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error(
+                        "acquire_collaborator_receipt",
+                        &admission.anchor_run_id,
+                        source,
+                    )
+                })?;
+            let mut tx = connection.begin().await.map_err(|source| {
+                db_error(
+                    "begin_collaborator_receipt",
+                    &admission.anchor_run_id,
+                    source,
+                )
+            })?;
+            admit_collaborator_session_tx(&mut tx, &record.user_id, &record.session_id).await?;
+            let anchor = load_run_metadata_after_session_admission_tx(
+                &mut tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+            )
+            .await?;
+            let receipt = if anchor.is_some() {
+                Self::collaborator_event_tx(
+                    &mut tx,
+                    &record.user_id,
+                    &record.session_id,
+                    &admission.anchor_run_id,
+                    COLLABORATOR_STAGE_EVENT,
+                    Some(&collaborator_source_key(&admission.source_message_id)),
+                )
+                .await?
+                .map(|event| collaborator_replay_receipt(&event, admission))
+                .transpose()?
+            } else {
+                None
+            };
+            let receipt = if let Some(receipt) = receipt {
+                load_run_metadata_after_session_admission_tx(
+                    &mut tx,
+                    &record.user_id,
+                    &record.session_id,
+                    &receipt.run_id,
+                )
+                .await?
+                .map(|_| receipt)
+            } else {
+                None
+            };
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "release_collaborator_receipt",
+                    &admission.anchor_run_id,
+                    source,
+                )
+            })?;
+            connection.release();
+            Ok::<_, CollaboratorStoreError>(receipt)
+        })
+        .await;
+        match proof {
+            Ok(Ok(Some(receipt))) => Ok(receipt),
+            Ok(Err(
+                error @ (CollaboratorStoreError::SourceMessageConflict { .. }
+                | CollaboratorStoreError::AssociationConflict { .. }
+                | CollaboratorStoreError::SessionUnavailable),
+            )) => Err(error),
+            _ => Err(CollaboratorStoreError::CommitUnknown {
+                anchor_run_id: admission.anchor_run_id.clone(),
+                source_message_id: admission.source_message_id.clone(),
+            }),
+        }
+    }
+
+    async fn insert_run_record_transaction_with_collaborator(
         &self,
         mut record: DurableRunRecord,
         claim_existing: bool,
         requested_session_id: Option<&str>,
         initial_event_rows: &[RunEventInsertRow],
-    ) -> Result<DurableRunStartClaim, String> {
+        collaborator: Option<&CollaboratorStageAdmission>,
+    ) -> Result<(DurableRunStartClaim, Option<CollaboratorStageReceipt>), CollaboratorStoreError>
+    {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
             && let Some(parent) = self
@@ -14561,11 +15905,56 @@ impl DatabaseRunStateStore {
         .await
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
-                "session is not active".to_string()
+                CollaboratorStoreError::SessionUnavailable
             } else {
-                db_error("insert_run_session_admission", &record.run_id, source).to_string()
+                db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
+        let mut collaborator_event_rows = vec![];
+        let mut collaborator_events_on_new_run = false;
+        let mut stage_receipt = None;
+        if let Some(admission) = collaborator {
+            let (receipt, anchor, events) = self
+                .prepare_collaborator_stage_tx(&mut tx, &mut record, admission)
+                .await?;
+            if receipt.replayed {
+                tx.rollback().await.map_err(|source| {
+                    db_error("rollback_collaborator_replay", &record.run_id, source)
+                })?;
+                connection.release();
+                // Replay is evidence for reconciliation, never a fresh owner
+                // claim, including inside this common creation transaction.
+                return Ok((
+                    DurableRunStartClaim::Existing {
+                        session_id: record.session_id.clone(),
+                        start_request_fingerprint: record.start_request_fingerprint.clone(),
+                    },
+                    Some(receipt),
+                ));
+            }
+            if let Some(anchor) = anchor {
+                collaborator_event_rows = self
+                    .append_collaborator_events_tx(&mut tx, &anchor, &events)
+                    .await?;
+            } else {
+                collaborator_events_on_new_run = true;
+                for event in events {
+                    collaborator_event_rows.push(build_run_event_insert_row(
+                        &record.user_id,
+                        &record.run_id,
+                        &record.session_id,
+                        record.agent_id.as_deref(),
+                        (initial_event_rows.len() + collaborator_event_rows.len()) as i64,
+                        &self.owner_pod_id,
+                        &event,
+                    )?);
+                }
+                record.last_event_idx = collaborator_event_rows
+                    .last()
+                    .map_or(record.last_event_idx, |event| event.event_idx);
+            }
+            stage_receipt = Some(receipt);
+        }
         let existing_session: Option<String> = sqlx::query_scalar(
             "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
         )
@@ -14594,12 +15983,15 @@ impl DatabaseRunStateStore {
             if claim_existing {
                 return self
                     .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
-                    .await;
+                    .await
+                    .map(|claim| (claim, None))
+                    .map_err(Into::into);
             }
             return Err(format!(
                 "run identity {} is already bound to session {existing_session}",
                 record.run_id
-            ));
+            )
+            .into());
         }
 
         if !run_requires_session_execution_slot(&record) {
@@ -14662,7 +16054,9 @@ impl DatabaseRunStateStore {
                 connection.release();
                 return self
                     .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
-                    .await;
+                    .await
+                    .map(|claim| (claim, None))
+                    .map_err(Into::into);
             }
             Err(source) => {
                 tx.rollback().await.map_err(|rollback_error| {
@@ -14670,7 +16064,7 @@ impl DatabaseRunStateStore {
                         .to_string()
                 })?;
                 connection.release();
-                return Err(db_error("insert_run", &record.run_id, source).to_string());
+                return Err(db_error("insert_run", &record.run_id, source).into());
             }
         };
         if requires_execution_slot
@@ -14689,14 +16083,14 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
             })?;
             connection.release();
-            return Err("session already has an active run".to_string());
+            return Err("session already has an active run".to_string().into());
         }
         if insert_result.rows_affected() == 0 {
             tx.rollback().await.map_err(|source| {
                 db_error("insert_run_rollback_noop", &record.run_id, source).to_string()
             })?;
             connection.release();
-            return Err("session already has an active run".to_string());
+            return Err("session already has an active run".to_string().into());
         }
         Self::insert_run_event_rows_tx(
             &mut tx,
@@ -14705,11 +16099,24 @@ impl DatabaseRunStateStore {
             "insert_initial_run_events",
         )
         .await?;
+        if collaborator_events_on_new_run {
+            Self::insert_run_event_rows_tx(
+                &mut tx,
+                &record.run_id,
+                &collaborator_event_rows,
+                "insert_initial_collaborator_events",
+            )
+            .await?;
+        }
         let projection = build_run_display_projection(
             &record,
-            initial_event_rows
-                .last()
-                .map(|event| event.event_type.clone()),
+            (if collaborator_events_on_new_run {
+                collaborator_event_rows.last()
+            } else {
+                None
+            })
+            .or_else(|| initial_event_rows.last())
+            .map(|event| event.event_type.clone()),
             None,
         );
         let insert_projection_sql = matrixone_statement_with_null_shape(
@@ -14780,14 +16187,46 @@ impl DatabaseRunStateStore {
             }
         };
         if let Some(commit_error) = commit_error {
-            let exact_owner_generation = self
+            let reconciliation = self
                 .reconcile_run_start_receipt(&record, initial_event_rows)
-                .await
-                .map_err(|error| format!("{commit_error}; {error}"))?;
+                .await;
+            let exact_owner_generation = match reconciliation {
+                Ok(generation) => generation,
+                Err(error) if collaborator.is_some() => {
+                    tracing::warn!(run_id = %record.run_id, error = %error, "collaborator commit proof unavailable");
+                    None
+                }
+                Err(error) => return Err(format!("{commit_error}; {error}").into()),
+            };
             if exact_owner_generation != Some(record.run_generation) {
+                if let Some(admission) = collaborator {
+                    return Err(CollaboratorStoreError::CommitUnknown {
+                        anchor_run_id: admission.anchor_run_id.clone(),
+                        source_message_id: admission.source_message_id.clone(),
+                    });
+                }
                 return Err(format!(
                     "{commit_error}; run create acknowledgement remains ambiguous"
-                ));
+                )
+                .into());
+            }
+            let collaborator_proof = tokio::time::timeout(
+                RUN_START_TIMEOUT_RECEIPT_TIMEOUT,
+                self.exact_run_event_rows_are_durable(
+                    &collaborator_event_rows,
+                    "reconcile_collaborator_stage_commit",
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+            if !collaborator_proof {
+                let admission = collaborator.ok_or(CollaboratorStoreError::Unsupported)?;
+                return Err(CollaboratorStoreError::CommitUnknown {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                    source_message_id: admission.source_message_id.clone(),
+                });
             }
             tracing::warn!(
                 user_id = %record.user_id,
@@ -14796,9 +16235,12 @@ impl DatabaseRunStateStore {
                 "recovered exact run create commit acknowledgement"
             );
         }
-        Ok(DurableRunStartClaim::Started {
-            owner_generation: record.run_generation,
-        })
+        Ok((
+            DurableRunStartClaim::Started {
+                owner_generation: record.run_generation,
+            },
+            stage_receipt,
+        ))
     }
 }
 
@@ -15761,6 +17203,398 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn derive_tool_interaction_origin(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        edge_agent_id: &str,
+        physical_workspace_id: &str,
+        provider_stage_input_id: Option<&str>,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("derive_tool_interaction_acquire", &identity.run_id, source)
+            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("derive_tool_interaction_begin", &identity.run_id, source)
+        })?;
+        let run = self
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                &identity.user_id,
+                &identity.session_id,
+                &identity.run_id,
+            )
+            .await?
+            .ok_or(ToolInteractionAdmissionError::Unproven)?;
+        let origin = Self::load_tool_interaction_origin_tx(
+            &mut tx,
+            &run,
+            identity,
+            edge_agent_id,
+            physical_workspace_id,
+            true,
+            provider_stage_input_id,
+        )
+        .await?;
+        tx.rollback().await.map_err(|source| {
+            db_error("derive_tool_interaction_rollback", &identity.run_id, source)
+        })?;
+        connection.release();
+        Ok(origin)
+    }
+
+    async fn insert_run_with_collaborator_stage(
+        &self,
+        mut record: DurableRunRecord,
+        admission: CollaboratorStageAdmission,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(CollaboratorStoreError::DeadlineExpired);
+        }
+        validate_collaborator_admission(&record, &admission)?;
+        let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        let creation = self.insert_run_record_transaction_with_collaborator(
+            record.clone(),
+            false,
+            None,
+            &initial_rows,
+            Some(&admission),
+        );
+        let result = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, creation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // CancellationSafePoolConnection prevents a dropped
+                    // transaction from being returned to the pool. Read the
+                    // exact source receipt, never infer success from run ID.
+                    return self
+                        .reconcile_collaborator_admission(&record, &admission)
+                        .await;
+                }
+            }
+        } else {
+            creation.await
+        };
+        match result {
+            Ok((_, Some(receipt))) => Ok(receipt),
+            Ok((_, None)) => Err(CollaboratorStoreError::AssociationConflict {
+                anchor_run_id: admission.anchor_run_id,
+            }),
+            Err(CollaboratorStoreError::CommitUnknown { .. }) => {
+                self.reconcile_collaborator_admission(&record, &admission)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn load_collaborator_association(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_collaborator_association", anchor_run_id, source)
+            })?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_collaborator_association", anchor_run_id, source))?;
+        admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            user_id,
+            session_id,
+            anchor_run_id,
+        )
+        .await?;
+        let association = if anchor.is_some() {
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, anchor_run_id).await?
+        } else {
+            None
+        };
+        tx.rollback().await.map_err(|source| {
+            db_error("release_collaborator_association", anchor_run_id, source)
+        })?;
+        connection.release();
+        Ok(association)
+    }
+
+    async fn load_collaborator_association_for_stage(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        stage_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        // Stage events are intentionally owned by the stable association
+        // anchor. Resolve that owner through the indexed stage binding, then
+        // reuse the canonical association decoder. Ordinary child guidance
+        // can reach this lookup too; an indexed miss is simply no association.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_collaborator_stage_association",
+                    stage_run_id,
+                    source,
+                )
+            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_collaborator_stage_association", stage_run_id, source)
+        })?;
+        admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
+        let anchor_run_id: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM agent_run_events
+             FORCE INDEX (idx_agent_run_events_owner_session_subject)
+             WHERE user_id = ? AND session_id = ? AND event_type = ?
+               AND subject_run_id = ?
+             ORDER BY event_idx DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(COLLABORATOR_STAGE_EVENT)
+        .bind(stage_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "find_collaborator_stage_association_anchor",
+                stage_run_id,
+                source,
+            )
+        })?;
+        let association = if let Some(anchor_run_id) = anchor_run_id {
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, &anchor_run_id).await?
+        } else {
+            None
+        };
+        tx.rollback().await.map_err(|source| {
+            db_error(
+                "release_collaborator_stage_association",
+                stage_run_id,
+                source,
+            )
+        })?;
+        connection.release();
+        Ok(association.filter(|association| association.latest_stage.run_id == stage_run_id))
+    }
+
+    async fn confirm_collaborator_native_session(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        native_session: &CollaboratorNativeSession,
+        expected_owner_generation: u64,
+    ) -> Result<(), CollaboratorStoreError> {
+        if native_session.provider == CollaboratorProvider::InternalModel
+            || native_session.native_session_id.trim().is_empty()
+            || native_session.native_session_id.len() > 512
+        {
+            return Err(CollaboratorStoreError::InvalidAdmission {
+                field: "native_session",
+            });
+        }
+        let anchor_id = &native_session.anchor_run_id;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_collaborator_native_session", anchor_id, source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_collaborator_native_session", anchor_id, source))?;
+        admit_collaborator_session_tx(&mut tx, &identity.user_id, &identity.session_id).await?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            &identity.user_id,
+            &identity.session_id,
+            anchor_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: anchor_id.clone(),
+        })?;
+        let association = Self::collaborator_association_tx(
+            &mut tx,
+            &identity.user_id,
+            &identity.session_id,
+            anchor_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
+            anchor_run_id: anchor_id.clone(),
+        })?;
+        if association.association.provider != native_session.provider
+            || association.latest_stage.run_id != identity.run_id
+        {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let stage = load_run_metadata_after_session_admission_tx(
+            &mut tx,
+            &identity.user_id,
+            &identity.session_id,
+            &identity.run_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: identity.run_id.clone(),
+        })?;
+        if stage.run_generation != expected_owner_generation
+            || stage.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+        {
+            return Err(CollaboratorStoreError::ParentNotCurrent {
+                run_id: identity.run_id.clone(),
+            });
+        }
+        if let Some(existing) = association.native_session {
+            if existing != *native_session {
+                return Err(CollaboratorStoreError::AssociationConflict {
+                    anchor_run_id: anchor_id.clone(),
+                });
+            }
+            let event = Self::collaborator_event_tx(
+                &mut tx,
+                &identity.user_id,
+                &identity.session_id,
+                anchor_id,
+                COLLABORATOR_NATIVE_SESSION_EVENT,
+                None,
+            )
+            .await?
+            .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+            let original_invocation: astra_turn_types::ToolInvocationIdentity =
+                decode_collaborator_fact(&event, "invocation")?;
+            if original_invocation != *identity {
+                return Err(CollaboratorStoreError::NativeSessionUnproven);
+            }
+            tx.rollback()
+                .await
+                .map_err(|source| db_error("release_native_session_replay", anchor_id, source))?;
+            connection.release();
+            return Ok(());
+        }
+        // Do not accept an owner HashMap, provider output text, a caller's ACK
+        // flag, a semantic cache hit, or an outcome_unknown ledger row.
+        let proof: Option<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT JSON_UNQUOTE(outcome_json), JSON_UNQUOTE(fingerprint_json), state FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state IN ('succeeded', 'failed') AND dispatch_certainty = 'dispatched'
+               AND completion_source_json IS NULL LIMIT 1 FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| db_error("prove_native_session_ack", &identity.run_id, source))?;
+        let (outcome_json, fingerprint_json, state) =
+            proof.ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        let state: astra_turn_types::ToolInvocationState =
+            serde_json::from_value(serde_json::Value::String(state)).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_native_session_state",
+                    entity: identity.run_id.clone(),
+                    source,
+                }
+            })?;
+        let outcome_json = outcome_json.ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        let fingerprint: astra_turn_types::ToolInvocationFingerprint =
+            serde_json::from_str(&fingerprint_json).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_native_session_fingerprint",
+                    entity: identity.run_id.clone(),
+                    source,
+                }
+            })?;
+        let locator = association
+            .latest_native_execution
+            .as_ref()
+            .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        if fingerprint.tool
+            != (astra_turn_types::DurableToolReference::Provider {
+                descriptor: locator.descriptor.clone(),
+            })
+        {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let outcome: astra_turn_types::ToolInvocationTerminalOutcome =
+            serde_json::from_str(&outcome_json).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_native_session_ack",
+                    entity: identity.run_id.clone(),
+                    source,
+                }
+            })?;
+        let result = match (state, outcome) {
+            (
+                astra_turn_types::ToolInvocationState::Succeeded,
+                astra_turn_types::ToolInvocationTerminalOutcome::Succeeded { result },
+            )
+            | (
+                astra_turn_types::ToolInvocationState::Failed,
+                astra_turn_types::ToolInvocationTerminalOutcome::Failed { result, .. },
+            ) => result,
+            _ => {
+                return Err(CollaboratorStoreError::NativeSessionUnproven);
+            }
+        };
+        let evidence: CollaboratorNativeSession = serde_json::from_value(
+            result
+                .metadata
+                .get(COLLABORATOR_NATIVE_SESSION_METADATA_KEY)
+                .cloned()
+                .ok_or(CollaboratorStoreError::NativeSessionUnproven)?,
+        )
+        .map_err(|source| DatabaseRunStateStoreError::Json {
+            operation: "decode_native_session_metadata",
+            entity: identity.run_id.clone(),
+            source,
+        })?;
+        if evidence != *native_session {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let rows = self
+            .append_collaborator_events_tx(
+                &mut tx,
+                &anchor,
+                &[serde_json::json!({
+                    "event_type": COLLABORATOR_NATIVE_SESSION_EVENT,
+                    "idempotency_key": "collaborator-native-session",
+                    "native_session": collaborator_json(native_session)?,
+                    "invocation": collaborator_json(identity)?,
+                    "owner_generation": expected_owner_generation,
+                })],
+            )
+            .await?;
+        if let Err(source) = tx.commit().await {
+            drop(connection);
+            let proven = tokio::time::timeout(
+                RUN_START_TIMEOUT_RECEIPT_TIMEOUT,
+                self.exact_run_event_rows_are_durable(&rows, "reconcile_native_session_ack"),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+            if !proven {
+                tracing::warn!(run_id = %identity.run_id, error = %source, "native session binding commit acknowledgement unknown");
+                return Err(CollaboratorStoreError::CommitUnknown {
+                    anchor_run_id: anchor_id.clone(),
+                    source_message_id: identity.invocation_id.clone(),
+                });
+            }
+        } else {
+            connection.release();
+        }
+        Ok(())
+    }
+
     async fn repair_terminal_projection_after_receipt(
         &self,
         user_id: &str,
@@ -19781,15 +21615,14 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut tx = connection.begin().await.map_err(|source| {
             db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
         })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
+        let Some((run, owner_lease_live)) = load_run_metadata_with_lease_for_exact_session_tx(
+            &mut tx,
+            request.user_id,
+            request.expected_session_id,
+            request.run_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?
         else {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -19804,6 +21637,28 @@ impl RunStateStore for DatabaseRunStateStore {
         };
         let (registration_batch_id, registration_events) =
             prepared_interaction_registration_batch(request, run.owner_pod_id.as_deref())?;
+        let mut remote_tool_interaction = false;
+        for event in request.events {
+            remote_tool_interaction |=
+                Self::validate_tool_interaction_origin_tx(&mut tx, &run, event, true)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if let Some(origin) =
+                tool_interaction_origin(event).map_err(|error| error.to_string())?
+                && (origin.control_epoch != request.expected_control_epoch
+                    || origin.owner_generation != request.expected_owner_generation)
+            {
+                return Err(ToolInteractionAdmissionError::Unproven.to_string());
+            }
+        }
+        if remote_tool_interaction
+            && request
+                .events
+                .iter()
+                .any(|event| event.pointer("/data/tool_invocation_origin").is_none())
+        {
+            return Err(ToolInteractionAdmissionError::Unproven.to_string());
+        }
         if run.run_generation != request.expected_owner_generation {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -19820,7 +21675,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 },
             );
         }
-        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+        if !remote_tool_interaction
+            && run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+        {
             let actual_owner_pod_id = run.owner_pod_id.clone();
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -19848,25 +21705,7 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Inactive { status });
         }
-        let lease_active: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
-             FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(request.user_id)
-        .bind(request.expected_session_id)
-        .bind(request.run_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "load_guarded_interaction_batch_lease",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if lease_active != 1 {
+        if !owner_lease_live {
             tx.rollback().await.map_err(|source| {
                 db_error(
                     "rollback_guarded_interaction_batch_expired",
@@ -20127,7 +21966,7 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(request.user_id)
         .bind(request.expected_session_id)
         .bind(request.run_id)
-        .bind(&self.owner_pod_id)
+        .bind(run.owner_pod_id.as_deref())
         .bind(expected_generation)
         .bind(STATUS_RUNNING)
         .bind(STATUS_WAITING)
@@ -20391,6 +22230,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::MissingRequest);
             };
+            let mut remote_tool_interaction = false;
             if let Some(queued_response_event_type) = queued_response_event_type {
                 let rows = sqlx::query(
                     "SELECT event_type, event_idx, payload_json
@@ -20420,6 +22260,17 @@ impl RunStateStore for DatabaseRunStateStore {
                     let event = decode_run_event_payload(&row, run_id)
                         .map_err(|error| error.to_string())?;
                     if event_type == kind.required_event_type() {
+                        remote_tool_interaction =
+                            Self::validate_tool_interaction_origin_tx(&mut tx, &run, &event, true)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        if let Some(origin) =
+                            tool_interaction_origin(&event).map_err(|error| error.to_string())?
+                            && (origin.control_epoch != request.expected_control_epoch
+                                || origin.owner_generation != request.expected_owner_generation)
+                        {
+                            return Err(ToolInteractionAdmissionError::Unproven.to_string());
+                        }
                         required = Some(event);
                     } else if event_type == kind.resolved_event_type() {
                         tx.rollback().await.map_err(|source| {
@@ -20615,7 +22466,9 @@ impl RunStateStore for DatabaseRunStateStore {
                     actual_owner_generation: run.run_generation,
                 });
             }
-            if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+            if !remote_tool_interaction
+                && run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+            {
                 let actual_owner_pod_id = run.owner_pod_id.clone();
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_owner", run_id, source).to_string()
@@ -20874,7 +22727,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .bind(user_id)
                 .bind(expected_session_id)
                 .bind(run_id)
-                .bind(&self.owner_pod_id)
+                .bind(run.owner_pod_id.as_deref())
                 .bind(expected_generation)
                 .bind(STATUS_RUNNING)
                 .bind(run.last_event_idx)
@@ -21027,7 +22880,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 kind,
                 request_id,
                 request.expected_owner_generation,
-                Some(&self.owner_pod_id),
+                run.owner_pod_id.as_deref(),
                 request.expected_control_epoch,
             );
             let event_idx = run.last_event_idx + 1;
@@ -21056,7 +22909,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(user_id)
             .bind(expected_session_id)
             .bind(run_id)
-            .bind(&self.owner_pod_id)
+            .bind(run.owner_pod_id.as_deref())
             .bind(expected_generation)
             .bind(STATUS_RUNNING)
             .bind(run.last_event_idx)
@@ -21298,6 +23151,33 @@ impl RunStateStore for DatabaseRunStateStore {
                 connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
             };
+            let require_live_budget = !matches!(
+                response_data
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str),
+                Some("timed_out" | "cancelled")
+            );
+            match Self::validate_tool_interaction_origin_tx(
+                &mut tx,
+                &run,
+                &required,
+                require_live_budget,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(
+                    ToolInteractionAdmissionError::Unproven
+                    | ToolInteractionAdmissionError::DeadlineExpired,
+                ) => {
+                    tx.rollback().await.map_err(|source| {
+                        db_error("resolve_tool_interaction_fenced", run_id, source).to_string()
+                    })?;
+                    connection.release();
+                    return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
             if let Some(existing) = queued_response.as_ref()
                 && !queued_interaction_response_matches(existing, &response_data)
             {
@@ -25048,12 +26928,15 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
-    let subject_run_id = matches!(
-        event_type.as_str(),
-        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
-    )
-    .then(|| extract_optional_string(event, "run_id"))
-    .flatten();
+    let subject_run_id = match event_type.as_str() {
+        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE => {
+            extract_optional_string(event, "run_id")
+        }
+        COLLABORATOR_STAGE_EVENT => event
+            .get("receipt")
+            .and_then(|receipt| extract_optional_string(receipt, "run_id")),
+        _ => None,
+    };
     let interaction_request_id = extract_interaction_request_id(event);
     let event_id = extract_optional_string(event, "event_id")
         .or_else(|| extract_optional_string(event, "id"))
@@ -25464,6 +27347,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     .unwrap_or(serde_json::Value::Null),
             );
             copy_execution_boundary_fields(&mut out, &data);
+            for key in [
+                "run_id",
+                "session_id",
+                "index",
+                "event_idx",
+                "run_generation",
+            ] {
+                insert_if_present(&mut out, &data, key);
+            }
             serde_json::Value::Object(out)
         }
         "tool_result" => {
@@ -25489,6 +27381,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             out.insert("result".to_string(), result);
             copy_explicit_artifacts(&mut out, &data);
             copy_execution_boundary_fields(&mut out, &data);
+            if let Some(observation) = data
+                .get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+                .and_then(astra_turn_types::project_native_collaborator_observation)
+            {
+                out.insert(
+                    astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                    observation,
+                );
+            }
             project_external_tool_call_end(serde_json::Value::Object(out))
         }
         "run_started" => {
@@ -26008,12 +27909,28 @@ fn project_explain_analyze(event: serde_json::Value) -> serde_json::Value {
 }
 
 const EXTERNAL_TOOL_EVENT_MAX_BYTES: usize = 64 * 1024;
+/// Reserve cursor overhead in the largest durable observation window.
+pub const MAX_TOOL_TERMINAL_PRESENTATION_BYTES: usize =
+    MAX_RUN_OBSERVATION_BYTES / MAX_RUN_OBSERVATION_EVENTS - 128;
 const EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES: usize = 48 * 1024;
 const EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 8 * 1024;
 const EXTERNAL_TOOL_ARGUMENTS_INLINE_MAX_BYTES: usize = 8 * 1024;
 const EXTERNAL_TOOL_ARGUMENTS_PREVIEW_MAX_BYTES: usize = 2 * 1024;
 
 fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value {
+    let mut event = project_tool_terminal_presentation(event, EXTERNAL_TOOL_EVENT_MAX_BYTES);
+    if let Some(object) = event.as_object_mut() {
+        object.remove("idempotency_key");
+    }
+    event
+}
+
+/// Bound presentation, not the authoritative tool result. Call after execution
+/// binding fields are attached and before publishing or persisting the event.
+pub fn project_tool_terminal_presentation(
+    event: serde_json::Value,
+    max_bytes: usize,
+) -> serde_json::Value {
     let original_event_bytes = encoded_json_len(&event);
     let original_event_sha256 = sha256_hex(
         serde_json::to_string(&event)
@@ -26023,23 +27940,59 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
     let Some(source) = event.as_object() else {
         return event;
     };
+    let native_observation = source
+        .get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+        .and_then(astra_turn_types::project_native_collaborator_observation);
 
     let mut out = serde_json::Map::from_iter([(
         "type".to_string(),
         serde_json::Value::String("tool_call_end".to_string()),
     )]);
-    for key in ["call_id", "tool"]
-        .into_iter()
-        .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
+    for key in [
+        "call_id",
+        "tool",
+        "run_id",
+        "session_id",
+        "tool_call_id",
+        "index",
+        "event_idx",
+        "run_generation",
+        "idempotency_key",
+    ]
+    .into_iter()
+    .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
     {
         if let Some(value) = source.get(key) {
             out.insert(key.to_string(), value.clone());
         }
     }
     copy_explicit_artifacts(&mut out, source);
+    // Replaying a presentation must not replace original evidence with the
+    // hash or size of its preview.
+    for key in [
+        "result_truncated",
+        "result_bytes",
+        "result_sha256",
+        "result_integrity",
+        "payload_truncated",
+        "event_bytes",
+        "event_sha256",
+        "result_omitted",
+        "arguments_omitted",
+        "native_stage_observation_omitted",
+        "executor_omitted",
+    ] {
+        insert_if_present(&mut out, source, key);
+    }
+    if let Some(observation) = &native_observation {
+        out.insert(
+            astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+            observation.clone(),
+        );
+    }
 
     if let Some(result) = source.get("result").or_else(|| source.get("output")) {
-        let (result, evidence) = project_external_tool_result(result.clone());
+        let (result, evidence) = project_external_tool_result(result.clone(), max_bytes);
         out.insert("result".to_string(), result);
         if let Some((original_bytes, content_sha256)) = evidence {
             out.insert(
@@ -26084,16 +28037,16 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
     }
 
     let mut projected = serde_json::Value::Object(out);
-    if encoded_json_len(&projected) > EXTERNAL_TOOL_EVENT_MAX_BYTES {
+    if encoded_json_len(&projected) > max_bytes {
         let call_id = source
             .get("call_id")
             .and_then(serde_json::Value::as_str)
-            .map(|value| truncate_utf8_bytes(value, 1024))
+            .map(str::to_owned)
             .unwrap_or_default();
         let tool = source
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .map(|value| truncate_utf8_bytes(value, 1024))
+            .map(str::to_owned)
             .unwrap_or_default();
         let projected_result = projected.get("result").cloned();
         let projected_arguments = projected.get("arguments").cloned();
@@ -26119,6 +28072,57 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
         let fallback_obj = fallback
             .as_object_mut()
             .expect("tool terminal fallback is an object");
+        for key in [
+            "run_id",
+            "session_id",
+            "tool_call_id",
+            "index",
+            "event_idx",
+            "run_generation",
+            "idempotency_key",
+            "result_truncated",
+            "result_bytes",
+            "result_sha256",
+            "result_integrity",
+            "event_bytes",
+            "event_sha256",
+            "result_omitted",
+            "arguments_omitted",
+            "native_stage_observation_omitted",
+            "executor_omitted",
+        ]
+        .into_iter()
+        .chain(
+            EXTERNAL_EXECUTION_BOUNDARY_FIELDS
+                .iter()
+                .copied()
+                .filter(|key| {
+                    !matches!(
+                        *key,
+                        "status"
+                            | "success"
+                            | "executed"
+                            | "disposition"
+                            | "duration_ms"
+                            | "error_kind"
+                    )
+                }),
+        ) {
+            insert_if_present(fallback_obj, projected.as_object().unwrap(), key);
+        }
+        if projected
+            .get("executor")
+            .is_some_and(|executor| encoded_json_len(executor) > max_bytes)
+        {
+            fallback_obj.remove("executor");
+            fallback_obj.insert("executor_omitted".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(observation) = native_observation {
+            fallback_obj.insert(
+                astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                observation,
+            );
+        }
         for (key, value) in [
             ("result", projected_result),
             ("arguments", projected_arguments),
@@ -26133,12 +28137,88 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
                 fallback_obj.insert(key.to_string(), value);
             }
         }
+        // Identity, execution facts and native observations take precedence
+        // over previews. Encoded JSON can be much larger than raw UTF-8 text.
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj.remove("arguments").is_some() {
+                fallback_obj.insert("arguments_omitted".into(), serde_json::Value::Bool(true));
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj.remove("executor").is_some() {
+                fallback_obj.insert("executor_omitted".into(), serde_json::Value::Bool(true));
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes
+            && let Some(result) = fallback.get("result")
+        {
+            let original = source
+                .get("result")
+                .or_else(|| source.get("output"))
+                .unwrap_or(result);
+            let encoded = serde_json::to_vec(original).unwrap();
+            let (original_bytes, content_sha256) =
+                external_lifecycle_projection_integrity(original)
+                    .map(|(bytes, digest)| (bytes, digest.to_owned()))
+                    .unwrap_or_else(|| (encoded.len(), sha256_hex(&encoded)));
+            let remaining = max_bytes.saturating_sub(
+                encoded_json_len(&fallback).saturating_sub(encoded_json_len(result)),
+            );
+            if let Some(control) = project_external_lifecycle_result(
+                result,
+                original_bytes,
+                &content_sha256,
+                remaining,
+            ) {
+                fallback["result"] = control;
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if let Some(result) = fallback_obj.remove("result") {
+                fallback_obj.insert("result_omitted".into(), serde_json::Value::Bool(true));
+                if !fallback_obj.contains_key("result_sha256") {
+                    let original = source
+                        .get("result")
+                        .or_else(|| source.get("output"))
+                        .unwrap_or(&result);
+                    let encoded = serde_json::to_vec(original).unwrap();
+                    let (bytes, digest) = external_lifecycle_projection_integrity(original)
+                        .map(|(bytes, digest)| (bytes, digest.to_owned()))
+                        .unwrap_or_else(|| (encoded.len(), sha256_hex(&encoded)));
+                    fallback_obj.insert("result_bytes".into(), serde_json::json!(bytes));
+                    fallback_obj.insert("result_sha256".into(), serde_json::json!(digest));
+                }
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj
+                .remove(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+                .is_some()
+            {
+                fallback_obj.insert(
+                    "native_stage_observation_omitted".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
         projected = fallback;
     }
-    assert!(
-        encoded_json_len(&projected) <= EXTERNAL_TOOL_EVENT_MAX_BYTES,
-        "external tool event projection exceeded its hard byte limit"
-    );
+    if encoded_json_len(&projected) > max_bytes {
+        // Never shorten an identity and accidentally attach facts to a
+        // different invocation. The normal snapshot-repair contract applies.
+        projected = serde_json::json!({
+            "type": "stream_gap", "run_id": source.get("run_id"),
+            "dropped_event_count": 1, "repair": "refresh_run_snapshot",
+            "event_sha256": original_event_sha256, "event_bytes": original_event_bytes
+        });
+        if encoded_json_len(&projected) > max_bytes {
+            return serde_json::Value::Null;
+        }
+    }
     projected
 }
 
@@ -26156,21 +28236,31 @@ fn copy_explicit_artifacts(
 
 fn project_external_tool_result(
     result: serde_json::Value,
+    event_budget: usize,
 ) -> (serde_json::Value, Option<(usize, String)>) {
     let encoded =
         serde_json::to_string(&result).expect("serializing a serde_json::Value must not fail");
-    if encoded.len() <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES {
+    let result_budget =
+        EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES.min(event_budget.saturating_mul(3) / 4);
+    if encoded.len() <= result_budget {
         return (result, None);
     }
 
-    let original_bytes = encoded.len();
-    let content_sha256 = sha256_hex(encoded.as_bytes());
-    if let Some(projected) =
-        project_external_lifecycle_result(&result, original_bytes, content_sha256.as_str())
-    {
+    let (original_bytes, content_sha256) = external_lifecycle_projection_integrity(&result)
+        .map(|(bytes, digest)| (bytes, digest.to_owned()))
+        .unwrap_or_else(|| (encoded.len(), sha256_hex(encoded.as_bytes())));
+    if let Some(projected) = project_external_lifecycle_result(
+        &result,
+        original_bytes,
+        content_sha256.as_str(),
+        result_budget,
+    ) {
         return (projected, Some((original_bytes, content_sha256)));
     }
-    let preview = truncate_utf8_bytes(&encoded, EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES);
+    let preview = truncate_utf8_bytes(
+        &encoded,
+        EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES.min(event_budget / 4),
+    );
     (
         serde_json::json!({
             "type": "astra.external_tool_result_summary.v1",
@@ -26188,10 +28278,32 @@ fn project_external_tool_result(
 /// for data tools, but it is insufficient for lifecycle tools: clients must
 /// still be able to identify and control the accepted Work unit. Selection is
 /// driven by the versioned Work observation, not by tool names or prose.
+fn external_lifecycle_projection_integrity(result: &serde_json::Value) -> Option<(usize, &str)> {
+    if result.get("type")?.as_str()? != "astra.external_tool_lifecycle_summary.v1"
+        || !result.get("truncated")?.as_bool()?
+    {
+        return None;
+    }
+    let observation = serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(
+        result
+            .get(astra_core::work_unit::WORK_UNIT_OBSERVATION_FIELD)?
+            .clone(),
+    )
+    .ok()?;
+    if !observation.is_valid() {
+        return None;
+    }
+    let bytes = usize::try_from(result.get("original_bytes")?.as_u64()?).ok()?;
+    let digest = result.get("content_sha256")?.as_str()?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((bytes, digest))
+}
+
 fn project_external_lifecycle_result(
     result: &serde_json::Value,
     original_bytes: usize,
     content_sha256: &str,
+    result_budget: usize,
 ) -> Option<serde_json::Value> {
     let parsed = match result {
         serde_json::Value::String(output) => serde_json::from_str(output).ok()?,
@@ -26204,6 +28316,8 @@ fn project_external_lifecycle_result(
             serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value.clone()).ok()
         })
         .filter(astra_core::work_unit::WorkUnitObservation::is_valid)?;
+    let (original_bytes, content_sha256) = external_lifecycle_projection_integrity(&parsed)
+        .unwrap_or((original_bytes, content_sha256));
 
     let mut compact = serde_json::Map::from_iter([
         (
@@ -26229,7 +28343,6 @@ fn project_external_lifecycle_result(
         "agent_id",
         "run_id",
         "group_id",
-        "title",
         "target_count",
         "transcript_location",
         "parent_run_id",
@@ -26240,9 +28353,13 @@ fn project_external_lifecycle_result(
             compact.insert(key.to_string(), value.clone());
         }
     }
-    if encoded_json_len(&serde_json::Value::Object(compact.clone()))
-        > EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES
-    {
+    if parsed["control_membership_omitted"] == "oversized" {
+        compact.insert(
+            "control_membership_omitted".into(),
+            serde_json::json!("oversized"),
+        );
+    }
+    if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
         // A syntactically valid observation may contain future extension
         // fields. Treat its byte size as untrusted input and fall back to the
         // generic bounded projection rather than exporting an oversized
@@ -26257,9 +28374,7 @@ fn project_external_lifecycle_result(
             continue;
         };
         compact.insert(key.to_string(), value);
-        if encoded_json_len(&serde_json::Value::Object(compact.clone()))
-            > EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES
-        {
+        if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
             compact.remove(key);
             compact.insert(
                 "control_membership_omitted".to_string(),
@@ -26268,8 +28383,16 @@ fn project_external_lifecycle_result(
             break;
         }
     }
+    if let Some(title) = parsed.get("title") {
+        compact.insert("title".into(), title.clone());
+        if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
+            compact.remove("title");
+        }
+    }
     let compact = serde_json::Value::Object(compact);
-    debug_assert!(encoded_json_len(&compact) <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
+    if encoded_json_len(&compact) > result_budget {
+        return None;
+    }
     Some(compact)
 }
 
@@ -28163,6 +30286,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(terminal.subject_run_id, None);
+
+        let stage = build_run_event_insert_row(
+            "user-1",
+            "anchor-run",
+            "session-1",
+            Some("root"),
+            10,
+            "pod-a",
+            &json!({
+                "event_type": COLLABORATOR_STAGE_EVENT,
+                "receipt": {"run_id": "stage-run"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(stage.subject_run_id.as_deref(), Some("stage-run"));
     }
 
     #[derive(Clone)]
@@ -28958,7 +31096,7 @@ mod tests {
         assert_ne!(
             left.is_ok(),
             right.is_ok(),
-            "one generation permits one owner only"
+            "one generation permits one owner only: left={left:?}, right={right:?}"
         );
         let winner = left.or(right).unwrap();
         assert_eq!(winner.run().run_generation, before.run_generation + 1);
@@ -33543,6 +35681,107 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_collaborator_stage_ack_loss_recovers_atomic_child_and_anchor_receipts() {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        let parent_id = Uuid::new_v4().to_string();
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("collaborator-ack-owner")
+            .with_lease_ttl(Duration::from_secs(300));
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        store.insert_run(parent).await.unwrap();
+        let anchor_id = Uuid::new_v4().to_string();
+        let mut request = CollaboratorStageAdmission {
+            anchor_run_id: anchor_id.clone(),
+            source_message_id: Uuid::new_v4().to_string(),
+            request_fingerprint: "source-intent-digest".into(),
+            execution_identity_fingerprint: "prepared-identity-digest".into(),
+            native_execution: None,
+            expected_previous_stage_run_id: None,
+            expected_parent_generation: 0,
+            association: CollaboratorAssociation {
+                provider: CollaboratorProvider::InternalModel,
+                execution_boundary: CollaboratorExecutionBoundary::ServerManaged,
+            },
+        };
+        let mut child = durable_run_record(&anchor_id);
+        child.user_id = user_id.clone();
+        child.session_id = session_id.clone();
+        child.parent_run_id = Some(parent_id.clone());
+        child.root_run_id = None;
+        child.ancestor_path = None;
+        child.run_generation = 1;
+        let first = store
+            .clone()
+            .with_run_create_commit_ack_loss_once()
+            .insert_run_with_collaborator_stage(child.clone(), request.clone(), None)
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &anchor_id,
+                    &[STATUS_RUNNING],
+                    Some(1),
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+        let next_id = Uuid::new_v4().to_string();
+        child.run_id = next_id.clone();
+        request.source_message_id = Uuid::new_v4().to_string();
+        request.expected_previous_stage_run_id = Some(anchor_id.clone());
+        let next = store
+            .clone()
+            .with_run_create_commit_ack_loss_once()
+            .insert_run_with_collaborator_stage(child, request, None)
+            .await
+            .unwrap();
+        assert!(!next.replayed);
+        assert_eq!(next.run_id, next_id);
+        let association = store
+            .load_collaborator_association(&user_id, &session_id, &anchor_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(association.latest_stage.run_id, next_id);
+        assert_eq!(
+            store
+                .load_run(&user_id, &anchor_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_COMPLETED
+        );
+        for run_id in [&next_id, &anchor_id, &parent_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_create_commit_ack_loss_recovers_exact_run_slot_and_initial_events_on_matrixone()
      {
         let (_, pool) = setup_database_run_state_store_it().await;
@@ -34703,6 +36942,103 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup frontier sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_applied_guidance_frontier_uses_source_intent_and_keeps_later_intent_visible_on_matrixone()
+     {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user_id = format!("guidance-frontier-source-u-{nonce}");
+        let session_id = format!("guidance-frontier-source-s-{nonce}");
+        let run_id = format!("guidance-frontier-source-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store
+            .insert_run(run)
+            .await
+            .expect("insert source frontier run");
+
+        for (intent_id, content) in [("intent-a", "first"), ("intent-b", "second")] {
+            store
+                .append_event(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    json!({
+                        "event_type": "user_intent",
+                        "idempotency_key": format!("user_intent:{intent_id}"),
+                        "data": {
+                            "intent_id": intent_id,
+                            "delivery": "guide_current_run",
+                            "input": {"content": content}
+                        }
+                    }),
+                )
+                .await
+                .expect("append accepted guidance");
+        }
+        // The applied fact is intentionally appended after both source
+        // intents. Its data.event_index identifies intent-a's source event;
+        // using this row's physical event_idx would incorrectly skip intent-b.
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({
+                    "event_type": "user_intent_applied",
+                    "idempotency_key": "user_intent_applied:intent-a",
+                    "data": {
+                        "intent_id": "intent-a",
+                        "event_index": 1,
+                        "status": "applied",
+                        "content": "first"
+                    }
+                }),
+            )
+            .await
+            .expect("append applied guidance fact");
+
+        let mut connection = pool.get().begin().await.expect("begin frontier read");
+        let frontier = DatabaseRunStateStore::load_applied_user_intent_source_frontier_tx(
+            &mut connection,
+            &user_id,
+            &session_id,
+            &run_id,
+            -1,
+        )
+        .await
+        .expect("read source guidance frontier");
+        assert_eq!(frontier, 1, "frontier must use intent-a's source index");
+        let newer: Option<i64> = sqlx::query_scalar(
+            "SELECT event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
+               AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .bind(frontier)
+        .fetch_optional(&mut *connection)
+        .await
+        .expect("seek unapplied later guidance");
+        assert_eq!(
+            newer,
+            Some(2),
+            "intent-b must still fence the provider question"
+        );
+        connection.rollback().await.expect("rollback frontier read");
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup source frontier session");
     }
 
     #[tokio::test]
@@ -38607,6 +40943,50 @@ mod tests {
     }
 
     #[test]
+    fn tool_terminal_presentation_preserves_scope_and_integrity_or_reports_a_gap() {
+        let event = json!({
+            "type": "tool_call_end", "run_id": "run", "session_id": "session", "call_id": "call",
+            "tool": "tool", "result": "界\\\"\n".repeat(12_000), "arguments": "x".repeat(8_000),
+            "executed": null, "status": "completed", "success": true,
+            "transport": "server_local", "executor": {"kind": "server_local"},
+            "workspace": {"path": "/workspace"}
+        });
+        let bounded = project_tool_terminal_presentation(event.clone(), 3968);
+        assert!(encoded_json_len(&bounded) <= 3968);
+        for key in [
+            "run_id",
+            "session_id",
+            "call_id",
+            "tool",
+            "executed",
+            "transport",
+            "executor",
+            "workspace",
+        ] {
+            assert_eq!(bounded[key], event[key], "{key}");
+        }
+        assert_eq!(bounded["result_bytes"], encoded_json_len(&event["result"]));
+        assert_eq!(
+            project_tool_terminal_presentation(bounded.clone(), 3968),
+            bounded
+        );
+        let mut receipt = event.clone();
+        receipt["result"] = json!({"status": "completed", "agent_id": "agent"});
+        receipt["arguments"] = json!({"instruction": "x".repeat(5_000)});
+        let receipt = project_tool_terminal_presentation(receipt, 3968);
+        assert_eq!(receipt["result"]["agent_id"], "agent");
+        assert_eq!(receipt["arguments_omitted"], true);
+        for key in ["call_id", "workspace"] {
+            let mut oversized = event.clone();
+            oversized[key] = json!("界".repeat(4_000));
+            let gap = project_tool_terminal_presentation(oversized, 3968);
+            assert_eq!(gap["type"], "stream_gap");
+            assert_eq!(gap["run_id"], "run");
+            assert_eq!(gap["repair"], "refresh_run_snapshot");
+        }
+    }
+
+    #[test]
     fn large_tool_results_are_bounded_on_the_external_client_surface() {
         let output = "界".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
         let original_bytes = serde_json::to_string(&serde_json::Value::String(output.clone()))
@@ -38661,14 +41041,15 @@ mod tests {
         let result = json!({
             "status": "completed",
             "group_id": "review-group",
-            "target_count": 2,
+            "target_count": 3,
             "results": [{"result": "x".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES * 2)}],
             "fanout": {
                 "group_id": "review-group",
-                "target_count": 2,
+                "target_count": 3,
                 "slots": [
                     {"slot_index": 0, "agent_id": "a", "run_id": "run-a", "status": "completed"},
-                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"}
+                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"},
+                    {"slot_index": 2, "agent_id": "c".repeat(256), "run_id": "r".repeat(256), "status": "completed"}
                 ]
             },
             "work_unit_observation": {
@@ -38681,17 +41062,94 @@ mod tests {
             }
         })
         .to_string();
-        let transformed = transform_run_event_for_client(json!({
+        let event = json!({
             "type": "tool_call_end",
             "call_id": "call-fanout",
             "tool": "agent_fanout",
             "result": result,
             "success": true,
-        }));
+        });
+        let durable = project_tool_terminal_presentation(event.clone(), 3968);
+        assert!(encoded_json_len(&durable) <= 3968);
+        assert_eq!(durable["result"]["group_id"], "review-group");
+        assert_eq!(durable["result"]["fanout"]["slots"][1]["run_id"], "run-b");
+        let mut pressure_result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        pressure_result["results"] = json!([{"result":"x".repeat(1_500)}]);
+        assert!(encoded_json_len(&pressure_result) < 3968 * 3 / 4);
+        let pressure = json!({
+            "type":"tool_call_end", "run_id":"run", "session_id":"session",
+            "call_id":"call-fanout", "tool":"agent_fanout", "success":true,
+            "result":pressure_result, "arguments":{"instruction":"x".repeat(5_000)},
+            "workspace":{"path":"x".repeat(1_700)}
+        });
+        let mut without_arguments = pressure.clone();
+        without_arguments
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        assert!(encoded_json_len(&without_arguments) > 3968);
+        let compact = project_tool_terminal_presentation(pressure.clone(), 3968);
+        assert!(encoded_json_len(&compact) <= 3968);
+        assert_eq!(compact["result"]["group_id"], "review-group");
+        assert_eq!(compact["result"]["fanout"]["slots"][1]["run_id"], "run-b");
+        assert_eq!(
+            compact["result"]["original_bytes"],
+            encoded_json_len(&pressure["result"])
+        );
+        assert_eq!(
+            compact["result"]["content_sha256"],
+            sha256_hex(&serde_json::to_vec(&pressure["result"]).unwrap())
+        );
+        assert_eq!(compact["arguments_omitted"], true);
+        assert_eq!(compact["workspace"], pressure["workspace"]);
+        assert_eq!(
+            project_tool_terminal_presentation(compact.clone(), 3968),
+            compact
+        );
+        let mut rebound = durable.clone();
+        rebound["run_id"] = json!("run");
+        rebound["session_id"] = json!("session");
+        rebound["run_generation"] = json!(7);
+        rebound["idempotency_key"] = json!("subrun-tool:7:".to_owned() + &"k".repeat(190));
+        rebound["workspace"] = json!({"path":""});
+        let padding = (3968 + 64usize).saturating_sub(encoded_json_len(&rebound));
+        rebound["workspace"]["path"] = json!("x".repeat(padding));
+        assert!(encoded_json_len(&rebound) > 3968);
+        let rebound = project_tool_terminal_presentation(rebound, 3968);
+        assert!(encoded_json_len(&rebound) <= 3968);
+        assert_eq!(rebound["result"]["group_id"], "review-group");
+        assert_eq!(
+            rebound["result"]["original_bytes"],
+            durable["result"]["original_bytes"]
+        );
+        assert_eq!(
+            rebound["result"]["content_sha256"],
+            durable["result"]["content_sha256"]
+        );
+        assert_eq!(rebound["result_sha256"], durable["result_sha256"]);
+        assert_eq!(
+            project_tool_terminal_presentation(rebound.clone(), 3968),
+            rebound
+        );
+        let mut omitted = durable["result"].clone();
+        omitted.as_object_mut().unwrap().remove("fanout");
+        omitted["control_membership_omitted"] = json!("oversized");
+        let retained =
+            project_external_lifecycle_result(&omitted, 1, &"0".repeat(64), 2000).unwrap();
+        assert_eq!(
+            retained["original_bytes"],
+            durable["result"]["original_bytes"]
+        );
+        assert_eq!(
+            retained["content_sha256"],
+            durable["result"]["content_sha256"]
+        );
+        assert_eq!(retained["control_membership_omitted"], "oversized");
+        let transformed = transform_run_event_for_client(event);
 
         assert_eq!(transformed["success"], true);
         assert_eq!(transformed["result"]["group_id"], "review-group");
-        assert_eq!(transformed["result"]["target_count"], 2);
+        assert_eq!(transformed["result"]["target_count"], 3);
         assert_eq!(
             transformed["result"]["work_unit_observation"]["kind"],
             "agent_fanout"
@@ -38851,7 +41309,7 @@ mod tests {
 
     #[test]
     fn oversized_execution_metadata_cannot_erase_the_terminal_outcome() {
-        let transformed = transform_run_event_for_client(json!({
+        let event = json!({
             "type": "tool_call_end",
             "call_id": "call-terminal",
             "tool": "introspect",
@@ -38866,21 +41324,57 @@ mod tests {
                 "untrusted_extension": "x".repeat(2 * 1024 * 1024),
             },
             "error_kind": "e".repeat(2 * 1024 * 1024),
-        }));
-
-        assert_eq!(transformed["type"], "tool_call_end");
-        assert_eq!(transformed["call_id"], "call-terminal");
-        assert_eq!(transformed["tool"], "introspect");
-        assert_eq!(transformed["result"]["snapshot"], "available");
-        assert_eq!(transformed["arguments"]["scope"], "current_run");
-        assert_eq!(transformed["status"], "rejected");
-        assert_eq!(transformed["success"], false);
-        assert_eq!(transformed["executed"], false);
-        assert_eq!(transformed["duration_ms"], 37);
-        assert_eq!(transformed["payload_truncated"], true);
-        assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
-        assert!(transformed.get("executor").is_none());
-        assert!(encoded_json_len(&transformed) <= EXTERNAL_TOOL_EVENT_MAX_BYTES);
+        });
+        for budget in [
+            EXTERNAL_TOOL_EVENT_MAX_BYTES,
+            MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+        ] {
+            let transformed = project_tool_terminal_presentation(event.clone(), budget);
+            assert_eq!(transformed["type"], "tool_call_end");
+            assert_eq!(transformed["call_id"], "call-terminal");
+            assert_eq!(transformed["tool"], "introspect");
+            assert_eq!(transformed["result"]["snapshot"], "available");
+            assert_eq!(transformed["arguments"]["scope"], "current_run");
+            assert_eq!(transformed["status"], "rejected");
+            assert_eq!(transformed["success"], false);
+            assert_eq!(transformed["executed"], false);
+            assert_eq!(transformed["duration_ms"], 37);
+            assert_eq!(transformed["payload_truncated"], true);
+            assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
+            assert!(transformed.get("executor").is_none());
+            assert_eq!(transformed["executor_omitted"], true);
+            assert!(encoded_json_len(&transformed) <= budget);
+            assert_eq!(
+                project_tool_terminal_presentation(transformed.clone(), budget),
+                transformed
+            );
+        }
+        let mut small = event;
+        small["executor"] = json!({"kind":"server_local"});
+        small["error_kind"] = json!("rejected");
+        let projected =
+            project_tool_terminal_presentation(small.clone(), MAX_TOOL_TERMINAL_PRESENTATION_BYTES);
+        assert_eq!(projected["executor"], small["executor"]);
+        assert!(projected.get("executor_omitted").is_none());
+        small["executor"]["extension"] = json!("x".repeat(3_000));
+        small["result"] = json!({"snapshot":"x".repeat(1_000)});
+        let budget = MAX_TOOL_TERMINAL_PRESENTATION_BYTES;
+        assert!(encoded_json_len(&small["executor"]) < budget);
+        assert!(encoded_json_len(&small["result"]) < budget);
+        assert!(encoded_json_len(&small) > budget);
+        let projected = project_tool_terminal_presentation(small.clone(), budget);
+        assert_eq!(projected["type"], "tool_call_end");
+        assert_eq!(projected["call_id"], small["call_id"]);
+        assert_eq!(projected["result"], small["result"]);
+        assert_eq!(projected["executed"], false);
+        assert_eq!(projected["status"], "rejected");
+        assert_eq!(projected["success"], false);
+        assert_eq!(projected["executor_omitted"], true);
+        assert!(encoded_json_len(&projected) <= budget);
+        assert_eq!(
+            project_tool_terminal_presentation(projected.clone(), budget),
+            projected
+        );
     }
 
     /// Covers all event types that reach the client via transform_run_event_for_client:

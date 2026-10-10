@@ -135,6 +135,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-credentials",
+ "astra-edge",
  "astra-harness",
  "astra-logging",
  "astra-mcp",
@@ -166,6 +167,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "gix",
+ "globset",
  "http",
  "inquire",
  "insta",
@@ -518,6 +520,7 @@ name = "astra-runtime-env"
 version = "0.2.11"
 dependencies = [
  "astra-core",
+ "astra-turn-types",
  "async-trait",
  "serde",
  "serde_json",
@@ -3040,6 +3043,19 @@ dependencies = [
  "gix-path",
  "gix-traverse",
  "parking_lot",
+]
+
+[[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

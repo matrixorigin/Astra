@@ -45,7 +45,7 @@ impl WorkSurfaceEventEmitter {
             return;
         };
         insert_binding_fields(&mut event, binding_fields);
-        if let Err(error) = tx.try_send(Value::Object(event)) {
+        if let Err(error) = tx.try_send(terminal_presentation(event)) {
             tracing::debug!(
                 target: "astra_runtime::work_surface",
                 session_id = %self.session_id,
@@ -65,7 +65,7 @@ impl WorkSurfaceEventEmitter {
             return;
         };
         insert_binding_fields(&mut event, binding_fields);
-        if let Err(error) = tx.send(Value::Object(event)).await {
+        if let Err(error) = tx.send(terminal_presentation(event)).await {
             tracing::debug!(
                 target: "astra_runtime::work_surface",
                 session_id = %self.session_id,
@@ -73,6 +73,20 @@ impl WorkSurfaceEventEmitter {
                 "{unavailable_label}"
             );
         }
+    }
+}
+
+fn terminal_presentation(event: Map<String, Value>) -> Value {
+    let event = Value::Object(event);
+    if event["type"] == "tool_call_end" {
+        // Leave space for the durable cursor added on replay. The largest
+        // observation window retains events up to 4 KiB each.
+        astra_services::runs::project_tool_terminal_presentation(
+            event,
+            astra_services::runs::MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+        )
+    } else {
+        event
     }
 }
 

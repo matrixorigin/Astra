@@ -157,6 +157,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/provider-interactions/respond",
             post(edge::edge_callback_handlers::post_provider_interaction_respond_handler),
         )
+        .route(
+            "/tools/interactions/request",
+            post(edge::edge_callback_handlers::post_tool_interaction_request_handler),
+        )
         .route("/chat/ws", get(ws_handler::ws_chat_handler))
         .route("/edge/ws", get(edge::edge_ws_handler::edge_ws_handler))
         .route(

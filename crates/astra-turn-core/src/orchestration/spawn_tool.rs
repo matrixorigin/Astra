@@ -118,6 +118,16 @@ pub struct WorkItemExecutionSpec {
     pub item_revision: i64,
 }
 
+/// Request a provider-owned execution tool, independently from an Astra model
+/// Offering. The current capability resolver, not this request, grants authority.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderChildExecutionRequest {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// Input for `agent(action='spawn')`.
 ///
 /// **Field order is load-bearing.** The struct is serialized to
@@ -247,9 +257,54 @@ pub struct SpawnAgentInput {
     /// JSON and is deliberately omitted from the public schema.
     #[serde(skip)]
     pub resolved_model_selection: Option<ModelSelection>,
+
+    /// Omission executes an admitted Astra model. Explicit tools must resolve
+    /// against the parent's selected provider capability surface before launch.
+    #[serde(default)]
+    pub execution: Option<ProviderChildExecutionRequest>,
+
+    /// Existing runtime-generated collaborator identity, never a native session
+    /// ID. Each continuation still has its own child run and terminal result.
+    #[serde(default)]
+    pub collaborator_id: Option<String>,
 }
 
 impl SpawnAgentInput {
+    /// Validate request identity before resolving a provider or allocating a
+    /// child. These are selectors only; tenant/capability checks belong to admission.
+    pub fn validate_execution_request(&self) -> Result<(), &'static str> {
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+        };
+        if let Some(execution) = &self.execution {
+            if !valid(&execution.tool)
+                || execution
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| !valid(model))
+            {
+                return Err(
+                    "provider execution requires bounded, non-empty tool and model selectors",
+                );
+            }
+            if self.requested_model_policy.is_some() || self.resolved_model_selection.is_some() {
+                return Err(
+                    "provider execution cannot use an Astra model Offering or model policy",
+                );
+            }
+            if self.inherit_prefix.is_some() {
+                return Err("provider execution cannot inherit an Astra model prefix");
+            }
+        }
+        if self.collaborator_id.as_deref().is_some_and(|id| !valid(id)) {
+            return Err("collaborator_id must be an exact bounded runtime identity");
+        }
+        Ok(())
+    }
+
     pub fn validate_fanout_metadata(&self) -> Result<(), String> {
         self.fanout_slot_identity().map(|_| ())
     }
@@ -344,6 +399,8 @@ impl Default for SpawnAgentInput {
             reasoning: None,
             requested_model_policy: None,
             resolved_model_selection: None,
+            execution: None,
+            collaborator_id: None,
         }
     }
 }
@@ -469,6 +526,11 @@ pub enum SpawnAgentOutput {
         agent_id: String,
         /// Immutable execution identity for the canonical child transcript.
         run_id: String,
+        /// Stable durable identity for a provider collaborator. This is an
+        /// association anchor, not the current stage's agent ID, so a later
+        /// turn can continue after a process restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collaborator_id: Option<String>,
         description: String,
         messaging_address: Option<String>,
     },
@@ -483,6 +545,7 @@ impl SpawnAgentOutput {
         Self::Launched {
             agent_id: agent_id.into(),
             run_id: run_id.into(),
+            collaborator_id: None,
             description: description.into(),
             messaging_address: None,
         }
@@ -493,6 +556,31 @@ impl SpawnAgentOutput {
 mod tests {
     use super::*;
     use astra_turn_types::ModelSelector;
+
+    #[test]
+    fn provider_execution_rejects_internal_model_policy_and_invalid_identity() {
+        let mut input = SpawnAgentInput {
+            execution: Some(ProviderChildExecutionRequest {
+                tool: "provider_agent".into(),
+                model: Some("native-model".into()),
+            }),
+            collaborator_id: Some("collaborator-1".into()),
+            ..Default::default()
+        };
+        assert!(input.validate_execution_request().is_ok());
+        input.requested_model_policy = Some(RequestedModelPolicy::Inherit);
+        assert!(input.validate_execution_request().is_err());
+        input.requested_model_policy = None;
+        for invalid in ["", " identity", "identity\n"] {
+            input.collaborator_id = Some(invalid.into());
+            assert!(input.validate_execution_request().is_err());
+        }
+        input.collaborator_id = None;
+        for invalid in ["", " tool", "tool\n"] {
+            input.execution.as_mut().unwrap().tool = invalid.into();
+            assert!(input.validate_execution_request().is_err());
+        }
+    }
 
     #[test]
     fn test_deserialize_input() {

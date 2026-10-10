@@ -685,15 +685,20 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
 pub struct RuntimeEnvironmentAdvertisement {
     pub schema_version: u32,
     pub binding: RunBinding,
+    /// Discovery facts produced by this authenticated local runtime. These
+    /// are requirements/capabilities, not permissions. Server admission must
+    /// use the selected registration's snapshot, never chat-request schemas.
+    pub provider_discovery: Vec<astra_turn_types::ProviderDiscoverySnapshot>,
 }
 
 impl RuntimeEnvironmentAdvertisement {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     pub fn new(binding: RunBinding) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             binding,
+            provider_discovery: Vec::new(),
         }
     }
 }
@@ -722,6 +727,30 @@ mod tests {
             true
         );
         assert!(value["binding"]["tool_surface"]["tool_names"].is_array());
+        assert_eq!(value["provider_discovery"], serde_json::json!([]));
+        let decoded: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(value.clone()).expect("decode current advertisement");
+        assert_eq!(
+            serde_json::to_value(decoded).expect("serialize decoded advertisement"),
+            value,
+            "wire round-trip preserves serialized facts, not skipped runtime admissions"
+        );
+        for replacement in [None, Some(serde_json::Value::Null)] {
+            let mut incomplete = value.clone();
+            let fields = incomplete.as_object_mut().expect("advertisement object");
+            match replacement {
+                None => {
+                    fields.remove("provider_discovery");
+                }
+                Some(value) => {
+                    fields.insert("provider_discovery".into(), value);
+                }
+            }
+            assert!(
+                serde_json::from_value::<RuntimeEnvironmentAdvertisement>(incomplete).is_err(),
+                "missing discovery evidence must not become an implicit empty capability set"
+            );
+        }
         assert!(
             value["binding"]["tool_surface"].get("admissions").is_none(),
             "selected provider offers are runtime evidence and must not churn prompt/runtime advertisement bytes"

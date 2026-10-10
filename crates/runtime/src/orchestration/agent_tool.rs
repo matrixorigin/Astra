@@ -157,7 +157,7 @@ fn render_spawn_agent_output(
     output: SpawnAgentOutput,
     parent_run_id: &str,
     transcript_location: AgentTranscriptLocation,
-    prepared_model: Option<&super::spawner::PreparedSpawnModelIdentity>,
+    prepared_execution: Option<&super::spawner::PreparedSpawnIdentity>,
 ) -> String {
     let SpawnAgentOutput::Launched { agent_id, .. } = &output;
     let mut value = match serde_json::to_value(&output) {
@@ -180,14 +180,8 @@ fn render_spawn_agent_output(
         "transcript_location".to_string(),
         Value::String(transcript_location.wire_value().to_string()),
     );
-    if let Some(model) = prepared_model {
-        object.insert(
-            "prepared_model".to_string(),
-            serde_json::json!({
-                "model_name": model.model_name,
-                "provenance": model.provenance,
-            }),
-        );
+    if let Some(identity) = prepared_execution {
+        object.insert("prepared_execution".into(), json!(identity));
     }
     if let Some(observation) = WorkUnitObservation::new(
         agent_id,
@@ -807,6 +801,18 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
             Err(error) => return rejected_delivery_message(error.to_string()).into(),
         };
 
+    if message_type == "question"
+        && router
+            .target_accepts_structured_requests(&target)
+            .await
+            .is_some_and(|accepts| !accepts)
+    {
+        return rejected_agent_message(
+            "the target mailbox cannot accept structured questions while its current execution is active; send concise text guidance or wait for its next agent boundary",
+        )
+        .into();
+    }
+
     // Replies must target a mailbox that actually survives long enough
     // to receive them. Interactive root execution uses a turn-scoped run_id,
     // while its mailbox is session-scoped; child/server agents normally use
@@ -966,6 +972,10 @@ struct AgentFanoutStartSlot {
     requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     #[serde(default)]
     reasoning: Option<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
+    #[serde(default)]
+    execution: Option<astra_turn_core::orchestration_spawn_tool::ProviderChildExecutionRequest>,
+    #[serde(default)]
+    collaborator_id: Option<String>,
 }
 
 /// Shared runtime configuration defaults for all slots in a fanout group.
@@ -991,6 +1001,8 @@ struct AgentFanoutDefaults {
     requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     #[serde(default)]
     reasoning: Option<astra_turn_core::orchestration_spawn_tool::ReasoningSelection>,
+    #[serde(default)]
+    execution: Option<astra_turn_core::orchestration_spawn_tool::ProviderChildExecutionRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1048,6 +1060,7 @@ const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "allowed_tools",
     "requested_model_policy",
     "reasoning",
+    "execution",
 ];
 const FANOUT_SLOT_FIELDS: &[&str] = &[
     "id",
@@ -1061,6 +1074,8 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "allowed_tools",
     "requested_model_policy",
     "reasoning",
+    "execution",
+    "collaborator_id",
 ];
 const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
     "action",
@@ -1219,6 +1234,12 @@ fn normalize_spawn_model_selection(
     input: &mut SpawnAgentInput,
     inherited: Option<&astra_turn_types::ModelSelection>,
 ) -> Result<(), String> {
+    input.validate_execution_request().map_err(str::to_string)?;
+    // Native selection and conversation continuation must resolve their own
+    // binding before considering an Astra model, never inherit by omission.
+    if input.execution.is_some() || input.collaborator_id.is_some() {
+        return Ok(());
+    }
     let omitted_before_authorized_preparation =
         input.requested_model_policy.is_none() && input.resolved_model_selection.is_none();
     let unresolved_auto = matches!(
@@ -1621,22 +1642,16 @@ async fn handle_agent_fanout_start_action_with_deadline(
         }
     };
     for (index, preparation) in preparations.iter().enumerate() {
-        let prepared_selection =
-            preparation
-                .model_identity()
-                .map(|identity| astra_turn_types::ModelSelection {
-                    offering_id: identity.offering_id,
-                });
-        if resolved_inputs[index]
-            .resolved_model_selection
-            .as_ref()
-            .zip(prepared_selection.as_ref())
-            .is_some_and(|(requested, prepared)| requested != prepared)
-        {
-            return render_agent_tool_admission_error(
-                "fanout admission resolved an Offering that conflicts with the requested selection",
-            );
-        }
+        let prepared_model = match super::spawner::prepared_model_for_input(
+            &resolved_inputs[index],
+            preparation.execution_identity(),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => return render_agent_tool_admission_error(&error.to_string()),
+        };
+        let prepared_selection = prepared_model.map(|identity| astra_turn_types::ModelSelection {
+            offering_id: identity.offering_id,
+        });
         if matches!(
             resolved_inputs[index].requested_model_policy.as_ref(),
             Some(astra_turn_types::RequestedModelPolicy::Fixed {
@@ -1710,6 +1725,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                     "requested_description": requested_description,
                     "agent_id": rendered_value.get("agent_id").cloned().unwrap_or(Value::Null),
                     "run_id": rendered_value.get("run_id").cloned().unwrap_or(Value::Null),
+                    "collaborator_id": rendered_value.get("collaborator_id").cloned().unwrap_or(Value::Null),
                     "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
                     "finish_reason": rendered_value.get("finish_reason").cloned().unwrap_or(Value::Null),
                     "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),
@@ -1717,7 +1733,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
                     "error_truncated": rendered_value.get("error_truncated").cloned().unwrap_or(Value::Null),
                     "error_kind": rendered_value.get("error_kind").cloned().unwrap_or(Value::Null),
                     "transcript_location": rendered_value.get("transcript_location").cloned().unwrap_or(Value::Null),
-                    "prepared_model": rendered_value.get("prepared_model").cloned().unwrap_or(Value::Null),
+                    "prepared_execution": rendered_value.get("prepared_execution").cloned().unwrap_or(Value::Null),
                 })
             })
         })
@@ -2031,8 +2047,8 @@ async fn render_agent_fanout_results(
             });
             // Preserve this bounded identity when a large aggregate later
             // replaces the nested result with a text preview.
-            if let Some(model) = item["result"].get("prepared_model").cloned() {
-                item["prepared_model"] = model;
+            if let Some(execution) = item["result"].get("prepared_execution").cloned() {
+                item["prepared_execution"] = execution;
             }
             if needs_recovery {
                 let object = item.as_object_mut().expect("slot result item object");
@@ -2651,6 +2667,10 @@ fn fanout_slot_spawn_input(
             .reasoning
             .or_else(|| defaults.and_then(|d| d.reasoning.clone())),
         resolved_model_selection: None,
+        execution: slot
+            .execution
+            .or_else(|| defaults.and_then(|defaults| defaults.execution.clone())),
+        collaborator_id: slot.collaborator_id,
     }
 }
 
@@ -2985,23 +3005,18 @@ async fn handle_agent_spawn_input_with_controls(
     let Some(preparation) = preparation else {
         return render_agent_tool_admission_error("spawn admission returned no preparation");
     };
-    let prepared_model = preparation.model_identity();
+    let prepared_execution = preparation.execution_identity();
+    let prepared_model =
+        match super::spawner::prepared_model_for_input(&input, prepared_execution.clone()) {
+            Ok(identity) => identity,
+            Err(error) => return render_agent_tool_admission_error(&error.to_string()),
+        };
     let prepared_selection =
         prepared_model
             .as_ref()
             .map(|identity| astra_turn_types::ModelSelection {
                 offering_id: identity.offering_id.clone(),
             });
-    if input
-        .resolved_model_selection
-        .as_ref()
-        .zip(prepared_selection.as_ref())
-        .is_some_and(|(requested, prepared)| requested != prepared)
-    {
-        return render_agent_tool_admission_error(
-            "spawn admission resolved an Offering that conflicts with the requested selection",
-        );
-    }
     if matches!(
         input.requested_model_policy.as_ref(),
         Some(astra_turn_types::RequestedModelPolicy::Fixed {
@@ -3070,7 +3085,7 @@ async fn handle_agent_spawn_input_with_controls(
             output,
             &ctx.run_id,
             ctx.transcript_location,
-            prepared_model.as_ref(),
+            prepared_execution.as_ref(),
         ),
         Ok(Err(SpawnError::ExecutorUnavailable)) => {
             render_agent_runtime_binding_error("agent", "spawn")
@@ -3375,14 +3390,8 @@ async fn enrich_collected_agent_result(
             );
         }
         object.insert("tool_calls".into(), json!(state.metrics.tool_calls));
-        if let Some(model) = state.prepared_model {
-            object.insert(
-                "prepared_model".into(),
-                json!({
-                    "model_name": model.model_name,
-                    "provenance": model.provenance,
-                }),
-            );
+        if let Some(identity) = state.prepared_execution {
+            object.insert("prepared_execution".into(), json!(identity));
         }
         let duration_ms = state
             .ended_at
@@ -3620,6 +3629,47 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn question_to_text_only_provider_stage_is_rejected_before_obligation() {
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(DelegationTracker::new()),
+        ));
+        let _sender = router
+            .register(
+                astra_messaging::types::AgentAddress::new("parent-run", "lead"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut receiver = router
+            .register_with_capabilities(
+                astra_messaging::types::AgentAddress::new("child-run", "native"),
+                Some("parent-run".into()),
+                astra_messaging::MailboxCapabilities::provider_stage_text_only(),
+            )
+            .await
+            .unwrap();
+        let obligations = crate::messaging::reply_obligations::ReplyObligations::default();
+
+        let output = handle_agent_send_message_with_router(
+            &json!({
+                "to": "native",
+                "message": "Can you confirm the provider result?",
+                "message_type": "question"
+            }),
+            &router,
+            "parent-run",
+            "lead",
+            &obligations,
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(receipt["status"], "rejected", "{receipt}");
+        assert!(!obligations.has_pending("parent-run"));
+        assert!(receiver.try_recv().is_none());
+    }
+
     #[test]
     fn rejected_delivery_explains_terminal_child_recovery_without_respawn() {
         let value: Value = serde_json::from_str(&rejected_delivery_message("agent not found"))
@@ -3678,11 +3728,13 @@ pub(crate) mod tests {
             SpawnAgentOutput::launched("reviewer-1", "run-1", "review runtime"),
             "run-parent",
             AgentTranscriptLocation::DurableServer,
-            Some(&crate::orchestration::PreparedSpawnModelIdentity {
-                offering_id: "offer-1".into(),
-                model_name: "glm-5.2".into(),
-                provenance: "prepared",
-            }),
+            Some(&crate::orchestration::PreparedSpawnIdentity::InternalModel(
+                crate::orchestration::PreparedSpawnModelIdentity {
+                    offering_id: "offer-1".into(),
+                    model_name: "glm-5.2".into(),
+                    provenance: "prepared",
+                },
+            )),
         );
         let parsed: Value = serde_json::from_str(&rendered).expect("spawn output is JSON");
         assert_eq!(agent_tool_structured_result_class(&parsed), None);
@@ -3690,7 +3742,7 @@ pub(crate) mod tests {
             decode_agent_tool_result(&parsed),
             Some(DecodedAgentToolResult::ControlReceipt(_))
         ));
-        assert_eq!(parsed["prepared_model"]["model_name"], "glm-5.2");
+        assert_eq!(parsed["prepared_execution"]["model_name"], "glm-5.2");
         assert!(parsed["instruction"].as_str().is_some_and(|instruction| {
             instruction.contains(CHILD_OUTCOME_GUIDANCE)
                 && instruction.contains("Do not claim child work is complete")
@@ -4246,12 +4298,14 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl crate::orchestration::PreparedSpawn for LargeInterruptedPrepared {
-        fn model_identity(&self) -> Option<crate::orchestration::PreparedSpawnModelIdentity> {
-            Some(crate::orchestration::PreparedSpawnModelIdentity {
-                offering_id: "offer-parent-test".into(),
-                model_name: "MiniMax-M2.7".into(),
-                provenance: "test_prepared",
-            })
+        fn execution_identity(&self) -> Option<crate::orchestration::PreparedSpawnIdentity> {
+            Some(crate::orchestration::PreparedSpawnIdentity::InternalModel(
+                crate::orchestration::PreparedSpawnModelIdentity {
+                    offering_id: "offer-parent-test".into(),
+                    model_name: "MiniMax-M2.7".into(),
+                    provenance: "test_prepared",
+                },
+            ))
         }
 
         fn launch(
@@ -6347,6 +6401,8 @@ pub(crate) mod tests {
             slot_id: Some("storage".into()),
             description: "Review storage".into(),
             prompt: "Review storage layer".into(),
+            execution: None,
+            collaborator_id: None,
             agent_type: None,
             initial_turns: None,
             max_output_tokens: None,
@@ -6618,6 +6674,8 @@ pub(crate) mod tests {
             slot_id: Some("correctness".into()),
             description: "Review correctness".into(),
             prompt: "Review correctness deeply".into(),
+            execution: None,
+            collaborator_id: None,
             agent_type: None,
             initial_turns: None,
             max_output_tokens: None,
@@ -6655,6 +6713,8 @@ pub(crate) mod tests {
             slot_id: Some("runtime".into()),
             description: "Investigate runtime".into(),
             prompt: "Investigate runtime failures".into(),
+            execution: None,
+            collaborator_id: None,
             agent_type: None,
             initial_turns: None,
             max_output_tokens: None,
@@ -6688,6 +6748,8 @@ pub(crate) mod tests {
             slot_id: Some("one".into()),
             description: "Fetch one source".into(),
             prompt: "Fetch one source and return its URL".into(),
+            execution: None,
+            collaborator_id: None,
             agent_type: None,
             initial_turns: None,
             max_output_tokens: None,
@@ -6725,6 +6787,8 @@ pub(crate) mod tests {
             slot_id: Some("correctness".into()),
             description: "Review correctness".into(),
             prompt: "Review correctness and return evidence".into(),
+            execution: None,
+            collaborator_id: None,
             agent_type: None,
             initial_turns: None,
             max_output_tokens: None,
@@ -8112,7 +8176,7 @@ pub(crate) mod tests {
                 .is_some_and(|results| {
                     results
                         .iter()
-                        .all(|item| item["prepared_model"]["model_name"] == "MiniMax-M2.7")
+                        .all(|item| item["prepared_execution"]["model_name"] == "MiniMax-M2.7")
                 }),
             "aggregate truncation must retain typed model identity: {collected_value}"
         );
@@ -8129,7 +8193,7 @@ pub(crate) mod tests {
         .await;
         let window: Value = serde_json::from_str(&window).unwrap();
         assert_eq!(
-            window["results"][0]["prepared_model"]["model_name"],
+            window["results"][0]["prepared_execution"]["model_name"],
             "MiniMax-M2.7"
         );
         assert!(

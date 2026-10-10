@@ -5063,6 +5063,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         };
         let mut denied_output = None;
+        let admission_source = if cloud_approved
+            || matches!(
+                &decision,
+                crate::cli::permission_manager::GateOutcome::NeedApproval { .. }
+            ) {
+            astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval
+        } else {
+            astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy
+        };
         let mut allowed = match decision {
             crate::cli::permission_manager::GateOutcome::Allow => true,
             crate::cli::permission_manager::GateOutcome::Deny(reason) => {
@@ -5504,6 +5513,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
                     command_timeout_cap_ms: request.command_timeout_cap_ms,
+                    admission_source: Some(admission_source),
                     ..Default::default()
                 };
                 let mut outcome = execute_with_invocation_metadata_responsive(
@@ -5700,7 +5710,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     std::sync::Arc::clone(&self.executor),
                                     tool.to_string(),
                                     args.clone(),
-                                    invocation,
+                                    astra_tools::tool_engine::ToolInvocationMetadata {
+                                        admission_source: Some(astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval),
+                                        ..invocation
+                                    },
                                     self.effective_tool_cancel_token(),
                                 )
                                 .await;
@@ -6409,6 +6422,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             turn_chain_id: Some(&turn_chain_id),
                             tool_call_id: Some(&request_id),
                             command_timeout_cap_ms,
+                            admission_source: Some(
+                                astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy,
+                            ),
                             ..Default::default()
                         };
                         let exec = catch_tool_execution_panic(
@@ -6632,6 +6648,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         turn_chain_id: Some(&req.turn_chain_id),
                         tool_call_id: Some(&req.request_id),
                         command_timeout_cap_ms: req.command_timeout_cap_ms,
+                        admission_source: Some(
+                            astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval,
+                        ),
                         ..Default::default()
                     },
                     Some(retry_cancel.clone()),
@@ -8225,6 +8244,11 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> crate::edge_tools::ToolExecutionOutcome {
+    if crate::edge_tools::is_native_collaborator_tool(&tool_name) {
+        return crate::edge_tools::ToolExecutionOutcome::error(
+            "Native collaborators require canonical child dispatch with an immutable execution grant, not a root tool callback".into(),
+        );
+    }
     if tool_name == "bash"
         && let Some(outcome) = executor
             .bash_detachable_with_metadata(&args, invocation, cancel_token.as_ref())

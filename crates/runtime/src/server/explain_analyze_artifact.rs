@@ -538,6 +538,8 @@ pub(crate) async fn persist_snapshot(
         "coverage_gaps": assessment.coverage_gaps,
         "execution_owner_generation": owner_generation,
         "events": captured.events,
+        "native_stage_observations": native_observation_events(events, expected_run_id),
+        "native_observation_coverage": "At most 16 call identities from supplied run events; absence or conflict is unknown, not evidence of no native work.",
     });
     let record = record_for_payload(
         artifact_id,
@@ -1027,6 +1029,10 @@ fn render_summary(
         "total_node_count": nodes.len(), "shown_node_count": 0, "omitted_node_count": nodes.len(),
         "nodes": [],
         "auxiliary_attempts": [],
+        "native_stage_observations": [],
+        "omitted_native_observation_count": 0,
+        "native_observation_coverage": artifact.content["native_observation_coverage"],
+        "native_observation_scope": "Stage usage is cumulative within the native stage, not current context occupancy; last request is a separate snapshot. Internal call count and health are unknown. Native usage does not enter physical-attempt cache metrics.",
         "note": "Bounded projected facts; null outcomes and measurements are unknown. Detail is available through the artifact handle at offset 0; this summary is not a pagination cursor. Child execution needs its own run evidence.",
     });
     // Reserve the mandatory envelope first, then select whole rows in one pass.
@@ -1041,7 +1047,30 @@ fn render_summary(
     }
     // Four count fields can grow by at most 20 decimal digits each on a
     // 64-bit target. Reserve that envelope growth independently of row bytes.
-    let mut budget = max_bytes.saturating_sub(minimum + 80);
+    let mut budget = max_bytes.saturating_sub(minimum + 100);
+    let native_events = native_observation_events(
+        artifact
+            .content
+            .get("native_stage_observations")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        run_id,
+    );
+    let native_count = native_events.len();
+    let mut native_retained = Vec::new();
+    for event in native_events {
+        let size = serde_json::to_vec(&event)
+            .map_err(|error| error.to_string())?
+            .len()
+            + 1;
+        if size <= budget {
+            budget -= size;
+            native_retained.push(event);
+        }
+    }
+    summary["omitted_native_observation_count"] = json!(native_count - native_retained.len());
+    summary["native_stage_observations"] = json!(native_retained);
     let mut priority = (0..nodes.len()).collect::<Vec<_>>();
     priority.sort_by_key(|index| {
         let node = &graph.nodes()[*index];
@@ -1111,6 +1140,109 @@ fn render_summary(
     Ok(output)
 }
 
+/// Select observations from the already-owned run events, never from another
+/// lookup or from bare run totals. Conflicting replays cannot become totals.
+fn native_observation_events(events: &[Value], run_id: &str) -> Vec<Value> {
+    let mut calls = std::collections::BTreeMap::<String, Option<Value>>::new();
+    for event in events {
+        let data = event.get("data").unwrap_or(event);
+        if !matches!(
+            astra_services::runs::extract_event_type(event).as_str(),
+            "tool_call_end" | "tool_result"
+        ) || data
+            .get("run_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != run_id)
+        {
+            continue;
+        }
+        let Some(call_id) = data
+            .get("call_id")
+            .or_else(|| data.get("tool_call_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+        else {
+            continue;
+        };
+        let missing = Value::Null;
+        let value = match data.get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY) {
+            Some(value) => value,
+            None if data["native_stage_observation_omitted"] == true => &missing,
+            None => continue,
+        };
+        let observation = if value.is_null() {
+            None
+        } else {
+            let Some(observation) =
+                astra_turn_types::project_native_collaborator_observation(value)
+            else {
+                continue;
+            };
+            Some(observation)
+        };
+        if let Some(existing) = calls.get_mut(call_id) {
+            if *existing != observation {
+                *existing = None;
+            }
+        } else if calls.len() < 16 {
+            calls.insert(call_id.into(), observation);
+        }
+    }
+    calls
+        .into_iter()
+        .map(|(call_id, observation)| {
+            json!({
+                "type": "tool_call_end", "run_id": run_id, "call_id": call_id,
+                "native_stage_observation": observation,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod native_observation_projection_tests {
+    use super::*;
+
+    #[test]
+    fn native_stage_replays_are_scoped_bounded_and_conflicts_stay_unknown() {
+        let observation = json!({
+            "native_session_id": "thread", "native_turn_id": "turn",
+            "dispatch_state": "acknowledged", "native_terminal": "completed",
+            "settlement_authoritative": true, "stage_inclusive_input_tokens": 30,
+            "stage_usage": {"cached_input_tokens": 10, "output_tokens": 5},
+            "last_request_input_tokens": 12, "model_context_window": 100,
+            "acknowledged_model": "model", "provider_error_code": null,
+            "provider_error_class": null,
+        });
+        let event = json!({"type":"tool_call_end", "run_id":"run", "call_id":"call", "native_stage_observation":observation});
+        let mut foreign = event.clone();
+        foreign["run_id"] = json!("foreign");
+        assert!(native_observation_events(&[foreign], "run").is_empty());
+        let replay = native_observation_events(&[event.clone(), event.clone()], "run");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0]["native_stage_observation"], observation);
+        let wrapped = json!({"event_type":"tool_result", "data":event});
+        assert_eq!(native_observation_events(&[wrapped], "run"), replay);
+        let mut conflicting = event.clone();
+        conflicting["native_stage_observation"]["stage_inclusive_input_tokens"] = json!(31);
+        let conflicted =
+            native_observation_events(&[event.clone(), conflicting, event.clone()], "run");
+        assert!(conflicted[0]["native_stage_observation"].is_null());
+        assert_eq!(native_observation_events(&conflicted, "run"), conflicted);
+        let events = (0..40)
+            .map(|index| {
+                let mut event = event.clone();
+                event["call_id"] = json!(format!("call-{index}"));
+                event
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(native_observation_events(&events, "run").len(), 16);
+        let mut oversized = event;
+        oversized["native_stage_observation"]["acknowledged_model"] = json!("x".repeat(100_000));
+        assert!(native_observation_events(&[oversized], "run").is_empty());
+    }
+}
+
 fn render_window(
     artifact: &StoredSessionArtifact,
     session_id: &str,
@@ -1167,6 +1299,9 @@ fn render_exact_run_projection(
     let projection = json!({
         "schema_version": 1,
         "observation": "exact_run_projection",
+        "usage_scope": "run_aggregate_not_current_context",
+        "tool_call_scope": "runtime_observed_invocations_not_provider_internal_calls",
+        "native_observation_scope": "native_stage_observation contains scoped stage usage and a last-request snapshot, not current context occupancy; native internal call count and health are unknown",
         "capture_status": "durable_event_projection",
         "explain_analyze_requested": astra_services::runs::run_requested_explain_analyze(run),
         "run": {
@@ -1186,6 +1321,9 @@ fn render_exact_run_projection(
             "error_message": run.error_message,
         },
         "events": events,
+        "native_stage_observations": native_observation_events(&run.events, &run.run_id),
+        "omitted_native_observation_count": 0,
+        "native_observation_coverage": "At most 16 identities from selected run events; missing or conflicting evidence remains unknown.",
         "omitted_event_count": omitted_events,
         "observed_event_count": run.events.len(),
         "total_event_count": observation.total_event_count,
@@ -1329,6 +1467,17 @@ fn render_bounded_exact_run_json(
             break;
         };
         if events.is_empty() {
+            if let Some(native) = projection["native_stage_observations"].as_array_mut()
+                && native.pop().is_some()
+            {
+                projection["omitted_native_observation_count"] =
+                    projection["omitted_native_observation_count"]
+                        .as_u64()
+                        .unwrap_or_default()
+                        .saturating_add(1)
+                        .into();
+                continue;
+            }
             break;
         }
         let remove_at = events
@@ -1356,6 +1505,8 @@ fn render_bounded_exact_run_json(
         },
         "events": [],
         "omitted_event_count": projection["omitted_event_count"],
+        "native_stage_observations": [],
+        "omitted_native_observation_count": projection["omitted_native_observation_count"],
         "note": "event window omitted; increase max_bytes",
     });
     let encoded = serde_json::to_string(&compact)
@@ -2086,10 +2237,52 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        engine.append_event("user-a", "session-a", "plain-run", json!({
-            "event_type": "tool_result",
-            "data": {"name": "large_output", "tool_call_id": "large-call", "output": "x".repeat(48 * 1024 - 128), "success": true}
-        })).await.unwrap();
+        let native_observation = json!({
+            "native_session_id": "thread", "native_turn_id": "turn",
+            "dispatch_state": "acknowledged", "native_terminal": "completed",
+            "settlement_authoritative": true, "stage_inclusive_input_tokens": 30,
+            "stage_usage": {"cached_input_tokens": 10, "output_tokens": 5},
+            "last_request_input_tokens": 12, "model_context_window": 100,
+            "acknowledged_model": "model", "provider_error_code": null,
+            "provider_error_class": null,
+        });
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user-a",
+            "session-a",
+            "plain-run",
+            "turn",
+            "large-call",
+        )
+        .unwrap();
+        let binding =
+            super::super::tool_execution_binding::ExecutionBindingState::server_sandbox(".");
+        let request =
+            binding.tool_execution_request_for_invocation(&identity, "large_output", &json!({}));
+        let mut result = astra_tools::ToolResult::text("x".repeat(48 * 1024 - 128));
+        result.metadata = Some(serde_json::Map::from_iter([(
+            "native_stage_observation".into(),
+            native_observation.clone(),
+        )]));
+        let terminal =
+            super::super::tool_route_boundary::tool_call_end_event(&request, &result, 1).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut emitter =
+            super::super::tool_work_surface_events::WorkSurfaceEventEmitter::new("session-a");
+        emitter.set_tx(tx);
+        emitter.try_emit(
+            terminal,
+            json!({"session_id": "session-a"}).as_object().unwrap(),
+            "test",
+        );
+        let terminal = rx.try_recv().unwrap();
+        assert!(serde_json::to_vec(&terminal).unwrap().len() <= 4096 - 128);
+        assert_eq!(terminal["run_id"], "plain-run");
+        assert_eq!(terminal["session_id"], "session-a");
+        assert_eq!(result.output.len(), 48 * 1024 - 128);
+        engine
+            .append_event("user-a", "session-a", "plain-run", terminal)
+            .await
+            .unwrap();
         engine
             .append_event(
                 "user-a",
@@ -2137,6 +2330,11 @@ pub(crate) mod tests {
         assert_eq!(projection["capture_status"], "durable_event_projection");
         assert_eq!(projection["run"]["run_id"], "plain-run");
         assert_eq!(projection["run"]["status"], "completed");
+        assert_eq!(
+            projection["native_stage_observations"][0]["native_stage_observation"],
+            native_observation
+        );
+        assert_eq!(projection["omitted_native_observation_count"], 0);
         assert!(output.output.contains("bash"));
         assert!(output.output.contains("42"));
         assert!(output.output.contains("run_finished"));
@@ -2208,6 +2406,7 @@ pub(crate) mod tests {
         );
         let compact_projection: Value = serde_json::from_str(&compact.output).unwrap();
         assert_eq!(compact_projection["run"]["run_id"], "plain-run");
+        assert_eq!(compact_projection["omitted_native_observation_count"], 1);
         let previous_compact = executor
             .execute_with_metadata(
                 "introspect",

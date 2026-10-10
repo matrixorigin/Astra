@@ -1259,6 +1259,14 @@ fn active_env_access_token(now_epoch: i64) -> Option<String> {
     Some(token)
 }
 
+/// Whether the token selected for a turn came from the environment bearer.
+/// Keep this decision next to `fresh_access_token` so delivery code does not
+/// reimplement expiry or precedence rules and accidentally replace it with a
+/// profile credential.
+pub(crate) fn uses_environment_access_token(token: &str) -> bool {
+    active_env_access_token(chrono::Utc::now().timestamp()).as_deref() == Some(token)
+}
+
 pub(crate) async fn fresh_access_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,

@@ -82,7 +82,8 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    if plan.runtime_process_authorization().is_none()
+    if !plan.requires_live_provider_interaction()
+        && plan.runtime_process_authorization().is_none()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {
         match try_edge_dispatch(
@@ -117,6 +118,9 @@ pub(crate) async fn execute_edge_bound(
                     .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
             }
         }
+    } else if plan.requires_live_provider_interaction() {
+        diagnostics
+            .push("edge-dispatch: collaborator stage requires live websocket delivery".to_string());
     } else if plan.runtime_process_authorization().is_some() {
         diagnostics.push(
             "edge-dispatch: process authorization requires live websocket delivery".to_string(),
@@ -369,6 +373,17 @@ async fn try_edge_websocket(
             "selected edge does not support runtime process authorization".to_string(),
         );
     }
+    let plan = match plan.bind_execution_ceiling(
+        &edge_owner_user_id,
+        &edge.edge_agent_id,
+        edge.workspace_dir.as_deref(),
+        edge.workspace_id.as_deref(),
+        edge.materialization_id.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return EdgeTransportAttempt::AdmissionRejected(reason),
+    };
+    let plan = &plan;
     let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &edge_owner_user_id,
         &request.session_id,
@@ -443,6 +458,7 @@ async fn try_edge_websocket(
     let edge_result = pool
         .execute_durably_admitted_invocation_on_connection_with_cancel(
             astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                execution_ceiling: plan.execution_ceiling(),
                 connection_user_id: &edge_owner_user_id,
                 identity: plan.identity(),
                 edge_agent_id: &edge.edge_agent_id,
@@ -450,6 +466,9 @@ async fn try_edge_websocket(
                 args: &request.args,
                 runtime_process_authorization: plan.runtime_process_authorization(),
                 timeout_secs: plan.execution_timeout_secs(),
+                execution_deadline_unix_ms: plan.execution_deadline_unix_ms(),
+                execution_timeout_ms: plan.execution_timeout_ms(),
+                command_timeout_cap_ms: plan.command_timeout_cap_ms(),
                 cancel_token,
             },
         )
@@ -644,6 +663,17 @@ async fn try_edge_dispatch(
             false,
         ));
     }
+    let plan = match plan.bind_execution_ceiling(
+        &agent.user_id,
+        &agent.edge_agent_id,
+        agent.worktree_path.as_deref(),
+        agent.workspace_id.as_deref(),
+        agent.materialization_id.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return EdgeTransportAttempt::AdmissionRejected(reason),
+    };
+    let plan = &plan;
     let request_id = plan.dispatch_request_id().to_string();
     // Use the edge owner's user_id (from the registry record) for the dispatch
     // identity, not the request user_id. The edge relay polls its own user_id,

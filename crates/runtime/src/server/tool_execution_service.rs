@@ -942,6 +942,21 @@ impl ToolExecutionService {
                 ),
             )));
         }
+        // A selected Edge provider offer is already an authenticated,
+        // schema-bound execution admission.  It may intentionally be absent
+        // from the process-wide builtin registry; asking the builtin surface
+        // to authorize it again turns every dynamic provider contract into
+        // UnknownTool before the Edge capability check can verify the exact
+        // provider snapshot.  Keep local policy above and let the Edge route
+        // perform the provider-specific binding/availability check below.
+        if request
+            .selected_offer
+            .as_ref()
+            .is_some_and(|offer| matches!(offer.route, ToolExecutionRouteKind::EdgeBound))
+            && request.policy.resolved_provider_policy.is_some()
+        {
+            return Ok(binding);
+        }
         match astra_runtime_env::CapabilityResolver.check_tool_call_for_surface(
             &self.tool_registry,
             &request.tool_name,

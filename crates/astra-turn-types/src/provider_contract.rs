@@ -23,6 +23,324 @@ pub const STABLE_TOOL_ALIAS_SCHEMA_KEY: &str = "x-astra-stable-tool-alias";
 /// consumers must never infer it from a runtime-qualified tool name.
 pub const STABLE_TOOL_ALIAS_METADATA_KEY: &str = "astra/stableToolAlias";
 
+pub const PROVIDER_RUNTIME_REQUIREMENTS_KEY: &str = "astra.runtimeRequirements";
+
+/// Bounded observation of one native stage, not execution authority or a
+/// physical model-attempt receipt. Internal tool activity is not reported by
+/// this protocol and must not be inferred from the outer invocation result.
+pub const NATIVE_COLLABORATOR_OBSERVATION_KEY: &str = "native_stage_observation";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCollaboratorObservation {
+    pub native_session_id: Option<String>,
+    pub native_turn_id: Option<String>,
+    pub dispatch_state: NativeStageDispatchState,
+    pub native_terminal: Option<String>,
+    pub settlement_authoritative: bool,
+    pub stage_inclusive_input_tokens: Option<u64>,
+    pub stage_usage: Option<crate::CanonicalTokenUsage>,
+    pub last_request_input_tokens: Option<u64>,
+    pub model_context_window: Option<u64>,
+    pub acknowledged_model: Option<String>,
+    pub provider_error_code: Option<i64>,
+    pub provider_error_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeStageDispatchState {
+    Acknowledged,
+    Unknown,
+    NotDispatched,
+}
+
+/// One projection used by the producer, durable event and external observation
+/// boundaries. No provider payload, prompt or unbounded error string survives.
+pub fn project_native_collaborator_observation(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if object.len() > 12
+        || object.iter().any(|(key, value)| {
+            key.len() > 64 || value.as_str().is_some_and(|text| text.len() > 256)
+        })
+        || object.get("stage_usage").is_some_and(|usage| {
+            !usage.is_null()
+                && !usage
+                    .as_object()
+                    .is_some_and(|usage| usage.len() <= 6 && usage.values().all(Value::is_u64))
+        })
+    {
+        return None;
+    }
+    let observation = NativeCollaboratorObservation::deserialize(value).ok()?;
+    if matches!(
+        observation.dispatch_state,
+        NativeStageDispatchState::Acknowledged
+    ) && (observation
+        .native_session_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || observation
+            .native_turn_id
+            .as_deref()
+            .is_none_or(str::is_empty))
+    {
+        return None;
+    }
+    if observation
+        .stage_inclusive_input_tokens
+        .is_some_and(|input| {
+            input > i64::MAX as u64
+                || observation.stage_usage.is_some_and(|usage| {
+                    [
+                        usage.input_tokens(),
+                        usage.cached_input_tokens(),
+                        usage.cache_creation_tokens(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .try_fold(0_u64, u64::checked_add)
+                    .is_none_or(|known| known > input)
+                })
+        })
+    {
+        return None;
+    }
+    let projected = serde_json::to_value(observation).ok()?;
+    (serde_json::to_vec(&projected).ok()?.len() <= 4096).then_some(projected)
+}
+
+#[cfg(test)]
+mod native_observation_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_native_observation_is_bounded_nullable_and_not_authority() {
+        let value = serde_json::json!({
+            "native_session_id": "thread", "native_turn_id": "turn",
+            "dispatch_state": "acknowledged", "native_terminal": "completed",
+            "settlement_authoritative": true,
+            "stage_inclusive_input_tokens": 30,
+            "stage_usage": {"cached_input_tokens": 10, "output_tokens": 5},
+            "last_request_input_tokens": 12, "model_context_window": 100,
+            "acknowledged_model": "model", "provider_error_code": null,
+            "provider_error_class": null,
+        });
+        assert_eq!(
+            project_native_collaborator_observation(&value),
+            Some(value.clone())
+        );
+        for (key, invalid) in [
+            ("native_session_id", Value::Null),
+            ("native_turn_id", Value::String(String::new())),
+            ("acknowledged_model", Value::String("x".repeat(257))),
+            ("stage_inclusive_input_tokens", serde_json::json!(9)),
+            (
+                "stage_usage",
+                serde_json::json!({"cached_input_tokens": -1}),
+            ),
+            (
+                "stage_usage",
+                serde_json::json!({"cached_input_tokens": {"raw":"payload"}}),
+            ),
+        ] {
+            let mut invalid_value = value.clone();
+            invalid_value[key] = invalid;
+            assert!(
+                project_native_collaborator_observation(&invalid_value).is_none(),
+                "{key}"
+            );
+        }
+        let mut unknown = value;
+        unknown["dispatch_state"] = serde_json::json!("unknown");
+        unknown["native_turn_id"] = Value::Null;
+        unknown["stage_inclusive_input_tokens"] = Value::Null;
+        unknown["stage_usage"] = Value::Null;
+        assert!(project_native_collaborator_observation(&unknown).is_some());
+        unknown["raw_provider_payload"] = serde_json::json!("not permitted");
+        assert!(project_native_collaborator_observation(&unknown).is_none());
+    }
+}
+/// Lossless provider-owned model evidence. Keep this in the existing
+/// extension map so peers that do not project the typed catalog still retain
+/// it when they recompute the discovery snapshot hash.
+pub const PROVIDER_MODEL_CATALOG_KEY: &str = "astra.modelCatalog";
+
+/// Typed declaration marker for a provider capacity that can continue an
+/// agent stage.  This is deliberately separate from `task_support`: ordinary
+/// asynchronous tools may require task support without being a collaborator
+/// transport.
+pub const PROVIDER_COLLABORATOR_STAGE_KEY: &str = "astra.collaboratorStage";
+
+/// Maximum number of provider-owned model records retained in one discovery
+/// snapshot. The catalog is capability evidence, not an unbounded provider
+/// response cache.
+pub const MAX_PROVIDER_MODEL_CATALOG_ITEMS: usize = 512;
+/// Bound provider-owned model evidence for transport and execution. Prompt
+/// publication has its own smaller budget; it must not make an otherwise
+/// valid exact provider selector unexecutable.
+pub const MAX_PROVIDER_MODEL_CATALOG_BYTES: usize = 192 * 1024;
+
+/// Installed-provider dependencies, not an authorization grant. The local
+/// runtime owner supplies these facts; canonical admission approves them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRuntimeRequirements {
+    pub executable: String,
+    pub read_paths: Vec<String>,
+}
+
+/// One model selector exposed by a provider-owned execution capacity.
+/// `selector` is the exact value sent back to that provider. Display names
+/// and aliases are evidence for model-side selection only; Astra never turns
+/// them into an Offering or guesses a nearby model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelDescriptor {
+    pub selector: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Bounded, provider-owned model capability evidence captured during
+/// discovery. It is deliberately optional: providers without a portable
+/// catalog can still execute their default model, while explicit selection
+/// must then be resolved by that provider's own adapter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelCatalog {
+    pub models: Vec<ProviderModelDescriptor>,
+    /// `false` means discovery/authentication succeeded but the provider's
+    /// model directory was not available for this snapshot.  It is distinct
+    /// from `None` on a declaration, which means the protocol does not publish
+    /// a portable catalog at all.
+    #[serde(default = "default_complete_model_catalog")]
+    pub complete: bool,
+}
+
+fn default_complete_model_catalog() -> bool {
+    true
+}
+
+impl ProviderModelCatalog {
+    pub fn new(models: Vec<ProviderModelDescriptor>) -> Result<Self, ProviderContractError> {
+        let catalog = Self {
+            models,
+            complete: true,
+        };
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    pub fn unavailable() -> Self {
+        Self {
+            models: Vec::new(),
+            complete: false,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderContractError> {
+        if self.models.len() > MAX_PROVIDER_MODEL_CATALOG_ITEMS {
+            return Err(ProviderContractError::InvalidModelCatalog(
+                "model catalog exceeds its bounded item limit".into(),
+            ));
+        }
+        let mut selectors_and_aliases = BTreeSet::new();
+        for model in &self.models {
+            let valid = |value: &str| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.trim() == value
+                    && !value.chars().any(char::is_control)
+            };
+            if !valid(&model.selector)
+                || !valid(&model.display_name)
+                || model.aliases.len() > 16
+                || model.aliases.iter().any(|alias| !valid(alias))
+                || model.reasoning_efforts.len() > 16
+                || model.reasoning_efforts.iter().any(|effort| !valid(effort))
+                || !selectors_and_aliases.insert(model.selector.clone())
+            {
+                return Err(ProviderContractError::InvalidModelCatalog(
+                    "model catalog contains an invalid or duplicate model".into(),
+                ));
+            }
+            for alias in &model.aliases {
+                if alias != &model.selector && !selectors_and_aliases.insert(alias.clone()) {
+                    return Err(ProviderContractError::InvalidModelCatalog(
+                        "model catalog contains a duplicate selector or alias".into(),
+                    ));
+                }
+            }
+        }
+        if !self.complete && !self.models.is_empty() {
+            return Err(ProviderContractError::InvalidModelCatalog(
+                "an incomplete model catalog must not contain model records".into(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_PROVIDER_MODEL_CATALOG_BYTES {
+            return Err(ProviderContractError::InvalidModelCatalog(
+                "model catalog exceeds its serialized byte limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return only provider-declared visible models for model-facing context.
+    /// Execution retains hidden entries for exact provider validation.
+    pub fn visible_models(&self, limit: usize) -> impl Iterator<Item = &ProviderModelDescriptor> {
+        self.models
+            .iter()
+            .filter(move |model| self.complete && !model.hidden)
+            .take(limit)
+    }
+}
+
+impl ProviderRuntimeRequirements {
+    pub fn from_extension_fields(
+        fields: &Map<String, Value>,
+    ) -> Result<Option<Self>, ProviderContractError> {
+        let Some(value) = fields.get(PROVIDER_RUNTIME_REQUIREMENTS_KEY) else {
+            return Ok(None);
+        };
+        let requirements: Self = serde_json::from_value(value.clone())
+            .map_err(|_| ProviderContractError::InvalidRuntimeRequirements)?;
+        let bounded = |path: &str| {
+            !path.trim().is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
+        };
+        if !bounded(&requirements.executable)
+            || requirements.read_paths.len() > 32
+            || requirements.read_paths.iter().any(|path| !bounded(path))
+            || requirements
+                .read_paths
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                > 16 * 1024
+        {
+            return Err(ProviderContractError::InvalidRuntimeRequirements);
+        }
+        // Platform path resolution and sensitive/bootstrap classification
+        // belong to the selected local owner, not this portable wire type.
+        Ok(Some(requirements))
+    }
+}
+
 macro_rules! non_empty_id {
     ($name:ident, $kind:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -260,6 +578,8 @@ pub struct ResolvedToolDescriptorDraft {
     pub schema_hash: String,
     pub claims: ResolvedProviderToolClaims,
     pub task_support: ProviderTaskSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ProviderModelCatalog>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extension_fields: Map<String, Value>,
     pub semantic_baseline: ResolvedToolSemantics,
@@ -281,6 +601,8 @@ pub struct ResolvedToolDescriptor {
     pub schema_hash: String,
     pub claims: ResolvedProviderToolClaims,
     pub task_support: ProviderTaskSupport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog: Option<ProviderModelCatalog>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extension_fields: Map<String, Value>,
     pub semantic_baseline: ResolvedToolSemantics,
@@ -312,6 +634,7 @@ impl ResolvedToolDescriptor {
             schema_hash: draft.schema_hash,
             claims: draft.claims,
             task_support: draft.task_support,
+            model_catalog: draft.model_catalog,
             extension_fields: draft.extension_fields,
             semantic_baseline: draft.semantic_baseline,
             provider_snapshot,
@@ -331,6 +654,7 @@ impl ResolvedToolDescriptor {
             schema_hash: self.schema_hash.clone(),
             claims: self.claims.clone(),
             task_support: self.task_support,
+            model_catalog: self.model_catalog.clone(),
             extension_fields: self.extension_fields.clone(),
             semantic_baseline: self.semantic_baseline.clone(),
         }
@@ -410,6 +734,156 @@ pub enum ProviderTaskSupport {
     Required,
 }
 
+/// Maximum serialized size of one semantic input sent to an active provider
+/// stage.  Inputs are control messages, not a second transcript; large
+/// context belongs in an existing artifact or the next stage request.
+pub const MAX_PROVIDER_STAGE_INPUT_BYTES: usize = 32 * 1024;
+
+/// Provider-neutral input that can be delivered at a safe boundary of an
+/// active collaborator run.  The canonical run/message owner supplies the
+/// identity; adapters only translate this value to their wire protocol.
+///
+/// This is deliberately smaller than [`AgentMessage`].  Progress, shutdown,
+/// and permission traffic keep their existing owners and must not be smuggled
+/// into a provider's user prompt. Structured provider questions and answers
+/// continue through the existing interaction-gate contract; this type only
+/// represents an unsolicited text supplement to an active turn.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderStageInput {
+    Text {
+        /// Stable logical identity used to deduplicate a retry after a
+        /// transport acknowledgement becomes unknown.
+        input_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        /// The adapter fills this from its currently acknowledged turn when
+        /// the canonical owner has not observed one yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_turn_id: Option<String>,
+    },
+}
+
+impl ProviderStageInput {
+    pub fn input_id(&self) -> &str {
+        let Self::Text { input_id, .. } = self;
+        input_id
+    }
+
+    pub fn expected_turn_id(&self) -> Option<&str> {
+        let Self::Text {
+            expected_turn_id, ..
+        } = self;
+        expected_turn_id.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderContractError> {
+        let valid_id = |value: &str| !value.trim().is_empty() && value == value.trim();
+        if !valid_id(self.input_id()) {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "input_id must be a non-empty identifier".into(),
+            ));
+        }
+        let Self::Text { content, .. } = self;
+        if content.trim().is_empty() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "text input must not be empty".into(),
+            ));
+        }
+        if self
+            .expected_turn_id()
+            .is_some_and(|turn_id| !valid_id(turn_id))
+        {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "expected_turn_id must be a non-empty identifier".into(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_PROVIDER_STAGE_INPUT_BYTES {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "provider stage input exceeds its byte budget".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Evidence returned by the provider adapter for one stage input. `accepted`
+/// is the only provider-level decision. A missing acknowledgement is a
+/// transport failure and is handled by the caller's bounded retry path; it is
+/// not another business state. Acceptance does not claim that a model has
+/// already emitted a response; durable application remains owned by the
+/// existing run-control facts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderStageInputAck {
+    pub input_id: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ProviderStageInputAck {
+    pub fn accepted(input: &ProviderStageInput, provider_turn_id: Option<String>) -> Self {
+        Self {
+            input_id: input.input_id().to_owned(),
+            accepted: true,
+            provider_turn_id,
+            reason: None,
+        }
+    }
+
+    pub fn rejected(input: &ProviderStageInput, reason: impl Into<String>) -> Self {
+        Self {
+            input_id: input.input_id().to_owned(),
+            accepted: false,
+            provider_turn_id: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn validate_for(&self, input: &ProviderStageInput) -> Result<(), ProviderContractError> {
+        if self.input_id != input.input_id() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "input acknowledgement does not match input_id".into(),
+            ));
+        }
+        if self.accepted && self.reason.is_some() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "accepted input acknowledgement must not carry a rejection reason".into(),
+            ));
+        }
+        if !self.accepted && self.provider_turn_id.is_some() {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "rejected input acknowledgement must not carry a provider turn".into(),
+            ));
+        }
+        if self
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.len() > 4096)
+        {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "input acknowledgement reason exceeds its byte budget".into(),
+            ));
+        }
+        if self
+            .provider_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| turn_id.trim().is_empty() || turn_id != turn_id.trim())
+        {
+            return Err(ProviderContractError::InvalidProviderStageInput(
+                "provider_turn_id must be a non-empty identifier".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Losslessly normalized tool declaration before Astra policy resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolDeclaration {
@@ -435,6 +909,28 @@ pub struct ProviderToolDeclaration {
 }
 
 impl ProviderToolDeclaration {
+    /// Decode the provider-owned model evidence from the lossless extension
+    /// map. The declaration remains the single source of truth; resolved
+    /// descriptors may cache the typed value only after snapshot validation.
+    pub fn model_catalog(&self) -> Result<Option<ProviderModelCatalog>, ProviderContractError> {
+        let Some(value) = self.extension_fields.get(PROVIDER_MODEL_CATALOG_KEY) else {
+            return Ok(None);
+        };
+        let catalog: ProviderModelCatalog = serde_json::from_value(value.clone())
+            .map_err(|error| ProviderContractError::InvalidModelCatalog(error.to_string()))?;
+        catalog.validate()?;
+        Ok(Some(catalog))
+    }
+
+    pub fn is_collaborator_stage(&self) -> bool {
+        self.task_support == ProviderTaskSupport::Required
+            && self
+                .extension_fields
+                .get(PROVIDER_COLLABORATOR_STAGE_KEY)
+                .and_then(Value::as_bool)
+                == Some(true)
+    }
+
     pub fn validate(&self) -> Result<(), ProviderContractError> {
         if self.native_tool_name.trim().is_empty() {
             return Err(ProviderContractError::EmptyIdentifier {
@@ -468,6 +964,7 @@ impl ProviderToolDeclaration {
                 field: "output_schema",
             });
         }
+        self.model_catalog()?;
         for source in [
             self.claims.read_only.as_ref().map(|claim| &claim.source),
             self.claims.destructive.as_ref().map(|claim| &claim.source),
@@ -844,6 +1341,13 @@ pub struct ProviderInteractionRequest {
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// The provider-stage input that was still awaiting its steer ACK when
+    /// this interaction arrived. It is an internal coordination fact, not
+    /// provider business payload; the server uses it only as a provisional
+    /// durable fence and applies current-run guidance only after an accepted
+    /// provider steer ACK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_stage_input_id: Option<String>,
 }
 
 impl ProviderInteractionRequest {
@@ -868,6 +1372,17 @@ impl ProviderInteractionRequest {
                 "timeout_ms must be between 1 and {}",
                 Self::MAX_TIMEOUT_MS
             )));
+        }
+        if self
+            .provider_stage_input_id
+            .as_deref()
+            .is_some_and(|input_id| {
+                input_id.trim().is_empty() || input_id != input_id.trim() || input_id.len() > 512
+            })
+        {
+            return Err(ProviderContractError::InvalidProviderInteraction(
+                "provider_stage_input_id must be a bounded identifier".into(),
+            ));
         }
         Ok(())
     }
@@ -970,10 +1485,16 @@ impl ProviderCallOutcome {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProviderContractError {
+    #[error("invalid installed-provider runtime requirements")]
+    InvalidRuntimeRequirements,
+    #[error("invalid provider model catalog: {0}")]
+    InvalidModelCatalog(String),
     #[error("{kind} must not be empty")]
     EmptyIdentifier { kind: &'static str },
     #[error("invalid provider interaction: {0}")]
     InvalidProviderInteraction(String),
+    #[error("invalid provider stage input: {0}")]
+    InvalidProviderStageInput(String),
     #[error("duplicate native tool id '{native_tool_id}' in provider snapshot")]
     DuplicateNativeToolId { native_tool_id: String },
     #[error("tool '{native_tool_id}' {field} must be a JSON object")]
@@ -1117,6 +1638,79 @@ mod tests {
         assert!(ProviderIdentity::new("  ").is_err());
         let parsed = serde_json::from_str::<ProviderBindingRef>(r#"""#);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn provider_model_catalog_is_bounded_and_preserves_capability_evidence() {
+        let catalog = ProviderModelCatalog::new(vec![ProviderModelDescriptor {
+            selector: "provider-model-v2".into(),
+            display_name: "Provider Model V2".into(),
+            aliases: vec!["v2".into()],
+            reasoning_efforts: vec!["high".into()],
+            hidden: false,
+        }])
+        .unwrap();
+        assert_eq!(catalog.visible_models(8).count(), 1);
+        let encoded = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(encoded["models"][0]["selector"], "provider-model-v2");
+        assert_eq!(encoded["models"][0]["aliases"][0], "v2");
+        assert_eq!(encoded["models"][0]["reasoning_efforts"][0], "high");
+
+        assert!(
+            ProviderModelCatalog::new(
+                (0..=MAX_PROVIDER_MODEL_CATALOG_ITEMS)
+                    .map(|index| ProviderModelDescriptor {
+                        selector: format!("model-{index}"),
+                        display_name: format!("Model {index}"),
+                        aliases: Vec::new(),
+                        reasoning_efforts: Vec::new(),
+                        hidden: false,
+                    })
+                    .collect()
+            )
+            .is_err()
+        );
+
+        let larger_catalog = ProviderModelCatalog::new(
+            (0..150)
+                .map(|index| ProviderModelDescriptor {
+                    selector: format!("provider-model-{index}"),
+                    display_name: "x".repeat(256),
+                    aliases: vec![format!("provider-alias-{index}")],
+                    reasoning_efforts: vec!["high".into()],
+                    hidden: false,
+                })
+                .collect(),
+        );
+        assert!(larger_catalog.is_ok());
+    }
+
+    #[test]
+    fn model_catalog_extension_is_lossless_in_discovery_snapshot() {
+        let catalog = ProviderModelCatalog::new(vec![ProviderModelDescriptor {
+            selector: "provider-model-v2".into(),
+            display_name: "Provider Model V2".into(),
+            aliases: vec!["v2".into()],
+            reasoning_efforts: vec!["high".into()],
+            hidden: false,
+        }])
+        .unwrap();
+        let mut tool = declaration("native", json!({"type": "object"}));
+        tool.extension_fields.insert(
+            PROVIDER_MODEL_CATALOG_KEY.into(),
+            serde_json::to_value(&catalog).unwrap(),
+        );
+        let snapshot = snapshot(vec![tool]);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            encoded["tool_declarations"][0]["extension_fields"][PROVIDER_MODEL_CATALOG_KEY],
+            serde_json::to_value(&catalog).unwrap()
+        );
+        let decoded: ProviderDiscoverySnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.tool_declarations[0].model_catalog().unwrap(),
+            Some(catalog)
+        );
     }
 
     #[test]
@@ -1281,6 +1875,7 @@ mod tests {
                 "options": [{"opaque": "value"}],
             }),
             timeout_ms: Some(600_000),
+            provider_stage_input_id: None,
         };
         request.validate().unwrap();
 
@@ -1299,6 +1894,7 @@ mod tests {
             request_id: "interaction-1".to_string(),
             payload: json!({}),
             timeout_ms: None,
+            provider_stage_input_id: None,
         };
 
         for response in [
@@ -1320,5 +1916,71 @@ mod tests {
         ] {
             assert!(response.validate_for(&request).is_err());
         }
+    }
+
+    #[test]
+    fn provider_stage_input_is_bounded_and_acknowledgements_are_fenced() {
+        let input = ProviderStageInput::Text {
+            input_id: "message-1".into(),
+            content: "please continue with the failing test".into(),
+            correlation_id: Some("turn-1".into()),
+            expected_turn_id: Some("turn-7".into()),
+        };
+        input.validate().unwrap();
+        let encoded = serde_json::to_vec(&input).unwrap();
+        assert!(encoded.len() <= MAX_PROVIDER_STAGE_INPUT_BYTES);
+
+        let ack = ProviderStageInputAck::accepted(&input, Some("turn-7".into()));
+        ack.validate_for(&input).unwrap();
+        let wrong = ProviderStageInputAck {
+            input_id: "message-2".into(),
+            ..ack
+        };
+        assert!(wrong.validate_for(&input).is_err());
+        assert!(
+            ProviderStageInputAck {
+                input_id: input.input_id().into(),
+                accepted: true,
+                provider_turn_id: None,
+                reason: Some("not actually accepted".into()),
+            }
+            .validate_for(&input)
+            .is_err()
+        );
+        assert!(
+            ProviderStageInputAck {
+                input_id: input.input_id().into(),
+                accepted: false,
+                provider_turn_id: Some("turn-7".into()),
+                reason: Some("rejected".into()),
+            }
+            .validate_for(&input)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_stage_input_rejects_empty_and_oversized_content() {
+        assert!(
+            ProviderStageInput::Text {
+                input_id: "message-1".into(),
+                content: "   ".into(),
+                correlation_id: None,
+                expected_turn_id: None,
+            }
+            .validate()
+            .is_err()
+        );
+
+        assert!(
+            ProviderStageInput::Text {
+                input_id: "message-1".into(),
+                content: "x".repeat(MAX_PROVIDER_STAGE_INPUT_BYTES),
+                correlation_id: None,
+                expected_turn_id: None,
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

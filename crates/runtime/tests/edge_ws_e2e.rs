@@ -393,6 +393,12 @@ async fn ws_auth(
         "edge authentication failed: {resp_json}"
     );
     assert_eq!(resp_json["user_id"], "test-user-1");
+    assert!(
+        resp_json["edge_id"]
+            .as_str()
+            .is_some_and(|edge_id| edge_id.starts_with("ws-")),
+        "successful authentication must return the server-owned registry identity: {resp_json}"
+    );
 
     ws
 }
@@ -604,9 +610,13 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
+        execution_ceiling: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
         timeout_secs: 30,
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(
@@ -664,9 +674,13 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         delivery_generation: 9,
         tool: "bash".to_string(),
         args: json!({"command": "effect"}),
+        execution_ceiling: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
         timeout_secs: 30,
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(

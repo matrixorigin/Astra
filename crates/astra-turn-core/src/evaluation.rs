@@ -3734,7 +3734,7 @@ pub fn eval_signal_to_json_with_thresholds(
         }),
         EvalSignal::AllToolsHealthy => json!({
             "kind": "all_tools_healthy",
-            "message": "All tool calls completed successfully with non-empty output",
+            "message": "All runtime-observed tool invocations completed successfully with non-empty output; provider-internal calls are not covered",
         }),
         EvalSignal::NoOpToolResults(count) => json!({
             "kind": "noop_tool_results",

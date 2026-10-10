@@ -551,6 +551,8 @@ pub struct RunStartContext {
     /// Exact runtime child instance, distinct from its reusable agent profile.
     /// Only an internal child admission may establish this recovery identity.
     pub(crate) child_runtime_id: Option<String>,
+    /// Trusted prepared-stage admission, never taken from execution_metadata.
+    pub(crate) collaborator_stage: Option<astra_services::runs::CollaboratorStageAdmission>,
     pub execution_restrictions: Option<astra_services::runs::DurableExecutionRestrictions>,
     pub admission_source: Option<astra_services::runs::DurableAdmissionSource>,
     pub(crate) execution_authentication:
@@ -604,6 +606,7 @@ impl Default for RunStartContext {
             skill_auto_route_policy: SkillAutoRouteExecutionPolicy::default(),
             execution_metadata: None,
             child_runtime_id: None,
+            collaborator_stage: None,
             execution_restrictions: None,
             admission_source: None,
             execution_authentication: None,
@@ -767,13 +770,18 @@ fn durable_model_identity(
 fn inherit_parent_run_identity(
     context: &mut RunStartContext,
     parent: &DurableRunRecord,
+    inherit_model_identity: bool,
 ) -> Result<(), String> {
-    match (
+    let parent_model_identity = match (
         parent.model_offering_id.as_deref(),
         parent.resolved_model_name.as_deref(),
     ) {
-        (None, None) => Ok(()),
-        (Some(offering_id), Some(model_name)) => {
+        (None, None) => None,
+        (Some(offering_id), Some(model_name)) => Some((offering_id, model_name)),
+        _ => return Err("durable parent run contains an incomplete model identity".to_string()),
+    };
+    if inherit_model_identity {
+        if let Some((offering_id, model_name)) = parent_model_identity {
             match (
                 context.model_selection.as_ref(),
                 context.resolved_model_selection.as_ref(),
@@ -787,19 +795,22 @@ fn inherit_parent_run_identity(
                         model_name: model_name.to_string(),
                         source_identity: None,
                     });
-                    Ok(())
                 }
                 (Some(_), Some(_)) if context.model_identity_admitted => {
-                    durable_model_identity(context).map(|_| ())
+                    durable_model_identity(context).map(|_| ())?;
                 }
-                _ => Err(
+                _ => return Err(
                     "child run model identity must be inherited or contain one matching admitted Offering and resolved model"
                         .to_string(),
                 ),
             }
+        } else if context.model_selection.is_some() || context.resolved_model_selection.is_some() {
+            return Err(
+                "child run model identity must be inherited or contain one matching admitted Offering and resolved model"
+                    .to_string(),
+            );
         }
-        _ => Err("durable parent run contains an incomplete model identity".to_string()),
-    }?;
+    }
 
     let parent_authentication = parent
         .execution_authentication()
@@ -1086,6 +1097,7 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
                 && key != "generation_controls"
                 && key != "delegated_model_requirements"
                 && key != "child_runtime_id"
+                && key != "collaborator_stage"
                 && key != "profile_authority"
                 && key != "delegation_authority"
             {
@@ -1864,9 +1876,34 @@ impl RunEngine {
         delegation_id: Option<&str>,
         agent_id: Option<&str>,
         retry_of: Option<&str>,
-        context: RunStartContext,
+        mut context: RunStartContext,
         execution_deadline: Option<tokio::time::Instant>,
     ) -> Result<RunExecutionAuthority, String> {
+        if let Some(stage) = context.collaborator_stage.take() {
+            let receipt = self
+                .admit_collaborator_stage(
+                    run_id,
+                    user_id,
+                    session_id,
+                    parent_run_id.ok_or("collaborator stage requires a parent run")?,
+                    agent_id.ok_or("collaborator stage requires a child identity")?,
+                    context,
+                    stage,
+                    execution_deadline,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            // The supervisor must resolve an idempotent receipt before launch.
+            // This authority-only entrypoint cannot turn it into a new lease.
+            if receipt.replayed || receipt.run_id != run_id {
+                return Err(
+                    "collaborator stage was already admitted; no new execution authority".into(),
+                );
+            }
+            return Ok(RunExecutionAuthority {
+                owner_generation: receipt.owner_generation,
+            });
+        }
         let build_record = self.build_run_start_record(
             run_id,
             user_id,
@@ -1876,6 +1913,7 @@ impl RunEngine {
             agent_id,
             retry_of,
             context,
+            true,
         );
         let record = match execution_deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, build_record)
@@ -1898,6 +1936,48 @@ impl RunEngine {
         Ok(RunExecutionAuthority { owner_generation })
     }
 
+    /// Admit one stage through the same run-record construction and store as
+    /// ordinary children. A replay receipt identifies an existing run; it is
+    /// not fresh execution authority and must never launch another process.
+    pub(crate) async fn admit_collaborator_stage(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        agent_id: &str,
+        context: RunStartContext,
+        admission: astra_services::runs::CollaboratorStageAdmission,
+        execution_deadline: Option<tokio::time::Instant>,
+    ) -> Result<
+        astra_services::runs::CollaboratorStageReceipt,
+        astra_services::runs::CollaboratorStoreError,
+    > {
+        let build_record = self.build_run_start_record(
+            run_id,
+            user_id,
+            session_id,
+            Some(parent_run_id),
+            None,
+            Some(agent_id),
+            None,
+            context,
+            false,
+        );
+        let record = match execution_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, build_record)
+                .await
+                .map_err(|_| astra_services::runs::CollaboratorStoreError::DeadlineExpired)??,
+            None => build_record.await?,
+        };
+        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(astra_services::runs::CollaboratorStoreError::DeadlineExpired);
+        }
+        self.store
+            .insert_run_with_collaborator_stage(record, admission, execution_deadline)
+            .await
+    }
+
     /// Atomically claim a provider-selected run identity or observe the
     /// immutable session already bound by a concurrent/retried request.
     pub async fn claim_run_with_context(
@@ -1909,7 +1989,9 @@ impl RunEngine {
         context: RunStartContext,
     ) -> Result<DurableRunStartClaim, String> {
         let record = self
-            .build_run_start_record(run_id, user_id, session_id, None, None, None, None, context)
+            .build_run_start_record(
+                run_id, user_id, session_id, None, None, None, None, context, true,
+            )
             .await?;
         self.store
             .claim_run_start(record, requested_session_id)
@@ -1926,13 +2008,23 @@ impl RunEngine {
         agent_id: Option<&str>,
         retry_of: Option<&str>,
         mut context: RunStartContext,
+        inherit_parent_model_identity: bool,
     ) -> Result<DurableRunRecord, String> {
         let now = chrono::Utc::now().to_rfc3339();
         let (root_run_id, ancestor_path, depth) = if let Some(parent_run_id) = parent_run_id {
             let parent = self
                 .require_delegation_parent(user_id, session_id, parent_run_id)
                 .await?;
-            inherit_parent_run_identity(&mut context, &parent)?;
+            if !inherit_parent_model_identity
+                && (context.model_selection.is_some()
+                    || context.resolved_model_selection.is_some()
+                    || context.requested_model_policy.is_some())
+            {
+                return Err(
+                    "native collaborator child must not carry an Astra model admission".into(),
+                );
+            }
+            inherit_parent_run_identity(&mut context, &parent, inherit_parent_model_identity)?;
             validate_child_work_binding(&context, &parent)?;
             let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
             let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
@@ -7931,11 +8023,16 @@ mod tests {
                         serde_json::json!({"thinking": {"mode": "off"}, "first_output_max_tokens": 1}),
                     ),
                     ("child_runtime_id".to_string(), serde_json::json!("forged")),
+                    (
+                        "collaborator_stage".to_string(),
+                        serde_json::json!({"anchor_run_id": "forged"}),
+                    ),
                 ])),
                 child_runtime_id: child_runtime_id.clone(),
                 ..Default::default()
             });
             assert!(event.get("generation_controls").is_none());
+            assert!(event.get("collaborator_stage").is_none());
             assert_eq!(
                 event
                     .get("child_runtime_id")
@@ -8185,7 +8282,8 @@ mod tests {
             assert!(invalid.execution_restrictions().is_err());
             assert!(invalid.admission_source().is_err());
             assert!(
-                inherit_parent_run_identity(&mut RunStartContext::default(), &invalid).is_err()
+                inherit_parent_run_identity(&mut RunStartContext::default(), &invalid, true)
+                    .is_err()
             );
         }
         for (run_id, user_id, authorization_id) in [
@@ -8206,6 +8304,77 @@ mod tests {
             ).await.is_err());
             assert!(engine.load_run("user-1", run_id).await.unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn native_collaborator_record_does_not_inherit_parent_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "native-model-parent",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let record = engine
+            .build_run_start_record(
+                "native-model-child",
+                "user-1",
+                "sess-1",
+                Some("native-model-parent"),
+                None,
+                Some("native-stage"),
+                None,
+                RunStartContext::default(),
+                false,
+            )
+            .await
+            .expect("native durable record should keep parent auth and lineage");
+        assert_eq!(record.parent_run_id.as_deref(), Some("native-model-parent"));
+        assert_eq!(record.model_offering_id, None);
+        assert_eq!(record.resolved_model_name, None);
+
+        let model_context = RunStartContext {
+            model_selection: Some(ModelSelection {
+                offering_id: "offer-parent".to_string(),
+            }),
+            resolved_model_selection: Some(ResolvedModelSelection {
+                offering_id: "offer-parent".to_string(),
+                model_name: "parent-model".to_string(),
+                source_identity: None,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            engine
+                .build_run_start_record(
+                    "native-model-child-with-model",
+                    "user-1",
+                    "sess-1",
+                    Some("native-model-parent"),
+                    None,
+                    Some("native-stage"),
+                    None,
+                    model_context,
+                    false,
+                )
+                .await
+                .is_err(),
+            "native admission must reject an explicitly supplied Astra model identity"
+        );
     }
 
     #[tokio::test]
@@ -10426,6 +10595,59 @@ mod tests {
         assert_eq!(poll.inputs.len(), 1);
         assert_eq!(poll.inputs[0].event_index, 2);
         assert_eq!(poll.inputs[0].intent_id, "intent-valid");
+    }
+
+    #[tokio::test]
+    async fn poll_user_intents_preserves_internal_unicode_guidance() {
+        let engine = test_engine();
+        engine
+            .start_run(
+                "run-provider-input-budget",
+                "user-1",
+                "sess-provider-input-budget",
+            )
+            .await
+            .unwrap();
+        engine
+            .append_events_batch(
+                "user-1",
+                "sess-provider-input-budget",
+                "run-provider-input-budget",
+                &[
+                    serde_json::json!({
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": "intent-too-large-provider-input",
+                            "delivery": "guide_current_run",
+                            "input": {"content": "界".repeat(11_000)}
+                        }
+                    }),
+                    serde_json::json!({
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": "intent-after-provider-input-budget",
+                            "delivery": "guide_current_run",
+                            "input": {"content": "continue with the bounded input"}
+                        }
+                    }),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let poll = engine
+            .poll_user_intents("user-1", "run-provider-input-budget", 0)
+            .await;
+
+        assert_eq!(poll.error, None);
+        assert_eq!(poll.next_cursor, 2);
+        assert_eq!(poll.inputs.len(), 2);
+        assert_eq!(
+            poll.inputs[1].intent_id,
+            "intent-after-provider-input-budget"
+        );
+        assert_eq!(poll.inputs[0].input["content"], "界".repeat(11_000));
+        assert!(poll.issues.is_empty());
     }
 
     #[tokio::test]

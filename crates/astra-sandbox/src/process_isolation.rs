@@ -30,6 +30,11 @@ use std::os::unix::process::ExitStatusExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
+mod framed;
+pub use framed::{
+    FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits, FramedProcessOutcome,
+};
+
 const MAX_CAPTURED_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_CAPTURED_STDERR_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: usize =
@@ -352,9 +357,24 @@ impl BashInvocationOwner {
 
     /// Complete the post-spawn handshake before the target is allowed to run.
     pub fn started(&mut self, child_pid: u32) -> std::io::Result<()> {
+        self.started_before(
+            child_pid,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &|| Ok(()),
+        )
+    }
+
+    /// Check the caller's start gate while awaiting READY and immediately
+    /// before START. The blocking worker retains ownership on refusal.
+    fn started_before(
+        &mut self,
+        child_pid: u32,
+        deadline: std::time::Instant,
+        check_start: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         if let Some(supervisor) = self.supervisor.as_mut() {
             supervisor.spawned();
-            supervisor.start(child_pid)?;
+            supervisor.start_before(child_pid, deadline, check_start)?;
         }
         self.process_scope.join_child(child_pid)
     }
@@ -451,6 +471,17 @@ pub struct InvocationSupervisor {
 }
 
 impl InvocationSupervisor {
+    fn target_released(&self) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.started)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Prepare a helper command and its authenticated control channel.
     /// [`Self::install`] must be called after all environment filtering and
     /// before spawning the returned command.
@@ -572,6 +603,19 @@ impl InvocationSupervisor {
 
     /// Authenticate the helper before allowing the target to execute.
     pub fn start(&mut self, helper_pid: u32) -> std::io::Result<()> {
+        self.start_before(
+            helper_pid,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &|| Ok(()),
+        )
+    }
+
+    fn start_before(
+        &mut self,
+        helper_pid: u32,
+        deadline: std::time::Instant,
+        check_start: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             if self.ready || self.started {
@@ -583,9 +627,9 @@ impl InvocationSupervisor {
                 "ASTRA_PROCESS_SUPERVISOR {} READY {} {}",
                 SUPERVISOR_PROTOCOL_VERSION, self.nonce, helper_pid
             );
-            let deadline = std::time::Instant::now() + SUPERVISOR_HANDSHAKE_TIMEOUT;
+            let deadline = deadline.min(std::time::Instant::now() + SUPERVISOR_HANDSHAKE_TIMEOUT);
             let actual = self
-                .read_protocol_line(deadline)?
+                .read_protocol_line_before(deadline, check_start)?
                 .ok_or_else(|| std::io::Error::other("supervisor closed before READY"))?;
             if actual != expected {
                 return Err(std::io::Error::other(format!(
@@ -593,14 +637,15 @@ impl InvocationSupervisor {
                 )));
             }
             self.ready = true;
+            check_start()?;
             self.control_write.write_all(b"S")?;
-            self.control_write.flush()?;
             self.started = true;
+            self.control_write.flush()?;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = helper_pid;
+            let _ = (helper_pid, deadline, check_start);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "invocation supervisor requires Linux",
@@ -672,7 +717,23 @@ impl InvocationSupervisor {
         &mut self,
         deadline: std::time::Instant,
     ) -> std::io::Result<Option<String>> {
+        self.read_protocol_line_before(deadline, &|| Ok(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_protocol_line_before(
+        &mut self,
+        deadline: std::time::Instant,
+        check_start: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<Option<String>> {
         loop {
+            check_start()?;
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for invocation supervisor receipt",
+                ));
+            }
             if let Some(newline) = self.receipt_buffer.iter().position(|byte| *byte == b'\n') {
                 let bytes = self.receipt_buffer.drain(..=newline).collect::<Vec<_>>();
                 let line = std::str::from_utf8(&bytes[..bytes.len() - 1])
@@ -699,12 +760,6 @@ impl InvocationSupervisor {
                 }
                 Ok(read) => self.receipt_buffer.extend_from_slice(&chunk[..read]),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "timed out waiting for invocation supervisor receipt",
-                        ));
-                    }
                     std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}

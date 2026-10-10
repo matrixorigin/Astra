@@ -19,6 +19,93 @@ use thiserror::Error;
 
 const RESOLVER_VERSION: &str = "provider-semantic-resolver-v1";
 
+/// The wire protocol used by a provider-owned collaborator stage.
+///
+/// This is deliberately resolved once from the authenticated provider
+/// snapshot. Runtime consumers must branch on this fact, never on a public
+/// tool name or a model string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCollaboratorProtocol {
+    CodexAppServer,
+    ClaudeStreamJson,
+    OpenCodeAcp,
+}
+
+impl NativeCollaboratorProtocol {
+    pub const CODEX: &'static str = "native-codex-app-server";
+    pub const CLAUDE: &'static str = "native-claude-stream-json";
+    pub const OPENCODE: &'static str = "native-opencode-acp";
+
+    pub fn protocol_id(self) -> astra_turn_types::ProviderProtocolId {
+        astra_turn_types::ProviderProtocolId::new(match self {
+            Self::CodexAppServer => Self::CODEX,
+            Self::ClaudeStreamJson => Self::CLAUDE,
+            Self::OpenCodeAcp => Self::OPENCODE,
+        })
+        .expect("native collaborator protocol identifiers are valid")
+    }
+
+    pub const EXTENSION_KEY: &'static str = "astra.nativeCollaboratorProtocol";
+
+    pub fn extension_value(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => Self::CODEX,
+            Self::ClaudeStreamJson => Self::CLAUDE,
+            Self::OpenCodeAcp => Self::OPENCODE,
+        }
+    }
+
+    pub fn from_extension_fields(
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Self> {
+        match fields
+            .get(Self::EXTENSION_KEY)
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(Self::CODEX) => Some(Self::CodexAppServer),
+            Some(Self::CLAUDE) => Some(Self::ClaudeStreamJson),
+            Some(Self::OPENCODE) => Some(Self::OpenCodeAcp),
+            _ => None,
+        }
+    }
+
+    pub const fn permission_scope(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "sandbox_expand:native_codex",
+            Self::ClaudeStreamJson => "sandbox_expand:native_claude",
+            Self::OpenCodeAcp => "sandbox_expand:native_opencode",
+        }
+    }
+
+    pub fn from_permission_scope(value: &str) -> Option<Self> {
+        [
+            Self::CodexAppServer,
+            Self::ClaudeStreamJson,
+            Self::OpenCodeAcp,
+        ]
+        .into_iter()
+        .find(|protocol| protocol.permission_scope() == value)
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "Codex",
+            Self::ClaudeStreamJson => "Claude Code",
+            Self::OpenCodeAcp => "OpenCode",
+        }
+    }
+
+    fn from_protocol(protocol: &astra_turn_types::ProviderProtocolId) -> Option<Self> {
+        match protocol.as_str() {
+            Self::CODEX => Some(Self::CodexAppServer),
+            Self::CLAUDE => Some(Self::ClaudeStreamJson),
+            Self::OPENCODE => Some(Self::OpenCodeAcp),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApprovalBaseline {
@@ -31,6 +118,10 @@ pub enum ProviderApprovalBaseline {
 /// later phases, but consumers must never reinterpret the raw claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedInvocationPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_requirements: Option<astra_turn_types::ProviderRuntimeRequirements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_collaborator_protocol: Option<NativeCollaboratorProtocol>,
     pub descriptor: ResolvedToolDescriptorRef,
     pub effect: ResolvedToolEffect,
     pub parallelizable: bool,
@@ -50,6 +141,14 @@ impl ResolvedInvocationPolicy {
         self.effect == ResolvedToolEffect::ReadOnly
     }
 
+    /// A collaborator stage is a control-plane invocation whose workspace
+    /// effect is supplied by the immutable execution grant. It must not be
+    /// treated as an ordinary mutating tool by a read-only child; the native
+    /// adapter still enforces the grant before starting the provider.
+    pub fn is_collaborator_stage(&self) -> bool {
+        self.native_collaborator_protocol.is_some()
+    }
+
     /// Content-addressed descriptor semantic baseline. Runtime admission,
     /// authority, route, approval outcome and argument refinements must be
     /// combined with this ID to form the final per-invocation decision.
@@ -64,6 +163,7 @@ impl ResolvedInvocationPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedProviderPolicyIndex {
     by_alias: BTreeMap<String, ResolvedInvocationPolicy>,
+    collaborator_stage_aliases: std::collections::BTreeSet<String>,
 }
 
 impl ResolvedProviderPolicyIndex {
@@ -71,6 +171,7 @@ impl ResolvedProviderPolicyIndex {
         snapshots: &[ResolvedProviderSnapshot],
     ) -> Result<Self, ProviderResolutionError> {
         let mut by_alias = BTreeMap::new();
+        let mut collaborator_stage_aliases = std::collections::BTreeSet::new();
         for snapshot in snapshots {
             let descriptors = snapshot
                 .descriptors
@@ -86,6 +187,24 @@ impl ResolvedProviderPolicyIndex {
                 })?;
                 let semantics = &descriptor.semantic_baseline;
                 let policy = ResolvedInvocationPolicy {
+                    runtime_requirements:
+                        astra_turn_types::ProviderRuntimeRequirements::from_extension_fields(
+                            &descriptor.extension_fields,
+                        )?,
+                    native_collaborator_protocol: (descriptor.task_support
+                        == astra_turn_types::ProviderTaskSupport::Required
+                        && descriptor
+                            .extension_fields
+                            .get(astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY)
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true))
+                    .then(|| {
+                        NativeCollaboratorProtocol::from_extension_fields(
+                            &descriptor.extension_fields,
+                        )
+                        .or_else(|| NativeCollaboratorProtocol::from_protocol(&snapshot.protocol))
+                    })
+                    .flatten(),
                     descriptor: descriptor_ref.clone(),
                     effect: semantics.effect,
                     parallelizable: semantics.concurrency
@@ -104,9 +223,21 @@ impl ResolvedProviderPolicyIndex {
                         alias: alias.to_string(),
                     });
                 }
+                if descriptor
+                    .extension_fields
+                    .get(astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY)
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && descriptor.task_support == astra_turn_types::ProviderTaskSupport::Required
+                {
+                    collaborator_stage_aliases.insert(alias.to_string());
+                }
             }
         }
-        Ok(Self { by_alias })
+        Ok(Self {
+            by_alias,
+            collaborator_stage_aliases,
+        })
     }
 
     pub fn resolve(&self, public_alias: &str) -> Option<&ResolvedInvocationPolicy> {
@@ -119,6 +250,10 @@ impl ResolvedProviderPolicyIndex {
 
     pub fn is_empty(&self) -> bool {
         self.by_alias.is_empty()
+    }
+
+    pub fn is_collaborator_stage(&self, public_alias: &str) -> bool {
+        self.collaborator_stage_aliases.contains(public_alias)
     }
 }
 
@@ -209,6 +344,7 @@ pub fn resolve_provider_snapshot(
             schema_hash,
             claims,
             task_support: declaration.task_support,
+            model_catalog: declaration.model_catalog()?,
             extension_fields: declaration.extension_fields.clone(),
             semantic_baseline,
         });
@@ -749,6 +885,77 @@ mod tests {
             read.baseline_content_id().unwrap(),
             changed.baseline_content_id().unwrap()
         );
+    }
+
+    #[test]
+    fn native_protocol_is_resolved_from_the_provider_snapshot_not_tool_name() {
+        let mut tool = declaration("arbitrary_public_id", ProviderToolClaims::default());
+        tool.task_support = ProviderTaskSupport::Required;
+        tool.extension_fields.insert(
+            astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
+            Value::Bool(true),
+        );
+        let snapshot = ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("provider-native").unwrap(),
+            ProviderBindingRef::new("binding-native").unwrap(),
+            NativeCollaboratorProtocol::CodexAppServer.protocol_id(),
+            vec![tool],
+        )
+        .unwrap();
+        let aliases = BTreeMap::from([(
+            NativeToolId::new("arbitrary_public_id").unwrap(),
+            PublicToolAlias::new("selected_stage").unwrap(),
+        )]);
+        let snapshot =
+            resolve_provider_snapshot(&snapshot, &ProviderClaimTrustPolicy::default(), &aliases)
+                .unwrap();
+        let policy = ResolvedProviderPolicyIndex::from_snapshots(&[snapshot])
+            .unwrap()
+            .resolve("selected_stage")
+            .unwrap()
+            .clone();
+
+        assert_eq!(
+            policy.native_collaborator_protocol,
+            Some(NativeCollaboratorProtocol::CodexAppServer)
+        );
+        assert!(policy.baseline_content_id().is_ok());
+    }
+
+    #[test]
+    fn runtime_requirements_are_preserved_and_change_the_decision_identity() {
+        let resolve = |paths: serde_json::Value| {
+            let mut tool = declaration("runtime", ProviderToolClaims::default());
+            tool.extension_fields.insert(
+                astra_turn_types::PROVIDER_RUNTIME_REQUIREMENTS_KEY.into(),
+                serde_json::json!({"executable":"/installed/provider", "read_paths":paths}),
+            );
+            let snapshot = resolve_provider_snapshot(
+                &discovery(vec![tool]),
+                &trusted_mcp(),
+                &aliases(&["runtime"]),
+            )
+            .unwrap();
+            ResolvedProviderPolicyIndex::from_snapshots(&[snapshot])
+        };
+        let first = resolve(serde_json::json!(["/installed/provider"])).unwrap();
+        let changed = resolve(serde_json::json!([
+            "/installed/provider",
+            "/runtime/library"
+        ]))
+        .unwrap();
+        let first = first.resolve("provider__runtime").unwrap();
+        let changed = changed.resolve("provider__runtime").unwrap();
+        assert_eq!(
+            first.runtime_requirements.as_ref().unwrap().read_paths,
+            ["/installed/provider"]
+        );
+        assert_ne!(
+            first.baseline_content_id().unwrap(),
+            changed.baseline_content_id().unwrap()
+        );
+        assert!(resolve(serde_json::json!(["\u{0}"])).is_err());
+        assert!(resolve(serde_json::json!(vec!["/runtime/library"; 33])).is_err());
     }
 
     #[test]

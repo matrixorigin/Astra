@@ -8,6 +8,7 @@ use serde_json::Value;
 #[derive(Debug, Default, Clone)]
 pub struct SseParser {
     buf: Vec<u8>,
+    max_frame_bytes: Option<usize>,
 }
 
 impl SseParser {
@@ -15,10 +16,33 @@ impl SseParser {
         Self::default()
     }
 
+    /// Bound untrusted frames without rejecting a chunk containing many small
+    /// events. Feed slices also bound allocation before delimiter discovery.
+    pub fn with_max_frame_bytes(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_frame_bytes: Some(limit),
+        }
+    }
+
     /// Push raw HTTP body bytes; returns all complete SSE events decoded so far.
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, ThinClientError> {
-        self.buf.extend_from_slice(chunk);
-        self.drain_complete_events()
+        let mut events = Vec::new();
+        for feed in chunk.chunks(16 * 1024) {
+            self.buf.extend_from_slice(feed);
+            events.extend(self.drain_complete_events()?);
+            self.check_frame_size(self.buf.len())?;
+        }
+        Ok(events)
+    }
+
+    fn check_frame_size(&self, size: usize) -> Result<(), ThinClientError> {
+        if let Some(limit) = self.max_frame_bytes
+            && size > limit
+        {
+            return Err(ThinClientError::ResponseTooLarge { limit });
+        }
+        Ok(())
     }
 
     /// Flush after the stream ends (handles final event without trailing blank line if any).
@@ -28,6 +52,7 @@ impl SseParser {
         }
         // If buffer has content but no trailing `\n\n`, treat remainder as one event block.
         let mut out = Vec::new();
+        self.check_frame_size(self.buf.len())?;
         let text = std::str::from_utf8(&self.buf)
             .map_err(|e| ThinClientError::SseParse(format!("invalid UTF-8 in SSE buffer: {e}")))?;
         if let Some(ev) = parse_event_block(text) {
@@ -42,6 +67,7 @@ impl SseParser {
         let mut out = Vec::new();
         while let Some(sep) = find_event_separator(&self.buf) {
             let (event_bytes, rest_start) = sep;
+            self.check_frame_size(event_bytes)?;
             let block = &self.buf[..event_bytes];
             let text = std::str::from_utf8(block)
                 .map_err(|e| ThinClientError::SseParse(format!("invalid UTF-8 in SSE: {e}")))?;
@@ -107,6 +133,28 @@ pub fn parse_sse_body(body: &str) -> Result<Vec<StreamEvent>, ThinClientError> {
 mod tests {
     use super::*;
     use crate::protocol::StreamEvent;
+
+    #[test]
+    fn frame_budget_rejects_unterminated_and_complete_floods_not_coalesced_events() {
+        for bytes in [b"xxxxxxxxx".as_slice(), b"data: {}xxxxxxxxx\n\n".as_slice()] {
+            assert!(matches!(
+                SseParser::with_max_frame_bytes(8).push_bytes(bytes),
+                Err(ThinClientError::ResponseTooLarge { limit: 8 })
+            ));
+        }
+        let event = b"data: {\"type\":\"thinking_done\"}\n\n";
+        let mut coalesced = Vec::new();
+        for _ in 0..100 {
+            coalesced.extend_from_slice(event);
+        }
+        assert_eq!(
+            SseParser::with_max_frame_bytes(event.len())
+                .push_bytes(&coalesced)
+                .unwrap()
+                .len(),
+            100
+        );
+    }
 
     #[test]
     fn single_json_event() {
