@@ -295,11 +295,7 @@ fn render_response(response: ProviderResponse, request: &ProviderRequest) -> Res
                 request.path, "/v1/chat/completions",
                 "OpenAI script must use its actual protocol endpoint"
             );
-            if request.body["stream"] == true {
-                streamed("text/event-stream", openai_events(&body), None)
-            } else {
-                Json(body).into_response()
-            }
+            openai_response(body, request.body["stream"] == true)
         }
         ProviderResponse::Anthropic(body) => {
             assert_eq!(
@@ -332,6 +328,15 @@ fn render_response(response: ProviderResponse, request: &ProviderRequest) -> Res
             chunks,
             release_before_chunk,
         } => streamed(content_type, chunks, release_before_chunk),
+    }
+}
+
+/// Render the same OpenAI fixture for provider gateways with consumer-owned routes.
+pub fn openai_response(body: Value, stream: bool) -> Response {
+    if stream {
+        streamed("text/event-stream", openai_events(&body), None)
+    } else {
+        Json(body).into_response()
     }
 }
 

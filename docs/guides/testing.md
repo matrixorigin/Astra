@@ -179,6 +179,90 @@ remained unstarted until the preceding deliveries; a late snapshot alone is not
 proof of deferred cancellation. Natural requests with unspecified cancellation
 targets and requests for an explicit deferred replacement use separate cases.
 
+## MOI consumer compatibility with a fresh Astra database
+
+`Test: MOI fresh-Astra compatibility` starts real MatrixOne and the real Astra
+HTTP router over a newly created, uniquely named database. The existing required
+`Test: online (core)` check requires this job to succeed; cancellation, failure,
+or skipping it cannot produce a green aggregate. It runs independently of path
+classification and needs no repository secrets or external model service.
+
+The consumer fixture in `crates/runtime/tests/moi_fresh_astra.rs` and its
+`normal_chat.rs` module share one baseline: Matrixflow `dev` commit
+`c244138ec330b768e7fb6ff8bbbc97f2d91081aa`, recorded in `MOI_CONTRACT_COMMIT`.
+The source contracts are:
+
+- `moi/pkg/service/agentresource/astra_protocol_astra_runtime_backend.go`
+- `moi/pkg/service/agentresource/astra_runtime_start_recovery.go`
+- `moi/pkg/service/agentresource/astra_runtime_history_recovery.go`
+- `moi/pkg/service/agentresource/astra_protocol_astra_runtime_recovery.go`
+- `moi/pkg/service/agentresource/astra_protocol_astra_runtime_session.go`
+- `moi/pkg/service/agentresource/agent_runtime_binding_reconcile.go`
+- `moi/pkg/components/astrabinding/registrar.go`
+- `moi/pkg/components/astraauth/provider_request.go`
+- `moi/pkg/api/handlers/agent_runtime_gateway.go`
+
+Requests, HMAC signing and response parsing intentionally do not use Astra's
+request/response structs. Missing-resource errors come from the real empty
+database, not a mock. The mock represents retained MOI data and its bounded
+pre-run repair policy: one session repair and one full binding-set repair, only
+for the exact missing-resource codes and identities, never after run allocation.
+Changing Astra's API must not be accompanied by silently updating this frozen
+consumer to make a breaking change pass. CI does not fetch a moving MOI branch.
+To advance the baseline, review the MOI changes from the pinned commit, update
+the shared fixture and affected assertions, and record the new commit here and
+in `MOI_CONTRACT_COMMIT`. A pass applies to that consumer baseline, not an older
+MOI deployment automatically.
+
+The two journeys cover an existing conversation and an existing agent opening
+a new conversation. They verify idempotent session/binding registration,
+foundation plus extension bindings, historical text/file references reaching
+the model, discovery snapshots and callback discovery, authenticated Skill/MCP
+callbacks, successful SSE termination and a subsequent turn reusing context
+without repeating model/tool work. A deterministic loopback model checks its
+actual inputs; canned answer text alone is not accepted as proof of restoration.
+
+The same required job also runs `moi_fresh_astra/normal_chat.rs` through that
+consumer and real router/database. The pinned consumer accepts
+`cancellation_requested`; the test still requires actual `cancelled` settlement
+before reusing the session. It checks:
+
+- reasoning and text arrive before the model finishes (a controlled upstream
+  stream barrier, not timing assumptions), with complete ordered output;
+- Skill/MCP start and result events retain their tool/call identities;
+- successful `run_finished` is followed by authoritative `turn_complete`,
+  agreeing with the streamed answer, before EOF;
+- an active session rejects a concurrent turn with its structured conflict;
+- the signed `DELETE /chat/runs/{run_id}` cancels a live run, preserves an
+  already completed run, and reports `run_not_found` for a lost historical run;
+- the negotiated `x-moi-model-gateway-error-contract: v1` payment rejection
+  preserves the error code, HTTP status, action and retryability in a correlated
+  failure and failed terminal, without a successful answer or provider-body leak;
+- the same session accepts subsequent turns after cancellation and failure.
+
+Scripted providers have a finite response inventory: duplicate inference or an
+unexpected call fails the test rather than receiving a generic mock response.
+
+This is an interaction contract, not an old-Astra-schema migration test, an
+in-flight upgrade test, or an LLM quality benchmark. It protects these concrete
+consumer journeys, not every possible MOI feature.
+
+To run against a **disposable local MatrixOne**, supply the normal explicit
+`MATRIXONE_*`, `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`,
+`ASTRA_RUNTIME_ROOT_SECRET` and `MEMORIA_MASTER_KEY` test settings, then:
+
+```bash
+ASTRA_TEST_DB_IT=1 RUST_MIN_STACK=16777216 \
+cargo test --locked -p astra-runtime --features moi-compat-tests \
+  --test moi_fresh_astra -- --ignored --nocapture
+```
+
+No Memoria process is needed. The test creates and drops only its own
+`astra_test_moi_<uuid>` database. A failed run can leave that diagnostic database
+behind; CI disposes of the entire isolated dependency stack. The dedicated
+feature keeps this test out of generic offline/online lanes, avoiding duplicate
+full-stack execution.
+
 ## Where Tests Live
 
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).

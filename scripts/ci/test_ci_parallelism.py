@@ -93,11 +93,12 @@ class ParallelGateTests(unittest.TestCase):
     def test_online_gate_requires_all_matrix_jobs_to_succeed(self):
         script = workflow_run_script(".github/workflows/test.yml", "Require online shards")
         for status in ("success", "failure", "cancelled", "skipped", ""):
-            with self.subTest(status=status):
-                result = subprocess.run(["bash", "-c", script], env={
-                    **os.environ, "SHARDS_RESULT": status,
-                }, capture_output=True, text=True)
-                self.assertEqual(result.returncode == 0, status == "success")
+            for moi_status in ("success", "failure", "cancelled", "skipped", ""):
+                with self.subTest(status=status, moi_status=moi_status):
+                    result = subprocess.run(["bash", "-c", script], env={
+                        **os.environ, "SHARDS_RESULT": status, "MOI_RESULT": moi_status,
+                    }, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, status == moi_status == "success")
 
     def test_parallel_jobs_depend_only_on_scope_and_gates_depend_on_shards(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
@@ -130,9 +131,19 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("run: make dev-deps-up", online)
         core = workflow.split("\n  test-online-core:\n", 1)[1].split("\n  test-online:", 1)[0]
         self.assertIn('name: "Test: online (core)"', core)
-        self.assertIn("needs: test-online", core)
+        self.assertIn("needs: [test-online, moi-compatibility]", core)
         self.assertIn("needs.test-online.result", core)
+        self.assertIn("needs.moi-compatibility.result", core)
         self.assertIn("if: ${{ !cancelled() }}", core)
+
+    def test_moi_consumer_gate_always_executes_the_frozen_client(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        job = workflow.split("\n  moi-compatibility:\n", 1)[1].split("\n  test-online:", 1)[0]
+        self.assertNotIn("needs: scope", job)
+        self.assertNotIn("RUN_TESTS", job)
+        self.assertIn("--features moi-compat-tests", job)
+        self.assertIn("--test moi_fresh_astra -- --ignored --nocapture", job)
+        self.assertNotIn("secrets.", job)
 
 
 class OnlineShardTests(unittest.TestCase):

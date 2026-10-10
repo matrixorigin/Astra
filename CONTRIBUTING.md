@@ -87,6 +87,10 @@ Required check names remain present when their heavy work is skipped, so this
 routing is compatible with branch protection and the merge queue. The routing
 contract and its tests live in [`scripts/ci/`](scripts/ci/).
 
+The frozen MOI consumer compatibility test runs independently of this routing
+on every Test Suite run. The required online core aggregate also requires that
+fresh-database journey to pass; see the testing guide for its exact scope.
+
 CLI tests build and run their complete inventory once, after building the
 standalone mock MCP server. Five protected check labels require that same
 completed job; they do not repeat setup, builds, archive downloads, or tests.

@@ -9,6 +9,8 @@ publish = false
 default = ["harness"]
 # Enables deterministic provider and edge-callback controls for full-stack tests.
 e2e-hooks = ["astra-services/e2e-hooks"]
+# Run the frozen MOI consumer separately from generic database integration.
+moi-compat-tests = ["e2e-hooks"]
 # Paid checks are not part of the generic ignored/MatrixOne CI lane.
 live-provider-tests = []
 # Enables OTLP trace export via `astra-logging` (build with `--features otel`).
@@ -24,6 +26,10 @@ required-features = ["e2e-hooks"]
 [[bin]]
 name = "astra-server"
 path = "src/main.rs"
+
+[[test]]
+name = "moi_fresh_astra"
+required-features = ["moi-compat-tests"]
 
 [dependencies]
 crc32fast = "1.4"
