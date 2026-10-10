@@ -243,6 +243,13 @@ before reusing the session. It checks:
 Scripted providers have a finite response inventory: duplicate inference or an
 unexpected call fails the test rather than receiving a generic mock response.
 
+Buffered and live consumers share the pinned MOI SSE framing rules, including
+LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls
+reject an early `[DONE]` even when a terminal follows it. MCP and Skill callbacks
+use distinct routes and validate JSON-RPC 2.0, route/method admission and the
+runtime grant; invalid callbacks fail the journey even if Astra retries. The
+same CI command includes these parser/admission controls and the database journey.
+
 This is an interaction contract, not an old-Astra-schema migration test, an
 in-flight upgrade test, or an LLM quality benchmark. It protects these concrete
 consumer journeys, not every possible MOI feature.
@@ -254,7 +261,7 @@ To run against a **disposable local MatrixOne**, supply the normal explicit
 ```bash
 ASTRA_TEST_DB_IT=1 RUST_MIN_STACK=16777216 \
 cargo test --locked -p astra-runtime --features moi-compat-tests \
-  --test moi_fresh_astra -- --ignored --nocapture
+  --test moi_fresh_astra -- --include-ignored --nocapture
 ```
 
 No Memoria process is needed. The test creates and drops only its own

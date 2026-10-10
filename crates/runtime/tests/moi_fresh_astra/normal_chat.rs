@@ -144,8 +144,7 @@ fn answer(text: &str) -> ProviderResponse {
 
 struct LiveStream {
     stream: axum::body::BodyDataStream,
-    pending: Vec<u8>,
-    received: Vec<Value>,
+    parser: sse::MoiSseParser,
 }
 
 impl LiveStream {
@@ -166,51 +165,52 @@ impl LiveStream {
         );
         Self {
             stream: response.into_body().into_data_stream(),
-            pending: Vec::new(),
-            received: Vec::new(),
+            parser: sse::MoiSseParser::default(),
         }
     }
 
     async fn read_chunk(&mut self) -> bool {
+        if self.parser.done {
+            return false;
+        }
         let Some(chunk) = tokio::time::timeout(Duration::from_secs(30), self.stream.next())
             .await
             .expect("SSE stalled")
             .map(Result::unwrap)
         else {
-            assert!(
-                self.pending.iter().all(u8::is_ascii_whitespace),
-                "truncated SSE frame"
-            );
+            self.parser.finish();
             return false;
         };
-        self.pending.extend_from_slice(&chunk);
-        assert!(self.pending.len() < 4 * 1024 * 1024, "SSE frame limit");
-        while let Some(end) = self.pending.windows(2).position(|bytes| bytes == b"\n\n") {
-            let frame: Vec<_> = self.pending.drain(..end + 2).collect();
-            self.received
-                .extend(events(std::str::from_utf8(&frame).expect("UTF-8 SSE")));
-        }
-        true
+        self.parser.feed(&chunk);
+        !self.parser.done
     }
 
     async fn prefix(&mut self) -> String {
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !self.received.iter().any(|e| e["type"] == "text_delta") {
+            while !self.parser.events.iter().any(|e| e["type"] == "text_delta") {
                 assert!(self.read_chunk().await, "EOF before streaming output");
             }
         })
         .await
         .expect("text buffered until model completion");
         assert!(
-            self.received
+            self.parser
+                .events
                 .iter()
                 .any(|e| e["type"] == "reasoning_delta" && e["content"] == "Checking the request."),
             "reasoning stream: {:?}",
-            self.received
+            self.parser.events
         );
-        assert_eq!(text(&self.received), "Hello ");
-        assert!(!self.received.iter().any(|e| e["type"] == "run_finished"));
-        self.received
+        assert_eq!(text(&self.parser.events), "Hello ");
+        assert!(
+            !self
+                .parser
+                .events
+                .iter()
+                .any(|e| e["type"] == "run_finished")
+        );
+        self.parser
+            .events
             .iter()
             .find(|e| e["type"] == "session_info")
             .unwrap()["run_id"]
@@ -225,8 +225,18 @@ impl LiveStream {
         })
         .await
         .expect("terminal stream did not close");
-        self.received
+        self.parser.events
     }
+}
+
+#[tokio::test]
+#[should_panic(expected = "one terminal before EOF")]
+async fn live_consumer_rejects_early_done() {
+    let stream = LiveStream {
+        stream: Body::from("data: [DONE]\r\n\r\ndata: {\"type\":\"run_finished\",\"status\":\"completed\"}\r\n\r\n").into_data_stream(),
+        parser: sse::MoiSseParser::default(),
+    };
+    assert_terminal(&stream.finish().await, "completed");
 }
 
 fn text(events: &[Value]) -> String {

@@ -142,7 +142,7 @@ class ParallelGateTests(unittest.TestCase):
         self.assertNotIn("needs: scope", job)
         self.assertNotIn("RUN_TESTS", job)
         self.assertIn("--features moi-compat-tests", job)
-        self.assertIn("--test moi_fresh_astra -- --ignored --nocapture", job)
+        self.assertIn("--test moi_fresh_astra -- --include-ignored --nocapture", job)
         self.assertNotIn("secrets.", job)
 
 

@@ -10,7 +10,7 @@ use astra_runtime::{build_app, build_server_state};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::State,
+    extract::{OriginalUri, State},
     http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::post as route_post,
@@ -29,6 +29,8 @@ use uuid::Uuid;
 
 #[path = "moi_fresh_astra/normal_chat.rs"]
 mod normal_chat;
+#[path = "moi_fresh_astra/sse.rs"]
+mod sse;
 
 const MOI_CONTRACT_COMMIT: &str = "c244138ec330b768e7fb6ff8bbbc97f2d91081aa";
 const KEY: &str = "moi-contract-only-provider-signing-key";
@@ -61,20 +63,56 @@ struct GatewayState {
 
 async fn gateway(
     State(state): State<Arc<Mutex<GatewayState>>>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let mut state = state.lock().unwrap();
+    let id = body["id"].clone();
+    let reject = |status, code| {
+        (
+            status,
+            Json(json!({"jsonrpc":"2.0","id":id,
+            "error":{"code":code,"message":"mock MOI callback rejected request"}})),
+        )
+            .into_response()
+    };
+    let rpc = uri.path() != "/model";
+    if rpc && body["jsonrpc"] != "2.0" {
+        state
+            .errors
+            .push("invalid callback JSON-RPC version".into());
+        return reject(StatusCode::BAD_REQUEST, -32600);
+    }
     if headers.get("authorization").and_then(|v| v.to_str().ok())
         != Some(state.authorization.as_str())
     {
         state
             .errors
             .push("capability call did not carry runtime grant".into());
+        return reject(StatusCode::UNAUTHORIZED, -32001);
     }
-    let method = body["method"].as_str().unwrap_or("model").to_owned();
+    // MOI's distinct HTTP entrypoints admit disjoint method sets. Do not let
+    // a valid request to the wrong descriptor accidentally succeed in the mock.
+    let method = if rpc {
+        body["method"].as_str().unwrap_or("")
+    } else {
+        "model"
+    };
+    if !matches!(
+        (uri.path(), method),
+        ("/mcp", "tools/list" | "tools/call")
+            | ("/skills", "skills/list" | "skills/read" | "skills/search")
+            | ("/model", "model")
+    ) {
+        state.errors.push(format!(
+            "wrong callback route/method: {} {method}",
+            uri.path()
+        ));
+        return reject(StatusCode::BAD_REQUEST, -32601);
+    }
+    let method = method.to_owned();
     state.requests.push((method.clone(), body.clone()));
-    let id = body["id"].clone();
     let result = match method.as_str() {
         "tools/list" => json!({"tools":[file_tool()]}),
         "skills/list" => {
@@ -232,6 +270,100 @@ async fn gateway(
     Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
 }
 
+fn gateway_router(state: Arc<Mutex<GatewayState>>) -> Router {
+    Router::new()
+        .route("/mcp", route_post(gateway))
+        .route("/skills", route_post(gateway))
+        .route("/model", route_post(gateway))
+        .with_state(state)
+}
+
+#[tokio::test]
+async fn callback_admission_rejects_wrong_route_version_and_grant() {
+    let state = Arc::new(Mutex::new(GatewayState {
+        authorization: "Bearer callback-test".into(),
+        ..Default::default()
+    }));
+    let app = gateway_router(state.clone());
+    for (path, method, version, authorization, status, code) in [
+        (
+            "/mcp",
+            "skills/list",
+            Some("2.0"),
+            "Bearer callback-test",
+            StatusCode::BAD_REQUEST,
+            -32601,
+        ),
+        (
+            "/skills",
+            "tools/list",
+            Some("2.0"),
+            "Bearer callback-test",
+            StatusCode::BAD_REQUEST,
+            -32601,
+        ),
+        (
+            "/mcp",
+            "tools/list",
+            None,
+            "Bearer callback-test",
+            StatusCode::BAD_REQUEST,
+            -32600,
+        ),
+        (
+            "/skills",
+            "skills/list",
+            Some("1.0"),
+            "Bearer callback-test",
+            StatusCode::BAD_REQUEST,
+            -32600,
+        ),
+        (
+            "/mcp",
+            "tools/list",
+            Some("2.0"),
+            "Bearer wrong-grant",
+            StatusCode::UNAUTHORIZED,
+            -32001,
+        ),
+    ] {
+        let mut body = json!({"id":"negative-control", "method":method,"params":{}});
+        if let Some(version) = version {
+            body["jsonrpc"] = json!(version);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", authorization)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path}: {body}");
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "negative-control");
+        assert_eq!(response["error"]["code"], code);
+        assert!(response.get("result").is_none());
+    }
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.errors.len(),
+        5,
+        "invalid callbacks must fail the journey even if Astra retries"
+    );
+    assert!(
+        state.requests.is_empty(),
+        "rejected callbacks cannot execute"
+    );
+}
+
 fn signed_request(path: &str, body: &Value) -> Request<Body> {
     signed_http_request("POST", path, path, body.to_string())
 }
@@ -282,21 +414,10 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, String) {
 }
 
 fn events(body: &str) -> Vec<Value> {
-    body.split("\n\n")
-        .filter_map(|frame| {
-            let data = frame
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() || data == "[DONE]" {
-                None
-            } else {
-                Some(serde_json::from_str(&data).expect("valid MOI SSE frame"))
-            }
-        })
-        .collect()
+    let mut parser = sse::MoiSseParser::default();
+    parser.feed(body.as_bytes());
+    parser.finish();
+    parser.events
 }
 
 fn history() -> String {
@@ -363,8 +484,8 @@ impl MoiClient {
             "capability_descriptors":{
                 "model_gateway":{"id":"moi-model-gateway","type":"model_gateway","transport":"http",
                     "endpoint_url":format!("{}/model",self.endpoint),"protocol":"openai_chat_completions","metadata":{},"model_context_window":128000},
-                "mcp":{"id":"moi-tools","type":"mcp","transport":"streamable_http","endpoint_url":format!("{}/capabilities",self.endpoint),"protocol":"mcp","metadata":{}},
-                "skills":{"id":"moi-skills","type":"skills","transport":"streamable_http","endpoint_url":format!("{}/capabilities",self.endpoint),"protocol":"astra_skills","metadata":{}}
+                "mcp":{"id":"moi-tools","type":"mcp","transport":"streamable_http","endpoint_url":format!("{}/mcp",self.endpoint),"protocol":"mcp","metadata":{}},
+                "skills":{"id":"moi-skills","type":"skills","transport":"streamable_http","endpoint_url":format!("{}/skills",self.endpoint),"protocol":"astra_skills","metadata":{}}
             },"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
         if let Some(session) = &self.session {
             value["session_id"] = json!(session);
@@ -568,10 +689,7 @@ async fn historical_moi_works_with_fresh_astra() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     settings.memoria.base_url = endpoint.clone();
-    let gateway_app = Router::new()
-        .route("/capabilities", route_post(gateway))
-        .route("/model", route_post(gateway))
-        .with_state(gateway_state.clone());
+    let gateway_app = gateway_router(gateway_state.clone());
     let gateway_task = tokio::spawn(async move {
         axum::serve(listener, gateway_app).await.unwrap();
     });

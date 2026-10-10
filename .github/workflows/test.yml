@@ -399,7 +399,7 @@ jobs:
         timeout-minutes: 25
         run: |
           cargo clippy --locked -p astra-runtime --features moi-compat-tests --test moi_fresh_astra -- -D warnings
-          cargo test --locked -p astra-runtime --features moi-compat-tests --test moi_fresh_astra -- --ignored --nocapture
+          cargo test --locked -p astra-runtime --features moi-compat-tests --test moi_fresh_astra -- --include-ignored --nocapture
       - name: Dump MatrixOne logs
         if: failure()
         run: >-
