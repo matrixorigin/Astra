@@ -10,6 +10,13 @@ use sha2::{Digest, Sha256};
 pub use astra_turn_types::ExplainAnalyzeEventV1;
 pub use astra_turn_types::{ModelSelection, ModelSelector, RequestedModelPolicy};
 
+/// HTTP 409: a callback attempts to overwrite an immutable payload.
+pub const EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE: &str = "edge_callback_payload_conflict";
+/// HTTP 409: a recorded interaction could not resume its execution authority.
+pub const RUN_INTERACTION_AUTHORITY_LOST_CODE: &str = "run_interaction_authority_lost";
+/// HTTP 409: newer user guidance superseded a recorded interaction.
+pub const RUN_INTERACTION_SUPERSEDED_CODE: &str = "run_interaction_superseded";
+
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

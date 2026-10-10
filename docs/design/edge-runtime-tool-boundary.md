@@ -205,6 +205,29 @@ coordination authority inside the tool-writable workspace.
   Concurrent contenders can retreat together, but cannot both be admitted;
   process-diverse jitter restores progress without a machine-global admission
   gate.
+- macOS watcher admission atomically reserves the kqueue descriptor and every
+  duplicated witness or opened binding descriptor before opening any watcher
+  files. The process-wide budget is the minimum of 1,024 descriptors, one
+  quarter of the current `RLIMIT_NOFILE` soft limit, and the soft limit minus
+  64 descriptors of headroom. Watched paths consume that same budget; there is
+  no unbounded path subscription pool. The 1,024 ceiling normally binds on
+  hosts with a soft limit of at least 4,096; the other terms protect low-limit
+  processes. Transient capacity shortage releases admission locks and waits
+  within the caller's remaining monotonic deadline. Exhaustion returns typed
+  `WorkspaceLeaseFailure::WatcherCapacity` facts with active/requested/limit
+  counts, carried into tool result fields as `reason: watcher_capacity` and
+  `watcher_descriptors`. These are the last observed capacity counts. If a retry
+  uses the remaining deadline before reaching watcher admission, expiry retains
+  that observed refusal instead of reclassifying it as workspace contention.
+  A definitive cancellation, binding failure, or ownership failure still wins.
+  It does not instruct the caller to wait for an operation
+  in this same workspace. A zero limit or a watcher larger than the budget
+  rejects immediately with `retryable: false` and a resource repair action.
+  Cancellation, failed registration, and lease drop
+  close descriptors before releasing the reservation. The budget covers
+  watcher-owned descriptors, not all runtime files/sockets; unrelated resource
+  exhaustion still fails closed. Lowering the soft limit does not revoke
+  existing leases, but subsequent admission uses the new limit.
 - Kernel ownership must end automatically when the holder process exits.
   Replacing or unlinking a witness or workspace binding must not admit a second
   generation, and any observed tamper revokes receipt authority permanently
@@ -213,7 +236,9 @@ coordination authority inside the tool-writable workspace.
   closed before launching a local command.
 
 Workspace lease admission uses the asynchronous options APIs with explicit
-cancellation and wait budgets. The unused synchronous acquisition APIs and
+cancellation and wait budgets. Observation, mutation, and opaque writer APIs
+return `Result<_, WorkspaceLeaseFailure>`; external observation preserves that
+typed admission failure separately from invalid path declarations. The unused synchronous acquisition APIs and
 no-options observation wrapper are retired from the Rust source API. Process
 coordination, generation watches, diagnostic paths, and guard cleanup remain
 shared; tests exercise the same acquisition paths as executors.

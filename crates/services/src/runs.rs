@@ -6016,7 +6016,9 @@ pub trait RunStateStore: Send + Sync {
     /// owns the semantic deadline: activation uses its bounded admission wait,
     /// while the heartbeat fences the executor before the durable lease can
     /// expire. Implementations must remain cancellation-safe when that caller
-    /// deadline drops the renewal future.
+    /// deadline drops the renewal future. `attempt_deadline` is that same
+    /// monotonic cutoff; optional diagnostics must leave time to return an
+    /// already-known refusal. Direct callers without a cutoff pass `None`.
     async fn renew_owner_lease(
         &self,
         _user_id: &str,
@@ -6024,6 +6026,7 @@ pub trait RunStateStore: Send + Sync {
         _run_id: &str,
         _expected_owner_generation: u64,
         _expected_statuses: &[&str],
+        _attempt_deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, String> {
         Ok(false)
     }
@@ -10546,6 +10549,72 @@ const FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(
 // Orphan recovery is a retrying background worker. Keep each attempt short so
 // one contended run cannot starve the rest of the recovery scan.
 const BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const OWNER_RENEWAL_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(250);
+const OWNER_RENEWAL_DIAGNOSTIC_MIN_WAIT: Duration = Duration::from_millis(1);
+
+/// Diagnostic I/O may use only a quarter of the caller's remaining attempt.
+/// Keep a refusal ready to return when the UPDATE consumes almost all of it.
+async fn owner_renewal_diagnostic(
+    attempt_deadline: Option<tokio::time::Instant>,
+    read: impl std::future::Future<Output = Result<ExactLiveRunExecutionAuthority, String>>,
+) -> OwnerRenewalDiagnostic {
+    let wait = attempt_deadline.map_or(OWNER_RENEWAL_DIAGNOSTIC_TIMEOUT, |deadline| {
+        OWNER_RENEWAL_DIAGNOSTIC_TIMEOUT
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()) / 4)
+    });
+    if wait < OWNER_RENEWAL_DIAGNOSTIC_MIN_WAIT {
+        return OwnerRenewalDiagnostic::SkippedDeadline;
+    }
+    match tokio::time::timeout(wait, read).await {
+        Ok(Ok(authority)) => OwnerRenewalDiagnostic::Snapshot(authority),
+        Ok(Err(_)) => OwnerRenewalDiagnostic::ReadFailed,
+        Err(_) => OwnerRenewalDiagnostic::TimedOut,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerRenewalDiagnostic {
+    Snapshot(ExactLiveRunExecutionAuthority),
+    ReadFailed,
+    TimedOut,
+    SkippedDeadline,
+}
+
+impl OwnerRenewalDiagnostic {
+    fn snapshot_reason(&self) -> &'static str {
+        match self {
+            Self::Snapshot(ExactLiveRunExecutionAuthority::Live) => "current_at_snapshot",
+            Self::Snapshot(ExactLiveRunExecutionAuthority::Inactive { .. }) => {
+                "inactive_or_cancellation_requested"
+            }
+            Self::Snapshot(ExactLiveRunExecutionAuthority::OwnerGenerationMismatch { .. }) => {
+                "generation_mismatch"
+            }
+            Self::Snapshot(ExactLiveRunExecutionAuthority::OwnerMismatch { .. }) => {
+                "owner_mismatch"
+            }
+            Self::Snapshot(ExactLiveRunExecutionAuthority::LeaseExpired) => {
+                "lease_expired_at_snapshot"
+            }
+            Self::Snapshot(ExactLiveRunExecutionAuthority::Missing) => {
+                "row_missing_or_session_mismatch"
+            }
+            Self::ReadFailed => "snapshot_read_failed",
+            Self::TimedOut => "snapshot_read_timed_out",
+            Self::SkippedDeadline => "snapshot_skipped_deadline",
+        }
+    }
+
+    fn finish_connection(&self, connection: CancellationSafePoolConnection) {
+        if matches!(self, Self::TimedOut) {
+            // Only a cancelled exchange leaves the protocol unsynchronized.
+            // Normal SQL errors and a skipped read may reuse the checkout.
+            connection.discard();
+        } else {
+            connection.release();
+        }
+    }
+}
 const RUN_START_TIMEOUT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS: i64 = 3;
 
@@ -22385,11 +22454,13 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         expected_owner_generation: u64,
         expected_statuses: &[&str],
+        attempt_deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, String> {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
 
+        let started = std::time::Instant::now();
         let mut query =
             sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET owner_pod_id = ");
         query.push_bind(&self.owner_pod_id);
@@ -22430,6 +22501,41 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
         let renewed = result.rows_affected() > 0;
+        if !renewed {
+            let renewal_elapsed_ms = started.elapsed().as_millis() as u64;
+            // A later snapshot helps correlate a refused UPDATE, but cannot
+            // prove which predicate failed at its execution time. It never
+            // grants authority, retries the UPDATE, or changes its false result.
+            let observed = owner_renewal_diagnostic(
+                attempt_deadline,
+                load_exact_live_run_execution_authority(
+                    connection.connection_mut(),
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    expected_owner_generation,
+                    &self.owner_pod_id,
+                    expected_statuses,
+                ),
+            )
+            .await;
+            let snapshot_reason = observed.snapshot_reason();
+            tracing::warn!(
+                target: "astra_services::runs",
+                operation = "renew_owner_lease",
+                user_id,
+                session_id = expected_session_id,
+                run_id,
+                expected_owner_generation,
+                renewal_elapsed_ms,
+                lease_ttl_ms = self.lease_ttl.as_millis() as u64,
+                snapshot_reason,
+                evidence = "post_update_snapshot",
+                "owner renewal matched no rows; snapshot is diagnostic only, not the cause of the refused update"
+            );
+            observed.finish_connection(connection);
+            return Ok(false);
+        }
         connection.release();
         Ok(renewed)
     }
@@ -28928,6 +29034,7 @@ mod tests {
                     &renewal_run,
                     0,
                     &[STATUS_RUNNING],
+                    None,
                 )
                 .await
         });
@@ -28955,6 +29062,222 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("clean owner renewal session");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_renewal_diagnostics_leave_room_for_short_and_nearly_spent_attempts() {
+        for remaining in [Duration::from_millis(185), Duration::from_millis(8)] {
+            let started = tokio::time::Instant::now();
+            let deadline = started + remaining;
+            let result = tokio::time::timeout_at(deadline, async {
+                let diagnostic =
+                    owner_renewal_diagnostic(Some(deadline), std::future::pending()).await;
+                assert_eq!(diagnostic.snapshot_reason(), "snapshot_read_timed_out");
+                false
+            })
+            .await
+            .expect("diagnostics must not turn a known refusal into an attempt timeout");
+            assert!(!result);
+            assert!(
+                tokio::time::Instant::now() - started <= remaining / 4 + Duration::from_millis(1)
+            );
+        }
+        for remaining in [Duration::ZERO, Duration::from_millis(3)] {
+            let diagnostic =
+                owner_renewal_diagnostic(Some(tokio::time::Instant::now() + remaining), async {
+                    panic!("a nearly spent attempt must not poll diagnostic I/O")
+                })
+                .await;
+            assert_eq!(diagnostic.snapshot_reason(), "snapshot_skipped_deadline");
+        }
+        let failed = owner_renewal_diagnostic(None, async { Err("SQL error".into()) }).await;
+        assert_eq!(failed.snapshot_reason(), "snapshot_read_failed");
+    }
+
+    #[derive(Clone, Default)]
+    struct OwnerRenewalDiagnosticCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for OwnerRenewalDiagnosticCapture {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "snapshot_reason" {
+                self.0.lock().unwrap().push(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OwnerRenewalDiagnosticCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "astra_services::runs" {
+                event.record(&mut self.clone());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn owner_renewal_diagnostic_reuses_sql_error_and_discards_timeout_connections() {
+        let (_, bootstrap_pool) = setup_database_run_state_store_it().await;
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*bootstrap_pool.get().connect_options()).clone())
+            .await
+            .expect("single-slot diagnostic pool");
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .unwrap();
+        let original: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(connection.connection_mut())
+            .await
+            .unwrap();
+        let failed = owner_renewal_diagnostic(None, async {
+            sqlx::query("SELECT (")
+                .fetch_optional(connection.connection_mut())
+                .await
+                .map(|_| ExactLiveRunExecutionAuthority::Missing)
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        assert_eq!(failed.snapshot_reason(), "snapshot_read_failed");
+        failed.finish_connection(connection);
+        let reused: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            original, reused,
+            "completed SQL errors must reuse the checkout"
+        );
+
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .unwrap();
+        let timed_out = owner_renewal_diagnostic(
+            Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            async {
+                sqlx::query("SELECT SLEEP(2)")
+                    .execute(connection.connection_mut())
+                    .await
+                    .map(|_| ExactLiveRunExecutionAuthority::Missing)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await;
+        assert_eq!(timed_out.snapshot_reason(), "snapshot_read_timed_out");
+        timed_out.finish_connection(connection);
+        let replaced: u64 = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&pool),
+        )
+        .await
+        .expect("discard must restore pool capacity")
+        .unwrap();
+        assert_ne!(
+            original, replaced,
+            "a timed-out exchange must never be reused"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn rejected_owner_renewal_retains_false_result_and_db_clock_diagnostics() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        let capture = OwnerRenewalDiagnosticCapture::default();
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("renewal-diagnostic-owner")
+            .with_lease_ttl(Duration::from_secs(300));
+        let nonce = Uuid::new_v4();
+        let user = format!("renewal-diagnostic-u-{nonce}");
+        let session = format!("renewal-diagnostic-s-{nonce}");
+        let run_id = format!("renewal-diagnostic-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        store.insert_run(run).await.expect("insert fresh owned run");
+        assert!(
+            store
+                .renew_owner_lease(&user, &session, &run_id, 0, &[STATUS_RUNNING], None)
+                .await
+                .expect("fresh first renewal")
+        );
+
+        for (mutation, expected) in [
+            ("owner_pod_id = 'another-owner'", "owner_mismatch"),
+            ("run_generation = 1", "generation_mismatch"),
+            ("status = 'completed'", "inactive_or_cancellation_requested"),
+            (
+                "cancellation_requested_at = NOW(6)",
+                "inactive_or_cancellation_requested",
+            ),
+            (
+                "owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)",
+                "lease_expired_at_snapshot",
+            ),
+            (
+                "session_id = 'different-session'",
+                "row_missing_or_session_mismatch",
+            ),
+        ] {
+            sqlx::query(
+                "UPDATE agent_runs SET owner_pod_id = 'renewal-diagnostic-owner',
+                 run_generation = 0, status = 'running', cancellation_requested_at = NULL,
+                 session_id = ?, owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 300 SECOND)
+                 WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&session)
+            .bind(&user)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .expect("reset exact live authority");
+            sqlx::query(&format!(
+                "UPDATE agent_runs SET {mutation} WHERE user_id = ? AND run_id = ?"
+            ))
+            .bind(&user)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .expect("invalidate one renewal predicate");
+            assert!(
+                !store
+                    .renew_owner_lease(&user, &session, &run_id, 0, &[STATUS_RUNNING], None)
+                    .with_subscriber(subscriber.clone())
+                    .await
+                    .expect("rejected renewal remains a resolved ownership conflict"),
+                "{mutation}"
+            );
+            assert_eq!(
+                capture.0.lock().unwrap().pop().as_deref(),
+                Some(expected),
+                "{mutation}"
+            );
+        }
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .expect("clean renewal diagnostic session");
+        sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .expect("clean renewal diagnostic fence");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33088,7 +33411,7 @@ mod tests {
         assert_eq!(reclaimed[0].claimed_from_generation, 0);
         assert!(
             !store
-                .renew_owner_lease(&user_id, &session_id, &run_id, 0, &[STATUS_RUNNING])
+                .renew_owner_lease(&user_id, &session_id, &run_id, 0, &[STATUS_RUNNING], None)
                 .await
                 .expect("stale generation renewal is a resolved ownership race")
         );
@@ -33100,7 +33423,7 @@ mod tests {
         );
         assert!(
             store
-                .renew_owner_lease(&user_id, &session_id, &run_id, 1, &[STATUS_RUNNING])
+                .renew_owner_lease(&user_id, &session_id, &run_id, 1, &[STATUS_RUNNING], None)
                 .await
                 .expect("current generation retains execution authority")
         );

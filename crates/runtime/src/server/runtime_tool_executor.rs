@@ -625,7 +625,7 @@ impl ServerWorkspaceAuthority {
 enum ServerWorkspaceAuthorityError {
     RecursiveRunScript,
     Cancelled,
-    Unavailable,
+    Unavailable(astra_tools::workspace_observation::WorkspaceLeaseFailure),
 }
 
 async fn acquire_server_workspace_authority(
@@ -674,13 +674,13 @@ async fn acquire_server_workspace_authority(
         .await
         .map(ServerWorkspaceAuthority::BoundWorkspace)
     } else {
-        Some(ServerWorkspaceAuthority::None)
+        Ok(ServerWorkspaceAuthority::None)
     };
-    authority.ok_or_else(|| {
+    authority.map_err(|failure| {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             ServerWorkspaceAuthorityError::Cancelled
         } else {
-            ServerWorkspaceAuthorityError::Unavailable
+            ServerWorkspaceAuthorityError::Unavailable(failure)
         }
     })
 }
@@ -4755,15 +4755,12 @@ impl RuntimeToolExecutor {
                     .await
                     .into();
             }
-            Err(ServerWorkspaceAuthorityError::Unavailable) => {
+            Err(ServerWorkspaceAuthorityError::Unavailable(failure)) => {
                 return lifecycle
                     .finish(
                         name,
                         &call_id,
-                        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
-                            name,
-                            &self.workspace_root,
-                        ),
+                        astra_tools::workspace_lease_failure_tool_result(name, failure),
                     )
                     .await
                     .into();
@@ -5393,10 +5390,10 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
                 Err(ServerWorkspaceAuthorityError::Cancelled) => {
                     return astra_tools::cancelled_tool_result(&request.tool_name, false).into();
                 }
-                Err(ServerWorkspaceAuthorityError::Unavailable) => {
-                    return astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
+                Err(ServerWorkspaceAuthorityError::Unavailable(failure)) => {
+                    return astra_tools::workspace_lease_failure_tool_result(
                         &request.tool_name,
-                        &self.workspace_root,
+                        failure,
                     )
                     .into();
                 }

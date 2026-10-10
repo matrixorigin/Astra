@@ -10285,6 +10285,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
         run_id: &str,
         expected_owner_generation: u64,
         expected_statuses: &[&str],
+        _attempt_deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, String> {
         if let Some(entered) = self.activation_renewal_entered.as_ref() {
             entered.notify_one();

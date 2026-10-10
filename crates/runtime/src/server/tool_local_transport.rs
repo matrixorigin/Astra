@@ -306,7 +306,7 @@ mod tests {
             .expect("transport completed receipt-side cleanup");
         assert!(workspace.path().join("descendant-settled").is_file());
         assert!(
-            second_writer.await.expect("second writer task").is_some(),
+            second_writer.await.expect("second writer task").is_ok(),
             "the next writer enters only after the prior owner settles"
         );
     }
@@ -381,7 +381,7 @@ mod tests {
                 Duration::from_millis(50),
             )
             .await
-            .is_none(),
+            .is_err(),
             "no second writer may enter after a terminal ownership timeout"
         );
     }

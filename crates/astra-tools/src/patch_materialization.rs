@@ -169,7 +169,7 @@ pub async fn observe_git_worktree_revision(
             WORKSPACE_LEASE_WAIT,
         )
         .await
-        .ok_or(GitWorkspaceObservationError::WorkspaceUnavailable)?;
+        .map_err(|_| GitWorkspaceObservationError::WorkspaceUnavailable)?;
     observe_git_worktree_revision_with_workspace_lease(workspace_root, &workspace_lease).await
 }
 
@@ -199,7 +199,7 @@ pub async fn materialize_git_patch(
     expected_base_revision: &WorkContentHash,
     patch: &[u8],
 ) -> GitPatchMaterializationOutcome {
-    let Some(workspace_lease) =
+    let Ok(workspace_lease) =
         crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
             workspace_root,
             None,
@@ -328,9 +328,11 @@ pub async fn export_git_worktree_patch(
             WORKSPACE_LEASE_WAIT,
         )
         .await
-        .ok_or(GitWorktreePatchExportError::Observation(
-            GitWorkspaceObservationError::WorkspaceUnavailable,
-        ))?;
+        .map_err(|_| {
+            GitWorktreePatchExportError::Observation(
+                GitWorkspaceObservationError::WorkspaceUnavailable,
+            )
+        })?;
     export_git_worktree_patch_with_workspace_lease(workspace_root, &workspace_lease).await
 }
 
@@ -397,7 +399,7 @@ pub async fn commit_reviewed_git_patch(
     patch: &[u8],
     metadata: &GitWorktreeCommitMetadata,
 ) -> GitWorktreeCommitOutcome {
-    let Some(workspace_lease) =
+    let Ok(workspace_lease) =
         crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
             workspace_root,
             None,
@@ -642,7 +644,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
     expected_result_revision: &WorkContentHash,
     patch: &[u8],
 ) -> GitReviewedCommitReconciliation {
-    let Some(workspace_lease) =
+    let Ok(workspace_lease) =
         crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
             workspace_root,
             None,

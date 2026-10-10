@@ -1131,8 +1131,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         )
         .await;
         match lease {
-            Some(guard) => Some(guard),
-            None => {
+            Ok(guard) => Some(guard),
+            Err(failure) => {
                 if ctx
                     .cancel_token
                     .as_ref()
@@ -1140,10 +1140,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 {
                     return crate::cancelled_tool_result("bash", false);
                 }
-                return crate::workspace_lease_unavailable_tool_result_for_workspace(
-                    "bash",
-                    &ctx.workspace_root,
-                );
+                return crate::workspace_lease_failure_tool_result("bash", failure);
             }
         }
     } else {

@@ -4843,15 +4843,12 @@ impl ToolExecutor {
                 )
                 .await;
             match lease {
-                Some(guard) => Some(guard),
-                None => {
+                Ok(guard) => Some(guard),
+                Err(failure) => {
                     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                         return super::cancelled_tool_execution_outcome("bash", false);
                     }
-                    return super::workspace_lease_unavailable_tool_execution_outcome(
-                        "bash",
-                        &self.effective_project_root(),
-                    );
+                    return super::workspace_lease_failure_tool_execution_outcome("bash", failure);
                 }
             }
         } else {
@@ -4872,6 +4869,7 @@ impl ToolExecutor {
             std::time::Duration::from_secs_f64(timeout_secs.max(0.1)),
         ).await {
             Ok(lease) => lease,
+            Err(astra_tools::workspace_observation::ExternalEffectLeaseFailure::Admission(failure)) => return super::workspace_lease_failure_tool_execution_outcome("bash", failure),
             Err(message) => return super::ToolExecutionOutcome::error(format!("Error: external state observation was not admitted: {message}")),
         };
         if external_effect_requested && external_lease.is_none() {
@@ -5392,7 +5390,7 @@ mod tests {
                     Duration::from_millis(100),
                 )
                 .await
-                .is_some()
+                .is_ok()
                 {
                     break;
                 }

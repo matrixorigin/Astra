@@ -48,12 +48,13 @@ pub use edge::{
 pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
-    EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
-    ModelSelection, ProviderInteractionRespondRequest, RequestedModelPolicy, RunUserIntentRequest,
-    RunUserIntentResponse, SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage,
-    SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
-    SessionUpdateRequest, StreamEvent, ToolResultHashParts, ToolResultRequest,
-    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
+    EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE, EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest,
+    EdgeHeartbeatResponse, EdgeRegisterRequest, ModelSelection, ProviderInteractionRespondRequest,
+    RUN_INTERACTION_AUTHORITY_LOST_CODE, RUN_INTERACTION_SUPERSEDED_CODE, RequestedModelPolicy,
+    RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest, SessionTranscriptItem,
+    SessionTranscriptPage, SessionTranscriptReadScope, SessionTranscriptToolCall,
+    SessionTranscriptToolResult, SessionUpdateRequest, StreamEvent, ToolResultHashParts,
+    ToolResultRequest, ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
     tool_result_status_is_error,
 };
 /// SSE / buffered HTTP response from a Server-owned developer loop.

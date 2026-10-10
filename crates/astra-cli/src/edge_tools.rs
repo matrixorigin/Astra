@@ -587,12 +587,11 @@ fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
     }
 }
 
-pub(crate) fn workspace_lease_unavailable_tool_execution_outcome(
+pub(crate) fn workspace_lease_failure_tool_execution_outcome(
     name: &str,
-    workspace_root: &Path,
+    failure: astra_tools::workspace_observation::WorkspaceLeaseFailure,
 ) -> ToolExecutionOutcome {
-    let result =
-        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(name, workspace_root);
+    let result = astra_tools::workspace_lease_failure_tool_result(name, failure);
     ToolExecutionOutcome {
         output: result.output,
         tool_result_fields: result.metadata,
@@ -4620,8 +4619,8 @@ impl ToolExecutor {
             )
             .await
             {
-                Some(guard) => Some(guard),
-                None => {
+                Ok(guard) => Some(guard),
+                Err(failure) => {
                     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                         if let Some(authority) = convergence_authority.as_deref() {
                             self.convergence_tracker.clear_authority(authority);
@@ -4629,10 +4628,7 @@ impl ToolExecutor {
                         return cancelled_edge_tool_run(name, false);
                     }
                     return EdgeToolRun::from_tool_result(
-                        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
-                            name,
-                            &self.project_root,
-                        ),
+                        astra_tools::workspace_lease_failure_tool_result(name, failure),
                     );
                 }
             }
@@ -4674,13 +4670,10 @@ impl ToolExecutor {
             )
             .await
             {
-                Some(guard) => Some(guard),
-                None => {
+                Ok(guard) => Some(guard),
+                Err(failure) => {
                     return EdgeToolRun::from_tool_result(
-                        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
-                            name,
-                            &self.project_root,
-                        ),
+                        astra_tools::workspace_lease_failure_tool_result(name, failure),
                     );
                 }
             }

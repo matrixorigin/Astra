@@ -160,7 +160,7 @@ async fn drive_awaiting_dispatch(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+    let Ok(workspace_lease) = acquire_workspace_mutation_lease_with_options(
         &workspace,
         Some(cancel),
         Duration::from_secs(120),
@@ -350,7 +350,7 @@ async fn drive_reconciliation(
         Ok(patch) => patch,
         Err(_) => return Ok(()),
     };
-    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+    let Ok(workspace_lease) = acquire_workspace_mutation_lease_with_options(
         &workspace,
         Some(cancel),
         Duration::from_secs(120),

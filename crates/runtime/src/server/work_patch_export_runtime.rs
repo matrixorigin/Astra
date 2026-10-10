@@ -83,7 +83,7 @@ pub(crate) async fn export_work_patch(
             Duration::from_secs(120),
         )
         .await
-        .ok_or_else(|| WorkPatchExportError::Unavailable("workspace lease unavailable".into()))?;
+        .map_err(|failure| WorkPatchExportError::Unavailable(failure.to_string()))?;
     if resolve().await.map_err(map_workspace_error)? != workspace {
         return Err(WorkPatchExportError::BasisConflict);
     }

@@ -1481,11 +1481,20 @@ struct EdgeCallbackFailure {
 pub(crate) fn edge_callback_detach_message(
     operation: &str,
     delivery: &str,
-    error: &impl std::fmt::Display,
+    details: &impl std::fmt::Display,
 ) -> String {
     format!(
-        "Astra could not settle the {operation} callback {delivery}. This client detached; that is not a cancellation of the server run. A timed-out acknowledgement does not prove the server rejected the {operation}. Details: {error}"
+        "Astra could not settle the {operation} callback {delivery}. This client detached; that is not a cancellation of the server run. An unacknowledged callback does not establish the server run's final state. Details: {details}"
     )
+}
+
+fn edge_callback_error_details(error: &astra_thin_client::ThinClientError) -> String {
+    match error {
+        astra_thin_client::ThinClientError::Api { status, body } => {
+            crate::cli::cli_config::cli_utils::read_api_error(status.as_u16(), body)
+        }
+        _ => error.to_string(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1546,16 +1555,27 @@ fn durable_allow_was_acknowledged(result: &Result<(), PostApprovalError>) -> boo
     }
 }
 
+// Both callback handlers route 401 through mark_edge_auth_failure before this classifier.
 fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
     match error {
-        astra_thin_client::ThinClientError::Api { status, .. }
-            if *status == reqwest::StatusCode::CONFLICT =>
+        astra_thin_client::ThinClientError::Api { status, body }
+            if *status == reqwest::StatusCode::CONFLICT
+                && serde_json::from_str::<Value>(body).is_ok_and(|value| {
+                    value.get("error_code").and_then(Value::as_str)
+                        == Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE)
+                }) =>
         {
             astra_core::ErrorKind::ContractViolation
         }
         astra_thin_client::ThinClientError::Api { status, .. } if status.is_server_error() => {
             astra_core::ErrorKind::ServerError
         }
+        astra_thin_client::ThinClientError::Api { status, .. }
+            if *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            astra_core::ErrorKind::RateLimit
+        }
+        astra_thin_client::ThinClientError::Api { .. } => astra_core::ErrorKind::InvalidRequest,
         error if error.is_transport() => astra_core::ErrorKind::StreamTransport,
         _ => astra_core::ErrorKind::ContractViolation,
     }
@@ -1834,11 +1854,17 @@ impl<'a> CliSseStreamHost<'a> {
             let kind = edge_callback_error_kind(error);
             let delivery = if error.is_transport() {
                 "after bounded transport retries"
+            } else if matches!(error, astra_thin_client::ThinClientError::Api { .. }) {
+                "because the callback endpoint returned an HTTP error"
             } else {
-                "because the server rejected its durable lifecycle state"
+                "because the callback response could not be validated"
             };
             self.callback_failure = Some(EdgeCallbackFailure {
-                message: edge_callback_detach_message(operation, delivery, error),
+                message: edge_callback_detach_message(
+                    operation,
+                    delivery,
+                    &edge_callback_error_details(error),
+                ),
                 kind,
             });
             self.callback_failure_run_id = (!run_id.trim().is_empty()).then(|| run_id.to_string());
@@ -1857,7 +1883,10 @@ impl<'a> CliSseStreamHost<'a> {
             self.mark_edge_auth_failure(run_id);
             true
         } else if !self.render_policy.suppress_tool_ui() {
-            eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            eprintln!(
+                "{}",
+                edge_sse_post_tool_result_fail_line(edge_callback_error_details(e)).yellow()
+            );
             self.mark_edge_callback_failure("tool-result", run_id, e);
             false
         } else {
@@ -1875,7 +1904,10 @@ impl<'a> CliSseStreamHost<'a> {
             self.mark_edge_auth_failure(run_id);
             true
         } else if !self.render_policy.suppress_tool_ui() {
-            eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+            eprintln!(
+                "{}",
+                edge_sse_post_approval_fail_line(edge_callback_error_details(e)).yellow()
+            );
             self.mark_edge_callback_failure("approval", run_id, e);
             false
         } else {
@@ -1932,10 +1964,12 @@ impl<'a> CliSseStreamHost<'a> {
                     Err(ref retry_err) => {
                         if self.handle_post_tool_result_error(&body.run_id, retry_err) {
                             Err(PostToolResultError::TerminalAuthFailure(
-                                retry_err.to_string(),
+                                edge_callback_error_details(retry_err),
                             ))
                         } else {
-                            Err(PostToolResultError::RequestFailed(retry_err.to_string()))
+                            Err(PostToolResultError::RequestFailed(
+                                edge_callback_error_details(retry_err),
+                            ))
                         }
                     }
                 }
@@ -1944,7 +1978,9 @@ impl<'a> CliSseStreamHost<'a> {
                 if self.handle_post_tool_result_error(&body.run_id, &e) {
                     Err(PostToolResultError::AuthRefreshFailed)
                 } else {
-                    Err(PostToolResultError::RequestFailed(e.to_string()))
+                    Err(PostToolResultError::RequestFailed(
+                        edge_callback_error_details(&e),
+                    ))
                 }
             }
         }
@@ -1975,10 +2011,12 @@ impl<'a> CliSseStreamHost<'a> {
                         Err(PostApprovalError::AlreadyRecorded(decision))
                     } else if self.handle_post_approval_error(&body.run_id, retry_err) {
                         Err(PostApprovalError::TerminalAuthFailure(
-                            retry_err.to_string(),
+                            edge_callback_error_details(retry_err),
                         ))
                     } else {
-                        Err(PostApprovalError::RequestFailed(retry_err.to_string()))
+                        Err(PostApprovalError::RequestFailed(
+                            edge_callback_error_details(retry_err),
+                        ))
                     }
                 } else {
                     Ok(())
@@ -1988,7 +2026,9 @@ impl<'a> CliSseStreamHost<'a> {
                 if self.handle_post_approval_error(&body.run_id, &e) {
                     Err(PostApprovalError::AuthRefreshFailed)
                 } else {
-                    Err(PostApprovalError::RequestFailed(e.to_string()))
+                    Err(PostApprovalError::RequestFailed(
+                        edge_callback_error_details(&e),
+                    ))
                 }
             }
         }
@@ -10988,21 +11028,254 @@ mod tests {
         assert_eq!(accum2.error_message.as_deref(), Some("Cancelled by user"));
     }
 
-    #[test]
-    fn edge_callback_detach_message_does_not_promise_cancellation() {
+    #[tokio::test]
+    async fn edge_callback_detach_message_does_not_promise_cancellation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let client = astra_core::net::client_builder_for_target(&server.uri())
+            .timeout(std::time::Duration::from_millis(20))
+            .build()
+            .expect("client");
+        let error = astra_thin_client::ThinClientError::Http(
+            client.get(server.uri()).send().await.expect_err("timeout"),
+        );
         let message = edge_callback_detach_message(
             "approval",
             "after bounded transport retries",
-            &"HTTP error: error sending request",
+            &super::edge_callback_error_details(&error),
         );
 
         assert!(message.contains("after bounded transport retries"));
+        assert_eq!(
+            edge_callback_error_kind(&error),
+            astra_core::ErrorKind::StreamTransport
+        );
         assert!(message.contains("This client detached"));
         assert!(message.contains("not a cancellation of the server run"));
-        assert!(message.contains("does not prove the server rejected the approval"));
+        assert!(message.contains("does not establish the server run's final state"));
         assert!(!message.contains("astra session cancel"));
         assert!(!message.contains("will be cancelled"));
         assert!(!message.contains("fail-closed"));
+    }
+
+    #[test]
+    fn edge_callback_http_failures_require_producer_codes_for_contract_conflicts() {
+        for (status, body, kind) in [
+            (
+                405,
+                "<html>blocked</html>",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                "<html>proxy conflict</html>",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (409, "conflict", astra_core::ErrorKind::InvalidRequest),
+            (
+                403,
+                "<html>denied</html>",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (429, "rate limited", astra_core::ErrorKind::RateLimit),
+            (
+                502,
+                "<html>bad gateway</html>",
+                astra_core::ErrorKind::ServerError,
+            ),
+            (
+                409,
+                r#"{"detail":"callback result hash mismatch","request_id":"conflict-test"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"message":"blocked"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"unknown_gateway_code","detail":"blocked"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"run_interaction_authority_lost","detail":"recorded"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"run_interaction_superseded","detail":"recorded"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"edge_callback_payload_conflict","detail":"immutable payload differs","request_id":"conflict-test"}"#,
+                astra_core::ErrorKind::ContractViolation,
+            ),
+        ] {
+            let error = astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                body: body.into(),
+            };
+            assert_eq!(edge_callback_error_kind(&error), kind, "{status}: {body}");
+            let message = edge_callback_detach_message(
+                "tool-result",
+                "because the callback endpoint returned an HTTP error",
+                &super::edge_callback_error_details(&error),
+            );
+            assert!(message.contains(&status.to_string()));
+            assert!(message.contains("not a cancellation of the server run"));
+            assert!(!message.contains("rejected its durable lifecycle state"));
+            assert!(!message.contains("<html>"));
+            if kind == astra_core::ErrorKind::ContractViolation {
+                assert!(message.contains("immutable payload differs"));
+                assert!(message.contains("conflict-test"));
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn edge_callback_rejections_stop_physical_stream_without_reposting() {
+        let page = r#"<!doctype html><html><script>untrusted script</script><textarea>{"traceid":"waf-test-123"}</textarea></html>"#;
+        let conflict_body = |code: Option<&str>| {
+            serde_json::json!({
+                "error_code": code,
+                "message": "blocked",
+                "request_id": "waf-test-123",
+            })
+            .to_string()
+        };
+        for (status, body, expected_kind) in [
+            (405, page.to_string(), astra_core::ErrorKind::InvalidRequest),
+            (
+                409,
+                conflict_body(None),
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                conflict_body(Some(astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE)),
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                conflict_body(Some(astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE)),
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                conflict_body(Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE)),
+                astra_core::ErrorKind::ContractViolation,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            for endpoint in ["/tools/result", "/approval/respond"] {
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(status).set_body_string(&body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).unwrap();
+            let workspace = tempdir().unwrap();
+            let executor =
+                std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+            let parent_cancel = tokio_util::sync::CancellationToken::new();
+            for is_approval in [false, true] {
+                let physical_cancel = parent_cancel.child_token();
+                let mut tool_cache = EdgeToolCache::new(10);
+                let ctx = EdgeSseContext {
+                    api: &api,
+                    token: "test-token",
+                    executor_id: "edge-test",
+                    executor: executor.clone(),
+                    render_policy: if is_approval {
+                        RenderPolicy::Silent
+                    } else {
+                        RenderPolicy::Stream
+                    },
+                    perm_manager: None,
+                    cancel_token: Some(&physical_cancel),
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    turn_rollback_on_failure: false,
+                    tool_cache: &mut tool_cache,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                };
+                let mut host = CliSseStreamHost::from_edge_ctx(ctx, 80, false);
+                let message = if is_approval {
+                    let result = host
+                        .post_approval_with_auth_retry(&astra_thin_client::ApprovalRespondRequest {
+                            session_id: "test-session".into(),
+                            run_id: "test-run".into(),
+                            request_id: "req-approval".into(),
+                            decision: astra_thin_client::ApprovalDecision::Allow,
+                            reason: None,
+                            tool_name: None,
+                            approval_kind: None,
+                        })
+                        .await;
+                    assert!(
+                        !durable_allow_was_acknowledged(&result),
+                        "an HTTP conflict must not authorize execution"
+                    );
+                    result.expect_err("rejected callback").to_string()
+                } else {
+                    let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                        astra_thin_client::ToolResultRequestParts {
+                            session_id: "test-session".into(),
+                            run_id: "test-run".into(),
+                            turn_chain_id: "test-chain".into(),
+                            request_id: "req-tool".into(),
+                            edge_agent_id: "edge-test".into(),
+                            status: "completed".into(),
+                            output: "already executed".into(),
+                            duration_ms: 1,
+                            tool_result_fields: None,
+                        },
+                    );
+                    match host.post_tool_result_with_auth_retry(&body).await {
+                        Err(PostToolResultError::RequestFailed(message)) => message,
+                        result => panic!("expected HTTP rejection: {result:?}"),
+                    }
+                };
+                assert!(message.contains(&status.to_string()));
+                assert!(message.contains("waf-test-123"));
+                assert!(!message.contains("<html>"));
+                assert!(!message.contains("untrusted script"));
+                assert!(physical_cancel.is_cancelled());
+                assert!(!parent_cancel.is_cancelled());
+                assert!(!host.auth_failure);
+                assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
+                let mut accum = ChatTurnSseAccum {
+                    error_message: Some("Cancelled by user".into()),
+                    ..Default::default()
+                };
+                apply_edge_callback_failure_result(&mut accum, host.callback_failure.clone());
+                assert_eq!(accum.error_kind, Some(expected_kind));
+                let final_message = accum.error_message.unwrap();
+                assert!(final_message.contains("not a cancellation of the server run"));
+                assert!(final_message.contains("waf-test-123"));
+                assert!(!final_message.contains("<html>"));
+                assert!(!final_message.contains("rejected its durable lifecycle state"));
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "only the two callbacks; no retries or Server cancel"
+            );
+        }
     }
 
     #[test]
@@ -11040,7 +11313,7 @@ mod tests {
 
         assert_eq!(
             edge_callback_error_kind(&error),
-            astra_core::ErrorKind::ContractViolation
+            astra_core::ErrorKind::InvalidRequest
         );
     }
 
@@ -11061,7 +11334,7 @@ mod tests {
                 body: r#"{"detail":"approval decision already recorded as deny"}"#.into(),
             }),
             None,
-            "a 409 without the recorded-decision code stays a lifecycle contract failure"
+            "a 409 without the recorded-decision code is not an acknowledgement"
         );
         assert!(durable_allow_was_acknowledged(&Err(
             PostApprovalError::AlreadyRecorded(RecordedApprovalDecision::Allow)

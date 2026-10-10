@@ -1545,11 +1545,12 @@ impl RunEngine {
                         &run_id,
                         expected_owner_generation,
                         OWNER_LEASE_RENEWAL_STATUSES,
+                        Some(renewal_started_at + policy.attempt_wait),
                     );
                     let renewed = tokio::select! {
                         biased;
                         _ = &mut stop_rx => break 'heartbeat,
-                        result = tokio::time::timeout(policy.attempt_wait, renewal) => result,
+                        result = tokio::time::timeout_at(renewal_started_at + policy.attempt_wait, renewal) => result,
                     };
                     match renewed {
                         Ok(Ok(true)) => {
@@ -1696,13 +1697,14 @@ impl RunEngine {
                 run_id,
                 expected_owner_generation,
                 OWNER_LEASE_RENEWAL_STATUSES,
+                Some(activation_started_at + policy.attempt_wait),
             );
             let result = tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => return Err(format!(
                     "durable execution authority activation was cancelled for run {run_id}"
                 )),
-                result = tokio::time::timeout(policy.attempt_wait, renew) => result,
+                result = tokio::time::timeout_at(activation_started_at + policy.attempt_wait, renew) => result,
             };
             match result {
                 Ok(Ok(true)) => {
@@ -7557,6 +7559,7 @@ mod tests {
             _run_id: &str,
             _expected_owner_generation: u64,
             _expected_statuses: &[&str],
+            _attempt_deadline: Option<tokio::time::Instant>,
         ) -> Result<bool, String> {
             let attempt = self.lease_renewals.fetch_add(1, Ordering::SeqCst);
             match self.lease_renewal_behavior {

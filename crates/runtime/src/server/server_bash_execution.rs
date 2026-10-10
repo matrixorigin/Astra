@@ -151,14 +151,12 @@ pub(crate) async fn execute_server_bash(
         )
         .await
         {
-            Some(guard) => Some(guard),
-            None => {
+            Ok(guard) => Some(guard),
+            Err(failure) => {
                 if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                     return astra_tools::cancelled_tool_result("bash", false);
                 }
-                return pre_dispatch_rejection_tool_result(
-                    "Error: workspace observation lease was unavailable or timed out; no bash command was run",
-                );
+                return astra_tools::workspace_lease_failure_tool_result("bash", failure);
             }
         }
     } else {
@@ -185,6 +183,7 @@ pub(crate) async fn execute_server_bash(
         args, workspace_root, cancel_token, Duration::from_secs_f64(timeout_secs.max(0.1)),
     ).await {
         Ok(lease) => lease,
+        Err(astra_tools::workspace_observation::ExternalEffectLeaseFailure::Admission(failure)) => return astra_tools::workspace_lease_failure_tool_result("bash", failure),
         Err(reason) => return pre_dispatch_rejection_tool_result(format!("Error: external state observation was not admitted: {reason}")),
     };
     if args

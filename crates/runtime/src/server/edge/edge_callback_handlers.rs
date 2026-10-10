@@ -135,9 +135,10 @@ fn ledger_capacity_error() -> (StatusCode, Json<ErrorResponse>) {
 }
 
 fn ledger_duplicate_error(key: &str) -> (StatusCode, Json<ErrorResponse>) {
-    error_response(
+    astra_core::error_response_coded(
         StatusCode::CONFLICT,
         format!("edge callback already recorded for key {key}; refusing to overwrite"),
+        astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE,
     )
 }
 
@@ -838,22 +839,24 @@ pub(crate) async fn post_approval_respond_handler(
                 reason,
                 ..
             }) => {
-                return Err(error_response(
+                return Err(astra_core::error_response_coded(
                     StatusCode::CONFLICT,
                     format!(
                         "Approval response was recorded, but the run no longer owns its execution authority: {reason:?}"
                     ),
+                    astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE,
                 ));
             }
             Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
                 user_intent_event_index,
                 ..
             }) => {
-                return Err(error_response(
+                return Err(astra_core::error_response_coded(
                     StatusCode::CONFLICT,
                     format!(
                         "Approval response was recorded, but newer user guidance at event {user_intent_event_index} superseded it"
                     ),
+                    astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE,
                 ));
             }
             Err((_, error)) => {
@@ -1057,11 +1060,12 @@ pub(crate) async fn post_approval_respond_handler(
                 registry.as_ref(),
                 "authority_lost",
             );
-            return Err(error_response(
+            return Err(astra_core::error_response_coded(
                 StatusCode::CONFLICT,
                 format!(
                     "Approval response was recorded, but the run no longer owns its execution authority: {reason:?}"
                 ),
+                astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE,
             ));
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
@@ -1072,11 +1076,12 @@ pub(crate) async fn post_approval_respond_handler(
                 registry.as_ref(),
                 "superseded",
             );
-            return Err(error_response(
+            return Err(astra_core::error_response_coded(
                 StatusCode::CONFLICT,
                 format!(
                     "Approval response was recorded, but newer user guidance at event {user_intent_event_index} superseded it"
                 ),
+                astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE,
             ));
         }
         Err((_, error)) => {
@@ -1288,22 +1293,24 @@ pub(crate) async fn post_user_prompt_respond_handler(
             reason,
             ..
         }) => {
-            return Err(error_response(
+            return Err(astra_core::error_response_coded(
                 StatusCode::CONFLICT,
                 format!(
                     "User prompt response was recorded, but the run no longer owns its execution authority: {reason:?}"
                 ),
+                astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE,
             ));
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
             user_intent_event_index,
             ..
         }) => {
-            return Err(error_response(
+            return Err(astra_core::error_response_coded(
                 StatusCode::CONFLICT,
                 format!(
                     "User prompt response was recorded, but newer user guidance at event {user_intent_event_index} superseded it"
                 ),
+                astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE,
             ));
         }
         Err((_, error)) => {
@@ -1563,22 +1570,24 @@ pub(crate) async fn post_provider_interaction_respond_handler(
             reason,
             ..
         }) => {
-            return Err(error_response(
+            return Err(astra_core::error_response_coded(
                 StatusCode::CONFLICT,
                 format!(
                     "Provider interaction was recorded, but the run no longer owns its execution authority: {reason:?}"
                 ),
+                astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE,
             ));
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
             user_intent_event_index,
             ..
         }) => {
-            return Err(error_response(
+            return Err(astra_core::error_response_coded(
                 StatusCode::CONFLICT,
                 format!(
                     "Provider interaction was recorded, but newer user guidance at event {user_intent_event_index} superseded it"
                 ),
+                astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE,
             ));
         }
         Err((_, error)) => {
@@ -2870,67 +2879,91 @@ mod edge_callback_insert_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn edge_approval_authority_loss_remains_conflict_across_retry_and_app_restart() {
+    async fn approval_nonresuming_outcomes_remain_coded_conflicts_across_retry_and_restart() {
         let journal_dir = tempfile::tempdir().unwrap();
         let _journal_guard =
             astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let lifecycle = Arc::new(
-            ApprovalTargetRunLifecycle::new("run-edge-authority-lost", "sess-edge-authority-lost")
-                .with_required(
-                    "req-edge-authority-lost",
-                    "approval_required",
-                    json!({
-                        "request_id": "req-edge-authority-lost",
-                        "tool": "write_file",
-                        "approval_kind": "standard",
-                        "delivery": "edge_ledger",
-                    }),
-                )
-                .with_resolved(
-                    "req-edge-authority-lost",
-                    "approval_resolved",
-                    json!({
-                        "request_id": "req-edge-authority-lost",
-                        "outcome": "approved",
-                        "decision": "allow",
-                        "reason": null,
-                        "tool": "write_file",
-                        "approval_kind": "standard",
-                        "_durable_resolution": {
-                            "disposition": "authority_lost",
-                            "authority_loss": {"kind": "frontier_changed"},
-                        }
-                    }),
+        for delivery in ["edge_ledger", "durable"] {
+            for (disposition, code) in [
+                (
+                    "authority_lost",
+                    astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE,
                 ),
-        );
-        let first_state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_auth_service(Arc::new(StaticAuthService))
-            .with_run_lifecycle_service(lifecycle.clone());
-        let restarted_state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_auth_service(Arc::new(StaticAuthService))
-            .with_run_lifecycle_service(lifecycle);
+                (
+                    "superseded",
+                    astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE,
+                ),
+            ] {
+                let lifecycle = Arc::new(
+                    ApprovalTargetRunLifecycle::new(
+                        "run-edge-authority-lost",
+                        "sess-edge-authority-lost",
+                    )
+                    .with_required(
+                        "req-edge-authority-lost",
+                        "approval_required",
+                        json!({
+                            "request_id": "req-edge-authority-lost",
+                            "tool": "write_file",
+                            "approval_kind": "standard",
+                            "delivery": delivery,
+                        }),
+                    )
+                    .with_resolved(
+                        "req-edge-authority-lost",
+                        "approval_resolved",
+                        json!({
+                            "request_id": "req-edge-authority-lost",
+                            "outcome": "approved",
+                            "decision": "allow",
+                            "reason": null,
+                            "tool": "write_file",
+                            "approval_kind": "standard",
+                            "_durable_resolution": {
+                                "disposition": disposition,
+                                "user_intent_event_index": 42,
+                                "authority_loss": {"kind": "frontier_changed"},
+                            }
+                        }),
+                    ),
+                );
+                let first_state =
+                    AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+                        .with_auth_service(Arc::new(StaticAuthService))
+                        .with_run_lifecycle_service(lifecycle.clone());
+                let restarted_state =
+                    AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+                        .with_auth_service(Arc::new(StaticAuthService))
+                        .with_run_lifecycle_service(lifecycle);
 
-        for (trace_id, state) in [
-            ("trace-edge-authority-lost-first", first_state),
-            ("trace-edge-authority-lost-restart", restarted_state),
-        ] {
-            let error = post_approval_respond_handler(
-                Extension(RequestTrace {
-                    request_id: trace_id.to_string(),
-                }),
-                State(state.clone()),
-                HeaderMap::new(),
-                Json(edge_approval_response(
-                    "run-edge-authority-lost",
-                    "sess-edge-authority-lost",
-                    "req-edge-authority-lost",
-                    astra_thin_client::ApprovalDecision::Allow,
-                )),
-            )
-            .await
-            .expect_err("authority-lost allow must never become an idempotent success");
-            assert_eq!(error.0, StatusCode::CONFLICT);
-            assert!(state.edge_callback_ledger.lock().await.is_empty());
+                for (trace_id, state) in [
+                    ("trace-edge-authority-lost-first", first_state),
+                    ("trace-edge-authority-lost-restart", restarted_state),
+                ] {
+                    let error = post_approval_respond_handler(
+                        Extension(RequestTrace {
+                            request_id: trace_id.to_string(),
+                        }),
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Json(edge_approval_response(
+                            "run-edge-authority-lost",
+                            "sess-edge-authority-lost",
+                            "req-edge-authority-lost",
+                            astra_thin_client::ApprovalDecision::Allow,
+                        )),
+                    )
+                    .await
+                    .expect_err("a nonresuming allow must never become an idempotent success");
+                    assert_eq!(error.0, StatusCode::CONFLICT);
+                    assert_eq!(error.1.0.error_code.as_deref(), Some(code));
+                    assert!(
+                        error.1.0.metadata.is_none(),
+                        "not a recorded-decision acknowledgement"
+                    );
+                    assert!(state.edge_callback_ledger.lock().await.is_empty());
+                }
+            }
         }
     }
 
@@ -3936,6 +3969,22 @@ mod edge_callback_insert_tests {
         .await
         .expect("the selected executor's exact retry must remain idempotent");
         assert_eq!(replay.0["delivery_route"], "idempotent_replay");
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
+        let divergent = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-divergent-replay".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request("edge-a", "different result")),
+        )
+        .await
+        .expect_err("a divergent retry cannot overwrite the consumed result");
+        assert_eq!(divergent.0, StatusCode::CONFLICT);
+        assert_eq!(
+            divergent.1.0.error_code.as_deref(),
+            Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE)
+        );
         assert!(state.edge_callback_ledger.lock().await.is_empty());
     }
 

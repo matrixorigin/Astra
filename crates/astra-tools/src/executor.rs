@@ -257,8 +257,8 @@ impl DefaultToolExecutor {
             )
             .await
             {
-                Some(guard) => Some(guard),
-                None => {
+                Ok(guard) => Some(guard),
+                Err(failure) => {
                     if self
                         .ctx
                         .cancel_token
@@ -269,10 +269,7 @@ impl DefaultToolExecutor {
                             .clear_authority(&self.convergence_authority);
                         return crate::cancelled_tool_result(name, false);
                     }
-                    return crate::workspace_lease_unavailable_tool_result_for_workspace(
-                        name,
-                        &self.ctx.workspace_root,
-                    );
+                    return crate::workspace_lease_failure_tool_result(name, failure);
                 }
             }
         } else {
@@ -296,12 +293,9 @@ impl DefaultToolExecutor {
             )
             .await
             {
-                Some(guard) => Some(guard),
-                None => {
-                    return crate::workspace_lease_unavailable_tool_result_for_workspace(
-                        name,
-                        &self.ctx.workspace_root,
-                    );
+                Ok(guard) => Some(guard),
+                Err(failure) => {
+                    return crate::workspace_lease_failure_tool_result(name, failure);
                 }
             }
         } else {
@@ -897,7 +891,7 @@ mod tests {
                     std::time::Duration::from_millis(1),
                 )
                 .await;
-            assert!(released.is_some(), "{name} leaked its workspace guard");
+            assert!(released.is_ok(), "{name} leaked its workspace guard");
         }
     }
 
