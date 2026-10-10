@@ -34781,7 +34781,7 @@ async fn submit_run_user_intent_rejects_oversized_content() {
 }
 
 #[tokio::test]
-async fn submit_run_user_intent_rejects_multibyte_provider_input_overflow() {
+async fn submit_run_user_intent_accepts_internal_unicode_guidance() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -34789,7 +34789,16 @@ async fn submit_run_user_intent_rejects_multibyte_provider_input_overflow() {
         .await
         .unwrap();
 
-    let e = err(svc
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-multibyte-input",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
+    let accepted = ok(svc
         .submit_run_user_intent(
             "run-multibyte-input".into(),
             "user-1".into(),
@@ -34801,19 +34810,198 @@ async fn submit_run_user_intent_rejects_multibyte_provider_input_overflow() {
         )
         .await);
 
-    assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        accepted.status,
+        astra_turn_types::UserIntentStatus::AcceptedRemote
+    );
     let durable = engine
         .load_run("user-1", "run-multibyte-input")
         .await
         .unwrap()
         .unwrap();
-    assert!(durable.events.iter().all(|event| {
+    assert!(durable.events.iter().any(|event| {
         event
             .get("data")
             .and_then(|data| data.get("intent_id"))
             .and_then(Value::as_str)
-            != Some("intent-multibyte-large")
+            == Some("intent-multibyte-large")
     }));
+    let poll = engine
+        .poll_user_intents("user-1", "run-multibyte-input", 0)
+        .await;
+    assert!(poll.issues.is_empty());
+    assert_eq!(poll.inputs.len(), 1);
+    assert_eq!(poll.inputs[0].input["content"], "界".repeat(11_000));
+}
+
+#[tokio::test]
+async fn native_guidance_validates_the_delivered_envelope_before_acceptance() {
+    let svc = test_service();
+    let run = "native-guidance";
+    svc.run_engine
+        .start_run_ext(
+            run,
+            "user-1",
+            "session-1",
+            None,
+            None,
+            Some("native-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut capabilities = PreparedRuntimeCapabilities::default();
+    capabilities
+        .bind_edge_discovery(Some(authenticated_edge_discovery_fixture()))
+        .unwrap();
+    let policy = capabilities
+        .provider_policy_index
+        .resolve("fixture_native_stage")
+        .unwrap();
+    let admission = astra_services::runs::CollaboratorStageAdmission {
+        anchor_run_id: run.into(),
+        source_message_id: "source".into(),
+        request_fingerprint: "request".into(),
+        execution_identity_fingerprint: "execution".into(),
+        native_execution: Some(astra_services::runs::CollaboratorNativeExecutionLocator {
+            descriptor: policy.descriptor.clone(),
+            public_tool_name: "fixture_native_stage".into(),
+            requested_model: None,
+            policy_content_id: "policy".into(),
+        }),
+        expected_previous_stage_run_id: None,
+        expected_parent_generation: 0,
+        association: astra_services::runs::CollaboratorAssociation {
+            provider: astra_services::runs::CollaboratorProvider::Codex,
+            execution_boundary: astra_services::runs::CollaboratorExecutionBoundary::ServerManaged,
+        },
+    };
+    svc.run_engine
+        .append_events_batch(
+            "user-1",
+            "session-1",
+            run,
+            &[json!({"event_type":"collaborator_stage_admitted", "admission":admission})],
+        )
+        .await
+        .unwrap();
+    install_live_run_state(&svc, "user-1", run, "session-1", RunStatus::Running, None).await;
+    let mut mailbox = svc
+        .server_agent_mailbox_router
+        .register(
+            astra_messaging::AgentAddress::new(run, "native-agent"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let intent = "intent-boundary";
+    let correlated = astra_turn_types::ProviderStageInput::Text {
+        input_id: intent.into(),
+        content: String::new(),
+        correlation_id: Some(intent.into()),
+        expected_turn_id: None,
+    };
+    let room = astra_turn_types::MAX_PROVIDER_STAGE_INPUT_BYTES
+        - serde_json::to_vec(&correlated).unwrap().len();
+    for (content, accepted) in [
+        ("界".repeat(10_903) + "xx", false),
+        ("\0".repeat(room / 6) + &"x".repeat(room % 6 + 1), false),
+        ("界".repeat(room / 3) + &"x".repeat(room % 3 + 1), false),
+        ("界".repeat(room / 3) + &"x".repeat(room % 3), true),
+    ] {
+        let before = svc
+            .run_engine
+            .load_run("user-1", run)
+            .await
+            .unwrap()
+            .unwrap()
+            .events
+            .len();
+        let result = svc
+            .submit_run_user_intent(
+                run.into(),
+                "user-1".into(),
+                RunUserIntentData {
+                    intent_id: intent.into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    input: json!({"content":content}),
+                },
+            )
+            .await;
+        if !accepted {
+            assert_eq!(err(result).0, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                svc.run_engine
+                    .load_run("user-1", run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .events
+                    .len(),
+                before
+            );
+            assert!(mailbox.try_recv().is_none());
+        } else {
+            assert_eq!(
+                ok(result).status,
+                astra_turn_types::UserIntentStatus::AcceptedRemote
+            );
+            let message = mailbox
+                .try_recv()
+                .expect("accepted guidance must reach the native mailbox");
+            let input = provider_stage_input_from_message(&message)
+                .unwrap()
+                .unwrap()
+                .input;
+            assert_eq!(
+                serde_json::to_vec(&input).unwrap().len(),
+                astra_turn_types::MAX_PROVIDER_STAGE_INPUT_BYTES
+            );
+            assert_eq!(serde_json::to_value(input).unwrap()["content"], content);
+        }
+    }
+}
+
+#[test]
+fn native_message_conversion_distinguishes_invalid_text_from_protocol_messages() {
+    let from = astra_messaging::AgentAddress::new("sender", "agent");
+    let target = astra_messaging::MessageTarget::Parent;
+    for content in [String::new(), "界".repeat(11_000)] {
+        let message = astra_messaging::AgentMessage::new(
+            from.clone(),
+            target.clone(),
+            astra_messaging::MessagePayload::Text {
+                content,
+                summary: None,
+            },
+        );
+        assert!(provider_stage_input_from_message(&message).is_err());
+    }
+    let progress = astra_messaging::AgentMessage::new(
+        from.clone(),
+        target.clone(),
+        astra_messaging::MessagePayload::Progress {
+            turn_index: 0,
+            tool_calls: 0,
+            status: "running".into(),
+            detail: None,
+        },
+    );
+    assert!(
+        provider_stage_input_from_message(&progress)
+            .unwrap()
+            .is_none()
+    );
+    let valid = astra_messaging::AgentMessage::new(
+        from,
+        target,
+        astra_messaging::MessagePayload::Text {
+            content: "continue".into(),
+            summary: None,
+        },
+    );
+    assert!(provider_stage_input_from_message(&valid).unwrap().is_some());
 }
 
 #[tokio::test]

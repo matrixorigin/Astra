@@ -429,7 +429,7 @@ fn permission_profile(
     }
     // Never inherit a root-readable built-in profile. Platform bootstrap is
     // enabled below only after proving it is covered by the runtime grant.
-    if cwd == "/" || astra_sandbox::is_sensitive_system_dir(std::path::Path::new(cwd)) {
+    if cwd == "/" || astra_sandbox::is_never_readable_path(std::path::Path::new(cwd)) {
         return Err("native workspace boundary is not readable by policy");
     }
     filesystem.insert(cwd.into(), json!(if write { "write" } else { "read" }));

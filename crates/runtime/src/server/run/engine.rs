@@ -4331,23 +4331,6 @@ fn parse_queued_user_intent(
             UserIntentPollIssueKind::NoActionableContent,
         ));
     }
-    if delivery == astra_turn_types::UserIntentDelivery::GuideCurrentRun {
-        let content = crate::turn::run_control::user_intent_content(&input)
-            .expect("actionable user intent was checked above");
-        let provider_input = astra_turn_types::ProviderStageInput::Text {
-            input_id: intent_id.to_string(),
-            content,
-            correlation_id: None,
-            expected_turn_id: None,
-        };
-        if provider_input.validate().is_err() {
-            return Err(user_intent_issue(
-                event_index,
-                Some(intent_id),
-                UserIntentPollIssueKind::InvalidProviderStageInput,
-            ));
-        }
-    }
     Ok(QueuedUserIntent {
         intent_id: intent_id.to_string(),
         delivery,
@@ -10615,7 +10598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_user_intents_isolates_provider_byte_budget_overflow() {
+    async fn poll_user_intents_preserves_internal_unicode_guidance() {
         let engine = test_engine();
         engine
             .start_run(
@@ -10658,16 +10641,13 @@ mod tests {
 
         assert_eq!(poll.error, None);
         assert_eq!(poll.next_cursor, 2);
-        assert_eq!(poll.inputs.len(), 1);
+        assert_eq!(poll.inputs.len(), 2);
         assert_eq!(
-            poll.inputs[0].intent_id,
+            poll.inputs[1].intent_id,
             "intent-after-provider-input-budget"
         );
-        assert_eq!(poll.issues.len(), 1);
-        assert_eq!(
-            poll.issues[0].kind,
-            UserIntentPollIssueKind::InvalidProviderStageInput
-        );
+        assert_eq!(poll.inputs[0].input["content"], "界".repeat(11_000));
+        assert!(poll.issues.is_empty());
     }
 
     #[tokio::test]

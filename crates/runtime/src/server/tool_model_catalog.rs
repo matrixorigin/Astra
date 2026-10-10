@@ -52,7 +52,22 @@ pub(crate) async fn handle_model_catalog(
         Ok(page) => {
             astra_tools::ToolResult::text(page_json(&page)).with_source_bounded_model_projection()
         }
-        Err(error) => astra_tools::ToolResult::error(page_json(&unavailable_page(error, scope))),
+        Err(error) => {
+            let result = astra_tools::ToolResult::error(page_json(&unavailable_page(error, scope)));
+            if matches!(
+                error,
+                CatalogError::InvalidRequest | CatalogError::InvalidCursor
+            ) {
+                result.with_failure_evidence(astra_core::ToolFailureEvidence::new(
+                    astra_core::ErrorKind::ToolInvalidArgs,
+                    astra_core::ToolFailureCause::InvalidArguments,
+                    false,
+                    vec![astra_core::ToolRecoveryAction::CorrectArguments],
+                ))
+            } else {
+                result
+            }
+        }
     }
 }
 

@@ -37,6 +37,7 @@ use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::canonical_commit::{
     CanonicalRewriteProof, canonical_commit_delta, pack_canonical_turn_segments,
 };
@@ -18836,22 +18837,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
         }
         let intent_id = input.intent_id.trim().to_string();
-        if input.delivery == astra_turn_types::UserIntentDelivery::GuideCurrentRun {
-            let content = crate::turn::run_control::user_intent_content(&input.input)
-                .expect("actionable user intent was checked above");
-            let provider_input = astra_turn_types::ProviderStageInput::Text {
-                input_id: intent_id.clone(),
-                content,
-                correlation_id: None,
-                expected_turn_id: None,
-            };
-            if provider_input.validate().is_err() {
-                return Err(error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "current-run guidance exceeds the provider stage input byte budget",
-                ));
-            }
-        }
         if user_intent_text_len(&input.input) > MAX_USER_INTENT_CHARS {
             return Err(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -18875,6 +18860,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        if native_target.is_some() {
+            native_text_input(
+                intent_id.clone(),
+                crate::turn::run_control::user_intent_content(&input.input)
+                    .expect("actionable user intent was checked above"),
+                Some(intent_id.clone()),
+            )
+            .map_err(|error| error_response(StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+        }
         let intent_input = input.input.clone();
         let event = json!({
             "event_type": "user_intent",
@@ -21681,26 +21675,40 @@ struct ProviderStageMessage {
     durable_user_intent: Option<astra_messaging::DurableUserIntentReference>,
 }
 
+fn native_text_input(
+    input_id: String,
+    content: String,
+    correlation_id: Option<String>,
+) -> Result<astra_turn_types::ProviderStageInput, astra_turn_types::ProviderContractError> {
+    let input = astra_turn_types::ProviderStageInput::Text {
+        input_id,
+        content,
+        correlation_id,
+        expected_turn_id: None,
+    };
+    input.validate()?;
+    Ok(input)
+}
+
 fn provider_stage_input_from_message(
     message: &astra_messaging::AgentMessage,
-) -> Option<ProviderStageMessage> {
+) -> Result<Option<ProviderStageMessage>, astra_turn_types::ProviderContractError> {
     let astra_messaging::MessagePayload::Text { content, .. } = &message.payload else {
-        return None;
+        return Ok(None);
     };
-    let input = astra_turn_types::ProviderStageInput::Text {
-        input_id: message
+    let input = native_text_input(
+        message
             .durable_user_intent
             .as_ref()
             .map(|intent| intent.intent_id.clone())
             .unwrap_or_else(|| message.id.clone()),
-        content: content.clone(),
-        correlation_id: message.correlation_id.clone(),
-        expected_turn_id: None,
-    };
-    input.validate().ok().map(|()| ProviderStageMessage {
+        content.clone(),
+        message.correlation_id.clone(),
+    )?;
+    Ok(Some(ProviderStageMessage {
         input,
         durable_user_intent: message.durable_user_intent.clone(),
-    })
+    }))
 }
 
 fn native_stage_reasoning_arguments(
@@ -23606,13 +23614,24 @@ impl ServerSubRunExecutor {
                             lease.commit();
                             continue;
                         };
-                        let Some(stage_message) = provider_stage_input_from_message(&message) else {
+                        let stage_message = match provider_stage_input_from_message(&message) {
+                            Ok(Some(stage_message)) => stage_message,
+                            Err(error) => {
+                                host.emit_headless_line(HeadlessStderrStyle::Yellow, format!(
+                                    "Native guidance {} was not delivered: {error}. Its custody is retained for settlement.",
+                                    message.durable_user_intent.as_ref().map_or(message.id.as_str(), |intent| intent.intent_id.as_str()),
+                                ));
+                                lease.defer(true);
+                                continue;
+                            }
+                            Ok(None) => {
                             // Keep this non-text protocol message for the
                             // ordinary loop. `defer(true)` removes it from
                             // readiness until the native stage returns, while
                             // later eligible text messages remain available.
                             lease.defer(true);
                             continue;
+                            }
                         };
                         // Steering is a provider action, not merely mailbox
                         // delivery. Recheck the canonical durable boundary

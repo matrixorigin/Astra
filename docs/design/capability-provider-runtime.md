@@ -741,6 +741,22 @@ degraded, quarantine and fallback facts
 Observation records decisions and outcomes. It must not implement alternate
 fallback, retry, or cache control flow.
 
+Provider-owned child selection uses the authenticated directory already supplied
+to the model. Human references are interpreted against its provider/model names;
+execution still requires exact selectors. Registration transport is distinct from
+the native protocol. Chat `model_catalog` is not a provider-model directory.
+An authorized provider's default execution does not require a model catalog;
+resolving an explicit model does.
+Unavailable or ambiguous requirements need clarification, not workspace discovery
+or substitution. A completed child's inline `result` is usable output; only
+explicit artifact/window references require retrieval.
+
+Current-run guidance retains the ordinary agent's character contract. The native
+route additionally validates its complete serialized input, including correlation,
+before durable acceptance, using the same constructor as mailbox delivery. Invalid
+native text produces observable non-delivery feedback and retains existing custody
+for settlement; it is not applied or automatically retried as a transport failure.
+
 Native stages carry a bounded `native_stage_observation` through the existing
 tool terminal event and its external projection. Its checked stage delta is
 separate from the last native request snapshot and model context capacity;
@@ -767,6 +783,8 @@ file denies and existing logical aliases. Grant selection is unchanged; roots
 containing glob syntax fail before dispatch. This reduces prompt overhead, not
 the isolation boundary, and does not claim protection for arbitrary future
 files beyond the native client's existing mask semantics.
+Canonical workspace roots must also pass the shared never-readable predicate
+before any grant: descendant masks cannot make a sensitive grant root safe.
 
 ## Required invariants and tests
 

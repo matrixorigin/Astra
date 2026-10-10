@@ -321,7 +321,8 @@ assert recv()['method']=='initialized'
 request=recv()
 assert request['id']==7 and request['method']=='account/read'
 emit({'id':7,'result':{'account':None,'requiresOpenaiAuth':False}})
-for line in sys.stdin: pass
+for line in sys.stdin:
+    assert json.loads(line).get('method') != 'model/list', 'provider default queried a catalog'
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
@@ -340,6 +341,21 @@ for line in sys.stdin: pass
     verify_provider_authentication(&mut process, &input, &mut evidence, &token, OUTPUT_BYTES)
         .await
         .expect("current provider authentication establishes the capability boundary");
+    assert_eq!(
+        resolve_requested_model(
+            &mut process,
+            &input,
+            &stage(),
+            &mut evidence,
+            OUTPUT_BYTES,
+            &token,
+            None,
+        )
+        .await
+        .unwrap(),
+        None,
+        "authenticated provider-default execution must not require a model catalog"
+    );
     let outcome = process.cancel_and_wait().await.unwrap();
     assert!(
         outcome
@@ -808,6 +824,37 @@ fn compact_native_masks_preserve_canonical_rule_matches() {
         let mut requirements = test_requirements();
         requirements.read_paths.push(root.into());
         assert!(permission_profile("/workspace", false, false, &requirements).is_err());
+    }
+    for root in [
+        "/workspace/.env-secrets",
+        "/workspace/.env-secrets/project",
+        "/workspace/credentials.json/project",
+    ] {
+        assert!(astra_sandbox::is_never_readable_path(std::path::Path::new(
+            root
+        )));
+        for write in [false, true] {
+            assert!(permission_profile(root, write, false, &test_requirements()).is_err());
+        }
+    }
+    #[cfg(unix)]
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let sensitive = directory.path().join(".env-secrets/project");
+        std::fs::create_dir_all(&sensitive).unwrap();
+        let alias = directory.path().join("innocent");
+        std::os::unix::fs::symlink(&sensitive, &alias).unwrap();
+        let canonical = alias.canonicalize().unwrap();
+        assert!(astra_sandbox::is_never_readable_path(&canonical));
+        assert!(
+            permission_profile(
+                canonical.to_str().unwrap(),
+                false,
+                false,
+                &test_requirements()
+            )
+            .is_err()
+        );
     }
 }
 
@@ -1572,6 +1619,7 @@ async fn live_native_parent_retains_observation_through_durable_custody() {
     let api = std::env::var("ASTRA_NATIVE_PARENT_HARNESS_API_URL").unwrap();
     let parent = std::env::var("ASTRA_NATIVE_PARENT_HARNESS_MODEL").unwrap();
     let native = std::env::var("ASTRA_NATIVE_CODEX_HARNESS_MODEL").unwrap();
+    let model_reference = std::env::var("ASTRA_NATIVE_PARENT_HARNESS_MODEL_REFERENCE").unwrap();
     let directory = tempfile::tempdir().unwrap();
     let marker = uuid::Uuid::new_v4().to_string();
     let path = directory.path().join("control.txt");
@@ -1599,7 +1647,7 @@ async fn live_native_parent_retains_observation_through_durable_custody() {
     }
 
     let prompt = format!(
-        "使用 Codex 的 {native} 模型、xhigh，读取 {}。只返回文件内容，不要由当前代理代替执行。",
+        "使用 Codex 的 {model_reference} 模型、xhigh，读取 {}。只返回文件内容。",
         path.display()
     );
     let result = cli_json(
@@ -1681,10 +1729,18 @@ async fn live_native_parent_retains_observation_through_durable_custody() {
         parent_calls.iter().any(|call| call["name"] == "agent"),
         "parent must actually delegate"
     );
+    for item in capture["transcript"]["items"].as_array().unwrap() {
+        if item["run_id"] == root && item["tool_result"].is_object() {
+            assert_eq!(
+                item["tool_result"]["status"], "completed",
+                "a successful final answer must not hide failed delegation attempts"
+            );
+        }
+    }
     for call in parent_calls {
         assert!(
-            matches!(call["name"].as_str(), Some("agent" | "introspect")),
-            "parent must not substitute its own execution"
+            call["name"] == "agent",
+            "delegation must not require parent discovery, bogus artifacts, or substitute execution"
         );
     }
 

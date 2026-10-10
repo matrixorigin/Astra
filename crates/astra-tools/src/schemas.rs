@@ -435,7 +435,7 @@ fn validate_schema_value(
     if let Some(expected) = schema.get("const")
         && value != expected
     {
-        issues.push(format!("{path} differs from its advertised constant"));
+        issues.push(format!("{path} must be {expected}"));
     }
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
         && !allowed.contains(value)
@@ -1457,7 +1457,7 @@ fn collaborator_identity_schema() -> Value {
 
 fn fanout_reasoning_schema() -> Value {
     json!({
-        "description": "Optional reasoning override only for the children the user requests it for; never copy one child's control to another. Shared defaults apply only to requirements common to all slots. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
+        "description": "Optional user-requested reasoning override. Effort uses mode=adaptive with effort=low|medium|high|max; native xhigh uses max. Token budgets use mode=enabled with budget_tokens, never effort. Omit to inherit thinking for the same Offering; different Offerings use their own defaults. Apply only to children covered by the user's request.",
         "x-astra-discovery-summary": "Omit outside user-requested scope.",
         "type": "object",
         "required": ["mode"],
@@ -1488,7 +1488,7 @@ fn agent_parameters_schema() -> Value {
         },
         "x-astra-per-action-discovery-summaries": {
             "spawn": DELEGATION_DISCOVERY_SUMMARY,
-            "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
+            "get_result": "action+returned agent_id; completed result is inline child output, not an artifact handle. Use sufficient output directly; follow only explicit artifact/window references. Do not repeat the child's work. Use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
             "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
@@ -2241,6 +2241,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
                         "catalog_revision": {"type": "string", "minLength": 71, "maxLength": 71}
                     },
+                    "oneOf": [
+                        {"properties": {"cursor": {"type": "null"}, "catalog_revision": {"type": "null"}}},
+                        {"required": ["cursor", "catalog_revision"]}
+                    ],
                     "additionalProperties": false
                 }
             }
@@ -4024,6 +4028,22 @@ mod tests {
         assert!(properties.contains_key("catalog_revision"));
         assert!(properties.get("facet").is_none());
         assert!(properties.get("format").is_none());
+        let revision = format!("sha256:{}", "0".repeat(64));
+        for (args, valid) in [
+            (json!({}), true),
+            (json!({"limit": 16}), true),
+            (
+                json!({"cursor": "next", "catalog_revision": revision}),
+                true,
+            ),
+            (json!({"cursor": "next"}), false),
+            (json!({"catalog_revision": revision}), false),
+        ] {
+            assert_eq!(
+                validate_tool_arguments_against_schema("model_catalog", &args, catalog).is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]

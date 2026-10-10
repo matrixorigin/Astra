@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use axum::{body::Body, http::Request};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -25,6 +26,158 @@ use super::harness::{
     post_json, seeded_model_selection, sse_first_data_json_with_type,
     try_claim_interrupted_matrix_e2e_fixture,
 };
+
+/// Compare the durable receipt with actual model input and the bounded SSE projection.
+async fn captured_tool_receipt(
+    ctx: &super::harness::MatrixE2eCtx,
+    events: &[Value],
+    user_message: &str,
+    tool: &str,
+    call_id: &str,
+    journaled: bool,
+) -> Value {
+    let requests = ctx.native_provider_requests().await;
+    let model = format!("mock-{}", ctx.suffix);
+    let outputs: Vec<_> = requests
+        .iter()
+        .filter(|request| request.body["model"] == model)
+        .filter_map(|request| request.body["messages"].as_array())
+        .filter(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "user" && message["content"] == user_message)
+        })
+        .flat_map(|messages| messages.iter())
+        .filter(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+        .map(|message| {
+            message["content"]
+                .as_str()
+                .expect("canonical tool receipt must be text")
+        })
+        .collect();
+    let model_output = outputs
+        .first()
+        .expect("receipt must reach a real parent model request");
+    assert!(
+        outputs.iter().all(|candidate| candidate == model_output),
+        "receipt changed between requests"
+    );
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_call_end" && event["call_id"] == call_id)
+        .collect();
+    assert_eq!(terminals.len(), 1, "one terminal per invocation");
+    let terminal = terminals[0];
+    let root = events
+        .iter()
+        .find(|event| event["type"] == "session_info")
+        .unwrap();
+    assert_eq!(terminal["run_id"], root["run_id"]);
+    assert_eq!(terminal["tool"], tool);
+    assert_eq!(terminal["success"], true);
+    assert!(serde_json::to_vec(terminal).unwrap().len() <= 64 * 1024);
+    let output = if journaled {
+        let chains: Vec<String> = sqlx::query_scalar(
+            "SELECT turn_chain_id FROM tool_invocation_ledger
+         WHERE user_id = ? AND session_id = ? AND run_id = ? AND invocation_id = ?",
+        )
+        .bind(&ctx.user_id)
+        .bind(&ctx.session_id)
+        .bind(root["run_id"].as_str().unwrap())
+        .bind(call_id)
+        .fetch_all(&ctx.pool)
+        .await
+        .unwrap();
+        assert_eq!(chains.len(), 1, "one authoritative invocation identity");
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &ctx.user_id,
+            &ctx.session_id,
+            root["run_id"].as_str().unwrap(),
+            &chains[0],
+            call_id,
+        )
+        .unwrap();
+        let record = astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(
+            ctx.shared_pool.clone(),
+        )
+        .get(&identity)
+        .await
+        .unwrap()
+        .expect("durable receipt");
+        let outcome = record.outcome.expect("terminal receipt");
+        assert!(matches!(
+            outcome,
+            astra_turn_types::ToolInvocationTerminalOutcome::Succeeded { .. }
+        ));
+        outcome.result().output.clone()
+    } else {
+        (*model_output).to_string()
+    };
+    let receipt: Value = serde_json::from_str(&output).expect("receipt JSON");
+    let encoded = serde_json::to_vec(&Value::String(output.clone())).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&encoded));
+    let model_receipt: Value = serde_json::from_str(model_output).unwrap();
+    if journaled {
+        for key in [
+            "status",
+            "work_id",
+            "branch_id",
+            "graph_revision",
+            "next_action",
+        ] {
+            assert_eq!(
+                model_receipt[key], receipt[key],
+                "model lifecycle field {key}"
+            );
+        }
+        assert_eq!(
+            model_receipt["task_board_update"]["work_id"],
+            receipt["task_board_update"]["work_id"]
+        );
+        assert_eq!(
+            model_receipt["task_board_update"]["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            receipt["task_board_update"]["tasks"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        for (model_task, task) in model_receipt["task_board_update"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(receipt["task_board_update"]["tasks"].as_array().unwrap())
+        {
+            for key in [
+                "item_id",
+                "item_revision",
+                "execution_status",
+                "delivery_status",
+            ] {
+                assert_eq!(model_task[key], task[key], "model board field {key}");
+            }
+        }
+    } else {
+        assert_eq!(*model_output, output);
+    }
+    if terminal["result"].is_string() {
+        assert_eq!(terminal["result"], output);
+    } else {
+        let summary = &terminal["result"];
+        assert_eq!(summary["type"], "astra.external_tool_result_summary.v1");
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(terminal["result_truncated"], true);
+        assert_eq!(summary["original_bytes"], encoded.len());
+        assert_eq!(terminal["result_bytes"], summary["original_bytes"]);
+        assert_eq!(summary["content_sha256"], digest);
+        assert_eq!(terminal["result_sha256"], digest);
+        assert_eq!(terminal["result_integrity"]["content_sha256"], digest);
+        assert_eq!(terminal["result_integrity"]["sha256_encoding"], "json");
+    }
+    receipt
+}
 
 /// Collect the FULL SSE stream body (up to deadline), not just until session_info.
 /// Returns (status, body_text).
@@ -2430,15 +2583,15 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
     .await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
     let events = parse_sse_events(&raw_sse);
-    let start_receipt = events
-        .iter()
-        .find(|event| {
-            event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some("create-canonical-work")
-        })
-        .and_then(|event| event["result"].as_str())
-        .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .unwrap_or_else(|| panic!("missing canonical Work start receipt: {raw_sse}"));
+    let start_receipt = captured_tool_receipt(
+        ctx,
+        &events,
+        "Track this as one durable task and complete it.",
+        "start_work",
+        "create-canonical-work",
+        true,
+    )
+    .await;
     let declared_tasks = start_receipt["declared_tasks"]
         .as_array()
         .unwrap_or_else(|| panic!("start receipt omitted task identities: {raw_sse}"));
@@ -2510,15 +2663,15 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
         "the second durable task must be visible immediately, not discovered by a later poll: {raw_sse}"
     );
     assert_eq!(second_board_task["delivery_status"], "unreported");
-    let first_settlement = events
-        .iter()
-        .find(|event| {
-            event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some("settle-canonical-task")
-        })
-        .and_then(|event| event["result"].as_str())
-        .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .unwrap_or_else(|| panic!("missing first canonical Work settlement receipt: {raw_sse}"));
+    let first_settlement = captured_tool_receipt(
+        ctx,
+        &events,
+        "Track this as one durable task and complete it.",
+        "settle_work_item",
+        "settle-canonical-task",
+        true,
+    )
+    .await;
     let first_delta = &first_settlement["task_board_update"];
     assert_eq!(first_delta["kind"], "upsert", "first settlement: {raw_sse}");
     let first_delta_tasks = first_delta["tasks"]
@@ -2943,15 +3096,15 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
             .all(|position| *position < final_positions[0]),
         "parent analyzed before the failed group settled: {raw_sse}"
     );
-    let aggregate = events
-        .iter()
-        .find(|event| {
-            event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some("online-failed-fanout-start")
-        })
-        .and_then(|event| event["result"].as_str())
-        .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .unwrap_or_else(|| panic!("missing failed fanout aggregate: {raw_sse}"));
+    let aggregate = captured_tool_receipt(
+        ctx,
+        &events,
+        "Run three reviews and preserve every failure cause.",
+        "agent_fanout",
+        "online-failed-fanout-start",
+        false,
+    )
+    .await;
     assert_eq!(aggregate["target_count"], 3, "{aggregate}");
     assert_eq!(aggregate["status"], "started");
     let launched = aggregate["agents"].as_array().unwrap();
