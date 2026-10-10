@@ -1,5 +1,14 @@
 use serde_json::Value;
 
+/// Shared model-facing scope contract, composed at compile time into schemas
+/// and receipts so compact projections cannot silently lose the same rule.
+#[macro_export]
+macro_rules! agent_parent_scope_guidance {
+    () => {
+        "Parent work excludes child scope, even at launch; revisit it only for gaps or counter-evidence after results."
+    };
+}
+
 pub const AGENT_RUNTIME_TOOL_NAMES: &[&str] = &["agent", "agent_fanout"];
 pub const AGENT_ACTIONS: &[&str] = &[
     "spawn",

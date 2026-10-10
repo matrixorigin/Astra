@@ -22,8 +22,14 @@ pub const PER_ACTION_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-per-action-discove
 /// Compact delegation guidance for the single-child and fan-out tools.
 /// Full invocation semantics stay in their function descriptions; the
 /// fan-out summary additionally preserves its cross-field slot invariant.
-const DELEGATION_DISCOVERY_SUMMARY: &str = "requested_model_policy:omit unasked;provider dir;model_catalog:Offering;no substitution/config reads;hard reqs;launched;propose final;no shell sleep;runtime waits;child question";
-const FANOUT_DISCOVERY_SUMMARY: &str = "requested_model_policy:omit unasked;provider dir;model_catalog:Offering;no substitution/config reads;hard reqs;slots=target_count;description+prompt;atomic;runtime waits";
+const DELEGATION_DISCOVERY_SUMMARY: &str = concat!(
+    crate::agent_parent_scope_guidance!(),
+    " Exact provider/Offering;no config/substitution;launch≠done;wait."
+);
+const FANOUT_DISCOVERY_SUMMARY: &str = concat!(
+    crate::agent_parent_scope_guidance!(),
+    " Exact provider/Offering;slots=target_count;description+prompt;atomic."
+);
 
 /// Rebuild the compact discovery summary after a typed action projection.
 ///
@@ -1481,14 +1487,14 @@ fn agent_parameters_schema() -> Value {
             "send_message": ["local", "server"]
         },
         "x-astra-surface-descriptions": {
-            "server": "Server-owned single-agent lifecycle. If visible, call it directly; use the current provider directory for provider-owned capacities and model_catalog only for unknown Astra Offering choices. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For Astra model requests, propose requested_model_policy with an exact authorized Offering ID or configured name; for provider-owned requests, copy the exact execution tool/model from the current provider directory. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
+            "server": concat!(crate::agent_parent_scope_guidance!(), "\n", "Server-owned single-agent lifecycle. If visible, call it directly; use the current provider directory for provider-owned capacities and model_catalog only for unknown Astra Offering choices. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For Astra model requests, propose requested_model_policy with an exact authorized Offering ID or configured name; for provider-owned requests, copy the exact execution tool/model from the current provider directory. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work.")
         },
         "x-astra-surface-discovery-summaries": {
             "server": DELEGATION_DISCOVERY_SUMMARY
         },
         "x-astra-per-action-discovery-summaries": {
             "spawn": DELEGATION_DISCOVERY_SUMMARY,
-            "get_result": "action+returned agent_id; completed result is inline child output, not an artifact handle. Use sufficient output directly; follow only explicit artifact/window references. Do not repeat the child's work. Use list for status; do not busy-poll",
+            "get_result": "action+returned agent_id; completed result: inline child output, not an artifact handle. Use sufficient output directly; follow only explicit artifact/window references. Use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
             "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
@@ -2112,7 +2118,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; returns a launched receipt promptly so the parent continues; no background arg); list reads child status; get_result needs the returned agent_id; run_chain needs name+description+steps.\n\n\
+                "description": concat!(crate::agent_parent_scope_guidance!(), "\n", "Actions: spawn needs description+prompt (not task/type/agent_id; returns a launched receipt promptly so the parent continues; no background arg); list reads child status; get_result needs the returned agent_id; run_chain needs name+description+steps.\n\n\
          Multi-agent and local fixed-chain operations. Actions: spawn, list, get_result, wait, run_chain, send_message. wait observes runtime activity without cancelling children on timeout; get_result inspects an outcome, not a polling loop. `run_chain` is a local executor pipeline, not a durable task list. If the user asks for task/Work tracking and `start_work` is visible, call `start_work` directly instead of using `agent`.\n\n\
          ## Required fields per action\n\
          - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `requested_model_policy`, `reasoning`, `initial_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
@@ -2138,7 +2144,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
          - When no canonical Work exists and the current turn requires durable task tracking, establish it with `start_work` before delegating. When canonical Work already exists, keep that Work as the durable scope rather than trying to create another one. `agent` and `agent_fanout` do not themselves create or replace a canonical task list.
          - `start_work` may return `initial_task`, and `settle_work_item` may return `next_task`. Each is already the server-selected primary-session assignment: execute it directly. Call `run_next_work_item({})` only when neither response supplied an assignment. Treat an assigned task's expected result as its stop boundary: gather sufficient direct evidence, settle immediately when satisfied, and do not expand into adjacent investigation. Generic `agent` and `agent_fanout` are reserved for real isolation or parallelism boundaries; a WorkItem alone is not a delegation reason.
-         - Background task tools only observe or control execution; they are not a planning system.",
+         - Background task tools only observe or control execution; they are not a planning system."),
                 "parameters": agent_parameters_schema()
             }
         }),
@@ -2146,13 +2152,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent_fanout",
-                "description": "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
+                "description": concat!(crate::agent_parent_scope_guidance!(), "\n", "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
          Actions:\n\
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
          - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; the parent-owned completion boundary independently stages terminal child outcomes, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy inherits the parent Offering. Exact Astra Offering and reasoning overrides require atomic admission before any slot starts. For provider-owned capacities, copy the exact `execution.tool` and provider `execution.model` from the current provider directory; for Astra Offerings, use `requested_model_policy` with an exact authorized Offering ID or configured name. Discover unknown Astra Offering choices through `model_catalog`. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll.",
+        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy inherits the parent Offering. Exact Astra Offering and reasoning overrides require atomic admission before any slot starts. For provider-owned capacities, copy the exact `execution.tool` and provider `execution.model` from the current provider directory; for Astra Offerings, use `requested_model_policy` with an exact authorized Offering ID or configured name. Discover unknown Astra Offering choices through `model_catalog`. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll."),
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
@@ -2814,94 +2820,50 @@ mod tests {
     }
 
     #[test]
-    fn deferred_delegation_discovery_preserves_user_model_requirements() {
+    fn deferred_delegation_discovery_preserves_scope_and_model_requirements() {
+        let scope = crate::agent_parent_scope_guidance!();
         for surface in ["server", "local"] {
             let mut schemas = all_tool_schemas();
             project_action_schemas_for_surface(&mut schemas, surface);
-
             for name in ["agent", "agent_fanout"] {
-                let schema = find_schema(&schemas, name).expect("delegation schema must exist");
-                let selection = crate::tool_search::tool_selection_contract(schema)
-                    .expect("delegation schema must have a discovery contract");
-                if surface == "server" {
-                    assert_eq!(
-                        selection["description_truncated"], false,
-                        "load-bearing Server guidance must fit deferred discovery for {name}"
-                    );
-                }
-                let summary = selection["description"]
+                let schema = find_schema(&schemas, name).expect("delegation schema");
+                let description = schema["function"]["description"].as_str().unwrap();
+                assert!(description.starts_with(scope), "{surface}/{name}");
+                assert!(description.contains("model_catalog"), "{surface}/{name}");
+                assert!(description.contains("configuration"), "{surface}/{name}");
+                let manifest = schema["function"]["parameters"]["x-astra-discovery-summary"]
                     .as_str()
-                    .expect("delegation discovery summary");
-                if name == "agent" {
-                    assert!(
-                        summary.contains("requested_model_policy"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(summary.contains("provider dir"), "{surface}: {summary}");
-                    assert!(
-                        summary.contains("model_catalog:Offering"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(summary.contains("hard reqs"), "{surface}: {summary}");
-                    assert!(
-                        summary.contains("no substitution/config reads"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(summary.contains("launched"), "{surface}: {summary}");
-                    assert!(summary.contains("omit unasked"), "{surface}: {summary}");
-                    assert!(
-                        summary.contains("propose final") || summary.contains("proposes final"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(summary.contains("child question"), "{surface}: {summary}");
-                    assert!(summary.contains("shell sleep"), "{surface}: {summary}");
-                    assert!(!summary.contains("foreground"), "{surface}: {summary}");
-                } else {
-                    let lower = summary.to_ascii_lowercase();
-                    assert!(
-                        lower.contains("provider dir"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(
-                        lower.contains("model_catalog:offering"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(
-                        lower.contains("model_catalog") && lower.contains("no substitution"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(lower.contains("hard reqs"), "{surface}/{name}: {summary}");
-                    assert!(
-                        summary.contains("no substitution/config reads"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(
-                        summary.contains("slots=target_count")
-                            && summary.contains("description+prompt")
-                            && summary.contains("atomic"),
-                        "{surface}/{name}: {summary}"
-                    );
+                    .unwrap();
+                let visible: String = manifest.chars().take(180).collect();
+                assert!(visible.contains(scope), "{surface}/{name}: {visible}");
+                if surface == "server" {
+                    assert!(manifest.chars().count() <= 180);
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn agent_manifest_summary_keeps_coordination_cues_within_its_budget() {
-        for surface in ["local", "server"] {
-            let mut schemas = all_tool_schemas();
-            project_action_schemas_for_surface(&mut schemas, surface);
-            let agent = find_schema(&schemas, "agent").unwrap();
-            let summary = agent["function"]["parameters"]["x-astra-discovery-summary"]
-                .as_str()
-                .unwrap();
-            let visible: String = summary.chars().take(180).collect();
-            for cue in ["requested_model_policy", "runtime waits", "no shell sleep"] {
-                assert!(visible.contains(cue), "{surface}: missing {cue}: {visible}");
-            }
-            if surface == "server" {
-                assert!(summary.chars().count() <= 180, "{surface}: {summary}");
-                assert!(visible.contains("child question"), "{surface}: {visible}");
+                let mut selected = schema.clone();
+                project_action_discovery_summary(
+                    selected["function"]["parameters"].as_object_mut().unwrap(),
+                    &[if name == "agent" { "spawn" } else { "start" }.to_string()],
+                );
+                let selection = crate::tool_search::tool_selection_contract(&selected).unwrap();
+                assert_eq!(
+                    selection["description_truncated"], false,
+                    "{surface}/{name}"
+                );
+                let summary = selection["description"].as_str().unwrap();
+                assert!(summary.contains(scope), "{surface}/{name}: {summary}");
+                assert!(
+                    summary.chars().count() <= 220,
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary.contains("Exact provider/Offering"),
+                    "{surface}/{name}"
+                );
+                if name == "agent_fanout" {
+                    for cue in ["slots=target_count", "description+prompt", "atomic"] {
+                        assert!(summary.contains(cue), "{surface}/{name}: {summary}");
+                    }
+                }
             }
         }
     }
@@ -2957,13 +2919,13 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("no shell sleep")
+                        .contains(crate::agent_parent_scope_guidance!())
                 );
                 assert!(
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("runtime waits")
+                        .contains("launch≠done")
                 );
                 let mut spawn = agent.clone();
                 project_action_discovery_summary(
@@ -2975,7 +2937,7 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("no shell sleep")
+                        .contains(crate::agent_parent_scope_guidance!())
                 );
                 let mut message = agent.clone();
                 project_action_discovery_summary(
@@ -2997,7 +2959,7 @@ mod tests {
                     "list",
                     "read-only in-memory status of direct owned children",
                 ),
-                ("get_result", "may briefly wait or reconcile durable state"),
+                ("get_result", "inline child output"),
             ] {
                 let mut selected = agent.clone();
                 project_action_discovery_summary(

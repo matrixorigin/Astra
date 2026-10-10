@@ -489,6 +489,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("No substitution"));
+    assert!(agent_description.starts_with(astra_tools::agent_parent_scope_guidance!()));
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];

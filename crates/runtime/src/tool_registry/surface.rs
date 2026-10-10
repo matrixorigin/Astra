@@ -440,7 +440,10 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "No substitution. launch≠done. Wait. Active mailboxes use send_message; provider follow-up uses the exact collaborator_id. Provider execution and exact collaborator resume are runtime-validated.",
+            concat!(
+                astra_tools::agent_parent_scope_guidance!(),
+                " No substitution. launch≠done. Wait. Mailbox:send_message;provider follow-up:exact collaborator_id."
+            ),
         ),
         "introspect" => (
             &[
