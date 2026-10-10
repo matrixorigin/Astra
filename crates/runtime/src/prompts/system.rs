@@ -547,8 +547,7 @@ fn safety_section() -> &'static str {
 fn planning_section() -> &'static str {
     "\n## Plan, Batch, Execute\n\
      1. **Plan** 3+ calls; re-plan on change.\n\
-     2. **Batch independent reads** (≤5 parallel); serialize real data dependencies.\n\
-     When delegating a scope, continue unrelated work; do not gather or repeat evidence within that scope, including in the launch batch, unless an identified acceptance gap or counter-evidence requires it.\n\
+     2. Batch reads (≤5); serialize dependencies. No child overlap, even at launch; verify gaps.\n\
      3. **Discover before reading**; Never guess paths.\n\
      4. **Read progressively**: structure/search, then targeted ranges.\n\
      5. **Preserve sole evidence**: checksum ≠ backup; use the current tool schema or its explicit selection protocol for any source-artifact contract; make the boundary observable before observe → transform → validate.\n\
@@ -1171,9 +1170,9 @@ mod tests {
         assert!(contains("One concern per str_replace"));
 
         // Parallel tool calls
-        assert!(contains("Batch independent reads"));
-        assert!(contains("≤5 parallel"));
-        assert!(contains("real data dependencies"));
+        assert!(contains("Batch reads (≤5)"));
+        assert!(contains("serialize dependencies"));
+        assert!(contains("No child overlap, even at launch; verify gaps"));
 
         // Token efficiency
         assert!(contains("Read progressively"));
