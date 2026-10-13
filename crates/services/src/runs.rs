@@ -7586,11 +7586,10 @@ pub fn normalized_run_user_intent_content(input: &serde_json::Value) -> Option<S
     }
 }
 
-fn user_intent_disposition_event_from_source(
+fn validated_user_intent_source(
     source_event_index: i64,
     source: &serde_json::Value,
-    status: UserIntentStatus,
-) -> Result<serde_json::Value, String> {
+) -> Result<(&str, &serde_json::Value, &serde_json::Value, String), String> {
     if extract_event_type(source) != "user_intent" {
         return Err(format!(
             "event index {source_event_index} is not a user intent"
@@ -7606,14 +7605,20 @@ fn user_intent_disposition_event_from_source(
         .ok_or_else(|| format!("user intent event {source_event_index} has no intent_id"))?;
     let delivery = data
         .get("delivery")
-        .cloned()
         .ok_or_else(|| format!("user intent event {source_event_index} has no delivery"))?;
-    let input = data
-        .get("input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let content = normalized_run_user_intent_content(&input)
+    let input = data.get("input").unwrap_or(&serde_json::Value::Null);
+    let content = normalized_run_user_intent_content(input)
         .ok_or_else(|| format!("user intent event {source_event_index} has no content"))?;
+    Ok((intent_id, delivery, input, content))
+}
+
+fn user_intent_disposition_event_from_source(
+    source_event_index: i64,
+    source: &serde_json::Value,
+    status: UserIntentStatus,
+) -> Result<serde_json::Value, String> {
+    let (intent_id, delivery, input, content) =
+        validated_user_intent_source(source_event_index, source)?;
     let event_type = match status {
         UserIntentStatus::Applied => "user_intent_applied",
         UserIntentStatus::Returned => "user_intent_returned",
@@ -7635,6 +7640,37 @@ fn user_intent_disposition_event_from_source(
             "input": input,
         },
     }))
+}
+
+fn invocation_guidance_is_valid(index: i64, event: &serde_json::Value) -> bool {
+    extract_event_type(event) == "user_intent"
+        && event
+            .pointer("/data/delivery")
+            .and_then(serde_json::Value::as_str)
+            == Some("guide_current_run")
+        && validated_user_intent_source(index, event).is_ok()
+}
+
+fn invocation_supersession_scope_key(user_id: &str, session_id: &str, run_id: &str) -> String {
+    sha256_hex(
+        &serde_json::to_vec(&("invocation_supersession", user_id, session_id, run_id))
+            .expect("a tuple of strings is JSON serializable"),
+    )
+}
+
+fn projected_invocation_supersession_scope_key(
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    index: i64,
+    event: &serde_json::Value,
+) -> Option<String> {
+    let indexed = match extract_event_type(event).as_str() {
+        "action_admission_granted" => true,
+        "user_intent" => !invocation_guidance_is_valid(index, event),
+        _ => false,
+    };
+    indexed.then(|| invocation_supersession_scope_key(user_id, session_id, run_id))
 }
 
 fn validate_user_intent_apply_request(
@@ -11592,7 +11628,7 @@ const GUIDANCE_LATEST_FENCE_SELECT_SQL: &str =
      ORDER BY event_idx DESC LIMIT 1 FOR UPDATE";
 
 const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, event_type, event_id, idempotency_key, event_hash, \
-            producer_pod_id, payload_json \
+            producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
 const RUN_STATUS_BINDING_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM agent_run_events
@@ -14283,7 +14319,7 @@ impl DatabaseRunStateStore {
             "INSERT INTO agent_run_events \
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
               subject_run_id, interaction_request_id, idempotency_key, event_hash, \
-              producer_pod_id, request_id, payload_json, created_at) ",
+              producer_pod_id, request_id, payload_json, invocation_supersession_scope_key, created_at) ",
         );
         builder.push_values(rows, |mut row, event| {
             row.push_bind(&event.id)
@@ -14301,6 +14337,7 @@ impl DatabaseRunStateStore {
                 .push_bind(&event.producer_pod_id)
                 .push_bind(&event.request_id)
                 .push_bind(&event.payload_json)
+                .push_bind(&event.invocation_supersession_scope_key)
                 .push("NOW(6)");
         });
         builder.push(matrixone_null_shape_comment(
@@ -14321,7 +14358,7 @@ impl DatabaseRunStateStore {
     ) -> Result<bool, String> {
         for expected in rows {
             let actual = sqlx::query(
-                "SELECT run_id, event_idx, event_hash FROM agent_run_events
+                "SELECT run_id, event_idx, event_hash, invocation_supersession_scope_key FROM agent_run_events
                  WHERE user_id = ? AND id = ? LIMIT 1",
             )
             .bind(&expected.user_id)
@@ -14344,6 +14381,10 @@ impl DatabaseRunStateStore {
             if run_id != expected.run_id
                 || event_idx != expected.event_idx
                 || event_hash != expected.event_hash
+                || actual
+                    .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                    .map_err(|source| db_error(operation, &expected.run_id, source).to_string())?
+                    != expected.invocation_supersession_scope_key
             {
                 return Ok(false);
             }
@@ -15181,7 +15222,7 @@ impl DatabaseRunStateStore {
             })?;
         for expected_event in expected_events {
             let actual = sqlx::query(
-                "SELECT run_id, event_idx, event_hash FROM agent_run_events
+                "SELECT run_id, event_idx, event_hash, invocation_supersession_scope_key FROM agent_run_events
                  WHERE user_id = ? AND id = ? LIMIT 1",
             )
             .bind(&expected_event.user_id)
@@ -15227,6 +15268,17 @@ impl DatabaseRunStateStore {
             if run_id != expected_event.run_id
                 || event_idx != expected_event.event_idx
                 || event_hash != expected_event.event_hash
+                || actual
+                    .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                    .map_err(|source| {
+                        db_error(
+                            "reconcile_timed_out_run_start_events",
+                            &expected.run_id,
+                            source,
+                        )
+                        .to_string()
+                    })?
+                    != expected_event.invocation_supersession_scope_key
             {
                 connection.release();
                 return Ok(None);
@@ -15338,45 +15390,32 @@ impl DatabaseRunStateStore {
                 db_error("interaction_superseding_intent", &run.run_id, source).to_string()
             });
         }
-        let mut cursor = control_epoch;
-        loop {
-            // Bound each allocation; the existing Run transaction protects
-            // immutable accepted source facts while the cursor advances.
-            let rows: Vec<(i64, String)> = sqlx::query_as(
-                "SELECT event_idx, payload_json FROM agent_run_events
-                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'user_intent'
-                   AND event_idx > ? ORDER BY event_idx ASC LIMIT 64",
-            )
-            .bind(&run.user_id)
-            .bind(&run.session_id)
-            .bind(&run.run_id)
-            .bind(cursor)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|source| {
-                db_error("interaction_invocation_guidance", &run.run_id, source).to_string()
-            })?;
-            for (index, payload) in &rows {
-                let event: serde_json::Value = serde_json::from_str(payload)
-                    .map_err(|error| format!("invalid accepted user intent: {error}"))?;
-                let is_guidance = event
-                    .pointer("/data/delivery")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("guide_current_run")
-                    && user_intent_disposition_event_from_source(
-                        *index,
-                        &event,
-                        UserIntentStatus::Applied,
-                    )
-                    .is_ok();
-                if !is_guidance {
-                    return Ok(Some(*index));
-                }
-                cursor = *index;
+        // The canonical append owner validates immutable source facts once.
+        // Seek the first superseding intent, without fetching guidance bodies
+        // or advancing the original dispatch authority while holding Run locks.
+        let candidate: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT user_id, session_id, run_id, event_idx FROM agent_run_events
+             WHERE invocation_supersession_scope_key = ? AND event_type = 'user_intent' AND event_idx > ?
+             ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(invocation_supersession_scope_key(&run.user_id, &run.session_id, &run.run_id))
+        .bind(control_epoch)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error("interaction_invocation_guidance", &run.run_id, source).to_string()
+        })?;
+        match candidate {
+            None => Ok(None),
+            Some((user, session, id, index))
+                if user == run.user_id
+                    && session == run.session_id
+                    && id == run.run_id
+                    && index > control_epoch =>
+            {
+                Ok(Some(index))
             }
-            if rows.len() < 64 {
-                return Ok(None);
-            }
+            Some(_) => Err("interaction supersession candidate scope mismatch".into()),
         }
     }
 
@@ -15544,8 +15583,8 @@ impl DatabaseRunStateStore {
             return Err(rejected());
         }
         let action_id = format!("tool_invocation:{}", identity.storage_key());
-        let grant: Option<String> = sqlx::query_scalar(
-            "SELECT payload_json FROM agent_run_events
+        let grant: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT payload_json, invocation_supersession_scope_key FROM agent_run_events
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND event_type = 'action_admission_granted' AND idempotency_key = ? LIMIT 1",
         )
@@ -15556,8 +15595,16 @@ impl DatabaseRunStateStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(|source| db_error("validate_tool_interaction_grant", &run.run_id, source))?;
-        let grant: serde_json::Value =
-            serde_json::from_str(&grant.ok_or_else(rejected)?).map_err(|_| rejected())?;
+        let (grant, scope_key) = grant.ok_or_else(rejected)?;
+        if scope_key.as_deref()
+            != Some(
+                invocation_supersession_scope_key(&run.user_id, &run.session_id, &run.run_id)
+                    .as_str(),
+            )
+        {
+            return Err(rejected());
+        }
+        let grant: serde_json::Value = serde_json::from_str(&grant).map_err(|_| rejected())?;
         let owner_generation = grant
             .pointer("/data/owner_generation")
             .and_then(serde_json::Value::as_u64)
@@ -19318,7 +19365,7 @@ impl RunStateStore for DatabaseRunStateStore {
         // subsequently fences or settles.
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let duplicate = sqlx::query(
-            "SELECT payload_json, event_idx FROM agent_run_events
+            "SELECT payload_json, event_idx, session_id, invocation_supersession_scope_key FROM agent_run_events
              WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
                AND idempotency_key = ? LIMIT 1",
         )
@@ -19331,6 +19378,16 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("admit_run_guidance_load_duplicate", request.run_id, source).to_string()
         })?;
         if let Some(row) = duplicate {
+            let projection_matches = row.try_get::<String, _>("session_id").map_err(|source| {
+                db_error("decode_guidance_duplicate_session", request.run_id, source).to_string()
+            })? == request.expected_session_id
+                && row
+                    .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                    .map_err(|source| {
+                        db_error("decode_guidance_duplicate_scope", request.run_id, source)
+                            .to_string()
+                    })?
+                    .is_none();
             let existing = decode_run_event_payload(&row, request.run_id)
                 .map_err(|error| error.to_string())?;
             let event_index = row.try_get("event_idx").map_err(|source| {
@@ -19350,11 +19407,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?;
             connection.release();
-            return Ok(if run_guidance_event_matches(&existing, request.event) {
-                AtomicRunGuidanceAdmission::Duplicate { event_index }
-            } else {
-                AtomicRunGuidanceAdmission::IdentityConflict
-            });
+            return Ok(
+                if projection_matches && run_guidance_event_matches(&existing, request.event) {
+                    AtomicRunGuidanceAdmission::Duplicate { event_index }
+                } else {
+                    AtomicRunGuidanceAdmission::IdentityConflict
+                },
+            );
         }
 
         if !durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref()) {
@@ -25207,7 +25266,7 @@ impl DatabaseRunStateStore {
     ) -> Result<GuidanceCommitRecovery, String> {
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let row = sqlx::query(
-            "SELECT id, event_idx, event_id, event_hash, producer_pod_id, payload_json
+            "SELECT id, event_idx, event_id, event_hash, producer_pod_id, payload_json, session_id, invocation_supersession_scope_key
              FROM agent_run_events
              WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
                AND idempotency_key = ? LIMIT 1",
@@ -25272,6 +25331,15 @@ impl DatabaseRunStateStore {
             })?;
         if event_hash != sha256_hex(payload_json.as_bytes())
             || !run_guidance_event_matches(&payload, request.event)
+            || row.try_get::<String, _>("session_id").map_err(|source| {
+                db_error("decode_reconciled_guidance_session", request.run_id, source).to_string()
+            })? != request.expected_session_id
+            || row
+                .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                .map_err(|source| {
+                    db_error("decode_reconciled_guidance_scope", request.run_id, source).to_string()
+                })?
+                != expected.invocation_supersession_scope_key
         {
             return Ok(GuidanceCommitRecovery::Conflict);
         }
@@ -27056,15 +27124,17 @@ struct RunEventInsertRow {
     producer_pod_id: String,
     request_id: Option<String>,
     payload_json: String,
+    invocation_supersession_scope_key: Option<String>,
 }
 
 impl RunEventInsertRow {
-    fn nullable_shape(&self) -> [bool; 4] {
+    fn nullable_shape(&self) -> [bool; 5] {
         [
             self.subject_run_id.is_some(),
             self.interaction_request_id.is_some(),
             self.idempotency_key.is_some(),
             self.request_id.is_some(),
+            self.invocation_supersession_scope_key.is_some(),
         ]
     }
 }
@@ -27098,6 +27168,9 @@ enum GuidanceCommitRecovery {
 
 #[derive(Debug)]
 struct RecoveredRunControlEvent {
+    user_id: String,
+    session_id: String,
+    run_id: String,
     id: String,
     event_idx: i64,
     event_type: String,
@@ -27107,6 +27180,7 @@ struct RecoveredRunControlEvent {
     producer_pod_id: String,
     payload_json: String,
     payload: serde_json::Value,
+    invocation_supersession_scope_key: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -27172,6 +27246,21 @@ fn decode_recovered_run_control_events(
                 .to_string()
             })?;
             Ok(RecoveredRunControlEvent {
+                user_id: row.try_get("user_id").map_err(|source| {
+                    db_error("decode_run_control_owner", run_id, source).to_string()
+                })?,
+                session_id: row.try_get("session_id").map_err(|source| {
+                    db_error("decode_run_control_session", run_id, source).to_string()
+                })?,
+                run_id: row.try_get("run_id").map_err(|source| {
+                    db_error("decode_run_control_run", run_id, source).to_string()
+                })?,
+                invocation_supersession_scope_key: row
+                    .try_get("invocation_supersession_scope_key")
+                    .map_err(|source| {
+                        db_error("decode_run_control_supersession_scope", run_id, source)
+                            .to_string()
+                    })?,
                 id: row.try_get("id").map_err(|source| {
                     db_error("decode_run_control_event_id", run_id, source).to_string()
                 })?,
@@ -27205,6 +27294,9 @@ fn recovered_run_control_event_is_exact(
     expected: &RunEventInsertRow,
 ) -> bool {
     recovered.id == expected.id
+        && recovered.user_id == expected.user_id
+        && recovered.session_id == expected.session_id
+        && recovered.run_id == expected.run_id
         && recovered.event_idx == expected.event_idx
         && recovered.event_type == expected.event_type
         && recovered.event_id == expected.event_id
@@ -27212,6 +27304,7 @@ fn recovered_run_control_event_is_exact(
         && recovered.event_hash == expected.event_hash
         && recovered.producer_pod_id == expected.producer_pod_id
         && recovered.payload_json == expected.payload_json
+        && recovered.invocation_supersession_scope_key == expected.invocation_supersession_scope_key
 }
 
 fn recovered_run_control_event_is_equivalent(
@@ -27220,6 +27313,14 @@ fn recovered_run_control_event_is_equivalent(
     expected_key: &str,
 ) -> bool {
     recovered.idempotency_key == expected_key
+        && recovered.invocation_supersession_scope_key
+            == projected_invocation_supersession_scope_key(
+                &recovered.user_id,
+                &recovered.session_id,
+                &recovered.run_id,
+                recovered.event_idx,
+                expected_event,
+            )
         && recovered.event_type == extract_event_type(expected_event)
         && recovered.event_hash == sha256_hex(recovered.payload_json.as_bytes())
         && run_events_have_same_immutable_payload(&recovered.payload, expected_event)
@@ -27417,6 +27518,8 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
+    let invocation_supersession_scope_key =
+        projected_invocation_supersession_scope_key(user_id, session_id, run_id, event_idx, event);
     let subject_run_id = match event_type.as_str() {
         "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE => {
             extract_optional_string(event, "run_id")
@@ -27449,6 +27552,7 @@ fn build_run_event_insert_row(
         producer_pod_id: owner_pod_id.to_string(),
         request_id: None,
         payload_json,
+        invocation_supersession_scope_key,
     })
 }
 
@@ -30832,6 +30936,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stage.subject_run_id.as_deref(), Some("stage-run"));
+    }
+
+    #[test]
+    fn invocation_guidance_projection_uses_canonical_source_validation() {
+        for (data, expected) in [
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":{"content":" 界\n"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":{"active_skills":[" rust "]}}),
+                true,
+            ),
+            (
+                serde_json::json!({"delivery":"guide_current_run","input":{"content":"answer"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":" ","delivery":"guide_current_run","input":{"content":"answer"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":{"content":" \n"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":null}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"replace_objective","input":{"content":"answer"}}),
+                false,
+            ),
+        ] {
+            let event = serde_json::json!({"event_type":"user_intent", "data":data, "invocation_supersession_scope_key":!expected});
+            let row = build_run_event_insert_row("u", "r", "s", None, 8, "pod", &event).unwrap();
+            assert_eq!(
+                row.invocation_supersession_scope_key.is_none(),
+                expected,
+                "{event}"
+            );
+            if !expected {
+                assert_eq!(
+                    row.invocation_supersession_scope_key.as_deref(),
+                    Some(invocation_supersession_scope_key("u", "s", "r").as_str())
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row.payload_json).unwrap(),
+                event
+            );
+            if expected {
+                let disposition =
+                    user_intent_disposition_event_from_source(8, &event, UserIntentStatus::Applied)
+                        .unwrap();
+                assert!(!disposition["data"]["content"].as_str().unwrap().is_empty());
+            }
+        }
+        let event = serde_json::json!({"event_type":"run_finished","data":{"intent_id":"i","delivery":"guide_current_run","input":"answer"}});
+        assert!(!invocation_guidance_is_valid(8, &event));
+        assert_eq!(
+            projected_invocation_supersession_scope_key("u", "s", "r", 8, &event),
+            None
+        );
+        let grant = serde_json::json!({"event_type":"action_admission_granted", "invocation_supersession_scope_key":"forged"});
+        assert_eq!(
+            projected_invocation_supersession_scope_key("u", "s", "r", 8, &grant),
+            Some(invocation_supersession_scope_key("u", "s", "r"))
+        );
+        assert_ne!(
+            invocation_supersession_scope_key("ab", "c", "r"),
+            invocation_supersession_scope_key("a", "bc", "r")
+        );
     }
 
     #[derive(Clone)]
@@ -39473,6 +39650,45 @@ mod tests {
         assert_eq!(projection.projection_event_idx, 1);
         assert_eq!(projection.latest_event_type.as_deref(), Some("user_intent"));
 
+        let request = AtomicRunGuidanceAdmissionRequest {
+            user_id: &user_id,
+            run_id: &run_id,
+            expected_session_id: &session_id,
+            intent_id: "guidance-ack",
+            event: &event,
+            process_local_execution_live: false,
+        };
+        let expected = build_run_event_insert_row(
+            &user_id,
+            &run_id,
+            &session_id,
+            None,
+            1,
+            "guidance-ack-owner",
+            &event,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reconcile_guidance_commit(request, &expected)
+                .await
+                .unwrap(),
+            GuidanceCommitRecovery::Equivalent(1)
+        );
+        sqlx::query("UPDATE agent_run_events SET invocation_supersession_scope_key=? WHERE user_id=? AND run_id=? AND event_idx=1")
+            .bind(invocation_supersession_scope_key(&user_id, &session_id, &run_id)).bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            store.admit_run_guidance(request).await.unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        );
+        assert_eq!(
+            store
+                .reconcile_guidance_commit(request, &expected)
+                .await
+                .unwrap(),
+            GuidanceCommitRecovery::Conflict
+        );
+
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
             .bind(&user_id)
@@ -45227,6 +45443,8 @@ mod tests {
             expected_session_id: session_id,
             expected_owner_generation: run.run_generation,
             source_event_indices: &indices,
+            invocation_identity: None,
+            purpose: UserIntentApplyPurpose::ModelBoundary,
         };
         assert!(matches!(
             store.apply_run_user_intents(apply).await.unwrap(),

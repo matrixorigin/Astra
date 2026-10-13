@@ -1144,6 +1144,258 @@ async fn native_interaction_keeps_dispatch_authority_without_consuming_unacknowl
     fixture.cleanup().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
+async fn native_interaction_lookup_work_does_not_grow_with_guidance_history() {
+    use sqlx::Row;
+    use std::sync::{Arc, Mutex};
+    use tracing::{
+        field::{Field, Visit},
+        instrument::WithSubscriber,
+    };
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    #[derive(Default)]
+    struct Sample {
+        sql: String,
+        rows: u64,
+        seconds: f64,
+    }
+    impl Visit for Sample {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "db.statement" {
+                self.sql = value.to_owned();
+            }
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "rows_returned" {
+                self.rows = value;
+            }
+        }
+        fn record_f64(&mut self, field: &Field, value: f64) {
+            if field.name() == "elapsed_secs" {
+                self.seconds = value;
+            }
+        }
+        fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+    }
+    struct Lookups(Arc<Mutex<Vec<Sample>>>);
+    impl<S: tracing::Subscriber> Layer<S> for Lookups {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "sqlx::query" {
+                return;
+            }
+            let mut sample = Sample::default();
+            event.record(&mut sample);
+            if sample.sql.contains("invocation_supersession_scope_key = ?")
+                && sample.sql.contains("event_idx >")
+            {
+                self.0.lock().unwrap().push(sample);
+            }
+        }
+    }
+    let mut baseline = [None, None];
+    for history in [0, 64, 1024] {
+        for early in [false, true] {
+            let fixture = Fixture::new().await;
+            let (_ledger, identity) = fixture.interaction_invocation().await;
+            let origin = fixture
+                .store
+                .derive_tool_interaction_origin(
+                    &identity,
+                    "selected-runner",
+                    &fixture.physical_workspace_id(),
+                )
+                .await
+                .unwrap();
+            let events: Vec<_> = (0..history).map(|n| json!({"event_type":"user_intent", "idempotency_key":format!("user_intent:guide-{n}"),
+                "data":{"intent_id":format!("guide-{n}"), "delivery":"guide_current_run", "input":{"content":" 界与新增约束 \n"}}})).collect();
+            fixture
+                .store
+                .append_events_batch(
+                    &fixture.user_id,
+                    &fixture.session_id,
+                    &identity.run_id,
+                    &events,
+                )
+                .await
+                .unwrap();
+            // New store instance has no process-local validation cursor/cache.
+            let callback = DatabaseRunStateStore::new(fixture.pool.clone())
+                .with_owner_pod_id(&fixture.owner)
+                .with_lease_ttl(Duration::from_secs(300));
+            let samples = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(Lookups(samples.clone())),
+            );
+            async {
+                let required = interaction_event(&origin, json!(7));
+                assert!(matches!(register_interaction(&callback, &origin, &required).await.unwrap(), AtomicRunInteractionBatchRegistration::Registered));
+                let response = json!({"request_id":"native-question","outcome":"submitted","payload":{"answer":"yes"}});
+                if early {
+                    assert!(matches!(resolve_interaction(&callback, &origin, response).await, DurableRunInteractionResolveOutcome::Queued(_)));
+                    assert!(matches!(begin_interaction(&callback, &origin).await.unwrap(), DurableRunInteractionWaitOutcome::AlreadyResolved(_)));
+                } else {
+                    assert_eq!(begin_interaction(&callback, &origin).await.unwrap(), DurableRunInteractionWaitOutcome::Waiting);
+                    assert!(matches!(resolve_interaction(&callback, &origin, response).await, DurableRunInteractionResolveOutcome::Resolved(_)));
+                }
+            }.with_subscriber(subscriber).await;
+            let sql = {
+                let samples = samples.lock().unwrap();
+                assert!(
+                    !samples.is_empty(),
+                    "capture actual SQLx lookups, not assumed counts"
+                );
+                assert_eq!(
+                    *baseline[usize::from(early)].get_or_insert(samples.len()),
+                    samples.len(),
+                    "query count grew with {history} guides"
+                );
+                assert!(
+                    samples
+                        .iter()
+                        .all(|s| s.rows == 0 && !s.sql.contains("payload_json"))
+                );
+                eprintln!(
+                    "guides={history} early={early} queries={} returned_rows=0 lookup_ms={:.3}",
+                    samples.len(),
+                    samples.iter().map(|s| s.seconds).sum::<f64>() * 1000.0
+                );
+                samples[0].sql.clone()
+            };
+            if history == 1024 && !early {
+                // Diagnose the producer key; interaction uses prepared SQL.
+                let key: String = sqlx::query_scalar("SELECT invocation_supersession_scope_key FROM agent_run_events WHERE user_id=? AND session_id=? AND run_id=? AND event_type='action_admission_granted' LIMIT 1")
+                    .bind(&fixture.user_id).bind(&fixture.session_id).bind(&identity.run_id).fetch_one(fixture.pool.get()).await.unwrap();
+                assert!(key.len() == 64 && key.bytes().all(|c| c.is_ascii_hexdigit()));
+                let mut explain = format!("EXPLAIN ANALYZE {sql}");
+                explain = explain.replacen('?', &format!("'{key}'"), 1);
+                explain = explain.replacen('?', &origin.control_epoch.to_string(), 1);
+                let rows = sqlx::raw_sql(&explain)
+                    .fetch_all(fixture.pool.get())
+                    .await
+                    .unwrap();
+                let plan = rows
+                    .iter()
+                    .map(|r| r.try_get::<String, _>(0).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                eprintln!("native intent lookup plan:\n{plan}");
+                assert!(
+                    plan.contains("Index Table Scan on agent_run_events.idx_agent_run_events_invocation_control"),
+                    "must use purpose index: {plan}"
+                );
+                let lines: Vec<_> = plan.lines().collect();
+                for marker in ["Index Table Scan on", "Table Scan on"] {
+                    let scan = lines
+                        .iter()
+                        .position(|line| {
+                            line.contains(marker)
+                                && (marker.starts_with("Index")
+                                    || !line.contains("Index Table Scan"))
+                        })
+                        .unwrap();
+                    let input_rows = lines[scan + 1]
+                        .split_whitespace()
+                        .find_map(|part| part.strip_prefix("inputRows="))
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap();
+                    assert_eq!(
+                        input_rows, 1,
+                        "only the grant, never guidance history: {plan}"
+                    );
+                }
+            }
+            // A malformed guide is a superseding fact; a claimed projection
+            // inside the payload cannot grant exclusion from this check.
+            let invalid = json!({"event_type":"user_intent", "idempotency_key":"user_intent:invalid", "invocation_supersession_scope_key":true,
+                "data":{"intent_id":"invalid", "delivery":"guide_current_run", "input":{"content":" \n"}}});
+            fixture
+                .store
+                .append_event(
+                    &fixture.user_id,
+                    &fixture.session_id,
+                    &identity.run_id,
+                    invalid,
+                )
+                .await
+                .unwrap();
+            let run = fixture
+                .store
+                .load_run(&fixture.user_id, &identity.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let positive_samples = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(Lookups(positive_samples.clone())),
+            );
+            assert_eq!(
+                register_interaction(&callback, &origin, &interaction_event(&origin, json!(7)))
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap(),
+                AtomicRunInteractionBatchRegistration::Superseded {
+                    user_intent_event_index: run.last_event_idx
+                }
+            );
+            {
+                let positive_samples = positive_samples.lock().unwrap();
+                assert_eq!(positive_samples.len(), 1);
+                assert_eq!(
+                    positive_samples[0].rows, 1,
+                    "calibrate the observer with a real superseding row"
+                );
+            }
+            if history == 1024 && !early {
+                let first = run.last_event_idx;
+                fixture.store.append_event(&fixture.user_id, &fixture.session_id, &identity.run_id,
+                    json!({"event_type":"user_intent","idempotency_key":"user_intent:later","data":{"intent_id":"later","delivery":"replace_objective","input":"new request"}})).await.unwrap();
+                assert_eq!(
+                    register_interaction(&callback, &origin, &interaction_event(&origin, json!(7)))
+                        .await
+                        .unwrap(),
+                    AtomicRunInteractionBatchRegistration::Superseded {
+                        user_intent_event_index: first
+                    }
+                );
+                // A stored candidate key is not tenant authority. Inject a
+                // corrupt header and verify the real admission fails closed.
+                let foreign = Uuid::new_v4().to_string();
+                sqlx::query("UPDATE agent_run_events SET user_id=? WHERE user_id=? AND run_id=? AND event_idx=?")
+                    .bind(&foreign).bind(&fixture.user_id).bind(&identity.run_id).bind(first).execute(fixture.pool.get()).await.unwrap();
+                assert!(
+                    register_interaction(&callback, &origin, &interaction_event(&origin, json!(7)))
+                        .await
+                        .is_err()
+                );
+                sqlx::query("UPDATE agent_run_events SET user_id=? WHERE user_id=? AND run_id=? AND event_idx=?")
+                    .bind(&fixture.user_id).bind(&foreign).bind(&identity.run_id).bind(first).execute(fixture.pool.get()).await.unwrap();
+                // Other indexed intents cannot replace the canonical grant.
+                sqlx::query("UPDATE agent_run_events SET invocation_supersession_scope_key=NULL WHERE user_id=? AND run_id=? AND event_type='action_admission_granted'")
+                    .bind(&fixture.user_id).bind(&identity.run_id).execute(fixture.pool.get()).await.unwrap();
+                assert!(matches!(
+                    fixture
+                        .store
+                        .derive_tool_interaction_origin(
+                            &identity,
+                            "selected-runner",
+                            &fixture.physical_workspace_id()
+                        )
+                        .await,
+                    Err(ToolInteractionAdmissionError::Unproven)
+                ));
+            }
+            fixture.cleanup().await;
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
 async fn native_question_remains_answerable_after_current_run_guidance() {

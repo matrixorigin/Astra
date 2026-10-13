@@ -887,6 +887,21 @@ belong to that same invocation; application does not resume the Run. Ordinary
 interactions retain their user-turn supersession fence. Generation, owner,
 lease, binding, cancellation, deadline and invocation settlement still fence
 both application and answers.
+
+The event append owner derives a nullable `invocation_supersession_scope_key`
+from the trusted user/session/run tuple. Admitted grant events and invalid or
+non-guidance user intents receive the key; valid `guide_current_run` sources
+and other events receive NULL. Caller-supplied keys cannot establish the fact.
+The grant-authority read verifies its anchor key. A single-column index selects
+grants and superseding intents without loading guidance history; event-type and
+original-epoch predicates stay residual so the existing grant preserves a
+nonempty candidate set. Returned user/session/run and epoch must match exactly;
+the hash carries no authorization. This adds no event or write statement, but adds an
+index entry per existing event and hashes qualifying grants/intents. Work depends
+on grants and superseding intents, not valid-guidance history. Ordinary queries
+are unchanged. Fresh readiness verifies the column/index; no backfill or mutable
+cursor is used.
+
 Feedback queueing transfers the original envelope to acknowledgement-only
 custody before awaiting its transport ACK. Failure to confirm feedback is
 retained in the existing tool-terminal presentation, including when invocation

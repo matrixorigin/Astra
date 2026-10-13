@@ -2067,6 +2067,11 @@ for line in sys.stdin:
         use tokio_tungstenite::tungstenite::Message;
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
         assert!(std::env::var_os("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN").is_some());
+        tracing_subscriber::fmt()
+            .with_env_filter("astra_cli::edge_tools::native_codex=debug,astra_cli::cli::edge_lifecycle::native_delivery=warn")
+            .with_test_writer()
+            .try_init()
+            .expect("isolated live harness installs its diagnostic subscriber");
         let workspace = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
         let (consumer, mut owner) = consumer(workspace.path(), runtime.path(), None);
@@ -2194,13 +2199,11 @@ for line in sys.stdin:
             1,
             "failure must be at actual publication, not discovery"
         );
-        let mut state = crate::cli::session::session_state::SessionState {
-            ingestion_user_id: Some("account-test".into()),
-            native_delivery: Some(handle),
-            native_delivery_session_id: Some("session-test".into()),
-            native_delivery_attachment_epoch: Some(0),
-            ..Default::default()
-        };
+        let mut state = owner;
+        state.ingestion_user_id = Some("account-test".into());
+        state.native_delivery = Some(handle);
+        state.native_delivery_session_id = Some("session-test".into());
+        state.native_delivery_attachment_epoch = Some(state.session_attachment_epoch);
         state.native_delivery_refresh.bind(refresh.clone());
         let ui_refresh = state.native_delivery_refresh.clone();
         let mut preparing = Box::pin(ensure_session_native_delivery(
