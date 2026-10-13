@@ -848,6 +848,9 @@ impl BottomPane {
         prompt: crate::cli::chat_stream::AskUserPrompt,
         response_tx: oneshot::Sender<crate::cli::chat_stream::AskUserResponse>,
     ) {
+        if response_tx.is_closed() {
+            return;
+        }
         self.view_stack
             .push(Box::new(AskUserView::new(prompt, response_tx)));
     }
@@ -1549,7 +1552,7 @@ impl BottomPane {
             // without args (Value::Null). We can't safely
             // re-evaluate those, so leave them in the queue and let
             // the original gate resolve them explicitly.
-            if entry.args.is_null() {
+            if entry.args.is_null() || entry.runtime_dependencies.is_some() {
                 return None;
             }
             let envelope = evaluate_permission(&entry.tool, &entry.args, &ctx);
@@ -1710,6 +1713,7 @@ impl BottomPane {
         if let Some(hint) = view.selection_hint {
             cell = cell.with_selection_hint(hint);
         }
+        cell.invocation_scoped = view.invocation_scoped;
         cell = cell.with_scope_context(
             view.workspace_untrusted,
             view.is_compound_command,

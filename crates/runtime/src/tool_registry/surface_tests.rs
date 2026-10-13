@@ -143,6 +143,55 @@ fn assert_resident_external_state_contract(resident_bash: &Value, canonical_bash
 // ── 1. Defaults ─────────────────────────────────────────────────────────────
 
 #[test]
+fn execution_limits_survive_resident_and_deferred_projection() {
+    let canonical = catalog_schemas();
+    let resident = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[]);
+    let resident_schemas = resident.always_load_schemas();
+    for (name, paths) in [
+        ("bash", vec!["/properties/mode"]),
+        (
+            "agent",
+            vec!["/properties/max_output_tokens", "/properties/message_type"],
+        ),
+        (
+            "agent_fanout",
+            vec![
+                "/properties/defaults/properties/max_output_tokens",
+                "/properties/slots/items/properties/max_output_tokens",
+            ],
+        ),
+    ] {
+        let original = canonical
+            .iter()
+            .find(|s| tool_schema_name(s) == Some(name))
+            .unwrap();
+        let selected: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+            &canonical,
+            &json!({"query":format!("select:{name}")}),
+        ))
+        .unwrap();
+        let native = resident_schemas
+            .iter()
+            .find(|s| tool_schema_name(s) == Some(name));
+        if name != "agent_fanout" {
+            assert!(native.is_some(), "{name} must be resident");
+        }
+        for path in paths {
+            let expected = original["function"]["parameters"].pointer(path).unwrap()
+                ["x-astra-discovery-summary"].as_str().expect("producer-owned execution limit");
+            for parameters in std::iter::once(&selected["matches"][0]["parameters"])
+                .chain(native.map(|s| &s["function"]["parameters"]))
+            {
+                assert_eq!(
+                    parameters.pointer(path).unwrap()["description"].as_str(),
+                    Some(expected)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
     let missing = missing_always_load_schema_names(default_always_load_names());
     assert!(
@@ -489,6 +538,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .expect("resident agent description");
     assert!(agent_description.contains("Wait"));
     assert!(agent_description.contains("No substitution"));
+    assert!(agent_description.starts_with(astra_tools::agent_parent_scope_guidance!()));
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -607,6 +657,18 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
     ).expect("ordinary delegation must not require model catalog fields");
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &json!({
+            "action":"spawn",
+            "description":"Provider stage",
+            "prompt":"Return the requested result",
+            "execution":{"tool":"native_codex"},
+            "collaborator_id":"runtime-generated-collaborator"
+        }),
+        agent,
+    )
+    .expect("resident agent contract must support provider stages and exact collaborator resume");
     let mut bounded_spawn = json!({"action":"spawn", "description":"Bounded child", "prompt":"Return the requested result", "max_output_tokens":256});
     astra_tools::schemas::validate_tool_arguments_against_schema("agent", &bounded_spawn, agent)
         .expect("the resident spawn exposes its first-request output ceiling");

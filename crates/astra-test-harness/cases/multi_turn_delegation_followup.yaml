@@ -3,6 +3,9 @@ description: |
   Delegate a small calculation using a natural-language model request, then
   inspect its execution in a later user turn. The retrospective must preserve
   the result and obtain bounded evidence without failed introspection calls.
+  Historical evidence may be selected either by the exact emitted run_id or by
+  the canonical previous-root selector for the later turn; both are identity
+  preserving and must not be replaced by an ordinary live snapshot.
 prompt: |
   Ask a GLM 5.2 subagent to calculate 17 times 23 and return only the integer.
   Report its actual result when it finishes. Do not change files or access the network.
@@ -32,30 +35,51 @@ criteria:
   ok: false
   min: 0
   max: 0
-- type: journal_tool_call_count
-  name: introspect
-  min: 1
-  max: 3
-  ok: true
-  document: arguments
-  path: /explain/target
-  equals: run
-- type: journal_tool_value_flow_bound
-  producer: agent
-  producer_document: result
-  producer_path: /run_id
-  producer_filters:
-    - document: arguments
-      path: /action
-      equals: spawn
-  consumer: introspect
-  consumer_document: arguments
-  consumer_paths: [/explain/run_id]
-  consumer_filters:
-    - document: arguments
-      path: /explain/target
-      equals: run
-  min_turns_after_producer: 1
+- type: any_of
+  criteria:
+    - type: all_of
+      criteria:
+        - type: journal_tool_call_count
+          name: introspect
+          min: 1
+          max: 3
+          ok: true
+          document: arguments
+          path: /explain/target
+          equals: run
+        - type: journal_tool_value_flow_bound
+          producer: agent
+          producer_document: result
+          producer_path: /run_id
+          producer_filters:
+            - document: arguments
+              path: /action
+              equals: spawn
+          consumer: introspect
+          consumer_document: arguments
+          consumer_paths: [/explain/run_id]
+          consumer_filters:
+            - document: arguments
+              path: /explain/target
+              equals: run
+          min_turns_after_producer: 1
+    - type: journal_tool_value_flow_bound
+      producer: agent
+      producer_document: run_id
+      producer_path: ''
+      producer_filters:
+        - document: arguments
+          path: /action
+          equals: spawn
+      consumer: introspect
+      consumer_document: result
+      consumer_paths: [/run_id]
+      consumer_filters:
+        - document: arguments
+          path: /explain/target
+          equals: previous
+      min_turns_after_producer: 1
+      max_turns_after_producer: 1
 - type: turn_rounds_between
   min: 1
   max: 10

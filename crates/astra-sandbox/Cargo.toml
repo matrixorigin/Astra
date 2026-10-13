@@ -36,7 +36,7 @@ astra-skills = { workspace = true }
 astra-core = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile.workspace = true
 temp-env.workspace = true
 

@@ -299,6 +299,7 @@ fn ask_user_owns_navigation_and_submit_over_hidden_approval() {
         AskUserPrompt {
             context: None,
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "Path".into(),
                 question: "Which visible choice?".into(),
                 options: vec![
@@ -344,6 +345,7 @@ fn ask_user_owns_navigation_and_submit_over_hidden_approval() {
         ask_rx.blocking_recv().unwrap(),
         AskUserResponse::Submitted(AskUserAnswers {
             answers: vec![AskUserQuestionAnswer {
+                id: None,
                 question: "Which visible choice?".into(),
                 answers: vec!["Second".into()],
                 multi_select: false,

@@ -82,7 +82,8 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    if plan.runtime_process_authorization().is_none()
+    if !plan.requires_live_provider_interaction()
+        && plan.runtime_process_authorization().is_none()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {
         match try_edge_dispatch(
@@ -117,6 +118,9 @@ pub(crate) async fn execute_edge_bound(
                     .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
             }
         }
+    } else if plan.requires_live_provider_interaction() {
+        diagnostics
+            .push("edge-dispatch: collaborator stage requires live websocket delivery".to_string());
     } else if plan.runtime_process_authorization().is_some() {
         diagnostics.push(
             "edge-dispatch: process authorization requires live websocket delivery".to_string(),
@@ -369,6 +373,17 @@ async fn try_edge_websocket(
             "selected edge does not support runtime process authorization".to_string(),
         );
     }
+    let plan = match plan.bind_execution_ceiling(
+        &edge_owner_user_id,
+        &edge.edge_agent_id,
+        edge.workspace_dir.as_deref(),
+        edge.workspace_id.as_deref(),
+        edge.materialization_id.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return EdgeTransportAttempt::AdmissionRejected(reason),
+    };
+    let plan = &plan;
     let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &edge_owner_user_id,
         &request.session_id,
@@ -412,10 +427,22 @@ async fn try_edge_websocket(
             }
         }
         Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Observing) => {
-            return match dispatch
-                .wait_result(&dispatch_identity, plan.wait_timeout())
-                .await
-            {
+            let wait = dispatch.wait_result(&dispatch_identity, plan.wait_timeout());
+            let result = if let Some(token) = cancel_token.as_ref() {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        // Observing does not own the physical dispatch claim.
+                        // Stop this wait without cancelling another owner.
+                        return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
+                            request, binding, ToolTransportKind::EdgeLedger, true,
+                        ));
+                    }
+                    result = wait => result,
+                }
+            } else {
+                wait.await
+            };
+            return match result {
                 Ok(Some(result_json)) => {
                     delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
                 }
@@ -443,6 +470,8 @@ async fn try_edge_websocket(
     let edge_result = pool
         .execute_durably_admitted_invocation_on_connection_with_cancel(
             astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                provider_stage_dispatch: request.provider_stage_dispatch.as_ref(),
+                execution_ceiling: plan.execution_ceiling(),
                 connection_user_id: &edge_owner_user_id,
                 identity: plan.identity(),
                 edge_agent_id: &edge.edge_agent_id,
@@ -450,6 +479,9 @@ async fn try_edge_websocket(
                 args: &request.args,
                 runtime_process_authorization: plan.runtime_process_authorization(),
                 timeout_secs: plan.execution_timeout_secs(),
+                execution_deadline_unix_ms: plan.execution_deadline_unix_ms(),
+                execution_timeout_ms: plan.execution_timeout_ms(),
+                command_timeout_cap_ms: plan.command_timeout_cap_ms(),
                 cancel_token,
             },
         )
@@ -458,9 +490,56 @@ async fn try_edge_websocket(
         target: "astra_runtime::edge_dispatch_diag",
         tool = %request.tool_name,
         edge_agent_id = %edge.edge_agent_id,
-        got_result = edge_result.is_some(),
+        got_result = edge_result.is_ok(),
         "edge_dispatch: try_edge_websocket execute_tool_with_cancel returned"
     );
+    let edge_result = match edge_result {
+        Ok(result) => result,
+        Err(astra_server_types::edge_connection_pool::EdgeInvocationDeliveryError::NotSent(
+            reason,
+        )) => {
+            let mut result = astra_tools::ToolResult::error(reason.to_owned());
+            let fields = result.metadata.get_or_insert_with(serde_json::Map::new);
+            fields.insert("execution_fact".into(), serde_json::json!("not_executed"));
+            fields.insert("execution_started".into(), serde_json::json!(false));
+            fields.insert("retryable".into(), serde_json::json!(false));
+            let receipt = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: dispatch_identity.session_id.clone(),
+                    run_id: dispatch_identity.run_id.clone(),
+                    turn_chain_id: dispatch_identity.turn_chain_id.clone(),
+                    request_id: dispatch_identity.request_id.clone(),
+                    edge_agent_id: edge.edge_agent_id.clone(),
+                    status: "rejected".into(),
+                    output: result.output.clone(),
+                    duration_ms: 0,
+                    tool_result_fields: result.metadata.clone(),
+                },
+            );
+            let receipt = serde_json::to_string(&receipt)
+                .expect("typed Edge result contains only serializable protocol fields");
+            // Preserve proof of non-delivery even if receipt persistence is
+            // uncertain. This owner never enqueued physical work.
+            if !matches!(
+                dispatch
+                    .deliver_result(&dispatch_identity, &edge.edge_agent_id, &receipt)
+                    .await,
+                Ok(true)
+            ) {
+                result
+                    .metadata
+                    .get_or_insert_with(serde_json::Map::new)
+                    .insert(
+                        "dispatch_receipt_unconfirmed".into(),
+                        serde_json::json!(true),
+                    );
+            }
+            return EdgeTransportAttempt::Delivered(result);
+        }
+        Err(astra_server_types::edge_connection_pool::EdgeInvocationDeliveryError::Unknown(_)) => {
+            return EdgeTransportAttempt::TransportDisconnected;
+        }
+    };
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
             request,
@@ -469,9 +548,6 @@ async fn try_edge_websocket(
             true,
         ));
     }
-    let Some(edge_result) = edge_result else {
-        return EdgeTransportAttempt::TransportDisconnected;
-    };
     EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         edge_result.output,
         edge_result.is_error,
@@ -644,6 +720,17 @@ async fn try_edge_dispatch(
             false,
         ));
     }
+    let plan = match plan.bind_execution_ceiling(
+        &agent.user_id,
+        &agent.edge_agent_id,
+        agent.worktree_path.as_deref(),
+        agent.workspace_id.as_deref(),
+        agent.materialization_id.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return EdgeTransportAttempt::AdmissionRejected(reason),
+    };
+    let plan = &plan;
     let request_id = plan.dispatch_request_id().to_string();
     // Use the edge owner's user_id (from the registry record) for the dispatch
     // identity, not the request user_id. The edge relay polls its own user_id,

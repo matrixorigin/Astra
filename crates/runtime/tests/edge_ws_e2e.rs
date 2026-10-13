@@ -266,9 +266,9 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        timeout: std::time::Duration,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             {
                 let rows = self.rows.lock().expect("test edge dispatch rows");
@@ -281,7 +281,12 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             }
             tokio::select! {
                 _ = self.terminal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => return Ok(None),
             }
         }
     }
@@ -393,6 +398,12 @@ async fn ws_auth(
         "edge authentication failed: {resp_json}"
     );
     assert_eq!(resp_json["user_id"], "test-user-1");
+    assert!(
+        resp_json["edge_id"]
+            .as_str()
+            .is_some_and(|edge_id| edge_id.starts_with("ws-")),
+        "successful authentication must return the server-owned registry identity: {resp_json}"
+    );
 
     ws
 }
@@ -404,7 +415,12 @@ async fn spawn_admitted_pool_invocation(
     tool: &str,
     args: serde_json::Value,
     call_id: &str,
-) -> tokio::task::JoinHandle<Option<astra_runtime::server::edge_connection_pool::EdgeToolResult>> {
+) -> tokio::task::JoinHandle<
+    Result<
+        astra_runtime::server::edge_connection_pool::EdgeToolResult,
+        astra_runtime::server::edge_connection_pool::EdgeInvocationDeliveryError,
+    >,
+> {
     let identity = astra_turn_types::ToolInvocationIdentity::new(
         "test-user-1",
         "direct-session",
@@ -576,6 +592,78 @@ async fn edge_ws_tool_request_roundtrip() {
     server.abort();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn queued_cancellation_never_precedes_its_request_on_the_real_socket() {
+    use std::{future::Future, task::Poll};
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let mut socket = ws_auth(addr, "edge-order", "tool-host").await;
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        "test-user-1",
+        "direct-session",
+        "direct-run",
+        "direct-turn",
+        "queued-cancel",
+    )
+    .unwrap();
+    let durable_identity = EdgeDispatchIdentity::new(
+        &identity.user_id,
+        &identity.session_id,
+        &identity.run_id,
+        &identity.turn_chain_id,
+        identity.storage_key(),
+    );
+    dispatch
+        .insert_dispatch(&durable_identity, "edge-order", "{}")
+        .await
+        .unwrap();
+    assert!(
+        dispatch
+            .claim_direct_dispatch(&durable_identity, "edge-order")
+            .await
+            .unwrap()
+    );
+    let arguments = json!({"command":"echo pending"});
+    let mut invocation = Box::pin(
+        state
+            .edge_connection_pool
+            .execute_durably_admitted_invocation_with_cancel(
+                &identity,
+                "edge-order",
+                "bash",
+                &arguments,
+                None,
+            ),
+    );
+    // Poll queue admission without yielding to the socket forwarder, then
+    // cancel its owner. Both request and cancellation are ready together.
+    std::future::poll_fn(|cx| {
+        assert!(invocation.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(invocation);
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        frames
+    })
+    .await
+    .expect("queued cancellation must reach the real Edge socket");
+    assert_eq!(frames[0]["type"], "edge_tool_request");
+    assert_eq!(frames[1]["type"], "edge_tool_cancel");
+    assert_eq!(frames[0]["request_id"], frames[1]["request_id"]);
+    assert_eq!(
+        frames[0]["delivery_generation"],
+        frames[1]["delivery_generation"]
+    );
+    socket.close(None).await.unwrap();
+    server.abort();
+}
+
 #[tokio::test]
 async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
@@ -604,9 +692,13 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
+        execution_ceiling: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        timeout_secs: 30,
+        timeout_secs: Some(30),
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(
@@ -664,9 +756,13 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         delivery_generation: 9,
         tool: "bash".to_string(),
         args: json!({"command": "effect"}),
+        execution_ceiling: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        timeout_secs: 30,
+        timeout_secs: Some(30),
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(
@@ -857,7 +953,10 @@ async fn edge_tool_disconnect_during_request_returns_none() {
         .expect("task should complete within 10s")
         .expect("task should not panic");
 
-    assert!(result.is_none(), "disconnected edge should return None");
+    assert!(
+        result.is_err(),
+        "disconnected edge must not claim a completion"
+    );
 
     server.abort();
 }

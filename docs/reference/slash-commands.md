@@ -50,6 +50,13 @@ current model, `/model clear` to clear the selection, or `/model <name>` to
 switch directly. `/model list` remains accepted as an alias for the picker,
 but the bare command is the suggested form.
 
+For an admitted effort-capable model, `/model <name>(thinking:low)` and
+`/model <name>(thinking:high)` request a thinking depth; `/model <name>` keeps
+the provider default. The picker only exposes options admitted by the model's
+catalog capability and protocol. `effort_only` does not support Off. Custom
+gateways may need an administrator-verified protocol declaration and a fresh
+model check; see [model management](cli-commands.md#astra-admin).
+
 The selected model name, Offering identity and catalog pricing form one session
 selection. Switching or clearing it replaces that selection; unknown catalog
 prices stay unknown, while explicit zero prices remain zero. `/model info <name>`

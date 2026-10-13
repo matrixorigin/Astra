@@ -1338,9 +1338,11 @@ steps:
 
     #[test]
     fn every_bundled_case_parses_with_the_strict_criterion_schema() {
-        let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
-        let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
-        assert!(!cases.is_empty());
+        for directory in ["cases", "fixtures/review_journey"] {
+            let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+            let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
+            assert!(!cases.is_empty());
+        }
     }
 
     #[test]

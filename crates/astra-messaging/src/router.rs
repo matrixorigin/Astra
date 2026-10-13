@@ -6,10 +6,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use super::delegation::{DelegationLookup, SubRunInfo};
-use super::transport::{MailboxSubscription, MessageStream, MessageTransport};
-use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
+use super::transport::{MailboxCapabilities, MailboxSubscription, MessageStream, MessageTransport};
+use super::types::{AgentAddress, AgentMessage, MailboxError, MessagePayload, MessageTarget};
 
 /// Result of a permission request sent via [`AgentMailbox::request_permission`].
 #[derive(Debug, Clone)]
@@ -142,6 +143,90 @@ impl MailboxReceiveLease<'_> {
     /// synchronously retain the model input before its next await.
     pub fn commit(mut self) {
         self.committed = true;
+    }
+
+    /// Publish feedback for a conclusively rejected delivery. Once queued,
+    /// custody switches synchronously to ACK-only retry before the next await.
+    /// Failed/uncertain queueing retains the original without automatic replay.
+    pub async fn report_non_adoption(self, timeout: Duration) -> Result<(), MailboxError> {
+        self.report_rejection(timeout, false).await
+    }
+
+    /// Answer an unsupported question with its original request identity.
+    /// This is a response the sender can observe, not an input-adoption ACK.
+    pub async fn reject_unsupported_request(self, timeout: Duration) -> Result<(), MailboxError> {
+        self.report_rejection(timeout, true).await
+    }
+
+    async fn report_rejection(
+        mut self,
+        timeout: Duration,
+        unsupported_request: bool,
+    ) -> Result<(), MailboxError> {
+        if self.messages.len() != 1 {
+            return Err(MailboxError::Protocol(
+                "non-adoption requires one delivery".into(),
+            ));
+        }
+        let message = self.messages[0].clone();
+        if unsupported_request && !matches!(message.payload, MessagePayload::Request { .. }) {
+            return Err(MailboxError::Protocol(
+                "unsupported-request response requires a question".into(),
+            ));
+        }
+        // Even cancellation during response publication must not restore this
+        // conclusively rejected input to the provider-ready queue.
+        self.committed = true;
+        self.mailbox.parked.push_back(ParkedDelivery {
+            message: message.clone(),
+            retry_after_provider: false,
+        });
+        let response = if unsupported_request {
+            let mut response = AgentMessage::new(
+                self.mailbox.address.clone(),
+                MessageTarget::Direct {
+                    address: message.from.clone(),
+                },
+                MessagePayload::Response {
+                    request_id: message.id.clone(),
+                    accepted: false,
+                    data: Some(serde_json::json!({
+                        "reason": "structured_requests_unsupported",
+                        "content": "This recipient cannot answer structured questions. Send text guidance instead."
+                    })),
+                },
+            );
+            response.correlation_id = message.correlation_id.clone();
+            response
+        } else {
+            AgentMessage::non_adoption_response(self.mailbox.address.clone(), &message)
+        };
+        if !matches!(
+            tokio::time::timeout(timeout, self.mailbox.send(response)).await,
+            Ok(Ok(()))
+        ) {
+            return Err(MailboxError::Transport(
+                "non-adoption feedback publication unconfirmed".into(),
+            ));
+        }
+        self.mailbox
+            .parked
+            .retain(|parked| parked.message.id != message.id);
+        self.mailbox.defer_acknowledgement(message);
+        if let Ok((failed, _)) = tokio::time::timeout(
+            timeout,
+            self.mailbox
+                .acknowledge_received_with_failures(&self.messages),
+        )
+        .await
+        {
+            for message in &self.messages {
+                if !failed.iter().any(|pending| pending.id == message.id) {
+                    self.mailbox.forget_acknowledgement(&message.id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Keep the exact delivery claimed but remove it from the ready queue.
@@ -366,17 +451,22 @@ impl AgentMailbox {
         }
     }
 
-    /// Take the deliveries whose staged context crossed the provider boundary.
-    pub fn take_adopted_acknowledgements(&mut self) -> Vec<Arc<AgentMessage>> {
-        std::mem::take(&mut self.pending_acks)
+    /// Already handled delivery may be redelivered after a failed transport ACK.
+    /// Refresh its claim token without dispatching it to the provider again.
+    pub fn acknowledgement_pending(&self, message_id: &str) -> bool {
+        self.pending_acks
+            .iter()
+            .any(|message| message.id == message_id)
     }
 
-    /// Restore only confirmations that failed, preserving the current envelope
-    /// if the transport redelivered the same logical message meanwhile.
-    pub fn restore_adopted_acknowledgements(&mut self, messages: Vec<Arc<AgentMessage>>) {
-        for message in messages {
-            self.defer_acknowledgement(message);
-        }
+    pub fn forget_acknowledgement(&mut self, message_id: &str) {
+        self.pending_acks.retain(|message| message.id != message_id);
+    }
+
+    /// Snapshot deliveries while retaining confirmation custody across a
+    /// cancelled or timed-out storage acknowledgement.
+    pub fn adopted_acknowledgements(&self) -> Vec<Arc<AgentMessage>> {
+        self.pending_acks.clone()
     }
 
     /// Confirm durable consumption after the caller has converted the messages
@@ -772,6 +862,19 @@ impl AgentMailboxRouter {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<AgentMailbox, MailboxError> {
+        self.register_with_capabilities(addr, delegation_id, MailboxCapabilities::default())
+            .await
+    }
+
+    /// Register an agent with the message forms its current loop can consume.
+    /// Capabilities are fixed for a mailbox lifetime; a reattachment that
+    /// changes them is rejected instead of widening an existing route.
+    pub async fn register_with_capabilities(
+        self: &Arc<Self>,
+        addr: AgentAddress,
+        delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
+    ) -> Result<AgentMailbox, MailboxError> {
         let gate = self.registration_gate(&addr.run_id);
         let held = gate.lock_owned().await;
 
@@ -781,7 +884,7 @@ impl AgentMailboxRouter {
         let router = Arc::clone(self);
         let task = tokio::spawn(async move {
             router
-                .register_inner(addr, delegation_id)
+                .register_inner(addr, delegation_id, capabilities)
                 .await
                 .map(|(mailbox, fresh_lifetime)| RegistrationHandoff {
                     mailbox: Some(mailbox),
@@ -799,6 +902,7 @@ impl AgentMailboxRouter {
         self: &Arc<Self>,
         addr: AgentAddress,
         delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
     ) -> Result<(AgentMailbox, bool), MailboxError> {
         let previous = self
             .address_registry
@@ -814,7 +918,18 @@ impl AgentMailboxRouter {
                 addr.run_id
             )));
         }
-        let subscription = self.transport.register(addr.clone(), delegation_id).await?;
+        if let Some(record) = &previous
+            && record.subscription.capabilities() != capabilities
+        {
+            return Err(MailboxError::Protocol(format!(
+                "run '{}' is already bound to a mailbox with different message capabilities",
+                addr.run_id
+            )));
+        }
+        let subscription = self
+            .transport
+            .register_with_capabilities(addr.clone(), delegation_id, capabilities)
+            .await?;
 
         let stream = match self.transport.subscribe(&subscription).await {
             Ok(stream) => stream,
@@ -1073,6 +1188,20 @@ impl AgentMailboxRouter {
             .is_some_and(|record| record.attached)
     }
 
+    /// Local target facts; named remote resolution returns these from the
+    /// transport's same directory read, never a second local-only lookup.
+    async fn target_capabilities(&self, target: &MessageTarget) -> Option<MailboxCapabilities> {
+        let MessageTarget::Direct { address } = target else {
+            return Some(MailboxCapabilities::provider_stage_text_only());
+        };
+        self.address_registry
+            .read()
+            .await
+            .get(&address.run_id)
+            .filter(|record| record.lifetime.address() == address)
+            .map(|record| record.subscription.capabilities())
+    }
+
     /// Resolve the address of a parent run.
     async fn resolve_parent_addr(&self, child_run_id: &str) -> Result<AgentAddress, MailboxError> {
         let parent_run_id = self
@@ -1121,7 +1250,15 @@ impl AgentMailboxRouter {
         &self,
         sender_run_id: &str,
         recipient: &str,
-    ) -> Result<(MessageTarget, String, Option<Vec<String>>), MailboxError> {
+    ) -> Result<
+        (
+            MessageTarget,
+            String,
+            Option<Vec<String>>,
+            Option<MailboxCapabilities>,
+        ),
+        MailboxError,
+    > {
         let recipient = recipient.trim();
         if recipient.is_empty() {
             return Err(MailboxError::Protocol(
@@ -1132,7 +1269,9 @@ impl AgentMailboxRouter {
         match recipient.to_ascii_lowercase().as_str() {
             "parent" | "orchestrator" => {
                 let address = self.resolve_parent_addr(sender_run_id).await?;
-                return Ok((MessageTarget::Direct { address }, "parent".into(), None));
+                let target = MessageTarget::Direct { address };
+                let capabilities = self.target_capabilities(&target).await;
+                return Ok((target, "parent".into(), None, capabilities));
             }
             "*" | "broadcast" | "all" | "peers" => {
                 let namespace = self
@@ -1156,6 +1295,7 @@ impl AgentMailboxRouter {
                     },
                     "broadcast".into(),
                     Some(recipients),
+                    Some(MailboxCapabilities::provider_stage_text_only()),
                 ));
             }
             _ => {}
@@ -1173,18 +1313,50 @@ impl AgentMailboxRouter {
                 )));
             }
             let display = address.to_string();
-            return Ok((MessageTarget::Direct { address }, display, None));
+            let target = MessageTarget::Direct { address };
+            let capabilities = self.target_capabilities(&target).await;
+            return Ok((target, display, None, capabilities));
         }
 
-        if let Ok(address) = self.resolve_agent(sender_run_id, recipient).await {
-            let display = address.to_string();
-            return Ok((MessageTarget::Direct { address }, display, None));
-        }
-        if let Some(parent_run_id) = self.parent_run_id(sender_run_id).await
-            && let Ok(address) = self.resolve_agent(&parent_run_id, recipient).await
+        match self
+            .transport
+            .resolve_mailbox(sender_run_id, recipient)
+            .await
         {
-            let display = address.to_string();
-            return Ok((MessageTarget::Direct { address }, display, None));
+            Ok(mailbox) => {
+                let display = mailbox.address.to_string();
+                return Ok((
+                    MessageTarget::Direct {
+                        address: mailbox.address,
+                    },
+                    display,
+                    None,
+                    Some(mailbox.capabilities),
+                ));
+            }
+            Err(MailboxError::AgentNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(parent_run_id) = self.parent_run_id(sender_run_id).await {
+            match self
+                .transport
+                .resolve_mailbox(&parent_run_id, recipient)
+                .await
+            {
+                Ok(mailbox) => {
+                    let display = mailbox.address.to_string();
+                    return Ok((
+                        MessageTarget::Direct {
+                            address: mailbox.address,
+                        },
+                        display,
+                        None,
+                        Some(mailbox.capabilities),
+                    ));
+                }
+                Err(MailboxError::AgentNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
 
         Err(MailboxError::Protocol(format!(
@@ -1368,7 +1540,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, display, _) = router
+        let (_, display, _, _) = router
             .resolve_message_target("parent-run", &child_address.agent_id)
             .await
             .unwrap();
@@ -1376,6 +1548,54 @@ mod tests {
         assert_eq!(display, "worker@child-run");
         assert!(!display.contains("@child-run@child-run"));
         parent.retire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mailbox_capabilities_are_scoped_to_one_lifetime_and_target() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let address = addr("native-run", "worker");
+        let _mailbox = router
+            .register_with_capabilities(
+                address.clone(),
+                Some("parent-run".into()),
+                MailboxCapabilities::provider_stage_text_only(),
+            )
+            .await
+            .unwrap();
+
+        let target = MessageTarget::Direct {
+            address: address.clone(),
+        };
+        assert_eq!(
+            router.target_capabilities(&target).await,
+            Some(MailboxCapabilities::provider_stage_text_only())
+        );
+        assert!(
+            router
+                .register(address, Some("parent-run".into()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_mailboxes_accept_structured_requests_by_default() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let address = addr("ordinary-run", "worker");
+        let _mailbox = router.register(address.clone(), None).await.unwrap();
+
+        assert_eq!(
+            router
+                .target_capabilities(&MessageTarget::Direct { address })
+                .await,
+            Some(MailboxCapabilities::default())
+        );
     }
 
     #[tokio::test]
@@ -2072,6 +2292,7 @@ mod tests {
         unregistered: AtomicUsize,
         subscribe_attempts: AtomicUsize,
         fail_on_attempt: usize,
+        send_without_confirmation: Option<(Arc<InProcessTransport>, Arc<tokio::sync::Notify>)>,
     }
 
     impl Default for FailingSubscribeTransport {
@@ -2081,19 +2302,21 @@ mod tests {
                 unregistered: AtomicUsize::new(0),
                 subscribe_attempts: AtomicUsize::new(0),
                 fail_on_attempt: 1,
+                send_without_confirmation: None,
             }
         }
     }
 
     #[async_trait]
     impl MessageTransport for FailingSubscribeTransport {
-        async fn register(
+        async fn register_with_capabilities(
             &self,
             _addr: AgentAddress,
             _delegation_id: Option<String>,
+            capabilities: MailboxCapabilities,
         ) -> Result<MailboxSubscription, MailboxError> {
             self.registered.fetch_add(1, AtomicOrdering::Relaxed);
-            Ok(MailboxSubscription::new(_addr))
+            Ok(MailboxSubscription::with_capabilities(_addr, capabilities))
         }
         async fn unregister(&self, _addr: &MailboxSubscription) -> Result<(), MailboxError> {
             self.unregistered.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2115,11 +2338,11 @@ mod tests {
                 }))
             }
         }
-        async fn resolve_agent(
+        async fn resolve_mailbox(
             &self,
             _delegation_id: &str,
             agent_id: &str,
-        ) -> Result<AgentAddress, MailboxError> {
+        ) -> Result<super::super::transport::ResolvedMailbox, MailboxError> {
             Err(MailboxError::AgentNotFound(AgentAddress::new("", agent_id)))
         }
         async fn list_agents(
@@ -2128,7 +2351,12 @@ mod tests {
         ) -> Result<Vec<AgentAddress>, MailboxError> {
             Ok(Vec::new())
         }
-        async fn send(&self, _msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
+        async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
+            if let Some((transport, entered)) = &self.send_without_confirmation {
+                transport.send(msg).await?;
+                entered.notify_one();
+                return std::future::pending().await;
+            }
             unreachable!()
         }
         async fn broadcast(
@@ -2407,11 +2635,22 @@ mod tests {
         };
 
         mailbox.defer_acknowledgement(first);
+        assert!(mailbox.acknowledgement_pending(&current.id));
         mailbox.defer_acknowledgement(current.clone());
+        assert!(mailbox.acknowledgement_pending(&current.id));
+        mailbox.forget_acknowledgement("unrelated-message");
+        assert!(mailbox.acknowledgement_pending(&current.id));
 
-        let pending = mailbox.take_adopted_acknowledgements();
+        let pending = mailbox.adopted_acknowledgements();
         assert_eq!(pending.len(), 1);
         assert!(Arc::ptr_eq(&pending[0], &current));
+        assert!(
+            mailbox.acknowledgement_pending(&current.id),
+            "snapshot retains custody"
+        );
+        mailbox.forget_acknowledgement(&current.id);
+        assert!(!mailbox.acknowledgement_pending(&current.id));
+        assert!(mailbox.adopted_acknowledgements().is_empty());
     }
 
     #[tokio::test]
@@ -2519,6 +2758,234 @@ mod tests {
             acknowledged.lock().expect("ack recorder lock").as_slice(),
             [message.id.as_str()]
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_question_is_answered_without_replaying_original() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let sender = addr("sender", "parent");
+        let receiver = addr("receiver", "native");
+        let mut sender_mailbox = router.register(sender.clone(), None).await.unwrap();
+        let mut mailbox = router
+            .register_with_capabilities(
+                receiver.clone(),
+                None,
+                MailboxCapabilities::provider_stage_text_only(),
+            )
+            .await
+            .unwrap();
+        let question = AgentMessage::new(
+            sender,
+            MessageTarget::Direct { address: receiver },
+            MessagePayload::Request {
+                request_type: crate::RequestType::Custom("question".into()),
+                data: serde_json::json!({"content": "Can you confirm the requirement?"}),
+            },
+        )
+        .with_correlation("question-correlation");
+        router.send(question.clone()).await.unwrap();
+        assert!(mailbox.wait_ready().await);
+        mailbox
+            .lease_bounded(1)
+            .reject_unsupported_request(Duration::from_secs(1))
+            .await
+            .unwrap();
+        let response = sender_mailbox.try_recv().expect("correlated refusal");
+        assert!(matches!(&response.payload,
+            MessagePayload::Response { request_id, accepted: false, .. }
+                if request_id == &question.id));
+        assert!(!crate::types::is_non_adoption_response(&response.payload));
+        assert_eq!(response.correlation_id, question.correlation_id);
+        assert_eq!(response.from, mailbox.address);
+        assert!(mailbox.try_recv().is_none());
+        assert!(mailbox.parked.is_empty());
+        assert!(mailbox.pending_acks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_adoption_publication_and_original_ack_have_separate_custody() {
+        for fail_publication in [false, true] {
+            let router = Arc::new(AgentMailboxRouter::new(
+                Arc::new(InProcessTransport::new()),
+                tracker(),
+            ));
+            let sender = addr("sender", "parent");
+            let receiver = addr("receiver", "child");
+            let mut sender_mailbox = router.register(sender.clone(), None).await.unwrap();
+            let mut mailbox = router.register(receiver.clone(), None).await.unwrap();
+            let original = Arc::new(
+                AgentMessage::new(
+                    sender,
+                    MessageTarget::Direct { address: receiver },
+                    MessagePayload::Text {
+                        content: "extra guidance".into(),
+                        summary: None,
+                    },
+                )
+                .with_correlation("separate-correlation"),
+            );
+            // Use the real receive-lease producer with a failing ACK stream.
+            *mailbox.stream.get_mut() = Box::new(SelectiveAckStream {
+                failing_id: original.id.clone(),
+                acknowledged: Arc::new(std::sync::Mutex::new(Vec::new())),
+            });
+            mailbox.buffered.get_mut().push_back(original.clone());
+            if fail_publication {
+                router.transport.shutdown().await.unwrap();
+            }
+            let outcome = mailbox
+                .lease_bounded(1)
+                .report_non_adoption(Duration::from_millis(100))
+                .await;
+            assert_eq!(outcome.is_err(), fail_publication);
+            assert!(
+                mailbox.try_recv().is_none(),
+                "rejection must never return to provider-ready input"
+            );
+            if fail_publication {
+                assert!(!mailbox.acknowledgement_pending(&original.id));
+                assert_eq!(mailbox.parked[0].message.id, original.id);
+                assert!(!mailbox.parked[0].retry_after_provider);
+            } else {
+                assert!(mailbox.acknowledgement_pending(&original.id));
+                assert!(mailbox.parked.is_empty());
+                let feedback = sender_mailbox.try_recv().unwrap();
+                assert!(crate::types::is_non_adoption_response(&feedback.payload));
+                assert_eq!(feedback.correlation_id, original.correlation_id);
+                assert_eq!(feedback.from, mailbox.address);
+                assert!(
+                    matches!(&feedback.payload, MessagePayload::Response { request_id, .. } if request_id == &original.id)
+                );
+                let acknowledged = Arc::new(std::sync::Mutex::new(Vec::new()));
+                *mailbox.stream.get_mut() = Box::new(AckRecordingStream {
+                    acknowledged: acknowledged.clone(),
+                });
+                let pending = mailbox.adopted_acknowledgements();
+                mailbox.acknowledge_received(&pending).await.unwrap();
+                for message in pending {
+                    mailbox.forget_acknowledgement(&message.id);
+                }
+                assert_eq!(*acknowledged.lock().unwrap(), vec![original.id.clone()]);
+                assert!(
+                    sender_mailbox.try_recv().is_none(),
+                    "ACK retry must not publish feedback twice"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_non_adoption_ack_keeps_ack_only_custody() {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let mut sender = router
+            .register(addr("sender", "parent"), None)
+            .await
+            .unwrap();
+        let mut receiver = router
+            .register(addr("receiver", "child"), None)
+            .await
+            .unwrap();
+        let original = Arc::new(AgentMessage::new(
+            sender.address.clone(),
+            MessageTarget::Direct {
+                address: receiver.address.clone(),
+            },
+            MessagePayload::Text {
+                content: "extra guidance".into(),
+                summary: None,
+            },
+        ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        *receiver.stream.get_mut() = Box::new(BlockingAckStream {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        receiver.buffered.get_mut().push_back(original.clone());
+        let mut publication = Box::pin(
+            receiver
+                .lease_bounded(1)
+                .report_non_adoption(Duration::from_secs(1)),
+        );
+        tokio::select! {
+            _ = entered.notified() => {}
+            result = &mut publication => panic!("ACK must be gated: {result:?}"),
+        }
+        drop(publication);
+        assert!(receiver.acknowledgement_pending(&original.id));
+        assert!(receiver.try_recv().is_none());
+        assert!(crate::types::is_non_adoption_response(
+            &sender.try_recv().unwrap().payload
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_publication_confirmation_never_restores_provider_ready_input() {
+        for cancel in [false, true] {
+            let transport = Arc::new(InProcessTransport::new());
+            let router = Arc::new(AgentMailboxRouter::new(transport.clone(), tracker()));
+            let mut sender = router
+                .register(addr("sender", "parent"), None)
+                .await
+                .unwrap();
+            let mut receiver = router
+                .register(addr("receiver", "child"), None)
+                .await
+                .unwrap();
+            let original = AgentMessage::new(
+                sender.address.clone(),
+                MessageTarget::Direct {
+                    address: receiver.address.clone(),
+                },
+                MessagePayload::Text {
+                    content: "extra guidance".into(),
+                    summary: None,
+                },
+            );
+            let id = original.id.clone();
+            sender.send(original).await.unwrap();
+            assert!(receiver.wait_ready().await);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            receiver.router = Arc::new(AgentMailboxRouter::new(
+                Arc::new(FailingSubscribeTransport {
+                    send_without_confirmation: Some((transport, entered.clone())),
+                    ..Default::default()
+                }),
+                tracker(),
+            ));
+            let mut publication = Box::pin(
+                receiver
+                    .lease_bounded(1)
+                    .report_non_adoption(Duration::from_millis(100)),
+            );
+            tokio::select! {
+                _ = entered.notified() => {}
+                result = &mut publication => panic!("real insertion must precede lost confirmation: {result:?}"),
+            }
+            assert!(crate::types::is_non_adoption_response(
+                &sender.try_recv().unwrap().payload
+            ));
+            if !cancel {
+                assert!(publication.as_mut().await.is_err());
+            }
+            drop(publication);
+            assert!(receiver.try_recv().is_none());
+            assert!(
+                !receiver.acknowledgement_pending(&id),
+                "publication was never confirmed"
+            );
+            assert_eq!(receiver.parked[0].message.id, id);
+            assert!(!receiver.parked[0].retry_after_provider);
+            assert!(
+                sender.try_recv().is_none(),
+                "uncertain publication is not automatically retried"
+            );
+        }
     }
 
     #[tokio::test]

@@ -3774,6 +3774,7 @@ impl GuidanceSubmissionError {
             | astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
             | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
             | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)
+            | astra_thin_client::ThinClientError::InvalidProviderInteractionResponse(_)
             | astra_thin_client::ThinClientError::InvalidSseJson(_) => {
                 Self::Unconfirmed(error.to_string())
             }
@@ -4580,7 +4581,7 @@ fn apply_tui_control_event(
         } => {
             if bottom_pane.return_user_intent(intent_id, *status, content) {
                 chat_widget.commit_system(history_cell::system::SystemCell::info(
-                    "The run ended before applying your guidance; it was restored as an unsent draft."
+                    "Your guidance was not adopted; it was restored as an unsent draft."
                         .to_string(),
                 ));
                 UserIntentProjection::Returned
@@ -5448,6 +5449,8 @@ struct ViewActionBackends {
     session_attachment_epoch: u64,
     file_writer: Option<super::file_writer::TuiFileWriter>,
     agent_workbench_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
+    native_delivery_refresh:
+        crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle,
 }
 
 /// Dispatch actions emitted by a live projection refresh. This keeps the
@@ -6961,6 +6964,7 @@ async fn dispatch_bottom_pane_view_action(
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::RefreshAgentMonitor => {
+            backends.native_delivery_refresh.request();
             if server_agent_observer.request_refresh() {
                 server_agent_observer.maybe_refresh();
                 reconcile_server_agent_observer(
@@ -7446,6 +7450,45 @@ fn refresh_footer_from_state(
     }
 }
 
+fn enqueue_approval_request(
+    bottom_pane: &mut BottomPane,
+    request: crate::cli::chat_stream::ApprovalRequest,
+    session_id: Option<&str>,
+    attachment_epoch: u64,
+) {
+    if request.metadata.as_ref().is_some_and(|metadata| {
+        metadata
+            .runtime_dependencies
+            .as_ref()
+            .is_some_and(|context| !context.is_current(session_id, attachment_epoch))
+    }) {
+        let _ = request
+            .response_tx
+            .send(crate::cli::chat_stream::ApprovalResponse::Deny);
+        return;
+    }
+    if let Some(metadata) = request.metadata {
+        bottom_pane.enqueue_approval_with_metadata(
+            request.tool,
+            request.header,
+            request.detail,
+            request.reason,
+            request.args,
+            request.response_tx,
+            *metadata,
+        );
+    } else {
+        bottom_pane.enqueue_approval(
+            request.tool,
+            request.header,
+            request.detail,
+            request.reason,
+            request.args,
+            request.response_tx,
+        );
+    }
+}
+
 fn surface_tui_file_write_errors(
     errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteError>,
     reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
@@ -7668,6 +7711,10 @@ pub(crate) async fn run_tui_session(
     state.tui_render_policy = Some(crate::cli::stream::stream_render::RenderPolicy::Silent);
     let mut tui_cancel_token = std::sync::Arc::new(session_shutdown_token.child_token());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
+    // Native collaborator delivery is session-scoped. Keep its lifetime on
+    // the process/session shutdown token, never on the per-turn interrupt
+    // token that is replaced after every Ctrl+C or completed turn.
+    state.native_delivery_shutdown = Some(session_shutdown_token.clone());
 
     // Approval channel: tool approval requests from SSE host → TUI overlay
     let (approval_tx, mut approval_rx) =
@@ -7988,6 +8035,16 @@ pub(crate) async fn run_tui_session(
         tokio::select! {
             _ = session_shutdown_token.cancelled() => {
                 break 'main Ok(());
+            }
+            Some(request) = approval_rx.recv() => {
+                enqueue_approval_request(&mut bottom_pane, request, state.session_id.as_deref(), state.session_attachment_epoch);
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                refresh_open_transcript_view(&chat_widget, &mut bottom_pane, width);
+                frame_requester.schedule_frame();
+            }
+            Some(request) = ask_user_rx.recv() => {
+                bottom_pane.enqueue_ask_user(request.prompt, request.response_tx);
+                frame_requester.schedule_frame();
             }
             Some(progress) = login_progress_rx.recv() => {
                 if login_tasks.is_empty() { continue; }
@@ -8539,6 +8596,7 @@ pub(crate) async fn run_tui_session(
                                         session_id: state.session_id.clone(),
                                         file_writer: Some(file_writer.clone()),
                                         agent_workbench_tx: agent_workbench_tx.clone(),
+                                        native_delivery_refresh: state.native_delivery_refresh_handle(),
                                         session_attachment_epoch: state.session_attachment_epoch,
                                     },
                                     &frame_requester,
@@ -9018,6 +9076,7 @@ pub(crate) async fn run_tui_session(
                                                     ),
                                                     file_writer: Some(file_writer.clone()),
                                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                                    native_delivery_refresh: state.native_delivery_refresh_handle(),
                                                     session_attachment_epoch: state.session_attachment_epoch,
                                                 },
                                                 &frame_requester,
@@ -9375,6 +9434,8 @@ pub(crate) async fn run_tui_session(
                                             slash_dispatch::session_hub_snapshot(&state);
                                         let turn_session_id = state.session_id.clone();
                                         let turn_session_attachment_epoch = state.session_attachment_epoch;
+                                        let native_delivery_refresh = state.native_delivery_refresh_handle();
+                                        let turn_permission_policy = state.perm_manager.subscribe_permission_policy();
                                         let turn_submission_id =
                                             uuid::Uuid::now_v7().to_string();
                                         let bound_turn_api = continuation.as_ref().map(|target| match &target.0.owner.native_binding {
@@ -9686,6 +9747,7 @@ pub(crate) async fn run_tui_session(
                                                                             session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                             file_writer: Some(file_writer.clone()),
                                                                             agent_workbench_tx: agent_workbench_tx.clone(),
+                                                                            native_delivery_refresh: native_delivery_refresh.clone(),
                                                                             session_attachment_epoch: turn_session_attachment_epoch,
                                                                         },
                                                                         &frame_requester,
@@ -10151,6 +10213,7 @@ pub(crate) async fn run_tui_session(
                                                                                 session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                                 file_writer: Some(file_writer.clone()),
                                                                                 agent_workbench_tx: agent_workbench_tx.clone(),
+                                                                                native_delivery_refresh: native_delivery_refresh.clone(),
                                                                                 session_attachment_epoch: turn_session_attachment_epoch,
                                                                             },
                                                                             &restored_local_agent_task_projections,
@@ -10728,26 +10791,10 @@ pub(crate) async fn run_tui_session(
                                                     // approval card is rendered by BottomPane above the
                                                     // composer so arrow-key focus is visible. Resolve
                                                     // events flush a compact audit line to scrollback.
-                                                    let _id = if let Some(metadata) = req.metadata {
-                                                        bottom_pane.enqueue_approval_with_metadata(
-                                                            req.tool,
-                                                            req.header,
-                                                            req.detail,
-                                                            req.reason,
-                                                            req.args,
-                                                            req.response_tx,
-                                                            *metadata,
-                                                        )
-                                                    } else {
-                                                        bottom_pane.enqueue_approval(
-                                                            req.tool,
-                                                            req.header,
-                                                            req.detail,
-                                                            req.reason,
-                                                            req.args,
-                                                            req.response_tx,
-                                                        )
-                                                    };
+                                                    let attachment = turn_permission_policy.current();
+                                                    enqueue_approval_request(&mut bottom_pane, req,
+                                                        attachment.as_ref().map(|policy| policy.session_id()),
+                                                        attachment.as_ref().map_or(0, |policy| policy.attachment_epoch()));
                                                     let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
@@ -10771,15 +10818,6 @@ pub(crate) async fn run_tui_session(
                                 }
                                                  }
                                                 Some(req) = ask_user_rx.recv() => {
-                                                    // Draft transition: show a brief
-                                                    // indicator before the ask-user form
-                                                    // opens so the user isn't surprised by
-                                                    // a sudden modal.
-                                                    chat_widget.commit_system(
-                                                        crate::tui::history_cell::system::SystemCell::response(
-                                                            "🤔 The agent needs your input — opening question…",
-                                                        ),
-                                                    );
                                                     bottom_pane.enqueue_ask_user(req.prompt, req.response_tx);
                                                     frame_requester.schedule_frame();
                                                     {
@@ -10872,6 +10910,7 @@ pub(crate) async fn run_tui_session(
                                                             session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                             file_writer: Some(file_writer.clone()),
                                                             agent_workbench_tx: agent_workbench_tx.clone(),
+                                                            native_delivery_refresh: native_delivery_refresh.clone(),
                                                             session_attachment_epoch: turn_session_attachment_epoch,
                                                         },
                                                         &restored_local_agent_task_projections,
@@ -11375,6 +11414,7 @@ pub(crate) async fn run_tui_session(
                                         session_id: state.session_id.clone(),
                                         file_writer: Some(file_writer.clone()),
                                         agent_workbench_tx: agent_workbench_tx.clone(),
+                                        native_delivery_refresh: state.native_delivery_refresh_handle(),
                                         session_attachment_epoch: state.session_attachment_epoch,
                                     },
                                     &restored_local_agent_task_projections,
@@ -12113,6 +12153,7 @@ pub(crate) async fn run_tui_session(
                         session_id: state.session_id.clone(),
                         file_writer: Some(file_writer.clone()),
                         agent_workbench_tx: agent_workbench_tx.clone(),
+                        native_delivery_refresh: state.native_delivery_refresh_handle(),
                         session_attachment_epoch: state.session_attachment_epoch,
                     },
                     &restored_local_agent_task_projections,
@@ -12315,6 +12356,7 @@ pub(crate) async fn run_tui_session(
                                     session_id: state.session_id.clone(),
                                     file_writer: Some(file_writer.clone()),
                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                    native_delivery_refresh: state.native_delivery_refresh_handle(),
                                     session_attachment_epoch: state.session_attachment_epoch,
                                 },
                             );
@@ -12334,6 +12376,7 @@ pub(crate) async fn run_tui_session(
                                     session_id: state.session_id.clone(),
                                     file_writer: Some(file_writer.clone()),
                                     agent_workbench_tx: agent_workbench_tx.clone(),
+                                    native_delivery_refresh: state.native_delivery_refresh_handle(),
                                     session_attachment_epoch: state.session_attachment_epoch,
                                 },
                                 &restored_local_agent_task_projections,
@@ -12608,6 +12651,13 @@ pub(crate) async fn run_tui_session(
     drop(plan_task_observer);
     drop(server_agent_observer);
     state.tui_cancel_token = None;
+    if let Some(handle) = state.native_delivery.take() {
+        handle.shutdown().await;
+    }
+    state.native_delivery_refresh.clear();
+    state.native_delivery_session_id = None;
+    state.native_delivery_attachment_epoch = None;
+    state.native_delivery_shutdown = None;
 
     if let Some(spawner) = state.agent_spawner.take() {
         retire_local_agent_spawner_with_reason(
@@ -12945,6 +12995,71 @@ fn apply_terminal_explain_analyze_degraded_marker(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_dependency_approval_uses_live_attachment_after_turn_binding() {
+        use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse};
+        use crate::tui::approval::queue::{ApprovalMetadata, RuntimeDependencyApprovalContext};
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let observer = state.perm_manager.subscribe_permission_policy();
+        assert!(observer.current().is_none());
+        state.set_session_id("bound-during-turn");
+        let admitted_epoch = state.session_attachment_epoch;
+        let mut pane = BottomPane::new();
+        for rebind in [false, true] {
+            if rebind {
+                state.reset_for_new_session();
+            }
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let mut request = ApprovalRequest::bare(
+                "sandbox_expand:runtime".into(),
+                "Read dependencies".into(),
+                None,
+                "exact dependency reads".into(),
+                serde_json::Value::Null,
+                tx,
+            );
+            request.metadata = Some(Box::new(ApprovalMetadata {
+                runtime_dependencies: Some(RuntimeDependencyApprovalContext {
+                    invocation: astra_turn_types::ToolInvocationIdentity::new(
+                        "u",
+                        "bound-during-turn",
+                        "r",
+                        "r",
+                        "i",
+                    )
+                    .unwrap(),
+                    attachment_epoch: admitted_epoch,
+                    execution_binding_generation: 1,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                }),
+                ..Default::default()
+            }));
+            let current = observer.current().unwrap();
+            enqueue_approval_request(
+                &mut pane,
+                request,
+                Some(current.session_id()),
+                current.attachment_epoch(),
+            );
+            if rebind {
+                assert!(!pane.has_pending_approvals());
+                assert_eq!(rx.try_recv().unwrap(), ApprovalResponse::Deny);
+            } else {
+                assert!(pane.has_pending_approvals());
+                assert_eq!(
+                    pane.reevaluate_approvals_for_mode(
+                        crate::cli::permission_manager::PermissionMode::Bypass
+                    ),
+                    0
+                );
+                assert!(rx.try_recv().is_err());
+                pane.respond_focused_approval(ApprovalResponse::AllowOnce);
+                assert_eq!(rx.try_recv().unwrap(), ApprovalResponse::AllowOnce);
+            }
+        }
+    }
+
     fn interactive_queue<const N: usize>(items: [String; N]) -> VecDeque<NextTurnSubmission> {
         items
             .into_iter()
@@ -15182,6 +15297,7 @@ mod tests {
                     session_attachment_epoch: 1,
                     file_writer: None,
                     agent_workbench_tx: tx,
+                    native_delivery_refresh: Default::default(),
                 },
                 &mut widget,
                 &mut pane,
@@ -20448,6 +20564,7 @@ mod tests {
                     session_attachment_epoch: 9,
                     file_writer: None,
                     agent_workbench_tx: tx,
+                    native_delivery_refresh: Default::default(),
                 },
                 &mut pane,
                 &mut widget,
@@ -20799,6 +20916,7 @@ mod tests {
                 session_attachment_epoch: 0,
                 file_writer: None,
                 agent_workbench_tx,
+                native_delivery_refresh: Default::default(),
             },
             &[],
             &mut widget,
@@ -21109,6 +21227,7 @@ mod tests {
                 session_id: Some("durable-root-session".into()),
                 file_writer: None,
                 agent_workbench_tx,
+                native_delivery_refresh: Default::default(),
                 session_attachment_epoch: 0,
             },
             &FrameRequester::test_dummy(),
@@ -21175,6 +21294,7 @@ mod tests {
                 session_id: Some("durable-root-session".into()),
                 file_writer: None,
                 agent_workbench_tx,
+                native_delivery_refresh: Default::default(),
                 session_attachment_epoch: 0,
             },
             &FrameRequester::test_dummy(),
@@ -21437,6 +21557,7 @@ mod tests {
             AskUserPrompt {
                 context: None,
                 questions: vec![AskUserQuestion {
+                    id: None,
                     header: "Choice".to_string(),
                     question: "Which path should survive?".to_string(),
                     options: vec![AskUserChoice {

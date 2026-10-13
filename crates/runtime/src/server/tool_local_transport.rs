@@ -241,6 +241,7 @@ mod tests {
             runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
         }
     }
 

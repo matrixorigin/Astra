@@ -30,14 +30,15 @@ pub use git_safety::{
 };
 pub use path::{SandboxPathError, canonicalize_parent_and_append, normalize_path, validate_path};
 pub use policy::{
-    IsolationLevel, SandboxPolicy, is_never_readable_path, is_sensitive_path,
-    is_sensitive_system_dir,
+    IsolationLevel, SandboxPolicy, SensitivePathRules, is_never_readable_path, is_sensitive_path,
+    is_sensitive_system_dir, sensitive_path_rules,
 };
 pub use process_isolation::{
-    BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
-    ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope, execute_isolated,
-    execute_isolated_with_cancel, invocation_supervisor_is_requested, process_scope_available,
-    run_invocation_supervisor_if_requested,
+    BashInvocationOwner, CgroupGuard, FramedProcess, FramedProcessEnd, FramedProcessInput,
+    FramedProcessLimits, FramedProcessOutcome, InvocationSupervisor, IsolatedOutput,
+    IsolationConfig, ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope,
+    execute_isolated, execute_isolated_with_cancel, invocation_supervisor_is_requested,
+    process_scope_available, run_invocation_supervisor_if_requested,
 };
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, InternalPathKind, SENSITIVE_ENV_VARS, ShellHardeningConfig,

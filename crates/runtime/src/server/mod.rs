@@ -738,7 +738,7 @@ mod tests {
         async fn wait_result(
             &self,
             _identity: &EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             unreachable!("wait_result is not used in cleanup tests")
         }

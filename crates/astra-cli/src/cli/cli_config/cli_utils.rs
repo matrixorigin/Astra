@@ -300,7 +300,10 @@ impl CliOwnerAuthSnapshot {
         self.owner_scope == astra_services::local_owner_scope()
             && match (&self.native_binding, crate::cli::native_auth::active()) {
                 (Some(bound), Some(active)) => std::sync::Arc::ptr_eq(bound, &active),
-                (None, None) => true,
+                (None, None) => self
+                    .legacy_binding
+                    .as_ref()
+                    .is_none_or(|binding| binding.is_active()),
                 _ => false,
             }
     }
@@ -991,7 +994,8 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
         | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
         | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
-        | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)) => {
+        | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)
+        | astra_thin_client::ThinClientError::InvalidProviderInteractionResponse(_)) => {
             error.to_string()
         }
         astra_thin_client::ThinClientError::InvalidSseJson(value) => {

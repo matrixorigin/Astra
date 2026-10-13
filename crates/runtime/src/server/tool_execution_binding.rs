@@ -200,6 +200,9 @@ pub struct ToolPolicySnapshot {
     /// run authority. Never a provider permission or a serialized deadline.
     #[serde(skip)]
     pub admission_deadline: Option<std::time::Instant>,
+    /// Same admitted work cutoff as admission_deadline, for remote transport.
+    #[serde(skip)]
+    pub execution_deadline_unix_ms: Option<u64>,
     pub allowed_tools: Vec<String>,
     pub approval_policy: Option<String>,
     pub network_policy: Option<String>,
@@ -283,6 +286,13 @@ pub struct ToolPermissionGrantSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRequest {
+    /// Never serialized or recovered: only this dispatch may enable steering.
+    #[serde(skip)]
+    pub provider_stage_dispatch: Option<
+        tokio::sync::watch::Sender<
+            Option<astra_server_types::edge_connection_pool::ProviderStageDispatchBinding>,
+        >,
+    >,
     pub user_id: String,
     pub run_id: String,
     pub turn_chain_id: String,
@@ -419,6 +429,10 @@ pub struct ExecutionBindingSnapshot {
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_binding_generation: Option<u64>,
+    /// Stable physical checkout identity for native Edge execution. The live
+    /// executor id may change after a CLI restart; this identity must not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_workspace_id: Option<String>,
 }
 
 impl ExecutionBindingSnapshot {
@@ -432,6 +446,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: Some(runtime),
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 
@@ -441,6 +456,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: None,
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 }
@@ -596,6 +612,7 @@ impl ExecutionBindingState {
             runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
         }
         .with_execution_binding_generation(self.execution_binding_generation)
     }

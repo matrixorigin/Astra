@@ -5493,6 +5493,76 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn git_inspection_survives_unavailable_workspace_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "build-output/\n").unwrap();
+        for args in [
+            vec!["init", "-q", "--template="],
+            vec!["add", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "inspection-evidence",
+            ],
+        ] {
+            let mut git = std::process::Command::new("git");
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("GIT_") {
+                    git.env_remove(name);
+                }
+            }
+            assert!(
+                git.env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::create_dir(dir.path().join("build-output")).unwrap();
+        std::fs::File::create(dir.path().join("build-output/artifact"))
+            .unwrap()
+            .set_len(9 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            astra_tools::workspace_observation::WorkspaceFingerprint::capture(dir.path()).is_none()
+        );
+        let executor = test_executor_in(dir.path());
+        for verification in [false, true] {
+            let mut args = serde_json::json!({"command":"git log -1 --format=%s", "force":true});
+            if verification {
+                args["mode"] = serde_json::json!("verify");
+            }
+            let outcome = executor
+                .execute_with_invocation_metadata_cancelable(
+                    "bash",
+                    &args,
+                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                    None,
+                )
+                .await;
+            assert!(
+                outcome.output.contains("inspection-evidence"),
+                "{outcome:?}"
+            );
+            assert_eq!(outcome.is_error, verification, "{outcome:?}");
+            assert!(outcome.tool_result_fields.as_ref().is_none_or(|fields| {
+                fields
+                    .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                    .is_none()
+            }));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn overlarge_non_git_verify_returns_typed_observer_recovery() {
         let dir = tempfile::tempdir().expect("workspace");
         for index in 0..=16_384 {

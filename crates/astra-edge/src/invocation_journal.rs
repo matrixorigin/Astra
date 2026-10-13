@@ -138,15 +138,24 @@ struct DurableInvocationRecord {
     execution_generation: Option<u64>,
     tool: String,
     canonical_arguments_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_ceiling: Option<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
     state: DurableState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<DurableEdgeResult>,
 }
 
 impl DurableInvocationRecord {
-    fn matches(&self, identity: &ToolInvocationIdentity, tool: &str, args: &Value) -> bool {
+    fn matches(
+        &self,
+        identity: &ToolInvocationIdentity,
+        tool: &str,
+        args: &Value,
+        ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+    ) -> bool {
         self.identity == *identity
             && self.tool == tool
+            && self.execution_ceiling.as_ref() == ceiling
             && self.canonical_arguments_hash
                 == astra_turn_types::canonical_public_arguments_hash(args)
     }
@@ -399,6 +408,9 @@ impl EdgeInvocationJournal {
         }
     }
 
+    // Keep the wire request key, durable identity, payload and frozen ceiling
+    // explicit at this admission boundary; none is inferred from another.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prepare(
         &mut self,
         request_id: &str,
@@ -407,6 +419,7 @@ impl EdgeInvocationJournal {
         tool: &str,
         args: &Value,
         execution_capacity_available: bool,
+        execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
             return Err(JournalError::IdentityConflict {
@@ -422,7 +435,7 @@ impl EdgeInvocationJournal {
             return Err(JournalError::TooLarge);
         }
         if let Some(mut record) = self.state.records.get(request_id).cloned() {
-            if !record.matches(identity, tool, args) {
+            if !record.matches(identity, tool, args, execution_ceiling) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
@@ -448,6 +461,7 @@ impl EdgeInvocationJournal {
             execution_generation: execution_capacity_available.then_some(delivery_generation),
             tool: tool.to_string(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
+            execution_ceiling: execution_ceiling.cloned(),
             state: if execution_capacity_available {
                 DurableState::Running
             } else {
@@ -946,7 +960,7 @@ mod tests {
             let id = identity.storage_key();
             let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
             journal
-                .prepare(&id, &identity, 1, "bash", &json!({}), true)
+                .prepare(&id, &identity, 1, "bash", &json!({}), true, None)
                 .await
                 .unwrap();
             let result = journal
@@ -974,7 +988,7 @@ mod tests {
             let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
             assert!(matches!(
                 restored
-                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), true)
+                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), true, None)
                     .await
                     .unwrap(),
                 PrepareOutcome::Replay(_)
@@ -1013,7 +1027,7 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 1, "bash", &args, true)
+                .prepare(&id, &identity, 1, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
@@ -1033,7 +1047,7 @@ mod tests {
         // Increasing the generation expands the envelope even when the result
         // body is unchanged. Bound and persist the new envelope before replay.
         let PrepareOutcome::Replay(bounded) = journal
-            .prepare(&id, &identity, u64::MAX, "bash", &args, true)
+            .prepare(&id, &identity, u64::MAX, "bash", &args, true, None)
             .await
             .unwrap()
         else {
@@ -1080,6 +1094,7 @@ mod tests {
             execution_generation: Some(1),
             tool: "bash".into(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(&json!({})),
+            execution_ceiling: None,
             state: DurableState::CompletedAwaitingAck,
             result: Some(result),
         };
@@ -1112,7 +1127,8 @@ mod tests {
                     1,
                     "bash",
                     &json!({}),
-                    true
+                    true,
+                    None
                 )
                 .await,
             Err(JournalError::TooLarge)
@@ -1136,6 +1152,7 @@ mod tests {
                     "read_file",
                     &json!({"path":"a"}),
                     true,
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -1177,14 +1194,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, true)
+                .prepare(&request_id, &identity, 4, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Active
@@ -1222,7 +1239,7 @@ mod tests {
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 4, "bash", &args, true)
+            .prepare(&request_id, &identity, 4, "bash", &args, true, None)
             .await
             .unwrap();
         drop(journal);
@@ -1237,7 +1254,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1254,7 +1271,7 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, false)
+                .prepare(&request_id, &identity, 4, "bash", &args, false, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1270,7 +1287,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1287,7 +1304,7 @@ mod tests {
         let args = json!({"path":"a"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "read_file", &args, false)
+            .prepare(&request_id, &identity, 1, "read_file", &args, false, None)
             .await
             .unwrap();
         drop(journal);
@@ -1308,7 +1325,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 2, "read_file", &args, true)
+                .prepare(&request_id, &identity, 2, "read_file", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1331,6 +1348,7 @@ mod tests {
                 "read_file",
                 &json!({"path":"a"}),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -1372,6 +1390,7 @@ mod tests {
                 "bash",
                 &json!({"command":"a"}),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -1383,11 +1402,119 @@ mod tests {
                 "bash",
                 &json!({"command":"b"}),
                 true,
+                None,
             )
             .await
             .err()
             .unwrap();
         assert!(matches!(error, JournalError::IdentityConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn redelivery_cannot_change_or_remove_frozen_execution_grant() {
+        use astra_server_types::edge_ws_protocol::EdgeExecutionCeiling;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("grant-fence");
+        let id = identity.storage_key();
+        let grant = EdgeExecutionCeiling {
+            workspace_root: "/selected/workspace".into(),
+            workspace_id: Some("workspace".into()),
+            materialization_id: Some("materialization".into()),
+            execution_binding_generation: 7,
+            runtime_read_paths: vec!["/selected/runtime/codex".into()],
+            workspace_write_allowed: false,
+            network_allowed: false,
+        };
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 1, "native", &json!({}), true, Some(&grant))
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        let mut variants = Vec::new();
+        let mut changed_runtime = grant.clone();
+        changed_runtime
+            .runtime_read_paths
+            .push("/another/runtime".into());
+        variants.push(changed_runtime);
+        let mut changed = grant.clone();
+        changed.workspace_root.push_str("/other");
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.workspace_id = None;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.materialization_id = None;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.execution_binding_generation += 1;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.workspace_write_allowed = true;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.network_allowed = true;
+        variants.push(changed);
+        for changed in &variants {
+            assert!(matches!(
+                journal
+                    .prepare(&id, &identity, 2, "native", &json!({}), true, Some(changed))
+                    .await,
+                Err(JournalError::IdentityConflict { .. })
+            ));
+        }
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 2, "native", &json!({}), true, None)
+                .await,
+            Err(JournalError::IdentityConflict { .. })
+        ));
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 2, "native", &json!({}), true, Some(&grant))
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_recovered_entries_stay_removed_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        for call in ["recovered-0", "recovered-1"] {
+            let identity = identity(call);
+            journal
+                .prepare(
+                    &identity.storage_key(),
+                    &identity,
+                    1,
+                    "bash",
+                    &json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        let pending = journal.pending_results().unwrap();
+        assert_eq!(pending.len(), 2);
+        for result in pending {
+            assert!(!journal.acknowledge(&result.request_id, 2).await.unwrap());
+            assert!(journal.acknowledge(&result.request_id, 1).await.unwrap());
+        }
+        drop(journal);
+        let journal = EdgeInvocationJournal::open(path).await.unwrap();
+        assert_eq!(journal.status().records, 0);
+        assert!(journal.pending_results().unwrap().is_empty());
     }
 
     #[tokio::test]

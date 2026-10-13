@@ -47,6 +47,7 @@ def catalog_page(items: list[dict], *, total: int | None = None, cursor=None) ->
 
 class FakeResponse:
     def __init__(self, payload: dict):
+        self.status = 200
         self.payload = json.dumps(payload).encode()
 
     def __enter__(self):
@@ -66,7 +67,10 @@ class FakeOpener:
 
     def open(self, request, timeout: float):
         self.requests.append((request, timeout))
-        return FakeResponse(next(self.payloads))
+        payload = next(self.payloads)
+        if isinstance(payload, Exception):
+            raise payload
+        return FakeResponse(payload)
 
 
 class PreflightTests(unittest.TestCase):
@@ -221,15 +225,17 @@ class PreflightTests(unittest.TestCase):
         )
         self.assertFalse(ok)
         (ok, detail), _ = self.fetch(
-            [catalog_page([catalog_item("deepseek-v4-flash", capability="none")])]
+            [catalog_page([catalog_item("deepseek-v4-flash", capability="none")]),
+             preflight.urllib.error.HTTPError("http://localhost", 400, "unsupported", {}, None)]
         )
         self.assertFalse(ok)
-        self.assertIn("requested controllable thinking", detail)
+        self.assertIn("model execution admission returned HTTP 400", detail)
         (ok, _), _ = self.fetch(
             [
                 catalog_page(
                     [catalog_item("deepseek-v4-flash", capability="native_only")]
-                )
+                ),
+                preflight.urllib.error.HTTPError("http://localhost", 400, "unsupported", {}, None),
             ]
         )
         self.assertFalse(ok)
@@ -243,13 +249,21 @@ class PreflightTests(unittest.TestCase):
         pages = [
             catalog_page([catalog_item("another-model")], total=2, cursor=cursor),
             catalog_page([catalog_item("deepseek-v4-flash")], total=2),
+            {"slots": [{"model_name":"deepseek-v4-flash", "offering_id":"offer-deepseek-v4-flash",
+                        "reasoning":{"mode":"adaptive", "effort":"high"}}]},
         ]
         (ok, detail), opener = self.fetch(pages)
         self.assertTrue(ok, detail)
-        self.assertEqual(len(opener.requests), 2)
+        self.assertEqual(len(opener.requests), 3)
         self.assertIn(
             "after_offering_id=offer-another-model", opener.requests[1][0].full_url
         )
+        admission = opener.requests[2][0]
+        self.assertEqual(admission.full_url, "http://127.0.0.1:17016/model-access/admit")
+        self.assertEqual(json.loads(admission.data)["slots"], [{
+            "selector":{"kind":"offering_id", "offering_id":"offer-deepseek-v4-flash"},
+            "reasoning":{"mode":"adaptive", "effort":"high"}
+        }])
 
     def test_repeated_catalog_cursor_fails_closed(self):
         cursor = {

@@ -70,6 +70,16 @@ profiles may narrow tools, skills, read-only access and budgets; they cannot
 grant capabilities the parent or provider lacks. Explicit model requirements
 remain authoritative; omitted child model selection inherits the parent binding.
 
+Skills do not introduce reviewer, execution-model or reasoning requirements.
+Independent review follows the user's or configured workflow's requirements;
+ordinary review remains with the current agent. Provider-owned native execution
+does not support the internal first-request output-token ceiling and rejects
+that control before launch rather than silently dropping a required limit.
+Native stages accept text guidance, not structured requests. A shutdown message
+is cooperative guidance, not cancellation authority; queued delivery does not
+prove termination. Hard cancellation remains with the authenticated run/session
+control and its settlement evidence.
+
 Users can inspect child progress, send guidance, pause, resume or cancel, and
 open an exact child transcript without flooding the parent conversation.
 Run identity connects launch, Work attempt, messages and physical provider

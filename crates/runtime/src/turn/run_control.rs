@@ -38,6 +38,12 @@ pub enum UserIntentAdmissionAuthority {
     DurableOwnerGeneration(u64),
 }
 
+#[derive(Clone, Copy)]
+pub struct UserIntentInvocationApplication<'a> {
+    pub identity: &'a astra_turn_types::ToolInvocationIdentity,
+    pub purpose: astra_services::runs::UserIntentApplyPurpose<'a>,
+}
+
 /// Exact decision at one externally metered provider boundary. Only
 /// `Authorized` permits calling the provider; durable-store failures and lost
 /// ownership remain distinguishable from a terminal/inactive run.
@@ -160,6 +166,8 @@ pub struct UserIntentPollIssue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserIntentApplyAck {
     Applied,
+    /// The provider conclusively declined this input; the run remains active.
+    Returned,
     /// Input retains its pending custody until this execution is resumed.
     Paused,
     /// The run terminated before application and durably returned delivery
@@ -335,6 +343,7 @@ pub trait UserIntentProvider: Send + Sync {
         run_id: &str,
         event_indices: &[usize],
         authority: UserIntentAdmissionAuthority,
+        invocation_identity: Option<UserIntentInvocationApplication<'_>>,
     ) -> Result<UserIntentApplyAck, String>;
 }
 

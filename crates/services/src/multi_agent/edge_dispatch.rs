@@ -244,13 +244,14 @@ pub trait EdgeDispatchService: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
-    /// A zero timeout performs one exact durable read without subscribing;
-    /// nonzero timeouts wait for arrival. Neither path treats cache absence as
+    /// Some(zero) performs one exact durable read without subscribing;
+    /// Some(nonzero) bounds the wait; None retains the subscription until
+    /// resolution or caller cancellation. No path treats cache absence as
     /// evidence that a durable result does not exist.
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        timeout: std::time::Duration,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String>;
 
     /// Clean up stale dispatches older than `older_than`.
@@ -1501,13 +1502,13 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(affected)
     }
 
-    #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, timeout_ms = timeout.as_millis()))]
+    #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, timeout_ms = ?timeout.map(|timeout| timeout.as_millis())))]
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        timeout: std::time::Duration,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
-        if timeout.is_zero() {
+        if timeout.is_some_and(|timeout| timeout.is_zero()) {
             if !identity.is_complete() {
                 return Err("edge result read requires complete owner identity".into());
             }
@@ -1542,7 +1543,11 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                     .map_err(|_| "edge_dispatch wait coordinator stopped".to_string())?;
             }
         };
-        match tokio::time::timeout(timeout, wait).await {
+        let result = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, wait).await.map_err(|_| ()),
+            None => Ok(wait.await),
+        };
+        match result {
             Ok(result) => result,
             Err(_) => {
                 tracing::warn!("edge_dispatch: batched wait_result timed out");
@@ -1566,7 +1571,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
              WHERE status IN ('pending', 'dispatched') \
-               AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND)",
+               AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
+               AND NOT EXISTS (SELECT 1 FROM agent_runs r \
+                   WHERE r.user_id = JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')) \
+                     AND r.session_id = edge_pending_dispatch.session_id \
+                     AND r.run_id = edge_pending_dispatch.run_id \
+                     AND r.status IN ('running', 'waiting', 'paused'))",
         )
         .bind(expired_result_json)
         .bind(secs)
@@ -1587,7 +1597,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let deleted = sqlx::query(
             "DELETE FROM edge_pending_dispatch \
              WHERE status IN ('completed', 'failed') \
-               AND COALESCE(completed_at, created_at) <= DATE_SUB(NOW(6), INTERVAL ? SECOND)",
+               AND COALESCE(completed_at, created_at) <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
+               AND NOT EXISTS (SELECT 1 FROM agent_runs r \
+                   WHERE r.user_id = JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')) \
+                     AND r.session_id = edge_pending_dispatch.session_id \
+                     AND r.run_id = edge_pending_dispatch.run_id \
+                     AND r.status IN ('running', 'waiting', 'paused'))",
         )
         .bind(secs)
         .execute(&self.pool)
@@ -1639,7 +1654,7 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     async fn wait_result(
         &self,
         _identity: &EdgeDispatchIdentity,
-        _timeout: std::time::Duration,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
         Err("edge dispatch service not configured".to_string())
     }
@@ -2159,7 +2174,7 @@ mod tests {
         let wait_identity = identity.clone();
         let wait = tokio::spawn(async move {
             pod_a
-                .wait_result(&wait_identity, std::time::Duration::from_secs(5))
+                .wait_result(&wait_identity, Some(std::time::Duration::from_secs(5)))
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2193,7 +2208,7 @@ mod tests {
             .expect("wait_result should observe completed result");
         let fresh_reader = DatabaseEdgeDispatchService::from_shared(&pool);
         let recovered = fresh_reader
-            .wait_result(&identity, std::time::Duration::ZERO)
+            .wait_result(&identity, Some(std::time::Duration::ZERO))
             .await
             .expect("exact read must not require a prior waiter")
             .expect("completed durable row must survive coordinator recreation");
@@ -2207,7 +2222,7 @@ mod tests {
         );
         assert!(
             fresh_reader
-                .wait_result(&other_identity, std::time::Duration::ZERO)
+                .wait_result(&other_identity, Some(std::time::Duration::ZERO))
                 .await
                 .unwrap()
                 .is_none(),

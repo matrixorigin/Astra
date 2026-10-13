@@ -3833,6 +3833,78 @@ mod tests {
     }
 
     #[test]
+    fn source_read_assignment_marker_edits_only_the_secret_value() {
+        let secret = "synthetic-sensitive-value-0123456789";
+        for (prefix, suffix) in [
+            ("export AWS_SECRET_ACCESS_KEY='", "'\nnext=42\n"),
+            ("AWS_SECRET_KEY=", "\nnext=42\n"),
+            (
+                "os.environ[\"AWS_SECRET_ACCESS_KEY\"] = \"",
+                "\"\nnext=42\n",
+            ),
+            ("password = \"", "\";\nnext=42\n"),
+            ("auth_token=", "\nnext=42\n"),
+            ("config['api_key'] = '", "'\nnext=42\n"),
+        ] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("sample.conf");
+            std::fs::write(&path, format!("{prefix}{secret}{suffix}")).unwrap();
+            let read = read_file(root.path(), &serde_json::json!({"path":"sample.conf"}));
+            assert!(!read.is_error && !read.output.contains(secret));
+            let start = read.output.find("[REDACTED:").unwrap();
+            let end = start + read.output[start..].find(']').unwrap() + 1;
+            let marker = read.output[start..end].to_string();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let mut forged = marker.clone();
+            let issuer = forged.rfind(':').unwrap() + 1;
+            let forged_byte = if &forged[issuer..issuer + 1] == "0" {
+                "1"
+            } else {
+                "0"
+            };
+            forged.replace_range(issuer..issuer + 1, forged_byte);
+            let display =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(&raw).0;
+            let rotated = "rotated-sensitive-value-0123456789";
+            for (before, anchor, replace_all) in [
+                (raw.clone(), marker.clone(), true),
+                (raw.clone(), forged, false),
+                (raw.clone(), display, false),
+                (raw.replace(secret, rotated), marker.clone(), false),
+                (format!("{raw}{raw}"), marker.clone(), false),
+            ] {
+                std::fs::write(&path, &before).unwrap();
+                let rejected = str_replace(
+                    root.path(),
+                    &serde_json::json!({
+                        "path":"sample.conf", "old_str":anchor,
+                        "new_str":"<your-service-credential>", "replace_all":replace_all
+                    }),
+                );
+                assert!(rejected.is_error);
+                assert!(!rejected.output.contains(secret) && !rejected.output.contains(rotated));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            }
+            std::fs::write(&path, &raw).unwrap();
+            let result = str_replace(
+                root.path(),
+                &serde_json::json!({
+                    "path":"sample.conf", "old_str":marker,
+                    "new_str":"<your-service-credential>"
+                }),
+            );
+            assert!(
+                !result.is_error,
+                "source-issued value reference must be editable"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{prefix}<your-service-credential>{suffix}")
+            );
+        }
+    }
+
+    #[test]
     fn str_replace_resolved_marker_equal_to_new_text_is_a_noop() {
         let tmp = TempDir::new().unwrap();
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";

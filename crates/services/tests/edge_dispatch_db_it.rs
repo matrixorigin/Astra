@@ -166,7 +166,7 @@ async fn edge_dispatch_full_lifecycle() {
 
     // 6. wait_result returns the result
     let result = svc
-        .wait_result(&identity, std::time::Duration::from_secs(5))
+        .wait_result(&identity, Some(std::time::Duration::from_secs(5)))
         .await
         .expect("wait_result");
     assert!(
@@ -268,7 +268,7 @@ async fn edge_dispatch_batched_wait_converges_across_pods_under_concurrency() {
         let waiter = waiter.clone();
         waits.spawn(async move {
             waiter
-                .wait_result(&identity, std::time::Duration::from_secs(10))
+                .wait_result(&identity, Some(std::time::Duration::from_secs(10)))
                 .await
         });
     }
@@ -429,7 +429,7 @@ async fn edge_dispatch_wait_result_timeout() {
 
     // 200ms timeout — should not be enough to deliver result
     let result = svc
-        .wait_result(&identity, std::time::Duration::from_millis(200))
+        .wait_result(&identity, Some(std::time::Duration::from_millis(200)))
         .await
         .expect("wait_result");
     assert!(result.is_none(), "wait_result should time out (Some=None)");
@@ -526,12 +526,12 @@ async fn edge_dispatch_request_id_is_owner_scoped() {
     assert!(ok_b, "owner B should complete its own dispatch");
 
     let result_a = svc
-        .wait_result(&identity_a, std::time::Duration::from_secs(1))
+        .wait_result(&identity_a, Some(std::time::Duration::from_secs(1)))
         .await
         .expect("wait owner A result")
         .expect("owner A result");
     let result_b = svc
-        .wait_result(&identity_b, std::time::Duration::from_secs(1))
+        .wait_result(&identity_b, Some(std::time::Duration::from_secs(1)))
         .await
         .expect("wait owner B result")
         .expect("owner B result");
@@ -585,10 +585,114 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
 
     // wait_result now returns None (row was deleted)
     let result = svc
-        .wait_result(&identity, std::time::Duration::from_millis(100))
+        .wait_result(&identity, Some(std::time::Duration::from_millis(100)))
         .await
         .expect("wait_result after cleanup");
     assert!(result.is_none(), "request should be gone after cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
+    use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+    require_env();
+    let pool = common::setup_pool().await;
+    let service = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("live-custody-{}", unique_suffix());
+    let mut run = common::collaborator_fixture::record(&user, "cleanup-session", None);
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))")
+        .bind(&user).bind(&run.session_id).execute(pool.get()).await.unwrap();
+    let edge_owner = format!("shared-edge-owner-{}", unique_suffix());
+    let identity = EdgeDispatchIdentity::new(
+        &edge_owner,
+        &run.session_id,
+        &run.run_id,
+        "cleanup-chain",
+        "cleanup-request",
+    );
+    DatabaseRunStateStore::new(pool.clone())
+        .insert_run(run.clone())
+        .await
+        .unwrap();
+    service
+        .admit_and_claim_direct_dispatch(&identity, "cleanup-edge",
+            &serde_json::json!({"identity":{"user_id":user,"session_id":run.session_id,"run_id":run.run_id}}).to_string())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE edge_pending_dispatch SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
+        .bind(&edge_owner).bind(&identity.request_id).execute(pool.get()).await.unwrap();
+    for status in ["running", "waiting", "paused"] {
+        sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+            .bind(status)
+            .bind(&user)
+            .bind(&run.run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        service
+            .cleanup_stale(std::time::Duration::from_secs(86_400))
+            .await
+            .unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
+        )
+        .bind(&edge_owner)
+        .bind(&identity.request_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(status, "dispatched");
+    }
+    assert!(
+        service
+            .deliver_result(&identity, "cleanup-edge", r#"{"output":"done"}"#)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE edge_pending_dispatch SET completed_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) WHERE user_id = ? AND request_id = ?")
+        .bind(&edge_owner).bind(&identity.request_id).execute(pool.get()).await.unwrap();
+    service
+        .cleanup_stale(std::time::Duration::from_secs(86_400))
+        .await
+        .unwrap();
+    assert!(
+        service
+            .wait_result(&identity, Some(std::time::Duration::ZERO))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    run.status = "completed".into();
+    sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+        .bind(&run.status)
+        .bind(&user)
+        .bind(&run.run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    service
+        .cleanup_stale(std::time::Duration::from_secs(86_400))
+        .await
+        .unwrap();
+    assert!(
+        service
+            .wait_result(&identity, Some(std::time::Duration::ZERO))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&user)
+        .bind(&run.run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(&user)
+        .bind(&run.session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -492,6 +492,10 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
     const SESSION: &str = "395d819b-81a7-4cc0-9aa8-3666ec1ac194";
     for admitted in [true, false] {
         let app = Router::new()
+            .route(
+                "/sessions",
+                post(|| async { axum::Json(json!({"session_id": SESSION})) }),
+            )
             .route("/agents/edge", post(|| async { axum::Json(json!({"ok": true})) }))
             .route("/skills", get(|| async { axum::Json(json!({
                 "skills": [], "total": 0, "limit": 100, "next_cursor": null

@@ -467,6 +467,18 @@ pub(crate) async fn handle_chat_input_with_ui(
         return Ok(InteractiveTurnOutcome::NotStarted);
     }
 
+    // Native collaborator capacity is prepared only after the canonical
+    // session/permission attachment exists. The helper is a no-op for
+    // headless callers, and failure is optional capacity rather than a
+    // reason to reject the ordinary Astra turn.
+    crate::cli::edge_lifecycle::native_delivery::ensure_session_native_delivery(
+        state,
+        ctx.api,
+        token,
+        &session_id,
+    )
+    .await;
+
     // Admission is per actual model turn, not per TUI lifetime. Keep this
     // token in scope through retry and Turn/TurnError settlement, then release
     // it so the next interactive turn (or another surface) can proceed.
@@ -577,6 +589,14 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
 
     let session_id =
         ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
+
+    crate::cli::edge_lifecycle::native_delivery::ensure_session_native_delivery(
+        state,
+        ctx.api,
+        token,
+        &session_id,
+    )
+    .await;
 
     let _execution_lease = acquire_interactive_turn_admission(state)?;
 

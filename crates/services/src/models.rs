@@ -5414,10 +5414,16 @@ async fn send_openai_probe_with_timeout(
         .is_some_and(|s| !s.is_empty());
 
     let usage_reasoning = observe_usage_reasoning
-        && json
-            .pointer("/usage/completion_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-            .is_some_and(|tokens| tokens > 0);
+        && [
+            "/usage/completion_tokens_details/reasoning_tokens",
+            "/usage/reasoning_tokens",
+        ]
+        .iter()
+        .any(|path| {
+            json.pointer(path)
+                .and_then(Value::as_u64)
+                .is_some_and(|tokens| tokens > 0)
+        });
     let observed = has_think_tags || has_reasoning_content || usage_reasoning;
     if !observed
         && json

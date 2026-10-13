@@ -127,74 +127,58 @@ pub enum Criterion {
     },
     ExecutionToolSequence {
         tools: Vec<String>,
+        /// When set, the final matched call must have the requested terminal
+        /// outcome. This keeps an ordered name sequence from treating a
+        /// failed boundary call as a successful recovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_ok: Option<bool>,
+        /// Require every next request to be emitted after the preceding
+        /// matched call's terminal receipt. This is needed for recovery
+        /// assertions and intentionally remains optional for parallel work.
+        #[serde(default)]
+        require_settled: bool,
     },
     /// Count direct children in the complete authoritative run tree.
-    ExecutionChildCount {
-        min: u32,
-        max: u32,
-    },
+    ExecutionChildCount { min: u32, max: u32 },
     /// Passes if the tool with `name` appears in the run's
     /// `tools_used` list. Cheapest possible check.
-    ToolCalled {
-        name: String,
-    },
+    ToolCalled { name: String },
 
     /// Passes when the run's exit code equals `code`. Useful for
     /// pinning expected failures.
-    ExitCode {
-        code: i32,
-    },
+    ExitCode { code: i32 },
 
     /// Passes when `astra chat --json` reports the expected terminal state.
-    FinalState {
-        expect: String,
-    },
+    FinalState { expect: String },
 
     /// Passes when the structured interruption kind matches.
-    InterruptionKind {
-        expect: String,
-    },
+    InterruptionKind { expect: String },
 
     /// Passes when a tool result class occurred within the expected count range.
-    ToolResultClassCount {
-        class: String,
-        min: u32,
-        max: u32,
-    },
+    ToolResultClassCount { class: String, min: u32, max: u32 },
 
     /// Passes when the total tool_calls_count is within the range
     /// `min..=max`. Catches runaway loops or under-tool-use.
-    ToolsCountBetween {
-        min: u32,
-        max: u32,
-    },
+    ToolsCountBetween { min: u32, max: u32 },
 
     /// Regex match against the run's stderr. Intended for
     /// observability checks — `^\[diagnostic\]` / `^\[audit\]`.
     /// The regex is compiled per-evaluation; test stays
     /// robust across Rust regex version bumps.
-    StderrMatches {
-        pattern: String,
-    },
+    StderrMatches { pattern: String },
 
     /// Passes when the final assistant text contains `needle`
     /// (case-sensitive substring match). For simple yes/no
     /// checks without pulling in a judger.
-    TextContains {
-        needle: String,
-    },
+    TextContains { needle: String },
 
     /// Passes when the final assistant text does not contain `needle`.
     /// Useful for deterministic stale-topic and provenance-contamination gates.
-    TextNotContains {
-        needle: String,
-    },
+    TextNotContains { needle: String },
 
     /// Passes when the assistant text, after trimming outer whitespace, is
     /// exactly `expected`.
-    TextEquals {
-        expected: String,
-    },
+    TextEquals { expected: String },
 
     /// Parses the complete assistant text as one JSON value and requires the
     /// value at the RFC 6901 JSON pointer to equal `equals`. Markdown fences
@@ -207,17 +191,11 @@ pub enum Criterion {
 
     /// Parses the complete assistant text as JSON and bounds the length of an
     /// array selected by an RFC 6901 JSON pointer.
-    TextJsonArrayCount {
-        path: String,
-        min: u32,
-        max: u32,
-    },
+    TextJsonArrayCount { path: String, min: u32, max: u32 },
 
     /// Requires that an RFC 6901 JSON pointer is absent from the complete
     /// assistant JSON value. A present `null` still counts as present.
-    TextJsonPathAbsent {
-        path: String,
-    },
+    TextJsonPathAbsent { path: String },
 
     /// Validates a generic directed acyclic graph encoded in the complete
     /// assistant JSON value. Node and edge field pointers are relative to
@@ -293,19 +271,13 @@ pub enum Criterion {
     /// rendered diagnostic message. Pair an absence assertion with
     /// `SessionEventCount { event_type: "turn_evaluation", .. }` when a
     /// missing evaluation event must not be mistaken for a healthy turn.
-    JournalTurnEvaluationSignalCount {
-        kind: String,
-        min: u32,
-        max: u32,
-    },
+    JournalTurnEvaluationSignalCount { kind: String, min: u32, max: u32 },
 
     /// Requires the terminal durable turn evaluation to report the requested
     /// product-success verdict. This prevents a harness from certifying a
     /// structurally shaped run whose own runtime evaluator detected unresolved
     /// failures or incomplete work.
-    JournalTurnEvaluationSuccess {
-        equals: bool,
-    },
+    JournalTurnEvaluationSuccess { equals: bool },
 
     /// Requires complete durable session evidence and rejects asynchronous
     /// subsystem failures/degradation recorded during the case.
@@ -347,9 +319,7 @@ pub enum Criterion {
     /// surface. This proves catalog authority at the product boundary; it
     /// intentionally does not inspect child tool surfaces, where an
     /// attempt-bound tool may be valid.
-    JournalTurnToolHidden {
-        name: String,
-    },
+    JournalTurnToolHidden { name: String },
 
     /// Exact number of complete tool-call records in durable turn events.
     /// The optional document/path/equality triplet narrows the count by one
@@ -428,10 +398,7 @@ pub enum Criterion {
     /// advertised by an earlier producer result. This is a structural
     /// provenance assertion over complete durable records; final assistant
     /// text and physical filesystem paths are not evidence.
-    JournalArtifactConsumed {
-        producer: String,
-        consumer: String,
-    },
+    JournalArtifactConsumed { producer: String, consumer: String },
 
     /// Proves that a successful consumer used an exact scalar value emitted
     /// by a prior successful producer. JSON pointers select the producer value
@@ -471,6 +438,11 @@ pub enum Criterion {
         /// order or model prose.
         #[serde(default)]
         min_turns_after_producer: Option<u32>,
+        /// Optional upper bound for the visible-turn distance. Together with
+        /// the minimum this can bind a consumer to the immediately previous
+        /// producer turn without inferring identity from event order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_turns_after_producer: Option<u32>,
     },
 
     /// LLM judger — calls a scoring model with the prompt +
@@ -509,35 +481,25 @@ pub enum Criterion {
     /// Passes when total tokens (prompt + completion) is within range.
     /// Catches token efficiency regressions — a case that used to cost
     /// 500 tokens suddenly costing 5000 means something broke.
-    TokensBetween {
-        min: u64,
-        max: u64,
-    },
+    TokensBetween { min: u64, max: u64 },
 
     /// Passes when wall-clock duration (ms) is within range.
     /// Catches latency regressions and hung subprocesses that
     /// complete just under the timeout.
-    DurationBetween {
-        min_ms: u64,
-        max_ms: u64,
-    },
+    DurationBetween { min_ms: u64, max_ms: u64 },
 
     /// Passes when the tools_used list contains the given names
     /// as an ordered subsequence. Does NOT require exact match —
     /// extra tools between the expected ones are allowed.
     /// Example: `[read_file, str_replace]` passes for
     /// `[bash, read_file, bash, str_replace, bash]`.
-    ToolSequence {
-        tools: Vec<String>,
-    },
+    ToolSequence { tools: Vec<String> },
 
     /// Requires an ordered subsequence in complete durable journal records.
     /// Unlike [`ToolSequence`], this includes server-side and child calls that
     /// the CLI envelope can omit, so it proves lifecycle ordering rather than
     /// merely the client-visible summary.
-    JournalToolSequence {
-        tools: Vec<String>,
-    },
+    JournalToolSequence { tools: Vec<String> },
 
     /// Requires every durable invocation of `successor` to occur only after
     /// `predecessor` has appeared in the same session journal. This is a
@@ -613,10 +575,7 @@ pub enum Criterion {
     /// Passes when the number of LLM round-trips (turns) is within range.
     /// Catches inefficient multi-turn loops where the agent should have
     /// completed in fewer rounds.
-    TurnRoundsBetween {
-        min: u32,
-        max: u32,
-    },
+    TurnRoundsBetween { min: u32, max: u32 },
 
     /// Passes when the tool cache hit rate >= threshold (0.0 to 1.0).
     /// A high cache rate means the agent is efficiently reusing
@@ -699,18 +658,13 @@ pub enum Criterion {
     /// prefix against provider-reported cache reads. It only counts feedback
     /// observations with `provider-prefix-v1`; total request cache reads may
     /// include a growing or provider-evicted conversation history.
-    ProviderStablePrefixCacheCoverage {
-        min: f64,
-        min_observations: u32,
-    },
+    ProviderStablePrefixCacheCoverage { min: f64, min_observations: u32 },
 
     /// Internal hard gate injected when a case declares
     /// `required_cache_scope`. It proves the requested reuse boundary from
     /// canonical primary execution facts rather than model metadata or a soft
     /// cache-quality criterion.
-    PromptCacheReuseScope {
-        scope: PromptCacheReuseScope,
-    },
+    PromptCacheReuseScope { scope: PromptCacheReuseScope },
 
     /// Passes when the session's pipeline alerts matching `rule`
     /// occur at most `max` times.
@@ -734,17 +688,13 @@ pub enum Criterion {
     ///
     /// Use for cases with multiple acceptable high-quality behaviors, such
     /// as "called the requested tool" OR "safely refused a runaway prompt".
-    AnyOf {
-        criteria: Vec<Criterion>,
-    },
+    AnyOf { criteria: Vec<Criterion> },
 
     /// Passes when every nested deterministic criterion passes.
     ///
     /// Useful for making a set of normally-soft metric bounds a hard case
     /// requirement without changing their default severity globally.
-    AllOf {
-        criteria: Vec<Criterion>,
-    },
+    AllOf { criteria: Vec<Criterion> },
 }
 
 fn default_cache_min_calls() -> u32 {
@@ -772,6 +722,9 @@ fn default_cache_read_min_pairs() -> u32 {
 pub enum JournalToolDocument {
     Arguments,
     Result,
+    /// The durable invocation's authenticated run identity. This virtual
+    /// scalar supports cross-turn provenance checks.
+    RunId,
     /// Executor-authored failure evidence for an invocation that did not
     /// produce a successful result. This is intentionally separate from
     /// `Result` so a failed command cannot be mistaken for a successful tool
@@ -1083,9 +1036,35 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
                 .count() as u32;
             Ok(count >= *min && count <= *max)
         }
-        Criterion::ExecutionToolSequence { tools } => {
-            let mut calls = calls.iter().filter(|call| call.run_id == root);
-            Ok(tools.iter().all(|name| calls.any(|call| call.name == name)))
+        Criterion::ExecutionToolSequence {
+            tools,
+            last_ok,
+            require_settled,
+        } => {
+            // Match an ordered subsequence of terminal receipts, rather than
+            // merely proving that every name exists somewhere in the run.
+            // Using the receipt order makes a recovery check cross the actual
+            // failed boundary instead of only the request emission boundary.
+            let mut calls: Vec<_> = calls.iter().filter(|call| call.run_id == root).collect();
+            calls.sort_by_key(|call| call.terminal_seq);
+            let mut calls = calls.into_iter();
+            let mut last_call = None;
+            let mut previous_terminal_seq = None;
+            for (position, name) in tools.iter().enumerate() {
+                let final_call = position + 1 == tools.len();
+                last_call = calls.find(|call| {
+                    call.name == name
+                        && (!*require_settled
+                            || previous_terminal_seq
+                                .is_none_or(|terminal_seq| call.request_seq > terminal_seq))
+                        && (!final_call || last_ok.is_none_or(|expected| call.ok == Some(expected)))
+                });
+                if last_call.is_none() {
+                    return Ok(false);
+                }
+                previous_terminal_seq = last_call.map(|call| call.terminal_seq);
+            }
+            Ok(last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)))
         }
         _ => unreachable!(),
     }
@@ -1603,6 +1582,9 @@ fn journal_tool_document(
         JournalToolDocument::Result => call.result.as_ref(),
         JournalToolDocument::Error => call.error.as_ref(),
         JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
+        // RunId is a virtual scalar handled by the bounded value-flow
+        // evaluator; it has no borrowed JSON document on the call itself.
+        JournalToolDocument::RunId => None,
     }
 }
 
@@ -4295,6 +4277,8 @@ fn evaluate_one_with_primary_cache(
             consumer_paths,
             consumer_filters,
             min_turns_after_producer,
+            max_turns_after_producer,
+            ..
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_value_flow_bound");
@@ -4309,13 +4293,20 @@ fn evaluate_one_with_primary_cache(
                     let consumer_document = journal_tool_document(&call, *consumer_document);
                     let matched_value = consumer_document.and_then(|document| {
                         produced.iter().find(|(value, producer_turn)| {
-                            let turn_separation_ok = min_turns_after_producer.is_none_or(|min| {
+                            let turn_separation_ok = if min_turns_after_producer.is_none()
+                                && max_turns_after_producer.is_none()
+                            {
+                                true
+                            } else {
                                 producer_turn.zip(call.turn).is_some_and(
                                     |(producer_turn, consumer_turn)| {
-                                        consumer_turn >= producer_turn.saturating_add(min)
+                                        let distance = consumer_turn.saturating_sub(producer_turn);
+                                        min_turns_after_producer.is_none_or(|min| distance >= min)
+                                            && max_turns_after_producer
+                                                .is_none_or(|max| distance <= max)
                                     },
                                 )
-                            });
+                            };
                             turn_separation_ok
                                 && consumer_paths.iter().any(|path| {
                                     flow_destinations_at_path(document, path)
@@ -4330,10 +4321,21 @@ fn evaluate_one_with_primary_cache(
                     }
                 }
                 if call.name == *producer && call_matches_predicates(&call, producer_filters) {
-                    let producer_value = journal_tool_document(&call, *producer_document)
-                        .and_then(|document| document.pointer(producer_path));
-                    if let Some(value) = producer_value.filter(|value| is_flow_scalar(value)) {
-                        produced.push((value.clone(), call.turn));
+                    let producer_value = if *producer_document == JournalToolDocument::RunId {
+                        (producer_path.is_empty())
+                            .then(|| {
+                                call.run_id
+                                    .as_deref()
+                                    .map(|run_id| serde_json::Value::String(run_id.to_owned()))
+                            })
+                            .flatten()
+                    } else {
+                        journal_tool_document(&call, *producer_document)
+                            .and_then(|document| document.pointer(producer_path))
+                            .cloned()
+                    };
+                    if let Some(value) = producer_value.filter(is_flow_scalar) {
+                        produced.push((value, call.turn));
                     }
                 }
             }
@@ -5145,7 +5147,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
-        Criterion::ExecutionToolSequence { tools } => {
+        Criterion::ExecutionToolSequence { tools, .. } => {
             if tools.is_empty()
                 || tools.len() > 64
                 || tools
@@ -5463,11 +5465,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
         }
         Criterion::JournalToolValueFlowBound {
             producer,
+            producer_document,
             producer_path,
             producer_filters,
             consumer,
             consumer_paths,
             consumer_filters,
+            min_turns_after_producer,
+            max_turns_after_producer,
             ..
         } => {
             for predicate in producer_filters.iter().chain(consumer_filters) {
@@ -5502,11 +5507,22 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                 .chain(consumer_paths.iter().map(|path| (path, "consumer_paths")))
                 .chain(filter_paths)
             {
-                if path.is_empty() || !path.starts_with('/') {
+                if (path.is_empty() && *producer_document != JournalToolDocument::RunId)
+                    || (!path.is_empty() && !path.starts_with('/'))
+                {
                     return Err(format!(
-                        "JournalToolValueFlowBound.{label} must be a non-empty RFC 6901 JSON pointer; got {path:?}"
+                        "JournalToolValueFlowBound.{label} must be an RFC 6901 JSON pointer; got {path:?}"
                     ));
                 }
+            }
+            if max_turns_after_producer
+                .zip(*min_turns_after_producer)
+                .is_some_and(|(max, min)| max < min)
+            {
+                return Err(
+                    "JournalToolValueFlowBound.max_turns_after_producer must be >= min_turns_after_producer"
+                        .into(),
+                );
             }
             Ok(())
         }
@@ -6442,7 +6458,9 @@ mod tests {
         assert!(check(
             &outcome,
             &Criterion::ExecutionToolSequence {
-                tools: vec!["agent".into()]
+                tools: vec!["agent".into()],
+                last_ok: None,
+                require_settled: false,
             }
         ));
         assert!(!check(
@@ -6642,6 +6660,104 @@ mod tests {
     }
 
     #[test]
+    fn execution_tool_sequence_requires_ordered_subsequence() {
+        let mut capture = crate::execution_capture::tests::tool_capture();
+        let page = capture.transcript.as_mut().unwrap();
+        let request_template = page.items[0].clone();
+        let result_template = page.items[1].clone();
+        let mut terminal = page.items.pop().unwrap();
+        terminal.item_seq = 11;
+        terminal.source_event_id = Some("terminal".into());
+        page.items.clear();
+        for (seq, id, name) in [
+            (1_i64, "catalog-before-1", "model_catalog"),
+            (3_i64, "catalog-before-2", "model_catalog"),
+            (5_i64, "rejected-agent", "agent"),
+            (9_i64, "catalog-after", "model_catalog"),
+        ] {
+            let mut request = request_template.clone();
+            request.item_seq = seq;
+            request.source_event_id = Some(format!("source-{seq}"));
+            request.tool_calls[0].tool_use_id = id.into();
+            request.tool_calls[0].name = name.into();
+            request.tool_calls[0].arguments = "{}".into();
+
+            let mut result = result_template.clone();
+            let result_seq = if seq == 3 { 7 } else { seq + 1 };
+            result.item_seq = result_seq;
+            result.source_event_id = Some(format!("source-{result_seq}"));
+            result.content = "{}".into();
+            let receipt = result.tool_result.as_mut().unwrap();
+            receipt.tool_use_id = id.into();
+            receipt.name = Some(name.into());
+            receipt.status = Some(if seq == 9 { "failed" } else { "completed" }.into());
+            page.items.extend([request, result]);
+        }
+        page.items.push(terminal);
+        capture.run_tree.runs[0].total_tool_calls = 4;
+
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.run_id = Some("root".into());
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(capture);
+        outcome.stream_capture = Some(stream);
+        let criterion = Criterion::ExecutionToolSequence {
+            tools: vec![
+                "model_catalog".into(),
+                "agent".into(),
+                "model_catalog".into(),
+            ],
+            last_ok: Some(true),
+            require_settled: true,
+        };
+        assert!(
+            !evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed,
+            "calls before the boundary must not satisfy the sequence"
+        );
+
+        {
+            let items = &mut outcome
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap()
+                .transcript
+                .as_mut()
+                .unwrap()
+                .items;
+            items[5].tool_result.as_mut().unwrap().status = Some("rejected".into());
+            items[2].item_seq = 7;
+            items[2].source_event_id = Some("source-7".into());
+            items[3].item_seq = 8;
+            items[3].source_event_id = Some("source-8".into());
+            items[3].tool_result.as_mut().unwrap().status = Some("failed".into());
+        }
+        assert!(
+            !evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed,
+            "a failed recovery call must not satisfy last_ok"
+        );
+        outcome
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap()
+            .transcript
+            .as_mut()
+            .unwrap()
+            .items[7]
+            .tool_result
+            .as_mut()
+            .unwrap()
+            .status = Some("completed".into());
+        assert!(evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+    }
+
+    #[test]
     fn shipped_rejection_cases_reject_extra_attempts_with_different_outcomes() {
         for name in [
             "flash_missing_child_model_fail_closed",
@@ -6695,8 +6811,20 @@ mod tests {
                 page.items.extend([request, response]);
                 capture.run_tree.runs[0].total_tool_calls = (page.items.len() / 2) as u32;
             };
-            let before_catalog = capture.clone();
             if name == "flash_rejected_delegation_preserves_parent_tools" {
+                let page = capture.transcript.as_mut().unwrap();
+                page.items[0].tool_calls[0].name = "model_catalog".into();
+                page.items[0].tool_calls[0].arguments = "{}".into();
+                page.items[1].content = r#"{"purpose":"chat"}"#.into();
+                page.items[1].tool_result.as_mut().unwrap().name = Some("model_catalog".into());
+                page.items[1].tool_result.as_mut().unwrap().status = Some("completed".into());
+                append(
+                    &mut capture,
+                    "agent",
+                    r#"{"action":"spawn"}"#,
+                    r#"{"error_kind":"invalid_request","status":"failed"}"#,
+                    "rejected",
+                );
                 append(
                     &mut capture,
                     "model_catalog",
@@ -6728,11 +6856,7 @@ mod tests {
                 {
                     continue;
                 }
-                let mut extra = if extra_name == "model_catalog" {
-                    before_catalog.clone()
-                } else {
-                    baseline.clone()
-                };
+                let mut extra = baseline.clone();
                 append(
                     &mut extra,
                     extra_name,
@@ -6759,22 +6883,6 @@ mod tests {
                     assert!(
                         results.iter().all(|result| result.passed),
                         "recovered discovery: {results:?}"
-                    );
-                    let calls = outcome
-                        .stream_capture
-                        .as_ref()
-                        .unwrap()
-                        .execution
-                        .as_ref()
-                        .unwrap()
-                        .tools("root")
-                        .unwrap();
-                    assert_eq!(
-                        calls
-                            .iter()
-                            .filter(|call| call.name == "model_catalog")
-                            .count(),
-                        2
                     );
                     continue;
                 }
@@ -9546,6 +9654,7 @@ mod tests {
                 },
             ],
             min_turns_after_producer: None,
+            max_turns_after_producer: None,
         };
         let splice_session = mk_session(&[(
             "turn",
@@ -9665,6 +9774,7 @@ mod tests {
                 },
             ],
             min_turns_after_producer: Some(1),
+            max_turns_after_producer: None,
         };
         let producer = call(
             "remember-1",
@@ -9709,6 +9819,98 @@ mod tests {
         assert!(
             result[0].passed,
             "later-turn evidence should satisfy the gate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_id_flow_binds_previous_root_to_the_prior_turn_producer() {
+        let criterion = Criterion::JournalToolValueFlowBound {
+            producer: "agent".into(),
+            producer_document: JournalToolDocument::RunId,
+            producer_path: "".into(),
+            producer_filters: vec![JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: Some(serde_json::json!("spawn")),
+                contains: None,
+            }],
+            consumer: "introspect".into(),
+            consumer_document: JournalToolDocument::Result,
+            consumer_paths: vec!["/run_id".into()],
+            consumer_filters: vec![JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/explain/target".into(),
+                equals: Some(serde_json::json!("previous")),
+                contains: None,
+            }],
+            min_turns_after_producer: Some(1),
+            max_turns_after_producer: Some(1),
+        };
+        let spawn = serde_json::json!({
+            "tool_call_id": "spawn-1",
+            "name": "agent",
+            "ok": true,
+            "args_full": r#"{"action":"spawn"} "#,
+            "result_full": "{}"
+        });
+        let introspect_previous = serde_json::json!({
+            "tool_call_id": "introspect-1",
+            "name": "introspect",
+            "ok": true,
+            "args_full": r#"{"explain":{"target":"previous"}}"#,
+            "result_full": r#"{"run_id":"root-1"}"#
+        });
+        let valid = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 1,
+                    "run_id": "root-1",
+                    "tool_calls": [spawn.clone()]
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "run_id": "root-2",
+                    "tool_calls": [introspect_previous.clone()]
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&valid),
+        );
+        assert!(result[0].passed, "valid previous-root binding: {result:?}");
+
+        let current_turn_spawn = mk_session(&[
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 1,
+                    "run_id": "root-1",
+                    "tool_calls": []
+                }),
+            ),
+            (
+                "turn",
+                serde_json::json!({
+                    "turn": 2,
+                    "run_id": "root-2",
+                    "tool_calls": [spawn, introspect_previous]
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&current_turn_spawn),
+        );
+        assert!(
+            !result[0].passed,
+            "a current-turn spawn cannot certify an unrelated previous root: {result:?}"
         );
     }
 

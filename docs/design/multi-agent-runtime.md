@@ -155,6 +155,13 @@ and the catalog-read contract belong to
 
 ## Result integration
 
+Persistent collaborator continuation currently belongs to acknowledged Codex
+conversations on the selected UserRunner. Each stage has a required admitted
+native locator; a new continuation also requires durable native-session proof.
+First-stage admission and exact source replay do not invent that proof.
+Ordinary internal Astra children retain their existing spawn, messaging,
+cancellation and recovery path, without a persistent native collaborator identity.
+
 Fanout cancellation closes admission, but is not proof that an accepted child
 has stopped. The existing cancellation event records the unassigned slot indexes
 under the admission lock. Recovery settles only those explicitly unassigned

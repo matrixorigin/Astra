@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::sync::{Notify, RwLock, broadcast};
 
-use super::transport::{MailboxSubscription, MessageStream, MessageTransport};
+use super::transport::{
+    MailboxCapabilities, MailboxSubscription, MessageStream, MessageTransport, ResolvedMailbox,
+};
 use super::types::{AgentAddress, AgentMessage, MailboxError};
 
 /// Broadcast channel capacity. Messages beyond this are dropped for slow receivers.
@@ -202,15 +204,16 @@ impl Default for InProcessTransport {
 
 #[async_trait]
 impl MessageTransport for InProcessTransport {
-    async fn register(
+    async fn register_with_capabilities(
         &self,
         addr: AgentAddress,
         delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
     ) -> Result<MailboxSubscription, MailboxError> {
         if self.is_shutdown.load(Ordering::Relaxed) {
             return Err(MailboxError::Transport("transport is shut down".into()));
         }
-        let subscription = MailboxSubscription::new(addr.clone());
+        let subscription = MailboxSubscription::with_capabilities(addr.clone(), capabilities);
         let mut inboxes = self.inboxes.write().await;
         let mut memberships = self.memberships.write().await;
         if let Some(inbox) = inboxes.get(&addr) {
@@ -218,6 +221,15 @@ impl MessageTransport for InProcessTransport {
             if state.attached {
                 return Err(MailboxError::Protocol(format!(
                     "mailbox {addr} already has an owner"
+                )));
+            }
+            if state
+                .last_owner
+                .as_ref()
+                .is_some_and(|owner| owner.capabilities() != capabilities)
+            {
+                return Err(MailboxError::Protocol(format!(
+                    "mailbox {addr} capabilities changed before retirement"
                 )));
             }
         } else if inboxes.len() >= MAX_RETAINED_INBOXES {
@@ -381,12 +393,15 @@ impl MessageTransport for InProcessTransport {
         }))
     }
 
-    async fn resolve_agent(
+    async fn resolve_mailbox(
         &self,
         delegation_id: &str,
         agent_id: &str,
-    ) -> Result<AgentAddress, MailboxError> {
-        self.memberships
+    ) -> Result<ResolvedMailbox, MailboxError> {
+        // Registration holds inboxes before memberships; preserve that order.
+        let inboxes = self.inboxes.read().await;
+        let address = self
+            .memberships
             .read()
             .await
             .iter()
@@ -394,7 +409,21 @@ impl MessageTransport for InProcessTransport {
                 (member_delegation == delegation_id && address.agent_id == agent_id)
                     .then(|| address.clone())
             })
-            .ok_or_else(|| MailboxError::AgentNotFound(AgentAddress::new("", agent_id)))
+            .ok_or_else(|| MailboxError::AgentNotFound(AgentAddress::new("", agent_id)))?;
+        let capabilities = inboxes
+            .get(&address)
+            .and_then(|inbox| {
+                inbox
+                    .state()
+                    .last_owner
+                    .as_ref()
+                    .map(MailboxSubscription::capabilities)
+            })
+            .ok_or_else(|| MailboxError::AgentNotFound(address.clone()))?;
+        Ok(ResolvedMailbox {
+            address,
+            capabilities,
+        })
     }
 
     async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError> {
