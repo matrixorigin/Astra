@@ -16,7 +16,11 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub const TOOL_NAME: &str = "native_codex";
-pub(crate) const FRAME_BYTES: usize = 256 * 1024;
+// Protocol messages contain complete answers and file diffs even when the
+// retained result is only a small preview. Keep that wire budget independent
+// of presentation, with one queued frame for backpressure rather than four
+// full-size copies. The shared process owner still bounds oversized input.
+pub(crate) const FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const OUTPUT_BYTES: usize = 64 * 1024;
 // The canonical interaction contract permits at most one hour per request.
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -548,7 +552,7 @@ async fn verify_installed_protocol(
             command,
             FramedProcessLimits {
                 max_frame_bytes: FRAME_BYTES,
-                max_queued_frames: 4,
+                max_queued_frames: 1,
                 max_stderr_bytes: 4096,
                 // The physical owner covers the whole discovery, not only
                 // handshake/authentication. Each phase remains bounded below.
@@ -1132,7 +1136,7 @@ struct Evidence {
     usage_uncertain: bool,
     session_acknowledged: bool,
     output: String,
-    final_output: Option<String>,
+    output_item_id: Option<String>,
     output_capped: bool,
     /// The provider itself failed a typed capability/readiness contract. The
     /// delivery owner uses this fact to withdraw capacity after publishing
@@ -1317,36 +1321,38 @@ impl Evidence {
                     self.provider_error_class = Some(classify_native_turn_error(&turn["error"]));
                 }
             }
-            "item/agentMessage/delta" => {
+            "item/agentMessage/delta" | "item/completed" => {
                 self.require_scope(params)?;
-                let delta = params
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .ok_or("invalid native message delta")?;
-                let mut keep = delta
+                let complete = method == "item/completed";
+                let (id, text) = if complete {
+                    let item = params.get("item").ok_or("missing native completed item")?;
+                    if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+                        return Ok(());
+                    }
+                    (&item["id"], &item["text"])
+                } else {
+                    (&params["itemId"], &params["delta"])
+                };
+                let id = id
+                    .as_str()
+                    .filter(|id| valid_id(id))
+                    .ok_or("invalid native message item ID")?;
+                let text = text.as_str().ok_or("invalid native message text")?;
+                // A completed item replaces its deltas. A new item replaces
+                // earlier commentary immediately, so failure cannot hide an
+                // already-observed partial answer behind the previous item.
+                if complete || self.output_item_id.as_deref() != Some(id) {
+                    self.output.clear();
+                    self.output_item_id = Some(id.to_owned());
+                }
+                let mut keep = text
                     .len()
                     .min(output_limit.saturating_sub(self.output.len()));
-                while !delta.is_char_boundary(keep) {
+                while !text.is_char_boundary(keep) {
                     keep -= 1;
                 }
-                self.output.push_str(&delta[..keep]);
-                self.output_capped |= keep < delta.len();
-            }
-            "item/completed" => {
-                self.require_scope(params)?;
-                let item = params.get("item").ok_or("missing native completed item")?;
-                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
-                    let text = item
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or("invalid native completed agent message")?;
-                    let mut keep = text.len().min(output_limit);
-                    while !text.is_char_boundary(keep) {
-                        keep -= 1;
-                    }
-                    self.final_output = Some(text[..keep].to_owned());
-                    self.output_capped |= keep < text.len();
-                }
+                self.output.push_str(&text[..keep]);
+                self.output_capped |= keep < text.len();
             }
             "thread/tokenUsage/updated" => {
                 if self.thread.is_none()
@@ -2779,7 +2785,7 @@ impl ToolExecutor {
         };
         let limits = FramedProcessLimits {
             max_frame_bytes: FRAME_BYTES,
-            max_queued_frames: 4,
+            max_queued_frames: 1,
             max_stderr_bytes: 4096,
             timeout,
         };
@@ -2898,10 +2904,7 @@ impl ToolExecutor {
                 provider: astra_services::runs::CollaboratorProvider::Codex,
                 native_session_id: id.clone(),
             });
-        // Delta notifications are progress, not the authoritative final
-        // message. The completed item replaces a possibly truncated progress
-        // buffer while retaining the same byte/UTF-8 budget.
-        let mut output = evidence.final_output.take().unwrap_or(evidence.output);
+        let mut output = evidence.output;
         if is_error {
             if !output.is_empty() {
                 output.push('\n');

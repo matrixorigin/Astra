@@ -1547,7 +1547,7 @@ fn output_is_utf8_bounded_and_not_terminal_evidence() {
     evidence
         .notification(
             "item/agentMessage/delta",
-            &json!({"threadId": "thread", "turnId": "turn", "delta": "你好completed"}),
+            &json!({"threadId": "thread", "turnId": "turn", "itemId": "answer", "delta": "你好completed"}),
             4,
         )
         .unwrap();
@@ -1562,7 +1562,7 @@ fn completed_agent_message_is_authoritative_over_truncated_progress() {
     evidence
         .notification(
             "item/agentMessage/delta",
-            &json!({"threadId": "thread", "turnId": "turn", "delta": "x".repeat(OUTPUT_BYTES + 1)}),
+            &json!({"threadId": "thread", "turnId": "turn", "itemId": "answer", "delta": "x".repeat(OUTPUT_BYTES + 1)}),
             OUTPUT_BYTES,
         )
         .unwrap();
@@ -1577,8 +1577,32 @@ fn completed_agent_message_is_authoritative_over_truncated_progress() {
             OUTPUT_BYTES,
         )
         .unwrap();
-    assert_eq!(evidence.final_output.as_deref(), Some("final answer"));
+    assert_eq!(evidence.output, "final answer");
     assert!(evidence.output_capped);
+    for delta in ["新", "答案"] {
+        evidence
+            .notification(
+                "item/agentMessage/delta",
+                &json!({"threadId": "thread", "turnId": "turn", "itemId": "next", "delta": delta}),
+                OUTPUT_BYTES,
+            )
+            .unwrap();
+    }
+    assert_eq!(evidence.output, "新答案");
+    assert!(evidence.terminal.is_none());
+    assert!(
+        evidence
+            .notification(
+                "item/agentMessage/delta",
+                &json!({"threadId": "thread", "turnId": "turn", "delta": "unbound text"}),
+                OUTPUT_BYTES,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        evidence.output, "新答案",
+        "invalid identity must not replace observed text"
+    );
 }
 
 #[test]
@@ -1724,20 +1748,6 @@ async fn live_native_configuration_suppresses_trusted_hooks_and_notifications() 
     );
     assert!(std::env::var_os("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN").is_some());
     let server = MockServer::start().await;
-    let body = [
-        json!({"type":"response.created","response":{"id":"synthetic"}}),
-        json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"message","content":[{"type":"output_text","text":"Synthetic boundary result."}]}}),
-        json!({"type":"response.completed","response":{"id":"synthetic","usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}}}),
-    ].iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body),
-        )
-        .expect(6)
-        .mount(&server)
-        .await;
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path().join("workspace");
     let config_home = directory.path().join("client");
@@ -1784,6 +1794,29 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
     .into_iter()
     .enumerate()
     {
+        // The positive legacy-notify control passes the answer as one argv
+        // entry; Linux's per-argument limit is not a protocol frame limit.
+        // Exercise large frames on the actual admitted configuration (which
+        // disables notify), including both start and retained-thread resume.
+        let answer = if disable {
+            "界".repeat(128_000)
+        } else {
+            "Synthetic boundary result.".to_owned()
+        };
+        let body = [
+            json!({"type":"response.created","response":{"id":"synthetic"}}),
+            json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"message","content":[{"type":"output_text","text":answer}]}}),
+            json!({"type":"response.completed","response":{"id":"synthetic","usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}}}),
+        ].iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
+        let _response = Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
         // The first stage authorizes configured live search. Every later
         // stage, including resume of that history, denies hosted networking.
         let profile = permission_profile(
@@ -1822,7 +1855,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 FramedProcessLimits {
                     timeout: Some(Duration::from_secs(15)),
                     max_frame_bytes: FRAME_BYTES,
-                    max_queued_frames: 4,
+                    max_queued_frames: 1,
                     max_stderr_bytes: 4096,
                 },
                 cancel.clone(),
@@ -1962,7 +1995,15 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
         let settlement = outcome.settlement.unwrap();
         assert!(settlement.ownership.is_authoritative());
         proof
-            .expect("bounded native automatic-command control")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "native control {index}: {error:?}; terminal={:?}, bytes={}, hook={}, notify={}",
+                    evidence.terminal,
+                    evidence.output.len(),
+                    hook_marker.exists(),
+                    notify_marker.exists()
+                )
+            })
             .unwrap();
         assert!(matches!(outcome.end, FramedProcessEnd::Exited));
         assert!(outcome.status.unwrap().success());
@@ -1982,10 +2023,13 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
             "diagnostic control disable={disable} resume={resume}: {stderr}"
         );
         assert_eq!(evidence.terminal.as_deref(), Some("completed"));
-        assert_eq!(
-            evidence.final_output.as_deref(),
-            Some("Synthetic boundary result.")
-        );
+        let expected = if disable {
+            "界".repeat(OUTPUT_BYTES / 3)
+        } else {
+            answer
+        };
+        assert_eq!(evidence.output, expected);
+        assert_eq!(evidence.output_capped, disable);
         assert_eq!(
             hook_marker.exists(),
             !disable && !diagnostic,
@@ -2078,7 +2122,7 @@ for line in sys.stdin:
                 command,
                 FramedProcessLimits {
                     max_frame_bytes: FRAME_BYTES,
-                    max_queued_frames: 4,
+                    max_queued_frames: 1,
                     max_stderr_bytes: 4096,
                     timeout: Some(Duration::from_secs(15)),
                 },
@@ -2277,7 +2321,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
             command,
             FramedProcessLimits {
                 max_frame_bytes: FRAME_BYTES,
-                max_queued_frames: 4,
+                max_queued_frames: 1,
                 max_stderr_bytes: 4096,
                 timeout: Some(Duration::from_secs(40)),
             },
@@ -2979,7 +3023,7 @@ mod transport {
                 command,
                 FramedProcessLimits {
                     max_frame_bytes: FRAME_BYTES,
-                    max_queued_frames: 4,
+                    max_queued_frames: 1,
                     max_stderr_bytes: 128,
                     timeout: None,
                 },
@@ -3501,7 +3545,7 @@ if ready:
         let script = format!(
             "{PREFIX}{}",
             r#"
-emit({'method':'item/agentMessage/delta','params':{'threadId':'thread','turnId':'turn','delta':'review complete'}})
+emit({'method':'item/agentMessage/delta','params':{'threadId':'thread','turnId':'turn','itemId':'answer','delta':'review complete'}})
 emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
 emit({'id':3,'result':{'turn':{'id':'turn','status':'inProgress'}}})
 for line in sys.stdin: pass
@@ -3847,7 +3891,7 @@ usage(150,20,170)
 steer=recv()
 assert steer['method']=='turn/steer'
 emit({'id':steer['id'],'result':{'turnId':'turn'}})
-emit({'method':'item/agentMessage/delta','params':{'threadId':'thread','turnId':'turn','delta':'still working'}})
+emit({'method':'item/agentMessage/delta','params':{'threadId':'thread','turnId':'turn','itemId':'answer','delta':'still working'}})
 emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'turn','status':'completed'}}})
 for line in sys.stdin: assert json.loads(line).get('method')!='turn/interrupt'
 "#

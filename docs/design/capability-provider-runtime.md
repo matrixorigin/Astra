@@ -794,6 +794,14 @@ or unknown error codes and lost/timed-out ACKs leave delivery unknown, disable
 further steering for that stage, and do not interrupt a healthy task. Malformed
 frames or conflicting request/turn identities use ordinary protocol cleanup.
 
+The native JSON-RPC envelope budget is independent of the retained answer:
+up to 4 MiB per frame with one queued frame; the presentation remains at most
+64 KiB (or the admitted smaller limit). Complete answers and file diffs can be
+larger than their presentation without turning a normal task into transport
+failure. Frames beyond the wire budget still fail closed. One item-identified
+message buffer replaces completed commentary with the next answer's deltas;
+failure preserves that latest partial answer rather than an older completed item.
+
 Native execution intersects the admitted write ceiling with local read-only
 restrictions before choosing workspace ownership. Enforced read-only stages can
 read the live workspace while another owner writes; this does not establish a

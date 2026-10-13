@@ -3229,7 +3229,8 @@ scenario = request["params"]["input"][0]["text"]
 cause = "usageLimitExceeded" if scenario == "quota_failed" else {"responseStreamDisconnected": {"httpStatusCode": 503}}
 if scenario == "retry_completed":
     emit({"method": "error", "params": {"threadId": "edge-thread", "turnId": "edge-turn", "willRetry": True, "error": {"message": "synthetic-private-detail", "codexErrorInfo": "usageLimitExceeded"}}})
-emit({"method": "item/agentMessage/delta", "params": {"threadId": "edge-thread", "turnId": "edge-turn", "delta": "NATIVE_EDGE_SUCCESS"}})
+emit({"method": "item/completed", "params": {"threadId": "edge-thread", "turnId": "edge-turn", "item": {"type": "agentMessage", "id": "commentary", "phase": "commentary", "text": "Earlier progress, not the answer"}}})
+emit({"method": "item/agentMessage/delta", "params": {"threadId": "edge-thread", "turnId": "edge-turn", "itemId": "answer", "delta": "NATIVE_EDGE_SUCCESS"}})
 turn = {"id": "edge-turn", "status": "completed"}
 if scenario in ("quota_failed", "connection_failed"):
     turn.update(status="failed", error={"codexErrorInfo": cause, "message": "synthetic-private-detail", "additionalDetails": "synthetic-private-detail"})
