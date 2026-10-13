@@ -66,7 +66,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                                 "run_index": 0, "outcome": outcome,
                                 "failure_class": {"InfraProviderError": {"provider": "sentinel-secret"}},
                                 "criteria": [{"criterion": {"type": "text_contains", "needle": "sentinel-secret"},
-                                              "passed": False, "message": "sentinel-secret"}]}]}
+                                              "passed": False, "severity": "hard", "score": None,
+                                              "detail": "sentinel-secret", "full_detail": "sentinel-secret"}]}]}
             (root / "harness/report.json").write_text(json.dumps(report))
             result = self.run_block("Publish safe result summary", root, **env)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -75,7 +76,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             row = json.loads(safe)["runs"][0]
             self.assertEqual(row["status"], "failed")
             self.assertEqual(row["failure_class"], "InfraProviderError")
-            self.assertEqual(row["criteria"], [{"type": "text_contains", "passed": False}])
+            self.assertEqual(row["criteria"], [{"type": "text_contains", "passed": False,
+                                                "severity": "hard", "score": None, "evaluation": "reported"}])
             self.assertEqual(row["terminal_reported"]["cached_input_tokens"], 7)
             self.assertIsNone(row["token_usage_coverage"])
 
@@ -107,3 +109,103 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             diagnostic = json.loads((root / "harness/diagnostic.json").read_text())
             self.assertIsNone(diagnostic["model_registered"])
             self.assertIsNone(diagnostic["model_active"])
+
+    def test_root_and_step_judgment_evidence(self):
+        metrics = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count",
+                   "prompt_tokens", "cached_input_tokens", "cache_creation_tokens", "completion_tokens")
+        outcome = {**dict.fromkeys(metrics, 0), "exit_code": 0, "text": "private-sentinel"}
+        def criterion(kind, passed, score, severity):
+            return {"criterion": {"type": kind, "question": "private-sentinel"},
+                    "passed": passed, "score": score, "severity": severity,
+                    "detail": "private-sentinel", "full_detail": "private-sentinel"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "harness").mkdir()
+            criteria = [criterion("judger", True, None, "quality"),
+                        criterion("hard_judger", False, None, "hard"),
+                        criterion("judger", True, 1.0, "quality"),
+                        criterion("hard_judger", False, 0.0, "hard"),
+                        criterion("duration_between", False, None, "soft")]
+            report = {"runs": [{"case_name": "multi_turn", "status": "failed", "run_index": 0,
+                                "outcome": outcome, "criteria": criteria[:1],
+                                "steps": [{"step_index": 0, "passed": False, "criteria": criteria,
+                                           "prompt": "private-sentinel", "outcome": outcome},
+                                          {"step_index": 1, "passed": False, "prompt": "private-sentinel"}]}]}
+            report_file = root / "harness/report.json"
+            report_file.write_text(json.dumps(report))
+            env = {"GITHUB_STEP_SUMMARY": str(root / "job-summary"), "GITHUB_SHA": "a" * 40}
+            result = self.run_block("Publish safe result summary", root, **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            safe = (root / "harness/summary.json").read_text()
+            self.assertNotIn("private-sentinel", safe + (root / "job-summary").read_text())
+            row = json.loads(safe)["runs"][0]
+            self.assertIsNone(row["criteria"][0]["passed"])
+            self.assertEqual(row["criteria"][0]["evaluation"], "unscored")
+            step = row["steps"][0]
+            self.assertFalse(step["passed"])
+            self.assertEqual(step["step_index"], 0)
+            self.assertIsNone(step["criteria"][1]["passed"])
+            self.assertEqual(step["criteria"][2]["score"], 1.0)
+            self.assertTrue(step["criteria"][2]["passed"])
+            self.assertEqual(step["criteria"][3]["evaluation"], "scored")
+            self.assertFalse(step["criteria"][3]["passed"])
+            self.assertEqual(step["criteria"][4]["severity"], "soft")
+            self.assertEqual(row["steps"][1], {"step_index": 1, "passed": False, "criteria": []})
+            # Invalid retained fields must fail before a safe artifact is written.
+            for field, invalid in [("score", True), ("score", float("nan")),
+                                   ("score", "private-sentinel"), ("passed", "private-sentinel"),
+                                   ("severity", "private-sentinel")]:
+                with self.subTest(field=field, invalid=invalid):
+                    (root / "harness/summary.json").unlink(missing_ok=True)
+                    bad = json.loads(json.dumps(report))
+                    bad["runs"][0]["criteria"][0][field] = invalid
+                    report_file.write_text(json.dumps(bad))
+                    result = self.run_block("Publish safe result summary", root, **env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("private-sentinel", result.stderr)
+                    self.assertFalse((root / "harness/summary.json").exists())
+            for field in ("criteria", "steps"):
+                for invalid in ({}, "", None):
+                    with self.subTest(field=field, collection=invalid):
+                        bad = json.loads(json.dumps(report))
+                        bad["runs"][0][field] = invalid
+                        report_file.write_text(json.dumps(bad))
+                        result = self.run_block("Publish safe result summary", root, **env)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse((root / "harness/summary.json").exists())
+            bad = json.loads(json.dumps(report))
+            bad["runs"][0]["steps"][0]["criteria"] = {}
+            report_file.write_text(json.dumps(bad))
+            result = self.run_block("Publish safe result summary", root, **env)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_live_command_enables_grading_and_passes_filter_literally(self):
+        section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
+        script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "harness").mkdir()
+            binaries = root / "target/debug"
+            binaries.mkdir(parents=True)
+            for name in ("astra", "astra-server"):
+                (binaries / name).touch()
+            stub = binaries / "astra-test"
+            stub.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
+                            "Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n"
+                            "Path(sys.argv[sys.argv.index('--report-file')+1]).write_text('{}')\n")
+            stub.chmod(0o700)
+            git = root / "git"
+            git.write_text("#!/bin/sh\nexec tar -cf - --files-from /dev/null\n")
+            git.chmod(0o700)
+            filter_value = "hello* $(touch unexpected)"
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                                    env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                         "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
+                                         "CASE_FILTER": filter_value, "CASE_RUNS": "1"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = json.loads((root / "argv.json").read_text())
+            self.assertNotIn("--no-judger", args)
+            self.assertEqual(args[args.index("--judger-model") + 1], "glm-5.3")
+            self.assertEqual(args[args.index("--filter") + 1], filter_value)
+            self.assertFalse((root / "unexpected").exists())

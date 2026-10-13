@@ -205,15 +205,18 @@ not filenames. No match, unavailable cases and failed cases are not passes.
 The registered model uses the local GLM-5.3 deployment's declared
 `reasoning_effort` protocol, 128,000-token context and 84,000-token output
 ceiling. Prices are deliberately omitted: supply deployment pricing separately
-before making monetary comparisons. Optional LLM grading is disabled; mandatory
-hard judgers still run, using GLM-5.3 unless a criterion explicitly selects
-another model. Cases requiring
-other models, external clients or special policy need those capabilities and
+before making monetary comparisons. Both advisory and required LLM graders run,
+using GLM-5.3 unless a criterion explicitly selects another model. Grading adds
+provider calls and cost; a same-model judge is not independent quality evidence.
+Cases requiring other models, external clients or special policy need those capabilities and
 must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
 these runs do not certify production embedding quality.
 
 The job summary and seven-day artifact contain per-case status, timing,
-terminal-reported token/cache counters and binary hashes. These counters are
+terminal-reported token/cache counters, binary hashes and root/step criterion
+results with severity and scores. A judge without a score is explicitly
+`unscored`, with `passed: null`, not a successful evaluation; non-judge booleans
+remain reported harness results, not a new execution certificate. These counters are
 not complete task-tree cost or certified cache ratios; consult usage coverage,
 and never interpret missing evidence as zero. Provider credentials are written
 only into a private temporary model file and removed during cleanup. Raw

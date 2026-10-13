@@ -132,7 +132,7 @@ jobs:
             --suite "$GITHUB_WORKSPACE/crates/astra-test-harness/cases" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
             --filter "$CASE_FILTER" --force-model glm-5.3 \
-            --judger-model glm-5.3 --no-judger --parallel 1 --runs "$CASE_RUNS" \
+            --judger-model glm-5.3 --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json" \
             > "$RUNNER_TEMP/harness/harness.log" 2>&1
 
@@ -189,22 +189,53 @@ jobs:
                   out.write("Harness did not produce a report. Check the failed setup/run step; this is not a pass.\n")
               # Report persistence is only a warning in astra-test; this CI gate must fail closed.
               raise SystemExit(1)
-          report = json.loads((root / "report.json").read_text())
+          import math
+
+          def safe_criteria(criteria):
+              if not isinstance(criteria, list):
+                  raise ValueError("invalid criteria collection")
+              projected = []
+              for c in criteria:
+                  kind, severity, score = c["criterion"]["type"], c["severity"], c.get("score")
+                  if (not isinstance(kind, str) or severity not in ("hard", "soft", "quality")
+                      or type(c["passed"]) is not bool
+                      or (score is not None and (type(score) not in (int, float) or not math.isfinite(score)))):
+                      raise ValueError("invalid criterion fields")
+                  judge = kind in ("judger", "hard_judger")
+                  projected.append({"type": kind, "severity": severity, "score": score,
+                                    "passed": None if judge and score is None else c["passed"],
+                                    "evaluation": ("unscored" if score is None else "scored") if judge else "reported"})
+              return projected
+
           # Do not upload arbitrary provider responses, prompts, stderr or session archives.
           metrics = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count",
                      "prompt_tokens", "cached_input_tokens", "cache_creation_tokens", "completion_tokens")
-          rows = []
-          for r in report["runs"]:
-              failure = r.get("failure_class")
-              # Externally tagged Rust enum: retain the variant, never the provider payload.
-              if isinstance(failure, dict):
-                  failure = next(iter(failure))
-              rows.append({"case": r["case_name"], "status": r["status"], "run_index": r["run_index"],
-                           "failure_class": failure, "exit_code": r["outcome"]["exit_code"],
-                           "criteria": [{"type": c["criterion"]["type"], "passed": c["passed"]}
-                                        for c in r.get("criteria", [])],
-                           "token_usage_coverage": r["outcome"].get("token_usage_coverage"),
-                           "terminal_reported": {k: r["outcome"][k] for k in metrics}})
+          try:
+              report = json.loads((root / "report.json").read_text())
+              if not isinstance(report, dict) or not isinstance(report.get("runs"), list):
+                  raise ValueError("invalid run collection")
+              rows = []
+              for r in report["runs"]:
+                  failure = r.get("failure_class")
+                  # Externally tagged Rust enum: retain the variant, never the provider payload.
+                  if isinstance(failure, dict):
+                      failure = next(iter(failure))
+                  steps = []
+                  raw_steps = r.get("steps", [])
+                  if not isinstance(raw_steps, list):
+                      raise ValueError("invalid step collection")
+                  for step in raw_steps:
+                      if type(step["step_index"]) is not int or step["step_index"] < 0 or type(step["passed"]) is not bool:
+                          raise ValueError("invalid step fields")
+                      steps.append({"step_index": step["step_index"], "passed": step["passed"],
+                                    "criteria": safe_criteria(step.get("criteria", []))})
+                  rows.append({"case": r["case_name"], "status": r["status"], "run_index": r["run_index"],
+                               "failure_class": failure, "exit_code": r["outcome"]["exit_code"],
+                               "criteria": safe_criteria(r.get("criteria", [])), "steps": steps,
+                               "token_usage_coverage": r["outcome"].get("token_usage_coverage"),
+                               "terminal_reported": {k: r["outcome"][k] for k in metrics}})
+          except (ValueError, KeyError, TypeError, OverflowError):
+              raise SystemExit("Invalid harness report; safe summary was not published") from None
           summary = {"commit": os.environ["GITHUB_SHA"], "model": "glm-5.3", "runs": rows,
                      "wall_time_ms": report.get("wall_time_ms"),
                      "accounting": "Terminal counters, not certified complete task-tree cost; absent cache coverage is unknown."}
