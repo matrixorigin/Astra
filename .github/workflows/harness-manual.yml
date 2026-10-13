@@ -1,0 +1,239 @@
+name: Harness (manual GLM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Case-name glob (hello* by default; * runs the whole live suite and costs more)"
+        required: true
+        default: "hello*"
+        type: string
+      runs:
+        description: "Repetitions per case"
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      SQLX_OFFLINE: "true"
+      ASTRA_CONFIG_SOURCE: explicit-env
+      ASTRA_EXPECTED_BUILD_GIT_SHA: ${{ github.sha }}
+      ASTRA_BUILD_SOURCE_GIT_SHA: ${{ github.sha }}
+      ASTRA_BUILD_SOURCE_GIT_DIRTY: "false"
+      ASTRA_API_URL: http://127.0.0.1:17001
+      ASTRA_API_HOST: 127.0.0.1
+      ASTRA_API_PORT: "17001"
+      MATRIXONE_HOST: 127.0.0.1
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      ASTRA_DATABASE: astra_harness
+      ASTRA_AUTO_CREATE_DATABASE: "1"
+      ASTRA_JWT_SECRET: ci-harness-jwt-secret-at-least-32-chars
+      ASTRA_TOKEN_ENCRYPTION_KEY: ci-harness-encryption-key-at-least-32-chars
+      ASTRA_RUNTIME_ROOT_SECRET: ci-harness-runtime-secret-at-least-32-chars
+      ASTRA_BCRYPT_COST: "4"
+      MEMORIA_BASE_URL: http://127.0.0.1:8100
+      MEMORIA_MASTER_KEY: ci-harness-memory-master-key
+      MEMORIA_SELF_HOSTED_MASTER_ACCESS: "1"
+      MEMORIA_EMBEDDING_PROVIDER: mock
+      MEMORIA_EMBEDDING_DIM: "384"
+      NO_PROXY: localhost,127.0.0.1,::1
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate secrets and prepare private model file
+        env:
+          GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
+          GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          url = os.environ["GLM_BASE_URL"].strip()
+          key = os.environ["GLM_API_KEY"].strip()
+          if not url or not key:
+              raise SystemExit("Configure HARNESS_GLM_BASE_URL and HARNESS_GLM_API_KEY repository secrets")
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+              raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
+          root = Path(os.environ["RUNNER_TEMP"]) / "harness"
+          root.mkdir(mode=0o700)
+          model = {"name": "glm-5.3", "provider": "openai", "base_url": url,
+                   "api_key": key, "thinking_protocol": "reasoning_effort",
+                   "context_window": 128000, "max_completion_tokens": 84000,
+                   "supported_parameters": ["tools"], "tags": ["code", "chat", "reasoning"]}
+          # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
+          with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
+              json.dump([model], out)
+          Path(".env").touch()
+          PY
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-harness
+          install-nextest: false
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build current Server, CLI and harness
+        run: |
+          cargo build --locked -p astra-runtime --bin astra-server
+          cargo build --locked -p astra-cli --bin astra
+          cargo build --locked -p astra-test-harness --bin astra-test
+
+      - name: Start disposable dependencies and candidate Server
+        timeout-minutes: 15
+        env:
+          BUILD_MODE: debug
+          SKIP_BUILD: "1"
+          API_START_TIMEOUT_SECONDS: "600"
+        run: |
+          make dev-deps-up dev-deps-wait
+          make dev-api-start-debug
+
+      - name: Register model through the normal admin flow
+        id: seed
+        timeout-minutes: 10
+        run: |
+          ./target/debug/astra admin register --username admin --password 11111111 --email admin@example.test
+          ./target/debug/astra admin login --username admin --password 11111111
+          # Loading already probes connectivity. Keep arbitrary provider diagnostics private;
+          # harness preflight verifies the active model before executing any case.
+          ./target/debug/astra admin model load "$RUNNER_TEMP/harness/models.yaml" --update-existing \
+            > "$RUNNER_TEMP/harness/model-load.log" 2>&1
+          rm -f "$RUNNER_TEMP/harness/models.yaml"
+
+      - name: Run real harness
+        id: harness
+        timeout-minutes: 60
+        env:
+          CASE_FILTER: ${{ inputs.filter }}
+          CASE_RUNS: ${{ inputs.runs }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/harness/workspace"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/harness/workspace"
+          sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
+          ./target/debug/astra-test \
+            --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
+            --suite "$GITHUB_WORKSPACE/crates/astra-test-harness/cases" \
+            --working-dir "$RUNNER_TEMP/harness/workspace" \
+            --filter "$CASE_FILTER" --force-model glm-5.3 \
+            --judger-model glm-5.3 --no-judger --parallel 1 --runs "$CASE_RUNS" \
+            --report-file "$RUNNER_TEMP/harness/report.json" \
+            > "$RUNNER_TEMP/harness/harness.log" 2>&1
+
+      - name: Diagnose failure without exposing provider responses
+        if: ${{ failure() }}
+        timeout-minutes: 2
+        env:
+          MODEL_LOAD_OUTCOME: ${{ steps.seed.outcome }}
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/harness"
+          health_status=$(curl --noproxy '*' --connect-timeout 2 --max-time 5 \
+            -s -o /dev/null -w '%{http_code}' "$ASTRA_API_URL/ready") || health_status=000
+          model_status=127
+          if [ -x ./target/debug/astra ]; then
+            model_status=0
+            timeout 30 ./target/debug/astra admin model show glm-5.3 \
+              > "$RUNNER_TEMP/harness/model-status.json" \
+              2> "$RUNNER_TEMP/harness/model-status.log" || model_status=$?
+          fi
+          export DIAGNOSTIC_HEALTH_STATUS="$health_status" DIAGNOSTIC_MODEL_EXIT="$model_status"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "harness"
+          model = {}
+          try:
+              model = json.loads((root / "model-status.json").read_text())
+          except (OSError, ValueError):
+              pass
+          if not isinstance(model, dict):
+              model = {}
+          diagnostic = {"server_readiness_http_status": int(os.environ["DIAGNOSTIC_HEALTH_STATUS"]),
+                        "model_lookup_exit_code": int(os.environ["DIAGNOSTIC_MODEL_EXIT"]),
+                        "model_registered": bool(model["model_id"]) if "model_id" in model else None,
+                        "model_active": model.get("is_active") if isinstance(model.get("is_active"), bool) else None,
+                        "model_load_step": os.environ["MODEL_LOAD_OUTCOME"],
+                        "harness_step": os.environ["HARNESS_OUTCOME"]}
+          text = json.dumps(diagnostic, indent=2) + "\n"
+          (root / "diagnostic.json").write_text(text)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
+              out.write("## Safe failure diagnostics\n\n```json\n" + text + "```\n")
+          PY
+
+      - name: Publish safe result summary
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "harness"
+          if not (root / "report.json").is_file():
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
+                  out.write("Harness did not produce a report. Check the failed setup/run step; this is not a pass.\n")
+              # Report persistence is only a warning in astra-test; this CI gate must fail closed.
+              raise SystemExit(1)
+          report = json.loads((root / "report.json").read_text())
+          # Do not upload arbitrary provider responses, prompts, stderr or session archives.
+          metrics = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count",
+                     "prompt_tokens", "cached_input_tokens", "cache_creation_tokens", "completion_tokens")
+          rows = []
+          for r in report["runs"]:
+              failure = r.get("failure_class")
+              # Externally tagged Rust enum: retain the variant, never the provider payload.
+              if isinstance(failure, dict):
+                  failure = next(iter(failure))
+              rows.append({"case": r["case_name"], "status": r["status"], "run_index": r["run_index"],
+                           "failure_class": failure, "exit_code": r["outcome"]["exit_code"],
+                           "criteria": [{"type": c["criterion"]["type"], "passed": c["passed"]}
+                                        for c in r.get("criteria", [])],
+                           "token_usage_coverage": r["outcome"].get("token_usage_coverage"),
+                           "terminal_reported": {k: r["outcome"][k] for k in metrics}})
+          summary = {"commit": os.environ["GITHUB_SHA"], "model": "glm-5.3", "runs": rows,
+                     "wall_time_ms": report.get("wall_time_ms"),
+                     "accounting": "Terminal counters, not certified complete task-tree cost; absent cache coverage is unknown."}
+          (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
+              out.write("## GLM-5.3 harness\n\n" + str(len(rows)) + " case runs; " +
+                        str(sum(r["status"] == "passed" for r in rows)) + " passed.\n\n")
+              out.write("See summary.json for terminal-reported timing/token/cache counters. Missing coverage is not zero.\n")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: harness-glm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/harness/summary.json
+            ${{ runner.temp }}/harness/binaries.sha256
+            ${{ runner.temp }}/harness/diagnostic.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop owned services and remove private model file
+        if: ${{ always() }}
+        timeout-minutes: 5
+        run: |
+          rm -f "$RUNNER_TEMP/harness/models.yaml"
+          cleanup_status=0
+          make dev-api-stop || cleanup_status=1
+          if [ -f .env ]; then
+            make dev-deps-down || cleanup_status=1
+          fi
+          exit "$cleanup_status"

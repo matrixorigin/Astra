@@ -182,6 +182,47 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 ## Quick start
 
+### Manual GitHub Actions run
+
+The **Harness (manual GLM)** workflow builds the selected Git revision's
+Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
+then runs the existing YAML cases against GLM-5.3. It is manual-only; normal
+PR checks do not spend provider tokens or require secrets.
+
+In the repository's **Settings → Secrets and variables → Actions**, create:
+
+- `HARNESS_GLM_BASE_URL`: the API base URL from the `glm-5.3` entry in your
+  `.models.yaml` (HTTPS, without credentials, query parameters or fragments).
+- `HARNESS_GLM_API_KEY`: that entry's API key.
+
+Open **Actions → Harness (manual GLM) → Run workflow**, select the branch,
+case-name glob and 1–3 repetitions. The default `hello*` is a small smoke test;
+`*` runs the whole live suite and can incur significant cost. Execution is
+serial, with a 60-minute suite limit and a 120-minute job limit. Cases execute
+in a separate copy of the checked-out workspace. Filters match case names,
+not filenames. No match, unavailable cases and failed cases are not passes.
+
+The registered model uses the local GLM-5.3 deployment's declared
+`reasoning_effort` protocol, 128,000-token context and 84,000-token output
+ceiling. Prices are deliberately omitted: supply deployment pricing separately
+before making monetary comparisons. Optional LLM grading is disabled; mandatory
+hard judgers still run, using GLM-5.3 unless a criterion explicitly selects
+another model. Cases requiring
+other models, external clients or special policy need those capabilities and
+must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
+these runs do not certify production embedding quality.
+
+The job summary and seven-day artifact contain per-case status, timing,
+terminal-reported token/cache counters and binary hashes. These counters are
+not complete task-tree cost or certified cache ratios; consult usage coverage,
+and never interpret missing evidence as zero. Provider credentials are written
+only into a private temporary model file and removed during cleanup. Raw
+transcripts, Server logs, model configuration and full reports are **not**
+uploaded, because they may contain sensitive provider responses. A setup failure
+without a report fails the workflow. Safe failure diagnostics retain local
+Server readiness status, model registration/activation, lookup exit code and
+step outcomes, without retaining arbitrary provider error text.
+
 ```sh
 # Local smoke: one case, no judger, parallel 4
 ./target/release/astra-test \
