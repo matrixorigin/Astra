@@ -25896,6 +25896,7 @@ async fn assert_runtime_guidance_applied(
                     run_id,
                     &indices,
                     UserIntentAdmissionAuthority::DurableOwnerGeneration(owner_generation),
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -26281,6 +26282,7 @@ async fn superseded_questionnaire_timeout_releases_wait_and_applies_guidance() {
         questions: vec![astra_tools::AskUserQuestion {
             header: "Scope".into(),
             question: "Which environment?".into(),
+            id: None,
             options: vec![],
             multi_select: false,
             allow_freeform: true,
@@ -26327,6 +26329,7 @@ async fn superseded_questionnaire_timeout_releases_wait_and_applies_guidance() {
                 "prompt-guidance",
                 &[source as usize],
                 UserIntentAdmissionAuthority::DurableOwnerGeneration(authority.owner_generation),
+                None,
             )
             .await
             .unwrap(),
