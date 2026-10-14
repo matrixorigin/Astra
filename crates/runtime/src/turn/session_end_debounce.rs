@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 /// Minimum gap between governance runs for the same session. Below this
 /// the subsequent run is considered "still active" and governance is
-/// deferred. Aligns with Memoria's reflect 1h cooldown but is client-
-/// side so even purge_working and store_episode are debounced.
+/// deferred. This bounds repeated episode/purge work independently of the
+/// backend's optional reflection policy.
 pub const GOVERNANCE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MAX_COMPLETED_SESSIONS: usize = 16 * 1024;
 
