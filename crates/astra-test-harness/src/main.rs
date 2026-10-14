@@ -204,6 +204,26 @@ fn collect_judger_models(
     }
 }
 
+fn collect_preflight_models(
+    cases: &[Case],
+    fallback: &[String],
+    judge: &str,
+    include_advisory: bool,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    for case in cases {
+        models.extend(case.models.as_deref().unwrap_or(fallback).iter().cloned());
+        models.extend(case.required_models.iter().cloned());
+        collect_judger_models(&case.criteria, judge, include_advisory, &mut models);
+        for step in &case.steps {
+            collect_judger_models(&step.criteria, judge, include_advisory, &mut models);
+        }
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
 fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) -> PathBuf {
     if !explicit.as_os_str().is_empty() && explicit.is_dir() {
         return std::fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf());
@@ -499,47 +519,28 @@ async fn run(args: Args) -> Result<()> {
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
-        let mut preflight_models: Vec<String> = if let Some(ref forced) = args.force_model {
-            vec![forced.clone()]
-        } else {
-            let mut all_models: Vec<String> = Vec::new();
-            for case in &cases {
-                if let Some(ref ms) = case.models {
-                    all_models.extend(ms.iter().cloned());
-                }
-            }
-            if all_models.is_empty() {
-                all_models = fallback_models.clone();
-            }
-            all_models
-        };
-        for case in &cases {
-            collect_judger_models(
-                &case.criteria,
-                &args.judger_model,
-                !args.no_judger,
-                &mut preflight_models,
-            );
-            for step in &case.steps {
-                collect_judger_models(
-                    &step.criteria,
-                    &args.judger_model,
-                    !args.no_judger,
-                    &mut preflight_models,
-                );
-            }
-        }
-        preflight_models.sort();
-        preflight_models.dedup();
+        let preflight_models = collect_preflight_models(
+            &cases,
+            &fallback_models,
+            &args.judger_model,
+            !args.no_judger,
+        );
         let require_memoria = cases.iter().any(Case::requires_memoria);
-        match run_preflight(
+        let preflight = run_preflight(
             &astra_bin,
             &preflight_models,
             args.profile.as_deref(),
             require_memoria,
         )
-        .await
-        {
+        .await;
+        if let Err(error) = astra_test_harness::preflight::write_preflight_result(
+            args.report_file.as_deref(),
+            &preflight_models,
+            &preflight,
+        ) {
+            eprintln!("[astra-test] WARNING: could not persist safe preflight facts: {error}");
+        }
+        match preflight {
             Ok(effective_profile) => {
                 if effective_profile.is_some() {
                     runner_profile = effective_profile;
@@ -777,6 +778,30 @@ async fn run(args: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_case_prerequisites_survive_forced_parent_and_include_fallback() {
+        let suite = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+        let mut child = astra_test_harness::case::Case::from_path(
+            &suite.join("multi_turn_delegation_followup.yaml"),
+        )
+        .unwrap();
+        child.models = Some(vec!["glm-5.3".into()]);
+        let smoke =
+            astra_test_harness::case::Case::from_path(&suite.join("hello_text_contains.yaml"))
+                .unwrap();
+        let fallback = vec!["fallback-parent".into()];
+        assert_eq!(
+            super::collect_preflight_models(&[child, smoke.clone()], &fallback, "glm-5.3", true),
+            ["fallback-parent", "glm-5.2", "glm-5.3"]
+        );
+        // Filtering happens before collection: unrelated cases cannot require
+        // the child model, and an advisory-off run cannot omit hard prerequisites.
+        assert_eq!(
+            super::collect_preflight_models(&[smoke], &fallback, "glm-5.3", false),
+            ["fallback-parent"]
+        );
+    }
+
     use super::resolve_workspace_astra_bin;
     use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;

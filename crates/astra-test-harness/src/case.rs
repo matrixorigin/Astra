@@ -44,6 +44,11 @@ pub struct Case {
     #[serde(default)]
     pub models: Option<Vec<String>>,
 
+    /// Supplementary models needed by the journey (e.g. an explicitly selected
+    /// child model). These prerequisites are not replaced by --force-model.
+    #[serde(default)]
+    pub required_models: Vec<String>,
+
     /// Success criteria evaluated in order. All must pass for the
     /// case to PASS. Order matters — deterministic checks first,
     /// expensive LLM judger last.
@@ -553,6 +558,10 @@ impl Case {
                     .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?,
             );
         }
+        if !case.required_models.is_empty() {
+            case.required_models = canonicalize_model_ids(&case.required_models)
+                .map_err(|e| anyhow::anyhow!("parse {} required_models: {e}", path.display()))?;
+        }
         // Fail fast on reserved-flag abuse so a typo in one case
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
@@ -690,6 +699,26 @@ impl Case {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn required_models_validate_at_the_case_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        for (models, accepted) in [
+            ("[]", true),
+            ("[glm-5.2, glm-5.3]", true),
+            ("['']", false),
+            ("[' glm-5.2']", false),
+            ("[glm-5.2, glm-5.2]", false),
+        ] {
+            std::fs::write(
+                &path,
+                format!("name: model-prerequisite\nprompt: hello\nrequired_models: {models}\n"),
+            )
+            .unwrap();
+            assert_eq!(Case::from_path(&path).is_ok(), accepted, "{models}");
+        }
+    }
+
     use super::*;
     use tempfile::tempdir;
 

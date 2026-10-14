@@ -194,12 +194,35 @@ In the repository's **Settings → Secrets and variables → Actions**, create:
 - `HARNESS_GLM_BASE_URL`: the API base URL from the `glm-5.3` entry in your
   `.models.yaml` (HTTPS, without credentials, query parameters or fragments).
 - `HARNESS_GLM_API_KEY`: that entry's API key.
+- Optional `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of genuine supplementary
+  model entries in the existing admin model-file format. Each entry supplies its
+  own endpoint, credentials, protocol and capacity; nothing is inherited from
+  GLM-5.3. Duplicate names and overrides of GLM-5.3 are rejected. For the full
+  current suite, supply a real `glm-5.2` entry; otherwise its prerequisite fails
+  before cases execute. This secret is not needed for `hello*`.
 
-Open **Actions → Harness (manual GLM) → Run workflow**, select the branch,
-case-name glob and 1–3 repetitions. The default `hello*` is a small smoke test;
-`*` runs the whole live suite and can incur significant cost. Execution is
+Open **Actions → Harness (manual GLM) → Run workflow**. Source inputs default to
+`repository: matrixorigin/astra`, `ref: main` (its latest commit at checkout).
+For a fork, enter e.g. `XuPeng-SH/Astra`; `ref` accepts a branch, tag or exact
+commit SHA available in that repository. The workflow-dispatch branch selects
+the workflow definition, not the source under test. Build checks and the report
+use the actual checked-out SHA. Only select trusted source: its build scripts,
+local actions and executables can access the provider credentials. The checkout
+token must have read access; arbitrary private repositories are not guaranteed.
+Managed build-cache uploads are disabled for this workflow (both rust-cache and
+sccache); existing rust-cache artifacts may still be restored.
+There is no additional actor or repository allowlist: manual dispatch relies on
+GitHub's repository write-access requirement. No organization membership token
+is needed. This restricts who starts the workflow, not the code they select;
+selected code can read and exfiltrate the provider key, so run only trusted commits.
+
+The case-name filter defaults to `*` (all top-level YAML cases, not recursive),
+with 1–3 repetitions. Use `hello*` for a small smoke test. Running all cases can
+incur significant cost and requires each case's additional capabilities. Execution is
 serial, with a 60-minute suite limit and a 120-minute job limit. Cases execute
-in a separate copy of the checked-out workspace. Filters match case names,
+in an independent Git clone with the selected SHA and actual origin history.
+Historical-fixture cases still require that history to exist in the selected
+repository. Filters match case names,
 not filenames. No match, unavailable cases and failed cases are not passes.
 
 The registered model uses the local GLM-5.3 deployment's declared
@@ -208,15 +231,28 @@ ceiling. Prices are deliberately omitted: supply deployment pricing separately
 before making monetary comparisons. Both advisory and required LLM graders run,
 using GLM-5.3 unless a criterion explicitly selects another model. Grading adds
 provider calls and cost; a same-model judge is not independent quality evidence.
-Cases requiring other models, external clients or special policy need those capabilities and
-must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
+CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answer
+minimum); the Server bounds the effective request by the admitted Offering's
+output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
+remain failures/unknown evidence, never accepted truncated answers or automatic retries.
+Cases may declare `required_models` for supplementary models, independently of
+their parent `models` matrix. These are checked by the existing fail-fast
+preflight after filtering and are not replaced by `--force-model`. For example,
+the full suite's delegation follow-up needs a genuine `glm-5.2` offering.
+The safe preflight sidecar identifies selected model IDs and the unavailable
+model without provider error details. Default all-case selection is not a claim
+that a GLM-5.3-only deployment can run every case.
+Cases requiring other models, external clients or special policy need those
+capabilities and must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
 these runs do not certify production embedding quality.
 
 The job summary and seven-day artifact contain per-case status, timing,
 terminal-reported token/cache counters, binary hashes and root/step criterion
-results with severity and scores. A judge without a score is explicitly
-`unscored`, with `passed: null`, not a successful evaluation; non-judge booleans
-remain reported harness results, not a new execution certificate. These counters are
+results with severity and scores. An advisory judge without a score is explicitly
+`unscored`, with `passed: null`, not a successful evaluation. Required judges may
+return a boolean acceptance without a numeric score: their canonical pass/fail
+remains `reported`, without claiming evaluation provenance. Non-judge booleans
+also remain reported harness results, not a new execution certificate. These counters are
 not complete task-tree cost or certified cache ratios; consult usage coverage,
 and never interpret missing evidence as zero. Provider credentials are written
 only into a private temporary model file and removed during cleanup. Raw

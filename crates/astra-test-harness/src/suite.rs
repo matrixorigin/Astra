@@ -765,6 +765,7 @@ impl<'a> SuiteRunner<'a> {
                     prompt: step.prompt.clone(),
                     prompt_variants: vec![],
                     models: Some(vec![model.to_string()]),
+                    required_models: case.required_models.clone(),
                     criteria: vec![],
                     debug_log: case.debug_log,
                     extra_cli_args: {
@@ -1705,6 +1706,7 @@ mod tests {
             prompt: format!("prompt-for-{name}"),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria,
             debug_log: false,
             extra_cli_args: vec![],

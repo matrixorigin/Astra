@@ -3,10 +3,20 @@ name: Harness (manual GLM)
 on:
   workflow_dispatch:
     inputs:
-      filter:
-        description: "Case-name glob (hello* by default; * runs the whole live suite and costs more)"
+      repository:
+        description: "Trusted source repository (owner/repo); selected code can access the provider key"
         required: true
-        default: "hello*"
+        default: "matrixorigin/astra"
+        type: string
+      ref:
+        description: "Source branch, tag or commit SHA (main resolves to its latest commit at checkout)"
+        required: true
+        default: "main"
+        type: string
+      filter:
+        description: "Case-name glob (* runs all top-level cases; paid provider calls)"
+        required: true
+        default: "*"
         type: string
       runs:
         description: "Repetitions per case"
@@ -27,8 +37,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       SQLX_OFFLINE: "true"
       ASTRA_CONFIG_SOURCE: explicit-env
-      ASTRA_EXPECTED_BUILD_GIT_SHA: ${{ github.sha }}
-      ASTRA_BUILD_SOURCE_GIT_SHA: ${{ github.sha }}
       ASTRA_BUILD_SOURCE_GIT_DIRTY: "false"
       ASTRA_API_URL: http://127.0.0.1:17001
       ASTRA_API_HOST: 127.0.0.1
@@ -53,12 +61,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Record checked-out source identity
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          printf 'ASTRA_EXPECTED_BUILD_GIT_SHA=%s\nASTRA_BUILD_SOURCE_GIT_SHA=%s\n' "$source_sha" "$source_sha" >> "$GITHUB_ENV"
 
       - name: Validate secrets and prepare private model file
         env:
           GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
           GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
+          ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}
         run: |
           python3 - <<'PY'
           import json, os
@@ -71,6 +88,18 @@ jobs:
           parsed = urlsplit(url)
           if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
               raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
+          try:
+              additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
+          except ValueError:
+              raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries") from None
+          names = {"glm-5.3"}
+          if not isinstance(additional, list):
+              raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries")
+          for entry in additional:
+              name = entry.get("name") if isinstance(entry, dict) else None
+              if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
+                  raise SystemExit("Additional models need unique nonempty names, excluding glm-5.3")
+              names.add(name.casefold())
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           model = {"name": "glm-5.3", "provider": "openai", "base_url": url,
@@ -79,7 +108,9 @@ jobs:
                    "supported_parameters": ["tools"], "tags": ["code", "chat", "reasoning"]}
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
           with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
-              json.dump([model], out)
+              # Supplementary entries are self-contained; never inherit another
+              # model's credentials, protocol or capacity. The admin loader owns validation.
+              json.dump([model, *additional], out)
           Path(".env").touch()
           PY
 
@@ -87,7 +118,9 @@ jobs:
         with:
           shared-key: ci-harness
           install-nextest: false
-          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          use-sccache: false
+          # A custom checkout must not publish artifacts into the trusted main cache.
+          save-cache: false
 
       - name: Build current Server, CLI and harness
         run: |
@@ -124,8 +157,14 @@ jobs:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
         run: |
-          mkdir -p "$RUNNER_TEMP/harness/workspace"
-          git archive HEAD | tar -x -C "$RUNNER_TEMP/harness/workspace"
+          workspace="$RUNNER_TEMP/harness/workspace"
+          git clone --quiet --no-hardlinks --no-checkout "$GITHUB_WORKSPACE" "$workspace"
+          git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin/ |
+            while read -r object ref; do
+              git -C "$workspace" update-ref --no-deref "$ref" "$object"
+            done
+          git -C "$workspace" remote set-url origin "$(git remote get-url origin)"
+          git -C "$workspace" checkout --quiet --detach "$ASTRA_BUILD_SOURCE_GIT_SHA"
           sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
           ./target/debug/astra-test \
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
@@ -165,12 +204,22 @@ jobs:
               pass
           if not isinstance(model, dict):
               model = {}
+          preflight = {}
+          try:
+              raw = json.loads((root / "report.preflight.json").read_text())
+              if (raw.get("status") in ("passed", "failed")
+                  and isinstance(raw.get("models"), list) and all(isinstance(m, str) for m in raw["models"])
+                  and (raw.get("unavailable_model") is None or isinstance(raw["unavailable_model"], str))):
+                  preflight = {k: raw.get(k) for k in ("status", "models", "unavailable_model")}
+          except (OSError, ValueError, AttributeError):
+              pass
           diagnostic = {"server_readiness_http_status": int(os.environ["DIAGNOSTIC_HEALTH_STATUS"]),
                         "model_lookup_exit_code": int(os.environ["DIAGNOSTIC_MODEL_EXIT"]),
                         "model_registered": bool(model["model_id"]) if "model_id" in model else None,
                         "model_active": model.get("is_active") if isinstance(model.get("is_active"), bool) else None,
                         "model_load_step": os.environ["MODEL_LOAD_OUTCOME"],
-                        "harness_step": os.environ["HARNESS_OUTCOME"]}
+                        "harness_step": os.environ["HARNESS_OUTCOME"],
+                        "model_lookup_name": "glm-5.3", "preflight": preflight or None}
           text = json.dumps(diagnostic, indent=2) + "\n"
           (root / "diagnostic.json").write_text(text)
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
@@ -203,8 +252,9 @@ jobs:
                       raise ValueError("invalid criterion fields")
                   judge = kind in ("judger", "hard_judger")
                   projected.append({"type": kind, "severity": severity, "score": score,
-                                    "passed": None if judge and score is None else c["passed"],
-                                    "evaluation": ("unscored" if score is None else "scored") if judge else "reported"})
+                                    "passed": None if kind == "judger" and score is None else c["passed"],
+                                    "evaluation": "scored" if judge and score is not None else
+                                                  "unscored" if kind == "judger" else "reported"})
               return projected
 
           # Do not upload arbitrary provider responses, prompts, stderr or session archives.
@@ -236,7 +286,7 @@ jobs:
                                "terminal_reported": {k: r["outcome"][k] for k in metrics}})
           except (ValueError, KeyError, TypeError, OverflowError):
               raise SystemExit("Invalid harness report; safe summary was not published") from None
-          summary = {"commit": os.environ["GITHUB_SHA"], "model": "glm-5.3", "runs": rows,
+          summary = {"commit": os.environ["ASTRA_BUILD_SOURCE_GIT_SHA"], "model": "glm-5.3", "runs": rows,
                      "wall_time_ms": report.get("wall_time_ms"),
                      "accounting": "Terminal counters, not certified complete task-tree cost; absent cache coverage is unknown."}
           (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -254,6 +304,7 @@ jobs:
             ${{ runner.temp }}/harness/summary.json
             ${{ runner.temp }}/harness/binaries.sha256
             ${{ runner.temp }}/harness/diagnostic.json
+            ${{ runner.temp }}/harness/report.preflight.json
           if-no-files-found: ignore
           retention-days: 7
 

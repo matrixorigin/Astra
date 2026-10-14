@@ -10,6 +10,7 @@ prompt: |
   Ask a GLM 5.2 subagent to calculate 17 times 23 and return only the integer.
   Report its actual result when it finishes. Do not change files or access the network.
 capability: delegation
+required_models: [glm-5.2]
 difficulty: 3
 weight: 2.0
 timeout_seconds: 240
