@@ -7,10 +7,9 @@ description: |
   the canonical previous-root selector for the later turn; both are identity
   preserving and must not be replaced by an ordinary live snapshot.
 prompt: |
-  Ask a GLM 5.2 subagent to calculate 17 times 23 and return only the integer.
+  Ask a subagent using model {{model}} to calculate 17 times 23 and return only the integer.
   Report its actual result when it finishes. Do not change files or access the network.
 capability: delegation
-required_models: [glm-5.2]
 difficulty: 3
 weight: 2.0
 timeout_seconds: 240
@@ -21,7 +20,7 @@ steps:
   - type: text_contains
     needle: '391'
   - type: text_contains
-    needle: 'glm-5.2'
+    needle: '{{model}}'
 criteria:
 - type: exit_code
   code: 0
@@ -94,12 +93,12 @@ criteria:
   max: 1
   json_match:
     path: /metadata/model_configuration/prepared_selection/model_name
-    equals: glm-5.2
+    equals: '{{model}}'
 - type: session_child_result_adopted
   expected_result: '391'
   spawn_match:
     path: /metadata/model_configuration/prepared_selection/model_name
-    equals: glm-5.2
+    equals: '{{model}}'
 - type: session_event_count
   event_type: agent_terminated
   min: 1

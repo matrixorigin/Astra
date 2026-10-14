@@ -197,9 +197,9 @@ In the repository's **Settings → Secrets and variables → Actions**, create:
 - Optional `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of genuine supplementary
   model entries in the existing admin model-file format. Each entry supplies its
   own endpoint, credentials, protocol and capacity; nothing is inherited from
-  GLM-5.3. Duplicate names and overrides of GLM-5.3 are rejected. For the full
-  current suite, supply a real `glm-5.2` entry; otherwise its prerequisite fails
-  before cases execute. This secret is not needed for `hello*`.
+  GLM-5.3. Duplicate names and overrides of GLM-5.3 are rejected. Only cases that
+  explicitly require another model need this secret; ordinary delegation uses
+  the selected matrix model, not a fixed GLM version.
 
 Open **Actions → Harness (manual GLM) → Run workflow**. Source inputs default to
 `repository: matrixorigin/astra`, `ref: main` (its latest commit at checkout).
@@ -237,8 +237,13 @@ output limit and its 8,192-token safety ceiling. Incomplete or malformed judgmen
 remain failures/unknown evidence, never accepted truncated answers or automatic retries.
 Cases may declare `required_models` for supplementary models, independently of
 their parent `models` matrix. These are checked by the existing fail-fast
-preflight after filtering and are not replaced by `--force-model`. For example,
-the full suite's delegation follow-up needs a genuine `glm-5.2` offering.
+preflight after filtering and are not replaced by `--force-model`.
+Prompts and assertion string values can use the explicit `{{model}}` marker,
+bound independently to each resolved matrix model (including `--force-model`).
+This includes follow-up prompts and criteria, nested assertions and exact child
+model identity checks. Unknown or malformed markers fail before execution.
+Model lists, grader model overrides, shell hooks and environment are literal,
+not templates. The delegation follow-up uses this binding and needs no second model.
 The safe preflight sidecar identifies selected model IDs and the unavailable
 model without provider error details. Default all-case selection is not a claim
 that a GLM-5.3-only deployment can run every case.

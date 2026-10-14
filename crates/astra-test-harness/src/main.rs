@@ -786,6 +786,13 @@ mod tests {
         )
         .unwrap();
         child.models = Some(vec!["glm-5.3".into()]);
+        assert!(child.required_models.is_empty());
+        assert_eq!(
+            super::collect_preflight_models(std::slice::from_ref(&child), &[], "glm-5.3", true),
+            ["glm-5.3"]
+        );
+        // A genuinely cross-model case still keeps its explicit prerequisites.
+        child.required_models = vec!["glm-5.2".into()];
         let smoke =
             astra_test_harness::case::Case::from_path(&suite.join("hello_text_contains.yaml"))
                 .unwrap();

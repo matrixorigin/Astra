@@ -489,6 +489,63 @@ pub fn matches_filter(name: &str, pattern: &str) -> bool {
 }
 
 impl Case {
+    /// Bind the resolved matrix model to prompts and assertions, not execution
+    /// configuration, hooks, environment or grader model overrides.
+    pub fn bind_model(&self, model: &str) -> anyhow::Result<Self> {
+        canonicalize_model_ids(&[model.to_owned()]).map_err(anyhow::Error::msg)?;
+        fn text(value: &mut String, model: &str) -> anyhow::Result<()> {
+            if value.replace("{{model}}", "").contains("{{") {
+                anyhow::bail!("unknown or malformed case binding; only {{{{model}}}} is supported");
+            }
+            *value = value.replace("{{model}}", model);
+            Ok(())
+        }
+        fn leaves(value: &mut serde_json::Value, model: &str) -> anyhow::Result<()> {
+            match value {
+                serde_json::Value::String(value) => text(value, model)?,
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        leaves(item, model)?;
+                    }
+                }
+                serde_json::Value::Object(fields) => {
+                    let grader = fields
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|kind| matches!(kind, "judger" | "hard_judger"));
+                    for (key, value) in fields {
+                        if grader && key == "model" {
+                            if value.as_str().is_some_and(|s| s.contains("{{")) {
+                                anyhow::bail!("grader model overrides must be literal model IDs");
+                            }
+                        } else {
+                            leaves(value, model)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn criteria(
+            values: &mut Vec<super::criteria::Criterion>,
+            model: &str,
+        ) -> anyhow::Result<()> {
+            let mut value = serde_json::to_value(&*values)?;
+            leaves(&mut value, model)?;
+            *values = serde_json::from_value(value)?;
+            super::criteria::validate_criteria(values).map_err(anyhow::Error::msg)
+        }
+        let mut bound = self.clone();
+        text(&mut bound.prompt, model)?;
+        criteria(&mut bound.criteria, model)?;
+        for step in &mut bound.steps {
+            text(&mut step.prompt, model)?;
+            criteria(&mut step.criteria, model)?;
+        }
+        Ok(bound)
+    }
+
     pub(crate) fn cli_wall_time_override_for(&self, timeout_seconds: u64) -> Option<u64> {
         self.cli_wall_time_seconds.filter(|seconds| {
             *seconds > CLI_TERMINAL_RESERVE_SECONDS
@@ -699,6 +756,74 @@ impl Case {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_model_binding_preserves_strict_spawn_checks_and_case_configuration() {
+        use crate::criteria::{Criterion, evaluate_deterministic_with_session};
+        use crate::runner::RunOutcome;
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/multi_turn_delegation_followup.yaml");
+        let mut original = Case::from_path(&path).unwrap();
+        original.setup_cmd = Some("literal {{model}}".into());
+        for model in ["glm-5.3", "another-provider/model", "quoted\"\\$()`模型"] {
+            let bound = original.bind_model(model).unwrap();
+            assert!(bound.prompt.contains(model));
+            assert_eq!(bound.setup_cmd, original.setup_cmd);
+            assert!(bound.required_models.is_empty());
+            let checks: Vec<_> = bound
+                .criteria
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c, Criterion::SessionEventCount { json_match: Some(_), event_type, .. }
+                        if event_type == "agent_spawned"
+                    )
+                })
+                .cloned()
+                .collect();
+            assert_eq!(checks.len(), 1);
+            let mut session = SessionCapture::default();
+            for (actual, passes) in [(model, true), ("wrong-model", false)] {
+                session.events = vec![JournalEvent {
+                    event_type: "agent_spawned".into(),
+                    raw: serde_json::json!({"metadata":{"model_configuration":{
+                        "prepared_selection":{"model_name":actual}
+                    }}}),
+                }];
+                assert_eq!(
+                    evaluate_deterministic_with_session(
+                        &checks,
+                        &RunOutcome::new(model),
+                        Some(&session)
+                    )[0]
+                    .passed,
+                    passes
+                );
+            }
+            let projection = serde_json::to_value(&bound).unwrap();
+            assert_eq!(projection["steps"][0]["criteria"][1]["needle"], model);
+            let adopted = bound
+                .criteria
+                .iter()
+                .find_map(|c| match c {
+                    Criterion::SessionChildResultAdopted { spawn_match, .. } => {
+                        spawn_match.as_ref()
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(adopted.equals, serde_json::json!(model));
+        }
+        assert!(original.prompt.contains("{{model}}"));
+        for model in ["", " ", " padded"] {
+            assert!(original.bind_model(model).is_err());
+        }
+        original.prompt = "use {{missing}}".into();
+        assert!(original.bind_model("m").is_err());
+        original.prompt = "use {{model".into();
+        assert!(original.bind_model("m").is_err());
+    }
+
     #[test]
     fn required_models_validate_at_the_case_boundary() {
         let dir = tempfile::tempdir().unwrap();
