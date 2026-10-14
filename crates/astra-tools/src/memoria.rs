@@ -1433,6 +1433,20 @@ impl MemoriaToolGateway {
             }
             return decorated;
         }
+        if op == "remember" {
+            match serde_json::from_str::<Value>(&raw_text) {
+                Ok(response) if response.get("error").is_some_and(|error| !error.is_null()) => {}
+                Ok(response) => {
+                    if let Err(error) = astra_memoria::confirmed_memory_id(&response) {
+                        return json!({"error": error}).to_string();
+                    }
+                }
+                Err(_) => {
+                    return json!({"error": "memory backend returned a malformed write receipt"})
+                        .to_string();
+                }
+            }
+        }
         if op == "expand" {
             return Self::decorate_expand_response(
                 &raw_text,
@@ -1640,14 +1654,12 @@ impl MemoriaToolGateway {
         }
     }
 
-    fn empty_success_response(op: &str, args: &Value) -> Value {
+    fn empty_success_response(op: &str, _args: &Value) -> Value {
         match op {
             "recall" => json!([]),
-            "remember" => json!({
-                "status": "completed",
-                "message": "memory stored",
-                "content": args.get("content").and_then(Value::as_str).unwrap_or(""),
-            }),
+            "remember" => {
+                json!({"error": "memory backend did not return a valid memory_id receipt"})
+            }
             "forget" => json!({
                 "status": "completed",
                 "message": "memory purge completed",
@@ -2847,14 +2859,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_success_response_remember_returns_ack() {
+    fn empty_success_response_remember_rejects_missing_receipt() {
         let value = MemoriaToolGateway::empty_success_response(
             "remember",
             &json!({"content": "prefers smoke tests"}),
         );
-        assert_eq!(value["status"], "completed");
-        assert_eq!(value["message"], "memory stored");
-        assert_eq!(value["content"], "prefers smoke tests");
+        assert!(value.get("error").is_some());
+        assert!(value.get("status").is_none());
     }
 
     // ── Session isolation via v2 `scope` → v1 `session_scope` ──
@@ -3132,6 +3143,52 @@ mod tests {
             requests.is_empty(),
             "validation failure must not send any HTTP request, got {requests:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn remember_requires_a_confirmed_http_write_receipt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for body in [
+            "",
+            "{}",
+            r#"{"memory_id":""}"#,
+            r#"{"memory_id":" "}"#,
+            r#"{"memory_id":12}"#,
+            "not-json",
+            r#"{"error":null}"#,
+            r#"{"memory_id":"mem-ok"}"#,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/memory/store"))
+                .respond_with(ResponseTemplate::new(201).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("test-token".into()));
+            let output = gateway
+                .call_with_timeout(
+                    "remember",
+                    &json!({
+                        "content": "A durable preference for small focused changes",
+                        "memory_type": "semantic"
+                    }),
+                    Duration::from_secs(1),
+                )
+                .await;
+            let response: Value = serde_json::from_str(&output).unwrap();
+            if body.contains("mem-ok") {
+                assert_eq!(response["memory_id"], "mem-ok");
+            } else {
+                assert!(
+                    response.get("error").is_some(),
+                    "body={body:?}, output={output}"
+                );
+                assert!(response.get("status").is_none());
+            }
+            server.verify().await;
+        }
     }
 
     #[tokio::test]

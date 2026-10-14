@@ -104,6 +104,31 @@ PATH="${fake_bin_dir}:${PATH}" \
 [[ "$("${install_dir}/astra" --version)" = "astra 0.1.0" ]]
 [[ "$("${install_dir}/astra-edge" --version)" = "astra-edge 0.1.0" ]]
 
+# The installer's archive-member check must be locale-independent: under
+# UTF-8 locales such as en_US.UTF-8 collation is case-insensitive, so an
+# unpinned sort orders the members "astra astra-edge LICENSE" and every real
+# install fails. Run the member-check path under such a locale when the
+# runner provides one and skip gracefully otherwise.
+utf8_locale=""
+for candidate in en_US.UTF-8 en_US.utf8 zh_CN.UTF-8 zh_CN.utf8; do
+    if [ "$(printf 'LICENSE\nastra\n' | LC_ALL="$candidate" sort 2>/dev/null)" \
+        = "$(printf 'astra\nLICENSE\n')" ]; then
+        utf8_locale="$candidate"
+        break
+    fi
+done
+if [ -n "$utf8_locale" ]; then
+    utf8_install_dir="${fixture_root}/utf8-installed"
+    mkdir -p "$utf8_install_dir"
+    PATH="${fake_bin_dir}:${PATH}" \
+        LC_ALL="$utf8_locale" \
+        ASTRA_TEST_RELEASE_DIR="$dist_dir" \
+        ASTRA_INSTALL_DIR="$utf8_install_dir" \
+        "${repo_root}/scripts/install-astra.sh" --version 0.1.0 >/dev/null
+    [[ "$("${utf8_install_dir}/astra" --version)" = "astra 0.1.0" ]]
+    [[ "$("${utf8_install_dir}/astra-edge" --version)" = "astra-edge 0.1.0" ]]
+fi
+
 latest_output="$(
     PATH="${fake_bin_dir}:${PATH}" \
         ASTRA_TEST_RELEASE_DIR="$dist_dir" \

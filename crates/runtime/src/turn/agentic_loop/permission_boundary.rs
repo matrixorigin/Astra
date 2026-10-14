@@ -183,6 +183,9 @@ mod tests {
             _: &str,
             _: &[usize],
             _: UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<UserIntentApplyAck, String> {
             Ok(UserIntentApplyAck::Applied)
         }

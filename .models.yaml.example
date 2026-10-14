@@ -63,8 +63,18 @@
 # optional volatile advisories are omitted. No model-name heuristic enables it.
 # Reload with: astra admin model load .models.yaml --update-existing
 #
-# Thinking/reasoning capability is auto-detected at load time via provider-aware
-# probe. No YAML declaration needed.
+# Thinking/reasoning checks use maintained adapter defaults where available.
+# A custom OpenAI-compatible gateway does not imply a known thinking protocol:
+# unsupported fields may be silently ignored. After verifying the deployment's
+# controls, declare its protocol as a TOP-LEVEL model field, for example:
+#   thinking_protocol: reasoning_effort
+# Then load with --update-existing and inspect `astra admin model show <name>`.
+# The check binds its observation to this model configuration. Reasoning-effort
+# deployments can report effort_only: Low/Medium/High control depth, not Off.
+# A plain model selection preserves the provider default; no global Low override
+# is installed by this declaration. Do not copy it to unverified deployments.
+# Other supported declarations are enable_thinking, thinking_object and moonshot;
+# binary controls require observable reasoning-on and reasoning-off behavior.
 #
 # ─── Provider Notes ───────────────────────────────────────────────────────────
 #

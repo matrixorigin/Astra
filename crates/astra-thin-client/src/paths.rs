@@ -31,6 +31,9 @@ pub const USER_PROMPT_RESPOND: &str = "/user-prompts/respond";
 /// `POST` — submit or cancel an opaque provider interaction.
 pub const PROVIDER_INTERACTION_RESPOND: &str = "/provider-interactions/respond";
 
+/// `POST` — register and await an interaction from an active Edge invocation.
+pub const TOOL_INTERACTION_REQUEST: &str = "/tools/interactions/request";
+
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
 

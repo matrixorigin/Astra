@@ -6192,6 +6192,18 @@ async fn heartbeat_and_expiry_finish_race_have_one_durable_owner() {
             .kind,
         ServiceErrorKind::Conflict
     );
+    // The recovery API intentionally processes a bounded, fair batch shared
+    // by all sessions. Under the full online lane another expired owner may
+    // occupy the first batch, so the contract is eventual bounded recovery,
+    // not that one call must select this particular invocation.
+    reconcile_until_invocation_status(
+        &shared_pool,
+        pool,
+        &user_id,
+        raced.invocation_id(),
+        "delivery_unknown",
+    )
+    .await;
     let raced_fact = sqlx::query(
         "SELECT status, owner_generation, provider_delivery_state
          FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",

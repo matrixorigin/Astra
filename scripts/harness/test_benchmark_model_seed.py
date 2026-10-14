@@ -44,10 +44,43 @@ class _Opener:
 
     def open(self, request, timeout):
         self.requests.append((request, timeout))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class BenchmarkModelSeedTests(unittest.TestCase):
+    def test_catalog_selection_requires_exact_server_admission(self):
+        catalog = {"items": [{"name": "selected", "offering_id": "offer-selected",
+                              "is_active": True, "thinking_capability": "both"}],
+                   "total": 1, "limit": 50, "catalog_revision": "revision", "next_cursor": None}
+        slot = {"model_name": "selected", "offering_id": "offer-selected",
+                "reasoning": {"mode": "model_default"}}
+        unsupported = seed.urllib.error.HTTPError("http://localhost", 400, "unsupported", {}, None)
+        cases = [(None, {"slots": [slot]}, True),
+                 ("high", {"slots": [{**slot, "reasoning": {"mode": "adaptive", "effort": "high"}}]}, True),
+                 ("high", unsupported, False), (None, OSError("unavailable"), False)]
+        cases.extend((None, response, False) for response in (
+            {}, {"slots": []}, {"slots": [slot, slot]},
+            {"slots": [{**slot, "model_name": "other"}]},
+            {"slots": [{**slot, "offering_id": "other"}]},
+            {"slots": [{**slot, "reasoning": {"mode": "disabled"}}]},
+        ))
+        for thinking, response, accepted in cases:
+            with self.subTest(thinking=thinking, response=response):
+                opener = _Opener([_Response(200, catalog),
+                                  response if isinstance(response, Exception) else _Response(200, response)])
+                with mock.patch.object(seed.preflight, "owned_api_opener", return_value=opener):
+                    ok, detail = seed.preflight.fetch_model_catalog(
+                        "http://localhost/models", "test-token", [("selected", thinking)])
+                self.assertEqual(ok, accepted, detail)
+                self.assertEqual(len(opener.requests), 2)
+                admission = opener.requests[-1][0]
+                self.assertEqual(admission.full_url, "http://localhost/model-access/admit")
+                self.assertEqual(json.loads(admission.data)["slots"][0]["selector"],
+                                 {"kind": "offering_id", "offering_id": "offer-selected"})
+
     def test_owned_api_never_redirects_authorization(self):
         received = []
         class Target(http.server.BaseHTTPRequestHandler):
@@ -136,6 +169,8 @@ class BenchmarkModelSeedTests(unittest.TestCase):
                             "thinking_capability": "effort_only",
                         },
                     ),
+                    _Response(200, {"slots":[{"model_name":"selected", "offering_id":"offer-selected",
+                                             "reasoning":{"mode":"adaptive", "effort":"high"}}]}),
                 ]
             )
             result = seed.register_selected_model(
@@ -143,13 +178,18 @@ class BenchmarkModelSeedTests(unittest.TestCase):
             )
         self.assertTrue(result["checked"])
         self.assertEqual(result["thinking_mode"], "high")
-        self.assertEqual(len(opener.requests), 2)
-        create, check = [request for request, _ in opener.requests]
+        self.assertEqual(len(opener.requests), 3)
+        create, check, admission = [request for request, _ in opener.requests]
         self.assertEqual(create.full_url, "http://127.0.0.1:17012/models")
         self.assertEqual(
             check.full_url, "http://127.0.0.1:17012/models/selected/check"
         )
         self.assertEqual(create.get_header("Authorization"), "Bearer access-secret")
+        self.assertEqual(admission.full_url, "http://127.0.0.1:17012/model-access/admit")
+        self.assertEqual(json.loads(admission.data)["slots"][0], {
+            "selector":{"kind":"configured_name", "model_name":"selected"},
+            "reasoning":{"mode":"adaptive", "effort":"high"}
+        })
         payload = json.loads(create.data)
         self.assertEqual(payload["name"], "selected")
         self.assertEqual(payload["input_modalities"], ["text", "image"])
@@ -165,6 +205,20 @@ class BenchmarkModelSeedTests(unittest.TestCase):
         self.assertEqual(payload["pricing"], {
             "currency": "USD", "unit": "per_token", "prompt": 0.000001, "completion": 0,
         })
+
+    def test_plain_selection_uses_model_default_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, models = self.fixture(Path(directory), selector="selected")
+            opener = _Opener([
+                _Response(201, {"name": "selected"}),
+                _Response(200, {"name": "selected", "is_active": True}),
+                _Response(200, {"slots": [{"model_name": "selected", "offering_id": "offer-selected",
+                                          "reasoning": {"mode": "model_default"}}]}),
+            ])
+            result = seed.register_selected_model("http://localhost", config, models, "token", opener)
+        self.assertTrue(result["checked"])
+        self.assertEqual(json.loads(opener.requests[-1][0].data)["slots"][0]["reasoning"],
+                         {"mode": "model_default"})
 
     def test_missing_duplicate_or_empty_credentials_fail_before_api(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -235,6 +289,7 @@ class BenchmarkModelSeedTests(unittest.TestCase):
                     [
                         _Response(201, {"name": "selected"}),
                         _Response(200, checked),
+                        seed.urllib.error.HTTPError("http://localhost", 400, "unsupported", {}, None),
                     ]
                 )
                 with self.assertRaises(seed.SeedError):

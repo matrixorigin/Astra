@@ -364,10 +364,10 @@ pub(crate) struct ExecutedExecution {
 enum SlotSettlement {
     EdgeObserved,
     PendingEdgeValidated {
-        execution: HeadlessResolvedExecution,
+        execution: Box<HeadlessResolvedExecution>,
         idem_key: Option<IdempotencyKey>,
     },
-    PendingEdgePermitted(PermittedExecution),
+    PendingEdgePermitted(Box<PermittedExecution>),
     /// `None` is an internal settled marker for a slot whose canonical
     /// terminal was already emitted elsewhere; it must not be projected by
     /// the shared loop.
@@ -675,7 +675,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if permitted.execution.is_edge_tool {
             self.slot_settlements.insert(
                 permitted.execution.id.clone(),
-                SlotSettlement::PendingEdgePermitted(permitted),
+                SlotSettlement::PendingEdgePermitted(Box::new(permitted)),
             );
         }
     }
@@ -821,7 +821,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             if self.has_edge_execution_custody(item) {
                 match self.slot_settlements.remove(&slot.id) {
                     Some(SlotSettlement::PendingEdgePermitted(permitted)) => {
-                        self.record_deferred_edge_execution(permitted).await;
+                        self.record_deferred_edge_execution(*permitted).await;
                     }
                     Some(SlotSettlement::PendingEdgeValidated {
                         execution,
@@ -834,7 +834,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         // was already consumed by resolution.
                         match self
                             .permit_execution(ValidatedExecution {
-                                execution,
+                                execution: *execution,
                                 idem_key,
                             })
                             .await

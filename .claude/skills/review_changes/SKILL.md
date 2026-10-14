@@ -41,9 +41,10 @@ legacy fallback decision paths.
   that requirement. Distinguish this from required current crash/retry recovery.
 - A review authorizes inspection, not fixes, commits, pushes, or PR mutations.
   Broader cleanup recommendations must stay separate from verified defects.
-- For independent review use GPT-6 high by default; complex design uses GPT-6
-  medium. A current explicit model/effort request takes precedence. Configure the
-  actual invocation, not just a prompt asking the reviewer to act as that model.
+- Perform ordinary review with the current agent. Independent review and model
+  or effort overrides apply only when required by the user or an applicable
+  configured workflow; this skill supplies no reviewer or model default.
+  Configure required overrides in the actual invocation, not just the prompt.
   Record the requested and reported model/effort when available, reviewed
   commit/diff identity, and review outcome. Do not infer hidden backend identity.
 - If the requested model or delegation is unavailable, disclose it; continue
@@ -64,6 +65,9 @@ git status --short
 git diff --stat
 ```
 
+These are inspections: omit Bash `mode`. `mode=verify` requests a separate
+unchanged-workspace proof after edits, not a check that a diagnostic command ran.
+
 Target resolution:
 
 | Target                    | Diff command                                                                    |
@@ -73,7 +77,7 @@ Target resolution:
 | `unstaged`                | `git diff`                                                                      |
 | `branch:<name>`           | `git diff <name>...HEAD`                                                        |
 | `commit:<sha>`            | `git show --stat <sha>` then `git show <sha>`                                   |
-| `commits:<N>`             | `git log --oneline -N`, then `git show` for every one of the N commits          |
+| `commits:<N>`             | Freeze N identities with `git log --oneline -N`; inspect summaries, file maps and bounded hunks for each |
 | `pr:<number>` / PR URL    | `gh pr diff` if `gh` is installed and authenticated; otherwise ask for the diff |
 
 For a commit, take file/add/delete totals from Git's canonical summary:
@@ -103,6 +107,10 @@ capability is unavailable. The parent coordinates coverage and validates results
 it must not perform a duplicate broad review while the reviewers are running.
 Read-only reviewers may share immutable source. Use separate worktrees only when a
 reviewer may mutate files or reviewers need different refs.
+
+When independent review is required, hand off the frozen identities, owned scope
+and evidence locations, not copied diffs or file contents. The child reads its
+own evidence; the parent validates findings and investigates concrete gaps.
 
 Keep review evidence bounded at the source. Prefer per-file hunks and exact line
 ranges over full repository/commit dumps. If a tool returns an artifact reference,

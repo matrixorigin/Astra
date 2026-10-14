@@ -278,6 +278,25 @@ impl From<&str> for MemoriaOperationError {
     }
 }
 
+/// A successful write must identify the durable memory it created or updated.
+/// HTTP success alone does not authorize cleanup or a claim of storage.
+pub fn confirmed_memory_id(response: &serde_json::Value) -> Result<String, String> {
+    let id = response
+        .get("memory_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "memory backend did not return a valid memory_id receipt".to_string())?;
+    validate_memory_id(id)?;
+    Ok(id.to_string())
+}
+
+/// Validate a receipt returned by any transport, including non-HTTP ports.
+pub fn validate_memory_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() || id.trim() != id {
+        return Err("memory backend did not return a valid memory_id receipt".into());
+    }
+    Ok(())
+}
+
 /// Provider-neutral Memoria operations used by runtime orchestration.
 /// Reads resolve fresh authority within the actual operation and report disabled
 /// separately from successful empty results. Defaults only delegate; callers do
@@ -394,7 +413,7 @@ pub trait MemoriaPort: Send + Sync {
     }
 
     async fn store_episode(&self, _session_id: &str, _overview: &str) -> Result<String, String> {
-        Ok(String::new())
+        Err("Memoria transport does not support episode persistence".into())
     }
 
     async fn store_scene(
@@ -403,7 +422,7 @@ pub trait MemoriaPort: Send + Sync {
         _signal: &str,
         _summary: &str,
     ) -> Result<String, String> {
-        Ok(String::new())
+        Err("Memoria transport does not support scene persistence".into())
     }
 
     async fn reflect_session(
@@ -473,6 +492,25 @@ pub fn parse_reflect_candidates(data: &Value) -> Vec<ReflectCandidate> {
             })
         })
         .collect()
+}
+
+/// Decode the same reflection response for direct and Server-proxied transports.
+/// A successful cooldown skip is an empty best-effort result, not a failure.
+pub fn parse_reflect_summary(data: &Value) -> ReflectSummary {
+    let candidate_payloads = parse_reflect_candidates(data);
+    ReflectSummary {
+        synthesized: data
+            .get("synthesized")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        candidates: (candidate_payloads.len() as u64).max(
+            data.get("scenes_created")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        ),
+        candidate_payloads,
+        diagnostics: data.to_string().chars().take(200).collect(),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -959,6 +997,79 @@ pub fn memoria_runtime_state() -> &'static MemoriaRuntimeState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct UnsupportedPersistence;
+    #[async_trait::async_trait]
+    impl MemoriaPort for UnsupportedPersistence {
+        async fn retrieve_ext(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: usize,
+            _: bool,
+        ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
+            Ok(Vec::new())
+        }
+        async fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<String, String> {
+            unreachable!("unsupported persistence must not fabricate a write")
+        }
+        async fn purge_working(&self, _: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn unsupported_episode_and_scene_persistence_fail_explicitly() {
+        use std::task::{Context, Poll, Waker};
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            UnsupportedPersistence
+                .store_episode("session", "overview")
+                .as_mut()
+                .poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+        assert!(matches!(
+            UnsupportedPersistence
+                .store_scene("session", "signal", "summary")
+                .as_mut()
+                .poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+    }
+
+    #[test]
+    fn reflect_cooldown_skip_is_a_successful_empty_optional_result() {
+        let summary =
+            parse_reflect_summary(&json!({"skipped": true, "cooldown_remaining_s": 3600}));
+        assert_eq!(summary.candidates, 0);
+        assert!(!summary.synthesized);
+        assert!(summary.candidate_payloads.is_empty());
+    }
+
+    #[test]
+    fn write_receipts_require_an_exact_nonempty_memory_id() {
+        for response in [
+            json!({}),
+            json!({"memory_id": null}),
+            json!({"memory_id": 7}),
+            json!({"memory_id": ""}),
+            json!({"memory_id": " "}),
+            json!({"memory_id": " id"}),
+        ] {
+            assert!(confirmed_memory_id(&response).is_err(), "{response}");
+        }
+        assert_eq!(
+            confirmed_memory_id(&json!({"memory_id": "id-1"})).unwrap(),
+            "id-1"
+        );
+    }
 
     #[test]
     fn memory_scope_keeps_owner_and_session_as_distinct_exact_identities() {

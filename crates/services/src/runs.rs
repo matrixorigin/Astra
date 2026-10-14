@@ -325,6 +325,24 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
+    /// Intermediate interaction from the exact selected remote invocation.
+    /// This does not finish the tool dispatch or grant execution authority.
+    async fn request_tool_interaction(
+        &self,
+        _user_id: String,
+        _identity: astra_turn_types::ToolInvocationIdentity,
+        _edge_agent_id: String,
+        _physical_workspace_id: String,
+        _interaction: astra_turn_types::ProviderInteractionRequest,
+        _stream_event_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    ) -> Result<astra_turn_types::ProviderInteractionResponse, (StatusCode, Json<ErrorResponse>)>
+    {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Remote tool interactions are unavailable",
+        ))
+    }
+
     async fn resolve_run_interaction(
         &self,
         _run_id: String,
@@ -2115,6 +2133,22 @@ where
             return Err(db_error("admit_session_scoped_run_write", run_id, source));
         }
     }
+    load_run_metadata_after_session_admission_tx(tx, user_id, expected_session_id, run_id).await
+}
+
+/// Load a run after the caller has already admitted and locked the session
+/// execution slot in this transaction.  Keeping this separate from the
+/// public exact-session helper avoids reacquiring the same session and slot
+/// locks for every related run in one collaborator admission/read.
+async fn load_run_metadata_after_session_admission_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<DurableRunRecord>>
+where
+    T: TransactionConnection,
+{
     let sql = format!(
         "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
@@ -2127,6 +2161,69 @@ where
         .await
         .map_err(|source| db_error("load_run_metadata_for_exact_session_tx", run_id, source))?;
     row.map(run_record_from_row).transpose()
+}
+
+async fn load_run_metadata_with_lease_after_session_admission_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<(DurableRunRecord, bool)>>
+where
+    T: TransactionConnection,
+{
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS},
+                CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
+                    AS owner_lease_live
+         FROM agent_runs
+         WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+    );
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(expected_session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "load_run_metadata_with_lease_after_session_admission_tx",
+                run_id,
+                source,
+            )
+        })?;
+    row.map(|row| {
+        let owner_lease_live = row
+            .try_get::<i64, _>("owner_lease_live")
+            .map_err(|source| db_error("decode_run_metadata_owner_lease_live", run_id, source))?;
+        Ok((run_record_from_row(row)?, owner_lease_live == 1))
+    })
+    .transpose()
+}
+
+async fn load_run_metadata_with_lease_for_exact_session_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+) -> DbStoreResult<Option<(DurableRunRecord, bool)>>
+where
+    T: TransactionConnection,
+{
+    match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => return Ok(None),
+        Err(source) => {
+            return Err(db_error("admit_session_scoped_run_write", run_id, source));
+        }
+    }
+    load_run_metadata_with_lease_after_session_admission_tx(
+        tx,
+        user_id,
+        expected_session_id,
+        run_id,
+    )
+    .await
 }
 
 async fn lock_work_interaction_attachment_tx(
@@ -2419,7 +2516,7 @@ pub(crate) async fn activate_execution_resume_tx(
         "insert_execution_resume_custody",
     )
     .await
-    .map_err(Unavailable)?;
+    .map_err(|error| Unavailable(error.to_string()))?;
     // Read authoritative lease time, not an application-clock approximation.
     let resumed =
         load_run_metadata_for_exact_session_tx(tx, &run.user_id, &run.session_id, &run.run_id)
@@ -2863,7 +2960,9 @@ pub enum DurableRunInteractionResolveOutcome {
         reason: DurableRunInteractionAuthorityLoss,
     },
     /// Newer user intent superseded the execution epoch that opened this wait.
-    /// The callback remains auditable, but cannot resume the stale frontier.
+    /// The callback remains auditable, but cannot authorize the stale action.
+    /// The exact live wait is released so its owner can consume guidance;
+    /// the superseded response still has no resumed decision authority.
     Superseded {
         event: serde_json::Value,
         user_intent_event_index: i64,
@@ -3351,11 +3450,50 @@ pub struct RunExecutionBoundaryAuthorizationRequest<'a> {
 /// durable state.
 #[derive(Clone, Copy, Debug)]
 pub struct AtomicRunUserIntentApplyRequest<'a> {
+    pub purpose: UserIntentApplyPurpose<'a>,
+    pub invocation_identity: Option<&'a astra_turn_types::ToolInvocationIdentity>,
     pub user_id: &'a str,
     pub run_id: &'a str,
     pub expected_session_id: &'a str,
     pub expected_owner_generation: u64,
     pub source_event_indices: &'a [i64],
+}
+
+/// Recording an already accepted provider input is not permission for a new
+/// action. The captured dispatch owner fences settlement to that execution.
+#[derive(Clone, Copy, Debug)]
+pub enum UserIntentApplyPurpose<'a> {
+    ModelBoundary,
+    ProviderAcknowledgement {
+        dispatch_owner: &'a str,
+    },
+    /// A conclusive provider refusal releases this source without application.
+    ProviderRejection {
+        dispatch_owner: Option<&'a str>,
+    },
+}
+
+impl<'a> UserIntentApplyPurpose<'a> {
+    fn dispatch_owner(self) -> Option<&'a str> {
+        match self {
+            Self::ModelBoundary => None,
+            Self::ProviderAcknowledgement { dispatch_owner } => Some(dispatch_owner),
+            Self::ProviderRejection { dispatch_owner } => dispatch_owner,
+        }
+    }
+
+    pub fn disposition(self) -> UserIntentStatus {
+        match self {
+            Self::ProviderRejection { .. } => UserIntentStatus::Returned,
+            _ => UserIntentStatus::Applied,
+        }
+    }
+
+    pub fn returning(self) -> Self {
+        Self::ProviderRejection {
+            dispatch_owner: self.dispatch_owner(),
+        }
+    }
 }
 
 /// Typed outcome of applying a bounded set of accepted user-intent facts.
@@ -3366,6 +3504,7 @@ pub enum AtomicRunUserIntentApply {
     Applied { event_indices: Vec<i64> },
     AckRecovered { event_indices: Vec<i64> },
     AlreadyApplied { event_indices: Vec<i64> },
+    Returned { event_indices: Vec<i64> },
     RunTerminalReturned,
     SettlementFenced,
     Inactive { status: String },
@@ -3626,6 +3765,51 @@ pub struct AtomicRunInteractionBatchRegistrationRequest<'a> {
     pub expected_control_epoch: i64,
     pub expected_owner_generation: u64,
     pub events: &'a [serde_json::Value],
+}
+
+/// Credential-free correlation facts, not an execution or provider owner.
+/// Registration and resolution revalidate these under the existing Run lock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInvocationInteractionOrigin {
+    pub identity: astra_turn_types::ToolInvocationIdentity,
+    pub edge_agent_id: String,
+    /// Stable checkout identity used across Edge reconnects. The executor
+    /// label above remains audit context, but is connection-scoped and cannot
+    /// authorize a resumed interaction on its own.
+    pub physical_workspace_id: String,
+    pub descriptor: astra_turn_types::ResolvedToolDescriptorRef,
+    pub execution_binding_generation: u64,
+    pub owner_generation: u64,
+    pub control_epoch: i64,
+    /// Copied from the run-start restrictions while the origin is derived.
+    /// Interaction callers must not reload and decode the full run journal
+    /// just to recover this immutable admission fact.
+    pub execution_work_deadline_unix_ms: Option<u64>,
+}
+
+fn tool_interaction_origin(
+    event: &serde_json::Value,
+) -> Result<Option<ToolInvocationInteractionOrigin>, ToolInteractionAdmissionError> {
+    event
+        .pointer("/data/tool_invocation_origin")
+        .map(|origin| {
+            serde_json::from_value(origin.clone())
+                .map_err(|_| ToolInteractionAdmissionError::Unproven)
+        })
+        .transpose()
+}
+
+#[derive(Debug, Error)]
+pub enum ToolInteractionAdmissionError {
+    #[error("durable tool interaction authority is unavailable")]
+    Unsupported,
+    #[error("native stage execution deadline expired")]
+    DeadlineExpired,
+    #[error("remote interaction is not bound to the exact active invocation and selected Edge")]
+    Unproven,
+    #[error(transparent)]
+    Store(#[from] DatabaseRunStateStoreError),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4670,7 +4854,8 @@ pub(crate) async fn admit_run_action_in_existing_transaction(
         std::slice::from_ref(&event_row),
         "insert_transactional_action_admission",
     )
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
 
     Ok(TransactionalRunActionAdmission::Granted {
         event_index,
@@ -5108,8 +5293,13 @@ fn validate_atomic_terminal_return_prefix(
     actual_prefix: Vec<AtomicTerminalEventRow>,
     first_event_idx: i64,
     expected_batch_id: &str,
+    native_guidance_unconfirmed: bool,
 ) -> AtomicTerminalReturnPrefixResolution {
-    let expected = terminal_user_intent_return_events(durable_intent_history_before_prefix, true);
+    let expected = terminal_user_intent_return_events(
+        durable_intent_history_before_prefix,
+        true,
+        native_guidance_unconfirmed,
+    );
     if actual_prefix.len() != expected.len() {
         return AtomicTerminalReturnPrefixResolution::Conflict(
             "terminal user-intent return count mismatch".to_string(),
@@ -5188,6 +5378,391 @@ pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
     })
 }
 
+/// Association facts live on the first real child run, not on a second
+/// collaborator lifecycle or a process-local registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaboratorProvider {
+    Codex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+// Credential-free association locator only. It cannot admit execution or
+// replace SessionExecutionBindingV1 / a provider descriptor or decision.
+pub enum CollaboratorExecutionBoundary {
+    UserRunner { runner_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorNativeExecutionLocator {
+    pub descriptor: astra_turn_types::ResolvedToolDescriptorRef,
+    pub public_tool_name: String,
+    pub requested_model: Option<String>,
+    /// Descriptor semantic baseline, not an invocation decision or authority.
+    pub policy_content_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorAssociation {
+    pub provider: CollaboratorProvider,
+    pub execution_boundary: CollaboratorExecutionBoundary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorStageAdmission {
+    pub anchor_run_id: String,
+    pub source_message_id: String,
+    /// Immutable intent digest, excluding the newly proposed child run ID.
+    pub request_fingerprint: String,
+    /// Digest of this stage's current execution admission. It is deliberately
+    /// stage-scoped: replacing a compatible local client must not invalidate
+    /// the stable collaborator association, but the new stage still records
+    /// the exact descriptor and policy that admitted it.
+    pub execution_identity_fingerprint: String,
+    /// Credential-free native selection for this stage, not execution authority.
+    pub native_execution: CollaboratorNativeExecutionLocator,
+    pub expected_previous_stage_run_id: Option<String>,
+    pub expected_parent_generation: u64,
+    pub association: CollaboratorAssociation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorStageReceipt {
+    pub anchor_run_id: String,
+    pub source_message_id: String,
+    pub run_id: String,
+    pub owner_generation: u64,
+    /// Observation of an already committed source message. Never convert
+    /// this to fresh RunExecutionAuthority; reconcile the returned run ID.
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+/// An acknowledged native session is independent of task success. Only an
+/// exact dispatched, settled success/failure invocation carrying this typed
+/// metadata can establish the association; rejection/unknown cannot.
+pub const COLLABORATOR_NATIVE_SESSION_METADATA_KEY: &str = "collaborator_native_session";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaboratorNativeSession {
+    pub anchor_run_id: String,
+    pub provider: CollaboratorProvider,
+    pub native_session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableCollaboratorAssociation {
+    pub association: CollaboratorAssociation,
+    pub latest_stage: CollaboratorStageReceipt,
+    pub latest_native_execution: CollaboratorNativeExecutionLocator,
+    pub native_session: Option<CollaboratorNativeSession>,
+}
+
+#[derive(Debug, Error)]
+pub enum CollaboratorStoreError {
+    #[error("collaborator admission is unsupported by this store")]
+    Unsupported,
+    #[error("collaborator admission deadline expired before creation")]
+    DeadlineExpired,
+    #[error("invalid collaborator admission field: {field}")]
+    InvalidAdmission { field: &'static str },
+    #[error("collaborator session is unavailable or not owned by this tenant")]
+    SessionUnavailable,
+    #[error("collaborator run is unavailable in the authorized session: {run_id}")]
+    RunUnavailable { run_id: String },
+    #[error("collaborator association conflicts: {anchor_run_id}")]
+    AssociationConflict { anchor_run_id: String },
+    #[error("collaborator source message conflicts: {source_message_id}")]
+    SourceMessageConflict { source_message_id: String },
+    #[error("collaborator previous stage changed: {anchor_run_id}")]
+    PreviousStageChanged { anchor_run_id: String },
+    #[error("collaborator previous stage is not terminal: {run_id}")]
+    PreviousStageActive { run_id: String },
+    #[error("collaborator stage has an unsettled invocation: {run_id}")]
+    UnsettledDispatch { run_id: String },
+    #[error("collaborator parent execution is no longer current: {run_id}")]
+    ParentNotCurrent { run_id: String },
+    #[error("collaborator native session has no acknowledged durable binding: {anchor_run_id}")]
+    NativeSessionUnbound { anchor_run_id: String },
+    #[error("collaborator native session acknowledgement is unproven")]
+    NativeSessionUnproven,
+    #[error(
+        "collaborator creation outcome is unknown: {anchor_run_id}, source_message_id={source_message_id}"
+    )]
+    CommitUnknown {
+        anchor_run_id: String,
+        source_message_id: String,
+    },
+    #[error(transparent)]
+    Store(#[from] DatabaseRunStateStoreError),
+    // Existing run/event helpers still expose String errors. Preserve them as
+    // opaque diagnostics; never classify or retry by matching their text.
+    #[error("existing run persistence operation failed: {0}")]
+    Persistence(String),
+}
+
+impl From<String> for CollaboratorStoreError {
+    fn from(error: String) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+impl CollaboratorStoreError {
+    /// Binding records settled history. Typed persistence uncertainty must not
+    /// discard that history; decoding/authority failures still fail closed.
+    pub fn native_binding_persistence_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::CommitUnknown { .. } => Some("commit_unknown"),
+            Self::Store(DatabaseRunStateStoreError::Database { source, .. })
+                if !matches!(
+                    source,
+                    sqlx::Error::ColumnDecode { .. }
+                        | sqlx::Error::ColumnNotFound(_)
+                        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+                        | sqlx::Error::Decode(_)
+                        | sqlx::Error::TypeNotFound { .. }
+                        | sqlx::Error::RowNotFound
+                ) =>
+            {
+                Some("persistence")
+            }
+            _ => None,
+        }
+    }
+}
+
+const COLLABORATOR_ASSOCIATED_EVENT: &str = "collaborator_associated";
+const COLLABORATOR_STAGE_EVENT: &str = "collaborator_stage_admitted";
+const COLLABORATOR_NATIVE_SESSION_EVENT: &str = "collaborator_native_session_bound";
+
+/// Terminal-only projection of existing admitted descriptor and invocation
+/// facts. It is not another input ledger and adds no steady-state polling.
+fn has_unsettled_guidance(intents: &[serde_json::Value]) -> bool {
+    terminal_user_intent_return_events(intents, true, false)
+        .iter()
+        .any(|event| {
+            event.pointer("/data/delivery")
+                == Some(&serde_json::json!(
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun
+                ))
+        })
+}
+
+async fn native_guidance_is_unconfirmed<'e, E>(
+    executor: E,
+    user_id: &str,
+    run_id: &str,
+    intents: &[serde_json::Value],
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    if !has_unsettled_guidance(intents) {
+        return Ok(false);
+    }
+    let uncertain: i64 = sqlx::query_scalar(
+        "SELECT CAST(EXISTS (
+           SELECT 1 FROM tool_invocation_ledger invocation
+           JOIN agent_run_events stage ON stage.user_id = invocation.user_id
+             AND stage.session_id = invocation.session_id AND stage.run_id = invocation.run_id
+             AND stage.event_type = 'collaborator_stage_admitted'
+           WHERE invocation.user_id = ? AND invocation.run_id = ?
+             AND JSON_EXTRACT(stage.payload_json, '$.admission.native_execution.descriptor')
+               = JSON_EXTRACT(JSON_UNQUOTE(invocation.fingerprint_json), '$.tool.descriptor')
+             AND invocation.dispatch_certainty <> 'not_dispatched'
+             AND (invocation.state IN ('dispatched', 'outcome_unknown')
+               OR invocation.dispatch_certainty = 'unknown'
+               OR JSON_UNQUOTE(JSON_EXTRACT(JSON_UNQUOTE(invocation.outcome_json), '$.result.metadata.guidance_disposition')) = 'unconfirmed')
+         ) AS SIGNED)",
+    ).bind(user_id).bind(run_id).fetch_one(executor).await?;
+    Ok(uncertain != 0)
+}
+
+/// Replay reads immutable admission and the committed return prefix, not a
+/// ledger outcome that late physical completion can legitimately change.
+async fn native_stage_was_admitted<'e, E>(
+    executor: E,
+    user_id: &str,
+    run_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT CAST(EXISTS (SELECT 1 FROM agent_run_events
+         WHERE user_id = ? AND run_id = ? AND event_type = 'collaborator_stage_admitted'
+           AND JSON_EXTRACT(payload_json, '$.admission.native_execution.descriptor') IS NOT NULL) AS SIGNED)",
+    ).bind(user_id).bind(run_id).fetch_one(executor).await?;
+    Ok(admitted != 0)
+}
+
+fn validate_collaborator_admission(
+    record: &DurableRunRecord,
+    admission: &CollaboratorStageAdmission,
+) -> Result<(), CollaboratorStoreError> {
+    let locator = &admission.native_execution;
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 256
+            && value.trim() == value
+            && !value.chars().any(char::is_control)
+    };
+    if !valid(&locator.public_tool_name)
+        || !valid(&locator.policy_content_id)
+        || locator
+            .requested_model
+            .as_deref()
+            .is_some_and(|model| !valid(model))
+    {
+        return Err(CollaboratorStoreError::InvalidAdmission {
+            field: "native_execution",
+        });
+    }
+    for (field, value) in [
+        ("anchor_run_id", admission.anchor_run_id.as_str()),
+        ("source_message_id", admission.source_message_id.as_str()),
+        (
+            "request_fingerprint",
+            admission.request_fingerprint.as_str(),
+        ),
+        (
+            "execution_identity_fingerprint",
+            admission.execution_identity_fingerprint.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() || value.len() > 512 {
+            return Err(CollaboratorStoreError::InvalidAdmission { field });
+        }
+    }
+    if record.parent_run_id.is_none()
+        || record.retry_of.is_some()
+        || record.status != STATUS_RUNNING
+        || record.run_generation > i64::MAX as u64
+        || admission.expected_parent_generation > i64::MAX as u64
+    {
+        return Err(CollaboratorStoreError::InvalidAdmission { field: "child_run" });
+    }
+    match &admission.association.execution_boundary {
+        CollaboratorExecutionBoundary::UserRunner { runner_id }
+            if runner_id.trim().is_empty() || runner_id.len() > 512 =>
+        {
+            return Err(CollaboratorStoreError::InvalidAdmission { field: "runner_id" });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collaborator_source_key(source_message_id: &str) -> String {
+    format!(
+        "collaborator-stage:{:x}",
+        Sha256::digest(source_message_id.as_bytes())
+    )
+}
+
+fn collaborator_replay_receipt(
+    event: &serde_json::Value,
+    admission: &CollaboratorStageAdmission,
+) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+    let original: CollaboratorStageAdmission = decode_collaborator_fact(event, "admission")?;
+    if original.anchor_run_id != admission.anchor_run_id
+        || original.association != admission.association
+        || original.source_message_id != admission.source_message_id
+        || original.request_fingerprint != admission.request_fingerprint
+        || original.execution_identity_fingerprint != admission.execution_identity_fingerprint
+        || original.native_execution != admission.native_execution
+        || original.expected_previous_stage_run_id != admission.expected_previous_stage_run_id
+    {
+        return Err(CollaboratorStoreError::SourceMessageConflict {
+            source_message_id: admission.source_message_id.clone(),
+        });
+    }
+    let mut receipt: CollaboratorStageReceipt = decode_collaborator_fact(event, "receipt")?;
+    if receipt.anchor_run_id != admission.anchor_run_id
+        || receipt.source_message_id != admission.source_message_id
+    {
+        return Err(CollaboratorStoreError::AssociationConflict {
+            anchor_run_id: admission.anchor_run_id.clone(),
+        });
+    }
+    receipt.replayed = true;
+    Ok(receipt)
+}
+
+async fn admit_collaborator_session_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), CollaboratorStoreError> {
+    crate::storage::admit_session_execution_write_with_facts(tx, session_id, user_id)
+        .await
+        .map(|_| ())
+        .map_err(|source| match source {
+            sqlx::Error::RowNotFound => CollaboratorStoreError::SessionUnavailable,
+            source => db_error("admit_collaborator_session", session_id, source).into(),
+        })
+}
+
+/// A routing snapshot is not write authority. Read session/deletion facts in
+/// the same snapshot as the association, without claiming a write fence or
+/// execution slot. Mutations still use `admit_collaborator_session_tx`.
+async fn read_collaborator_session_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), CollaboratorStoreError> {
+    let available: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM agent_sessions sessions
+         LEFT JOIN agent_session_lifecycle_fences fences
+           ON fences.user_id = sessions.user_id AND fences.session_id = sessions.session_id
+         WHERE sessions.user_id = ? AND sessions.session_id = ?
+           AND sessions.status <> 'deleting'
+           AND fences.delete_requested_at IS NULL AND fences.database_deleted_at IS NULL
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| db_error("read_collaborator_session", session_id, source))?;
+    available
+        .map(|_| ())
+        .ok_or(CollaboratorStoreError::SessionUnavailable)
+}
+
+fn collaborator_json<T: Serialize>(value: &T) -> Result<serde_json::Value, CollaboratorStoreError> {
+    serde_json::to_value(value).map_err(|source| {
+        DatabaseRunStateStoreError::Json {
+            operation: "encode_collaborator_fact",
+            entity: "agent_run_events".into(),
+            source,
+        }
+        .into()
+    })
+}
+
+fn decode_collaborator_fact<T: serde::de::DeserializeOwned>(
+    event: &serde_json::Value,
+    field: &str,
+) -> Result<T, CollaboratorStoreError> {
+    serde_json::from_value(event.get(field).cloned().unwrap_or(serde_json::Value::Null)).map_err(
+        |source| {
+            DatabaseRunStateStoreError::Json {
+                operation: "decode_collaborator_fact",
+                entity: field.into(),
+                source,
+            }
+            .into()
+        },
+    )
+}
+
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
     async fn request_permission_mode(
@@ -5229,6 +5804,73 @@ pub trait RunStateStore: Send + Sync {
 
     /// Insert a new run record.
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
+
+    /// Derive correlation from the real dispatched invocation and original
+    /// Run admission, never from a client's generation or decision snapshot.
+    /// The interaction commit must independently revalidate this observation.
+    async fn derive_tool_interaction_origin(
+        &self,
+        _identity: &astra_turn_types::ToolInvocationIdentity,
+        _edge_agent_id: &str,
+        _physical_workspace_id: &str,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        Err(ToolInteractionAdmissionError::Unsupported)
+    }
+
+    /// RunEngine's alternative to ordinary insert, not an additional child
+    /// creation call. The child and association receipt commit together.
+    async fn insert_run_with_collaborator_stage(
+        &self,
+        _record: DurableRunRecord,
+        _admission: CollaboratorStageAdmission,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    async fn load_collaborator_association(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _anchor_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    /// Resolve the stable association for its current stage run. The
+    /// association is deliberately stored on the stable anchor, while user
+    /// guidance is addressed to the latest stage run. This control-plane
+    /// lookup is not part of ordinary turn assembly.
+    async fn load_collaborator_association_for_stage(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _stage_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    async fn confirm_collaborator_native_session(
+        &self,
+        _identity: &astra_turn_types::ToolInvocationIdentity,
+        _native_session: &CollaboratorNativeSession,
+        _expected_owner_generation: u64,
+    ) -> Result<(), CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
+
+    /// Repair only a missing association from an existing settled receipt.
+    /// This records history and never grants execution or renews ownership.
+    async fn recover_collaborator_native_session(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _anchor_run_id: &str,
+        _expected_predecessor_run_id: &str,
+        _expected_owner_generation: u64,
+    ) -> Result<Option<CollaboratorNativeSession>, CollaboratorStoreError> {
+        Err(CollaboratorStoreError::Unsupported)
+    }
 
     /// Insert a run without allowing durable admission to exceed the caller's
     /// execution deadline. Implementations with an authoritative store should
@@ -6200,6 +6842,7 @@ impl InMemoryRunStateStore {
                     let mut terminal_returns = terminal_user_intent_return_events(
                         &run.events,
                         transition_releases_user_intent_ownership(status, events),
+                        false,
                     );
                     terminal_returns.extend_from_slice(events);
                     let new_events = new_idempotent_events(&run.events, &terminal_returns);
@@ -6943,11 +7586,10 @@ pub fn normalized_run_user_intent_content(input: &serde_json::Value) -> Option<S
     }
 }
 
-fn user_intent_disposition_event_from_source(
+fn validated_user_intent_source(
     source_event_index: i64,
     source: &serde_json::Value,
-    status: UserIntentStatus,
-) -> Result<serde_json::Value, String> {
+) -> Result<(&str, &serde_json::Value, &serde_json::Value, String), String> {
     if extract_event_type(source) != "user_intent" {
         return Err(format!(
             "event index {source_event_index} is not a user intent"
@@ -6963,14 +7605,20 @@ fn user_intent_disposition_event_from_source(
         .ok_or_else(|| format!("user intent event {source_event_index} has no intent_id"))?;
     let delivery = data
         .get("delivery")
-        .cloned()
         .ok_or_else(|| format!("user intent event {source_event_index} has no delivery"))?;
-    let input = data
-        .get("input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let content = normalized_run_user_intent_content(&input)
+    let input = data.get("input").unwrap_or(&serde_json::Value::Null);
+    let content = normalized_run_user_intent_content(input)
         .ok_or_else(|| format!("user intent event {source_event_index} has no content"))?;
+    Ok((intent_id, delivery, input, content))
+}
+
+fn user_intent_disposition_event_from_source(
+    source_event_index: i64,
+    source: &serde_json::Value,
+    status: UserIntentStatus,
+) -> Result<serde_json::Value, String> {
+    let (intent_id, delivery, input, content) =
+        validated_user_intent_source(source_event_index, source)?;
     let event_type = match status {
         UserIntentStatus::Applied => "user_intent_applied",
         UserIntentStatus::Returned => "user_intent_returned",
@@ -6994,12 +7642,48 @@ fn user_intent_disposition_event_from_source(
     }))
 }
 
+fn invocation_guidance_is_valid(index: i64, event: &serde_json::Value) -> bool {
+    extract_event_type(event) == "user_intent"
+        && event
+            .pointer("/data/delivery")
+            .and_then(serde_json::Value::as_str)
+            == Some("guide_current_run")
+        && validated_user_intent_source(index, event).is_ok()
+}
+
+fn invocation_supersession_scope_key(user_id: &str, session_id: &str, run_id: &str) -> String {
+    sha256_hex(
+        &serde_json::to_vec(&("invocation_supersession", user_id, session_id, run_id))
+            .expect("a tuple of strings is JSON serializable"),
+    )
+}
+
+fn projected_invocation_supersession_scope_key(
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    index: i64,
+    event: &serde_json::Value,
+) -> Option<String> {
+    let indexed = match extract_event_type(event).as_str() {
+        "action_admission_granted" => true,
+        "user_intent" => !invocation_guidance_is_valid(index, event),
+        _ => false,
+    };
+    indexed.then(|| invocation_supersession_scope_key(user_id, session_id, run_id))
+}
+
 fn validate_user_intent_apply_request(
     request: AtomicRunUserIntentApplyRequest<'_>,
 ) -> Result<Vec<i64>, String> {
     validate_expected_run_session_id(request.expected_session_id)?;
     if request.user_id.trim().is_empty() || request.run_id.trim().is_empty() {
         return Err("atomic user-intent apply requires user and run identities".to_string());
+    }
+    if request.purpose.disposition() == UserIntentStatus::Returned
+        && request.invocation_identity.is_none()
+    {
+        return Err("provider rejection requires exact invocation proof".to_string());
     }
     let mut indices = request.source_event_indices.to_vec();
     indices.sort_unstable();
@@ -7107,6 +7791,7 @@ fn run_events_have_unsettled_user_intent(events: &[serde_json::Value]) -> bool {
 fn terminal_user_intent_return_events(
     existing: &[serde_json::Value],
     releases_executor_ownership: bool,
+    native_guidance_unconfirmed: bool,
 ) -> Vec<serde_json::Value> {
     if !releases_executor_ownership {
         return Vec::new();
@@ -7147,6 +7832,14 @@ fn terminal_user_intent_return_events(
                 return None;
             }
             let delivery = data.get("delivery")?.clone();
+            if native_guidance_unconfirmed
+                && delivery
+                    == serde_json::json!(astra_turn_types::UserIntentDelivery::GuideCurrentRun)
+            {
+                // Missing Applied is not evidence of non-delivery to a
+                // native provider. Preserve unresolved custody, not a retry.
+                return None;
+            }
             let input = data.get("input")?.clone();
             let content = input
                 .get("content")
@@ -7733,7 +8426,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 return Ok(false);
             };
             cancellation_requests.insert((request.user_id.to_string(), request.run_id.to_string()));
-            let mut events_to_commit = terminal_user_intent_return_events(&run.events, true);
+            let mut events_to_commit = terminal_user_intent_return_events(&run.events, true, false);
             events_to_commit.push(terminal_event);
             let new_events = new_idempotent_events(&run.events, &events_to_commit);
             apply_in_memory_status_transition(&mut slots, run, STATUS_CANCELLED, None, None, None)?;
@@ -8077,6 +8770,15 @@ impl RunStateStore for InMemoryRunStateStore {
             )?;
             expected.push((*source_index, applied, returned));
         }
+        if (request.purpose.dispatch_owner().is_some()
+            || request.purpose.disposition() == UserIntentStatus::Returned)
+            && expected.iter().any(|(_, applied, _)| {
+                applied.pointer("/data/delivery")
+                    != Some(&serde_json::json!(UserIntentDelivery::GuideCurrentRun))
+            })
+        {
+            return Ok(AtomicRunUserIntentApply::IdentityConflict);
+        }
         let unique_intent_count = expected
             .iter()
             .filter_map(|(_, applied, _)| extract_optional_string(applied, "idempotency_key"))
@@ -8107,6 +8809,9 @@ impl RunStateStore for InMemoryRunStateStore {
                 return Ok(AtomicRunUserIntentApply::IdentityConflict);
             }
             if let Some((position, actual)) = existing_applied {
+                if request.purpose.disposition() == UserIntentStatus::Returned {
+                    return Ok(AtomicRunUserIntentApply::IdentityConflict);
+                }
                 if !run_events_have_same_immutable_payload(actual, applied) {
                     return Ok(AtomicRunUserIntentApply::IdentityConflict);
                 }
@@ -8122,14 +8827,26 @@ impl RunStateStore for InMemoryRunStateStore {
                 }
                 returned_count += 1;
             } else {
-                pending.push(applied.clone());
+                pending.push(
+                    if request.purpose.disposition() == UserIntentStatus::Returned {
+                        returned.clone()
+                    } else {
+                        applied.clone()
+                    },
+                );
                 pending_source_indices.push(*source_index);
             }
         }
 
         if returned_count > 0 {
             return Ok(if returned_count == expected.len() {
-                AtomicRunUserIntentApply::RunTerminalReturned
+                if request.purpose.disposition() == UserIntentStatus::Returned {
+                    AtomicRunUserIntentApply::Returned {
+                        event_indices: Vec::new(),
+                    }
+                } else {
+                    AtomicRunUserIntentApply::RunTerminalReturned
+                }
             } else {
                 AtomicRunUserIntentApply::IdentityConflict
             });
@@ -8139,10 +8856,13 @@ impl RunStateStore for InMemoryRunStateStore {
                 event_indices: already_applied,
             });
         }
-        if !matches!(run.status.as_str(), STATUS_RUNNING | STATUS_WAITING) {
+        if run.status != STATUS_RUNNING {
             return Ok(AtomicRunUserIntentApply::Inactive {
                 status: run.status.clone(),
             });
+        }
+        if request.invocation_identity.is_some() {
+            return Err(ToolInteractionAdmissionError::Unsupported.to_string());
         }
         let latest_fence = latest_user_intent_admission_transition(&run.events);
         if let Some(latest_fence) = latest_fence {
@@ -8177,15 +8897,26 @@ impl RunStateStore for InMemoryRunStateStore {
             .or_insert_with(|| build_run_display_projection(run, None, None));
         if projection.projection_event_idx <= run.last_event_idx {
             projection.projection_event_idx = run.last_event_idx;
-            projection.latest_event_type = Some("user_intent_applied".to_string());
+            let event_type = if request.purpose.disposition() == UserIntentStatus::Returned {
+                "user_intent_returned"
+            } else {
+                "user_intent_applied"
+            };
+            projection.latest_event_type = Some(event_type.to_string());
             projection.projection_hash = event_metadata_projection_patch_hash(
                 &run.run_id,
                 run.last_event_idx,
-                Some("user_intent_applied"),
+                Some(event_type),
             );
             projection.updated_at = run.updated_at.clone();
         }
-        Ok(AtomicRunUserIntentApply::Applied { event_indices })
+        Ok(
+            if request.purpose.disposition() == UserIntentStatus::Returned {
+                AtomicRunUserIntentApply::Returned { event_indices }
+            } else {
+                AtomicRunUserIntentApply::Applied { event_indices }
+            },
+        )
     }
 
     async fn load_run_status_snapshot(
@@ -8676,6 +9407,13 @@ impl RunStateStore for InMemoryRunStateStore {
         request: AtomicRunInteractionBatchRegistrationRequest<'_>,
     ) -> Result<AtomicRunInteractionBatchRegistration, String> {
         let kind = validate_interaction_batch_registration(request)?;
+        if request
+            .events
+            .iter()
+            .any(|event| event.pointer("/data/tool_invocation_origin").is_some())
+        {
+            return Err(ToolInteractionAdmissionError::Unproven.to_string());
+        }
         let updated = {
             let action_fence = self.action_fence_for(request.user_id, request.run_id);
             let _action_fence = action_fence.lock_owned().await;
@@ -9088,7 +9826,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     request.run_id
                 ));
             }
-            let mut events = terminal_user_intent_return_events(&run.events, true);
+            let mut events = terminal_user_intent_return_events(&run.events, true, false);
             events.push(terminal_event);
             apply_in_memory_status_transition(&mut slots, run, STATUS_CANCELLED, None, None, None)?;
             run.error_code = None;
@@ -9500,7 +10238,9 @@ impl RunStateStore for InMemoryRunStateStore {
                                 && extract_event_type(event) == "user_intent"
                         })
                     {
-                        resume_wait = false;
+                        // Release only this interaction's exact live wait. The
+                        // superseded receipt still fences its stale response; the
+                        // executor must consume guidance before its next action.
                         superseded_by = Some(index as i64);
                     }
                 } else {
@@ -10791,6 +11531,10 @@ pub struct DatabaseRunStateStore {
     owner_pod_id: String,
     lease_ttl: Duration,
     session_execution_slot_stale_after: Duration,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    native_binding_insert_failure_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    native_binding_insert_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     interaction_commit_ack_loss_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -10884,7 +11628,7 @@ const GUIDANCE_LATEST_FENCE_SELECT_SQL: &str =
      ORDER BY event_idx DESC LIMIT 1 FOR UPDATE";
 
 const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, event_type, event_id, idempotency_key, event_hash, \
-            producer_pod_id, payload_json \
+            producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
 const RUN_STATUS_BINDING_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM agent_run_events
@@ -11312,7 +12056,8 @@ impl DatabaseRunStateStore {
                 "transition_run_status_with_events_insert_events",
             )
             .await;
-            if let Err(mut detail) = insert_result {
+            if let Err(error) = insert_result {
+                let mut detail = error.to_string();
                 match tx.rollback().await {
                     Ok(()) => connection.release(),
                     Err(rollback_error) => {
@@ -11419,6 +12164,12 @@ impl DatabaseRunStateStore {
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
             session_execution_slot_stale_after: Self::DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER,
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            native_binding_insert_failure_once: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            native_binding_insert_barrier: None,
             #[cfg(test)]
             interaction_commit_ack_loss_once: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -11858,6 +12609,22 @@ impl DatabaseRunStateStore {
         self
     }
 
+    /// Exercise the real INSERT error boundary without mutating shared schema.
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn fail_next_native_binding_insert_for_test(&self) {
+        self.native_binding_insert_failure_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn with_native_binding_insert_barrier_for_test(
+        mut self,
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.native_binding_insert_barrier = Some(barrier);
+        self
+    }
+
     #[cfg(test)]
     fn with_interaction_commit_ack_loss_once(self) -> Self {
         self.interaction_commit_ack_loss_once
@@ -12173,7 +12940,8 @@ impl DatabaseRunStateStore {
             &interaction_closure_rows,
             "atomic_terminal_settlement_insert_interaction_closures",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         if !event_rows.is_empty() {
             Self::insert_run_event_rows_tx(
                 tx,
@@ -12181,7 +12949,8 @@ impl DatabaseRunStateStore {
                 &event_rows,
                 "atomic_terminal_settlement_insert_events",
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         }
 
         Ok(Some(AtomicRunTerminalSettlementCommit {
@@ -12322,7 +13091,13 @@ impl DatabaseRunStateStore {
                         run.last_event_idx,
                     )
                     .await?;
-                if !terminal_user_intent_return_events(&durable_intent_history, true).is_empty() {
+                let unconfirmed = has_unsettled_guidance(&durable_intent_history)
+                    && native_stage_was_admitted(self.pool.get(), request.user_id, request.run_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                if !terminal_user_intent_return_events(&durable_intent_history, true, unconfirmed)
+                    .is_empty()
+                {
                     return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
                         "terminal user-intent return prefix missing for run {}",
                         request.run_id
@@ -12495,11 +13270,23 @@ impl DatabaseRunStateStore {
         let durable_intent_history = self
             .load_atomic_terminal_intent_history_through(user_id, run_id, preceding_non_return_idx)
             .await?;
+        let unconfirmed = has_unsettled_guidance(&durable_intent_history)
+            && native_stage_was_admitted(self.pool.get(), user_id, run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        let unconfirmed = unconfirmed
+            && !actual_prefix.iter().any(|(_, event)| {
+                event.pointer("/data/delivery")
+                    == Some(&serde_json::json!(
+                        astra_turn_types::UserIntentDelivery::GuideCurrentRun
+                    ))
+            });
         Ok(validate_atomic_terminal_return_prefix(
             &durable_intent_history,
             actual_prefix,
             prefix_start_idx,
             expected_settlement_batch_id,
+            unconfirmed,
         ))
     }
 
@@ -13027,9 +13814,13 @@ impl DatabaseRunStateStore {
             .into_iter()
             .map(|row| decode_run_event_payload(&row, run_id))
             .collect::<DbStoreResult<Vec<_>>>()?;
+        let unconfirmed = native_guidance_is_unconfirmed(&mut **tx, user_id, run_id, &existing)
+            .await
+            .map_err(|source| db_error("terminal_native_guidance_disposition", run_id, source))?;
         Ok(terminal_user_intent_return_events(
             &existing,
             releases_executor_ownership,
+            unconfirmed,
         ))
     }
     pub async fn acquire_owner_lease(
@@ -13520,7 +14311,7 @@ impl DatabaseRunStateStore {
         run_id: &str,
         rows: &[RunEventInsertRow],
         operation: &'static str,
-    ) -> Result<(), String> {
+    ) -> DbStoreResult<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -13528,7 +14319,7 @@ impl DatabaseRunStateStore {
             "INSERT INTO agent_run_events \
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
               subject_run_id, interaction_request_id, idempotency_key, event_hash, \
-              producer_pod_id, request_id, payload_json, created_at) ",
+              producer_pod_id, request_id, payload_json, invocation_supersession_scope_key, created_at) ",
         );
         builder.push_values(rows, |mut row, event| {
             row.push_bind(&event.id)
@@ -13546,6 +14337,7 @@ impl DatabaseRunStateStore {
                 .push_bind(&event.producer_pod_id)
                 .push_bind(&event.request_id)
                 .push_bind(&event.payload_json)
+                .push_bind(&event.invocation_supersession_scope_key)
                 .push("NOW(6)");
         });
         builder.push(matrixone_null_shape_comment(
@@ -13555,7 +14347,7 @@ impl DatabaseRunStateStore {
             .build()
             .execute(&mut **tx)
             .await
-            .map_err(|source| db_error(operation, run_id, source).to_string())?;
+            .map_err(|source| db_error(operation, run_id, source))?;
         Ok(())
     }
 
@@ -13566,7 +14358,7 @@ impl DatabaseRunStateStore {
     ) -> Result<bool, String> {
         for expected in rows {
             let actual = sqlx::query(
-                "SELECT run_id, event_idx, event_hash FROM agent_run_events
+                "SELECT run_id, event_idx, event_hash, invocation_supersession_scope_key FROM agent_run_events
                  WHERE user_id = ? AND id = ? LIMIT 1",
             )
             .bind(&expected.user_id)
@@ -13589,6 +14381,10 @@ impl DatabaseRunStateStore {
             if run_id != expected.run_id
                 || event_idx != expected.event_idx
                 || event_hash != expected.event_hash
+                || actual
+                    .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                    .map_err(|source| db_error(operation, &expected.run_id, source).to_string())?
+                    != expected.invocation_supersession_scope_key
             {
                 return Ok(false);
             }
@@ -13948,13 +14744,7 @@ impl DatabaseRunStateStore {
                 sqlx::Error::Protocol("locked run event counter changed".to_string()),
             ));
         }
-        Self::insert_run_event_rows_tx(&mut tx, run_id, &rows, "insert_run_events_batch")
-            .await
-            .map_err(|error| DatabaseRunStateStoreError::Database {
-                operation: "insert_run_events_batch",
-                entity: run_id.to_string(),
-                source: sqlx::Error::Protocol(error),
-            })?;
+        Self::insert_run_event_rows_tx(&mut tx, run_id, &rows, "insert_run_events_batch").await?;
         let latest_event_type = rows
             .last()
             .expect("committed event batch")
@@ -14432,7 +15222,7 @@ impl DatabaseRunStateStore {
             })?;
         for expected_event in expected_events {
             let actual = sqlx::query(
-                "SELECT run_id, event_idx, event_hash FROM agent_run_events
+                "SELECT run_id, event_idx, event_hash, invocation_supersession_scope_key FROM agent_run_events
                  WHERE user_id = ? AND id = ? LIMIT 1",
             )
             .bind(&expected_event.user_id)
@@ -14478,6 +15268,17 @@ impl DatabaseRunStateStore {
             if run_id != expected_event.run_id
                 || event_idx != expected_event.event_idx
                 || event_hash != expected_event.event_hash
+                || actual
+                    .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                    .map_err(|source| {
+                        db_error(
+                            "reconcile_timed_out_run_start_events",
+                            &expected.run_id,
+                            source,
+                        )
+                        .to_string()
+                    })?
+                    != expected_event.invocation_supersession_scope_key
             {
                 connection.release();
                 return Ok(None);
@@ -14509,13 +15310,930 @@ impl DatabaseRunStateStore {
         Ok(durable_run_start_receipt_matches(expected, &actual).then_some(actual.run_generation))
     }
 
+    /// Called only while holding the canonical Session/Run locks. No local
+    /// callback expectation, caller ACK or provider owner substitutes for
+    /// the live invocation, its admitted control epoch and selected binding.
+    async fn validate_tool_interaction_origin_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        event: &serde_json::Value,
+        require_live_budget: bool,
+    ) -> Result<bool, ToolInteractionAdmissionError> {
+        let Some(origin) = tool_interaction_origin(event)? else {
+            return Ok(false);
+        };
+        if extract_event_type(event) != DurableRunInteractionKind::Provider.required_event_type()
+            || event.pointer("/data/provider_run_owner").is_some()
+        {
+            return Err(ToolInteractionAdmissionError::Unproven);
+        }
+        let actual = Self::load_tool_interaction_origin_tx(
+            tx,
+            run,
+            &origin.identity,
+            &origin.edge_agent_id,
+            &origin.physical_workspace_id,
+            require_live_budget,
+        )
+        .await?;
+        if actual != origin {
+            return Err(ToolInteractionAdmissionError::Unproven);
+        }
+        Ok(true)
+    }
+
+    async fn load_tool_interaction_origin_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        edge_agent_id: &str,
+        physical_workspace_id: &str,
+        require_live_budget: bool,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        let mut origin = Self::load_live_tool_invocation_authority_tx(
+            tx,
+            run,
+            identity,
+            require_live_budget,
+            None,
+        )
+        .await?;
+        if edge_agent_id.trim().is_empty() || origin.physical_workspace_id != physical_workspace_id
+        {
+            return Err(ToolInteractionAdmissionError::Unproven);
+        }
+        // A reconnected authenticated runner may have a new transport ID;
+        // the invocation and physical workspace authority remain unchanged.
+        origin.edge_agent_id = edge_agent_id.to_owned();
+        Ok(origin)
+    }
+
+    async fn interaction_superseding_intent_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        control_epoch: i64,
+        invocation_owned: bool,
+    ) -> Result<Option<i64>, String> {
+        if !invocation_owned {
+            return sqlx::query_scalar(
+                "SELECT event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'user_intent'
+                   AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+            )
+            .bind(&run.user_id)
+            .bind(&run.session_id)
+            .bind(&run.run_id)
+            .bind(control_epoch)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| {
+                db_error("interaction_superseding_intent", &run.run_id, source).to_string()
+            });
+        }
+        // The canonical append owner validates immutable source facts once.
+        // Seek the first superseding intent, without fetching guidance bodies
+        // or advancing the original dispatch authority while holding Run locks.
+        let candidate: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT user_id, session_id, run_id, event_idx FROM agent_run_events
+             WHERE invocation_supersession_scope_key = ? AND event_type = 'user_intent' AND event_idx > ?
+             ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(invocation_supersession_scope_key(&run.user_id, &run.session_id, &run.run_id))
+        .bind(control_epoch)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error("interaction_invocation_guidance", &run.run_id, source).to_string()
+        })?;
+        match candidate {
+            None => Ok(None),
+            Some((user, session, id, index))
+                if user == run.user_id
+                    && session == run.session_id
+                    && id == run.run_id
+                    && index > control_epoch =>
+            {
+                Ok(Some(index))
+            }
+            Some(_) => Err("interaction supersession candidate scope mismatch".into()),
+        }
+    }
+
+    async fn validate_invocation_user_intent_apply_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        purpose: UserIntentApplyPurpose<'_>,
+    ) -> Result<(), ToolInteractionAdmissionError> {
+        let rejected = || ToolInteractionAdmissionError::Unproven;
+        if run.status == STATUS_RUNNING || purpose.dispatch_owner().is_some() {
+            Self::load_live_tool_invocation_authority_tx(
+                tx,
+                run,
+                identity,
+                purpose.dispatch_owner().is_none(),
+                purpose.dispatch_owner(),
+            )
+            .await?;
+            return Ok(());
+        }
+        if run.status != STATUS_WAITING
+            || run.waiting_for.as_deref() != Some(DurableRunInteractionKind::Provider.waiting_for())
+        {
+            return Err(rejected());
+        }
+        // Only the exact question owning the current wait may share this
+        // invocation. Guidance application cannot resume or replace that wait.
+        let row: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT waiting.payload_json, required.payload_json,
+               CAST(CASE WHEN EXISTS (SELECT 1 FROM agent_run_events resolved
+                 WHERE resolved.user_id = waiting.user_id AND resolved.session_id = waiting.session_id
+                   AND resolved.run_id = waiting.run_id
+                   AND resolved.interaction_request_id = waiting.interaction_request_id
+                   AND resolved.event_type = 'provider_interaction_resolved') THEN 1 ELSE 0 END AS SIGNED)
+             FROM agent_run_events waiting
+             LEFT JOIN agent_run_events required ON required.user_id = waiting.user_id
+               AND required.session_id = waiting.session_id AND required.run_id = waiting.run_id
+               AND required.interaction_request_id = waiting.interaction_request_id
+               AND required.event_type = 'provider_interaction_required'
+             WHERE waiting.user_id = ? AND waiting.session_id = ? AND waiting.run_id = ?
+               AND waiting.event_type = 'interaction_wait_started'
+               AND JSON_UNQUOTE(JSON_EXTRACT(waiting.payload_json, '$.data.waiting_for')) = 'provider_interaction'
+             ORDER BY waiting.event_idx DESC LIMIT 1",
+        )
+        .bind(&run.user_id).bind(&run.session_id).bind(&run.run_id)
+        .fetch_optional(&mut **tx).await
+        .map_err(|source| db_error("validate_invocation_guidance_question", &run.run_id, source))?;
+        let (wait, required, resolved) = row.ok_or_else(rejected)?;
+        if resolved != 0 {
+            return Err(rejected());
+        }
+        let required = required.ok_or_else(rejected)?;
+        let wait: serde_json::Value = serde_json::from_str(&wait).map_err(|_| rejected())?;
+        let required: serde_json::Value =
+            serde_json::from_str(&required).map_err(|_| rejected())?;
+        let origin = tool_interaction_origin(&required)?.ok_or_else(rejected)?;
+        let authority = interaction_wait_authority(&wait).ok_or_else(rejected)?;
+        if origin.identity != *identity
+            || authority.expected_owner_generation != run.run_generation
+            || authority.expected_owner_pod_id != run.owner_pod_id
+            || authority.expected_control_epoch != origin.control_epoch
+            || interaction_registration_authority(&required)
+                .map(|registration| InteractionWaitAuthority::from(&registration))
+                != Some(authority)
+            || !Self::validate_tool_interaction_origin_tx(tx, run, &required, true).await?
+        {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+
+    async fn load_live_tool_invocation_authority_tx(
+        tx: &mut Transaction<'_, MySql>,
+        run: &DurableRunRecord,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        require_live_budget: bool,
+        settlement_dispatch_owner: Option<&str>,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+        };
+        let rejected = || ToolInteractionAdmissionError::Unproven;
+        if identity.user_id != run.user_id
+            || identity.session_id != run.session_id
+            || identity.run_id != run.run_id
+        {
+            return Err(rejected());
+        }
+        let row: Option<(String, String, u64)> = sqlx::query_as(
+            "SELECT JSON_UNQUOTE(fingerprint_json), JSON_UNQUOTE(decision_json),
+                    CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS UNSIGNED)
+             FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ?
+               AND state = 'dispatched' AND dispatch_certainty = 'dispatched'
+               AND dispatch_owner IS NOT NULL AND dispatch_lease_expires_at >= NOW(6)
+               AND (? IS NULL OR dispatch_owner = ?)
+               AND outcome_json IS NULL AND completion_source_json IS NULL
+               AND EXISTS (SELECT 1 FROM agent_runs active_run
+                 WHERE active_run.user_id = tool_invocation_ledger.user_id
+                   AND active_run.session_id = tool_invocation_ledger.session_id
+                   AND active_run.run_id = tool_invocation_ledger.run_id
+                   AND active_run.run_generation = ?
+                   AND ((active_run.owner_pod_id IS NOT NULL
+                     AND active_run.owner_lease_expires_at >= NOW(6)
+                     AND active_run.status IN ('running', 'waiting')
+                     AND active_run.cancellation_requested_at IS NULL)
+                     OR (? IS NOT NULL AND active_run.status IN ('running', 'waiting', 'paused', 'cancelled')))) FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .bind(settlement_dispatch_owner)
+        .bind(settlement_dispatch_owner)
+        .bind(run.run_generation)
+        .bind(settlement_dispatch_owner)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("validate_tool_interaction_invocation", &run.run_id, source))?;
+        let (fingerprint, decision, now_unix_ms) = row.ok_or_else(rejected)?;
+        let fingerprint: ToolInvocationFingerprint =
+            serde_json::from_str(&fingerprint).map_err(|_| rejected())?;
+        let decision: ToolInvocationDecision =
+            serde_json::from_str(&decision).map_err(|_| rejected())?;
+        let DurableToolReference::Provider { descriptor } = fingerprint.tool else {
+            return Err(rejected());
+        };
+        let admitted_executor_id = decision
+            .snapshot
+            .pointer("/executor/executor_id")
+            .and_then(serde_json::Value::as_str);
+        if fingerprint.policy_decision_id != decision.decision_id
+            || admitted_executor_id.is_none()
+            || admitted_executor_id.is_some_and(|executor_id| executor_id.trim().is_empty())
+        {
+            return Err(rejected());
+        }
+        let kind: ExecutorBindingRequestKind = serde_json::from_value(
+            decision
+                .snapshot
+                .pointer("/executor/kind")
+                .cloned()
+                .ok_or_else(rejected)?,
+        )
+        .map_err(|_| rejected())?;
+        let transport: ToolTransportKindRequest = serde_json::from_value(
+            decision
+                .snapshot
+                .pointer("/executor/transport")
+                .cloned()
+                .ok_or_else(rejected)?,
+        )
+        .map_err(|_| rejected())?;
+        if kind != ExecutorBindingRequestKind::EdgeAgent
+            || !matches!(
+                transport,
+                ToolTransportKindRequest::EdgeWs
+                    | ToolTransportKindRequest::EdgeLedger
+                    | ToolTransportKindRequest::EdgeWsAuthorized
+            )
+        {
+            return Err(rejected());
+        }
+        let action_id = format!("tool_invocation:{}", identity.storage_key());
+        let grant: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT payload_json, invocation_supersession_scope_key FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND event_type = 'action_admission_granted' AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(action_admission_granted_idempotency_key(&action_id))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("validate_tool_interaction_grant", &run.run_id, source))?;
+        let (grant, scope_key) = grant.ok_or_else(rejected)?;
+        if scope_key.as_deref()
+            != Some(
+                invocation_supersession_scope_key(&run.user_id, &run.session_id, &run.run_id)
+                    .as_str(),
+            )
+        {
+            return Err(rejected());
+        }
+        let grant: serde_json::Value = serde_json::from_str(&grant).map_err(|_| rejected())?;
+        let owner_generation = grant
+            .pointer("/data/owner_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(rejected)?;
+        let grant_control_epoch = grant
+            .pointer("/data/expected_control_epoch")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(rejected)?;
+        if owner_generation != run.run_generation
+            || grant_control_epoch < -1
+            || grant
+                .pointer("/data/action_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(action_id.as_str())
+            || grant
+                .pointer("/data/session_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(identity.session_id.as_str())
+        {
+            return Err(rejected());
+        }
+        let control_epoch = grant_control_epoch;
+        let started: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_started'
+             ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("load_tool_interaction_run_binding", &run.run_id, source))?;
+        let started: serde_json::Value =
+            serde_json::from_str(&started.ok_or_else(rejected)?).map_err(|_| rejected())?;
+        let execution_binding_generation = started
+            .pointer("/data/execution_binding_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(rejected)?;
+        let mut execution_work_deadline_unix_ms = None;
+        if let Some(restrictions) = started.pointer("/data/execution_restrictions") {
+            let restrictions: DurableExecutionRestrictions =
+                serde_json::from_value(restrictions.clone()).map_err(|_| rejected())?;
+            restrictions.validate().map_err(|_| rejected())?;
+            let DurableExecutionRestrictions::V1 {
+                execution_work_deadline_unix_ms: work_deadline,
+                ..
+            } = restrictions;
+            execution_work_deadline_unix_ms = work_deadline;
+            if require_live_budget && work_deadline.is_some_and(|deadline| deadline <= now_unix_ms)
+            {
+                return Err(ToolInteractionAdmissionError::DeadlineExpired);
+            }
+        }
+        // Same non-locking Session binding read as dispatch admission: the
+        // live unresolved invocation fences a provider-selection change.
+        let key = SessionKeyV1::owner_session(
+            "server",
+            &identity.user_id,
+            &identity.session_id,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let binding: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation, binding_json FROM session_execution_bindings
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("validate_tool_interaction_binding", &run.run_id, source))?;
+        let (generation, binding) = binding.ok_or_else(rejected)?;
+        let binding: crate::SessionExecutionBindingV1 =
+            serde_json::from_str(&binding).map_err(|_| rejected())?;
+        binding.validate().map_err(|_| rejected())?;
+        if u64::try_from(generation).ok() != Some(execution_binding_generation)
+            || binding.generation != execution_binding_generation
+            || binding.state != crate::SessionExecutionBindingStateV1::Ready
+            || binding.executor.kind != ExecutorBindingRequestKind::EdgeAgent
+        {
+            return Err(rejected());
+        }
+        let edge_agent_id = binding
+            .executor
+            .executor_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(rejected)?;
+        let physical_workspace_id = binding
+            .physical_workspace_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(rejected)?;
+        let dispatched: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM edge_pending_dispatch
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ?
+               AND request_id = ?
+               AND status = 'dispatched' AND result_json IS NULL FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(identity.storage_key())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "validate_tool_interaction_edge_dispatch",
+                &run.run_id,
+                source,
+            )
+        })?;
+        if dispatched.is_none() {
+            return Err(rejected());
+        }
+        Ok(ToolInvocationInteractionOrigin {
+            identity: identity.clone(),
+            edge_agent_id: edge_agent_id.to_string(),
+            physical_workspace_id: physical_workspace_id.to_string(),
+            descriptor,
+            execution_binding_generation,
+            owner_generation,
+            control_epoch,
+            execution_work_deadline_unix_ms,
+        })
+    }
+
+    async fn collaborator_event_tx(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+        event_type: &str,
+        source_key: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, CollaboratorStoreError> {
+        let row = if let Some(source_key) = source_key {
+            sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?
+                   AND idempotency_key = ? LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(anchor_run_id)
+            .bind(event_type)
+            .bind(source_key)
+            .fetch_optional(&mut **tx)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 FORCE INDEX (idx_agent_run_events_control_type_idx)
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = ?
+                 ORDER BY event_idx DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(anchor_run_id)
+            .bind(event_type)
+            .fetch_optional(&mut **tx)
+            .await
+        }
+        .map_err(|source| db_error("load_collaborator_event", anchor_run_id, source))?;
+        row.as_ref()
+            .map(|row| decode_run_event_payload(row, anchor_run_id))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn collaborator_association_tx(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        let mut query =
+            sqlx::QueryBuilder::<MySql>::new("SELECT event_type, payload_json, event_idx FROM (");
+        for (index, event_type) in [
+            COLLABORATOR_ASSOCIATED_EVENT,
+            COLLABORATOR_STAGE_EVENT,
+            COLLABORATOR_NATIVE_SESSION_EVENT,
+        ]
+        .iter()
+        .enumerate()
+        {
+            if index > 0 {
+                query.push(" UNION ALL ");
+            }
+            query.push("(SELECT event_type, payload_json, event_idx FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx) WHERE user_id = ");
+            query.push_bind(user_id);
+            query.push(" AND session_id = ");
+            query.push_bind(session_id);
+            query.push(" AND run_id = ");
+            query.push_bind(anchor_run_id);
+            query.push(" AND event_type = ");
+            query.push_bind(*event_type);
+            query.push(" ORDER BY event_idx DESC LIMIT 1)");
+        }
+        query.push(") AS collaborator_facts");
+        let rows = query
+            .build()
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|source| db_error("load_collaborator_facts", anchor_run_id, source))?;
+        let mut facts = std::collections::BTreeMap::new();
+        for row in rows {
+            let event_type: String = row
+                .try_get("event_type")
+                .map_err(|source| db_error("load_collaborator_facts", anchor_run_id, source))?;
+            facts.insert(event_type, row);
+        }
+        let Some(event) = facts.get(COLLABORATOR_ASSOCIATED_EVENT) else {
+            return Ok(None);
+        };
+        let event = decode_run_event_payload(event, anchor_run_id)?;
+        let association = decode_collaborator_fact(&event, "association")?;
+        let latest = facts.get(COLLABORATOR_STAGE_EVENT).ok_or_else(|| {
+            CollaboratorStoreError::AssociationConflict {
+                anchor_run_id: anchor_run_id.into(),
+            }
+        })?;
+        let latest = decode_run_event_payload(latest, anchor_run_id)?;
+        let latest_admission: CollaboratorStageAdmission =
+            decode_collaborator_fact(&latest, "admission")?;
+        let native_session = facts
+            .get(COLLABORATOR_NATIVE_SESSION_EVENT)
+            .map(|row| {
+                let event = decode_run_event_payload(row, anchor_run_id)?;
+                decode_collaborator_fact(&event, "native_session")
+            })
+            .transpose()?;
+        Ok(Some(DurableCollaboratorAssociation {
+            association,
+            latest_stage: decode_collaborator_fact(&latest, "receipt")?,
+            latest_native_execution: latest_admission.native_execution,
+            native_session,
+        }))
+    }
+
+    /// Called only after insert_run_record's session/lifecycle/slot fence.
+    /// The anchor row serializes all stage writers across nodes and restarts.
+    async fn prepare_collaborator_stage_tx(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        record: &mut DurableRunRecord,
+        admission: &CollaboratorStageAdmission,
+    ) -> Result<
+        (
+            CollaboratorStageReceipt,
+            Option<DurableRunRecord>,
+            Vec<serde_json::Value>,
+        ),
+        CollaboratorStoreError,
+    > {
+        validate_collaborator_admission(record, admission)?;
+        let anchor = load_run_metadata_after_session_admission_tx(
+            tx,
+            &record.user_id,
+            &record.session_id,
+            &admission.anchor_run_id,
+        )
+        .await?;
+        let existing = if anchor.is_some() {
+            Self::collaborator_association_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Some(existing) = &existing {
+            if existing.association != admission.association {
+                return Err(CollaboratorStoreError::AssociationConflict {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                });
+            }
+            if let Some(event) = Self::collaborator_event_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+                COLLABORATOR_STAGE_EVENT,
+                Some(&collaborator_source_key(&admission.source_message_id)),
+            )
+            .await?
+            {
+                let receipt = collaborator_replay_receipt(&event, admission)?;
+                return Ok((receipt, anchor, vec![]));
+            }
+            if admission.expected_previous_stage_run_id.as_deref()
+                != Some(&existing.latest_stage.run_id)
+            {
+                return Err(CollaboratorStoreError::PreviousStageChanged {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                });
+            }
+            let previous = load_run_metadata_after_session_admission_tx(
+                tx,
+                &record.user_id,
+                &record.session_id,
+                &existing.latest_stage.run_id,
+            )
+            .await?
+            .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+                run_id: existing.latest_stage.run_id.clone(),
+            })?;
+            if !durable_run_status_is_terminal(&previous.status) {
+                return Err(CollaboratorStoreError::PreviousStageActive {
+                    run_id: previous.run_id,
+                });
+            }
+            // Terminal run status alone is not evidence that a dispatched
+            // native operation has settled. Ledger preparation/dispatch also
+            // takes this session/run fence, so no new attempt can race here.
+            let unsettled: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND (state IN ('prepared', 'dispatched', 'outcome_unknown')
+                        OR dispatch_certainty = 'unknown') LIMIT 1 FOR UPDATE",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&previous.run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("fence_collaborator_dispatch", &previous.run_id, source))?;
+            if unsettled.is_some() {
+                return Err(CollaboratorStoreError::UnsettledDispatch {
+                    run_id: previous.run_id,
+                });
+            }
+            if existing.native_session.is_none() {
+                return Err(CollaboratorStoreError::NativeSessionUnbound {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                });
+            }
+        } else if anchor.is_some()
+            || admission.anchor_run_id != record.run_id
+            || admission.expected_previous_stage_run_id.is_some()
+        {
+            return Err(CollaboratorStoreError::AssociationConflict {
+                anchor_run_id: admission.anchor_run_id.clone(),
+            });
+        }
+        let parent_id =
+            record
+                .parent_run_id
+                .as_deref()
+                .ok_or(CollaboratorStoreError::InvalidAdmission {
+                    field: "parent_run_id",
+                })?;
+        let parent = load_run_metadata_after_session_admission_tx(
+            tx,
+            &record.user_id,
+            &record.session_id,
+            parent_id,
+        )
+        .await?
+        .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+            run_id: parent_id.into(),
+        })?;
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND run_generation = ? AND owner_pod_id = ?
+               AND owner_lease_expires_at > NOW(6)
+               AND status IN ('running', 'waiting', 'paused'))",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(parent_id)
+        .bind(admission.expected_parent_generation as i64)
+        .bind(&self.owner_pod_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| db_error("fence_collaborator_parent", parent_id, source))?;
+        if !live
+            || lock_durable_lineage_cancellation_markers_tx(tx, &parent)
+                .await?
+                .any()
+        {
+            return Err(CollaboratorStoreError::ParentNotCurrent {
+                run_id: parent_id.into(),
+            });
+        }
+        let root = parent
+            .root_run_id
+            .as_ref()
+            .ok_or(CollaboratorStoreError::InvalidAdmission {
+                field: "parent_root",
+            })?;
+        let path = format!(
+            "{}/{}",
+            parent
+                .ancestor_path
+                .as_deref()
+                .ok_or(CollaboratorStoreError::InvalidAdmission {
+                    field: "parent_lineage"
+                },)?,
+            record.run_id
+        );
+        let depth = parent
+            .depth
+            .checked_add(1)
+            .ok_or(CollaboratorStoreError::InvalidAdmission { field: "depth" })?;
+        if record
+            .root_run_id
+            .as_ref()
+            .is_some_and(|value| value != root)
+            || record
+                .ancestor_path
+                .as_ref()
+                .is_some_and(|value| value != &path)
+            || (record.depth != 0 && record.depth != depth)
+        {
+            return Err(CollaboratorStoreError::InvalidAdmission {
+                field: "child_lineage",
+            });
+        }
+        record.root_run_id = Some(root.clone());
+        record.ancestor_path = Some(path);
+        record.depth = depth;
+        let receipt = CollaboratorStageReceipt {
+            anchor_run_id: admission.anchor_run_id.clone(),
+            source_message_id: admission.source_message_id.clone(),
+            run_id: record.run_id.clone(),
+            owner_generation: record.run_generation,
+            replayed: false,
+        };
+        let mut events = vec![];
+        if existing.is_none() {
+            events.push(serde_json::json!({
+                "event_type": COLLABORATOR_ASSOCIATED_EVENT,
+                "idempotency_key": "collaborator-association",
+                "association": collaborator_json(&admission.association)?,
+            }));
+        }
+        events.push(serde_json::json!({
+            "event_type": COLLABORATOR_STAGE_EVENT,
+            "idempotency_key": collaborator_source_key(&admission.source_message_id),
+            "admission": collaborator_json(admission)?,
+            "receipt": collaborator_json(&receipt)?,
+        }));
+        Ok((receipt, anchor, events))
+    }
+
+    async fn append_collaborator_events_tx(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        anchor: &DurableRunRecord,
+        events: &[serde_json::Value],
+    ) -> Result<Vec<RunEventInsertRow>, CollaboratorStoreError> {
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            let idx = anchor
+                .last_event_idx
+                .checked_add(rows.len() as i64 + 1)
+                .ok_or(CollaboratorStoreError::InvalidAdmission { field: "event_idx" })?;
+            rows.push(build_run_event_insert_row(
+                &anchor.user_id,
+                &anchor.run_id,
+                &anchor.session_id,
+                anchor.agent_id.as_deref(),
+                idx,
+                &self.owner_pod_id,
+                event,
+            )?);
+        }
+        if let Some(last) = rows.last() {
+            let updated = sqlx::query(
+                "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND last_event_idx = ?",
+            )
+            .bind(last.event_idx)
+            .bind(&anchor.user_id)
+            .bind(&anchor.session_id)
+            .bind(&anchor.run_id)
+            .bind(anchor.last_event_idx)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| db_error("advance_collaborator_events", &anchor.run_id, source))?;
+            if updated.rows_affected() != 1 {
+                return Err(CollaboratorStoreError::AssociationConflict {
+                    anchor_run_id: anchor.run_id.clone(),
+                });
+            }
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            if rows
+                .iter()
+                .any(|row| row.event_type == COLLABORATOR_NATIVE_SESSION_EVENT)
+                && self
+                    .native_binding_insert_failure_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // A duplicate in this batch produces a real SQL driver error.
+                // The surrounding transaction rolls back; no conflicting fact
+                // is planted for a subsequent recovery attempt.
+                if let Some(barrier) = &self.native_binding_insert_barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                rows.push(rows.last().expect("binding row exists").clone());
+            }
+            Self::insert_run_event_rows_tx(tx, &anchor.run_id, &rows, "insert_collaborator_events")
+                .await?;
+        }
+        Ok(rows)
+    }
+
     async fn insert_run_record_transaction(
+        &self,
+        record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+        initial_event_rows: &[RunEventInsertRow],
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record_transaction_with_collaborator(
+            record,
+            claim_existing,
+            requested_session_id,
+            initial_event_rows,
+            None,
+        )
+        .await
+        .map(|(claim, _)| claim)
+        .map_err(|error| match error {
+            CollaboratorStoreError::SessionUnavailable => "session is not active".to_owned(),
+            CollaboratorStoreError::Persistence(reason) => reason,
+            error => error.to_string(),
+        })
+    }
+
+    async fn reconcile_collaborator_admission(
+        &self,
+        record: &DurableRunRecord,
+        admission: &CollaboratorStageAdmission,
+    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+        let proof = tokio::time::timeout(RUN_START_TIMEOUT_RECEIPT_TIMEOUT, async {
+            let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error(
+                        "acquire_collaborator_receipt",
+                        &admission.anchor_run_id,
+                        source,
+                    )
+                })?;
+            let mut tx = connection.begin().await.map_err(|source| {
+                db_error(
+                    "begin_collaborator_receipt",
+                    &admission.anchor_run_id,
+                    source,
+                )
+            })?;
+            admit_collaborator_session_tx(&mut tx, &record.user_id, &record.session_id).await?;
+            let anchor = load_run_metadata_after_session_admission_tx(
+                &mut tx,
+                &record.user_id,
+                &record.session_id,
+                &admission.anchor_run_id,
+            )
+            .await?;
+            let receipt = if anchor.is_some() {
+                Self::collaborator_event_tx(
+                    &mut tx,
+                    &record.user_id,
+                    &record.session_id,
+                    &admission.anchor_run_id,
+                    COLLABORATOR_STAGE_EVENT,
+                    Some(&collaborator_source_key(&admission.source_message_id)),
+                )
+                .await?
+                .map(|event| collaborator_replay_receipt(&event, admission))
+                .transpose()?
+            } else {
+                None
+            };
+            let receipt = if let Some(receipt) = receipt {
+                load_run_metadata_after_session_admission_tx(
+                    &mut tx,
+                    &record.user_id,
+                    &record.session_id,
+                    &receipt.run_id,
+                )
+                .await?
+                .map(|_| receipt)
+            } else {
+                None
+            };
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "release_collaborator_receipt",
+                    &admission.anchor_run_id,
+                    source,
+                )
+            })?;
+            connection.release();
+            Ok::<_, CollaboratorStoreError>(receipt)
+        })
+        .await;
+        match proof {
+            Ok(Ok(Some(receipt))) => Ok(receipt),
+            Ok(Err(
+                error @ (CollaboratorStoreError::SourceMessageConflict { .. }
+                | CollaboratorStoreError::AssociationConflict { .. }
+                | CollaboratorStoreError::SessionUnavailable),
+            )) => Err(error),
+            _ => Err(CollaboratorStoreError::CommitUnknown {
+                anchor_run_id: admission.anchor_run_id.clone(),
+                source_message_id: admission.source_message_id.clone(),
+            }),
+        }
+    }
+
+    async fn insert_run_record_transaction_with_collaborator(
         &self,
         mut record: DurableRunRecord,
         claim_existing: bool,
         requested_session_id: Option<&str>,
         initial_event_rows: &[RunEventInsertRow],
-    ) -> Result<DurableRunStartClaim, String> {
+        collaborator: Option<&CollaboratorStageAdmission>,
+    ) -> Result<(DurableRunStartClaim, Option<CollaboratorStageReceipt>), CollaboratorStoreError>
+    {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
             && let Some(parent) = self
@@ -14561,11 +16279,56 @@ impl DatabaseRunStateStore {
         .await
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
-                "session is not active".to_string()
+                CollaboratorStoreError::SessionUnavailable
             } else {
-                db_error("insert_run_session_admission", &record.run_id, source).to_string()
+                db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
+        let mut collaborator_event_rows = vec![];
+        let mut collaborator_events_on_new_run = false;
+        let mut stage_receipt = None;
+        if let Some(admission) = collaborator {
+            let (receipt, anchor, events) = self
+                .prepare_collaborator_stage_tx(&mut tx, &mut record, admission)
+                .await?;
+            if receipt.replayed {
+                tx.rollback().await.map_err(|source| {
+                    db_error("rollback_collaborator_replay", &record.run_id, source)
+                })?;
+                connection.release();
+                // Replay is evidence for reconciliation, never a fresh owner
+                // claim, including inside this common creation transaction.
+                return Ok((
+                    DurableRunStartClaim::Existing {
+                        session_id: record.session_id.clone(),
+                        start_request_fingerprint: record.start_request_fingerprint.clone(),
+                    },
+                    Some(receipt),
+                ));
+            }
+            if let Some(anchor) = anchor {
+                collaborator_event_rows = self
+                    .append_collaborator_events_tx(&mut tx, &anchor, &events)
+                    .await?;
+            } else {
+                collaborator_events_on_new_run = true;
+                for event in events {
+                    collaborator_event_rows.push(build_run_event_insert_row(
+                        &record.user_id,
+                        &record.run_id,
+                        &record.session_id,
+                        record.agent_id.as_deref(),
+                        (initial_event_rows.len() + collaborator_event_rows.len()) as i64,
+                        &self.owner_pod_id,
+                        &event,
+                    )?);
+                }
+                record.last_event_idx = collaborator_event_rows
+                    .last()
+                    .map_or(record.last_event_idx, |event| event.event_idx);
+            }
+            stage_receipt = Some(receipt);
+        }
         let existing_session: Option<String> = sqlx::query_scalar(
             "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
         )
@@ -14594,12 +16357,15 @@ impl DatabaseRunStateStore {
             if claim_existing {
                 return self
                     .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
-                    .await;
+                    .await
+                    .map(|claim| (claim, None))
+                    .map_err(Into::into);
             }
             return Err(format!(
                 "run identity {} is already bound to session {existing_session}",
                 record.run_id
-            ));
+            )
+            .into());
         }
 
         if !run_requires_session_execution_slot(&record) {
@@ -14662,7 +16428,9 @@ impl DatabaseRunStateStore {
                 connection.release();
                 return self
                     .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
-                    .await;
+                    .await
+                    .map(|claim| (claim, None))
+                    .map_err(Into::into);
             }
             Err(source) => {
                 tx.rollback().await.map_err(|rollback_error| {
@@ -14670,7 +16438,7 @@ impl DatabaseRunStateStore {
                         .to_string()
                 })?;
                 connection.release();
-                return Err(db_error("insert_run", &record.run_id, source).to_string());
+                return Err(db_error("insert_run", &record.run_id, source).into());
             }
         };
         if requires_execution_slot
@@ -14689,14 +16457,14 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
             })?;
             connection.release();
-            return Err("session already has an active run".to_string());
+            return Err("session already has an active run".to_string().into());
         }
         if insert_result.rows_affected() == 0 {
             tx.rollback().await.map_err(|source| {
                 db_error("insert_run_rollback_noop", &record.run_id, source).to_string()
             })?;
             connection.release();
-            return Err("session already has an active run".to_string());
+            return Err("session already has an active run".to_string().into());
         }
         Self::insert_run_event_rows_tx(
             &mut tx,
@@ -14705,11 +16473,24 @@ impl DatabaseRunStateStore {
             "insert_initial_run_events",
         )
         .await?;
+        if collaborator_events_on_new_run {
+            Self::insert_run_event_rows_tx(
+                &mut tx,
+                &record.run_id,
+                &collaborator_event_rows,
+                "insert_initial_collaborator_events",
+            )
+            .await?;
+        }
         let projection = build_run_display_projection(
             &record,
-            initial_event_rows
-                .last()
-                .map(|event| event.event_type.clone()),
+            (if collaborator_events_on_new_run {
+                collaborator_event_rows.last()
+            } else {
+                None
+            })
+            .or_else(|| initial_event_rows.last())
+            .map(|event| event.event_type.clone()),
             None,
         );
         let insert_projection_sql = matrixone_statement_with_null_shape(
@@ -14780,14 +16561,46 @@ impl DatabaseRunStateStore {
             }
         };
         if let Some(commit_error) = commit_error {
-            let exact_owner_generation = self
+            let reconciliation = self
                 .reconcile_run_start_receipt(&record, initial_event_rows)
-                .await
-                .map_err(|error| format!("{commit_error}; {error}"))?;
+                .await;
+            let exact_owner_generation = match reconciliation {
+                Ok(generation) => generation,
+                Err(error) if collaborator.is_some() => {
+                    tracing::warn!(run_id = %record.run_id, error = %error, "collaborator commit proof unavailable");
+                    None
+                }
+                Err(error) => return Err(format!("{commit_error}; {error}").into()),
+            };
             if exact_owner_generation != Some(record.run_generation) {
+                if let Some(admission) = collaborator {
+                    return Err(CollaboratorStoreError::CommitUnknown {
+                        anchor_run_id: admission.anchor_run_id.clone(),
+                        source_message_id: admission.source_message_id.clone(),
+                    });
+                }
                 return Err(format!(
                     "{commit_error}; run create acknowledgement remains ambiguous"
-                ));
+                )
+                .into());
+            }
+            let collaborator_proof = tokio::time::timeout(
+                RUN_START_TIMEOUT_RECEIPT_TIMEOUT,
+                self.exact_run_event_rows_are_durable(
+                    &collaborator_event_rows,
+                    "reconcile_collaborator_stage_commit",
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+            if !collaborator_proof {
+                let admission = collaborator.ok_or(CollaboratorStoreError::Unsupported)?;
+                return Err(CollaboratorStoreError::CommitUnknown {
+                    anchor_run_id: admission.anchor_run_id.clone(),
+                    source_message_id: admission.source_message_id.clone(),
+                });
             }
             tracing::warn!(
                 user_id = %record.user_id,
@@ -14796,9 +16609,12 @@ impl DatabaseRunStateStore {
                 "recovered exact run create commit acknowledgement"
             );
         }
-        Ok(DurableRunStartClaim::Started {
-            owner_generation: record.run_generation,
-        })
+        Ok((
+            DurableRunStartClaim::Started {
+                owner_generation: record.run_generation,
+            },
+            stage_receipt,
+        ))
     }
 }
 
@@ -14891,8 +16707,8 @@ impl DatabaseRunStateStore {
         Ok(Vec::new())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn claim_exact_recovery_candidate_for_test(
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub async fn claim_exact_recovery_candidate_for_test(
         &self,
         user_id: &str,
         run_id: &str,
@@ -15135,7 +16951,8 @@ impl DatabaseRunStateStore {
                 &[event_row],
                 "insert_recovery_claim_event",
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
             let updated = sqlx::query(
                 "UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ? AND run_generation = ? AND last_event_idx = ?",
             ).bind(next_idx).bind(&run.user_id).bind(&run.run_id)
@@ -15596,7 +17413,7 @@ impl DatabaseRunStateStore {
                 &event_rows,
                 "execution_owner_cancellation_insert_events",
             )
-            .await?;
+            .await.map_err(|error| error.to_string())?;
 
             // Keep the user-visible projection in the authoritative commit.
             // This replaces a second post-commit transaction that could wait
@@ -15759,8 +17576,492 @@ impl DatabaseRunStateStore {
     }
 }
 
+impl DatabaseRunStateStore {
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_collaborator_native_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        anchor_id: &str,
+        stage_id: &str,
+        expected_owner_generation: u64,
+        expected_receipt: Option<(
+            &astra_turn_types::ToolInvocationIdentity,
+            &CollaboratorNativeSession,
+        )>,
+    ) -> Result<Option<CollaboratorNativeSession>, CollaboratorStoreError> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_collaborator_native_session", anchor_id, source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_collaborator_native_session", anchor_id, source))?;
+        admit_collaborator_session_tx(&mut tx, user_id, session_id).await?;
+        let anchor =
+            load_run_metadata_after_session_admission_tx(&mut tx, user_id, session_id, anchor_id)
+                .await?
+                .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+                    run_id: anchor_id.to_string(),
+                })?;
+        let association =
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, anchor_id)
+                .await?
+                .ok_or_else(|| CollaboratorStoreError::AssociationConflict {
+                    anchor_run_id: anchor_id.to_string(),
+                })?;
+        if association.latest_stage.run_id != stage_id {
+            return Err(CollaboratorStoreError::PreviousStageChanged {
+                anchor_run_id: anchor_id.into(),
+            });
+        }
+        let stage =
+            load_run_metadata_after_session_admission_tx(&mut tx, user_id, session_id, stage_id)
+                .await?
+                .ok_or_else(|| CollaboratorStoreError::RunUnavailable {
+                    run_id: stage_id.to_string(),
+                })?;
+        // Reporting generation is a CAS fence, not the origin of the receipt.
+        if stage.run_generation != expected_owner_generation {
+            return Err(CollaboratorStoreError::ParentNotCurrent {
+                run_id: stage_id.into(),
+            });
+        }
+        if expected_receipt.is_none() && !durable_run_status_is_terminal(&stage.status) {
+            return Err(CollaboratorStoreError::PreviousStageActive {
+                run_id: stage_id.into(),
+            });
+        }
+        if expected_receipt.is_some_and(|(identity, _)| {
+            identity.user_id != user_id
+                || identity.session_id != session_id
+                || identity.run_id != stage_id
+        }) {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        // Do not accept an owner HashMap, provider output text, a caller's ACK
+        // flag, a semantic cache hit, or an outcome_unknown ledger row.
+        let proof: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT turn_chain_id, invocation_id, JSON_UNQUOTE(outcome_json), JSON_UNQUOTE(fingerprint_json), state
+             FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND (? IS NULL OR (turn_chain_id = ? AND invocation_id = ?))
+               AND state IN ('succeeded', 'failed') AND dispatch_certainty = 'dispatched'
+               AND outcome_json IS NOT NULL AND completion_source_json IS NULL LIMIT 2 FOR UPDATE",
+        ).bind(user_id).bind(session_id).bind(stage_id)
+            .bind(expected_receipt.map(|(identity, _)| identity.turn_chain_id.as_str()))
+            .bind(expected_receipt.map(|(identity, _)| identity.turn_chain_id.as_str()))
+            .bind(expected_receipt.map(|(identity, _)| identity.invocation_id.as_str()))
+            .fetch_all(&mut *tx).await
+            .map_err(|source| db_error("prove_native_session_ack", stage_id, source))?;
+        let [row] = proof.as_slice() else {
+            if expected_receipt.is_none() && proof.is_empty() {
+                return Ok(None);
+            }
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        };
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            user_id, session_id, stage_id, &row.0, &row.1,
+        )
+        .map_err(|_| CollaboratorStoreError::NativeSessionUnproven)?;
+        let (outcome_json, fingerprint_json, state) = (&row.2, &row.3, row.4.clone());
+        let state: astra_turn_types::ToolInvocationState =
+            serde_json::from_value(serde_json::Value::String(state)).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_native_session_state",
+                    entity: identity.run_id.clone(),
+                    source,
+                }
+            })?;
+        let fingerprint: astra_turn_types::ToolInvocationFingerprint =
+            serde_json::from_str(fingerprint_json).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_native_session_fingerprint",
+                    entity: identity.run_id.clone(),
+                    source,
+                }
+            })?;
+        let locator = &association.latest_native_execution;
+        if fingerprint.tool
+            != (astra_turn_types::DurableToolReference::Provider {
+                descriptor: locator.descriptor.clone(),
+            })
+        {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let outcome: astra_turn_types::ToolInvocationTerminalOutcome =
+            serde_json::from_str(outcome_json).map_err(|source| {
+                DatabaseRunStateStoreError::Json {
+                    operation: "decode_native_session_ack",
+                    entity: identity.run_id.clone(),
+                    source,
+                }
+            })?;
+        let result = match (state, outcome) {
+            (
+                astra_turn_types::ToolInvocationState::Succeeded,
+                astra_turn_types::ToolInvocationTerminalOutcome::Succeeded { result },
+            )
+            | (
+                astra_turn_types::ToolInvocationState::Failed,
+                astra_turn_types::ToolInvocationTerminalOutcome::Failed { result, .. },
+            ) => result,
+            _ => {
+                return Err(CollaboratorStoreError::NativeSessionUnproven);
+            }
+        };
+        if result
+            .metadata
+            .get("workspace_effect_settled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let Some(metadata) = result
+            .metadata
+            .get(COLLABORATOR_NATIVE_SESSION_METADATA_KEY)
+        else {
+            if expected_receipt.is_none() {
+                return Ok(None);
+            }
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        };
+        let native_session: CollaboratorNativeSession = serde_json::from_value(metadata.clone())
+            .map_err(|_| CollaboratorStoreError::NativeSessionUnproven)?;
+        if native_session.anchor_run_id != anchor_id
+            || native_session.provider != association.association.provider
+            || native_session.native_session_id.trim().is_empty()
+            || native_session.native_session_id.len() > 512
+            || expected_receipt.is_some_and(|(_, expected)| *expected != native_session)
+        {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let action_id = format!("tool_invocation:{}", identity.storage_key());
+        let grant: Option<(String, String)> = sqlx::query_as(
+            "SELECT payload_json, event_hash FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND event_type = 'action_admission_granted' AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(stage_id)
+        .bind(action_admission_granted_idempotency_key(&action_id))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| db_error("prove_native_session_generation", stage_id, source))?;
+        let (payload, hash) = grant.ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        if hash != sha256_hex(payload.as_bytes()) {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        let grant: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|_| CollaboratorStoreError::NativeSessionUnproven)?;
+        let original_generation = grant
+            .pointer("/data/owner_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        if grant.get("event_type").and_then(serde_json::Value::as_str)
+            != Some("action_admission_granted")
+            || grant
+                .pointer("/data/expected_control_epoch")
+                .and_then(serde_json::Value::as_i64)
+                .is_none_or(|epoch| epoch < -1)
+            || original_generation < association.latest_stage.owner_generation
+            || original_generation > expected_owner_generation
+            || grant
+                .pointer("/data/action_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(action_id.as_str())
+            || grant
+                .pointer("/data/session_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(session_id)
+        {
+            return Err(CollaboratorStoreError::NativeSessionUnproven);
+        }
+        if let Some(existing) = association.native_session {
+            let event = Self::collaborator_event_tx(
+                &mut tx,
+                user_id,
+                session_id,
+                anchor_id,
+                COLLABORATOR_NATIVE_SESSION_EVENT,
+                None,
+            )
+            .await?
+            .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+            let original_invocation: astra_turn_types::ToolInvocationIdentity =
+                decode_collaborator_fact(&event, "invocation")?;
+            let bound_generation: u64 = decode_collaborator_fact(&event, "owner_generation")?;
+            if existing != native_session
+                || original_invocation != identity
+                || bound_generation != original_generation
+            {
+                return Err(CollaboratorStoreError::NativeSessionUnproven);
+            }
+            tx.rollback()
+                .await
+                .map_err(|source| db_error("release_native_session_replay", anchor_id, source))?;
+            connection.release();
+            return Ok(Some(native_session));
+        }
+        let rows = self
+            .append_collaborator_events_tx(
+                &mut tx,
+                &anchor,
+                &[serde_json::json!({
+                    "event_type": COLLABORATOR_NATIVE_SESSION_EVENT,
+                    "idempotency_key": "collaborator-native-session",
+                    "native_session": collaborator_json(&native_session)?,
+                    "invocation": collaborator_json(&identity)?,
+                    "owner_generation": original_generation,
+                })],
+            )
+            .await?;
+        if let Err(source) = tx.commit().await {
+            drop(connection);
+            let proven = tokio::time::timeout(
+                RUN_START_TIMEOUT_RECEIPT_TIMEOUT,
+                self.exact_run_event_rows_are_durable(&rows, "reconcile_native_session_ack"),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+            if !proven {
+                tracing::warn!(run_id = %identity.run_id, error = %source, "native session binding commit acknowledgement unknown");
+                return Err(CollaboratorStoreError::CommitUnknown {
+                    anchor_run_id: anchor_id.to_string(),
+                    source_message_id: identity.invocation_id.clone(),
+                });
+            }
+        } else {
+            connection.release();
+        }
+        Ok(Some(native_session))
+    }
+}
+
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn derive_tool_interaction_origin(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        edge_agent_id: &str,
+        physical_workspace_id: &str,
+    ) -> Result<ToolInvocationInteractionOrigin, ToolInteractionAdmissionError> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("derive_tool_interaction_acquire", &identity.run_id, source)
+            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("derive_tool_interaction_begin", &identity.run_id, source)
+        })?;
+        let run = self
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                &identity.user_id,
+                &identity.session_id,
+                &identity.run_id,
+            )
+            .await?
+            .ok_or(ToolInteractionAdmissionError::Unproven)?;
+        let origin = Self::load_tool_interaction_origin_tx(
+            &mut tx,
+            &run,
+            identity,
+            edge_agent_id,
+            physical_workspace_id,
+            true,
+        )
+        .await?;
+        tx.rollback().await.map_err(|source| {
+            db_error("derive_tool_interaction_rollback", &identity.run_id, source)
+        })?;
+        connection.release();
+        Ok(origin)
+    }
+
+    async fn insert_run_with_collaborator_stage(
+        &self,
+        mut record: DurableRunRecord,
+        admission: CollaboratorStageAdmission,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<CollaboratorStageReceipt, CollaboratorStoreError> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(CollaboratorStoreError::DeadlineExpired);
+        }
+        validate_collaborator_admission(&record, &admission)?;
+        let initial_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        let creation = self.insert_run_record_transaction_with_collaborator(
+            record.clone(),
+            false,
+            None,
+            &initial_rows,
+            Some(&admission),
+        );
+        let result = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, creation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // CancellationSafePoolConnection prevents a dropped
+                    // transaction from being returned to the pool. Read the
+                    // exact source receipt, never infer success from run ID.
+                    return self
+                        .reconcile_collaborator_admission(&record, &admission)
+                        .await;
+                }
+            }
+        } else {
+            creation.await
+        };
+        match result {
+            Ok((_, Some(receipt))) => Ok(receipt),
+            Ok((_, None)) => Err(CollaboratorStoreError::AssociationConflict {
+                anchor_run_id: admission.anchor_run_id,
+            }),
+            Err(CollaboratorStoreError::CommitUnknown { .. }) => {
+                self.reconcile_collaborator_admission(&record, &admission)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn load_collaborator_association(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_collaborator_association", anchor_run_id, source)
+            })?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_collaborator_association", anchor_run_id, source))?;
+        read_collaborator_session_tx(&mut tx, user_id, session_id).await?;
+        let anchor: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(anchor_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| db_error("read_collaborator_anchor", anchor_run_id, source))?;
+        let association = if anchor.is_some() {
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, anchor_run_id).await?
+        } else {
+            None
+        };
+        tx.rollback().await.map_err(|source| {
+            db_error("release_collaborator_association", anchor_run_id, source)
+        })?;
+        connection.release();
+        Ok(association)
+    }
+
+    async fn load_collaborator_association_for_stage(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        stage_run_id: &str,
+    ) -> Result<Option<DurableCollaboratorAssociation>, CollaboratorStoreError> {
+        // Stage events are intentionally owned by the stable association
+        // anchor. Resolve that owner through the indexed stage binding, then
+        // reuse the canonical association decoder. Ordinary child guidance
+        // can reach this lookup too; an indexed miss is simply no association.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_collaborator_stage_association",
+                    stage_run_id,
+                    source,
+                )
+            })?;
+        let mut tx = connection.begin().await.map_err(|source| {
+            db_error("begin_collaborator_stage_association", stage_run_id, source)
+        })?;
+        read_collaborator_session_tx(&mut tx, user_id, session_id).await?;
+        let anchor_run_id: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM agent_run_events
+             FORCE INDEX (idx_agent_run_events_owner_session_subject)
+             WHERE user_id = ? AND session_id = ? AND event_type = ?
+               AND subject_run_id = ?
+             ORDER BY event_idx DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(COLLABORATOR_STAGE_EVENT)
+        .bind(stage_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "find_collaborator_stage_association_anchor",
+                stage_run_id,
+                source,
+            )
+        })?;
+        let association = if let Some(anchor_run_id) = anchor_run_id {
+            Self::collaborator_association_tx(&mut tx, user_id, session_id, &anchor_run_id).await?
+        } else {
+            None
+        };
+        tx.rollback().await.map_err(|source| {
+            db_error(
+                "release_collaborator_stage_association",
+                stage_run_id,
+                source,
+            )
+        })?;
+        connection.release();
+        Ok(association.filter(|association| association.latest_stage.run_id == stage_run_id))
+    }
+
+    async fn confirm_collaborator_native_session(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        native_session: &CollaboratorNativeSession,
+        expected_owner_generation: u64,
+    ) -> Result<(), CollaboratorStoreError> {
+        self.bind_collaborator_native_session(
+            &identity.user_id,
+            &identity.session_id,
+            &native_session.anchor_run_id,
+            &identity.run_id,
+            expected_owner_generation,
+            Some((identity, native_session)),
+        )
+        .await?
+        .ok_or(CollaboratorStoreError::NativeSessionUnproven)?;
+        Ok(())
+    }
+
+    async fn recover_collaborator_native_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        anchor_run_id: &str,
+        expected_predecessor_run_id: &str,
+        expected_owner_generation: u64,
+    ) -> Result<Option<CollaboratorNativeSession>, CollaboratorStoreError> {
+        self.bind_collaborator_native_session(
+            user_id,
+            session_id,
+            anchor_run_id,
+            expected_predecessor_run_id,
+            expected_owner_generation,
+            None,
+        )
+        .await
+    }
+
     async fn repair_terminal_projection_after_receipt(
         &self,
         user_id: &str,
@@ -16009,7 +18310,8 @@ impl RunStateStore for DatabaseRunStateStore {
             std::slice::from_ref(&row),
             "insert_pre_durable_child_terminal",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         match tx.commit().await {
             Ok(()) => connection.release(),
             Err(error) => {
@@ -16367,14 +18669,14 @@ impl RunStateStore for DatabaseRunStateStore {
                 &interaction_closure_rows,
                 "terminalize_orphaned_run_cancellation_insert_interaction_closures",
             )
-            .await?;
+            .await.map_err(|error| error.to_string())?;
             Self::insert_run_event_rows_tx(
                 &mut tx,
                 request.run_id,
                 &terminal_event_rows,
                 "terminalize_orphaned_run_cancellation_insert_terminal_events",
             )
-            .await?;
+            .await.map_err(|error| error.to_string())?;
             let mut projection_run = run.clone();
             projection_run.status = STATUS_CANCELLED.to_string();
             projection_run.waiting_for = None;
@@ -16872,14 +19174,23 @@ impl RunStateStore for DatabaseRunStateStore {
         limit: usize,
     ) -> Result<Option<DurableRunUserIntentControlDelta>, String> {
         let limit_plus_one = validate_user_intent_control_delta_limit(limit)?;
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
-            .map_err(|error| error.to_string())?
-        else {
+            .map_err(|source| {
+                db_error("acquire_user_intent_watermark", run_id, source).to_string()
+            })?;
+        let watermark = sqlx::query_scalar::<_, i64>(
+            "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(connection.connection_mut())
+        .await
+        .map_err(|source| db_error("load_user_intent_watermark", run_id, source).to_string())?;
+        connection.release();
+        let Some(authoritative_last_event_idx) = watermark else {
             return Ok(None);
         };
-        let authoritative_last_event_idx = run.last_event_idx;
         if after_event_idx >= authoritative_last_event_idx {
             return Ok(Some(DurableRunUserIntentControlDelta {
                 authoritative_last_event_idx,
@@ -17054,7 +19365,7 @@ impl RunStateStore for DatabaseRunStateStore {
         // subsequently fences or settles.
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let duplicate = sqlx::query(
-            "SELECT payload_json, event_idx FROM agent_run_events
+            "SELECT payload_json, event_idx, session_id, invocation_supersession_scope_key FROM agent_run_events
              WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
                AND idempotency_key = ? LIMIT 1",
         )
@@ -17067,6 +19378,16 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("admit_run_guidance_load_duplicate", request.run_id, source).to_string()
         })?;
         if let Some(row) = duplicate {
+            let projection_matches = row.try_get::<String, _>("session_id").map_err(|source| {
+                db_error("decode_guidance_duplicate_session", request.run_id, source).to_string()
+            })? == request.expected_session_id
+                && row
+                    .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                    .map_err(|source| {
+                        db_error("decode_guidance_duplicate_scope", request.run_id, source)
+                            .to_string()
+                    })?
+                    .is_none();
             let existing = decode_run_event_payload(&row, request.run_id)
                 .map_err(|error| error.to_string())?;
             let event_index = row.try_get("event_idx").map_err(|source| {
@@ -17086,11 +19407,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?;
             connection.release();
-            return Ok(if run_guidance_event_matches(&existing, request.event) {
-                AtomicRunGuidanceAdmission::Duplicate { event_index }
-            } else {
-                AtomicRunGuidanceAdmission::IdentityConflict
-            });
+            return Ok(
+                if projection_matches && run_guidance_event_matches(&existing, request.event) {
+                    AtomicRunGuidanceAdmission::Duplicate { event_index }
+                } else {
+                    AtomicRunGuidanceAdmission::IdentityConflict
+                },
+            );
         }
 
         if !durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref()) {
@@ -17219,7 +19542,8 @@ impl RunStateStore for DatabaseRunStateStore {
             std::slice::from_ref(&event_row),
             "admit_run_guidance_insert_event",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         Self::upsert_event_metadata_projection_tx(&mut tx, &run, event_index, "user_intent")
             .await?;
 
@@ -17505,7 +19829,8 @@ impl RunStateStore for DatabaseRunStateStore {
             std::slice::from_ref(&event_row),
             "insert_user_intent_admission_transition",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         Self::upsert_event_metadata_projection_tx(
             &mut tx,
             &run,
@@ -17668,7 +19993,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 actual_owner_generation,
             });
         }
-        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+            && request.purpose.dispatch_owner().is_none()
+        {
             let actual_owner_pod_id = run.owner_pod_id;
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -17793,6 +20120,15 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(AtomicRunUserIntentApply::IdentityConflict);
         }
 
+        if (request.purpose.dispatch_owner().is_some()
+            || request.purpose.disposition() == UserIntentStatus::Returned)
+            && expected.iter().any(|(applied, _)| {
+                applied.pointer("/data/delivery")
+                    != Some(&serde_json::json!(UserIntentDelivery::GuideCurrentRun))
+            })
+        {
+            return Ok(AtomicRunUserIntentApply::IdentityConflict);
+        }
         let disposition_keys = expected
             .iter()
             .flat_map(|(applied, returned)| {
@@ -17883,6 +20219,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 return Ok(AtomicRunUserIntentApply::IdentityConflict);
             }
             if let Some((event_index, actual)) = actual_applied {
+                if request.purpose.disposition() == UserIntentStatus::Returned {
+                    return Ok(AtomicRunUserIntentApply::IdentityConflict);
+                }
                 if !run_events_have_same_immutable_payload(actual, applied) {
                     tx.rollback().await.map_err(|source| {
                         db_error(
@@ -17911,7 +20250,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 }
                 returned_count += 1;
             } else {
-                pending.push(applied.clone());
+                pending.push(
+                    if request.purpose.disposition() == UserIntentStatus::Returned {
+                        returned.clone()
+                    } else {
+                        applied.clone()
+                    },
+                );
                 pending_source_indices.push(*source_index);
             }
         }
@@ -17928,7 +20273,13 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             connection.release();
             return Ok(if all_returned {
-                AtomicRunUserIntentApply::RunTerminalReturned
+                if request.purpose.disposition() == UserIntentStatus::Returned {
+                    AtomicRunUserIntentApply::Returned {
+                        event_indices: Vec::new(),
+                    }
+                } else {
+                    AtomicRunUserIntentApply::RunTerminalReturned
+                }
             } else {
                 AtomicRunUserIntentApply::IdentityConflict
             });
@@ -17947,7 +20298,11 @@ impl RunStateStore for DatabaseRunStateStore {
                 event_indices: existing_applied_indices,
             });
         }
-        if run.status != STATUS_RUNNING {
+        if run.status != STATUS_RUNNING
+            && !(run.status == STATUS_WAITING && request.invocation_identity.is_some())
+            && !(request.purpose.dispatch_owner().is_some()
+                && matches!(run.status.as_str(), STATUS_PAUSED | STATUS_CANCELLED))
+        {
             let status = run.status;
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -17960,6 +20315,19 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(AtomicRunUserIntentApply::Inactive { status });
         }
+        if let Some(identity) = request.invocation_identity {
+            Self::validate_invocation_user_intent_apply_tx(
+                &mut tx,
+                &run,
+                identity,
+                request.purpose,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        if request.purpose.dispatch_owner().is_some() && request.invocation_identity.is_none() {
+            return Ok(AtomicRunUserIntentApply::IdentityConflict);
+        }
         let lease_live: i64 = sqlx::query_scalar(
             "SELECT CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
              FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -17971,7 +20339,7 @@ impl RunStateStore for DatabaseRunStateStore {
         .map_err(|source| {
             db_error("check_user_intent_apply_lease", request.run_id, source).to_string()
         })?;
-        if lease_live != 1 {
+        if lease_live != 1 && request.purpose.dispatch_owner().is_none() {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_expired_user_intent_apply", request.run_id, source).to_string()
             })?;
@@ -18001,6 +20369,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .map(|gate| gate.blocks_pending_sources(&pending_source_indices))
             .transpose()?
             .unwrap_or(false)
+            && request.purpose.dispatch_owner().is_none()
         {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_fenced_user_intent_apply", request.run_id, source).to_string()
@@ -18014,29 +20383,36 @@ impl RunStateStore for DatabaseRunStateStore {
         // same transaction, before publishing `user_intent_applied`; otherwise
         // a crash between the two commits could resurrect the old carrier and
         // block or reinterpret the already-applied user turn.
-        let current_turn_chain_id = expected
-            .last()
-            .and_then(|(applied, _)| applied.get("data"))
-            .and_then(|data| data.get("intent_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|intent_id| !intent_id.trim().is_empty())
-            .ok_or_else(|| {
-                "validated user-intent apply batch lost its canonical intent identity".to_string()
-            })?;
-        let work_owner = crate::work::WorkOwnerId::parse(request.user_id.to_string())
-            .map_err(|error| format!("invalid Work owner at user-intent apply: {error}"))?;
-        let work_session =
-            crate::work::InternalSessionId::parse(request.expected_session_id.to_string())
-                .map_err(|error| format!("invalid Work session at user-intent apply: {error}"))?;
-        crate::work::cancel_pending_for_new_turn_tx(
-            &mut tx,
-            &work_owner,
-            &work_session,
-            current_turn_chain_id,
-            "new user turn superseded an unfinished Work establishment",
-        )
-        .await
-        .map_err(|error| format!("durable Work supersession failed: {error}"))?;
+        if request.purpose.dispatch_owner().is_none()
+            && request.purpose.disposition() == UserIntentStatus::Applied
+        {
+            let current_turn_chain_id = expected
+                .last()
+                .and_then(|(applied, _)| applied.get("data"))
+                .and_then(|data| data.get("intent_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|intent_id| !intent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    "validated user-intent apply batch lost its canonical intent identity"
+                        .to_string()
+                })?;
+            let work_owner = crate::work::WorkOwnerId::parse(request.user_id.to_string())
+                .map_err(|error| format!("invalid Work owner at user-intent apply: {error}"))?;
+            let work_session =
+                crate::work::InternalSessionId::parse(request.expected_session_id.to_string())
+                    .map_err(|error| {
+                        format!("invalid Work session at user-intent apply: {error}")
+                    })?;
+            crate::work::cancel_pending_for_new_turn_tx(
+                &mut tx,
+                &work_owner,
+                &work_session,
+                current_turn_chain_id,
+                "new user turn superseded an unfinished Work establishment",
+            )
+            .await
+            .map_err(|error| format!("durable Work supersession failed: {error}"))?;
+        }
 
         let first_event_index = run
             .last_event_idx
@@ -18065,14 +20441,16 @@ impl RunStateStore for DatabaseRunStateStore {
         let updated = sqlx::query(
             "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6)
              WHERE user_id = ? AND run_id = ? AND last_event_idx = ?
-               AND status IN ('running', 'waiting') AND owner_pod_id = ?
-               AND run_generation = ? AND owner_lease_expires_at >= NOW(6)",
+               AND ((status IN ('running', 'waiting') AND owner_pod_id = ? AND owner_lease_expires_at >= NOW(6))
+                 OR (? = TRUE AND status IN ('running', 'waiting', 'paused', 'cancelled')))
+               AND run_generation = ?",
         )
         .bind(last_event_index)
         .bind(request.user_id)
         .bind(request.run_id)
         .bind(run.last_event_idx)
         .bind(&self.owner_pod_id)
+        .bind(request.purpose.dispatch_owner().is_some())
         .bind(expected_generation)
         .execute(&mut *tx)
         .await
@@ -18092,18 +20470,29 @@ impl RunStateStore for DatabaseRunStateStore {
             &inserted,
             "insert_user_intent_apply",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         Self::upsert_event_metadata_projection_tx(
             &mut tx,
             &run,
             last_event_index,
-            "user_intent_applied",
+            if request.purpose.disposition() == UserIntentStatus::Returned {
+                "user_intent_returned"
+            } else {
+                "user_intent_applied"
+            },
         )
         .await?;
 
         let expected_applied = expected
             .iter()
-            .map(|(applied, _)| applied.clone())
+            .map(|(applied, returned)| {
+                if request.purpose.disposition() == UserIntentStatus::Returned {
+                    returned.clone()
+                } else {
+                    applied.clone()
+                }
+            })
             .collect::<Vec<_>>();
         let mut event_indices = existing_applied_indices;
         event_indices.extend(inserted.iter().map(|row| row.event_idx));
@@ -18138,10 +20527,22 @@ impl RunStateStore for DatabaseRunStateStore {
                 .map_err(|error| format!("{commit_error}; {error}"))?;
             match recovery {
                 UserIntentApplyRecovery::ThisAttempt(event_indices) => {
-                    return Ok(AtomicRunUserIntentApply::AckRecovered { event_indices });
+                    return Ok(
+                        if request.purpose.disposition() == UserIntentStatus::Returned {
+                            AtomicRunUserIntentApply::Returned { event_indices }
+                        } else {
+                            AtomicRunUserIntentApply::AckRecovered { event_indices }
+                        },
+                    );
                 }
                 UserIntentApplyRecovery::Equivalent(event_indices) => {
-                    return Ok(AtomicRunUserIntentApply::AlreadyApplied { event_indices });
+                    return Ok(
+                        if request.purpose.disposition() == UserIntentStatus::Returned {
+                            AtomicRunUserIntentApply::Returned { event_indices }
+                        } else {
+                            AtomicRunUserIntentApply::AlreadyApplied { event_indices }
+                        },
+                    );
                 }
                 UserIntentApplyRecovery::Conflict => {
                     return Ok(AtomicRunUserIntentApply::IdentityConflict);
@@ -18235,7 +20636,13 @@ impl RunStateStore for DatabaseRunStateStore {
             }
             return Err(commit_error);
         }
-        Ok(AtomicRunUserIntentApply::Applied { event_indices })
+        Ok(
+            if request.purpose.disposition() == UserIntentStatus::Returned {
+                AtomicRunUserIntentApply::Returned { event_indices }
+            } else {
+                AtomicRunUserIntentApply::Applied { event_indices }
+            },
+        )
     }
 
     async fn load_run_status_snapshot(
@@ -18636,7 +21043,8 @@ impl RunStateStore for DatabaseRunStateStore {
             &interaction_closure_rows,
             "guarded_transition_insert_interaction_closures",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
 
         let insert_result = Self::insert_run_event_rows_tx(
             &mut tx,
@@ -18645,7 +21053,8 @@ impl RunStateStore for DatabaseRunStateStore {
             "guarded_transition_run_status_with_event_insert_event",
         )
         .await;
-        if let Err(mut detail) = insert_result {
+        if let Err(error) = insert_result {
+            let mut detail = error.to_string();
             match tx.rollback().await {
                 Ok(()) => connection.release(),
                 Err(rollback_error) => {
@@ -18860,7 +21269,8 @@ impl RunStateStore for DatabaseRunStateStore {
             &event_rows,
             "generation_fenced_append_insert",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         if let Err(source) = tx.commit().await {
             drop(connection);
             let commit_error = db_error("generation_fenced_append_commit", run_id, source);
@@ -19610,7 +22020,8 @@ impl RunStateStore for DatabaseRunStateStore {
             std::slice::from_ref(&event_row),
             "insert_atomic_guarded_tool_request",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         let mut receipt = atomic_tool_request_receipt(
             request.action.run_id,
             action_event_index,
@@ -19781,15 +22192,14 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut tx = connection.begin().await.map_err(|source| {
             db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
         })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
+        let Some((run, owner_lease_live)) = load_run_metadata_with_lease_for_exact_session_tx(
+            &mut tx,
+            request.user_id,
+            request.expected_session_id,
+            request.run_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?
         else {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -19804,6 +22214,28 @@ impl RunStateStore for DatabaseRunStateStore {
         };
         let (registration_batch_id, registration_events) =
             prepared_interaction_registration_batch(request, run.owner_pod_id.as_deref())?;
+        let mut remote_tool_interaction = false;
+        for event in request.events {
+            remote_tool_interaction |=
+                Self::validate_tool_interaction_origin_tx(&mut tx, &run, event, true)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if let Some(origin) =
+                tool_interaction_origin(event).map_err(|error| error.to_string())?
+                && (origin.control_epoch != request.expected_control_epoch
+                    || origin.owner_generation != request.expected_owner_generation)
+            {
+                return Err(ToolInteractionAdmissionError::Unproven.to_string());
+            }
+        }
+        if remote_tool_interaction
+            && request
+                .events
+                .iter()
+                .any(|event| event.pointer("/data/tool_invocation_origin").is_none())
+        {
+            return Err(ToolInteractionAdmissionError::Unproven.to_string());
+        }
         if run.run_generation != request.expected_owner_generation {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -19820,7 +22252,9 @@ impl RunStateStore for DatabaseRunStateStore {
                 },
             );
         }
-        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+        if !remote_tool_interaction
+            && run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+        {
             let actual_owner_pod_id = run.owner_pod_id.clone();
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -19848,25 +22282,7 @@ impl RunStateStore for DatabaseRunStateStore {
             connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Inactive { status });
         }
-        let lease_active: i64 = sqlx::query_scalar(
-            "SELECT CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
-             FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(request.user_id)
-        .bind(request.expected_session_id)
-        .bind(request.run_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "load_guarded_interaction_batch_lease",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if lease_active != 1 {
+        if !owner_lease_live {
             tx.rollback().await.map_err(|source| {
                 db_error(
                     "rollback_guarded_interaction_batch_expired",
@@ -19893,24 +22309,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 request.expected_control_epoch, request.run_id, run.last_event_idx
             ));
         }
-        let newer_intent: Option<i64> = sqlx::query_scalar(
-            "SELECT event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-               AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+        let newer_intent: Option<i64> = Self::interaction_superseding_intent_tx(
+            &mut tx,
+            &run,
+            request.expected_control_epoch,
+            remote_tool_interaction,
         )
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .bind(request.expected_control_epoch)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error(
-                "load_guarded_interaction_batch_newer_intent",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
+        .await?;
         if let Some(user_intent_event_index) = newer_intent {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -20127,7 +22532,7 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(request.user_id)
         .bind(request.expected_session_id)
         .bind(request.run_id)
-        .bind(&self.owner_pod_id)
+        .bind(run.owner_pod_id.as_deref())
         .bind(expected_generation)
         .bind(STATUS_RUNNING)
         .bind(STATUS_WAITING)
@@ -20155,7 +22560,8 @@ impl RunStateStore for DatabaseRunStateStore {
             &event_rows,
             "insert_guarded_interaction_batch",
         )
-        .await?;
+        .await
+        .map_err(|error| error.to_string())?;
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -20391,6 +22797,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::MissingRequest);
             };
+            let mut remote_tool_interaction = false;
             if let Some(queued_response_event_type) = queued_response_event_type {
                 let rows = sqlx::query(
                     "SELECT event_type, event_idx, payload_json
@@ -20420,6 +22827,17 @@ impl RunStateStore for DatabaseRunStateStore {
                     let event = decode_run_event_payload(&row, run_id)
                         .map_err(|error| error.to_string())?;
                     if event_type == kind.required_event_type() {
+                        remote_tool_interaction =
+                            Self::validate_tool_interaction_origin_tx(&mut tx, &run, &event, true)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        if let Some(origin) =
+                            tool_interaction_origin(&event).map_err(|error| error.to_string())?
+                            && (origin.control_epoch != request.expected_control_epoch
+                                || origin.owner_generation != request.expected_owner_generation)
+                        {
+                            return Err(ToolInteractionAdmissionError::Unproven.to_string());
+                        }
                         required = Some(event);
                     } else if event_type == kind.resolved_event_type() {
                         tx.rollback().await.map_err(|source| {
@@ -20490,20 +22908,13 @@ impl RunStateStore for DatabaseRunStateStore {
                         }
                     }
                     if disposition.is_none() {
-                        let newer_intent: Option<i64> = sqlx::query_scalar(
-                            "SELECT event_idx FROM agent_run_events
-                             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-                               AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+                        let newer_intent: Option<i64> = Self::interaction_superseding_intent_tx(
+                            &mut tx,
+                            &run,
+                            registration_authority.expected_control_epoch,
+                            remote_tool_interaction,
                         )
-                        .bind(user_id)
-                        .bind(run_id)
-                        .bind(registration_authority.expected_control_epoch)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|source| {
-                            db_error("load_queued_interaction_promotion_intent", run_id, source)
-                                .to_string()
-                        })?;
+                        .await?;
                         if let Some(user_intent_event_index) = newer_intent {
                             disposition = Some(InteractionResolutionDisposition::Superseded {
                                 user_intent_event_index,
@@ -20588,7 +22999,8 @@ impl RunStateStore for DatabaseRunStateStore {
                             std::slice::from_ref(&event_row),
                             "finalize_queued_interaction_insert",
                         )
-                        .await?;
+                        .await
+                        .map_err(|error| error.to_string())?;
                         tx.commit().await.map_err(|source| {
                             db_error("finalize_queued_interaction_commit", run_id, source)
                                 .to_string()
@@ -20615,7 +23027,9 @@ impl RunStateStore for DatabaseRunStateStore {
                     actual_owner_generation: run.run_generation,
                 });
             }
-            if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+            if !remote_tool_interaction
+                && run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+            {
                 let actual_owner_pod_id = run.owner_pod_id.clone();
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_owner", run_id, source).to_string()
@@ -20653,19 +23067,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::OwnerLeaseExpired);
             }
-            let newer_intent: Option<i64> = sqlx::query_scalar(
-                "SELECT event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-               AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+            let newer_intent: Option<i64> = Self::interaction_superseding_intent_tx(
+                &mut tx,
+                &run,
+                request.expected_control_epoch,
+                remote_tool_interaction,
             )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(request.expected_control_epoch)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error("load_run_interaction_wait_newer_intent", run_id, source).to_string()
-            })?;
+            .await?;
             if let Some(user_intent_event_index) = newer_intent {
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_superseded", run_id, source).to_string()
@@ -20874,7 +23282,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .bind(user_id)
                 .bind(expected_session_id)
                 .bind(run_id)
-                .bind(&self.owner_pod_id)
+                .bind(run.owner_pod_id.as_deref())
                 .bind(expected_generation)
                 .bind(STATUS_RUNNING)
                 .bind(run.last_event_idx)
@@ -20909,7 +23317,8 @@ impl RunStateStore for DatabaseRunStateStore {
                     &event_rows,
                     "promote_queued_interaction_insert",
                 )
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
                 let commit_error = match tx.commit().await {
                     Ok(()) => {
                         connection.release();
@@ -21027,7 +23436,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 kind,
                 request_id,
                 request.expected_owner_generation,
-                Some(&self.owner_pod_id),
+                run.owner_pod_id.as_deref(),
                 request.expected_control_epoch,
             );
             let event_idx = run.last_event_idx + 1;
@@ -21056,7 +23465,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(user_id)
             .bind(expected_session_id)
             .bind(run_id)
-            .bind(&self.owner_pod_id)
+            .bind(run.owner_pod_id.as_deref())
             .bind(expected_generation)
             .bind(STATUS_RUNNING)
             .bind(run.last_event_idx)
@@ -21099,7 +23508,8 @@ impl RunStateStore for DatabaseRunStateStore {
                 std::slice::from_ref(&event_row),
                 "begin_run_interaction_wait_insert",
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
             let commit_error = match tx.commit().await {
                 Ok(()) => {
                     connection.release();
@@ -21298,6 +23708,33 @@ impl RunStateStore for DatabaseRunStateStore {
                 connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
             };
+            let require_live_budget = !matches!(
+                response_data
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str),
+                Some("timed_out" | "cancelled")
+            );
+            let remote_tool_interaction = match Self::validate_tool_interaction_origin_tx(
+                &mut tx,
+                &run,
+                &required,
+                require_live_budget,
+            )
+            .await
+            {
+                Ok(proven) => proven,
+                Err(
+                    ToolInteractionAdmissionError::Unproven
+                    | ToolInteractionAdmissionError::DeadlineExpired,
+                ) => {
+                    tx.rollback().await.map_err(|source| {
+                        db_error("resolve_tool_interaction_fenced", run_id, source).to_string()
+                    })?;
+                    connection.release();
+                    return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             if let Some(existing) = queued_response.as_ref()
                 && !queued_interaction_response_matches(existing, &response_data)
             {
@@ -21374,23 +23811,16 @@ impl RunStateStore for DatabaseRunStateStore {
                             authority_loss =
                                 Some(DurableRunInteractionAuthorityLoss::OwnerLeaseExpired);
                         } else {
-                            superseded_by = sqlx::query_scalar(
-                                "SELECT event_idx FROM agent_run_events
-                                 WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-                                   AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+                            // Keep the exact live wait release. Supersession
+                            // fences the stale response, not consumption of the
+                            // new guidance before the owner's next action.
+                            superseded_by = Self::interaction_superseding_intent_tx(
+                                &mut tx,
+                                &run,
+                                wait_authority.expected_control_epoch,
+                                remote_tool_interaction,
                             )
-                            .bind(user_id)
-                            .bind(run_id)
-                            .bind(wait_authority.expected_control_epoch)
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|source| {
-                                db_error("resolve_run_interaction_newer_intent", run_id, source)
-                                    .to_string()
-                            })?;
-                            if superseded_by.is_some() {
-                                resume_wait = false;
-                            }
+                            .await?;
                         }
                     }
                 }
@@ -21455,20 +23885,13 @@ impl RunStateStore for DatabaseRunStateStore {
                             run.last_event_idx
                         ));
                     } else {
-                        superseded_by = sqlx::query_scalar(
-                            "SELECT event_idx FROM agent_run_events
-                             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-                               AND event_idx > ? ORDER BY event_idx ASC LIMIT 1",
+                        superseded_by = Self::interaction_superseding_intent_tx(
+                            &mut tx,
+                            &run,
+                            registration_authority.expected_control_epoch,
+                            remote_tool_interaction,
                         )
-                        .bind(user_id)
-                        .bind(run_id)
-                        .bind(registration_authority.expected_control_epoch)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|source| {
-                            db_error("resolve_queued_interaction_newer_intent", run_id, source)
-                                .to_string()
-                        })?;
+                        .await?;
                         queue_response = superseded_by.is_none();
                     }
                 }
@@ -21537,7 +23960,8 @@ impl RunStateStore for DatabaseRunStateStore {
                     std::slice::from_ref(&event_row),
                     "resolve_queued_interaction_insert",
                 )
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
                 let commit_error = match tx.commit().await {
                     Ok(()) => {
                         connection.release();
@@ -21705,7 +24129,8 @@ impl RunStateStore for DatabaseRunStateStore {
                 &event_rows,
                 "resolve_run_interaction_insert_events",
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
             let commit_error = match tx.commit().await {
                 Ok(()) => {
                     connection.release();
@@ -22841,7 +25266,7 @@ impl DatabaseRunStateStore {
     ) -> Result<GuidanceCommitRecovery, String> {
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let row = sqlx::query(
-            "SELECT id, event_idx, event_id, event_hash, producer_pod_id, payload_json
+            "SELECT id, event_idx, event_id, event_hash, producer_pod_id, payload_json, session_id, invocation_supersession_scope_key
              FROM agent_run_events
              WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
                AND idempotency_key = ? LIMIT 1",
@@ -22906,6 +25331,15 @@ impl DatabaseRunStateStore {
             })?;
         if event_hash != sha256_hex(payload_json.as_bytes())
             || !run_guidance_event_matches(&payload, request.event)
+            || row.try_get::<String, _>("session_id").map_err(|source| {
+                db_error("decode_reconciled_guidance_session", request.run_id, source).to_string()
+            })? != request.expected_session_id
+            || row
+                .try_get::<Option<String>, _>("invocation_supersession_scope_key")
+                .map_err(|source| {
+                    db_error("decode_reconciled_guidance_scope", request.run_id, source).to_string()
+                })?
+                != expected.invocation_supersession_scope_key
         {
             return Ok(GuidanceCommitRecovery::Conflict);
         }
@@ -23207,7 +25641,9 @@ impl DatabaseRunStateStore {
                 actual_owner_generation,
             });
         }
-        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+        if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
+            && request.purpose.dispatch_owner().is_none()
+        {
             let actual_owner_pod_id = run.owner_pod_id;
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -24671,6 +27107,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug)]
+#[cfg_attr(any(test, feature = "e2e-hooks"), derive(Clone))]
 struct RunEventInsertRow {
     id: String,
     run_id: String,
@@ -24687,15 +27124,17 @@ struct RunEventInsertRow {
     producer_pod_id: String,
     request_id: Option<String>,
     payload_json: String,
+    invocation_supersession_scope_key: Option<String>,
 }
 
 impl RunEventInsertRow {
-    fn nullable_shape(&self) -> [bool; 4] {
+    fn nullable_shape(&self) -> [bool; 5] {
         [
             self.subject_run_id.is_some(),
             self.interaction_request_id.is_some(),
             self.idempotency_key.is_some(),
             self.request_id.is_some(),
+            self.invocation_supersession_scope_key.is_some(),
         ]
     }
 }
@@ -24729,6 +27168,9 @@ enum GuidanceCommitRecovery {
 
 #[derive(Debug)]
 struct RecoveredRunControlEvent {
+    user_id: String,
+    session_id: String,
+    run_id: String,
     id: String,
     event_idx: i64,
     event_type: String,
@@ -24738,6 +27180,7 @@ struct RecoveredRunControlEvent {
     producer_pod_id: String,
     payload_json: String,
     payload: serde_json::Value,
+    invocation_supersession_scope_key: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24803,6 +27246,21 @@ fn decode_recovered_run_control_events(
                 .to_string()
             })?;
             Ok(RecoveredRunControlEvent {
+                user_id: row.try_get("user_id").map_err(|source| {
+                    db_error("decode_run_control_owner", run_id, source).to_string()
+                })?,
+                session_id: row.try_get("session_id").map_err(|source| {
+                    db_error("decode_run_control_session", run_id, source).to_string()
+                })?,
+                run_id: row.try_get("run_id").map_err(|source| {
+                    db_error("decode_run_control_run", run_id, source).to_string()
+                })?,
+                invocation_supersession_scope_key: row
+                    .try_get("invocation_supersession_scope_key")
+                    .map_err(|source| {
+                        db_error("decode_run_control_supersession_scope", run_id, source)
+                            .to_string()
+                    })?,
                 id: row.try_get("id").map_err(|source| {
                     db_error("decode_run_control_event_id", run_id, source).to_string()
                 })?,
@@ -24836,6 +27294,9 @@ fn recovered_run_control_event_is_exact(
     expected: &RunEventInsertRow,
 ) -> bool {
     recovered.id == expected.id
+        && recovered.user_id == expected.user_id
+        && recovered.session_id == expected.session_id
+        && recovered.run_id == expected.run_id
         && recovered.event_idx == expected.event_idx
         && recovered.event_type == expected.event_type
         && recovered.event_id == expected.event_id
@@ -24843,6 +27304,7 @@ fn recovered_run_control_event_is_exact(
         && recovered.event_hash == expected.event_hash
         && recovered.producer_pod_id == expected.producer_pod_id
         && recovered.payload_json == expected.payload_json
+        && recovered.invocation_supersession_scope_key == expected.invocation_supersession_scope_key
 }
 
 fn recovered_run_control_event_is_equivalent(
@@ -24851,6 +27313,14 @@ fn recovered_run_control_event_is_equivalent(
     expected_key: &str,
 ) -> bool {
     recovered.idempotency_key == expected_key
+        && recovered.invocation_supersession_scope_key
+            == projected_invocation_supersession_scope_key(
+                &recovered.user_id,
+                &recovered.session_id,
+                &recovered.run_id,
+                recovered.event_idx,
+                expected_event,
+            )
         && recovered.event_type == extract_event_type(expected_event)
         && recovered.event_hash == sha256_hex(recovered.payload_json.as_bytes())
         && run_events_have_same_immutable_payload(&recovered.payload, expected_event)
@@ -25048,12 +27518,17 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
-    let subject_run_id = matches!(
-        event_type.as_str(),
-        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
-    )
-    .then(|| extract_optional_string(event, "run_id"))
-    .flatten();
+    let invocation_supersession_scope_key =
+        projected_invocation_supersession_scope_key(user_id, session_id, run_id, event_idx, event);
+    let subject_run_id = match event_type.as_str() {
+        "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE => {
+            extract_optional_string(event, "run_id")
+        }
+        COLLABORATOR_STAGE_EVENT => event
+            .get("receipt")
+            .and_then(|receipt| extract_optional_string(receipt, "run_id")),
+        _ => None,
+    };
     let interaction_request_id = extract_interaction_request_id(event);
     let event_id = extract_optional_string(event, "event_id")
         .or_else(|| extract_optional_string(event, "id"))
@@ -25077,6 +27552,7 @@ fn build_run_event_insert_row(
         producer_pod_id: owner_pod_id.to_string(),
         request_id: None,
         payload_json,
+        invocation_supersession_scope_key,
     })
 }
 
@@ -25219,6 +27695,10 @@ fn project_stream_gap(event: serde_json::Value) -> serde_json::Value {
     {
         projected["explain_analyze_recovered"] = serde_json::Value::Bool(explain_analyze_recovered);
     }
+    copy_tool_delivery_diagnostics(
+        projected.as_object_mut().unwrap(),
+        event.as_object().unwrap(),
+    );
     projected
 }
 
@@ -25464,6 +27944,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     .unwrap_or(serde_json::Value::Null),
             );
             copy_execution_boundary_fields(&mut out, &data);
+            for key in [
+                "run_id",
+                "session_id",
+                "index",
+                "event_idx",
+                "run_generation",
+            ] {
+                insert_if_present(&mut out, &data, key);
+            }
             serde_json::Value::Object(out)
         }
         "tool_result" => {
@@ -25489,6 +27978,16 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             out.insert("result".to_string(), result);
             copy_explicit_artifacts(&mut out, &data);
             copy_execution_boundary_fields(&mut out, &data);
+            copy_tool_delivery_diagnostics(&mut out, &data);
+            if let Some(observation) = data
+                .get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+                .and_then(astra_turn_types::project_native_collaborator_observation)
+            {
+                out.insert(
+                    astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                    observation,
+                );
+            }
             project_external_tool_call_end(serde_json::Value::Object(out))
         }
         "run_started" => {
@@ -26008,12 +28507,51 @@ fn project_explain_analyze(event: serde_json::Value) -> serde_json::Value {
 }
 
 const EXTERNAL_TOOL_EVENT_MAX_BYTES: usize = 64 * 1024;
+/// Reserve cursor overhead in the largest durable observation window.
+pub const MAX_TOOL_TERMINAL_PRESENTATION_BYTES: usize =
+    MAX_RUN_OBSERVATION_BYTES / MAX_RUN_OBSERVATION_EVENTS - 128;
 const EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES: usize = 48 * 1024;
 const EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 8 * 1024;
 const EXTERNAL_TOOL_ARGUMENTS_INLINE_MAX_BYTES: usize = 8 * 1024;
 const EXTERNAL_TOOL_ARGUMENTS_PREVIEW_MAX_BYTES: usize = 2 * 1024;
 
 fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value {
+    let mut event = project_tool_terminal_presentation(event, EXTERNAL_TOOL_EVENT_MAX_BYTES);
+    if let Some(object) = event.as_object_mut() {
+        object.remove("idempotency_key");
+    }
+    event
+}
+
+// Only finite observational diagnostics cross presentation boundaries; these
+// fields never supply execution or recovery authority.
+fn copy_tool_delivery_diagnostics(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
+    for key in ["guidance_disposition", "native_session_binding"] {
+        if source.get(key).and_then(serde_json::Value::as_str) == Some("unconfirmed") {
+            out.insert(key.into(), serde_json::json!("unconfirmed"));
+        }
+    }
+    if out.contains_key("native_session_binding")
+        && let Some(reason @ ("persistence" | "timeout" | "commit_unknown")) = source
+            .get("native_session_binding_reason")
+            .and_then(serde_json::Value::as_str)
+    {
+        out.insert(
+            "native_session_binding_reason".into(),
+            serde_json::json!(reason),
+        );
+    }
+}
+
+/// Bound presentation, not the authoritative tool result. Call after execution
+/// binding fields are attached and before publishing or persisting the event.
+pub fn project_tool_terminal_presentation(
+    event: serde_json::Value,
+    max_bytes: usize,
+) -> serde_json::Value {
     let original_event_bytes = encoded_json_len(&event);
     let original_event_sha256 = sha256_hex(
         serde_json::to_string(&event)
@@ -26023,23 +28561,62 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
     let Some(source) = event.as_object() else {
         return event;
     };
+    let native_observation = source
+        .get(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+        .and_then(astra_turn_types::project_native_collaborator_observation);
 
     let mut out = serde_json::Map::from_iter([(
         "type".to_string(),
         serde_json::Value::String("tool_call_end".to_string()),
     )]);
-    for key in ["call_id", "tool"]
-        .into_iter()
-        .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
+    // Delivery diagnostics are independent of native execution success and
+    // must survive result-preview omission. Never retain arbitrary payloads.
+    copy_tool_delivery_diagnostics(&mut out, source);
+    for key in [
+        "call_id",
+        "tool",
+        "run_id",
+        "session_id",
+        "tool_call_id",
+        "index",
+        "event_idx",
+        "run_generation",
+        "idempotency_key",
+    ]
+    .into_iter()
+    .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
     {
         if let Some(value) = source.get(key) {
             out.insert(key.to_string(), value.clone());
         }
     }
     copy_explicit_artifacts(&mut out, source);
+    // Replaying a presentation must not replace original evidence with the
+    // hash or size of its preview.
+    for key in [
+        "result_truncated",
+        "result_bytes",
+        "result_sha256",
+        "result_integrity",
+        "payload_truncated",
+        "event_bytes",
+        "event_sha256",
+        "result_omitted",
+        "arguments_omitted",
+        "native_stage_observation_omitted",
+        "executor_omitted",
+    ] {
+        insert_if_present(&mut out, source, key);
+    }
+    if let Some(observation) = &native_observation {
+        out.insert(
+            astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+            observation.clone(),
+        );
+    }
 
     if let Some(result) = source.get("result").or_else(|| source.get("output")) {
-        let (result, evidence) = project_external_tool_result(result.clone());
+        let (result, evidence) = project_external_tool_result(result.clone(), max_bytes);
         out.insert("result".to_string(), result);
         if let Some((original_bytes, content_sha256)) = evidence {
             out.insert(
@@ -26084,16 +28661,16 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
     }
 
     let mut projected = serde_json::Value::Object(out);
-    if encoded_json_len(&projected) > EXTERNAL_TOOL_EVENT_MAX_BYTES {
+    if encoded_json_len(&projected) > max_bytes {
         let call_id = source
             .get("call_id")
             .and_then(serde_json::Value::as_str)
-            .map(|value| truncate_utf8_bytes(value, 1024))
+            .map(str::to_owned)
             .unwrap_or_default();
         let tool = source
             .get("tool")
             .and_then(serde_json::Value::as_str)
-            .map(|value| truncate_utf8_bytes(value, 1024))
+            .map(str::to_owned)
             .unwrap_or_default();
         let projected_result = projected.get("result").cloned();
         let projected_arguments = projected.get("arguments").cloned();
@@ -26119,6 +28696,60 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
         let fallback_obj = fallback
             .as_object_mut()
             .expect("tool terminal fallback is an object");
+        for key in [
+            "run_id",
+            "session_id",
+            "tool_call_id",
+            "index",
+            "event_idx",
+            "run_generation",
+            "idempotency_key",
+            "result_truncated",
+            "result_bytes",
+            "result_sha256",
+            "result_integrity",
+            "event_bytes",
+            "event_sha256",
+            "result_omitted",
+            "arguments_omitted",
+            "native_stage_observation_omitted",
+            "executor_omitted",
+            "guidance_disposition",
+            "native_session_binding",
+            "native_session_binding_reason",
+        ]
+        .into_iter()
+        .chain(
+            EXTERNAL_EXECUTION_BOUNDARY_FIELDS
+                .iter()
+                .copied()
+                .filter(|key| {
+                    !matches!(
+                        *key,
+                        "status"
+                            | "success"
+                            | "executed"
+                            | "disposition"
+                            | "duration_ms"
+                            | "error_kind"
+                    )
+                }),
+        ) {
+            insert_if_present(fallback_obj, projected.as_object().unwrap(), key);
+        }
+        if projected
+            .get("executor")
+            .is_some_and(|executor| encoded_json_len(executor) > max_bytes)
+        {
+            fallback_obj.remove("executor");
+            fallback_obj.insert("executor_omitted".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(observation) = native_observation {
+            fallback_obj.insert(
+                astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY.into(),
+                observation,
+            );
+        }
         for (key, value) in [
             ("result", projected_result),
             ("arguments", projected_arguments),
@@ -26133,12 +28764,89 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
                 fallback_obj.insert(key.to_string(), value);
             }
         }
+        // Identity, execution facts and native observations take precedence
+        // over previews. Encoded JSON can be much larger than raw UTF-8 text.
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj.remove("arguments").is_some() {
+                fallback_obj.insert("arguments_omitted".into(), serde_json::Value::Bool(true));
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj.remove("executor").is_some() {
+                fallback_obj.insert("executor_omitted".into(), serde_json::Value::Bool(true));
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes
+            && let Some(result) = fallback.get("result")
+        {
+            let original = source
+                .get("result")
+                .or_else(|| source.get("output"))
+                .unwrap_or(result);
+            let encoded = serde_json::to_vec(original).unwrap();
+            let (original_bytes, content_sha256) =
+                external_lifecycle_projection_integrity(original)
+                    .map(|(bytes, digest)| (bytes, digest.to_owned()))
+                    .unwrap_or_else(|| (encoded.len(), sha256_hex(&encoded)));
+            let remaining = max_bytes.saturating_sub(
+                encoded_json_len(&fallback).saturating_sub(encoded_json_len(result)),
+            );
+            if let Some(control) = project_external_lifecycle_result(
+                result,
+                original_bytes,
+                &content_sha256,
+                remaining,
+            ) {
+                fallback["result"] = control;
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if let Some(result) = fallback_obj.remove("result") {
+                fallback_obj.insert("result_omitted".into(), serde_json::Value::Bool(true));
+                if !fallback_obj.contains_key("result_sha256") {
+                    let original = source
+                        .get("result")
+                        .or_else(|| source.get("output"))
+                        .unwrap_or(&result);
+                    let encoded = serde_json::to_vec(original).unwrap();
+                    let (bytes, digest) = external_lifecycle_projection_integrity(original)
+                        .map(|(bytes, digest)| (bytes, digest.to_owned()))
+                        .unwrap_or_else(|| (encoded.len(), sha256_hex(&encoded)));
+                    fallback_obj.insert("result_bytes".into(), serde_json::json!(bytes));
+                    fallback_obj.insert("result_sha256".into(), serde_json::json!(digest));
+                }
+            }
+        }
+        if encoded_json_len(&fallback) > max_bytes {
+            let fallback_obj = fallback.as_object_mut().unwrap();
+            if fallback_obj
+                .remove(astra_turn_types::NATIVE_COLLABORATOR_OBSERVATION_KEY)
+                .is_some()
+            {
+                fallback_obj.insert(
+                    "native_stage_observation_omitted".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
         projected = fallback;
     }
-    assert!(
-        encoded_json_len(&projected) <= EXTERNAL_TOOL_EVENT_MAX_BYTES,
-        "external tool event projection exceeded its hard byte limit"
-    );
+    if encoded_json_len(&projected) > max_bytes {
+        // Never shorten an identity and accidentally attach facts to a
+        // different invocation. The normal snapshot-repair contract applies.
+        projected = serde_json::json!({
+            "type": "stream_gap", "run_id": source.get("run_id"),
+            "dropped_event_count": 1, "repair": "refresh_run_snapshot",
+            "event_sha256": original_event_sha256, "event_bytes": original_event_bytes
+        });
+        copy_tool_delivery_diagnostics(projected.as_object_mut().unwrap(), source);
+        if encoded_json_len(&projected) > max_bytes {
+            return serde_json::Value::Null;
+        }
+    }
     projected
 }
 
@@ -26156,21 +28864,31 @@ fn copy_explicit_artifacts(
 
 fn project_external_tool_result(
     result: serde_json::Value,
+    event_budget: usize,
 ) -> (serde_json::Value, Option<(usize, String)>) {
     let encoded =
         serde_json::to_string(&result).expect("serializing a serde_json::Value must not fail");
-    if encoded.len() <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES {
+    let result_budget =
+        EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES.min(event_budget.saturating_mul(3) / 4);
+    if encoded.len() <= result_budget {
         return (result, None);
     }
 
-    let original_bytes = encoded.len();
-    let content_sha256 = sha256_hex(encoded.as_bytes());
-    if let Some(projected) =
-        project_external_lifecycle_result(&result, original_bytes, content_sha256.as_str())
-    {
+    let (original_bytes, content_sha256) = external_lifecycle_projection_integrity(&result)
+        .map(|(bytes, digest)| (bytes, digest.to_owned()))
+        .unwrap_or_else(|| (encoded.len(), sha256_hex(encoded.as_bytes())));
+    if let Some(projected) = project_external_lifecycle_result(
+        &result,
+        original_bytes,
+        content_sha256.as_str(),
+        result_budget,
+    ) {
         return (projected, Some((original_bytes, content_sha256)));
     }
-    let preview = truncate_utf8_bytes(&encoded, EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES);
+    let preview = truncate_utf8_bytes(
+        &encoded,
+        EXTERNAL_TOOL_RESULT_PREVIEW_MAX_BYTES.min(event_budget / 4),
+    );
     (
         serde_json::json!({
             "type": "astra.external_tool_result_summary.v1",
@@ -26188,10 +28906,32 @@ fn project_external_tool_result(
 /// for data tools, but it is insufficient for lifecycle tools: clients must
 /// still be able to identify and control the accepted Work unit. Selection is
 /// driven by the versioned Work observation, not by tool names or prose.
+fn external_lifecycle_projection_integrity(result: &serde_json::Value) -> Option<(usize, &str)> {
+    if result.get("type")?.as_str()? != "astra.external_tool_lifecycle_summary.v1"
+        || !result.get("truncated")?.as_bool()?
+    {
+        return None;
+    }
+    let observation = serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(
+        result
+            .get(astra_core::work_unit::WORK_UNIT_OBSERVATION_FIELD)?
+            .clone(),
+    )
+    .ok()?;
+    if !observation.is_valid() {
+        return None;
+    }
+    let bytes = usize::try_from(result.get("original_bytes")?.as_u64()?).ok()?;
+    let digest = result.get("content_sha256")?.as_str()?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((bytes, digest))
+}
+
 fn project_external_lifecycle_result(
     result: &serde_json::Value,
     original_bytes: usize,
     content_sha256: &str,
+    result_budget: usize,
 ) -> Option<serde_json::Value> {
     let parsed = match result {
         serde_json::Value::String(output) => serde_json::from_str(output).ok()?,
@@ -26204,6 +28944,8 @@ fn project_external_lifecycle_result(
             serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value.clone()).ok()
         })
         .filter(astra_core::work_unit::WorkUnitObservation::is_valid)?;
+    let (original_bytes, content_sha256) = external_lifecycle_projection_integrity(&parsed)
+        .unwrap_or((original_bytes, content_sha256));
 
     let mut compact = serde_json::Map::from_iter([
         (
@@ -26229,7 +28971,6 @@ fn project_external_lifecycle_result(
         "agent_id",
         "run_id",
         "group_id",
-        "title",
         "target_count",
         "transcript_location",
         "parent_run_id",
@@ -26240,9 +28981,13 @@ fn project_external_lifecycle_result(
             compact.insert(key.to_string(), value.clone());
         }
     }
-    if encoded_json_len(&serde_json::Value::Object(compact.clone()))
-        > EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES
-    {
+    if parsed["control_membership_omitted"] == "oversized" {
+        compact.insert(
+            "control_membership_omitted".into(),
+            serde_json::json!("oversized"),
+        );
+    }
+    if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
         // A syntactically valid observation may contain future extension
         // fields. Treat its byte size as untrusted input and fall back to the
         // generic bounded projection rather than exporting an oversized
@@ -26257,9 +29002,7 @@ fn project_external_lifecycle_result(
             continue;
         };
         compact.insert(key.to_string(), value);
-        if encoded_json_len(&serde_json::Value::Object(compact.clone()))
-            > EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES
-        {
+        if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
             compact.remove(key);
             compact.insert(
                 "control_membership_omitted".to_string(),
@@ -26268,8 +29011,16 @@ fn project_external_lifecycle_result(
             break;
         }
     }
+    if let Some(title) = parsed.get("title") {
+        compact.insert("title".into(), title.clone());
+        if encoded_json_len(&serde_json::Value::Object(compact.clone())) > result_budget {
+            compact.remove("title");
+        }
+    }
     let compact = serde_json::Value::Object(compact);
-    debug_assert!(encoded_json_len(&compact) <= EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
+    if encoded_json_len(&compact) > result_budget {
+        return None;
+    }
     Some(compact)
 }
 
@@ -28018,7 +30769,11 @@ mod tests {
                 "input": {"content": "preserve me"}
             }
         })];
-        let returned = terminal_user_intent_return_events(&intent_history, true);
+        let returned = terminal_user_intent_return_events(&intent_history, true, false);
+        assert!(
+            terminal_user_intent_return_events(&intent_history, true, true).is_empty(),
+            "unconfirmed native delivery cannot produce a retryable return"
+        );
         assert_eq!(returned.len(), 1);
         let mut conflicting = returned[0].clone();
         conflicting["data"]["content"] = json!("different");
@@ -28028,6 +30783,7 @@ mod tests {
                 vec![atomic_terminal_test_row(10, conflicting, "batch")],
                 10,
                 "batch",
+                false
             ),
             AtomicTerminalReturnPrefixResolution::Conflict(_)
         ));
@@ -28044,6 +30800,7 @@ mod tests {
             vec![atomic_terminal_test_row(10, returned[0].clone(), &batch_id)],
             10,
             &batch_id,
+            false,
         ) {
             AtomicTerminalReturnPrefixResolution::Exact(prefix) => prefix,
             AtomicTerminalReturnPrefixResolution::Conflict(reason) => {
@@ -28100,10 +30857,10 @@ mod tests {
                 "input": {"content": "preserve me"}
             }
         })];
-        let returned = terminal_user_intent_return_events(&intent_history, true);
+        let returned = terminal_user_intent_return_events(&intent_history, true, false);
 
         assert!(matches!(
-            validate_atomic_terminal_return_prefix(&intent_history, Vec::new(), 10, "batch"),
+            validate_atomic_terminal_return_prefix(&intent_history, Vec::new(), 10, "batch", false),
             AtomicTerminalReturnPrefixResolution::Conflict(_)
         ));
         assert!(matches!(
@@ -28116,6 +30873,7 @@ mod tests {
                 )],
                 10,
                 "current-settlement-batch",
+                false
             ),
             AtomicTerminalReturnPrefixResolution::Conflict(_)
         ));
@@ -28163,6 +30921,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(terminal.subject_run_id, None);
+
+        let stage = build_run_event_insert_row(
+            "user-1",
+            "anchor-run",
+            "session-1",
+            Some("root"),
+            10,
+            "pod-a",
+            &json!({
+                "event_type": COLLABORATOR_STAGE_EVENT,
+                "receipt": {"run_id": "stage-run"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(stage.subject_run_id.as_deref(), Some("stage-run"));
+    }
+
+    #[test]
+    fn invocation_guidance_projection_uses_canonical_source_validation() {
+        for (data, expected) in [
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":{"content":" 界\n"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":{"active_skills":[" rust "]}}),
+                true,
+            ),
+            (
+                serde_json::json!({"delivery":"guide_current_run","input":{"content":"answer"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":" ","delivery":"guide_current_run","input":{"content":"answer"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":{"content":" \n"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"guide_current_run","input":null}),
+                false,
+            ),
+            (
+                serde_json::json!({"intent_id":"i","delivery":"replace_objective","input":{"content":"answer"}}),
+                false,
+            ),
+        ] {
+            let event = serde_json::json!({"event_type":"user_intent", "data":data, "invocation_supersession_scope_key":!expected});
+            let row = build_run_event_insert_row("u", "r", "s", None, 8, "pod", &event).unwrap();
+            assert_eq!(
+                row.invocation_supersession_scope_key.is_none(),
+                expected,
+                "{event}"
+            );
+            if !expected {
+                assert_eq!(
+                    row.invocation_supersession_scope_key.as_deref(),
+                    Some(invocation_supersession_scope_key("u", "s", "r").as_str())
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row.payload_json).unwrap(),
+                event
+            );
+            if expected {
+                let disposition =
+                    user_intent_disposition_event_from_source(8, &event, UserIntentStatus::Applied)
+                        .unwrap();
+                assert!(!disposition["data"]["content"].as_str().unwrap().is_empty());
+            }
+        }
+        let event = serde_json::json!({"event_type":"run_finished","data":{"intent_id":"i","delivery":"guide_current_run","input":"answer"}});
+        assert!(!invocation_guidance_is_valid(8, &event));
+        assert_eq!(
+            projected_invocation_supersession_scope_key("u", "s", "r", 8, &event),
+            None
+        );
+        let grant = serde_json::json!({"event_type":"action_admission_granted", "invocation_supersession_scope_key":"forged"});
+        assert_eq!(
+            projected_invocation_supersession_scope_key("u", "s", "r", 8, &grant),
+            Some(invocation_supersession_scope_key("u", "s", "r"))
+        );
+        assert_ne!(
+            invocation_supersession_scope_key("ab", "c", "r"),
+            invocation_supersession_scope_key("a", "bc", "r")
+        );
     }
 
     #[derive(Clone)]
@@ -28958,7 +31804,7 @@ mod tests {
         assert_ne!(
             left.is_ok(),
             right.is_ok(),
-            "one generation permits one owner only"
+            "one generation permits one owner only: left={left:?}, right={right:?}"
         );
         let winner = left.or(right).unwrap();
         assert_eq!(winner.run().run_generation, before.run_generation + 1);
@@ -33543,6 +36389,203 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_collaborator_stage_ack_loss_recovers_atomic_child_and_anchor_receipts() {
+        use crate::tool_invocation_ledger::{
+            DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
+        };
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint,
+            ToolInvocationIdentity, ToolInvocationResultPayload, ToolInvocationState,
+            ToolInvocationTerminalOutcome,
+        };
+        use std::collections::BTreeMap;
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        let parent_id = Uuid::new_v4().to_string();
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let store = DatabaseRunStateStore::new(pool.clone())
+            .with_owner_pod_id("collaborator-ack-owner")
+            .with_lease_ttl(Duration::from_secs(300));
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        store.insert_run(parent).await.unwrap();
+        let anchor_id = Uuid::new_v4().to_string();
+        let mut request = CollaboratorStageAdmission {
+            anchor_run_id: anchor_id.clone(),
+            source_message_id: Uuid::new_v4().to_string(),
+            request_fingerprint: "source-intent-digest".into(),
+            execution_identity_fingerprint: "prepared-identity-digest".into(),
+            native_execution: CollaboratorNativeExecutionLocator {
+                descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
+                    astra_turn_types::ToolIdentity::new(
+                        astra_turn_types::ProviderBindingRef::new("ack-runner").unwrap(),
+                        astra_turn_types::NativeToolId::new("native_codex").unwrap(),
+                    ),
+                    "ack-descriptor",
+                )
+                .unwrap(),
+                public_tool_name: "native_codex".into(),
+                requested_model: None,
+                policy_content_id: "ack-policy".into(),
+            },
+            expected_previous_stage_run_id: None,
+            expected_parent_generation: 0,
+            association: CollaboratorAssociation {
+                provider: CollaboratorProvider::Codex,
+                execution_boundary: CollaboratorExecutionBoundary::UserRunner {
+                    runner_id: "ack-workspace".into(),
+                },
+            },
+        };
+        let mut child = durable_run_record(&anchor_id);
+        child.user_id = user_id.clone();
+        child.session_id = session_id.clone();
+        child.parent_run_id = Some(parent_id.clone());
+        child.root_run_id = None;
+        child.ancestor_path = None;
+        child.run_generation = 1;
+        let first = store
+            .clone()
+            .with_run_create_commit_ack_loss_once()
+            .insert_run_with_collaborator_stage(child.clone(), request.clone(), None)
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        let native = CollaboratorNativeSession {
+            anchor_run_id: anchor_id.clone(),
+            provider: CollaboratorProvider::Codex,
+            native_session_id: Uuid::new_v4().to_string(),
+        };
+        let ledger = DatabaseToolInvocationLedger::new(pool.clone());
+        let identity = ToolInvocationIdentity::new(
+            &user_id,
+            &session_id,
+            &anchor_id,
+            "ack-turn",
+            "ack-invocation",
+        )
+        .unwrap();
+        let decision =
+            ToolInvocationDecision::new(&serde_json::json!({"route":"user_runner"})).unwrap();
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::Provider {
+                descriptor: request.native_execution.descriptor.clone(),
+            },
+            &serde_json::json!({"task":"ack recovery"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        ledger
+            .prepare(&identity, &fingerprint, &decision)
+            .await
+            .unwrap();
+        ledger
+            .claim_dispatch(
+                &identity,
+                "ack-worker",
+                90_000,
+                ToolInvocationDispatchAdmission {
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 1,
+                    expected_owner_pod_id: "collaborator-ack-owner".into(),
+                    expected_execution_binding_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let result = ToolInvocationResultPayload::new(
+            "acknowledged",
+            BTreeMap::from([
+                ("workspace_effect_settled".into(), serde_json::json!(true)),
+                (
+                    COLLABORATOR_NATIVE_SESSION_METADATA_KEY.into(),
+                    serde_json::to_value(&native).unwrap(),
+                ),
+            ]),
+            None,
+        )
+        .unwrap();
+        ledger
+            .compare_and_complete(
+                &identity,
+                ToolInvocationState::Dispatched,
+                Some("ack-worker"),
+                &ToolInvocationTerminalOutcome::Succeeded { result },
+            )
+            .await
+            .unwrap();
+        store
+            .confirm_collaborator_native_session(&identity, &native, 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &anchor_id,
+                    &[STATUS_RUNNING],
+                    Some(1),
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+        let next_id = Uuid::new_v4().to_string();
+        child.run_id = next_id.clone();
+        request.source_message_id = Uuid::new_v4().to_string();
+        request.expected_previous_stage_run_id = Some(anchor_id.clone());
+        let next = store
+            .clone()
+            .with_run_create_commit_ack_loss_once()
+            .insert_run_with_collaborator_stage(child, request, None)
+            .await
+            .unwrap();
+        assert!(!next.replayed);
+        assert_eq!(next.run_id, next_id);
+        let association = store
+            .load_collaborator_association(&user_id, &session_id, &anchor_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(association.latest_stage.run_id, next_id);
+        assert_eq!(
+            store
+                .load_run(&user_id, &anchor_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_COMPLETED
+        );
+        for run_id in [&next_id, &anchor_id, &parent_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_run_create_commit_ack_loss_recovers_exact_run_slot_and_initial_events_on_matrixone()
      {
         let (_, pool) = setup_database_run_state_store_it().await;
@@ -36607,6 +39650,45 @@ mod tests {
         assert_eq!(projection.projection_event_idx, 1);
         assert_eq!(projection.latest_event_type.as_deref(), Some("user_intent"));
 
+        let request = AtomicRunGuidanceAdmissionRequest {
+            user_id: &user_id,
+            run_id: &run_id,
+            expected_session_id: &session_id,
+            intent_id: "guidance-ack",
+            event: &event,
+            process_local_execution_live: false,
+        };
+        let expected = build_run_event_insert_row(
+            &user_id,
+            &run_id,
+            &session_id,
+            None,
+            1,
+            "guidance-ack-owner",
+            &event,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reconcile_guidance_commit(request, &expected)
+                .await
+                .unwrap(),
+            GuidanceCommitRecovery::Equivalent(1)
+        );
+        sqlx::query("UPDATE agent_run_events SET invocation_supersession_scope_key=? WHERE user_id=? AND run_id=? AND event_idx=1")
+            .bind(invocation_supersession_scope_key(&user_id, &session_id, &run_id)).bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            store.admit_run_guidance(request).await.unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        );
+        assert_eq!(
+            store
+                .reconcile_guidance_commit(request, &expected)
+                .await
+                .unwrap(),
+            GuidanceCommitRecovery::Conflict
+        );
+
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
             .bind(&user_id)
@@ -38607,6 +41689,50 @@ mod tests {
     }
 
     #[test]
+    fn tool_terminal_presentation_preserves_scope_and_integrity_or_reports_a_gap() {
+        let event = json!({
+            "type": "tool_call_end", "run_id": "run", "session_id": "session", "call_id": "call",
+            "tool": "tool", "result": "界\\\"\n".repeat(12_000), "arguments": "x".repeat(8_000),
+            "executed": null, "status": "completed", "success": true,
+            "transport": "server_local", "executor": {"kind": "server_local"},
+            "workspace": {"path": "/workspace"}
+        });
+        let bounded = project_tool_terminal_presentation(event.clone(), 3968);
+        assert!(encoded_json_len(&bounded) <= 3968);
+        for key in [
+            "run_id",
+            "session_id",
+            "call_id",
+            "tool",
+            "executed",
+            "transport",
+            "executor",
+            "workspace",
+        ] {
+            assert_eq!(bounded[key], event[key], "{key}");
+        }
+        assert_eq!(bounded["result_bytes"], encoded_json_len(&event["result"]));
+        assert_eq!(
+            project_tool_terminal_presentation(bounded.clone(), 3968),
+            bounded
+        );
+        let mut receipt = event.clone();
+        receipt["result"] = json!({"status": "completed", "agent_id": "agent"});
+        receipt["arguments"] = json!({"instruction": "x".repeat(5_000)});
+        let receipt = project_tool_terminal_presentation(receipt, 3968);
+        assert_eq!(receipt["result"]["agent_id"], "agent");
+        assert_eq!(receipt["arguments_omitted"], true);
+        for key in ["call_id", "workspace"] {
+            let mut oversized = event.clone();
+            oversized[key] = json!("界".repeat(4_000));
+            let gap = project_tool_terminal_presentation(oversized, 3968);
+            assert_eq!(gap["type"], "stream_gap");
+            assert_eq!(gap["run_id"], "run");
+            assert_eq!(gap["repair"], "refresh_run_snapshot");
+        }
+    }
+
+    #[test]
     fn large_tool_results_are_bounded_on_the_external_client_surface() {
         let output = "界".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
         let original_bytes = serde_json::to_string(&serde_json::Value::String(output.clone()))
@@ -38661,14 +41787,15 @@ mod tests {
         let result = json!({
             "status": "completed",
             "group_id": "review-group",
-            "target_count": 2,
+            "target_count": 3,
             "results": [{"result": "x".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES * 2)}],
             "fanout": {
                 "group_id": "review-group",
-                "target_count": 2,
+                "target_count": 3,
                 "slots": [
                     {"slot_index": 0, "agent_id": "a", "run_id": "run-a", "status": "completed"},
-                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"}
+                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"},
+                    {"slot_index": 2, "agent_id": "c".repeat(256), "run_id": "r".repeat(256), "status": "completed"}
                 ]
             },
             "work_unit_observation": {
@@ -38681,17 +41808,94 @@ mod tests {
             }
         })
         .to_string();
-        let transformed = transform_run_event_for_client(json!({
+        let event = json!({
             "type": "tool_call_end",
             "call_id": "call-fanout",
             "tool": "agent_fanout",
             "result": result,
             "success": true,
-        }));
+        });
+        let durable = project_tool_terminal_presentation(event.clone(), 3968);
+        assert!(encoded_json_len(&durable) <= 3968);
+        assert_eq!(durable["result"]["group_id"], "review-group");
+        assert_eq!(durable["result"]["fanout"]["slots"][1]["run_id"], "run-b");
+        let mut pressure_result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        pressure_result["results"] = json!([{"result":"x".repeat(1_500)}]);
+        assert!(encoded_json_len(&pressure_result) < 3968 * 3 / 4);
+        let pressure = json!({
+            "type":"tool_call_end", "run_id":"run", "session_id":"session",
+            "call_id":"call-fanout", "tool":"agent_fanout", "success":true,
+            "result":pressure_result, "arguments":{"instruction":"x".repeat(5_000)},
+            "workspace":{"path":"x".repeat(1_700)}
+        });
+        let mut without_arguments = pressure.clone();
+        without_arguments
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        assert!(encoded_json_len(&without_arguments) > 3968);
+        let compact = project_tool_terminal_presentation(pressure.clone(), 3968);
+        assert!(encoded_json_len(&compact) <= 3968);
+        assert_eq!(compact["result"]["group_id"], "review-group");
+        assert_eq!(compact["result"]["fanout"]["slots"][1]["run_id"], "run-b");
+        assert_eq!(
+            compact["result"]["original_bytes"],
+            encoded_json_len(&pressure["result"])
+        );
+        assert_eq!(
+            compact["result"]["content_sha256"],
+            sha256_hex(&serde_json::to_vec(&pressure["result"]).unwrap())
+        );
+        assert_eq!(compact["arguments_omitted"], true);
+        assert_eq!(compact["workspace"], pressure["workspace"]);
+        assert_eq!(
+            project_tool_terminal_presentation(compact.clone(), 3968),
+            compact
+        );
+        let mut rebound = durable.clone();
+        rebound["run_id"] = json!("run");
+        rebound["session_id"] = json!("session");
+        rebound["run_generation"] = json!(7);
+        rebound["idempotency_key"] = json!("subrun-tool:7:".to_owned() + &"k".repeat(190));
+        rebound["workspace"] = json!({"path":""});
+        let padding = (3968 + 64usize).saturating_sub(encoded_json_len(&rebound));
+        rebound["workspace"]["path"] = json!("x".repeat(padding));
+        assert!(encoded_json_len(&rebound) > 3968);
+        let rebound = project_tool_terminal_presentation(rebound, 3968);
+        assert!(encoded_json_len(&rebound) <= 3968);
+        assert_eq!(rebound["result"]["group_id"], "review-group");
+        assert_eq!(
+            rebound["result"]["original_bytes"],
+            durable["result"]["original_bytes"]
+        );
+        assert_eq!(
+            rebound["result"]["content_sha256"],
+            durable["result"]["content_sha256"]
+        );
+        assert_eq!(rebound["result_sha256"], durable["result_sha256"]);
+        assert_eq!(
+            project_tool_terminal_presentation(rebound.clone(), 3968),
+            rebound
+        );
+        let mut omitted = durable["result"].clone();
+        omitted.as_object_mut().unwrap().remove("fanout");
+        omitted["control_membership_omitted"] = json!("oversized");
+        let retained =
+            project_external_lifecycle_result(&omitted, 1, &"0".repeat(64), 2000).unwrap();
+        assert_eq!(
+            retained["original_bytes"],
+            durable["result"]["original_bytes"]
+        );
+        assert_eq!(
+            retained["content_sha256"],
+            durable["result"]["content_sha256"]
+        );
+        assert_eq!(retained["control_membership_omitted"], "oversized");
+        let transformed = transform_run_event_for_client(event);
 
         assert_eq!(transformed["success"], true);
         assert_eq!(transformed["result"]["group_id"], "review-group");
-        assert_eq!(transformed["result"]["target_count"], 2);
+        assert_eq!(transformed["result"]["target_count"], 3);
         assert_eq!(
             transformed["result"]["work_unit_observation"]["kind"],
             "agent_fanout"
@@ -38851,7 +42055,7 @@ mod tests {
 
     #[test]
     fn oversized_execution_metadata_cannot_erase_the_terminal_outcome() {
-        let transformed = transform_run_event_for_client(json!({
+        let event = json!({
             "type": "tool_call_end",
             "call_id": "call-terminal",
             "tool": "introspect",
@@ -38866,21 +42070,129 @@ mod tests {
                 "untrusted_extension": "x".repeat(2 * 1024 * 1024),
             },
             "error_kind": "e".repeat(2 * 1024 * 1024),
-        }));
+        });
+        for budget in [
+            EXTERNAL_TOOL_EVENT_MAX_BYTES,
+            MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+        ] {
+            let transformed = project_tool_terminal_presentation(event.clone(), budget);
+            assert_eq!(transformed["type"], "tool_call_end");
+            assert_eq!(transformed["call_id"], "call-terminal");
+            assert_eq!(transformed["tool"], "introspect");
+            assert_eq!(transformed["result"]["snapshot"], "available");
+            assert_eq!(transformed["arguments"]["scope"], "current_run");
+            assert_eq!(transformed["status"], "rejected");
+            assert_eq!(transformed["success"], false);
+            assert_eq!(transformed["executed"], false);
+            assert_eq!(transformed["duration_ms"], 37);
+            assert_eq!(transformed["payload_truncated"], true);
+            assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
+            assert!(transformed.get("executor").is_none());
+            assert_eq!(transformed["executor_omitted"], true);
+            assert!(encoded_json_len(&transformed) <= budget);
+            assert_eq!(
+                project_tool_terminal_presentation(transformed.clone(), budget),
+                transformed
+            );
+        }
+        let mut small = event;
+        small["executor"] = json!({"kind":"server_local"});
+        small["error_kind"] = json!("rejected");
+        let projected =
+            project_tool_terminal_presentation(small.clone(), MAX_TOOL_TERMINAL_PRESENTATION_BYTES);
+        assert_eq!(projected["executor"], small["executor"]);
+        assert!(projected.get("executor_omitted").is_none());
+        small["executor"]["extension"] = json!("x".repeat(3_000));
+        small["result"] = json!({"snapshot":"x".repeat(1_000)});
+        let budget = MAX_TOOL_TERMINAL_PRESENTATION_BYTES;
+        assert!(encoded_json_len(&small["executor"]) < budget);
+        assert!(encoded_json_len(&small["result"]) < budget);
+        assert!(encoded_json_len(&small) > budget);
+        let projected = project_tool_terminal_presentation(small.clone(), budget);
+        assert_eq!(projected["type"], "tool_call_end");
+        assert_eq!(projected["call_id"], small["call_id"]);
+        assert_eq!(projected["result"], small["result"]);
+        assert_eq!(projected["executed"], false);
+        assert_eq!(projected["status"], "rejected");
+        assert_eq!(projected["success"], false);
+        assert_eq!(projected["executor_omitted"], true);
+        assert!(encoded_json_len(&projected) <= budget);
+        assert_eq!(
+            project_tool_terminal_presentation(projected.clone(), budget),
+            projected
+        );
+    }
 
-        assert_eq!(transformed["type"], "tool_call_end");
-        assert_eq!(transformed["call_id"], "call-terminal");
-        assert_eq!(transformed["tool"], "introspect");
-        assert_eq!(transformed["result"]["snapshot"], "available");
-        assert_eq!(transformed["arguments"]["scope"], "current_run");
-        assert_eq!(transformed["status"], "rejected");
-        assert_eq!(transformed["success"], false);
-        assert_eq!(transformed["executed"], false);
-        assert_eq!(transformed["duration_ms"], 37);
-        assert_eq!(transformed["payload_truncated"], true);
-        assert_eq!(transformed["error_kind"].as_str().map(str::len), Some(1024));
-        assert!(transformed.get("executor").is_none());
-        assert!(encoded_json_len(&transformed) <= EXTERNAL_TOOL_EVENT_MAX_BYTES);
+    #[test]
+    fn terminal_delivery_diagnostics_survive_bounded_projection_and_repair() {
+        for reason in ["persistence", "timeout", "commit_unknown"] {
+            for (result_bytes, identity_bytes) in [(16, 16), (100_000, 16), (100_000, 100_000)] {
+                let source = json!({"type":"tool_call_end", "run_id":"run", "tool":"native",
+                    "call_id":"i".repeat(identity_bytes), "result":"x".repeat(result_bytes),
+                    "native_session_binding":"unconfirmed", "native_session_binding_reason":reason,
+                    "guidance_disposition":"unconfirmed"});
+                let projected = project_tool_terminal_presentation(
+                    source,
+                    MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+                );
+                assert_eq!(projected["native_session_binding"], "unconfirmed");
+                assert_eq!(projected["native_session_binding_reason"], reason);
+                assert_eq!(projected["guidance_disposition"], "unconfirmed");
+                assert!(encoded_json_len(&projected) <= MAX_TOOL_TERMINAL_PRESENTATION_BYTES);
+                if projected["type"] == "tool_call_end" {
+                    assert_eq!(
+                        project_tool_terminal_presentation(
+                            projected.clone(),
+                            MAX_TOOL_TERMINAL_PRESENTATION_BYTES
+                        ),
+                        projected
+                    );
+                } else {
+                    assert_eq!(projected["type"], "stream_gap");
+                    assert_eq!(projected["repair"], "refresh_run_snapshot");
+                }
+                for envelope in [
+                    projected.clone(),
+                    json!({"event_type":if projected["type"] == "tool_call_end" { "tool_result" } else { "stream_gap" }, "data":projected}),
+                ] {
+                    let client = transform_run_event_for_client(envelope);
+                    assert_eq!(client["native_session_binding"], "unconfirmed");
+                    assert_eq!(client["native_session_binding_reason"], reason);
+                    assert_eq!(client["guidance_disposition"], "unconfirmed");
+                    assert!(encoded_json_len(&client) <= MAX_TOOL_TERMINAL_PRESENTATION_BYTES);
+                    assert_eq!(transform_run_event_for_client(client.clone()), client);
+                }
+            }
+        }
+        for (binding, reason) in [
+            (json!("unconfirmed"), json!("x".repeat(100_000))),
+            (json!("unconfirmed"), json!({"reason":"persistence"})),
+            (json!("confirmed"), json!("persistence")),
+            (json!(null), json!("persistence")),
+        ] {
+            let projected = project_tool_terminal_presentation(
+                json!({"type":"tool_call_end",
+                "native_session_binding":binding, "native_session_binding_reason":reason}),
+                MAX_TOOL_TERMINAL_PRESENTATION_BYTES,
+            );
+            assert!(projected.get("native_session_binding_reason").is_none());
+            assert_eq!(
+                projected.get("native_session_binding").is_some(),
+                binding == "unconfirmed"
+            );
+            let gap = json!({"type":"stream_gap", "run_id":"run", "dropped_event_count":1,
+                "repair":"refresh_run_snapshot", "native_session_binding":binding,
+                "native_session_binding_reason":reason});
+            for envelope in [gap.clone(), json!({"event_type":"stream_gap", "data":gap})] {
+                let client = transform_run_event_for_client(envelope);
+                assert!(client.get("native_session_binding_reason").is_none());
+                assert_eq!(
+                    client.get("native_session_binding").is_some(),
+                    binding == "unconfirmed"
+                );
+                assert_eq!(transform_run_event_for_client(client.clone()), client);
+            }
+        }
     }
 
     /// Covers all event types that reach the client via transform_run_event_for_client:
@@ -40306,6 +43618,9 @@ mod tests {
                     assert!(matches!(
                         store
                             .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                                purpose: UserIntentApplyPurpose::ModelBoundary,
+                                invocation_identity: None,
+
                                 user_id: "u1",
                                 run_id: &run_id,
                                 expected_session_id: "s1",
@@ -41981,13 +45296,252 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(durable.status, STATUS_WAITING);
-        assert!(
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert_eq!(durable.waiting_for, None);
+        assert_eq!(
             durable
                 .events
                 .iter()
-                .all(|event| extract_event_type(event) != "run_resumed")
+                .filter(|event| extract_event_type(event) == "run_resumed")
+                .count(),
+            1
         );
+    }
+
+    async fn assert_superseded_interaction_releases_wait_for_guidance(
+        store: &dyn RunStateStore,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        outcome: &str,
+        kind: DurableRunInteractionKind,
+    ) {
+        let mut run = durable_run_record(run_id);
+        run.user_id = user_id.to_string();
+        run.session_id = session_id.to_string();
+        store.insert_run(run).await.unwrap();
+        let run = store.load_run(user_id, run_id).await.unwrap().unwrap();
+        let epoch = run.last_event_idx;
+        let required = [match kind {
+            DurableRunInteractionKind::AskUser => {
+                ask_user_prompted_event("superseded-questionnaire", session_id)
+            }
+            DurableRunInteractionKind::Approval => {
+                approval_required_event("superseded-questionnaire", "bash", session_id)
+            }
+            DurableRunInteractionKind::Provider => {
+                provider_interaction_required_event("superseded-questionnaire", session_id)
+            }
+        }];
+        assert_eq!(
+            store
+                .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                    user_id,
+                    run_id,
+                    expected_session_id: session_id,
+                    expected_control_epoch: epoch,
+                    expected_owner_generation: run.run_generation,
+                    events: &required,
+                })
+                .await
+                .unwrap(),
+            AtomicRunInteractionBatchRegistration::Registered
+        );
+        assert_eq!(
+            store
+                .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                    user_id,
+                    run_id,
+                    expected_session_id: session_id,
+                    request_id: "superseded-questionnaire",
+                    kind,
+                    expected_control_epoch: epoch,
+                    expected_owner_generation: run.run_generation,
+                })
+                .await
+                .unwrap(),
+            DurableRunInteractionWaitOutcome::Waiting
+        );
+        let guidance = json!({
+            "event_type": "user_intent", "idempotency_key": "user_intent:new-questionnaire-guidance",
+            "data": {"intent_id": "new-questionnaire-guidance", "delivery": "guide_current_run",
+                "input": {"content": "use the production environment"}}
+        });
+        let admission = store
+            .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                user_id,
+                run_id,
+                expected_session_id: session_id,
+                intent_id: "new-questionnaire-guidance",
+                event: &guidance,
+                process_local_execution_live: true,
+            })
+            .await
+            .unwrap();
+        let AtomicRunGuidanceAdmission::Committed { event_index } = admission else {
+            panic!("guidance must be accepted while waiting: {admission:?}");
+        };
+        let response = json!({"request_id": "superseded-questionnaire", "outcome": outcome,
+            "decision": if outcome == "timed_out" { "timeout" } else { "allow" },
+            "tool": "bash", "approval_kind": "standard",
+            "payload": {"selected": "stale-option"}, "answers": {"answers": []}});
+        let resolution = store
+            .resolve_run_interaction(
+                user_id,
+                session_id,
+                run_id,
+                "superseded-questionnaire",
+                kind,
+                response.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resolution, DurableRunInteractionResolveOutcome::Superseded {
+            user_intent_event_index, ..
+        } if user_intent_event_index == event_index)
+        );
+        let resumed = store.load_run(user_id, run_id).await.unwrap().unwrap();
+        assert_eq!(resumed.status, STATUS_RUNNING);
+        assert_eq!(resumed.waiting_for, None);
+        let resolved = resumed
+            .events
+            .iter()
+            .find(|event| extract_event_type(event) == kind.resolved_event_type())
+            .unwrap();
+        assert_eq!(
+            resolved["data"]["_durable_resolution"]["disposition"], "superseded",
+            "releasing the wait must not authorize the stale answer"
+        );
+        assert_eq!(
+            resumed
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "run_resumed")
+                .count(),
+            1
+        );
+        // An exact callback retry cannot reopen the questionnaire or double-resume.
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    user_id,
+                    session_id,
+                    run_id,
+                    "superseded-questionnaire",
+                    kind,
+                    response,
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Superseded { .. }
+        ));
+        let indices = [event_index];
+        let apply = AtomicRunUserIntentApplyRequest {
+            user_id,
+            run_id,
+            expected_session_id: session_id,
+            expected_owner_generation: run.run_generation,
+            source_event_indices: &indices,
+            invocation_identity: None,
+            purpose: UserIntentApplyPurpose::ModelBoundary,
+        };
+        assert!(matches!(
+            store.apply_run_user_intents(apply).await.unwrap(),
+            AtomicRunUserIntentApply::Applied { .. }
+        ));
+        assert!(matches!(
+            store.apply_run_user_intents(apply).await.unwrap(),
+            AtomicRunUserIntentApply::AlreadyApplied { .. }
+        ));
+        let applied = store.load_run(user_id, run_id).await.unwrap().unwrap();
+        assert_eq!(
+            applied
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "user_intent_applied")
+                .count(),
+            1
+        );
+        let next = [match kind {
+            DurableRunInteractionKind::AskUser => {
+                ask_user_prompted_event("next-questionnaire", session_id)
+            }
+            DurableRunInteractionKind::Approval => {
+                approval_required_event("next-questionnaire", "bash", session_id)
+            }
+            DurableRunInteractionKind::Provider => {
+                provider_interaction_required_event("next-questionnaire", session_id)
+            }
+        }];
+        assert_eq!(
+            store
+                .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                    user_id,
+                    run_id,
+                    expected_session_id: session_id,
+                    expected_control_epoch: applied.last_event_idx,
+                    expected_owner_generation: applied.run_generation,
+                    events: &next,
+                })
+                .await
+                .unwrap(),
+            AtomicRunInteractionBatchRegistration::Registered,
+            "the same run must admit its next fresh action after applying guidance"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_interaction_releases_wait_for_guidance() {
+        for (kind, outcome) in [
+            (DurableRunInteractionKind::AskUser, "submitted"),
+            (DurableRunInteractionKind::AskUser, "timed_out"),
+            (DurableRunInteractionKind::Approval, "approved"),
+            (DurableRunInteractionKind::Approval, "timed_out"),
+            (DurableRunInteractionKind::Provider, "submitted"),
+            (DurableRunInteractionKind::Provider, "timed_out"),
+        ] {
+            let store = InMemoryRunStateStore::new();
+            assert_superseded_interaction_releases_wait_for_guidance(
+                &store,
+                "u1",
+                "s1",
+                &format!("questionnaire-{outcome}"),
+                outcome,
+                kind,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_superseded_interaction_releases_wait_for_guidance() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for (kind, outcome) in [
+            (DurableRunInteractionKind::AskUser, "submitted"),
+            (DurableRunInteractionKind::AskUser, "timed_out"),
+            (DurableRunInteractionKind::Approval, "approved"),
+            (DurableRunInteractionKind::Approval, "timed_out"),
+            (DurableRunInteractionKind::Provider, "submitted"),
+            (DurableRunInteractionKind::Provider, "timed_out"),
+        ] {
+            let nonce = Uuid::new_v4();
+            let user_id = format!("questionnaire-u-{nonce}");
+            let session_id = format!("questionnaire-s-{nonce}");
+            let run_id = format!("questionnaire-r-{nonce}");
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+            assert_superseded_interaction_releases_wait_for_guidance(
+                &store,
+                &user_id,
+                &session_id,
+                &run_id,
+                outcome,
+                kind,
+            )
+            .await;
+            cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        }
     }
 
     #[tokio::test]
@@ -44757,6 +48311,9 @@ mod tests {
         store.insert_run(run).await.unwrap();
 
         let request = AtomicRunUserIntentApplyRequest {
+            purpose: UserIntentApplyPurpose::ModelBoundary,
+            invocation_identity: None,
+
             user_id: "u1",
             run_id: "intent-apply-large-tail",
             expected_session_id: "s1",
@@ -44813,6 +48370,9 @@ mod tests {
         store.insert_run(fenced_run).await.unwrap();
 
         let fenced_request = AtomicRunUserIntentApplyRequest {
+            purpose: UserIntentApplyPurpose::ModelBoundary,
+            invocation_identity: None,
+
             user_id: "u1",
             run_id: "intent-apply-ack-lost-fence",
             expected_session_id: "s1",
@@ -44845,6 +48405,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     expected_owner_generation: 16,
                     ..fenced_request
                 })
@@ -44879,6 +48442,9 @@ mod tests {
         terminal_run.last_event_idx = 1;
         store.insert_run(terminal_run).await.unwrap();
         let terminal_request = AtomicRunUserIntentApplyRequest {
+            purpose: UserIntentApplyPurpose::ModelBoundary,
+            invocation_identity: None,
+
             user_id: "u1",
             run_id: "intent-apply-ack-lost-terminal",
             expected_session_id: "s2",
@@ -44926,6 +48492,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     expected_owner_generation: 22,
                     ..terminal_request
                 })
@@ -44938,6 +48507,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     user_id: "u1",
                     run_id: "intent-apply-ack-lost-terminal",
                     expected_session_id: "s2",
@@ -44996,6 +48568,9 @@ mod tests {
 
         let stale = store
             .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                purpose: UserIntentApplyPurpose::ModelBoundary,
+                invocation_identity: None,
+
                 user_id: "u1",
                 run_id: "intent-apply-authority",
                 expected_session_id: "s1",
@@ -45027,6 +48602,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     user_id: "u1",
                     run_id: "intent-apply-authority",
                     expected_session_id: "s1",
@@ -45042,6 +48620,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     user_id: "foreign",
                     run_id: "intent-apply-authority",
                     expected_session_id: "s1",
@@ -45088,6 +48669,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     user_id: "u1",
                     run_id: "intent-apply-post-cutoff",
                     expected_session_id: "sess-intent-apply-post-cutoff",
@@ -45132,6 +48716,9 @@ mod tests {
             apply_barrier.wait().await;
             apply_store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     user_id: "u1",
                     run_id: "intent-apply-fence-race",
                     expected_session_id: "s1",
@@ -45209,6 +48796,9 @@ mod tests {
             apply_barrier.wait().await;
             apply_store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     user_id: "u1",
                     run_id: "intent-apply-guidance-race",
                     expected_session_id: "s1",
@@ -45408,6 +48998,9 @@ mod tests {
 
         let ack_loss_store = store.clone().with_user_intent_apply_commit_ack_loss_once();
         let request = AtomicRunUserIntentApplyRequest {
+            purpose: UserIntentApplyPurpose::ModelBoundary,
+            invocation_identity: None,
+
             user_id: &user_id,
             run_id: &run_id,
             expected_session_id: &session_id,
@@ -45433,16 +49026,18 @@ mod tests {
             AtomicRunUserIntentAdmissionTransition::Changed { .. }
         ));
         assert!(matches!(
-            store
-                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
-                    source_event_indices: &[1],
-                    ..request
-                })
-                .await
-                .unwrap(),
-            AtomicRunUserIntentApply::Applied { ref event_indices }
-                if event_indices == &[5]
-        ));
+                    store
+                        .apply_run_user_intents(AtomicRunUserIntentApplyRequest { purpose: UserIntentApplyPurpose::ModelBoundary,
+        invocation_identity: None,
+
+                            source_event_indices: &[1],
+                            ..request
+                        })
+                        .await
+                        .unwrap(),
+                    AtomicRunUserIntentApply::Applied { ref event_indices }
+                        if event_indices == &[5]
+                ));
         assert!(matches!(
             store.apply_run_user_intents(request).await.unwrap(),
             AtomicRunUserIntentApply::AlreadyApplied { ref event_indices }
@@ -45461,6 +49056,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     expected_owner_generation: 8,
                     ..request
                 })
@@ -45483,6 +49081,9 @@ mod tests {
         assert_eq!(
             store
                 .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: None,
+
                     source_event_indices: &[2],
                     ..request
                 })

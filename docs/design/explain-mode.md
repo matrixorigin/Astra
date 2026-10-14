@@ -469,6 +469,14 @@ A client-local companion is unavailable to a remote model without a shared
 authorized backend. Explain artifacts never grant access to raw prompts,
 chain-of-thought, credentials, tool arguments, tool output or trace payloads.
 
+Native stage observations use the already supplied run events. A snapshot
+retains at most 16 call identities, collapses identical replays, and marks
+conflicting observations unknown. Summary byte budgets explicitly report
+omitted retained observations. Stage input is cumulative within that stage;
+last-request input and model capacity are separate fields, not current context
+occupancy. Internal native tool counts and health are unknown. These observations
+are never added to physical model-attempt cache denominators.
+
 ## Correctness and failure behavior
 
 - Report publication has its own typed `artifact_publication` result, separate

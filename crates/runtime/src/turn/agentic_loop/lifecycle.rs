@@ -232,6 +232,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         "correlation_id": msg.correlation_id,
                         "message_kind": message_kind,
                         "response_request_id": match &msg.payload {
+                            payload if astra_messaging::types::is_non_adoption_response(payload) => None,
                             astra_messaging::types::MessagePayload::Response { request_id, .. } => Some(request_id),
                             _ => None,
                         },
@@ -378,7 +379,7 @@ pub(crate) async fn acknowledge_adopted_mailbox_messages(state: &mut AgenticLoop
         let Some(mailbox) = state.messaging.mailbox.as_mut() else {
             return;
         };
-        mailbox.take_adopted_acknowledgements()
+        mailbox.adopted_acknowledgements()
     };
     if pending.is_empty() {
         return;
@@ -398,7 +399,11 @@ pub(crate) async fn acknowledge_adopted_mailbox_messages(state: &mut AgenticLoop
         );
     }
     if let Some(mailbox) = state.messaging.mailbox.as_mut() {
-        mailbox.restore_adopted_acknowledgements(retry);
+        for message in pending {
+            if !retry.iter().any(|failed| failed.id == message.id) {
+                mailbox.forget_acknowledgement(&message.id);
+            }
+        }
     }
 }
 
@@ -8487,6 +8492,9 @@ mod tests {
             _run_id: &str,
             _event_indices: &[usize],
             _authority: crate::turn::run_control::UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
             Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }
@@ -8528,6 +8536,9 @@ mod tests {
             _run_id: &str,
             _event_indices: &[usize],
             _authority: crate::turn::run_control::UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
             Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }

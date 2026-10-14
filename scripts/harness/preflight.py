@@ -607,6 +607,78 @@ def _catalog_page_url(url: str, cursor: dict[str, str] | None) -> str:
     return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def owned_api_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+class ModelContractError(ValueError):
+    pass
+
+
+def request_json(
+    opener: urllib.request.OpenerDirector, url: str, token: str,
+    payload: dict[str, Any] | None, expected_status: int, operation: str,
+    *, method: str = "POST", timeout: float = 60,
+) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {token}"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = response.status
+            response_body = response.read(2 * 1024 * 1024)
+    except urllib.error.HTTPError as error:
+        raise ModelContractError(f"{operation} returned HTTP {error.code}") from None
+    except (OSError, urllib.error.URLError):
+        raise ModelContractError(f"{operation} could not reach the owned Astra server") from None
+    if status != expected_status:
+        raise ModelContractError(f"{operation} returned HTTP {status}")
+    try:
+        value = json.loads(response_body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise ModelContractError(f"{operation} returned invalid JSON") from None
+    if not isinstance(value, dict):
+        raise ModelContractError(f"{operation} returned a non-object response")
+    return value
+
+
+def admit_model_execution(
+    api_url: str, token: str, model_name: str, thinking: str | None,
+    *, offering_id: str | None = None, opener=None, timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Use Server's exact control admission, without invoking the model."""
+    if thinking not in {None, "high"}:
+        raise ValueError("unsupported benchmark reasoning selection")
+    if offering_id is not None and (not isinstance(offering_id, str) or not offering_id):
+        raise ValueError("selected Offering identity is missing")
+    selector = ({"kind": "offering_id", "offering_id": offering_id} if offering_id is not None
+                else {"kind": "configured_name", "model_name": model_name})
+    reasoning = ({"mode": "adaptive", "effort": "high"} if thinking == "high"
+                 else {"mode": "model_default"})
+    payload = request_json(
+        opener or owned_api_opener(), api_url.rstrip("/") + "/model-access/admit", token,
+        {"slots": [{"selector": selector, "reasoning": reasoning}]},
+        200, "model execution admission", timeout=timeout,
+    )
+    slots = payload.get("slots")
+    if not isinstance(slots, list) or len(slots) != 1 or not isinstance(slots[0], dict):
+        raise ValueError("model execution admission returned invalid slots")
+    slot = slots[0]
+    if (slot.get("model_name") != model_name or slot.get("reasoning") != reasoning
+            or not isinstance(slot.get("offering_id"), str) or not slot["offering_id"]
+            or (offering_id is not None and slot["offering_id"] != offering_id)):
+        raise ValueError("model execution admission returned mismatched identity or reasoning")
+    return {"offering_id": slot["offering_id"], "model_name": model_name, "reasoning": reasoning}
+
+
 def fetch_model_catalog(
     url: str,
     token: str,
@@ -614,7 +686,7 @@ def fetch_model_catalog(
     timeout: float = 8.0,
 ) -> tuple[bool, str]:
     """Drain and validate exact selected routes without putting the token in argv."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = owned_api_opener()
     cursor: dict[str, str] | None = None
     seen_cursors: set[tuple[str, str, str]] = set()
     items: list[dict[str, Any]] = []
@@ -622,13 +694,8 @@ def fetch_model_catalog(
     expected_revision: str | None = None
     try:
         while True:
-            request = urllib.request.Request(
-                _catalog_page_url(url, cursor),
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            with opener.open(request, timeout=timeout) as response:
-                body = response.read(2 * 1024 * 1024)
-            page = json.loads(body.decode("utf-8"))
+            page = request_json(opener, _catalog_page_url(url, cursor), token, None,
+                                200, "model catalog", method="GET", timeout=timeout)
             page_items = page.get("items") if isinstance(page, dict) else None
             total = page.get("total") if isinstance(page, dict) else None
             revision = page.get("catalog_revision") if isinstance(page, dict) else None
@@ -687,17 +754,23 @@ def fetch_model_catalog(
                     f"{base}: expected one active exact Offering, found {len(active)}"
                 )
                 continue
-            capability = active[0].get("thinking_capability")
-            if thinking_mode == "high" and capability not in {"both", "effort_only"}:
-                failures.append(
-                    f"{base}: requested controllable thinking but capability is {capability!r}"
-                )
-                continue
+            parsed = urllib.parse.urlsplit(url)
+            api_url = urllib.parse.urlunsplit(parsed._replace(
+                path=parsed.path.rsplit("/", 1)[0], query="", fragment=""
+            ))
+            offering_id = active[0].get("offering_id")
+            if not isinstance(offering_id, str) or not offering_id:
+                raise ValueError("selected Offering identity is missing")
+            admitted = admit_model_execution(
+                api_url, token, active[0]["name"], thinking_mode,
+                offering_id=offering_id, opener=opener, timeout=timeout,
+            )
             selected.append(
                 {
                     "name": active[0].get("name"),
                     "offering_id": active[0].get("offering_id"),
-                    "thinking_capability": capability,
+                    "thinking_capability": active[0].get("thinking_capability"),
+                    "reasoning": admitted["reasoning"],
                 }
             )
         detail = {

@@ -271,12 +271,15 @@ mod tests {
 
     #[async_trait]
     impl MessageTransport for AmbiguousQuestionTransport {
-        async fn register(
+        async fn register_with_capabilities(
             &self,
             address: AgentAddress,
             delegation: Option<String>,
+            capabilities: astra_messaging::MailboxCapabilities,
         ) -> Result<MailboxSubscription, MailboxError> {
-            self.0.register(address, delegation).await
+            self.0
+                .register_with_capabilities(address, delegation, capabilities)
+                .await
         }
         async fn unregister(&self, subscription: &MailboxSubscription) -> Result<(), MailboxError> {
             self.0.unregister(subscription).await
@@ -287,12 +290,12 @@ mod tests {
         ) -> Result<Box<dyn MessageStream>, MailboxError> {
             self.0.subscribe(subscription).await
         }
-        async fn resolve_agent(
+        async fn resolve_mailbox(
             &self,
             delegation: &str,
             agent: &str,
-        ) -> Result<AgentAddress, MailboxError> {
-            self.0.resolve_agent(delegation, agent).await
+        ) -> Result<astra_messaging::ResolvedMailbox, MailboxError> {
+            self.0.resolve_mailbox(delegation, agent).await
         }
         async fn list_agents(&self, delegation: &str) -> Result<Vec<AgentAddress>, MailboxError> {
             self.0.list_agents(delegation).await
@@ -858,6 +861,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_request_admission_uses_receiver_capability_before_publication() {
+        for capabilities in [
+            astra_messaging::MailboxCapabilities::provider_stage_text_only(),
+            astra_messaging::MailboxCapabilities::default(),
+        ] {
+            let transport = Arc::new(InProcessTransport::new());
+            let tracker = Arc::new(DelegationTracker::new());
+            let sender_router =
+                Arc::new(AgentMailboxRouter::new(transport.clone(), tracker.clone()));
+            let receiver_router = Arc::new(AgentMailboxRouter::new(transport, tracker));
+            let sender = sender_router
+                .register(AgentAddress::new("parent", "root"), None)
+                .await
+                .unwrap();
+            let mut receiver = receiver_router
+                .register_with_capabilities(
+                    AgentAddress::new("child", "worker"),
+                    Some("parent".into()),
+                    capabilities,
+                )
+                .await
+                .unwrap();
+            assert!(sender_router.registered_address("child").await.is_none());
+            let replies = ReplyObligations::default();
+            for (message_type, needs_reply) in [("shutdown_request", false), ("question", true)] {
+                let request = crate::orchestration::agent_tool::handle_agent_send_message_with_router_observed(
+                &json!({"to":"worker", "message_type":message_type, "message":"Coordinate work"}),
+                &sender_router, "parent", "root", &replies,
+            ).await;
+                let output: Value = serde_json::from_str(&request.output).unwrap();
+                assert_eq!(output["success"], capabilities.accepts_structured_requests);
+                assert_eq!(
+                    replies.has_pending("parent"),
+                    capabilities.accepts_structured_requests && needs_reply
+                );
+                if capabilities.accepts_structured_requests {
+                    let message = receiver
+                        .try_recv()
+                        .expect("ordinary remote question must arrive");
+                    assert_eq!(output["message_id"], message.id);
+                    assert!(matches!(message.payload, MessagePayload::Request { .. }));
+                    receiver.acknowledge_received(&[message]).await.unwrap();
+                } else {
+                    assert_eq!(output["executed"], false);
+                    assert!(request.accepted_send.is_none());
+                    assert!(receiver.try_recv().is_none());
+                }
+            }
+            let guidance = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+                &json!({"to":"worker", "message":"Use a compact output."}),
+                &sender_router,
+                "parent",
+                "root",
+                &replies,
+            )
+            .await;
+            assert_eq!(
+                serde_json::from_str::<Value>(&guidance).unwrap()["success"],
+                true
+            );
+            let message = receiver
+                .try_recv()
+                .expect("text must remain supported on both receivers");
+            assert!(
+                matches!(&message.payload, MessagePayload::Text { content, .. } if content == "Use a compact output.")
+            );
+            receiver.acknowledge_received(&[message]).await.unwrap();
+            receiver.unregister().await.unwrap();
+            drop(receiver);
+            tokio::task::yield_now().await;
+            assert!(
+                receiver_router
+                    .register_with_capabilities(
+                        AgentAddress::new("child", "worker"),
+                        Some("parent".into()),
+                        astra_messaging::MailboxCapabilities {
+                            accepts_structured_requests: !capabilities.accepts_structured_requests
+                        },
+                    )
+                    .await
+                    .is_err(),
+                "a different router cannot widen a detached lifetime"
+            );
+            sender.retire().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn question_id_is_rendered_and_answer_has_response_wire() {
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
         let child_replies = ReplyObligations::default();
@@ -1287,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_response_does_not_wake_a_run_waiting_for_an_exact_answer() {
-        let (router, _parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
+        let (router, mut parent_mailbox, child_mailbox, _dt) = setup_two_agents().await;
         let replies = Arc::new(ReplyObligations::default());
         replies
             .reserve(
@@ -1329,6 +1420,47 @@ mod tests {
         assert!(replies.has_pending("run-child-0"));
         assert!(state.volatile_pending.is_empty());
 
+        let mut guidance = AgentMessage::new(
+            state.messaging.mailbox.as_ref().unwrap().address.clone(),
+            MessageTarget::Direct {
+                address: parent_mailbox.address.clone(),
+            },
+            MessagePayload::Text {
+                content: "extra guidance".into(),
+                summary: None,
+            },
+        );
+        guidance.id = "expected-question".into();
+        guidance.correlation_id = Some("separate-correlation".into());
+        router.send(guidance).await.unwrap();
+        assert!(parent_mailbox.wait_ready().await);
+        parent_mailbox
+            .lease_bounded(1)
+            .report_non_adoption(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            drain_mailbox_model_context(&mut host, &mut state)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            state.volatile_pending[0].payload["response_request_id"],
+            Value::Null
+        );
+        assert!(
+            state.volatile_pending[0].payload["display"]
+                .as_str()
+                .unwrap()
+                .contains("not_adopted")
+        );
+        state.lease_volatile_pending().unwrap();
+        state.commit_volatile_attempt_lease();
+        assert!(
+            replies.has_pending("run-child-0"),
+            "observing rejection feedback must not settle a question"
+        );
+
         let correct = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
             &json!({
                 "action": "send_message",
@@ -1362,6 +1494,12 @@ mod tests {
         state.commit_volatile_attempt_lease();
         assert!(!replies.has_pending("run-child-0"));
         assert_eq!(state.volatile_pending.len(), 1);
+        assert!(
+            state.volatile_pending[0].payload["display"]
+                .as_str()
+                .unwrap()
+                .contains("Use JSON.")
+        );
     }
 
     #[tokio::test]

@@ -219,6 +219,7 @@ fn remote_child_recovery_capacity() -> &'static Arc<Semaphore> {
 fn effective_spawn_allowed_tools(
     requested: Option<&[String]>,
     profile_defaults: &HashSet<String>,
+    execution_tool: Option<&str>,
 ) -> Vec<String> {
     let profile_defaults = astra_turn_core::tool_allowlist::normalize_tool_names(profile_defaults);
     let profile_is_unrestricted = profile_defaults.contains("*");
@@ -231,6 +232,16 @@ fn effective_spawn_allowed_tools(
     };
     if tools.iter().any(|tool| tool == "*") {
         return vec!["*".to_string()];
+    }
+    // A provider execution is a separate, explicitly admitted capability. It
+    // must not require the model to repeat the provider tool in the child's
+    // ordinary tool allowlist; doing so makes a native stage fail in a
+    // read-only/default persona before its provider admission is reached.
+    if let Some(execution_tool) = execution_tool
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+    {
+        tools.push(execution_tool.to_ascii_lowercase());
     }
     tools.sort();
     tools.dedup();
@@ -247,8 +258,8 @@ fn parent_coordination_addendum(agent_prompt: &str) -> String {
     format!(
         "{}\n\n## Parent coordination\n\
          The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
-         Stay within the delegated task boundary. If you need an answer from your parent, use `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...)`; `ask_user` addresses the human, not your parent. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
-         A parent question is control flow, never terminal output. After sending one through agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...), wait for the correlated answer and do not finish the run until the delegated brief is complete. \
+         Stay within the delegated task boundary. Parent communication is a typed protocol: whenever the brief requires a parent answer, your next action MUST be `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", message=...)`; `ask_user` addresses the human, not your parent. Never put a question to the parent in ordinary text or in the terminal result: plain text cannot create a request ID and cannot be answered. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
+         A parent question is control flow, never terminal output. After the question tool returns `queued`, use `agent(action=\"wait\")` and wait for the correlated answer; do not finish the run until that answer is observed and the delegated brief is complete. \
          Routine tool-by-tool progress does not need reporting. Complete the entire delegated brief before returning: every explicit operation, condition, and requested output is required. Do not return an intermediate calculation, partial checklist, plan, or first step as the terminal result. Before finishing, verify that the result answers the full brief; if something remains incomplete, state exactly what remains and why. Return only the answer, evidence, or decision the parent needs. Honor the brief's requested output format exactly; persona and summary defaults must not add explanation or formatting. Otherwise keep a one-shot result to one line when sufficient. Do not paste file contents, diffs, or large logs into the result—store detailed artifacts where the task requires them and summarize the relevant evidence. Your terminal result is delivered to the parent automatically.",
         agent_prompt,
     )
@@ -582,10 +593,10 @@ fn restored_agent_delivery_from_journal(
     (terminal_result.or(transcript_result), applied_user_intents)
 }
 
-fn restored_prepared_model_from_journal(
+fn restored_prepared_execution_from_journal(
     events: &[astra_services::session_journal::JournalEvent],
     run_id: &str,
-) -> Option<PreparedSpawnModelIdentity> {
+) -> Option<PreparedSpawnIdentity> {
     let spawn = events.iter().rev().find(|event| {
         event.event_type == astra_services::session_journal::JournalEventType::AgentSpawned
             && event
@@ -595,6 +606,16 @@ fn restored_prepared_model_from_journal(
                 .and_then(serde_json::Value::as_str)
                 == Some(run_id)
     })?;
+    if let Some(execution) = spawn
+        .metadata
+        .as_ref()?
+        .pointer("/model_configuration/prepared_execution")
+        && execution.get("kind").and_then(serde_json::Value::as_str) == Some("external_provider")
+    {
+        return serde_json::from_value(execution.clone())
+            .ok()
+            .map(PreparedSpawnIdentity::ExternalProvider);
+    }
     let selection = spawn
         .metadata
         .as_ref()?
@@ -604,11 +625,13 @@ fn restored_prepared_model_from_journal(
     if offering_id.is_empty() || model_name.is_empty() {
         return None;
     }
-    Some(PreparedSpawnModelIdentity {
-        offering_id: offering_id.to_string(),
-        model_name: model_name.to_string(),
-        provenance: "local_journal",
-    })
+    Some(PreparedSpawnIdentity::InternalModel(
+        PreparedSpawnModelIdentity {
+            offering_id: offering_id.to_string(),
+            model_name: model_name.to_string(),
+            provenance: "local_journal",
+        },
+    ))
 }
 
 fn restored_agent_status(
@@ -944,39 +967,94 @@ enum DirectChildSlot {
     Consumed {
         run_id: String,
         status_fingerprint: String,
-        result: Option<DirectChildCompletion>,
+        result: Option<Arc<DirectChildCompletion>>,
     },
+}
+
+impl DirectChildSlot {
+    fn consume(&mut self) -> Option<Arc<DirectChildCompletion>> {
+        let Self::Pending { child, .. } = self else {
+            return None;
+        };
+        let consumed = Self::Consumed {
+            run_id: child.run_id.clone(),
+            status_fingerprint: direct_child_result_fingerprint(
+                &child.status,
+                &child.applied_user_intents,
+            ),
+            result: None,
+        };
+        let Self::Pending { child, .. } = std::mem::replace(self, consumed) else {
+            unreachable!("pending child was checked under the owner lock")
+        };
+        let child = Arc::new(child);
+        if let Self::Consumed { result, .. } = self {
+            *result = Some(Arc::clone(&child));
+        }
+        Some(child)
+    }
 }
 
 fn direct_child_result_fingerprint(
     status: &AgentStatus,
     applied_user_intents: &[crate::turn::agentic_loop::host::AppliedUserIntent],
 ) -> String {
-    let fields = match status {
-        AgentStatus::Initializing => serde_json::json!(["initializing"]),
-        AgentStatus::Running { activity } => serde_json::json!(["running", activity]),
-        AgentStatus::Idle => serde_json::json!(["idle"]),
+    struct DigestWriter(Sha256);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(Sha256::new());
+    match status {
+        AgentStatus::Initializing => {
+            serde_json::to_writer(&mut writer, &(["initializing"], applied_user_intents))
+        }
+        AgentStatus::Running { activity } => {
+            serde_json::to_writer(&mut writer, &(("running", activity), applied_user_intents))
+        }
+        AgentStatus::Idle => serde_json::to_writer(&mut writer, &(["idle"], applied_user_intents)),
         AgentStatus::Completed {
             result,
             finish_reason,
-        } => serde_json::json!(["completed", result, finish_reason]),
+        } => serde_json::to_writer(
+            &mut writer,
+            &(("completed", result, finish_reason), applied_user_intents),
+        ),
         AgentStatus::Interrupted {
             partial_result,
             finish_reason,
-        } => serde_json::json!(["interrupted", partial_result, finish_reason]),
+        } => serde_json::to_writer(
+            &mut writer,
+            &(
+                ("interrupted", partial_result, finish_reason),
+                applied_user_intents,
+            ),
+        ),
         AgentStatus::Failed {
             error,
             finish_reason,
-        } => serde_json::json!(["failed", error, finish_reason]),
-        AgentStatus::Waiting { reason } => serde_json::json!(["waiting", reason]),
-        AgentStatus::Paused { reason } => serde_json::json!(["paused", reason]),
-        AgentStatus::Cancelled { by_user, reason } => {
-            serde_json::json!(["cancelled", by_user, reason])
+        } => serde_json::to_writer(
+            &mut writer,
+            &(("failed", error, finish_reason), applied_user_intents),
+        ),
+        AgentStatus::Waiting { reason } => {
+            serde_json::to_writer(&mut writer, &(("waiting", reason), applied_user_intents))
         }
-    };
-    let bytes = serde_json::to_vec(&(fields, applied_user_intents))
-        .expect("child result receipt must serialize");
-    format!("{:x}", Sha256::digest(bytes))
+        AgentStatus::Paused { reason } => {
+            serde_json::to_writer(&mut writer, &(("paused", reason), applied_user_intents))
+        }
+        AgentStatus::Cancelled { by_user, reason } => serde_json::to_writer(
+            &mut writer,
+            &(("cancelled", by_user, reason), applied_user_intents),
+        ),
+    }
+    .expect("child result receipt must serialize");
+    format!("{:x}", writer.0.finalize())
 }
 
 impl serde::Serialize for DirectChildCompletion {
@@ -1184,7 +1262,7 @@ impl FanoutParentAdmission {
             .collect()
     }
 
-    pub fn take_completed_direct_children(&self) -> Vec<DirectChildCompletion> {
+    pub fn take_completed_direct_children(&self) -> Vec<Arc<DirectChildCompletion>> {
         let mut children = astra_core::sync_poison::recover_mutex_lock(&self.direct_children);
         let ids: Vec<_> = children
             .iter()
@@ -1193,24 +1271,7 @@ impl FanoutParentAdmission {
             .map(|(id, _)| id.clone())
             .collect();
         ids.into_iter()
-            .filter_map(|id| {
-                let slot = children.get_mut(&id)?;
-                let DirectChildSlot::Pending { child, .. } = slot else {
-                    return None;
-                };
-                let consumed = DirectChildSlot::Consumed {
-                    run_id: child.run_id.clone(),
-                    status_fingerprint: direct_child_result_fingerprint(
-                        &child.status,
-                        &child.applied_user_intents,
-                    ),
-                    result: Some(child.clone()),
-                };
-                match std::mem::replace(slot, consumed) {
-                    DirectChildSlot::Pending { child, .. } => Some(child),
-                    DirectChildSlot::Consumed { .. } => None,
-                }
-            })
+            .filter_map(|id| children.get_mut(&id)?.consume())
             .collect()
     }
 
@@ -1245,15 +1306,7 @@ impl FanoutParentAdmission {
         {
             return false;
         }
-        *slot = DirectChildSlot::Consumed {
-            run_id: child.run_id.clone(),
-            status_fingerprint: direct_child_result_fingerprint(
-                &child.status,
-                &child.applied_user_intents,
-            ),
-            result: Some(child.clone()),
-        };
-        true
+        slot.consume().is_some()
     }
 
     /// Borrow the owner-held pause without cloning pending child outputs.
@@ -1273,7 +1326,10 @@ impl FanoutParentAdmission {
             })
     }
 
-    pub fn retained_direct_child_result(&self, agent_id: &str) -> Option<DirectChildCompletion> {
+    pub fn retained_direct_child_result(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<DirectChildCompletion>> {
         let children = astra_core::sync_poison::recover_mutex_lock(&self.direct_children);
         match children.get(agent_id)? {
             DirectChildSlot::Consumed { result, .. } => result.clone(),
@@ -1699,7 +1755,7 @@ fn durable_pre_durable_child_terminals(
                     spawn_tool_call_id: None,
                     fanout_slot: Some(slot),
                     execution_metadata: None,
-                    prepared_model: None,
+                    prepared_execution: None,
                 })
             })
         })
@@ -2087,6 +2143,26 @@ pub struct SpawnContext {
     pub delegation_chain: Vec<String>,
 }
 
+pub(crate) fn delegated_requirements_for_spawn(
+    input: &SpawnAgentInput,
+    context: &SpawnContext,
+) -> Result<astra_turn_types::DelegationIntentRequirements, SpawnError> {
+    let requirements = match context.delegation_model_admission.as_ref() {
+        Some(admission) => admission
+            .child_requirements
+            .get(input.fanout_slot_index.unwrap_or(0))
+            .cloned()
+            .ok_or_else(|| {
+                SpawnError::InvalidInput("prepared child requirement slot is missing".into())
+            })?,
+        None => Default::default(),
+    };
+    requirements
+        .validate()
+        .map_err(|reason| SpawnError::InvalidInput(reason.into()))?;
+    Ok(requirements)
+}
+
 /// Apply a frozen user instruction before model admission or capacity
 /// reservation. The same rule is checked again by `prepare_static_spawn`, so
 /// prepared and direct spawn paths cannot silently drop the constraint.
@@ -2344,8 +2420,8 @@ pub struct SpawnedAgentState {
     pub spawn_tool_call_id: Option<String>,
     pub fanout_slot: Option<AgentFanoutSlotIdentity>,
     pub execution_metadata: Option<serde_json::Value>,
-    /// Admitted child model, when known. Preparation is not provider acceptance.
-    pub prepared_model: Option<PreparedSpawnModelIdentity>,
+    /// Selected execution, when known. Preparation is not provider acceptance.
+    pub prepared_execution: Option<PreparedSpawnIdentity>,
 }
 
 // SpawnedAgentInfo is re-exported from orchestration_types above.
@@ -2685,12 +2761,35 @@ impl ChildCancellationGrace {
 /// Trait for executing spawned agent runs.
 ///
 /// Similar to `SubRunExecutor` but specifically for dynamic agent spawning.
-/// CLI layer implements this to run the agentic loop.
+/// Server preparation owns admission; CLI and User Runner supply local capacity.
 #[async_trait]
 pub trait PreparedSpawn: Send {
-    /// Credential-free selection evidence available before child execution.
+    /// Credential-free execution evidence available before child execution.
     /// Absence must not be interpreted as admission or provider acceptance.
-    fn model_identity(&self) -> Option<PreparedSpawnModelIdentity> {
+    fn execution_identity(&self) -> Option<PreparedSpawnIdentity> {
+        None
+    }
+
+    /// Effective controls resolved by trusted preparation, including durable
+    /// collaborator defaults. They must reach launch rather than be recomputed
+    /// from the original request, which may intentionally omit them.
+    fn effective_thinking(&self) -> Option<astra_turn_core::thinking_config::ThinkingConfig> {
+        None
+    }
+
+    /// Stable durable identity to return for a provider collaborator. Ordinary
+    /// children have no such identity; native stages use their association
+    /// anchor so follow-up requests do not depend on the latest stage ID.
+    fn collaborator_id(&self, _launched_run_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Provider-owned execution selected during trusted preparation. This is
+    /// distinct from the model-visible child tool allowlist: a native
+    /// collaborator may be admitted after the original request omitted its
+    /// provider tool. Launch must use the prepared value rather than
+    /// reconstructing it from that original request.
+    fn execution_tool_name(&self) -> Option<&str> {
         None
     }
 
@@ -2702,7 +2801,75 @@ pub trait PreparedSpawn: Send {
 
 pub type SpawnExecution = futures_util::future::BoxFuture<'static, Result<SpawnRunResult, String>>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Selection evidence from the one-use preparation, never execution authority.
+/// External native model selection is independent of Astra Offering admission.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreparedSpawnIdentity {
+    InternalModel(PreparedSpawnModelIdentity),
+    ExternalProvider(PreparedSpawnProviderIdentity),
+}
+
+/// Shared identity check at tool admission and the final spawn boundary.
+/// Caller-specific model-resolution requirements remain at their own boundary.
+pub(crate) fn prepared_model_for_input(
+    input: &SpawnAgentInput,
+    identity: Option<PreparedSpawnIdentity>,
+) -> Result<Option<PreparedSpawnModelIdentity>, SpawnError> {
+    input
+        .validate_execution_request()
+        .map_err(|reason| SpawnError::InvalidInput(reason.into()))?;
+    let model = match identity {
+        Some(PreparedSpawnIdentity::InternalModel(model)) if input.execution.is_none() => {
+            Some(model)
+        }
+        Some(PreparedSpawnIdentity::ExternalProvider(provider))
+            if input.execution.is_some() || input.collaborator_id.is_some() =>
+        {
+            if input.requested_model_policy.is_some()
+                || input.resolved_model_selection.is_some()
+                || input.inherit_prefix.is_some()
+                || input
+                    .execution
+                    .as_ref()
+                    .is_some_and(|request| request.model != provider.requested_model)
+            {
+                return Err(SpawnError::InvalidInput(
+                    "native preparation conflicts with the requested execution".into(),
+                ));
+            }
+            None
+        }
+        None if input.execution.is_none() && input.collaborator_id.is_none() => None,
+        _ => {
+            return Err(SpawnError::InvalidInput(
+                "selected collaborator requires matching trusted execution preparation".into(),
+            ));
+        }
+    };
+    if input
+        .resolved_model_selection
+        .as_ref()
+        .zip(model.as_ref())
+        .is_some_and(|(requested, prepared)| requested.offering_id != prepared.offering_id)
+    {
+        return Err(SpawnError::InvalidInput(
+            "prepared Offering does not match the requested model selection".into(),
+        ));
+    }
+    Ok(model)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedSpawnProviderIdentity {
+    pub descriptor: astra_turn_types::ResolvedToolDescriptorRef,
+    pub decision_id: String,
+    pub execution_binding_generation: u64,
+    /// Requested native model, not evidence that the provider used it.
+    pub requested_model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PreparedSpawnModelIdentity {
     pub offering_id: String,
     pub model_name: String,
@@ -3366,7 +3533,7 @@ impl DynamicAgentSpawner {
         &self,
         parent_run_id: &str,
         agent_id: &str,
-    ) -> Option<DirectChildCompletion> {
+    ) -> Option<Arc<DirectChildCompletion>> {
         let parent = astra_core::sync_poison::recover_mutex_lock(&self.fanout_parents)
             .get(parent_run_id)
             .and_then(std::sync::Weak::upgrade)?;
@@ -4611,7 +4778,7 @@ impl DynamicAgentSpawner {
                 spawn_tool_call_id: None,
                 fanout_slot: fanout_slot.clone(),
                 execution_metadata: None,
-                prepared_model: restored_prepared_model_from_journal(
+                prepared_execution: restored_prepared_execution_from_journal(
                     &journal_events,
                     &projection.run_id,
                 ),
@@ -4703,7 +4870,7 @@ impl DynamicAgentSpawner {
                 spawn_tool_call_id: None,
                 fanout_slot: spawn.and_then(|spawn| spawn.fanout_slot.clone()),
                 execution_metadata: None,
-                prepared_model: run
+                prepared_execution: run
                     .model_offering_id
                     .as_ref()
                     .zip(run.resolved_model_name.as_ref())
@@ -4711,7 +4878,8 @@ impl DynamicAgentSpawner {
                         offering_id: offering_id.clone(),
                         model_name: model_name.clone(),
                         provenance: "durable_run",
-                    }),
+                    })
+                    .map(PreparedSpawnIdentity::InternalModel),
             };
             if let Some(existing) = self.get_agent_state_any(&state.agent_id).await {
                 if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
@@ -4840,7 +5008,7 @@ impl DynamicAgentSpawner {
                 spawn_tool_call_id: None,
                 fanout_slot: None,
                 execution_metadata: None,
-                prepared_model: None,
+                prepared_execution: None,
             };
             self.restore_direct_child_completion(&state);
             self.durable_observed_agent_ids
@@ -6432,6 +6600,12 @@ impl DynamicAgentSpawner {
             .parent_delegation_authority
             .require_delegation()
             .map_err(SpawnError::InvalidInput)?;
+        input
+            .validate_execution_request()
+            .map_err(|error| SpawnError::InvalidInput(error.into()))?;
+        if input.execution.is_some() || input.collaborator_id.is_some() {
+            return Ok(());
+        }
         match input.requested_model_policy.as_ref() {
             Some(astra_turn_types::RequestedModelPolicy::Inherit)
             | Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
@@ -6466,6 +6640,7 @@ impl DynamicAgentSpawner {
         &self,
         input: &SpawnAgentInput,
         context: &SpawnContext,
+        prepared_execution_tool: Option<&str>,
     ) -> Result<
         (
             astra_turn_core::orchestration_builtin_agents::AgentTypeDefinition,
@@ -6517,9 +6692,11 @@ impl DynamicAgentSpawner {
             astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
                 input.reasoning.as_ref(),
                 input.resolved_model_selection.as_ref(),
-                (!unresolved_configured_name)
-                    .then_some(context.parent_model_reasoning.as_ref())
-                    .flatten(),
+                (!unresolved_configured_name
+                    && input.execution.is_none()
+                    && input.collaborator_id.is_none())
+                .then_some(context.parent_model_reasoning.as_ref())
+                .flatten(),
             )
             && (budget_tokens < 1024
                 || input
@@ -6548,8 +6725,16 @@ impl DynamicAgentSpawner {
             ));
         }
 
-        let effective_allowed_tools =
-            effective_spawn_allowed_tools(input.allowed_tools.as_deref(), &agent_def.allowed_tools);
+        let effective_allowed_tools = effective_spawn_allowed_tools(
+            input.allowed_tools.as_deref(),
+            &agent_def.allowed_tools,
+            prepared_execution_tool.or_else(|| {
+                input
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.tool.as_str())
+            }),
+        );
         let effective_inherited_skills = context.inherited_skills.clone();
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
@@ -6621,7 +6806,14 @@ impl DynamicAgentSpawner {
                 )?;
             }
             Self::prepare_authorized_model_selection(input, context, parent_selection)?;
-            self.prepare_static_spawn(input, context)?;
+            self.prepare_static_spawn(
+                input,
+                context,
+                input
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.tool.as_str()),
+            )?;
         }
         if self.executor.is_none() {
             return Err(SpawnError::ExecutorUnavailable);
@@ -7136,32 +7328,33 @@ impl DynamicAgentSpawner {
                 )));
             }
         }
-        let static_preparation = match self.prepare_static_spawn(&input, context) {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                let rejection_reason = match &error {
-                    SpawnError::UnknownAgentType(agent_type) => {
-                        format!("unknown agent type: {agent_type}")
-                    }
-                    SpawnError::DepthLimitExceeded(reason) => {
-                        format!("recursion depth limit exceeded: {reason}")
-                    }
-                    SpawnError::NestedForkInheritanceRejected => {
-                        "nested fork inheritance is rejected".to_string()
-                    }
-                    _ => error.to_string(),
-                };
-                self.record_fanout_spawn_rejected_for_input(
-                    fanout_slot.as_ref(),
-                    &input,
-                    context,
-                    reservation_owner_id,
-                    rejection_reason,
-                )
-                .await;
-                return Err(error);
-            }
-        };
+        let static_preparation =
+            match self.prepare_static_spawn(&input, context, preparation.execution_tool_name()) {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    let rejection_reason = match &error {
+                        SpawnError::UnknownAgentType(agent_type) => {
+                            format!("unknown agent type: {agent_type}")
+                        }
+                        SpawnError::DepthLimitExceeded(reason) => {
+                            format!("recursion depth limit exceeded: {reason}")
+                        }
+                        SpawnError::NestedForkInheritanceRejected => {
+                            "nested fork inheritance is rejected".to_string()
+                        }
+                        _ => error.to_string(),
+                    };
+                    self.record_fanout_spawn_rejected_for_input(
+                        fanout_slot.as_ref(),
+                        &input,
+                        context,
+                        reservation_owner_id,
+                        rejection_reason,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
 
         // Enforce fanout boundary: once a parent run uses a fixed-size
         // fanout group, bare spawns in that run are replacement/retry
@@ -7202,6 +7395,8 @@ impl DynamicAgentSpawner {
         let read_only_execution =
             context.inherited_permissions.read_only_execution || agent_def.read_only;
 
+        let delegated_model_requirements = delegated_requirements_for_spawn(&input, context)?;
+
         // 2. Generate IDs
         let agent_name = input
             .name
@@ -7214,23 +7409,19 @@ impl DynamicAgentSpawner {
         // Trusted preparation carries the exact selected model identity. Use
         // it before model-sensitive thinking and prefix compatibility are
         // computed; the caller's configured name is not an execution identity.
-        let prepared_identity = preparation.model_identity();
+        let execution_identity = preparation.execution_identity();
+        let collaborator_id = preparation.collaborator_id(&run_id);
+        let native_execution = matches!(
+            execution_identity,
+            Some(PreparedSpawnIdentity::ExternalProvider(_))
+        );
+        let prepared_identity = prepared_model_for_input(&input, execution_identity.clone())?;
         let prepared_selection =
             prepared_identity
                 .as_ref()
                 .map(|identity| astra_turn_types::ModelSelection {
                     offering_id: identity.offering_id.clone(),
                 });
-        if input
-            .resolved_model_selection
-            .as_ref()
-            .zip(prepared_selection.as_ref())
-            .is_some_and(|(requested, prepared)| requested != prepared)
-        {
-            return Err(SpawnError::InvalidInput(
-                "prepared Offering does not match the requested model selection".into(),
-            ));
-        }
         let resolved_model_selection = input
             .resolved_model_selection
             .clone()
@@ -7259,12 +7450,20 @@ impl DynamicAgentSpawner {
         let model = prepared_identity
             .as_ref()
             .map(|identity| identity.model_name.clone())
-            .or_else(|| context.resolved_model_name.clone());
-        let thinking = astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
-            input.reasoning.as_ref(),
-            resolved_model_selection.as_ref(),
-            context.parent_model_reasoning.as_ref(),
-        );
+            .or_else(|| {
+                (!native_execution)
+                    .then(|| context.resolved_model_name.clone())
+                    .flatten()
+            });
+        let thinking = preparation.effective_thinking().unwrap_or_else(|| {
+            astra_turn_core::orchestration_spawn_tool::resolve_child_thinking(
+                input.reasoning.as_ref(),
+                resolved_model_selection.as_ref(),
+                (!native_execution)
+                    .then_some(context.parent_model_reasoning.as_ref())
+                    .flatten(),
+            )
+        });
         // 3b. Resolve fork-prefix inheritance before any side effects
         // (mailbox, worktree, active_agents state). A hard-fail from
         // `required=true` must NOT leave half-constructed state
@@ -7374,7 +7573,7 @@ impl DynamicAgentSpawner {
             spawn_tool_call_id: context.spawn_tool_call_id.clone(),
             fanout_slot: fanout_slot.clone(),
             execution_metadata: context.execution_metadata.clone(),
-            prepared_model: prepared_identity.clone(),
+            prepared_execution: execution_identity.clone(),
         };
         #[cfg(test)]
         let reservation_hook = self
@@ -7540,11 +7739,19 @@ impl DynamicAgentSpawner {
         // optional user-facing `name` field.
         let addr = AgentAddress::new(&run_id, &agent_id);
         let delegation_id = Some(context.parent_run_id.clone());
-        let mailbox = match self
-            .mailbox_router
-            .register(addr.clone(), delegation_id)
-            .await
-        {
+        let mailbox = match if native_execution {
+            self.mailbox_router
+                .register_with_capabilities(
+                    addr.clone(),
+                    delegation_id,
+                    astra_messaging::MailboxCapabilities::provider_stage_text_only(),
+                )
+                .await
+        } else {
+            self.mailbox_router
+                .register(addr.clone(), delegation_id)
+                .await
+        } {
             Ok(mailbox) => Some(mailbox),
             Err(error) => {
                 self.active_agents.write().await.remove(&agent_id);
@@ -7685,12 +7892,16 @@ impl DynamicAgentSpawner {
             model_configuration["requested_model_policy"] = serde_json::to_value(policy)
                 .expect("requested model policy has a closed serialization");
         }
-        if let Some(identity) = preparation.model_identity() {
+        if let Some(identity) = prepared_identity.as_ref() {
             model_configuration["prepared_selection"] = serde_json::json!({
                 "offering_id": identity.offering_id,
                 "model_name": identity.model_name,
                 "provenance": identity.provenance,
             });
+        }
+        if let Some(identity) = execution_identity.as_ref() {
+            model_configuration["prepared_execution"] = serde_json::to_value(identity)
+                .expect("prepared execution is credential-free structured evidence");
         }
         self.emit_agent_spawned_trace(
             &spawned_state_for_trace,
@@ -7771,16 +7982,7 @@ impl DynamicAgentSpawner {
             system_prompt_addendum: coordination_addendum,
             resolved_model_selection,
             requested_model_policy: input.requested_model_policy.clone(),
-            delegated_model_requirements: context
-                .delegation_model_admission
-                .as_ref()
-                .and_then(|admission| {
-                    admission
-                        .child_requirements
-                        .get(input.fanout_slot_index.unwrap_or(0))
-                })
-                .cloned()
-                .unwrap_or_default(),
+            delegated_model_requirements,
             fanout_slot: fanout_slot.clone(),
             thinking,
             model,
@@ -7958,6 +8160,7 @@ impl DynamicAgentSpawner {
         Ok(SpawnAgentOutput::Launched {
             agent_id,
             run_id,
+            collaborator_id,
             description,
             messaging_address: messaging_address_text,
         })
@@ -10738,7 +10941,7 @@ pub(crate) mod tests {
         let results = parent.take_completed_direct_children();
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].status, AgentStatus::Completed { .. }));
-        let payload = serde_json::to_value(&results[0]).unwrap();
+        let payload = serde_json::to_value(results[0].as_ref()).unwrap();
         assert!(!payload["result"].as_str().unwrap().is_empty());
         assert_eq!(
             payload["result_sha256"],
@@ -10832,6 +11035,85 @@ pub(crate) mod tests {
             direct_child_result_fingerprint(&first, &[]),
             direct_child_result_fingerprint(&second, &[])
         );
+    }
+
+    #[test]
+    fn direct_child_streaming_fingerprint_preserves_existing_serialized_identity() {
+        let text = "界\n\"\\".repeat(2000);
+        let intent = crate::turn::agentic_loop::host::AppliedUserIntent {
+            intent_id: "intent".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            event_index: 7,
+            content: text.clone(),
+        };
+        let cases = [
+            (AgentStatus::Initializing, json!(["initializing"])),
+            (AgentStatus::Idle, json!(["idle"])),
+            (
+                AgentStatus::Running {
+                    activity: text.clone(),
+                },
+                json!(["running", text]),
+            ),
+            (
+                AgentStatus::Completed {
+                    result: text.clone(),
+                    finish_reason: None,
+                },
+                json!(["completed", text, null]),
+            ),
+            (
+                AgentStatus::Completed {
+                    result: text.clone(),
+                    finish_reason: Some(text.clone()),
+                },
+                json!(["completed", text, text]),
+            ),
+            (
+                AgentStatus::Interrupted {
+                    partial_result: text.clone(),
+                    finish_reason: text.clone(),
+                },
+                json!(["interrupted", text, text]),
+            ),
+            (
+                AgentStatus::Failed {
+                    error: text.clone(),
+                    finish_reason: Some(text.clone()),
+                },
+                json!(["failed", text, text]),
+            ),
+            (
+                AgentStatus::Waiting {
+                    reason: text.clone(),
+                },
+                json!(["waiting", text]),
+            ),
+            (
+                AgentStatus::Paused {
+                    reason: text.clone(),
+                },
+                json!(["paused", text]),
+            ),
+            (
+                AgentStatus::Cancelled {
+                    by_user: true,
+                    reason: text.clone(),
+                },
+                json!(["cancelled", true, text]),
+            ),
+        ];
+        for (status, previous_fields) in cases {
+            for intents in [std::slice::from_ref(&intent), &[]] {
+                // Previous producer representation, independent of the streaming writer.
+                let bytes = serde_json::to_vec(&(&previous_fields, intents)).unwrap();
+                assert_eq!(
+                    direct_child_result_fingerprint(&status, intents),
+                    format!("{:x}", Sha256::digest(bytes))
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -11048,10 +11330,16 @@ pub(crate) mod tests {
             "data": {"full_text": "original success", "applied_user_intents": []}
         }));
         spawner.restore_durable_agent_runs(&[child.clone()]).await;
-        assert!(matches!(
-            parent.take_completed_direct_children()[0].status,
-            AgentStatus::Completed { .. }
-        ));
+        let accepted = parent.take_completed_direct_children().pop().unwrap();
+        assert!(matches!(&accepted.status, AgentStatus::Completed { .. }));
+        let reader_snapshot = Arc::clone(&accepted);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            released.await.unwrap();
+            assert!(
+                matches!(&reader_snapshot.status, AgentStatus::Completed { result, .. } if result == "original success")
+            );
+        });
 
         spawner.completed_agents.write().await.clear();
         child.status = astra_core::STATUS_FAILED.into();
@@ -11066,6 +11354,9 @@ pub(crate) mod tests {
             &corrected[0].status,
             AgentStatus::Failed { error, .. } if error == "durable failure"
         ));
+        assert!(!Arc::ptr_eq(&accepted, &corrected[0]));
+        release.send(()).unwrap();
+        reader.await.unwrap();
     }
 
     #[tokio::test]
@@ -11347,7 +11638,8 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_millis(10), parent.wait_for_direct_children())
             .await
             .unwrap();
-        let payload = serde_json::to_value(&parent.take_completed_direct_children()[0]).unwrap();
+        let staged = parent.take_completed_direct_children().pop().unwrap();
+        let payload = serde_json::to_value(staged.as_ref()).unwrap();
         assert!(payload["result"].as_str().unwrap().len() <= 4096);
         assert_eq!(payload["result_truncated"], true);
         assert_eq!(payload["result_bytes"], 18000);
@@ -11355,6 +11647,12 @@ pub(crate) mod tests {
         // The completion notification is a preview; reading the existing
         // terminal status must retain the full UTF-8 result without a rerun.
         let retained = parent.retained_direct_child_result("agent-0").unwrap();
+        assert!(Arc::ptr_eq(&staged, &retained));
+        let second_read = parent.retained_direct_child_result("agent-0").unwrap();
+        assert!(
+            Arc::ptr_eq(&retained, &second_read),
+            "reads must share the complete result"
+        );
         assert!(
             spawner
                 .retained_child_result("other-parent", "agent-0")
@@ -11377,6 +11675,10 @@ pub(crate) mod tests {
         assert_eq!(result["result"], "界".repeat(6000));
         assert!(parent.finalize_direct_children_if_settled());
         assert!(parent.retained_direct_child_result("agent-0").is_none());
+        assert!(
+            matches!(&retained.status, AgentStatus::Completed { result, .. } if result == &"界".repeat(6000)),
+            "an outstanding reader retains its accepted snapshot after owner finalization"
+        );
     }
 
     #[tokio::test]
@@ -11583,7 +11885,10 @@ pub(crate) mod tests {
         assert!(first.contains("runtime owns your run identity"));
         assert!(first.contains("to=\"parent\""));
         assert!(first.contains("message_type=\"question\""));
+        assert!(first.contains("next action MUST be"));
+        assert!(first.contains("Never put a question to the parent in ordinary text"));
         assert!(first.contains("A parent question is control flow, never terminal output"));
+        assert!(first.contains("returns `queued`"));
         assert!(first.contains("wait for the correlated answer"));
         assert!(first.contains("`ask_user` addresses the human"));
         assert!(first.contains("Return only the answer, evidence, or decision"));
@@ -11621,10 +11926,11 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl MessageTransport for PendingRegisterTransport {
-        async fn register(
+        async fn register_with_capabilities(
             &self,
             _addr: astra_messaging::AgentAddress,
             _delegation_id: Option<String>,
+            _capabilities: astra_messaging::MailboxCapabilities,
         ) -> Result<MailboxSubscription, astra_messaging::MailboxError> {
             self.register_started
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -11647,11 +11953,11 @@ pub(crate) mod tests {
             ))
         }
 
-        async fn resolve_agent(
+        async fn resolve_mailbox(
             &self,
             _delegation_id: &str,
             _agent_id: &str,
-        ) -> Result<astra_messaging::AgentAddress, astra_messaging::MailboxError> {
+        ) -> Result<astra_messaging::ResolvedMailbox, astra_messaging::MailboxError> {
             Err(astra_messaging::MailboxError::Transport(
                 "not used by spawn shutdown regression".to_string(),
             ))
@@ -11679,12 +11985,13 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl MessageTransport for PendingTerminalTransport {
-        async fn register(
+        async fn register_with_capabilities(
             &self,
             _addr: astra_messaging::AgentAddress,
             _delegation_id: Option<String>,
+            capabilities: astra_messaging::MailboxCapabilities,
         ) -> Result<MailboxSubscription, astra_messaging::MailboxError> {
-            Ok(MailboxSubscription::new(_addr))
+            Ok(MailboxSubscription::with_capabilities(_addr, capabilities))
         }
 
         async fn unregister(
@@ -11703,11 +12010,11 @@ pub(crate) mod tests {
             Ok(Box::new(EmptyMessageStream))
         }
 
-        async fn resolve_agent(
+        async fn resolve_mailbox(
             &self,
             _delegation_id: &str,
             _agent_id: &str,
-        ) -> Result<astra_messaging::AgentAddress, astra_messaging::MailboxError> {
+        ) -> Result<astra_messaging::ResolvedMailbox, astra_messaging::MailboxError> {
             Err(astra_messaging::MailboxError::Transport(
                 "not used by cleanup regression".to_string(),
             ))
@@ -11747,14 +12054,14 @@ pub(crate) mod tests {
             "read_file".to_string(),
         ];
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&requested), &restricted),
+            effective_spawn_allowed_tools(Some(&requested), &restricted, None),
             vec!["read_file".to_string()],
             "a read-only/restricted profile cannot be widened by spawn arguments"
         );
 
         let unrestricted = ["*".to_string()].into_iter().collect();
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&requested), &unrestricted),
+            effective_spawn_allowed_tools(Some(&requested), &unrestricted, None),
             vec!["read_file".to_string(), "write_file".to_string()],
             "a full profile honors the normalized explicit child boundary"
         );
@@ -11766,7 +12073,8 @@ pub(crate) mod tests {
             assert_eq!(
                 effective_spawn_allowed_tools(
                     Some(&["tool_search".to_string(), "write_file".to_string()]),
-                    &profile.allowed_tools
+                    &profile.allowed_tools,
+                    None,
                 ),
                 vec!["tool_search".to_string()],
                 "{} must retain discovery while rejecting mutation",
@@ -11779,9 +12087,20 @@ pub(crate) mod tests {
             .find(|definition| definition.agent_type == "explore")
             .expect("explore profile");
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&["web_fetch".to_string()]), &explore.allowed_tools,),
+            effective_spawn_allowed_tools(
+                Some(&["web_fetch".to_string()]),
+                &explore.allowed_tools,
+                None,
+            ),
             vec!["web_fetch".to_string()],
             "a read-only research profile must retain an explicitly narrowed read-only web capability"
+        );
+
+        let native =
+            effective_spawn_allowed_tools(None, &explore.allowed_tools, Some("native_codex"));
+        assert!(
+            native.contains(&"native_codex".to_string()),
+            "an explicitly admitted provider execution must not depend on persona tool defaults"
         );
     }
 
@@ -15226,12 +15545,14 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl PreparedSpawn for IdentityPreparedSpawn {
-        fn model_identity(&self) -> Option<PreparedSpawnModelIdentity> {
-            Some(PreparedSpawnModelIdentity {
-                offering_id: "offer-reviewed".into(),
-                model_name: "same-display-name".into(),
-                provenance: "admission_validated",
-            })
+        fn execution_identity(&self) -> Option<PreparedSpawnIdentity> {
+            Some(PreparedSpawnIdentity::InternalModel(
+                PreparedSpawnModelIdentity {
+                    offering_id: "offer-reviewed".into(),
+                    model_name: "same-display-name".into(),
+                    provenance: "admission_validated",
+                },
+            ))
         }
 
         fn launch(
@@ -16666,6 +16987,131 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn external_preparation_requires_matching_input_and_never_inherits_parent_model() {
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        struct ExternalPrepared(ThinkingConfig);
+
+        #[async_trait]
+        impl PreparedSpawn for ExternalPrepared {
+            fn effective_thinking(&self) -> Option<ThinkingConfig> {
+                Some(self.0.clone())
+            }
+
+            fn execution_identity(&self) -> Option<PreparedSpawnIdentity> {
+                Some(PreparedSpawnIdentity::ExternalProvider(
+                    PreparedSpawnProviderIdentity {
+                        descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
+                            astra_turn_types::ToolIdentity::new(
+                                astra_turn_types::ProviderBindingRef::new("selected-user-runner")
+                                    .unwrap(),
+                                astra_turn_types::NativeToolId::new("native-collaborator").unwrap(),
+                            ),
+                            "test-protocol-v1",
+                        )
+                        .unwrap(),
+                        decision_id: "admitted-provider-decision".into(),
+                        execution_binding_generation: 1,
+                        requested_model: Some("native-model".into()),
+                    },
+                ))
+            }
+
+            fn launch(self: Box<Self>, config: SpawnRunConfig) -> Result<SpawnExecution, String> {
+                assert!(config.model.is_none());
+                assert!(config.resolved_model_selection.is_none());
+                assert!(config.requested_model_policy.is_none());
+                assert_eq!(config.thinking, self.0);
+                Ok(Box::pin(async move {
+                    ImmediateStatusExecutor {
+                        status: "completed",
+                        finish_reason: "normal",
+                        output: Some("native result"),
+                        error: None,
+                    }
+                    .execute(config)
+                    .await
+                }))
+            }
+        }
+
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
+            ImmediateStatusExecutor {
+                status: "completed",
+                finish_reason: "normal",
+                output: None,
+                error: None,
+            },
+        ));
+        let error = spawner
+            .spawn_with_prepared_controls(
+                make_bg_input(),
+                &make_bg_context(),
+                None,
+                None,
+                Box::new(ExternalPrepared(ThinkingConfig::ModelDefault)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SpawnError::InvalidInput(_)));
+        assert!(spawner.active_agents.read().await.is_empty());
+        assert!(
+            spawner
+                .mailbox_router
+                .list_registered_agents(&make_bg_context().parent_run_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut input = make_bg_input();
+        input.execution = Some(
+            astra_turn_core::orchestration_spawn_tool::ProviderChildExecutionRequest {
+                tool: "native-collaborator".into(),
+                model: Some("native-model".into()),
+            },
+        );
+        let mut context = make_bg_context();
+        context.resolved_model_name = Some("parent-model".into());
+        context.parent_model_reasoning = Some(
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: "parent-offering".into(),
+                },
+                resolved_model_name: Some("parent-model".into()),
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Adaptive {
+                    effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                },
+            },
+        );
+        for thinking in [
+            ThinkingConfig::ModelDefault,
+            ThinkingConfig::Off,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        ] {
+            // An omitted control must use the prepared conversation default,
+            // not the parent's reasoning or the raw request's ModelDefault.
+            assert!(input.reasoning.is_none());
+            let SpawnAgentOutput::Launched { agent_id, .. } = spawner
+                .spawn_with_prepared_controls(
+                    input.clone(),
+                    &context,
+                    None,
+                    None,
+                    Box::new(ExternalPrepared(thinking)),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                spawner
+                    .wait_for_agent(&agent_id, Duration::from_secs(1))
+                    .await,
+                Some(AgentStatus::Completed { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_spawn_journal_records_identity_without_claiming_provider_use() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
@@ -16751,7 +17197,10 @@ pub(crate) mod tests {
         let model = restored
             .get_agent_state_any(&agent_id)
             .await
-            .and_then(|state| state.prepared_model)
+            .and_then(|state| match state.prepared_execution {
+                Some(PreparedSpawnIdentity::InternalModel(model)) => Some(model),
+                _ => None,
+            })
             .expect("model identity survives local journal recovery");
         assert_eq!(model.offering_id, "offer-reviewed");
         assert_eq!(model.model_name, "same-display-name");
@@ -19082,7 +19531,7 @@ pub(crate) mod tests {
             spawn_tool_call_id: None,
             fanout_slot: None,
             execution_metadata: None,
-            prepared_model: None,
+            prepared_execution: None,
         }
     }
 
@@ -24485,7 +24934,7 @@ pub(crate) mod tests {
                     .get_agent_state_any(&results[0].agent_id)
                     .await
                     .unwrap()
-                    .prepared_model
+                    .prepared_execution
                     .is_none()
             );
             match &results[0].status {

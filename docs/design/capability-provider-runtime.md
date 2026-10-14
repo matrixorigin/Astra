@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-07-16.
+> Last updated: 2026-10-09.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -132,6 +132,10 @@ human-readable strings.
 A malformed tool should be isolated at the smallest safe boundary. A local
 declaration error must not silently disable unrelated provider capabilities.
 
+A model-selection or reasoning-level refusal rejects that invocation, not a
+healthy provider. Withdraw capacity only for provider readiness, transport,
+protocol, or authority failures established at their owning boundary.
+
 ### Optimizations never become authority
 
 Prompt caching, semantic read-result caching, batching, and compaction may
@@ -230,6 +234,41 @@ Snapshot construction must:
 - preserve optional versus explicitly false claims;
 - derive versions/hashes from semantic content, not timestamps or process IDs;
 - exclude volatile health samples and call statistics from descriptor hashes.
+
+### Authenticated local-runtime discovery
+
+Runtime advertisements use schema version 2 and carry an explicit
+`provider_discovery` array, including an empty array when no dynamic provider is
+declared. Missing discovery is not inferred from public tool schemas. Local
+snapshots use the `cli-local` discovery protocol, the authenticated executor as
+provider identity, and the materialization/root physical identity as binding.
+
+Server admission resolves the selected authenticated registration through the
+same conservative resolver as other providers and installs one combined policy
+index. Authentication proves provenance, not claim trust or permission. Recovery
+retains the admitted snapshot through the existing checkpoint; current dispatch
+must still reject a changed descriptor, capability or materialization.
+
+The qualified `astra.runtimeRequirements` extension declares an executable and
+a bounded set of runtime read dependencies. It does not grant access. A frozen
+execution ceiling limits workspace, network and runtime reads; local approval
+and sensitive-path denials still apply independently. The current ceiling cannot
+represent restricted filesystem allowlists or stronger isolation guarantees and
+must reject them rather than project them into unrestricted workspace reads.
+
+CLI runtime dependency admission reads the existing session permission writer
+through an immutable subscription. Requests carry the canonical session
+attachment epoch; reset, rebind or writer closure invalidates retained policy.
+One invocation-scoped approval covers the frozen dependency set, with every
+dependency checked again after policy changes and before dispatch. An automatic
+policy release is not recorded as a user approval. The existing TUI approval
+queue is reused; mode-only queue reevaluation cannot authorize this bundle.
+Remembered dependency grants require acknowledgement from that same permission
+writer and are not currently supported by this admission path.
+
+These contracts do not imply that a particular external collaborator is ready
+for end-user use; its production entrypoint and complete journey need separate
+verification.
 
 ### Provider claims
 
@@ -705,6 +744,212 @@ degraded, quarantine and fallback facts
 
 Observation records decisions and outcomes. It must not implement alternate
 fallback, retry, or cache control flow.
+
+Provider-owned child selection uses the authenticated directory already supplied
+to the model. Human references are interpreted against its provider/model names;
+execution still requires exact selectors. Registration transport is distinct from
+the native protocol. Chat `model_catalog` is not a provider-model directory.
+An authorized provider's default execution does not require a model catalog;
+resolving an explicit model does.
+Unavailable or ambiguous requirements need clarification, not workspace discovery
+or substitution. A completed child's inline `result` is usable output; only
+explicit artifact/window references require retrieval.
+
+Current-run guidance retains the ordinary agent's character contract. The native
+route additionally validates its complete serialized input, including correlation,
+before durable acceptance, using the same constructor as physical steering. Invalid
+native text produces observable non-delivery feedback and retains existing custody
+for settlement; it is not applied or automatically retried as a transport failure.
+
+The supported native collaborator protocol is Codex app-server. Discovery selects
+the first verified client in PATH order and publishes only that client's binding;
+the ordered installation fingerprint still invalidates discovery on replacement
+or precedence changes. Later clients are not probed after selection. Both thread
+start and resume replace the complete configured MCP table with an empty table
+and disable apps/plugins. No user configuration read, per-server copying or
+alternate configuration parser is needed. Rejected thread overrides fail closed.
+The same start/resume configuration disables command hooks and clears legacy
+notification commands: those automatic commands do not inherit thread permissions.
+The admitted network ceiling also governs provider-hosted search. Denial disables
+both live and cached search at start/resume; an allowed network preserves the
+configured search preference without upgrading it. A failed terminal preserves
+a bounded machine error class in the existing native observation and visible
+result. Provider messages and details are excluded, and retry notifications do
+not establish terminal failure or authorize another physical execution.
+Native completion proves settled stage execution, not Astra Work delivery.
+Native preparation rejects assigned WorkItems and authoritative checks selected
+for its completion phase; advisory and unselected declarations do not block it.
+The existing child executor checks the same contract before durable activation.
+
+A pending user
+question does not suspend its steering dispatcher: one outstanding steer is
+correlated and acknowledged while the existing question decision remains live.
+The active turn has one protocol dispatcher. A matching, well-formed `-32600`
+steer error conclusively rejects that input without aborting the task. Its durable
+source is returned through the existing input settlement owner before later
+guidance is delivered. Persistence retries settle that source without another
+physical steer; only applied sources enter model context. Refusal does not close
+the stage's guidance or mailbox lanes. Internal
+or unknown error codes and lost/timed-out ACKs leave delivery unknown, disable
+further steering for that stage, and do not interrupt a healthy task. Malformed
+frames or conflicting request/turn identities use ordinary protocol cleanup.
+
+The native JSON-RPC envelope budget is independent of the retained answer:
+up to 4 MiB per frame with one queued frame; the presentation remains at most
+64 KiB (or the admitted smaller limit). Complete answers and file diffs can be
+larger than their presentation without turning a normal task into transport
+failure. Frames beyond the wire budget still fail closed. One item-identified
+message buffer replaces completed commentary with the next answer's deltas;
+failure preserves that latest partial answer rather than an older completed item.
+
+Native execution intersects the admitted write ceiling with local read-only
+restrictions before choosing workspace ownership. Enforced read-only stages can
+read the live workspace while another owner writes; this does not establish a
+stable snapshot. Opaque writable stages retain the exclusive workspace lease
+through descendant settlement. Concurrent writable work requires separately
+admitted workspace domains, and a continuing native session is never silently
+rebound to a different workspace.
+Consumed direct-child results use shared immutable custody for staging and reads.
+Fingerprinting streams borrowed data into its digest without copying full output;
+the serialized identity is unchanged. This reduces temporary allocation and
+read-copy cost, but does not bound cumulative parent-held result bytes.
+
+Native session proof is emitted only after the complete thread and permission
+acknowledgement has been validated. Binding that proof from a settled, dispatched
+receipt precedes the stage's cancellation or supersession outcome. A missing
+binding can be recovered on native continuation using the same confirmation
+owner and original action-admission generation. Recovery records receipt history;
+it does not renew a lease, clear cancellation or grant execution. Ordinary turns
+and association snapshot reads do not perform this repair.
+The reporting generation fences the current stage; the binding records its
+original hashed action-grant generation. Replaying a terminal receipt after
+owner recovery does not attribute the old work to the newer generation.
+Confirmation has one bounded settlement attempt. Persistence uncertainty retains
+the delivered result and its receipt with an unconfirmed-binding advisory;
+contradictory proof still fails closed. Cancellation and supersession keep their
+existing outcomes. Continuation repair checks the expected predecessor and its
+generation together under the same session/run locks.
+
+SQL failures keep their typed cause through the event INSERT owner; opaque
+diagnostic strings cannot authorize binding recovery. Mailbox guidance with an
+unknown acknowledgement retains that fact in the invocation receipt and terminal
+projection, including receipt replay, independently of the task outcome.
+
+Usage snapshots are observations. Resets, inconsistent lanes and ambiguous
+resume baselines make complete stage accounting unknown without interrupting
+execution or withdrawing capability. Later snapshots cannot manufacture the
+missing stage charge. Null accounting is distinct from measured zero.
+
+Capability refresh uses a requested/completed sequence in the existing delivery
+supervisor. Each installation acknowledges only requests captured before that
+attempt, after discovery and publication settle. A later request cannot reuse
+initial readiness. Turns wait within the existing bounded preparation window;
+timeout or owner closure does not prove publication. Admitted work retains its
+existing drain and settlement owner while refresh is pending.
+A processed conclusive rejection produces correlated `not_adopted` feedback, or
+an explicit unconfirmed-feedback outcome; it is not parked for a nonexistent
+later agent loop. Unknown delivery is never replayed or inferred from successful
+Run completion. Transport queueing is not proof of model adoption or observation.
+Durable user-intent application/return remains owned by Run settlement.
+The public control endpoint writes only that durable source, not a second mailbox
+copy. Its consumer can steer only after its own successful physical dispatch
+supplies the exact connection and delivery generation. An accepted ACK transfers
+the source to the existing pending-application custody before any persistence
+await; retries in that custody only persist application. Replayed applied facts
+restore context without steering. Input IDs correlate ACKs; they do not establish
+provider deduplication or exactly-once delivery across an ACK/persistence crash.
+
+Persistence retries after an accepted ACK retain the original invocation and
+dispatch owner. They record the accepted effect under that execution generation,
+including after pause or cancellation; they cannot resume work, supersede a newer
+objective, or authorize another provider action. Completion retains the existing
+dispatch custody for a bounded final application drain. If settlement is still
+unconfirmed, existing invocation facts prevent the source from being returned as
+safe to resend. The active task itself has no implicit five-minute deadline.
+Protocol negotiation, input acknowledgements and socket delivery remain bounded;
+physical Edge disconnection cancels and settles its owned processes before a new
+attachment can admit work. Session context and durable results remain available
+for subsequent stages and replay.
+
+Native task lifetime is optional and distinct from per-command and observation
+timeouts. Without an explicit work budget, an authenticated selected task keeps
+its result subscription until completion, cancellation, disconnect or authority
+loss. Explicit absolute/remaining work budgets remain paired and non-renewable.
+Bootstrap, protocol handshakes, input ACKs, individual questions and output drain
+remain bounded. Result capacity refuses new dispatch rather than evicting an
+active waiter; dropping the waiter releases generation-fenced callback custody.
+An outstanding question belongs to its live dispatched invocation, not the
+mutable applied-input frontier. Its origin retains the original dispatch grant;
+guidance acceptance, refusal or uncertain delivery does not invalidate that
+question. Positive-ACK application supplies the exact invocation identity for
+transactional validation. While waiting, the current unresolved question must
+belong to that same invocation; application does not resume the Run. Ordinary
+interactions retain their user-turn supersession fence. Generation, owner,
+lease, binding, cancellation, deadline and invocation settlement still fence
+both application and answers.
+
+The event append owner derives a nullable `invocation_supersession_scope_key`
+from the trusted user/session/run tuple. Admitted grant events and invalid or
+non-guidance user intents receive the key; valid `guide_current_run` sources
+and other events receive NULL. Caller-supplied keys cannot establish the fact.
+The grant-authority read verifies its anchor key. A single-column index selects
+grants and superseding intents without loading guidance history; event-type and
+original-epoch predicates stay residual so the existing grant preserves a
+nonempty candidate set. Returned user/session/run and epoch must match exactly;
+the hash carries no authorization. This adds no event or write statement, but adds an
+index entry per existing event and hashes qualifying grants/intents. Work depends
+on grants and superseding intents, not valid-guidance history. Ordinary queries
+are unchanged. Fresh readiness verifies the column/index; no backfill or mutable
+cursor is used.
+
+Feedback queueing transfers the original envelope to acknowledgement-only
+custody before awaiting its transport ACK. Failure to confirm feedback is
+retained in the existing tool-terminal presentation, including when invocation
+settlement remains unknown; it never converts that invocation to success.
+The bounded diagnostic remains separate from the original output and its
+integrity evidence, including truncated presentation and snapshot repair.
+
+Mailbox structured-request capability belongs to registration and is immutable
+for its lifetime. Remote resolution returns it with the address in the existing
+directory query. Unknown or text-only receivers cannot acquire question/reply
+obligations. An unexpected structured Request at a native text-only receiver is
+answered with a correlated `accepted=false` response for the original question
+ID, using the existing feedback/ACK custody rather than a second message path.
+
+Native questionnaires retain stable IDs through the shared question UI and answer
+normalization. Distinct IDs may have identical display text. Display text is only
+the identity for ordinary questionnaires that do not supply protocol IDs; mixed
+identity modes are rejected. Association reads are tenant-scoped nonlocking
+snapshots, not execution grants; authoritative writes retain admission fencing.
+
+Native stages carry a bounded `native_stage_observation` through the existing
+tool terminal event and its external projection. Its checked stage delta is
+separate from the last native request snapshot and model context capacity;
+neither is a measurement of current context occupancy. Missing cache lanes or
+resume baselines remain unknown. The runtime invocation count and health do
+not describe provider-internal tools. Observation does not authorize completion
+or retry and requires no additional run, ledger, or artifact lookup.
+
+Native receipts use the existing host terminal custody even when no live
+observer is attached. Terminal presentation is bounded after execution metadata
+and again after generation/idempotency attachment, within the existing durable
+observation-window budget. Arguments are discarded before usable control
+results; exact routing is retained or replaced by an explicit repair gap.
+Canonical results and answers are not shortened. Native terminals use the
+existing exact-generation, idempotent precommit, including pause/cancel
+reconciliation. Later atomic settlement does not insert the same terminal
+again. Correcting missing native custody adds one semantic row and its existing
+precommit transaction; it is not zero additional storage. Observation requires
+no additional lookup or separate lifecycle.
+
+Codex permission masks project the shared sensitive-path rules into two
+deterministic brace globs per admitted directory, retaining literal credential
+file denies and existing logical aliases. Grant selection is unchanged; roots
+containing glob syntax fail before dispatch. This reduces prompt overhead, not
+the isolation boundary, and does not claim protection for arbitrary future
+files beyond the native client's existing mask semantics.
+Canonical workspace roots must also pass the shared never-readable predicate
+before any grant: descendant masks cannot make a sensitive grant root safe.
 
 ## Required invariants and tests
 

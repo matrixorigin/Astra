@@ -480,6 +480,8 @@ pub fn evaluate_permission_with_provider_policy(
         || is_read_only_tool_with_args(tool_name, Some(args)),
         |policy| policy.is_read_only(),
     );
+    let collaborator_stage = provider_policy.is_some_and(|policy| policy.is_collaborator_stage());
+    let inherited_collaborator_stage = ctx.inherited.read_only_execution && collaborator_stage;
     // Work lifecycle transitions are control-plane capabilities. Their
     // durable state changes are validated by the Work executor, so they must
     // remain usable in a read-only child even though they are not ordinary
@@ -487,11 +489,12 @@ pub fn evaluate_permission_with_provider_policy(
     // contract instead of extending a permission-name allowlist here.
     let contract_read_only = provider_policy.is_none()
         && astra_runtime_env::builtin_tool_is_read_only_execution_capability(tool_name);
-    let coordination_or_consultation = provider_policy.is_none()
+    let coordination_or_consultation = (provider_policy.is_none()
         && (is_internal_orchestration_control(tool_name, args)
             || crate::tool::categories::classify(tool_name, Some(args)).category
                 == crate::tool::categories::ToolCategory::Consultative
-            || contract_read_only);
+            || contract_read_only))
+        || collaborator_stage;
     if ctx.inherited.read_only_execution
         && (tool_name == "bash"
             || tool_name == "lsp"
@@ -844,8 +847,8 @@ pub fn evaluate_permission_with_provider_policy(
         push_skipped(&mut trace, EvaluationStep::AskRules, "no ask rule matched");
     }
 
-    let provider_requires_approval =
-        provider_policy.is_some_and(|policy| policy.requires_approval());
+    let provider_requires_approval = provider_policy
+        .is_some_and(|policy| policy.requires_approval() && !inherited_collaborator_stage);
     let static_explicit_reason = if provider_policy.is_none() {
         explicit_approval_reason(tool_name, args)
     } else {
@@ -902,13 +905,19 @@ pub fn evaluate_permission_with_provider_policy(
         // This keeps admission and execution aligned: read-only invocations,
         // plan-control tools, and plan-internal authoring pass; external
         // implementation side effects are denied.
-        if !crate::plan_mode_policy::is_plan_mode_blocked_tool(tool_name, args) {
+        if collaborator_stage
+            || !crate::plan_mode_policy::is_plan_mode_blocked_tool(tool_name, args)
+        {
             let decision = HardDecision::Allow;
             push_matched(
                 &mut trace,
                 EvaluationStep::Mode,
                 &decision,
-                "allowed by plan-mode policy",
+                if collaborator_stage {
+                    "collaborator stage admitted; its adapter applies the plan-mode ceiling"
+                } else {
+                    "allowed by plan-mode policy"
+                },
             );
             return envelope(
                 decision,
@@ -1104,6 +1113,23 @@ pub fn evaluate_permission_with_provider_policy(
         EvaluationStep::AllowRules,
         "no allow rule matched",
     );
+
+    if inherited_collaborator_stage && ctx.mode() != PermissionMode::Deny {
+        let decision = HardDecision::Allow;
+        push_matched(
+            &mut trace,
+            EvaluationStep::Mode,
+            &decision,
+            "collaborator stage admitted by the read-only execution ceiling; workspace effects remain grant-bound",
+        );
+        return envelope(
+            decision,
+            DecisionSource::InternalOrchestration,
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
 
     if ctx.mode() != PermissionMode::Deny && is_internal_orchestration_control(tool_name, args) {
         let decision = HardDecision::Allow;
@@ -3224,6 +3250,8 @@ mod tests {
         approval: crate::provider_resolution::ProviderApprovalBaseline,
     ) -> crate::provider_resolution::ResolvedInvocationPolicy {
         crate::provider_resolution::ResolvedInvocationPolicy {
+            runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
@@ -3243,6 +3271,17 @@ mod tests {
             semantic_cache: astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
             diagnostics: Vec::new(),
         }
+    }
+
+    fn collaborator_policy(
+        effect: astra_turn_types::ResolvedToolEffect,
+        parallelizable: bool,
+        approval: crate::provider_resolution::ProviderApprovalBaseline,
+    ) -> crate::provider_resolution::ResolvedInvocationPolicy {
+        let mut policy = provider_policy(effect, parallelizable, approval);
+        policy.native_collaborator_protocol =
+            Some(crate::provider_resolution::NativeCollaboratorProtocol::CodexAppServer);
+        policy
     }
 
     #[test]
@@ -3339,6 +3378,68 @@ mod tests {
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
         assert!(matches!(envelope.source, DecisionSource::DenyRule { .. }));
+    }
+
+    #[test]
+    fn collaborator_stage_uses_the_child_ceiling_without_becoming_a_global_read_only_tool() {
+        let child = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                read_only_execution: true,
+                ..Default::default()
+            },
+        );
+        let collaborator = collaborator_policy(
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            false,
+            crate::provider_resolution::ProviderApprovalBaseline::RequiresApproval,
+        );
+        let admitted = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &child,
+            Some(&collaborator),
+        );
+        assert_eq!(admitted.decision, HardDecision::Allow);
+        assert_eq!(admitted.source, DecisionSource::InternalOrchestration);
+
+        let ordinary_mutating = provider_policy(
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            false,
+            crate::provider_resolution::ProviderApprovalBaseline::RequiresApproval,
+        );
+        let denied = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &child,
+            Some(&ordinary_mutating),
+        );
+        assert!(matches!(denied.decision, HardDecision::Deny { .. }));
+
+        let root = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let root_decision = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &root,
+            Some(&collaborator),
+        );
+        assert!(matches!(
+            root_decision.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+
+        let plan = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Plan,
+        );
+        let plan_decision = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &plan,
+            Some(&collaborator),
+        );
+        assert_eq!(plan_decision.decision, HardDecision::Allow);
     }
 
     // ── Issue #326 P5 / R2 Major 5: MCP capability metadata ──

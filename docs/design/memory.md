@@ -94,6 +94,28 @@ transport failures retain downstream summary behavior. Cleanup maps every read
 error to purge failure. Write admission before expensive work and fresh final
 write checks remain required.
 
+Session-end governance must distinguish a successful empty snapshot read from
+a failed or denied read. Any snapshot read error stops destructive governance
+and retains working memories for a later retry. Required writes must return an
+exact, nonempty memory ID: an empty successful HTTP response or an unsupported
+transport operation is not proof of storage. Unconfirmed episodes retain working
+memory; unconfirmed scenes are failed writes. Only required episode persistence
+and working cleanup determine the consolidation success cooldown. Optional
+reflection/scene failures remain observable but do not replay those completed
+stages. Failed episode persistence or cleanup retains retry eligibility; this
+is not an automatic durable retry queue.
+
+The CLI transport persists typed episodes and scenes through the authenticated
+Server memory proxy, sharing the direct transport's encoding and receipt
+validation. It requests reflection candidates through the same proxy; successful
+backend cooldown skips are empty results. CLI exit retains its shared five-second
+maintenance budget and cancels/drains unfinished work rather than granting purge
+on a timeout. A required archive must be confirmed before working cleanup.
+
+Session-start recall applies
+each profile/episode cap only after typed prompt admission, so invalid or
+inactive rows cannot displace valid evidence already returned by the backend.
+
 The bounded admitted authority-resolution counts are message recall 2 → 1,
 session-start recall 3 → 2, snapshot loading 2 → 1, and applicable compaction
 2 → 1. Independent session-start lanes deliberately resolve twice even when

@@ -488,11 +488,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
         if !status.is_success() {
             return Err(format!("memory store HTTP {status}"));
         }
-        let memory_id = payload
-            .get("memory_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "memory store missing memory_id".to_string())?
-            .to_string();
+        let memory_id = astra_runtime::turn::cloud::memoria_compact::confirmed_memory_id(&payload)?;
         if memory_type == "working"
             && let Some(session_id) = session_id
             && let Ok(mut guard) = self.working_ids.lock()
@@ -500,6 +496,66 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
             guard.insert(session_id.to_string(), memory_id.clone());
         }
         Ok(memory_id)
+    }
+
+    async fn store_episode(&self, session_id: &str, overview: &str) -> Result<String, String> {
+        astra_runtime::turn::cloud::memoria_compact::MemoryScope::new(
+            &self.owner_user_id,
+            session_id,
+        )?;
+        if overview.trim().is_empty() {
+            return Err("store_episode: empty overview".into());
+        }
+        let content = astra_runtime::turn::cloud::memoria_compact::encode_episode_memory(
+            session_id, overview,
+        );
+        self.store(&content, "episodic", Some(session_id), Some("T3"))
+            .await
+    }
+
+    async fn store_scene(
+        &self,
+        session_id: &str,
+        signal: &str,
+        summary: &str,
+    ) -> Result<String, String> {
+        astra_runtime::turn::cloud::memoria_compact::MemoryScope::new(
+            &self.owner_user_id,
+            session_id,
+        )?;
+        if summary.trim().is_empty() {
+            return Err("store_scene: empty summary".into());
+        }
+        let content =
+            astra_runtime::turn::cloud::memoria_compact::encode_scene_memory(signal, summary);
+        self.store(&content, "semantic", Some(session_id), Some("T4"))
+            .await
+    }
+
+    async fn reflect_session(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<astra_runtime::turn::cloud::memoria_compact::ReflectSummary, String> {
+        astra_runtime::turn::cloud::memoria_compact::MemoryScope::new(
+            &self.owner_user_id,
+            session_id,
+        )?;
+        let token = self.fresh_token().await?;
+        let text = self
+            .api
+            .post_bearer_path_json_text(
+                &token,
+                "/memory/reflect",
+                &serde_json::json!({
+                    "session_id": session_id, "force": force, "mode": "candidates"
+                }),
+            )
+            .await
+            .map_err(|error| format!("memory reflect failed: {error}"))?;
+        let response = serde_json::from_str(&text)
+            .map_err(|error| format!("memory reflect parse failed: {error}"))?;
+        Ok(astra_runtime::turn::cloud::memoria_compact::parse_reflect_summary(&response))
     }
 
     async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
@@ -1484,6 +1540,149 @@ mod tests {
             svc.is_none(),
             "missing auth identity should disable session memory extractor"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_exit_archives_before_cleanup_and_retains_unconfirmed_working() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::body_partial_json;
+        let _creds_guard = crate::tests::isolate_credentials();
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        write_profile_with_token("session-1");
+        for receipt in [
+            r#"{"memory_id":"episode-1"}"#,
+            "{}",
+            r#"{"memory_id":""}"#,
+            "not-json",
+        ] {
+            let server = MockServer::start().await;
+            let events = Arc::new(Mutex::new(Vec::<&str>::new()));
+            let sid = "cli-exit-archive";
+            let snapshot = astra_runtime::session_memory::runner::encode_session_memory_entry(
+                sid,
+                "# Session Memory\n\n## Task Specification\nComplete durable archive\n\n## Current State\n- Changes verified",
+            );
+            Mock::given(method("POST"))
+                .and(path("/memory/retrieve"))
+                .and(header_exists("authorization"))
+                .and(body_partial_json(
+                    serde_json::json!({"session_id": sid, "session_scope": "only"}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "memories": [{"memory_id": "working-1", "user_id": "user-1", "session_id": sid,
+                        "memory_type": "working", "content": snapshot}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let stored = Arc::clone(&events);
+            let response_body = receipt.to_string();
+            Mock::given(method("POST")).and(path("/memory/store"))
+                .and(header_exists("authorization"))
+                .and(body_partial_json(serde_json::json!({"memory_type": "episodic", "trust_tier": "T3", "session_id": sid})))
+                .respond_with(move |_: &wiremock::Request| {
+                    stored.lock().unwrap().push("episode");
+                    ResponseTemplate::new(201).set_body_string(response_body.clone())
+                }).expect(1).mount(&server).await;
+            let purged = Arc::clone(&events);
+            Mock::given(method("DELETE"))
+                .and(path("/memory/working-1"))
+                .and(header_exists("authorization"))
+                .respond_with(move |_: &wiremock::Request| {
+                    purged.lock().unwrap().push("purge");
+                    ResponseTemplate::new(204)
+                })
+                .expect(u64::from(receipt.contains("episode-1")))
+                .mount(&server)
+                .await;
+            let reflected = Arc::clone(&events);
+            Mock::given(method("POST"))
+                .and(path("/memory/reflect"))
+                .and(header_exists("authorization"))
+                .and(body_partial_json(
+                    serde_json::json!({"mode": "candidates", "session_id": sid, "force": false}),
+                ))
+                .respond_with(move |_: &wiremock::Request| {
+                    reflected.lock().unwrap().push("reflect");
+                    ResponseTemplate::new(503).set_body_string("optional reflection unavailable")
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let mut state = SessionState {
+                session_id: Some(sid.into()),
+                turn: 3,
+                session_memory_port: Some(Arc::new(CliSessionMemoryMemoriaPort::new(
+                    api, None, "user-1",
+                ))),
+                ..Default::default()
+            };
+            crate::cli::session::session_cleanup::finalize_session_with_budget(
+                &mut state,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            let expected = if receipt.contains("episode-1") {
+                vec!["episode", "purge", "reflect"]
+            } else {
+                vec!["episode", "reflect"]
+            };
+            assert_eq!(*events.lock().unwrap(), expected, "receipt={receipt}");
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_stores_typed_scenes_and_accepts_reflect_skips() {
+        use wiremock::matchers::body_partial_json;
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        let content = astra_runtime::turn::cloud::memoria_compact::encode_scene_memory(
+            "pattern",
+            "recurring evidence",
+        );
+        Mock::given(method("POST"))
+            .and(path("/memory/store"))
+            .and(header_exists("authorization"))
+            .and(body_partial_json(
+                serde_json::json!({"content": content, "memory_type": "semantic",
+                "session_id": "session-1", "trust_tier": "T4"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"memory_id": "scene-1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/memory/reflect"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"skipped": true, "cooldown_remaining_s": 3600}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        assert_eq!(
+            port.store_scene("session-1", "pattern", "recurring evidence")
+                .await
+                .unwrap(),
+            "scene-1"
+        );
+        let summary = port.reflect_session("session-1", false).await.unwrap();
+        assert_eq!(summary.candidates, 0);
+        assert!(summary.candidate_payloads.is_empty());
+        server.verify().await;
     }
 
     #[serial_test::serial]

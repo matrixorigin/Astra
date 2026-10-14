@@ -560,6 +560,8 @@ async fn public_executor_pages_fresh_catalog_and_detects_change() {
         json!({"source_policy":"cloud_only"}),
         json!({"question":42}),
         json!({"catalog":{}}),
+        json!({"cursor":"next"}),
+        json!({"catalog_revision":format!("sha256:{}", "0".repeat(64))}),
     ] {
         assert!(
             executor
@@ -568,6 +570,15 @@ async fn public_executor_pages_fresh_catalog_and_detects_change() {
                 .is_error
         );
     }
+    assert_eq!(models.reads.load(Ordering::SeqCst), 0);
+    let malformed = handle_model_catalog(&json!({"cursor":"next"}), "owner", Some(&reader)).await;
+    let evidence: astra_core::ToolFailureEvidence =
+        serde_json::from_value(malformed.metadata.as_ref().unwrap()["recovery_evidence"].clone())
+            .unwrap();
+    assert_eq!(
+        evidence.cause,
+        astra_core::ToolFailureCause::InvalidArguments
+    );
     assert_eq!(models.reads.load(Ordering::SeqCst), 0);
     let first = executor
         .execute_with_metadata("model_catalog", &json!({"limit":16}))

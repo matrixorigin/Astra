@@ -83,6 +83,13 @@ heuristics. Outline signatures are redacted for display and do not establish
 full-file delivery or authorize replacement. A bounded prefix is identified as
 partial content; its measured line count does not describe the unread suffix.
 
+Credential read views preserve assignment syntax and replace only the secret
+value with an opaque reference. Presentation boundaries retain complete,
+canonical non-secret reference envelopes across processes; this does not grant
+edit authority. Only the source executor can authenticate the reference and
+resolve one unchanged, unambiguous source span. Adjacent raw secrets remain
+subject to redaction, and display-only markers cannot authorize edits.
+
 
 ### Server-owned execution
 
@@ -102,6 +109,12 @@ metadata. The separate delivery deadline includes callback settlement time and
 must not extend the command budget. Missing or invalid command authority rejects
 a Bash request. Model arguments remain unchanged for approval, invocation identity
 and journal evidence; runtime controls are never injected into those arguments.
+
+Ordinary shell inspection and diagnostics use command output as evidence and
+omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
+after edits. If bounded observation is unavailable, command output is retained
+but the requested verification fails closed; it must not mint a completion or
+no-change receipt. Command text does not select or weaken this contract.
 
 ### Rename authority
 
@@ -242,6 +255,35 @@ typed admission failure separately from invalid path declarations. The unused sy
 no-options observation wrapper are retired from the Rust source API. Process
 coordination, generation watches, diagnostic paths, and guard cleanup remain
 shared; tests exercise the same acquisition paths as executors.
+
+Native collaborator delivery delegates workspace serialization to the CLI tool
+executor. It does not hold a workspace lease while asking for approval or acquire
+the executor's lease a second time. After acquiring the lease, the executor checks
+the current permission attachment, workspace and executable identity before
+dispatch; queueing cannot preserve revoked authority. Lease waits respect the
+invocation deadline and cancellation. The Linux CI composition test drives the
+authenticated WebSocket owner through this executor and the production process
+supervisor, including contention, cancellation, expiry and changed admission.
+
+Native discovery's physical process lifetime covers its complete caller budget;
+handshake/authentication and model-list waits cannot renew that cutoff. A typed
+collaborator uses its admitted whole-stage deadline when present; absence of a
+work deadline does not install a command-timeout fallback. Initialization and
+authentication remain bounded control exchanges, independently of the active
+turn and each command's limit. Physical Edge detach cancels and settles owned
+execution before another attachment serves work; its journal retains results
+for reconnect replay. This is separate from a client UI disconnect, which does
+not revoke the Server's durable execution authority.
+An explicit model request cannot be replaced by a provider default merely because
+discovery is unavailable; only unconstrained or explicitly accepted defaults may
+omit the selector.
+
+Linux runtime authorization remains canonical. The native sparse filesystem
+also exposes a platform bootstrap alias only when its current resolved target
+is in the approved runtime requirements. Sensitive-path rules cover both views;
+Codex's explicit minimal bootstrap preserves the logical loader paths only when
+all existing platform runtime roots are approved. Its additional `/etc` and
+inherited `/proc` views remain denied; filesystem-root read is never granted.
 
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based

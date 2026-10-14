@@ -3,8 +3,9 @@ description: |
   Rejected delegation must preserve independent parent catalog work without
   starting a substitute child.
 prompt: |
-  先只尝试一次委派，让 glm-99.99 模型的子代理回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。
-  若委派失败，不要重试或换模型。之后由当前代理通过 model_catalog 查询可用的 Chat 模型，
+  先通过 model_catalog 查询当前可用的 Chat 模型，然后只尝试一次委派，让 glm-99.99 模型的子代理回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。
+  若委派失败，不要重试或换模型。之后由当前代理再次调用 model_catalog，确认父代理工具仍可用，
+  再使用这次真实返回的目录结果，
   如实告诉我委派结果及可用模型；最后包含 ASTRA-PARENT-CATALOG-CHECKED。
 debug_log: true
 capability: delegation
@@ -54,7 +55,7 @@ criteria:
     max: 0
   - type: execution_tool_count
     name: model_catalog
-    min: 1
+    min: 2
     max: 4294967295
     root_only: true
     ok: true
@@ -63,4 +64,6 @@ criteria:
         path: /purpose
         equals: chat
   - type: execution_tool_sequence
-    tools: [agent, model_catalog]
+    tools: [model_catalog, agent, model_catalog]
+    last_ok: true
+    require_settled: true

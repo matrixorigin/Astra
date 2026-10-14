@@ -2897,7 +2897,11 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
     vec![
         (
             "Enter",
-            "send a message or run the selected slash action".into(),
+            "send a message; guide the active run when admission permits; run the selected slash action".into(),
+        ),
+        (
+            "Ctrl+Q",
+            "queue conversational input for the next turn while working; send normally when idle".into(),
         ),
         ("Shift+Enter", "insert a newline in the composer".into()),
         (
@@ -3907,6 +3911,9 @@ mod routing_tests {
         );
 
         let bindings = keyboard_shortcut_pairs();
+        assert!(bindings.iter().any(|(key, hint)| {
+            *key == "Ctrl+Q" && hint.contains("next turn") && hint.contains("idle")
+        }));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+O"));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+G"));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+E"));

@@ -32,6 +32,7 @@ type LocalMessage = { id: string; role: "user" | "assistant"; text: string };
 type PendingTurn = { requestId: string; message: string };
 type TurnState = "idle" | "connecting" | "working" | "waiting" | "disconnected";
 type PromptQuestion = {
+  id?: string;
   question?: string;
   header?: string;
   options?: PromptOption[];
@@ -525,6 +526,7 @@ export function WorkTurnComposer({
         return;
       }
       return {
+        ...(question.id !== undefined ? { id: question.id } : {}),
         question: question.question ?? question.header ?? "",
         answers: values,
         multi_select: question.multi_select === true,
