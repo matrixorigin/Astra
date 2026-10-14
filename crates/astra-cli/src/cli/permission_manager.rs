@@ -263,6 +263,10 @@ fn content_aware_fingerprint(
 ) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
     use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
+    if let Some(fingerprint) = native_bootstrap_fingerprint(name, args) {
+        return fingerprint;
+    }
+
     match cloud_gated_tool_kind_with_args(name, Some(args)) {
         Some(CloudGatedToolKind::Execute) => {
             if let Some(cmd) = command_hint_from_args(args) {
@@ -279,6 +283,21 @@ fn content_aware_fingerprint(
         }
         None => ApprovalFingerprint::bare(name),
     }
+}
+
+// Native bootstrap approval is tied to a frozen declaration and exact path,
+// unlike ordinary remembered sandbox expansion. Never mint a bare override
+// that would silently authorize another provider installation.
+fn native_bootstrap_fingerprint(
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<astra_turn_core::approval_fingerprint::ApprovalFingerprint> {
+    astra_turn_core::provider_resolution::NativeCollaboratorProtocol::from_permission_scope(name)?;
+    let hash = args.get("provider_snapshot_hash")?.as_str()?;
+    let binding = args.get("provider_binding")?.as_str()?;
+    let path = args.get("directory")?.as_str()?;
+    let key = serde_json::to_string(&(name, hash, binding, path)).ok()?;
+    Some(astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(&key))
 }
 
 fn file_write_fingerprint_tool(tool_name: &str) -> &str {
@@ -343,7 +362,8 @@ fn approval_lookup_fingerprint_candidates(
 ) -> Vec<astra_turn_core::approval_fingerprint::ApprovalFingerprint> {
     use astra_turn_core::approval_fingerprint::ApprovalFingerprint;
 
-    let primary = approval_lookup_fingerprint(name, args);
+    let primary = native_bootstrap_fingerprint(name, args)
+        .unwrap_or_else(|| approval_lookup_fingerprint(name, args));
     let mut candidates = vec![primary.clone()];
     if matches!(
         cloud_gated_tool_kind_with_args(name, Some(args)),
@@ -1070,6 +1090,146 @@ fn normalize_permission_rule_text(rule: &str) -> String {
     trimmed.to_string()
 }
 
+/// Immutable projection of one bound permission writer. No telemetry or
+/// mutation API is shared with observers.
+pub(crate) struct PermissionPolicySnapshot {
+    session_id: String,
+    attachment_epoch: u64,
+    context: astra_runtime::orchestration::PermissionSyncContext,
+    // The canonical engine consumes the context's JSON fingerprints; the
+    // sandbox refinement consumes typed exact-match overrides. Both are
+    // immutable projections of the same writer, built only for observers.
+    overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
+    trusted_sandbox_roots: Vec<PathBuf>,
+}
+
+impl PermissionPolicySnapshot {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn attachment_epoch(&self) -> u64 {
+        self.attachment_epoch
+    }
+
+    pub(crate) fn runtime_context(&self) -> &astra_runtime::orchestration::PermissionSyncContext {
+        &self.context
+    }
+
+    /// Only sandbox expansion has the CLI-specific trusted-root/scoped
+    /// approval refinement. All rule matching stays in the existing engine.
+    pub(crate) fn check_sandbox_expansion(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> GateOutcome {
+        if !name.starts_with("sandbox_expand:") {
+            return GateOutcome::Deny("not a sandbox expansion request".into());
+        }
+        let envelope =
+            astra_turn_core::permission::engine::evaluate_permission(name, args, &self.context);
+        let rule_context =
+            astra_turn_core::permission::types::RuleMatchContext::from_tool_args(name, args);
+        sandbox_expansion_decision(
+            name,
+            args,
+            &envelope,
+            self.context
+                .inherited
+                .is_allowed_with_context(name, &rule_context),
+            &self.overrides,
+            &self.trusted_sandbox_roots,
+        )
+        .unwrap_or_else(|| match envelope.decision {
+            HardDecision::Allow => GateOutcome::Allow,
+            HardDecision::Deny { reason } => GateOutcome::Deny(reason),
+            HardDecision::NeedExternal { prompt } => GateOutcome::NeedApproval {
+                tool: prompt.tool,
+                header: prompt.header,
+                detail: prompt.detail,
+                reason: if matches!(envelope.source, DecisionSource::SandboxExpansion) {
+                    trim_sandbox_reason_for_ui(&prompt.reason)
+                } else {
+                    prompt.reason
+                },
+            },
+        })
+    }
+}
+
+/// Read-only watch endpoint. Never expose a watch borrow across an await or a
+/// sender that could turn a reader into a second policy owner.
+#[derive(Clone)]
+pub(crate) struct PermissionPolicySubscription {
+    receiver: tokio::sync::watch::Receiver<Option<std::sync::Arc<PermissionPolicySnapshot>>>,
+}
+
+impl PermissionPolicySubscription {
+    pub(crate) fn current(&self) -> Option<std::sync::Arc<PermissionPolicySnapshot>> {
+        if self.receiver.has_changed().is_err() {
+            return None;
+        }
+        self.receiver.borrow().clone()
+    }
+
+    pub(crate) async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
+        self.receiver.changed().await
+    }
+}
+
+fn path_under_trusted_roots(candidate: &Path, roots: &[PathBuf]) -> bool {
+    canonicalize_existing_or_parent(candidate)
+        .is_ok_and(|abs| roots.iter().any(|root| abs.starts_with(root)))
+}
+
+fn sandbox_expansion_decision(
+    name: &str,
+    args: &serde_json::Value,
+    envelope: &DecisionEnvelope,
+    allow_rule_matches: bool,
+    overrides: &astra_turn_core::approval_fingerprint::FingerprintedOverrides,
+    trusted_roots: &[PathBuf],
+) -> Option<GateOutcome> {
+    if let Some(reason) = sandbox_expand_sensitive_target_denial(name, args) {
+        return Some(GateOutcome::Deny(reason));
+    }
+    if !matches!(envelope.source, DecisionSource::SandboxExpansion)
+        || !matches!(envelope.decision, HardDecision::NeedExternal { .. })
+    {
+        return None;
+    }
+    if let Some(allowed) = approval_lookup_fingerprint_candidates(name, args)
+        .iter()
+        .find_map(|fp| overrides.check(fp))
+    {
+        return Some(if allowed {
+            GateOutcome::Allow
+        } else {
+            GateOutcome::Deny("Sandbox expansion denied for session".into())
+        });
+    }
+    if sandbox_expand_target_path(args)
+        .is_some_and(|path| path_under_trusted_roots(&path, trusted_roots))
+    {
+        return Some(GateOutcome::Allow);
+    }
+    if allow_rule_matches {
+        return Some(GateOutcome::Allow);
+    }
+    None
+}
+
+fn trim_sandbox_reason_for_ui(raw: &str) -> String {
+    const INSTRUCTION: &str =
+        "Ask the user for permission before accessing files outside the project.";
+    raw.trim()
+        .trim_end_matches(INSTRUCTION)
+        .trim()
+        .trim_end_matches('.')
+        .to_string()
+        + "."
+}
+
 pub(crate) struct PermissionManager {
     mode: PermissionMode,
     /// Atomic mirror of `mode` for read-only consumers that hold no
@@ -1082,6 +1242,8 @@ pub(crate) struct PermissionManager {
     mode_mirror: std::sync::Arc<std::sync::atomic::AtomicU8>,
     applied_mode_request_id: SharedModeSelection,
     permission_control_signal: tokio::sync::watch::Sender<Option<ScopedModeSelection>>,
+    policy_publication:
+        tokio::sync::watch::Sender<Option<std::sync::Arc<PermissionPolicySnapshot>>>,
     session_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker,
@@ -1123,6 +1285,8 @@ pub(crate) struct PermissionManager {
     workspace_trust: Option<WorkspaceTrustEvaluation>,
     /// Active session id for durable permission audit events.
     active_session_id: Option<String>,
+    // Copied from SessionState; never advanced by the permission writer.
+    permission_attachment_epoch: Option<u64>,
 }
 
 pub(crate) struct WorkspaceTrustStartupPrompt {
@@ -1229,6 +1393,7 @@ impl PermissionManager {
         if let Some(session_id) = self.active_session_id.as_deref() {
             persist_permission_mode_to_workspace(session_id, mode);
         }
+        self.publish_permission_policy();
     }
 
     /// Hand out a cheap clone of the mode mirror so an external
@@ -1271,11 +1436,23 @@ impl PermissionManager {
     }
 
     pub(crate) fn set_active_session_id(&mut self, session_id: &str) {
+        if self.active_session_id.as_deref() != Some(session_id) {
+            self.permission_attachment_epoch = None;
+        }
         self.active_session_id = Some(session_id.to_string());
+        self.publish_permission_policy();
+    }
+
+    pub(crate) fn bind_permission_attachment(&mut self, session_id: &str, attachment_epoch: u64) {
+        self.active_session_id = Some(session_id.to_string());
+        self.permission_attachment_epoch = Some(attachment_epoch);
+        self.publish_permission_policy();
     }
 
     pub(crate) fn clear_active_session_id(&mut self) {
         self.active_session_id = None;
+        self.permission_attachment_epoch = None;
+        self.publish_permission_policy();
     }
 
     fn active_session_id(&self) -> Option<&str> {
@@ -1287,6 +1464,7 @@ impl PermissionManager {
     pub(crate) fn clear_turn_overrides(&mut self) {
         self.turn_overrides =
             astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
+        self.publish_permission_policy();
     }
 
     /// Start a new session binding: session approvals from the previous
@@ -1294,22 +1472,7 @@ impl PermissionManager {
     pub(crate) fn clear_session_overrides(&mut self) {
         self.session_overrides =
             astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
-    }
-
-    fn check_overrides(
-        &self,
-        fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
-    ) -> Option<bool> {
-        self.turn_overrides
-            .check(fp)
-            .or_else(|| self.session_overrides.check(fp))
-    }
-
-    fn check_overrides_any(
-        &self,
-        fps: &[astra_turn_core::approval_fingerprint::ApprovalFingerprint],
-    ) -> Option<bool> {
-        fps.iter().find_map(|fp| self.check_overrides(fp))
+        self.publish_permission_policy();
     }
 
     fn matching_override(
@@ -1375,6 +1538,7 @@ impl PermissionManager {
             )),
             applied_mode_request_id: Default::default(),
             permission_control_signal: tokio::sync::watch::channel(None).0,
+            policy_publication: tokio::sync::watch::channel(None).0,
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1394,6 +1558,7 @@ impl PermissionManager {
             load_policy: PermissionLoadPolicy::TrustAll,
             workspace_trust: None,
             active_session_id: None,
+            permission_attachment_epoch: None,
         }
     }
 
@@ -1510,6 +1675,7 @@ impl PermissionManager {
             )),
             applied_mode_request_id: Default::default(),
             permission_control_signal: tokio::sync::watch::channel(None).0,
+            policy_publication: tokio::sync::watch::channel(None).0,
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1529,6 +1695,7 @@ impl PermissionManager {
             load_policy: policy,
             workspace_trust,
             active_session_id: None,
+            permission_attachment_epoch: None,
         }
     }
 
@@ -1801,6 +1968,39 @@ impl PermissionManager {
         self.evaluation_context()
     }
 
+    pub(crate) fn subscribe_permission_policy(&self) -> PermissionPolicySubscription {
+        let subscription = PermissionPolicySubscription {
+            receiver: self.policy_publication.subscribe(),
+        };
+        // Register first: mutations with no observers intentionally skip
+        // cloning. A late subscriber must receive current, not cached policy.
+        self.publish_permission_policy();
+        subscription
+    }
+
+    fn publish_permission_policy(&self) {
+        if self.policy_publication.receiver_count() == 0 {
+            return;
+        }
+        let snapshot = self
+            .active_session_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .zip(self.permission_attachment_epoch)
+            .map(|(session_id, attachment_epoch)| {
+                std::sync::Arc::new(PermissionPolicySnapshot {
+                    session_id: session_id.clone(),
+                    attachment_epoch,
+                    context: self.runtime_permission_context(),
+                    overrides: self.combined_overrides_for_evaluation(),
+                    trusted_sandbox_roots: self.trusted_sandbox_roots.clone(),
+                })
+            });
+        // Synchronous publication cannot lose revocation through a spawned
+        // task or failed try_write; readers cannot mutate the projection.
+        self.policy_publication.send_replace(snapshot);
+    }
+
     pub(crate) fn runtime_permission_handle(
         &self,
     ) -> astra_runtime::orchestration::PermissionSyncHandle {
@@ -1887,12 +2087,14 @@ impl PermissionManager {
         self.settings = settings;
         self.cached_allow = self.settings.parsed_allow_rules();
         self.cached_deny = self.settings.parsed_deny_rules();
+        self.publish_permission_policy();
     }
 
     fn replace_user_settings(&mut self, settings: PermissionSettings) {
         self.user_settings = settings;
         self.cached_user_allow = self.user_settings.parsed_allow_rules();
         self.cached_user_deny = self.user_settings.parsed_deny_rules();
+        self.publish_permission_policy();
     }
 
     fn remember_allow_rule_in_memory(
@@ -1919,6 +2121,7 @@ impl PermissionManager {
                 }
             }
         }
+        self.publish_permission_policy();
     }
 
     fn record_rule_persisted(
@@ -1951,6 +2154,7 @@ impl PermissionManager {
         let Some(root) = self.project_root.clone() else {
             self.load_policy = policy;
             self.workspace_trust = workspace_trust;
+            self.publish_permission_policy();
             return;
         };
 
@@ -1963,6 +2167,7 @@ impl PermissionManager {
         self.replace_project_settings(settings);
         self.load_policy = policy;
         self.workspace_trust = workspace_trust;
+        self.publish_permission_policy();
     }
 
     fn set_workspace_trust_state(
@@ -2068,6 +2273,7 @@ impl PermissionManager {
         let Some(root) = self.project_root.clone() else {
             self.settings.allow.push(rule_text);
             self.cached_allow = self.settings.parsed_allow_rules();
+            self.publish_permission_policy();
             return;
         };
 
@@ -2295,17 +2501,6 @@ impl PermissionManager {
         args: &serde_json::Value,
         read_only_execution: bool,
     ) -> GateOutcome {
-        fn trim_sandbox_reason_for_ui(raw: &str) -> String {
-            const INSTRUCTION: &str =
-                "Ask the user for permission before accessing files outside the project.";
-            raw.trim()
-                .trim_end_matches(INSTRUCTION)
-                .trim()
-                .trim_end_matches('.')
-                .to_string()
-                + "."
-        }
-
         let envelope = if read_only_execution {
             self.evaluate_permission_envelope_with_read_only_ceiling(name, args)
         } else {
@@ -2320,29 +2515,16 @@ impl PermissionManager {
             None,
         );
 
-        if let Some(reason) = sandbox_expand_sensitive_target_denial(name, args) {
-            return GateOutcome::Deny(reason);
-        }
-
-        if matches!(envelope.source, DecisionSource::SandboxExpansion)
-            && matches!(envelope.decision, HardDecision::NeedExternal { .. })
-        {
-            if let Some(allowed) =
-                self.check_overrides_any(&approval_lookup_fingerprint_candidates(name, args))
-            {
-                return if allowed {
-                    GateOutcome::Allow
-                } else {
-                    GateOutcome::Deny("Sandbox expansion denied for session".into())
-                };
-            }
-            if let Some(target) = sandbox_expand_target_path(args)
-                && self.path_under_trusted_root(&target)
-            {
-                return GateOutcome::Allow;
-            }
-            if self.check_allow_rules(name, args) {
-                return GateOutcome::Allow;
+        if name.starts_with("sandbox_expand:") {
+            if let Some(decision) = sandbox_expansion_decision(
+                name,
+                args,
+                &envelope,
+                self.check_allow_rules(name, args),
+                &self.combined_overrides_for_evaluation(),
+                &self.trusted_sandbox_roots,
+            ) {
+                return decision;
             }
         }
 
@@ -2427,6 +2609,7 @@ impl PermissionManager {
             None => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(name),
         };
         self.session_overrides.insert(fp.clone(), allowed);
+        self.publish_permission_policy();
         if !allowed {
             self.denial_tracker.record(&fp, false);
             self.record_rejection(name, "session override: deny");
@@ -2442,6 +2625,7 @@ impl PermissionManager {
     ) {
         let fp = fingerprint_for_match_target(name, args, target);
         self.session_overrides.insert(fp.clone(), allowed);
+        self.publish_permission_policy();
         if !allowed {
             self.denial_tracker.record(&fp, false);
             self.record_rejection(name, "session override: deny");
@@ -2460,6 +2644,7 @@ impl PermissionManager {
             None => astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(name),
         };
         self.turn_overrides.insert(fp.clone(), allowed);
+        self.publish_permission_policy();
         if !allowed {
             self.denial_tracker.record(&fp, false);
             self.record_rejection(name, "turn override: deny");
@@ -2475,6 +2660,7 @@ impl PermissionManager {
     ) {
         let fp = fingerprint_for_match_target(name, args, target);
         self.turn_overrides.insert(fp.clone(), allowed);
+        self.publish_permission_policy();
         if !allowed {
             self.denial_tracker.record(&fp, false);
             self.record_rejection(name, "turn override: deny");
@@ -2499,6 +2685,7 @@ impl PermissionManager {
         };
         if !self.trusted_sandbox_roots.iter().any(|r| r == &canonical) {
             self.trusted_sandbox_roots.push(canonical);
+            self.publish_permission_policy();
         }
     }
 
@@ -2509,16 +2696,6 @@ impl PermissionManager {
         if let Some(p) = parse_sandbox_target_path(reason) {
             self.trust_sandbox_root(p);
         }
-    }
-
-    /// Does the given path sit under any trusted sandbox root?
-    fn path_under_trusted_root(&self, candidate: &Path) -> bool {
-        let Ok(abs) = canonicalize_existing_or_parent(candidate) else {
-            return false;
-        };
-        self.trusted_sandbox_roots
-            .iter()
-            .any(|root| abs.starts_with(root))
     }
 
     /// Summary of current permission state for `/allow rules`.
@@ -2567,6 +2744,7 @@ impl PermissionManager {
     /// Existing live overrides take priority (session-priority merge).
     pub(crate) fn merge_restored_overrides(&mut self, json: &serde_json::Value) {
         self.session_overrides.merge_from_json(json);
+        self.publish_permission_policy();
     }
 
     /// Export session overrides as a `FingerprintedOverrides` clone for checkpoint persistence.
@@ -2640,6 +2818,265 @@ mod tests {
 
     fn bare_fp(tool: &str) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
         astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool)
+    }
+
+    #[tokio::test]
+    async fn permission_policy_publication_tracks_bind_mode_revocation_unbind_and_drop() {
+        let mut pm = PermissionManager::new(false);
+        let mut observer = pm.subscribe_permission_policy();
+        assert!(observer.current().is_none());
+        pm.bind_permission_attachment("policy-publication-test", 1);
+        observer.changed().await.unwrap();
+        assert_eq!(
+            observer.current().unwrap().session_id(),
+            "policy-publication-test"
+        );
+        pm.set_mode(PermissionMode::Bypass);
+        observer.changed().await.unwrap();
+        let old = observer.current().unwrap();
+        assert!(matches!(
+            old.check_sandbox_expansion(
+                "sandbox_expand:read_file",
+                &serde_json::json!({"directory":"/outside-test"})
+            ),
+            GateOutcome::Allow
+        ));
+        pm.set_mode(PermissionMode::Deny);
+        observer.changed().await.unwrap();
+        assert!(matches!(
+            observer.current().unwrap().check_sandbox_expansion(
+                "sandbox_expand:read_file",
+                &serde_json::json!({"directory":"/outside-test"})
+            ),
+            GateOutcome::Deny(_)
+        ));
+        // Immutable old projections are not a current authorization source.
+        assert_eq!(old.runtime_context().inherited.mode, PermissionMode::Bypass);
+        pm.clear_active_session_id();
+        observer.changed().await.unwrap();
+        assert!(observer.current().is_none());
+        pm.bind_permission_attachment("policy-publication-next", 2);
+        assert_eq!(
+            observer.current().unwrap().session_id(),
+            "policy-publication-next"
+        );
+        drop(pm);
+        assert!(
+            observer.current().is_none(),
+            "closed writer must not retain old Allow"
+        );
+    }
+
+    #[test]
+    fn permission_policy_publication_preserves_scoped_overrides_and_turn_clears() {
+        let mut pm = PermissionManager::new(false);
+        pm.bind_permission_attachment("policy-overrides-test", 1);
+        let observer = pm.subscribe_permission_policy();
+        let args = serde_json::json!({"command":"cargo test pkg-a"});
+        let other = serde_json::json!({"command":"cargo test pkg-b"});
+        pm.record_approval_with_match_target("bash", &args, &AllowMatchTarget::Exact, true);
+        let current = observer.current().unwrap();
+        assert!(matches!(
+            astra_turn_core::permission::engine::evaluate_permission(
+                "bash",
+                &args,
+                current.runtime_context()
+            )
+            .decision,
+            astra_turn_core::permission::engine::HardDecision::Allow
+        ));
+        assert!(matches!(
+            astra_turn_core::permission::engine::evaluate_permission(
+                "bash",
+                &other,
+                current.runtime_context()
+            )
+            .decision,
+            astra_turn_core::permission::engine::HardDecision::NeedExternal { .. }
+        ));
+        pm.clear_session_overrides();
+        assert!(matches!(
+            astra_turn_core::permission::engine::evaluate_permission(
+                "bash",
+                &args,
+                observer.current().unwrap().runtime_context()
+            )
+            .decision,
+            astra_turn_core::permission::engine::HardDecision::NeedExternal { .. }
+        ));
+        pm.record_turn_approval_with_match_target("bash", &args, &AllowMatchTarget::Exact, true);
+        assert!(matches!(
+            astra_turn_core::permission::engine::evaluate_permission(
+                "bash",
+                &args,
+                observer.current().unwrap().runtime_context()
+            )
+            .decision,
+            astra_turn_core::permission::engine::HardDecision::Allow
+        ));
+        pm.clear_turn_overrides();
+        assert!(matches!(
+            astra_turn_core::permission::engine::evaluate_permission(
+                "bash",
+                &args,
+                observer.current().unwrap().runtime_context()
+            )
+            .decision,
+            astra_turn_core::permission::engine::HardDecision::NeedExternal { .. }
+        ));
+        pm.record_approval("sandbox_expand:read_file", None, true);
+        pm.record_turn_approval("sandbox_expand:read_file", None, false);
+        assert!(matches!(
+            observer.current().unwrap().check_sandbox_expansion(
+                "sandbox_expand:read_file",
+                &serde_json::json!({"directory":"/outside-test"})
+            ),
+            GateOutcome::Deny(_)
+        ));
+        pm.clear_turn_overrides();
+        assert!(matches!(
+            observer.current().unwrap().check_sandbox_expansion(
+                "sandbox_expand:read_file",
+                &serde_json::json!({"directory":"/outside-test"})
+            ),
+            GateOutcome::Allow
+        ));
+        let restored = pm.export_session_overrides().unwrap().to_json().unwrap();
+        pm.clear_session_overrides();
+        pm.merge_restored_overrides(&restored);
+        assert!(matches!(
+            observer.current().unwrap().check_sandbox_expansion(
+                "sandbox_expand:read_file",
+                &serde_json::json!({"directory":"/outside-test"})
+            ),
+            GateOutcome::Allow
+        ));
+    }
+
+    #[test]
+    fn permission_policy_publication_uses_shared_sandbox_gate_and_deny_precedence() {
+        let mut pm = PermissionManager::new(false);
+        pm.bind_permission_attachment("policy-sandbox-test", 1);
+        let observer = pm.subscribe_permission_policy();
+        let root = tempfile::tempdir().unwrap();
+        let allowed = serde_json::json!({"directory": root.path()});
+        let name = "sandbox_expand:read_file";
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion(name, &allowed),
+            GateOutcome::NeedApproval { .. }
+        ));
+        pm.trust_sandbox_root(root.path().to_path_buf());
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion(name, &allowed),
+            GateOutcome::Allow
+        ));
+        let sensitive = serde_json::json!({"directory":root.path().join(".env.local")});
+        for mode in [
+            PermissionMode::Prompt,
+            PermissionMode::Bypass,
+            PermissionMode::Auto,
+        ] {
+            pm.set_mode(mode);
+            assert!(matches!(
+                pm.check_nonblocking(name, &sensitive),
+                GateOutcome::Deny(_)
+            ));
+            assert!(matches!(
+                observer
+                    .current()
+                    .unwrap()
+                    .check_sandbox_expansion(name, &sensitive),
+                GateOutcome::Deny(_)
+            ));
+        }
+        let mut denied = PermissionSettings::default();
+        denied.deny.push("sandbox_expand:read_file()".into());
+        pm.replace_project_settings(denied);
+        assert!(matches!(
+            pm.check_nonblocking(name, &allowed),
+            GateOutcome::Deny(_)
+        ));
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion(name, &allowed),
+            GateOutcome::Deny(_)
+        ));
+        pm.replace_project_settings(PermissionSettings::default());
+        let mut user_denied = PermissionSettings::default();
+        user_denied.deny.push("sandbox_expand:read_file()".into());
+        pm.replace_user_settings(user_denied);
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion(name, &allowed),
+            GateOutcome::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn permission_policy_publication_includes_memory_rules_and_late_subscribers() {
+        let mut pm = PermissionManager::new(false);
+        pm.bind_permission_attachment("policy-rules-test", 1);
+        pm.add_allow_rule("sandbox_expand:read_file()");
+        assert!(
+            pm.policy_publication.borrow().is_none(),
+            "unused publication must not build a policy snapshot"
+        );
+        let observer = pm.subscribe_permission_policy();
+        let args = serde_json::json!({"directory":"/outside-test"});
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion("sandbox_expand:read_file", &args),
+            GateOutcome::Allow
+        ));
+        pm.replace_project_settings(PermissionSettings::default());
+        pm.remember_allow_rule_in_memory(
+            astra_turn_core::permission::audit::PersistTarget::User,
+            "sandbox_expand:read_file()",
+        );
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion("sandbox_expand:read_file", &args),
+            GateOutcome::Allow
+        ));
+        pm.replace_user_settings(PermissionSettings::default());
+        assert!(matches!(
+            observer
+                .current()
+                .unwrap()
+                .check_sandbox_expansion("sandbox_expand:read_file", &args),
+            GateOutcome::NeedApproval { .. }
+        ));
+        pm.clear_active_session_id();
+        pm.set_mode(PermissionMode::Bypass);
+        assert!(
+            observer.current().is_none(),
+            "unbound updates cannot authorize"
+        );
+        drop(observer);
+        pm.bind_permission_attachment("policy-late-rebind", 2);
+        pm.set_mode(PermissionMode::Deny);
+        assert!(pm.policy_publication.borrow().is_none());
+        let observer = pm.subscribe_permission_policy();
+        let snapshot = observer.current().unwrap();
+        assert_eq!(snapshot.session_id(), "policy-late-rebind");
+        assert!(matches!(
+            snapshot.check_sandbox_expansion("sandbox_expand:read_file", &args),
+            GateOutcome::Deny(_)
+        ));
     }
 
     // ── classify ──────────────────────────────────────────────────────────────

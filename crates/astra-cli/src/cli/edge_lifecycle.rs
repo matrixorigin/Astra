@@ -1,6 +1,8 @@
 //! Cloud edge registry + heartbeat (Phase 3). See `docs/design/multi-agent-cloud-runtime.md` §5.5.
 
 use std::cell::Cell;
+pub(crate) mod native_delivery;
+pub(crate) mod provider_interaction;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -777,7 +779,14 @@ mod tests {
         attach_runtime_environment_capabilities(&mut body);
 
         let capabilities = body.capabilities.expect("runtime capabilities");
-        assert_eq!(capabilities["schema_version"], 1);
+        let decoded: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(capabilities.clone())
+                .expect("current consumer accepts advertisement");
+        assert_eq!(
+            decoded.schema_version,
+            astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+        );
+        assert!(decoded.provider_discovery.is_empty());
         assert_eq!(
             capabilities["binding"]["workspace"]["kind"],
             "edge_workspace"

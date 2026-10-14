@@ -333,6 +333,21 @@ fn has_pending_run_dependency<H: AgenticLoopHost>(host: &H, state: &AgenticLoopS
         || state.messaging.reply_obligations.has_pending(run_id)
 }
 
+/// A settled failure in the same provider batch must be visible before an
+/// optional observation wait. The wait receipt is still authoritative for
+/// live child/reply ownership; this predicate only prevents a failed sibling
+/// from hiding the next repair decision behind an observation timeout.
+fn settled_round_has_failed_call(settled_tool_calls: &[ToolCallRecord]) -> bool {
+    settled_tool_calls.iter().any(|record| {
+        matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        ) || (record.effective_disposition()
+            == astra_services::session_journal::ToolCallDisposition::Executed
+            && !record.ok)
+    })
+}
+
 /// Select the terminal repair boundary for a provider batch that could not
 /// execute any requested call.
 ///
@@ -2388,6 +2403,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         .await;
         let mut journal_tool_calls = pre_execution_tool_calls;
         journal_tool_calls.extend(round_tool_calls.iter().cloned());
+        let settled_round_has_failure = settled_round_has_failed_call(&journal_tool_calls);
         state
             .tool_ledger_receipt
             .observe_round(&provider_tool_attempts, &journal_tool_calls);
@@ -2980,7 +2996,9 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             })
             .min_by_key(|receipt| receipt.timeout_ms);
         let reply_pending = state.messaging.reply_obligations.has_pending(run_id);
-        if reply_pending || admitted_wait.is_some() {
+        let skip_optional_wait =
+            admitted_wait.is_some() && !reply_pending && settled_round_has_failure;
+        if reply_pending || (admitted_wait.is_some() && !skip_optional_wait) {
             // Finish the host's PostToolBatch/PostTurn before the shared loop
             // waits. A correlated question cannot be bypassed by a sibling's
             // observation timeout.
@@ -4580,6 +4598,69 @@ mod tests {
             .reply_obligations
             .reject("parent-run", "question-1");
         assert!(!has_pending_run_dependency(&host, &state));
+    }
+
+    #[test]
+    fn failed_same_batch_launch_does_not_make_optional_wait_park() {
+        let records = vec![
+            tool_record_with_args(
+                "agent",
+                json!({
+                    "action": "spawn",
+                    "description": "unavailable child",
+                    "prompt": "must fail"
+                }),
+                false,
+            ),
+            tool_record_with_args(
+                "agent",
+                json!({"action": "wait", "timeout_ms": 30_000}),
+                true,
+            ),
+        ];
+        assert!(
+            settled_round_has_failed_call(&records),
+            "a failed sibling must be observed even when another child remains live"
+        );
+    }
+
+    #[test]
+    fn wait_without_a_launch_keeps_future_input_observation() {
+        let records = vec![tool_record_with_args(
+            "agent",
+            json!({"action": "wait", "timeout_ms": 30_000}),
+            true,
+        )];
+        assert!(!settled_round_has_failed_call(&records));
+    }
+
+    #[test]
+    fn preflight_rejection_and_unrelated_failure_bypass_optional_wait() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let preflight_rejection = ToolCallRecord {
+            name: "agent".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Rejected),
+            ..Default::default()
+        };
+        let unrelated_failure = ToolCallRecord {
+            name: "read_file".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        };
+        let wait = tool_record_with_args(
+            "agent",
+            json!({"action": "wait", "timeout_ms": 30_000}),
+            true,
+        );
+
+        assert!(settled_round_has_failed_call(&[
+            preflight_rejection,
+            wait.clone()
+        ]));
+        assert!(settled_round_has_failed_call(&[unrelated_failure, wait]));
     }
 
     #[test]

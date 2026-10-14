@@ -82,6 +82,15 @@ until successful durable settlement. Authentication and session retries resend
 uncommitted facts; notifications arriving after request admission remain queued.
 Durable user guidance keeps its Server acceptance and disposition protocol.
 
+The TUI composer exposes Enter for ordinary submission and Ctrl+Q for explicit
+next-turn conversational input. The latter stays in the existing client-owned
+FIFO and never becomes current-run guidance. Enqueueing alone does not close
+guidance admission or arm the startup ordering latch. The ordinary lifecycle
+handoff, modal/draft gates, session-change restoration, and guidance custody
+rules remain authoritative. Local controls retain their dispatcher semantics.
+This queue has process-local custody, not durable Server acceptance or recovery
+across client restart; it does not add a runtime delivery class or scheduler.
+
 The startup card reserves terminal width before styling and clips text by Unicode
 display cells. Native MOI login uses a short `MOI` display label, not its internal
 credential profile identifier. Narrow or short terminals use a static presentation;

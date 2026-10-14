@@ -23,6 +23,8 @@
 
 #![allow(dead_code)]
 
+pub mod collaborator_fixture;
+
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;
 

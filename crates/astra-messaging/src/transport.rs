@@ -10,6 +10,34 @@ use async_trait::async_trait;
 
 use super::types::{AgentAddress, AgentMessage, MailboxError};
 
+/// Message forms supported by the registered receiver, independent of node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MailboxCapabilities {
+    pub accepts_structured_requests: bool,
+}
+
+impl Default for MailboxCapabilities {
+    fn default() -> Self {
+        Self {
+            accepts_structured_requests: true,
+        }
+    }
+}
+
+impl MailboxCapabilities {
+    pub const fn provider_stage_text_only() -> Self {
+        Self {
+            accepts_structured_requests: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedMailbox {
+    pub address: AgentAddress,
+    pub capabilities: MailboxCapabilities,
+}
+
 /// Authority to close one registration, never whichever registration happens
 /// to occupy the same logical address later. Keep the returned value with the
 /// mailbox/cleanup owner; do not resolve it again when cleaning up.
@@ -17,14 +45,24 @@ use super::types::{AgentAddress, AgentMessage, MailboxError};
 pub struct MailboxSubscription {
     address: AgentAddress,
     id: String,
+    capabilities: MailboxCapabilities,
 }
 
 impl MailboxSubscription {
     pub fn new(address: AgentAddress) -> Self {
+        Self::with_capabilities(address, MailboxCapabilities::default())
+    }
+
+    pub fn with_capabilities(address: AgentAddress, capabilities: MailboxCapabilities) -> Self {
         Self {
             address,
             id: uuid::Uuid::new_v4().simple().to_string(),
+            capabilities,
         }
+    }
+
+    pub fn capabilities(&self) -> MailboxCapabilities {
+        self.capabilities
     }
 
     pub fn address(&self) -> &AgentAddress {
@@ -119,6 +157,16 @@ pub trait MessageTransport: Send + Sync {
         &self,
         addr: AgentAddress,
         delegation_id: Option<String>,
+    ) -> Result<MailboxSubscription, MailboxError> {
+        self.register_with_capabilities(addr, delegation_id, MailboxCapabilities::default())
+            .await
+    }
+
+    async fn register_with_capabilities(
+        &self,
+        addr: AgentAddress,
+        delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
     ) -> Result<MailboxSubscription, MailboxError>;
 
     /// Close only this subscription. A stale handle is an idempotent no-op.
@@ -157,7 +205,17 @@ pub trait MessageTransport: Send + Sync {
         &self,
         delegation_id: &str,
         agent_id: &str,
-    ) -> Result<AgentAddress, MailboxError>;
+    ) -> Result<AgentAddress, MailboxError> {
+        self.resolve_mailbox(delegation_id, agent_id)
+            .await
+            .map(|mailbox| mailbox.address)
+    }
+
+    async fn resolve_mailbox(
+        &self,
+        delegation_id: &str,
+        agent_id: &str,
+    ) -> Result<ResolvedMailbox, MailboxError>;
 
     /// List live members of one delegation namespace.
     async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError>;

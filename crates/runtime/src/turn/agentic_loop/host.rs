@@ -2077,7 +2077,10 @@ pub struct UserIntentState {
     /// Accepted events waiting for durable acknowledgement. They become model
     /// visible only after that acknowledgement commits. The durable cursor
     /// remains behind these events, allowing recovery from the provider outbox.
-    pending_apply_events: Vec<crate::turn::run_control::QueuedUserIntent>,
+    pending_apply_events: Vec<(
+        crate::turn::run_control::QueuedUserIntent,
+        astra_turn_types::UserIntentStatus,
+    )>,
 }
 
 pub(crate) struct ObservedUserIntents {
@@ -2144,30 +2147,64 @@ impl UserIntentState {
         }
     }
 
-    pub(crate) fn stage_pending_apply_events(
+    pub(crate) fn stage_pending_disposition_events(
         &mut self,
         events: &[crate::turn::run_control::QueuedUserIntent],
-    ) -> bool {
+        disposition: astra_turn_types::UserIntentStatus,
+    ) -> Result<bool, &'static str> {
+        if !matches!(
+            disposition,
+            astra_turn_types::UserIntentStatus::Applied
+                | astra_turn_types::UserIntentStatus::Returned
+        ) {
+            return Err("invalid pending user-intent disposition");
+        }
+        if events.iter().any(|event| {
+            self.pending_apply_events.iter().any(|(pending, status)| {
+                pending.event_index == event.event_index && *status != disposition
+            })
+        }) {
+            return Err("pending user-intent disposition cannot be replaced");
+        }
         let pending_before = self.pending_apply_events.len();
         for event in events {
             if !self
                 .pending_apply_events
                 .iter()
-                .any(|pending| pending.event_index == event.event_index)
+                .any(|(pending, _)| pending.event_index == event.event_index)
             {
-                self.pending_apply_events.push(event.clone());
+                self.pending_apply_events.push((event.clone(), disposition));
             }
         }
         self.pending_apply_events
-            .sort_by_key(|event| event.event_index);
-        self.pending_apply_events.len() > pending_before
+            .sort_by_key(|(event, _)| event.event_index);
+        Ok(self.pending_apply_events.len() > pending_before)
     }
 
     pub(crate) fn pending_apply_event_indices(&self) -> Vec<usize> {
         self.pending_apply_events
             .iter()
-            .map(|event| event.event_index)
+            .map(|(event, _)| event.event_index)
             .collect()
+    }
+
+    pub(crate) fn pending_disposition(
+        &self,
+        indices: &[usize],
+    ) -> Result<astra_turn_types::UserIntentStatus, &'static str> {
+        let mut disposition = None;
+        for index in indices {
+            let position = self
+                .pending_apply_events
+                .binary_search_by_key(index, |(event, _)| event.event_index)
+                .map_err(|_| "user-intent disposition has no pending source custody")?;
+            let status = self.pending_apply_events[position].1;
+            if disposition.is_some_and(|previous| previous != status) {
+                return Err("mixed user-intent dispositions require separate settlement");
+            }
+            disposition = Some(status);
+        }
+        Ok(disposition.unwrap_or(astra_turn_types::UserIntentStatus::Applied))
     }
 
     pub(crate) fn should_retry_apply_ack(&self, now: tokio::time::Instant) -> bool {
@@ -2175,6 +2212,13 @@ impl UserIntentState {
             && self
                 .next_apply_ack_at
                 .is_none_or(|deadline| now >= deadline)
+    }
+
+    pub(crate) fn pending_apply_ack_deadline(&self) -> Option<tokio::time::Instant> {
+        (!self.pending_apply_events.is_empty()).then(|| {
+            self.next_apply_ack_at
+                .unwrap_or_else(tokio::time::Instant::now)
+        })
     }
 
     pub(crate) fn acknowledge_apply_events(
@@ -2186,7 +2230,7 @@ impl UserIntentState {
             .copied()
             .collect::<std::collections::HashSet<_>>();
         let mut acknowledged = Vec::new();
-        self.pending_apply_events.retain(|event| {
+        self.pending_apply_events.retain(|(event, _)| {
             if applied.contains(&event.event_index) {
                 acknowledged.push(event.clone());
                 false
@@ -5636,6 +5680,51 @@ pub(crate) mod tests {
 
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
+
+    #[test]
+    fn pending_intent_disposition_requires_exact_custody_and_cannot_be_replaced() {
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+        let event = crate::turn::run_control::QueuedUserIntent {
+            intent_id: "refused-input".into(),
+            delivery: UserIntentDelivery::GuideCurrentRun,
+            status: UserIntentStatus::AcceptedRemote,
+            event_index: 4,
+            input: json!({"content":"guidance"}),
+        };
+        let mut state = UserIntentState::default();
+        assert!(state.pending_disposition(&[4]).is_err());
+        assert!(
+            state
+                .stage_pending_disposition_events(
+                    std::slice::from_ref(&event),
+                    UserIntentStatus::Returned
+                )
+                .unwrap()
+        );
+        assert!(
+            !state
+                .stage_pending_disposition_events(
+                    std::slice::from_ref(&event),
+                    UserIntentStatus::Returned
+                )
+                .unwrap()
+        );
+        assert!(
+            state
+                .stage_pending_disposition_events(
+                    std::slice::from_ref(&event),
+                    UserIntentStatus::Applied
+                )
+                .is_err()
+        );
+        assert!(state.pending_disposition(&[4, 5]).is_err());
+        assert_eq!(
+            state.pending_disposition(&[4]).unwrap(),
+            UserIntentStatus::Returned
+        );
+        assert_eq!(state.return_pending_apply_events(&[4]), vec![event]);
+        assert!(state.pending_apply_event_indices().is_empty());
+    }
 
     #[test]
     fn request_constraints_preserve_original_and_current_selection_ceilings() {

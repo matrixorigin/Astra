@@ -1,0 +1,38 @@
+name: ordinary_review_owns_current_execution
+description: Ordinary review loads the project skill without introducing a reviewer or verification obligation.
+prompt: Review the latest two commits. Report actionable correctness findings first.
+prompt_variants:
+  - id: zh
+    prompt: 帮我 review 最新的两个 commits，先说确实存在的正确性问题。
+setup_cmd: 'python3 "$ASTRA_REVIEW_JOURNEY_SOURCE/setup.py"'
+timeout_seconds: 180
+capability: tool_use
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: skill
+    min: 1
+    max: 1
+    ok: true
+    document: arguments
+    path: /skill_name
+    equals: review-changes
+  - type: journal_tool_call_count
+    name: agent
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+    document: arguments
+    path: /mode
+    equals: verify
+  - type: hard_judger
+    question: Does the review identify that increment now subtracts one and is_even now returns true for odd values, grounding both findings in the two commits rather than claiming the helpers are correct?
+    threshold: 0.8

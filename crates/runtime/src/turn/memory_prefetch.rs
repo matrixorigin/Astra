@@ -216,14 +216,27 @@ pub async fn prefetch_session_start_memories_with_client(
         .into_iter()
         .filter(|m| m.memory_type == "episodic")
         .collect();
-    // Sort each typed bucket by server-side retrieval score and cap.
+    // Rank each bucket, then cap only entries that pass prompt admission.
+    // Invalid or inactive rows must not displace lower-ranked valid evidence.
     astra_turn_types::sort_by_retrieval_score(&mut profile);
     astra_turn_types::sort_by_retrieval_score(&mut recent_episodes);
-    profile.truncate(3);
-    recent_episodes.truncate(3);
+    let mut profile_count = 0;
+    let mut episode_count = 0;
     let entries = merge_structured_results(profile, recent_episodes)
         .iter()
         .filter_map(context_entry_from_rankable)
+        .filter(|entry| {
+            let count = match entry.memory_type.as_deref() {
+                Some("profile") => &mut profile_count,
+                Some("episodic") => &mut episode_count,
+                _ => return false,
+            };
+            if *count >= 3 {
+                return false;
+            }
+            *count += 1;
+            true
+        })
         .collect();
     SessionStartPrefetchResult {
         entries,
@@ -661,6 +674,104 @@ mod tests {
             astra_turn_types::MemoryRetrievalOutcome::Complete
         );
         assert_eq!(client.calls.lock().expect("calls").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn first_turn_prefetch_caps_only_prompt_eligible_rows() {
+        let mut invalid_profile = typed_memory(
+            "invalid-profile",
+            astra_prompts::memory_proto::NS_PREF,
+            "profile",
+            "An unstructured profile must not displace valid preferences",
+            1.0,
+        );
+        invalid_profile.content = "unstructured legacy profile".into();
+        let mut inactive_profile = typed_memory(
+            "inactive-profile",
+            astra_prompts::memory_proto::NS_PREF,
+            "profile",
+            "An archived preference must not displace valid preferences",
+            0.99,
+        );
+        inactive_profile.content = astra_prompts::memory_proto::MemoryEntry::new(
+            astra_prompts::memory_proto::NS_PREF,
+            astra_prompts::memory_proto::ST_ARCHIVED,
+            "An archived preference must not displace valid preferences",
+        )
+        .encode();
+        let mismatched_profile = typed_memory(
+            "mismatched-profile",
+            astra_prompts::memory_proto::NS_KNOWLEDGE,
+            "profile",
+            "A namespace mismatch must not displace valid preferences",
+            0.98,
+        );
+        let mut invalid_episode = typed_memory(
+            "invalid-episode",
+            astra_prompts::memory_proto::NS_EPISODE,
+            "episodic",
+            "An unstructured episode must not displace valid session history",
+            1.0,
+        );
+        let mut unranked_episode = invalid_episode.clone();
+        unranked_episode.memory_id = "unranked-episode".into();
+        unranked_episode.retrieval_score = None;
+        invalid_episode.content = "unstructured legacy episode".into();
+        let profiles = vec![
+            invalid_profile,
+            inactive_profile,
+            mismatched_profile,
+            typed_memory(
+                "profile-low",
+                astra_prompts::memory_proto::NS_PREF,
+                "profile",
+                "The user prefers explanations grounded in observed evidence",
+                0.7,
+            ),
+            typed_memory(
+                "profile-high",
+                astra_prompts::memory_proto::NS_PREF,
+                "profile",
+                "The user prefers concise explanations of runtime behavior",
+                0.8,
+            ),
+        ];
+        let mut episodes = vec![invalid_episode, unranked_episode];
+        for index in 0..4 {
+            episodes.push(typed_memory(
+                &format!("episode-{index}"),
+                astra_prompts::memory_proto::NS_EPISODE,
+                "episodic",
+                "The prior session verified the canonical runtime memory boundary",
+                0.8 - f64::from(index) * 0.1,
+            ));
+        }
+        let client = ScriptedClient {
+            responses: Mutex::new(VecDeque::from([Ok(profiles), Ok(episodes)])),
+            ..Default::default()
+        };
+
+        let result = prefetch_session_start_memories_with_client(&client, "user", "session").await;
+        let ids = result
+            .entries
+            .iter()
+            .filter_map(|entry| entry.memory_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "profile-high",
+                "profile-low",
+                "episode-0",
+                "episode-1",
+                "episode-2"
+            ]
+        );
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Complete
+        );
+        assert_eq!(client.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

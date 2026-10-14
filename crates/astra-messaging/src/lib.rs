@@ -20,7 +20,7 @@ pub use db_transport::{CleanupScheduler, DatabaseTransport};
 pub use delegation::{DelegationLookup, SubRunInfo};
 pub use in_process::InProcessTransport;
 pub use router::{AgentMailbox, AgentMailboxRouter, PermissionOutcome};
-pub use transport::{MessageStream, MessageTransport};
+pub use transport::{MailboxCapabilities, MessageStream, MessageTransport, ResolvedMailbox};
 pub use types::{
     AgentAddress, AgentMessage, AgentSignal, MailboxError, MessagePayload, MessageTarget,
     RequestType, agent_communication_event,

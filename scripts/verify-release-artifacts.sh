@@ -80,7 +80,9 @@ for suffix in "${expected[@]}"; do
         exit 1
     fi
 
-    members="$(tar -tzf "$archive" | sort)"
+    # LC_ALL pins the comparison to C byte order: under UTF-8 locales collation
+    # is case-insensitive and would reorder the members, rejecting valid sets.
+    members="$(tar -tzf "$archive" | LC_ALL=C sort)"
     if [[ "$members" != $'LICENSE\nastra\nastra-edge' ]]; then
         echo "$archive must contain exactly astra, astra-edge, and LICENSE at its root" >&2
         printf '%s\n' "$members" >&2
@@ -88,5 +90,7 @@ for suffix in "${expected[@]}"; do
     fi
 done
 
-sort -k2 "${checksum_files[@]}" > checksums.txt
+# LC_ALL pins checksums.txt to C byte order so the published manifest is
+# byte-identical no matter which locale published the release.
+LC_ALL=C sort -k2 "${checksum_files[@]}" > checksums.txt
 printf '%s  %s\n' "$(sha256_file checksums.txt)" checksums.txt > checksums.txt.sha256

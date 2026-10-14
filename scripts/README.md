@@ -51,7 +51,9 @@ cache before enabling it. Backend startup failures fall back to direct `rustc`,
 and sccache's native I/O fallback covers interruptions after startup. The
 offline fault-injection contract is included in `validate_repository.py`.
 
-The remaining Harness tests exercise Harbor integration contracts and require
+The model seed suite also verifies catalog-selected Offering identity and exact
+reasoning admission without Harbor, services, or model calls. It runs in the
+existing offline CI gate. The remaining Harness tests exercise Harbor integration contracts and require
 the benchmark environment. Run the complete suite there with
 `python3 -m unittest discover -s scripts/harness -p 'test_*.py'`.
 

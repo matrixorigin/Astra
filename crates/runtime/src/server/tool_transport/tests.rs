@@ -306,7 +306,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        _timeout: std::time::Duration,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
         if !self.return_result {
             return Ok(None);
@@ -402,7 +402,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
     async fn wait_result(
         &self,
         _identity: &EdgeDispatchIdentity,
-        _timeout: std::time::Duration,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
         let sender = self.wait_started.lock().expect("wait started lock").take();
         if let Some(sender) = sender {
@@ -563,9 +563,9 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        timeout: std::time::Duration,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             {
                 let rows = self.rows.lock().expect("shared dispatch rows");
@@ -578,7 +578,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
             }
             tokio::select! {
                 _ = self.terminal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => return Ok(None),
             }
         }
     }
@@ -718,6 +718,7 @@ fn request(
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     }
@@ -733,6 +734,296 @@ fn request_scoped_mcp_request(tool_name: &str) -> ToolExecutionRequest {
         tool_name,
         "request-scoped-mcp",
     ))
+}
+
+#[test]
+fn edge_provider_selection_requires_the_current_frozen_descriptor() {
+    use super::super::tool_execution_binding::{
+        ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+    };
+    use astra_turn_core::provider_resolution::{
+        ProviderClaimTrustPolicy, ResolvedProviderPolicyIndex, resolve_provider_snapshot,
+    };
+    use astra_turn_types::*;
+    let tool = ProviderToolDeclaration {
+        native_tool_id: NativeToolId::new("structured_worker").unwrap(),
+        native_tool_name: "structured_worker".into(),
+        stable_tool_alias: None,
+        title: None,
+        description: None,
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        claims: ProviderToolClaims::default(),
+        task_support: ProviderTaskSupport::Unspecified,
+        extension_fields: serde_json::Map::from_iter([(
+            PROVIDER_RUNTIME_REQUIREMENTS_KEY.into(),
+            serde_json::json!({"executable": "/usr/bin/worker", "read_paths": ["/usr/bin/worker", "/usr/lib"]}),
+        )]),
+    };
+    let discovery = ProviderDiscoverySnapshot::new(
+        ProviderIdentity::new("selected-runtime").unwrap(),
+        ProviderBindingRef::new(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-edge-1",
+                "/Users/test/project",
+            ),
+        )
+        .unwrap(),
+        ProviderProtocolId::new("cli-local").unwrap(),
+        vec![tool],
+    )
+    .unwrap();
+    let aliases = std::collections::BTreeMap::from([(
+        NativeToolId::new("structured_worker").unwrap(),
+        PublicToolAlias::new("structured_worker").unwrap(),
+    )]);
+    let resolved =
+        resolve_provider_snapshot(&discovery, &ProviderClaimTrustPolicy::default(), &aliases)
+            .unwrap();
+    let index = ResolvedProviderPolicyIndex::from_snapshots(&[resolved]).unwrap();
+    let mut agent = edge_agent_record("edge-1");
+    let mut advert: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+        serde_json::from_value(agent.capabilities.clone().unwrap()).unwrap();
+    advert.provider_discovery = vec![discovery.clone()];
+    agent.capabilities = Some(serde_json::to_value(&advert).unwrap());
+    let mut invocation = request(
+        "structured_worker",
+        WorkspaceBinding::edge_workspace(
+            "project",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "Edge",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        ),
+    );
+    invocation.policy.resolved_provider_policy = index.resolve("structured_worker").cloned();
+    assert!(
+        EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
+            .is_err()
+    );
+    invocation.policy.permission_grant = Some(ToolPermissionGrantSnapshot {
+        source: ToolPermissionGrantSource::Policy,
+        reason: None,
+        updates_hash: None,
+    });
+    assert!(
+        EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
+            .is_err()
+    );
+    invocation.policy.execution_binding_generation = Some(7);
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
+        .unwrap();
+    assert!(!plan.requires_live_provider_interaction());
+    assert!(plan.dispatch_payload_json().is_err());
+
+    let read_only_binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/Users/test/project",
+            astra_runtime_env::WorkspaceAuthority::ReadOnly,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent("edge-1"),
+        astra_runtime_env::RuntimeBinding::host_process("edge-host:edge-1"),
+        astra_runtime_env::PolicyIntent::read_only_review(),
+        &astra_runtime_env::ToolRegistry::builtins(),
+    );
+    let mut read_only_invocation = invocation.clone();
+    read_only_invocation.workspace.authority = WorkspaceAuthority::ReadOnly;
+    let read_only_plan = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &read_only_invocation,
+        &read_only_binding,
+    )
+    .unwrap();
+    assert_eq!(
+        read_only_binding.policy.isolation,
+        astra_runtime_env::IsolationIntent::ProviderEnforced
+    );
+    assert!(read_only_plan.execution_ceiling().is_some());
+
+    for filesystem in [
+        astra_runtime_env::FilesystemPolicy::NoAccess,
+        astra_runtime_env::FilesystemPolicy::ExplicitAllowList,
+    ] {
+        let mut restricted = advert.binding.clone();
+        restricted.policy.filesystem = filesystem;
+        assert!(
+            EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &restricted)
+                .is_err()
+        );
+    }
+    assert!(
+        plan.bind_execution_ceiling(
+            "user-1",
+            "edge-1",
+            Some("/Users/test/project"),
+            None,
+            Some("replacement-checkout")
+        )
+        .is_err()
+    );
+    for (owner, executor, root, materialization) in [
+        (
+            "other-user",
+            "edge-1",
+            "/Users/test/project",
+            Some("materialization-edge-1"),
+        ),
+        (
+            "user-1",
+            "other-edge",
+            "/Users/test/project",
+            Some("materialization-edge-1"),
+        ),
+        (
+            "user-1",
+            "edge-1",
+            "/different",
+            Some("materialization-edge-1"),
+        ),
+        ("user-1", "edge-1", "/Users/test/project", None),
+    ] {
+        assert!(
+            plan.bind_execution_ceiling(owner, executor, Some(root), None, materialization)
+                .is_err()
+        );
+    }
+    let bound = plan
+        .bind_execution_ceiling(
+            "user-1",
+            "edge-1",
+            Some("/Users/test/project"),
+            None,
+            Some("materialization-edge-1"),
+        )
+        .unwrap();
+    let ceiling = bound.execution_ceiling().unwrap();
+    assert_eq!(ceiling.execution_binding_generation, 7);
+    assert_eq!(
+        ceiling.materialization_id.as_deref(),
+        Some("materialization-edge-1")
+    );
+    assert_eq!(ceiling.runtime_read_paths, ["/usr/bin/worker", "/usr/lib"]);
+    let payload: astra_server_types::EdgeServerMessage =
+        serde_json::from_str(&bound.dispatch_payload_json().unwrap()).unwrap();
+    let astra_server_types::EdgeServerMessage::ToolRequest {
+        execution_ceiling, ..
+    } = payload
+    else {
+        panic!("tool request required");
+    };
+    assert_eq!(execution_ceiling.as_deref(), Some(ceiling));
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let select = |agent: &astra_services::multi_agent::EdgeAgentRecord,
+                  invocation: &ToolExecutionRequest| {
+        super::super::tool_edge_selection::select_capable_edge_agent(
+            std::slice::from_ref(agent),
+            Some("edge-1"),
+            invocation,
+            &registry,
+        )
+        .map(|selected| selected.is_some())
+    };
+    assert!(select(&agent, &invocation).unwrap());
+    let mut unadmitted = invocation.clone();
+    unadmitted.policy.resolved_provider_policy = None;
+    assert!(select(&agent, &unadmitted).is_err());
+
+    let mut collaborator_tool = discovery.tool_declarations[0].clone();
+    collaborator_tool.task_support = ProviderTaskSupport::Required;
+    collaborator_tool
+        .extension_fields
+        .insert(PROVIDER_COLLABORATOR_STAGE_KEY.into(), Value::Bool(true));
+    collaborator_tool.extension_fields.insert(
+        astra_turn_core::provider_resolution::NativeCollaboratorProtocol::EXTENSION_KEY.into(),
+        Value::String(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer
+                .extension_value()
+                .into(),
+        ),
+    );
+    let collaborator_discovery = ProviderDiscoverySnapshot::new(
+        ProviderIdentity::new("selected-runtime").unwrap(),
+        ProviderBindingRef::new(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-edge-1",
+                "/Users/test/project",
+            ),
+        )
+        .unwrap(),
+        ProviderProtocolId::new("cli-local").unwrap(),
+        vec![collaborator_tool],
+    )
+    .unwrap();
+    let collaborator_resolved = resolve_provider_snapshot(
+        &collaborator_discovery,
+        &ProviderClaimTrustPolicy::default(),
+        &aliases,
+    )
+    .unwrap();
+    let collaborator_index =
+        ResolvedProviderPolicyIndex::from_snapshots(&[collaborator_resolved]).unwrap();
+    let mut collaborator_invocation = invocation.clone();
+    collaborator_invocation.policy.resolved_provider_policy =
+        collaborator_index.resolve("structured_worker").cloned();
+    let collaborator_plan = EdgeBoundExecutionPlan::try_from_request(&collaborator_invocation)
+        .expect("collaborator policy should produce an edge plan");
+    assert!(collaborator_plan.requires_live_provider_interaction());
+    let mut command_binding = advert.binding.clone();
+    command_binding.policy.resources.max_execution_secs = Some(7.2);
+    let stage_plan = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &collaborator_invocation,
+        &command_binding,
+    )
+    .unwrap();
+    assert_eq!(stage_plan.execution_timeout_secs(), None);
+    assert_eq!(stage_plan.wait_timeout(), None);
+    assert_eq!(stage_plan.command_timeout_cap_ms(), Some(8_000));
+    collaborator_invocation.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    collaborator_invocation.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let bounded_stage = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &collaborator_invocation,
+        &command_binding,
+    )
+    .unwrap();
+    assert_eq!(bounded_stage.execution_timeout_secs(), None);
+    assert!(bounded_stage.execution_timeout_ms().unwrap() <= 3_000);
+    assert_eq!(bounded_stage.command_timeout_cap_ms(), Some(8_000));
+    for change in [
+        "schema",
+        "root",
+        "executor",
+        "process",
+        "readable",
+        "reachable",
+    ] {
+        let mut changed = advert.clone();
+        match change {
+            "schema" => {
+                let old = &changed.provider_discovery[0];
+                let mut tools = old.tool_declarations.clone();
+                tools[0].input_schema = serde_json::json!({"type": "object", "required": ["new"]});
+                changed.provider_discovery[0] = ProviderDiscoverySnapshot::new(
+                    old.provider_identity.clone(),
+                    old.binding_ref.clone(),
+                    old.protocol.clone(),
+                    tools,
+                )
+                .unwrap();
+            }
+            "root" => changed.binding.workspace.cwd = Some("/different".into()),
+            "process" => changed.binding.capabilities.runtime.runtime_has_process = false,
+            "readable" => changed.binding.capabilities.workspace.readable = false,
+            "reachable" => changed.binding.capabilities.executor.reachable = false,
+            _ => changed.binding.executor.executor_id = "other-edge".into(),
+        }
+        let mut stale = agent.clone();
+        stale.capabilities = Some(serde_json::to_value(changed).unwrap());
+        assert!(select(&stale, &invocation).is_err(), "{change}");
+    }
 }
 
 #[test]
@@ -1313,7 +1604,10 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
 
     assert_eq!(plan.selected_executor_id(), Some("edge-1"));
     assert_eq!(plan.dispatch_request_id(), plan.identity().storage_key());
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(310));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(310))
+    );
 
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
@@ -1373,6 +1667,101 @@ fn durable_edge_payload_never_contains_runtime_process_authorization() {
 }
 
 #[test]
+fn edge_dispatch_preserves_admitted_work_budget_without_rewriting_arguments() {
+    let mut request = request(
+        "native_codex",
+        WorkspaceBinding::edge_workspace(
+            "selected CLI",
+            "/selected",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "selected-cli",
+            "selected CLI",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.args = serde_json::json!({"task":"review", "model":"luna"});
+    request.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+    let payload: Value = serde_json::from_str(&plan.dispatch_payload_json().unwrap()).unwrap();
+    assert_eq!(
+        payload["identity"],
+        serde_json::to_value(plan.identity()).unwrap()
+    );
+    assert_eq!(payload["request_id"], plan.identity().storage_key());
+    assert_eq!(payload["args"], request.args);
+    assert_eq!(payload["execution_deadline_unix_ms"], 4_102_444_800_000u64);
+    assert!(payload["execution_timeout_ms"].as_u64().unwrap() <= 600_000);
+    assert!(payload["execution_timeout_ms"].as_u64().unwrap() > 590_000);
+    assert!(payload["command_timeout_cap_ms"].is_null());
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(310))
+    );
+    request.policy.max_execution_secs = Some(7.2);
+    let binding = request.runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins());
+    let governed =
+        EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
+    let governed: Value = serde_json::from_str(&governed.dispatch_payload_json().unwrap()).unwrap();
+    assert_eq!(governed["command_timeout_cap_ms"], 8_000);
+    assert!(
+        governed["execution_timeout_ms"].as_u64().unwrap() > 590_000,
+        "command policy must not replace native whole-stage budget"
+    );
+    let decoded: astra_server_types::EdgeServerMessage = serde_json::from_value(payload).unwrap();
+    let replay = serde_json::to_value(decoded).unwrap();
+    assert_eq!(replay["execution_deadline_unix_ms"], 4_102_444_800_000u64);
+    request.policy.admission_deadline = Some(std::time::Instant::now());
+    assert!(matches!(
+        EdgeBoundExecutionPlan::try_from_request(&request),
+        Err(astra_turn_types::ToolInvocationContractError::InvalidExecutionBudget)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn admitted_edge_plan_remaining_never_renews_and_rejects_partial_pair() {
+    let mut request = request(
+        "native_codex",
+        WorkspaceBinding::edge_workspace("CLI", "/selected", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "cli",
+            "CLI",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(86_400));
+    request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+    let original = plan.execution_timeout_ms().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(5430)).await;
+    let remaining = plan.execution_timeout_ms().unwrap();
+    assert_eq!(original - remaining, 5_430_000);
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(310))
+    );
+    let payload: Value = serde_json::from_str(&plan.dispatch_payload_json().unwrap()).unwrap();
+    assert_eq!(payload["execution_timeout_ms"], remaining);
+    tokio::time::advance(std::time::Duration::from_secs(86_400)).await;
+    assert_eq!(plan.execution_timeout_ms(), Some(0));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(10))
+    );
+    request.policy.execution_deadline_unix_ms = None;
+    assert!(EdgeBoundExecutionPlan::try_from_request(&request).is_err());
+    request.policy.admission_deadline = None;
+    request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    assert!(EdgeBoundExecutionPlan::try_from_request(&request).is_err());
+}
+
+#[test]
 fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(
@@ -1397,7 +1786,10 @@ fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
 
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(40));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(40))
+    );
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
@@ -1428,7 +1820,10 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
 
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(18));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(18))
+    );
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
@@ -1461,19 +1856,24 @@ fn edge_bound_execution_plan_clamps_invalid_or_excessive_policy_timeout() {
     request.policy.max_execution_secs = Some(0.0);
     let binding = request.runtime_environment_binding(&registry);
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
-    assert_eq!(plan.execution_timeout_secs(), 1);
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(11));
+    assert_eq!(plan.execution_timeout_secs(), Some(1));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(11))
+    );
 
     request.policy.max_execution_secs = Some(9_999.0);
     let binding = request.runtime_environment_binding(&registry);
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
     assert_eq!(
         plan.execution_timeout_secs(),
-        astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS
+        Some(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS)
     );
     assert_eq!(
         plan.wait_timeout(),
-        std::time::Duration::from_secs(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS + 10)
+        Some(std::time::Duration::from_secs(
+            astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS + 10
+        ))
     );
 }
 
@@ -3221,7 +3621,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
                 assert_eq!(request_id, row.request_id);
                 assert_eq!(tool, "bash");
                 assert_eq!(args, serde_json::json!({}));
-                assert!(timeout_secs > 0);
+                assert!(timeout_secs.is_some_and(|timeout| timeout > 0));
             }
             other => panic!("expected tool request payload, got {other:?}"),
         }
@@ -4339,6 +4739,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -4379,6 +4780,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -4419,6 +4821,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),

@@ -1177,7 +1177,7 @@ async fn bootstrap_in_database(database: Option<String>) -> BootstrapResult {
             "edge_agent_id": edge_agent_id,
             "hostname": "system-matrix-edge",
             "worktree_path": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
-            "capabilities": { "tools": ["read_file"] }
+            "capabilities": astra_thin_client::edge_runtime_environment_capabilities(&edge_agent_id, MATRIX_E2E_EDGE_WORKSPACE_ROOT)
         }),
     )
     .await;

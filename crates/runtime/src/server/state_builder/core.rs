@@ -331,7 +331,7 @@ mod tests {
         async fn wait_result(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             Ok(None)
         }
@@ -396,6 +396,7 @@ mod tests {
             runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
             selected_offer: None,
             policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
         }

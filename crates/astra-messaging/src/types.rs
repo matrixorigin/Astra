@@ -60,6 +60,13 @@ pub enum MessageTarget {
 
 // ─── Message Payload ────────────────────────────────────────────────────────
 
+/// Correlated non-adoption feedback is informational, never a question answer.
+pub fn is_non_adoption_response(payload: &MessagePayload) -> bool {
+    matches!(payload, MessagePayload::Response { request_id, accepted: false, data: Some(data) }
+        if data.get("disposition").and_then(serde_json::Value::as_str) == Some("not_adopted")
+            && data.get("message_id").and_then(serde_json::Value::as_str) == Some(request_id.as_str()))
+}
+
 /// The content of an agent message.
 ///
 /// Tagged union — each variant serializes with a `"type"` discriminator
@@ -286,6 +293,28 @@ fn bounded_communication_summary(value: &str) -> String {
 }
 
 impl AgentMessage {
+    /// A processed rejection is feedback, not an answer or proof of intent
+    /// application. Correlate it to the transport message, never its intent ID.
+    pub fn non_adoption_response(from: AgentAddress, original: &AgentMessage) -> Self {
+        let mut response = Self::new(
+            from,
+            MessageTarget::Direct {
+                address: original.from.clone(),
+            },
+            MessagePayload::Response {
+                request_id: original.id.clone(),
+                accepted: false,
+                data: Some(serde_json::json!({
+                    "disposition": "not_adopted",
+                    "message_id": original.id,
+                    "content": "The native stage rejected this guidance; it was not adopted."
+                })),
+            },
+        );
+        response.correlation_id = original.correlation_id.clone();
+        response
+    }
+
     /// Create a new message with auto-generated ID and current timestamp.
     pub fn new(from: AgentAddress, to: MessageTarget, payload: MessagePayload) -> Self {
         let timestamp_ms = chrono::Utc::now().timestamp_millis();

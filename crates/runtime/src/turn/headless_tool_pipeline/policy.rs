@@ -707,7 +707,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.slot_settlements.insert(
                     execution.id.clone(),
                     SlotSettlement::PendingEdgeValidated {
-                        execution: snapshot,
+                        execution: Box::new(snapshot),
                         idem_key: idem_key.clone(),
                     },
                 );

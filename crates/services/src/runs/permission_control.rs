@@ -266,7 +266,9 @@ impl DatabaseRunStateStore {
         if updated.rows_affected() != 1 {
             return Err("permission event append lost run authority".into());
         }
-        Self::insert_run_event_rows_tx(tx, &run.run_id, &[row], "permission_mode_append").await?;
+        Self::insert_run_event_rows_tx(tx, &run.run_id, &[row], "permission_mode_append")
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(idx)
     }
 

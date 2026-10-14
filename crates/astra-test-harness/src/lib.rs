@@ -53,6 +53,7 @@ pub mod judger;
 pub mod model_profiles;
 pub mod pipeline_analysis;
 pub mod preflight;
+pub mod progress;
 pub mod report;
 pub mod router_offline;
 pub mod runner;

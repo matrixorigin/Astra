@@ -1,11 +1,10 @@
 use std::sync::OnceLock;
 
-/// Stable executor identity for the local checkout (§5.5 `edge_executor_id`).
+/// Executor identity for the live CLI boundary (§5.5 `edge_executor_id`).
 ///
-/// A one-shot CLI invocation is a short-lived process, but a Session may span
-/// several such invocations. Deriving the default from the persisted physical
-/// materialization keeps the executor identity across those process boundaries
-/// while preserving `ASTRA_EDGE_EXECUTOR_ID` as the explicit label override.
+/// The materialization remains part of the binding, while the process suffix
+/// prevents two TUI processes in one checkout from replacing each other's Edge
+/// socket. `ASTRA_EDGE_EXECUTOR_ID` remains the explicit stable label override.
 static EDGE_EXECUTOR_INSTANCE_ID: OnceLock<Result<String, String>> = OnceLock::new();
 
 pub(crate) fn edge_executor_instance_id() -> &'static str {
@@ -46,16 +45,20 @@ fn default_materialization_executor_id() -> Result<String, String> {
 }
 
 fn materialization_executor_id(materialization_id: &str) -> String {
-    format!("edge-materialization-{materialization_id}")
+    format!(
+        "edge-materialization-{materialization_id}-process-{}",
+        std::process::id()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn materialization_executor_id_is_stable_and_namespaced() {
+    fn materialization_executor_id_is_process_scoped_and_namespaced() {
         let first = super::materialization_executor_id("materialization-test");
         let second = super::materialization_executor_id("materialization-test");
         assert_eq!(first, second);
         assert!(first.starts_with("edge-materialization-"));
+        assert!(first.ends_with(&format!("-process-{}", std::process::id())));
     }
 }

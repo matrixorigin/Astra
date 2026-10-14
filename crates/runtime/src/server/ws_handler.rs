@@ -3323,6 +3323,7 @@ mod tests {
             prompt: AskUserPrompt {
                 context: Some("Need confirmation".into()),
                 questions: vec![astra_tools::AskUserQuestion {
+                    id: None,
                     header: "Confirm".into(),
                     question: "Continue?".into(),
                     options: vec![
@@ -3392,6 +3393,7 @@ mod tests {
                 prompt: AskUserPrompt {
                     context: None,
                     questions: vec![astra_tools::AskUserQuestion {
+                        id: None,
                         header: "Confirm".into(),
                         question: "Continue?".into(),
                         options: vec![

@@ -172,6 +172,17 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
+When newer guidance supersedes an interaction, resolution releases
+only that exact live wait under its original owner, generation and lease. The
+resolution receipt remains `superseded`: an old answer, approval or provider
+response is not applied or treated as resumed decision authority. The owner
+consumes the durable guidance before admitting a fresh action. Stale frontiers,
+lost ownership, cancellation and terminal runs never grant this wait release.
+An Edge approval reader that observes the shared `superseded` receipt before
+its guidance poll wakes takes that same supersession continuation path; it
+does not classify the receipt as lost authority or replay the old decision.
+An `authority_lost` receipt still fails closed.
+
 ### Bounded continuation and completion
 
 An execution slice is a capacity checkpoint, not a task-completion boundary.

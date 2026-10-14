@@ -470,13 +470,30 @@ mod tests {
         let app = Router::new().route("/chat/completions", post(|Json(body): Json<Value>| async move {
             assert!(body.get("thinking").is_none());
             assert!(body.get("enable_thinking").is_none());
+            assert!(body.get("temperature").is_none());
             let mut response = serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":"391"}}]});
             if body["model"] == "native" {
                 assert!(body.get("reasoning_effort").is_none());
                 response["choices"][0]["message"]["reasoning_content"] = serde_json::json!("multiply");
-            } else if body["model"] == "effort" {
-                assert_eq!(body["reasoning_effort"], "low");
-                response["usage"] = serde_json::json!({"completion_tokens_details":{"reasoning_tokens":12}});
+            } else if let Some((path, value)) = body["model"].as_str().unwrap().split_once('-') {
+                if path == "unknown" {
+                    assert!(body.get("reasoning_effort").is_none());
+                } else {
+                    assert_eq!(body["reasoning_effort"], "low");
+                }
+                let value: Value = serde_json::from_str(value).unwrap();
+                response["usage"] = match path {
+                    "nested" => serde_json::json!({"completion_tokens_details":{"reasoning_tokens":value}}),
+                    "flat" => serde_json::json!({"reasoning_tokens":value}),
+                    "mixed" => value,
+                    "unknown" if value.is_object() => value,
+                    "unknown" => serde_json::json!({"reasoning_tokens":value}),
+                    "malformed" => {
+                        response["choices"][0]["message"]["content"] = serde_json::json!("");
+                        serde_json::json!({"reasoning_tokens":1})
+                    }
+                    _ => panic!("unexpected fixture path"),
+                };
             }
             Json(response)
         }));
@@ -484,25 +501,69 @@ mod tests {
         let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        for (model, protocol, expected) in [
+        let mut cases = vec![
             (
-                "native",
+                "native".to_string(),
                 ThinkingProtocol::Unknown,
                 Some(ThinkingCapability::NativeOnly),
             ),
             (
-                "effort",
+                "inconclusive".to_string(),
+                ThinkingProtocol::ReasoningEffort,
+                None,
+            ),
+            ("inconclusive".to_string(), ThinkingProtocol::Unknown, None),
+        ];
+        for path in ["nested", "flat"] {
+            for (value, expected) in [
+                (serde_json::json!(1), Some(ThinkingCapability::EffortOnly)),
+                (serde_json::json!(12), Some(ThinkingCapability::EffortOnly)),
+                (serde_json::json!(0), None),
+                (serde_json::json!(-1), None),
+                (serde_json::json!("1"), None),
+                (serde_json::json!(1.5), None),
+                (Value::Null, None),
+                (serde_json::json!(true), None),
+            ] {
+                cases.push((
+                    format!("{path}-{value}"),
+                    ThinkingProtocol::ReasoningEffort,
+                    expected,
+                ));
+            }
+        }
+        for usage in [
+            serde_json::json!({"reasoning_tokens":1,"completion_tokens_details":{"reasoning_tokens":0}}),
+            serde_json::json!({"reasoning_tokens":1,"completion_tokens_details":{"reasoning_tokens":"invalid"}}),
+            serde_json::json!({"reasoning_tokens":0,"completion_tokens_details":{"reasoning_tokens":1}}),
+            serde_json::json!({"reasoning_tokens":"invalid","completion_tokens_details":{"reasoning_tokens":1}}),
+        ] {
+            cases.push((
+                format!("mixed-{usage}"),
                 ThinkingProtocol::ReasoningEffort,
                 Some(ThinkingCapability::EffortOnly),
-            ),
-            ("inconclusive", ThinkingProtocol::Unknown, None),
-        ] {
+            ));
+        }
+        cases.push(("unknown-1".into(), ThinkingProtocol::Unknown, None));
+        cases.push((
+            "unknown-{\"completion_tokens_details\":{\"reasoning_tokens\":1}}".into(),
+            ThinkingProtocol::Unknown,
+            None,
+        ));
+        cases.push((
+            "malformed-1".into(),
+            ThinkingProtocol::ReasoningEffort,
+            None,
+        ));
+        for (model, protocol, expected) in cases {
             let result =
-                probe_chat_protocol(&client, "openai", model, &url, "fixture", protocol).await;
+                probe_chat_protocol(&client, "openai", &model, &url, "fixture", protocol).await;
             assert_eq!(
                 result.error.is_none().then_some(result.capability),
-                expected
+                expected,
+                "{model}"
             );
+            assert_eq!(result.error.is_some(), expected.is_none(), "{model}");
         }
         server.abort();
     }

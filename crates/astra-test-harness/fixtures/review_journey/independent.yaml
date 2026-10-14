@@ -1,0 +1,35 @@
+name: explicitly_required_review_inherits_model
+description: Explicit independence remains supported without a skill-imposed provider or model override.
+prompt: Ask one independent child, using the current model and default reasoning, to review the latest two commits. Report its actionable correctness findings.
+setup_cmd: 'python3 "$ASTRA_REVIEW_JOURNEY_SOURCE/setup.py"'
+timeout_seconds: 180
+capability: delegation
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_call_count
+    name: skill
+    min: 1
+    max: 2
+    ok: true
+    document: arguments
+    path: /skill_name
+    equals: review-changes
+  - type: journal_tool_call_count
+    name: native_codex
+    min: 0
+    max: 0
+  - type: session_child_result_adopted
+    spawn_match:
+      path: /metadata/model_configuration/thinking/mode
+      equals: model_default
+  - type: hard_judger
+    question: Does the delivered review identify that increment now subtracts one and is_even now returns true for odd values, with evidence from the commits?
+    threshold: 0.8

@@ -6,7 +6,7 @@ use crate::cli::{
 /// resumable session yet. The identity is provisional until its first turn is
 /// durably admitted; this prevents an admission failure from making an empty
 /// draft the next process's implicit recovery target.
-async fn create_server_session_identity(
+pub(crate) async fn create_server_session_identity(
     api: &astra_thin_client::ThinClient,
     token: &str,
 ) -> Result<String, String> {

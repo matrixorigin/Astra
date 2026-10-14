@@ -205,6 +205,7 @@ impl AskUserView {
             .iter()
             .enumerate()
             .map(|(idx, question)| AskUserQuestionAnswer {
+                id: question.id.clone(),
                 question: question.question.clone(),
                 answers: self.question_answers(idx),
                 multi_select: question.multi_select,
@@ -1089,7 +1090,7 @@ impl BottomPaneView for AskUserView {
     }
 
     fn is_complete(&self) -> bool {
-        self.completed
+        self.completed || self.response_tx.as_ref().is_some_and(|tx| tx.is_closed())
     }
 
     fn completion(&self) -> Option<ViewCompletion> {

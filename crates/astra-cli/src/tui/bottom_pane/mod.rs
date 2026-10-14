@@ -848,6 +848,9 @@ impl BottomPane {
         prompt: crate::cli::chat_stream::AskUserPrompt,
         response_tx: oneshot::Sender<crate::cli::chat_stream::AskUserResponse>,
     ) {
+        if response_tx.is_closed() {
+            return;
+        }
         self.view_stack
             .push(Box::new(AskUserView::new(prompt, response_tx)));
     }
@@ -1549,7 +1552,7 @@ impl BottomPane {
             // without args (Value::Null). We can't safely
             // re-evaluate those, so leave them in the queue and let
             // the original gate resolve them explicitly.
-            if entry.args.is_null() {
+            if entry.args.is_null() || entry.runtime_dependencies.is_some() {
                 return None;
             }
             let envelope = evaluate_permission(&entry.tool, &entry.args, &ctx);
@@ -1710,6 +1713,7 @@ impl BottomPane {
         if let Some(hint) = view.selection_hint {
             cell = cell.with_selection_hint(hint);
         }
+        cell.invocation_scoped = view.invocation_scoped;
         cell = cell.with_scope_context(
             view.workspace_untrusted,
             view.is_compound_command,
@@ -2012,7 +2016,7 @@ impl BottomPane {
         None
     }
 
-    /// Slash menu navigation. Enter with no matches falls through to
+    /// Slash menu navigation. Submit keys with no matches fall through to
     /// the composer so the raw draft gets submitted as-is (avoids a
     /// silent no-op).
     fn handle_slash_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
@@ -2082,7 +2086,17 @@ impl BottomPane {
                 }
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Enter => {
+            _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
+                let explicit_followup = ChatComposer::is_explicit_followup_key(key);
+                if explicit_followup {
+                    // Apply the same paste guard as ordinary composer queueing.
+                    // A due burst can change the completion or add arguments;
+                    // refresh the menu before choosing a command from it.
+                    if self.composer.handle_key(key) != ComposerAction::QueueFollowUp {
+                        return Some(BottomPaneAction::Consumed);
+                    }
+                    self.sync_popups();
+                }
                 if let Some(picked) = self
                     .slash_menu
                     .as_ref()
@@ -2091,7 +2105,11 @@ impl BottomPane {
                 {
                     self.composer.clear_draft();
                     self.slash_menu = None;
-                    return Some(BottomPaneAction::SubmitInput(picked));
+                    return Some(if explicit_followup {
+                        BottomPaneAction::QueueFollowUp(picked)
+                    } else {
+                        BottomPaneAction::SubmitInput(picked)
+                    });
                 }
                 None
             }
@@ -2147,12 +2165,17 @@ impl BottomPane {
     }
 
     fn route_to_composer(&mut self, key: KeyEvent) -> BottomPaneAction {
-        let action = match self.composer.handle_key(key) {
-            ComposerAction::Submit => {
+        let composer_action = self.composer.handle_key(key);
+        let action = match composer_action {
+            ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
                 self.slash_menu = None;
                 self.close_mention();
-                BottomPaneAction::SubmitInput(text)
+                if composer_action == ComposerAction::QueueFollowUp {
+                    BottomPaneAction::QueueFollowUp(text)
+                } else {
+                    BottomPaneAction::SubmitInput(text)
+                }
             }
             ComposerAction::OpenExternalEditor => {
                 if self.task_status.is_active() {
@@ -2638,6 +2661,10 @@ pub(crate) enum ApprovalActivation {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
+    /// A composer-only delivery choice. The active loop retains conversational
+    /// input in its existing local FIFO; idle input and local controls use the
+    /// ordinary dispatcher. This does not transfer custody to the Server.
+    QueueFollowUp(String),
     OpenExternalEditor(String),
     /// The shortcut was pressed while a turn owns the event loop. Opening the
     /// editor here would stop polling that turn, so the dispatcher must show a

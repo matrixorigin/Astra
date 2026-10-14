@@ -1891,9 +1891,16 @@ fn schedule_session_end_governance(state: &AppState, owner_id: String, session_i
                     purged = report.working_purged,
                     episode_chars = report.episode_chars,
                     scenes_stored = report.scenes_stored,
-                    "session-end governance complete"
+                    working_purge_failed = report.working_purge_failed,
+                    episode_write_failed = report.working_retained_due_to_episode_failure,
+                    scene_persist_failures = report.scene_persist_failures,
+                    reflection_failed = report.reflection_failed,
+                    consolidation_complete = report.consolidation_complete(),
+                    "session-end governance finished"
                 );
-                governance_permit.complete();
+                if report.consolidation_complete() {
+                    governance_permit.complete();
+                }
             }
             Ok(Err(error)) => {
                 tracing::warn!(

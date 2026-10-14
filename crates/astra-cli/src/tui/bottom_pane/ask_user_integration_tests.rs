@@ -47,6 +47,56 @@ fn choice(label: &str, description: Option<&str>) -> AskUserChoice {
 }
 
 #[test]
+fn ask_user_closed_request_does_not_keep_a_modal_open() {
+    let mut bp = BottomPane::new();
+    let prompt = AskUserPrompt {
+        context: None,
+        questions: vec![AskUserQuestion {
+            id: None,
+            header: "Direction".into(),
+            question: "Choose a direction".into(),
+            options: vec![],
+            multi_select: false,
+            allow_freeform: true,
+        }],
+        timeout_ms: None,
+    };
+    let (tx, rx) = oneshot::channel();
+    drop(rx);
+    bp.enqueue_ask_user(prompt.clone(), tx);
+    assert!(!bp.has_active_view());
+
+    let rx = enqueue(&mut bp, prompt);
+    assert!(bp.has_active_view());
+    drop(rx);
+    assert!(bp.pre_draw_tick(std::time::Instant::now()));
+    assert!(!bp.has_active_view());
+}
+
+#[test]
+fn native_questionnaire_preserves_ids_with_identical_labels() {
+    let mut bp = BottomPane::new();
+    let prompt = astra_tools::ask_user::parse_ask_user_prompt(&serde_json::json!({
+        "questions": [
+            {"id":"first", "header":"Choice", "question":"Proceed?", "options":[{"label":"Yes"},{"label":"No"}]},
+            {"id":"second", "header":"Choice", "question":"Proceed?", "options":[{"label":"Yes"},{"label":"No"}]}
+        ]
+    })).unwrap();
+    let mut rx = enqueue(&mut bp, prompt.clone());
+    let _ = bp.handle_key(key('1'));
+    let _ = bp.handle_key(key('2'));
+    let _ = bp.handle_key(special(KeyCode::Tab));
+    let _ = bp.handle_key(special(KeyCode::Enter));
+    let AskUserResponse::Submitted(answers) = rx.try_recv().unwrap() else {
+        panic!("questionnaire was not submitted");
+    };
+    let answers = astra_tools::ask_user::normalize_ask_user_answers(&prompt, &answers).unwrap();
+    let result = answers.to_tool_result_value();
+    assert_eq!(result["answers"]["first"], serde_json::json!("Yes"));
+    assert_eq!(result["answers"]["second"], serde_json::json!("No"));
+}
+
+#[test]
 fn ask_user_single_question_digit_submits_answer() {
     let mut bp = BottomPane::new();
     let mut rx = enqueue(
@@ -54,6 +104,7 @@ fn ask_user_single_question_digit_submits_answer() {
         AskUserPrompt {
             context: Some("The agent needs a product decision.".into()),
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "Stack".into(),
                 question: "Which implementation should we use?".into(),
                 options: vec![
@@ -73,6 +124,7 @@ fn ask_user_single_question_digit_submits_answer() {
         rx.try_recv().unwrap(),
         AskUserResponse::Submitted(AskUserAnswers {
             answers: vec![AskUserQuestionAnswer {
+                id: None,
                 question: "Which implementation should we use?".into(),
                 answers: vec!["Native TUI".into()],
                 multi_select: false,
@@ -91,6 +143,7 @@ fn ask_user_questionnaire_renders_tabs_and_multi_select_checkboxes() {
             context: Some("Need to pin the first version.".into()),
             questions: vec![
                 AskUserQuestion {
+                    id: None,
                     header: "Frontend".into(),
                     question: "Which frontend stack should we use?".into(),
                     options: vec![choice("React + TS", None), choice("Vue 3 + TS", None)],
@@ -98,6 +151,7 @@ fn ask_user_questionnaire_renders_tabs_and_multi_select_checkboxes() {
                     allow_freeform: true,
                 },
                 AskUserQuestion {
+                    id: None,
                     header: "Features".into(),
                     question: "Which features should we include first?".into(),
                     options: vec![choice("RBAC", None), choice("Reports", None)],
@@ -133,6 +187,7 @@ fn ask_user_questionnaire_submits_answers_across_tabs() {
             context: None,
             questions: vec![
                 AskUserQuestion {
+                    id: None,
                     header: "Frontend".into(),
                     question: "Which frontend stack should we use?".into(),
                     options: vec![choice("React + TS", None), choice("Vue 3 + TS", None)],
@@ -140,6 +195,7 @@ fn ask_user_questionnaire_submits_answers_across_tabs() {
                     allow_freeform: false,
                 },
                 AskUserQuestion {
+                    id: None,
                     header: "Features".into(),
                     question: "Which features should we include first?".into(),
                     options: vec![choice("RBAC", None), choice("Reports", None)],
@@ -162,12 +218,14 @@ fn ask_user_questionnaire_submits_answers_across_tabs() {
         AskUserResponse::Submitted(AskUserAnswers {
             answers: vec![
                 AskUserQuestionAnswer {
+                    id: None,
                     question: "Which frontend stack should we use?".into(),
                     answers: vec!["React + TS".into()],
                     multi_select: false,
                     annotation: None,
                 },
                 AskUserQuestionAnswer {
+                    id: None,
                     question: "Which features should we include first?".into(),
                     answers: vec!["RBAC".into()],
                     multi_select: true,
@@ -186,6 +244,7 @@ fn preview_question_renders_preview_panel_and_notes_hint() {
         AskUserPrompt {
             context: None,
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "Layout".into(),
                 question: "Which layout should we use?".into(),
                 options: vec![
@@ -220,6 +279,7 @@ fn preview_question_submits_notes_and_selected_preview_annotation() {
         AskUserPrompt {
             context: None,
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "Layout".into(),
                 question: "Which layout should we use?".into(),
                 options: vec![
@@ -255,6 +315,7 @@ fn preview_question_submits_notes_and_selected_preview_annotation() {
         rx.try_recv().unwrap(),
         AskUserResponse::Submitted(AskUserAnswers {
             answers: vec![AskUserQuestionAnswer {
+                id: None,
                 question: "Which layout should we use?".into(),
                 answers: vec!["Cards".into()],
                 multi_select: false,
@@ -275,6 +336,7 @@ fn freeform_other_renders_visible_input_box_and_cursor() {
         AskUserPrompt {
             context: Some("需要先补齐需求信息。".into()),
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "限制".into(),
                 question: "请说明你的偏好技术栈，以及还有什么额外限制。".into(),
                 options: vec![choice("前后端分离", None), choice("单体应用", None)],
@@ -307,6 +369,7 @@ fn freeform_only_question_without_options_submits_typed_answer() {
         AskUserPrompt {
             context: None,
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "Name".into(),
                 question: "What should we name this command?".into(),
                 options: vec![],
@@ -327,6 +390,7 @@ fn freeform_only_question_without_options_submits_typed_answer() {
         rx.try_recv().unwrap(),
         AskUserResponse::Submitted(AskUserAnswers {
             answers: vec![AskUserQuestionAnswer {
+                id: None,
                 question: "What should we name this command?".into(),
                 answers: vec!["astra ask".into()],
                 multi_select: false,
@@ -344,6 +408,7 @@ fn ask_user_escape_reports_cancellation_not_answer_sentinel() {
         AskUserPrompt {
             context: None,
             questions: vec![AskUserQuestion {
+                id: None,
                 header: "Continue".into(),
                 question: "Continue?".into(),
                 options: vec![choice("Yes", None), choice("No", None)],
