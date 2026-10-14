@@ -480,7 +480,7 @@ fn apply_dashboard_event_to_snapshot(snapshot: &mut DashboardSnapshot, event: &D
 
 static DASHBOARD_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn next_dashboard_event_sequence() -> u64 {
+pub fn next_dashboard_event_sequence() -> u64 {
     DASHBOARD_EVENT_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1
 }
 

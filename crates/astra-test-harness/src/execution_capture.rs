@@ -48,6 +48,14 @@ pub struct SessionExecutionCapture {
 pub(crate) struct ExecutionToolCall<'a> {
     pub run_id: &'a str,
     pub name: &'a str,
+    /// Request sequence, used when a criterion requires a later request to
+    /// observe an earlier terminal result before it is emitted.
+    pub request_seq: i64,
+    /// Terminal receipt sequence, distinct from the request sequence. A
+    /// sequence criterion that crosses a recovery boundary must use the
+    /// observed terminal order, not merely the order in which requests were
+    /// emitted.
+    pub terminal_seq: i64,
     pub arguments: Option<Value>,
     pub result: Option<Value>,
     pub raw_result: &'a str,
@@ -330,6 +338,8 @@ impl SessionExecutionCapture {
                 ExecutionToolCall {
                     run_id: run,
                     name: &call.name,
+                    request_seq: seq,
+                    terminal_seq: item.item_seq,
                     arguments: serde_json::from_str(&call.arguments).ok(),
                     result: serde_json::from_str(&item.content).ok(),
                     raw_result: &item.content,

@@ -266,7 +266,11 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
 
     let plan_mode_blocked = provider_policy.map_or_else(
         || crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool_name, &normalized_args),
-        |policy| !policy.is_read_only(),
+        // A native collaborator is admitted as a control-plane stage. Its
+        // adapter clamps the actual workspace effect to the plan-mode ceiling
+        // before starting the provider, so do not reject it merely because
+        // its descriptor cannot claim that every invocation is read-only.
+        |policy| !policy.is_read_only() && !policy.is_collaborator_stage(),
     );
     if plan_mode_active && plan_mode_blocked {
         return PermissionCheckResult::Denied {
@@ -279,6 +283,22 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
             ),
         };
     }
+    // Plan mode clamps a collaborator stage to the same read-only execution
+    // ceiling that the native adapter will enforce. Keep that projection
+    // local to this permission decision; the provider declaration must not
+    // claim that every invocation is read-only, and the original policy still
+    // reaches execution for its actual grant and protocol identity.
+    let plan_mode_policy = provider_policy
+        .filter(|policy| plan_mode_active && policy.is_collaborator_stage())
+        .map(|policy| {
+            let mut projected = policy.clone();
+            projected.effect = astra_turn_types::ResolvedToolEffect::ReadOnly;
+            projected.approval =
+                astra_turn_core::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval;
+            projected.idempotency = astra_turn_types::ResolvedToolIdempotency::PureRead;
+            projected
+        });
+    let effective_provider_policy = plan_mode_policy.as_ref().or(provider_policy);
     let normalized_args_str = serde_json::to_string(&normalized_args).ok();
     check_tool_permission_with_provider_policy(
         tool_name,
@@ -286,7 +306,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         permission_context,
         mailbox,
         timeout,
-        provider_policy,
+        effective_provider_policy,
     )
     .await
 }
@@ -312,6 +332,8 @@ mod tests {
     fn provider_policy(effect: astra_turn_types::ResolvedToolEffect) -> ResolvedInvocationPolicy {
         let read_only = effect == astra_turn_types::ResolvedToolEffect::ReadOnly;
         ResolvedInvocationPolicy {
+            runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
@@ -345,6 +367,9 @@ mod tests {
         });
         let read = provider_policy(astra_turn_types::ResolvedToolEffect::ReadOnly);
         let unknown = provider_policy(astra_turn_types::ResolvedToolEffect::Unknown);
+        let mut collaborator = provider_policy(astra_turn_types::ResolvedToolEffect::Mutating);
+        collaborator.native_collaborator_protocol =
+            Some(astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer);
 
         let allowed = check_tool_permission_in_plan_mode_with_provider_policy(
             "provider__read",
@@ -357,6 +382,18 @@ mod tests {
         )
         .await;
         assert!(is_allowed(&allowed));
+
+        let allowed_collaborator = check_tool_permission_in_plan_mode_with_provider_policy(
+            "provider__collaborator",
+            Some("{}"),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+            true,
+            Some(&collaborator),
+        )
+        .await;
+        assert!(is_allowed(&allowed_collaborator));
 
         let denied = check_tool_permission_in_plan_mode_with_provider_policy(
             "provider__unknown",

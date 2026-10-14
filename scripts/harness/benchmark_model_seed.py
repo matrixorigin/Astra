@@ -21,19 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import preflight
-
-
-class SeedError(RuntimeError):
-    pass
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def owned_api_opener() -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+from preflight import ModelContractError as SeedError, owned_api_opener, request_json as _request_json
 
 
 def _load_yaml(path: Path) -> Any:
@@ -224,42 +212,6 @@ def model_create_payload(entry: dict[str, Any], model_name: str) -> dict[str, An
     return payload
 
 
-def _request_json(
-    opener: urllib.request.OpenerDirector,
-    url: str,
-    token: str,
-    payload: dict[str, Any] | None,
-    expected_status: int,
-    operation: str,
-    *,
-    method: str = "POST",
-    timeout: float = 60,
-) -> dict[str, Any]:
-    body = None
-    headers = {"Authorization": f"Bearer {token}"}
-    if payload is not None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            status = response.status
-            response_body = response.read(2 * 1024 * 1024)
-    except urllib.error.HTTPError as error:
-        raise SeedError(f"{operation} returned HTTP {error.code}") from None
-    except (OSError, urllib.error.URLError):
-        raise SeedError(f"{operation} could not reach the owned Astra server") from None
-    if status != expected_status:
-        raise SeedError(f"{operation} returned HTTP {status}")
-    try:
-        value = json.loads(response_body.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise SeedError(f"{operation} returned invalid JSON") from error
-    if not isinstance(value, dict):
-        raise SeedError(f"{operation} returned a non-object response")
-    return value
-
-
 def register_selected_model(
     api_url: str,
     config: Path,
@@ -293,10 +245,10 @@ def register_selected_model(
     if checked.get("name") != model_name or checked.get("is_active") is not True:
         raise SeedError("selected model connectivity check did not activate the exact model")
     capability = checked.get("thinking_capability")
-    if thinking == "high" and capability not in {"both", "effort_only"}:
-        raise SeedError(
-            "selected high-thinking model does not expose controllable thinking"
-        )
+    try:
+        preflight.admit_model_execution(base_url, token, model_name, thinking, opener=opener)
+    except ValueError as error:
+        raise SeedError(str(error)) from None
     return {
         "model_name": model_name,
         "thinking_mode": thinking or "none",

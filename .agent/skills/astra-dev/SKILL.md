@@ -45,9 +45,10 @@ behavior. A small diff is not a systemic fix by itself.
 - Consolidate or remove redundant implementations, tables, projections, and tests
   within the changed ownership boundary. Search callers and relevant recent main
   commits; do not expand into unrelated cleanup or optimize for lines deleted.
-- For complex design use GPT-6 medium; for independent review before committing
-  use GPT-6 high, unless the current task explicitly specifies otherwise. Follow
-  the model-evidence rules in [review-changes](../review_changes/SKILL.md).
+- Honor design and independent-review requirements from the user or applicable
+  configured workflow, including model and effort. Do not introduce them merely
+  by loading this skill. Follow [review-changes](../review_changes/SKILL.md)
+  for required review and model provenance.
 
 ## Hard Rule: Structured Control Flow
 

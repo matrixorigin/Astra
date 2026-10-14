@@ -1236,10 +1236,11 @@ mod tests {
         let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("target_count slots")
+            desc.contains("Parent work excludes child scope")
+                && desc.contains("Exact provider/Offering")
+                && desc.contains("slots=target_count")
                 && desc.contains("description+prompt")
-                && desc.contains("atomic")
-                && desc.contains("hard requirements bind"),
+                && desc.contains("atomic"),
             "selection summary must keep the current fanout admission contract: {desc}"
         );
     }

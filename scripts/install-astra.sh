@@ -211,7 +211,9 @@ fi
 [ "$expected" = "$actual" ] || fail "checksum mismatch for ${archive}"
 info "Checksum verified"
 
-members=$(tar -tzf "${tmp_dir}/${archive}" | sort)
+# LC_ALL pins the comparison to C byte order: under UTF-8 locales collation
+# is case-insensitive and would reorder the members, failing real installs.
+members=$(tar -tzf "${tmp_dir}/${archive}" | LC_ALL=C sort)
 [ "$members" = "$(printf 'LICENSE\nastra\nastra-edge')" ] \
     || fail "release archive must contain exactly astra, astra-edge, and LICENSE at its root"
 for binary in $BINARIES; do

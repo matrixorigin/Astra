@@ -71,7 +71,9 @@ use sqlx::{MySql, Pool, Row, query};
 use tokio::sync::{Notify, RwLock, mpsc, oneshot, watch};
 use tracing::Instrument;
 
-use super::transport::{MailboxSubscription, MessageStream, MessageTransport};
+use super::transport::{
+    MailboxCapabilities, MailboxSubscription, MessageStream, MessageTransport, ResolvedMailbox,
+};
 use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
 
 /// Default interval between DB polls for new messages.
@@ -177,6 +179,7 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
             run_id VARCHAR(128) NOT NULL,
             owner_instance_id VARCHAR(64) NOT NULL,
             lease_expires_at_ms BIGINT NOT NULL,
+            accepts_structured_requests BOOLEAN NOT NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (delegation_id, agent_id),
             INDEX idx_agent_mailbox_directory_lease (lease_expires_at_ms)
@@ -521,7 +524,7 @@ impl DatabaseTransport {
             "UPDATE agent_mailbox_directory
              SET lease_expires_at_ms = {DIRECTORY_DB_NOW_MS} + ?, updated_at = NOW(6), owner_instance_id = ?
              WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
-               AND owner_instance_id = ?"
+               AND owner_instance_id = ? AND accepts_structured_requests = ?"
         ))
         .bind(lease_duration_ms)
         .bind(subscription.id())
@@ -529,6 +532,7 @@ impl DatabaseTransport {
         .bind(&addr.agent_id)
         .bind(&addr.run_id)
         .bind(previous.unwrap_or(subscription).id())
+        .bind(subscription.capabilities().accepts_structured_requests)
         .execute(&self.pool)
         .await
         .map_err(|error| MailboxError::Transport(format!("directory renew: {error}")))?;
@@ -541,24 +545,27 @@ impl DatabaseTransport {
         query(&format!(
             "DELETE FROM agent_mailbox_directory
              WHERE delegation_id = ? AND agent_id = ?
-               AND lease_expires_at_ms <= {DIRECTORY_DB_NOW_MS}"
+               AND lease_expires_at_ms <= {DIRECTORY_DB_NOW_MS}
+               AND accepts_structured_requests = ?"
         ))
         .bind(delegation_id)
         .bind(&addr.agent_id)
+        .bind(subscription.capabilities().accepts_structured_requests)
         .execute(&self.pool)
         .await
         .map_err(|error| MailboxError::Transport(format!("directory reclaim: {error}")))?;
 
         let inserted = query(&format!(
             "INSERT IGNORE INTO agent_mailbox_directory
-             (delegation_id, agent_id, run_id, owner_instance_id, lease_expires_at_ms)
-             VALUES (?, ?, ?, ?, {DIRECTORY_DB_NOW_MS} + ?)"
+             (delegation_id, agent_id, run_id, owner_instance_id, lease_expires_at_ms, accepts_structured_requests)
+             VALUES (?, ?, ?, ?, {DIRECTORY_DB_NOW_MS} + ?, ?)"
         ))
         .bind(delegation_id)
         .bind(&addr.agent_id)
         .bind(&addr.run_id)
         .bind(subscription.id())
         .bind(lease_duration_ms)
+        .bind(subscription.capabilities().accepts_structured_requests)
         .execute(&self.pool)
         .await
         .map_err(|error| MailboxError::Transport(format!("directory register: {error}")))?;
@@ -579,7 +586,7 @@ impl DatabaseTransport {
     ) -> Result<(), MailboxError> {
         let addr = subscription.address();
         query(
-            "DELETE FROM agent_mailbox_directory
+            "UPDATE agent_mailbox_directory SET lease_expires_at_ms = 0
              WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
                AND owner_instance_id = ?",
         )
@@ -677,10 +684,11 @@ impl DatabaseTransport {
 
 #[async_trait]
 impl MessageTransport for DatabaseTransport {
-    async fn register(
+    async fn register_with_capabilities(
         &self,
         addr: AgentAddress,
         delegation_id: Option<String>,
+        capabilities: MailboxCapabilities,
     ) -> Result<MailboxSubscription, MailboxError> {
         let gate = self.registration_gate(&addr);
         let _registration = gate.lock().await;
@@ -688,7 +696,15 @@ impl MessageTransport for DatabaseTransport {
             return Err(MailboxError::Transport("transport is shut down".into()));
         }
         let previous = self.registrations.read().await.get(&addr).cloned();
-        let subscription = MailboxSubscription::new(addr.clone());
+        if previous
+            .as_ref()
+            .is_some_and(|(owner, _)| owner.capabilities() != capabilities)
+        {
+            return Err(MailboxError::Protocol(
+                "mailbox capabilities changed before retirement".into(),
+            ));
+        }
+        let subscription = MailboxSubscription::with_capabilities(addr.clone(), capabilities);
         if let Some(delegation_id) = delegation_id.as_deref()
             && let Err(error) = self
                 .register_directory_entry(
@@ -804,6 +820,17 @@ impl MessageTransport for DatabaseTransport {
                 errors.join("; ")
             )))
         }
+    }
+
+    async fn retire(&self, subscription: &MailboxSubscription) -> Result<(), MailboxError> {
+        query("DELETE FROM agent_mailbox_directory WHERE run_id = ? AND agent_id = ? AND owner_instance_id = ?")
+            .bind(&subscription.run_id)
+            .bind(&subscription.agent_id)
+            .bind(subscription.id())
+            .execute(&self.pool)
+            .await
+            .map_err(|error| MailboxError::Transport(format!("directory retirement: {error}")))?;
+        Ok(())
     }
 
     async fn forget_abandoned_route(
@@ -956,13 +983,13 @@ impl MessageTransport for DatabaseTransport {
         }))
     }
 
-    async fn resolve_agent(
+    async fn resolve_mailbox(
         &self,
         delegation_id: &str,
         agent_id: &str,
-    ) -> Result<AgentAddress, MailboxError> {
+    ) -> Result<ResolvedMailbox, MailboxError> {
         let row = query(&format!(
-            "SELECT run_id FROM agent_mailbox_directory
+            "SELECT run_id, accepts_structured_requests FROM agent_mailbox_directory
              WHERE delegation_id = ? AND agent_id = ?
                AND lease_expires_at_ms > {DIRECTORY_DB_NOW_MS}"
         ))
@@ -977,7 +1004,17 @@ impl MessageTransport for DatabaseTransport {
         let run_id: String = row
             .try_get("run_id")
             .map_err(|error| MailboxError::Transport(format!("directory decode: {error}")))?;
-        Ok(AgentAddress::new(run_id, agent_id))
+        let accepts_structured_requests =
+            row.try_get("accepts_structured_requests")
+                .map_err(|error| {
+                    MailboxError::Transport(format!("directory capability decode: {error}"))
+                })?;
+        Ok(ResolvedMailbox {
+            address: AgentAddress::new(run_id, agent_id),
+            capabilities: MailboxCapabilities {
+                accepts_structured_requests,
+            },
+        })
     }
 
     async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError> {
@@ -1096,7 +1133,7 @@ impl MessageTransport for DatabaseTransport {
             .collect();
         if !directory_owners.is_empty() {
             let mut cleanup = sqlx::QueryBuilder::<MySql>::new(
-                "DELETE FROM agent_mailbox_directory WHERE owner_instance_id IN (",
+                "UPDATE agent_mailbox_directory SET lease_expires_at_ms = 0 WHERE owner_instance_id IN (",
             );
             let mut owners = cleanup.separated(", ");
             for owner in directory_owners {
@@ -1946,6 +1983,7 @@ impl MessageStream for DatabaseMessageStream {
         let mut outcomes = vec![Ok(()); messages.len()];
         let mut direct = Vec::new();
         let mut broadcast = Vec::new();
+        let mut confirmed = Vec::new();
         for (index, message) in messages.iter().enumerate() {
             let Some(claim_token) = self.claim_token(message).map(str::to_owned) else {
                 outcomes[index] = Err(MailboxError::Protocol(
@@ -1982,8 +2020,7 @@ impl MessageStream for DatabaseMessageStream {
                         );
                     }
                     for (index, _, _) in entries {
-                        self.receipts
-                            .remove(&(Arc::as_ptr(&messages[index]) as usize));
+                        confirmed.push(Arc::as_ptr(&messages[index]) as usize);
                     }
                 }
                 Err(error) => {
@@ -1992,6 +2029,11 @@ impl MessageStream for DatabaseMessageStream {
                     }
                 }
             }
+        }
+        // No awaits after removing receipts. A cancelled mixed batch retains
+        // the original envelopes for an idempotent storage retry.
+        for key in confirmed {
+            self.receipts.remove(&key);
         }
         outcomes
     }
@@ -2599,6 +2641,211 @@ mod tests {
                 .ends_with("LIMIT ?"),
             "orphan delivery cleanup must stay batch bounded"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_remote_resolution_retains_receiver_capability_and_lease_fencing() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.unwrap();
+        let namespace = format!("capability-{}", uuid::Uuid::new_v4());
+        let receiver = DatabaseTransport::new(pool.clone());
+        let sender = DatabaseTransport::new(pool.clone());
+        for capabilities in [
+            MailboxCapabilities::provider_stage_text_only(),
+            MailboxCapabilities::default(),
+        ] {
+            let address = AgentAddress::new(
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            let subscription = receiver
+                .register_with_capabilities(address.clone(), Some(namespace.clone()), capabilities)
+                .await
+                .unwrap();
+            let resolved = sender
+                .resolve_mailbox(&namespace, &address.agent_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved,
+                ResolvedMailbox {
+                    address: address.clone(),
+                    capabilities
+                }
+            );
+            let renewed = receiver
+                .register_with_capabilities(address.clone(), Some(namespace.clone()), capabilities)
+                .await
+                .unwrap();
+            receiver.unregister(&subscription).await.unwrap();
+            assert_eq!(
+                sender
+                    .resolve_mailbox(&namespace, &address.agent_id)
+                    .await
+                    .unwrap()
+                    .capabilities,
+                capabilities,
+                "stale cleanup must not remove renewed capability"
+            );
+            receiver.unregister(&renewed).await.unwrap();
+            assert!(matches!(
+                sender.resolve_mailbox(&namespace, &address.agent_id).await,
+                Err(MailboxError::AgentNotFound(_))
+            ));
+            assert!(
+                sender
+                    .register_with_capabilities(
+                        address.clone(),
+                        Some(namespace.clone()),
+                        MailboxCapabilities {
+                            accepts_structured_requests: !capabilities.accepts_structured_requests
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            let recovered = sender
+                .register_with_capabilities(address.clone(), Some(namespace.clone()), capabilities)
+                .await
+                .unwrap();
+            receiver.unregister(&renewed).await.unwrap();
+            assert_eq!(
+                sender
+                    .resolve_mailbox(&namespace, &address.agent_id)
+                    .await
+                    .unwrap()
+                    .capabilities,
+                capabilities
+            );
+            sender.unregister(&recovered).await.unwrap();
+            assert!(
+                receiver
+                    .register_with_capabilities(
+                        address.clone(),
+                        Some(namespace.clone()),
+                        MailboxCapabilities {
+                            accepts_structured_requests: !capabilities.accepts_structured_requests
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "detach must preserve immutable capabilities across transports"
+            );
+            sender.retire(&recovered).await.unwrap();
+            let next = receiver
+                .register_with_capabilities(
+                    address.clone(),
+                    Some(namespace.clone()),
+                    MailboxCapabilities {
+                        accepts_structured_requests: !capabilities.accepts_structured_requests,
+                    },
+                )
+                .await
+                .unwrap();
+            sender.retire(&recovered).await.unwrap();
+            assert_eq!(
+                sender
+                    .resolve_mailbox(&namespace, &address.agent_id)
+                    .await
+                    .unwrap()
+                    .capabilities,
+                next.capabilities(),
+                "stale retirement must not remove the successor"
+            );
+            receiver.unregister(&next).await.unwrap();
+            receiver.retire(&next).await.unwrap();
+        }
+        receiver.shutdown().await.unwrap();
+        sender.shutdown().await.unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cancelled_mixed_ack_batch_retains_original_envelopes_for_retry() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.unwrap();
+        let receiver = AgentAddress::new(format!("mixed-{}", uuid::Uuid::new_v4()), "receiver");
+        let delegation = format!("mixed-{}", uuid::Uuid::new_v4());
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(10));
+        let subscription = transport
+            .register(receiver.clone(), Some(delegation.clone()))
+            .await
+            .unwrap();
+        let mut stream = transport.subscribe(&subscription).await.unwrap();
+        let message = |to| {
+            Arc::new(AgentMessage::new(
+                AgentAddress::new("mixed-sender", "sender"),
+                to,
+                MessagePayload::Text {
+                    content: "guidance".into(),
+                    summary: None,
+                },
+            ))
+        };
+        let direct = message(MessageTarget::Direct {
+            address: receiver.clone(),
+        });
+        let broadcast = message(MessageTarget::Broadcast {
+            delegation_id: delegation.clone(),
+        });
+        transport.send(direct.clone()).await.unwrap();
+        transport
+            .broadcast(&delegation, broadcast.clone())
+            .await
+            .unwrap();
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            delivered.push(
+                tokio::time::timeout(Duration::from_secs(2), stream.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let mut lock = pool.begin().await.unwrap();
+        query("SELECT message_id FROM agent_message_broadcast_delivery WHERE message_id = ? FOR UPDATE")
+            .bind(&broadcast.id).fetch_one(&mut *lock).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                stream.acknowledge_many(&delivered)
+            )
+            .await
+            .is_err(),
+            "the broadcast row lock must interrupt this real mixed batch"
+        );
+        assert_eq!(
+            queue_message_status(&pool, &direct.id).await,
+            "acked",
+            "direct acknowledgement must have committed before cancellation"
+        );
+        lock.rollback().await.unwrap();
+        let outcomes =
+            tokio::time::timeout(Duration::from_secs(2), stream.acknowledge_many(&delivered))
+                .await
+                .unwrap();
+        assert!(
+            outcomes.iter().all(Result::is_ok),
+            "retry must retain exact delivered envelopes: {outcomes:?}"
+        );
+        assert_eq!(
+            broadcast_delivery_status(
+                &pool,
+                &broadcast.id,
+                &format!("{}@{}", receiver.agent_id, receiver.run_id)
+            )
+            .await,
+            "acked"
+        );
+        transport.unregister(&subscription).await.unwrap();
+        transport.retire(&subscription).await.unwrap();
+        transport.shutdown().await.unwrap();
+        pool.close().await;
     }
 
     #[tokio::test]

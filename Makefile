@@ -252,7 +252,14 @@ dev-deps-up:
 		exit 1; \
 	fi
 	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
-	@$(DEPS_COMPOSE) up -d matrixone
+	@attempt=1; \
+	while ! ( $(DEPS_COMPOSE) up -d matrixone ); do \
+		if [ "$$attempt" -ge 3 ]; then exit 1; fi; \
+		delay=$$((attempt * 5)); \
+		echo "MatrixOne startup failed; retrying in $${delay}s ($$attempt/3)..."; \
+		sleep "$$delay"; \
+		attempt=$$((attempt + 1)); \
+	done
 	@$(MAKE) dev-deps-wait-matrixone
 	@$(MAKE) dev-deps-ensure-memoria
 	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"

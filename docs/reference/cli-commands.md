@@ -195,6 +195,23 @@ astra admin prompt optimize --agent-id <agent_id> [--optimization-type quality]
 astra admin feedback export [--agent-id <agent_id>] [--format jsonl]
 ```
 
+For a custom OpenAI-compatible deployment, transport compatibility does not prove
+support for thinking controls. If the deployment has been verified to support
+`reasoning_effort`, add `thinking_protocol: reasoning_effort` alongside `name`
+and `provider` in its YAML model entry, then run
+`astra admin model load .models.yaml --update-existing`. Keep all existing model
+fields and quirks: supplying quirks replaces the complete stored object.
+`astra admin model check <name>` repeats the check; `model show <name>` exposes
+the observation and diagnostics. An `effort_only` result allows effort selection,
+not thinking Off. An inconclusive check establishes no new capability. A matching
+prior capability may remain available while diagnostics record the latest error.
+
+Explicit CLI model selectors such as `'<name>(thinking:low)'`,
+`'<name>(thinking:medium)'` and `'<name>(thinking:high)'` select depth. A plain
+`<name>` retains the provider default. The declaration alone does not force Low
+and a successful effort probe does not prove that the provider honors every
+level; verify the deployment's supported values before declaring its protocol.
+
 ## Notes
 
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)

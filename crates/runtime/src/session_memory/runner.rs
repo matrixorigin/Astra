@@ -666,19 +666,23 @@ pub async fn load_current_session_memory_with_freshness(
 ) -> Option<LoadedSessionMemory> {
     load_current_session_memory_snapshot(memoria, session_id)
         .await
+        .ok()
+        .flatten()
         .map(|snapshot| LoadedSessionMemory {
             content: snapshot.to_markdown(),
             updated_turn: Some(snapshot.updated_turn),
         })
 }
 
+/// Preserve read failures for destructive consumers. Optional context callers
+/// explicitly project errors to absent context instead of granting cleanup.
 pub(crate) async fn load_current_session_memory_snapshot(
     memoria: &dyn MemoriaPort,
     session_id: &str,
-) -> Option<SessionMemorySnapshot> {
+) -> Result<Option<SessionMemorySnapshot>, astra_memoria::MemoriaOperationError> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let query = format!("{SESSION_MEMORY_PREFIX} {session_id} session memory");
@@ -692,11 +696,11 @@ pub(crate) async fn load_current_session_memory_snapshot(
         )
         .await
     {
-        Ok(memories) => select_latest_session_memory_snapshot(&memories, session_id),
-        Err(astra_memoria::MemoriaOperationError::Disabled(_)) => None,
-        Err(astra_memoria::MemoriaOperationError::AuthorityUnavailable(error)) => {
+        Ok(memories) => Ok(select_latest_session_memory_snapshot(&memories, session_id)),
+        Err(error @ astra_memoria::MemoriaOperationError::Disabled(_)) => Err(error),
+        Err(error @ astra_memoria::MemoriaOperationError::AuthorityUnavailable(_)) => {
             tracing::warn!(session_id, error = %error, "session memory admission check unavailable");
-            None
+            Err(error)
         }
         Err(e) => {
             tracing::warn!(
@@ -704,7 +708,7 @@ pub(crate) async fn load_current_session_memory_snapshot(
                 error = %e,
                 "session_memory typed retrieval failed"
             );
-            None
+            Err(e)
         }
     }
 }
@@ -765,7 +769,10 @@ pub async fn load_current_session_memory_preferring_local_with_freshness(
     let local = load_local_session_memory_artifact(session_id);
     let local_turn = load_local_session_memory_metadata(session_id)
         .and_then(|metadata| metadata.last_extracted_turn);
-    let remote = load_current_session_memory_snapshot(memoria, session_id).await;
+    let remote = load_current_session_memory_snapshot(memoria, session_id)
+        .await
+        .ok()
+        .flatten();
 
     select_current_session_memory(local, local_turn, remote)
 }
@@ -790,7 +797,7 @@ pub async fn load_current_session_memory_preferring_local_with_deadline(
     )
     .await
     {
-        Ok(remote) => remote,
+        Ok(remote) => remote.ok().flatten(),
         Err(_) => {
             tracing::warn!(
                 session_id = %session_id,
@@ -3741,7 +3748,7 @@ mod tests {
         assert!(
             load_current_session_memory_snapshot(&memoria, "disabled-session")
                 .await
-                .is_none()
+                .is_err()
         );
         assert_eq!(memoria.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         for error in [
@@ -3751,8 +3758,19 @@ mod tests {
         ] {
             let memoria: Arc<dyn MemoriaPort> = Arc::new(DisabledMemoria(
                 std::sync::atomic::AtomicUsize::new(0),
-                error,
+                error.clone(),
             ));
+            assert_eq!(
+                load_current_session_memory_snapshot(memoria.as_ref(), "session")
+                    .await
+                    .unwrap_err(),
+                error
+            );
+            assert!(
+                load_current_session_memory(memoria.as_ref(), "session")
+                    .await
+                    .is_none()
+            );
             assert_eq!(
                 retrieve_prior_session_memory_page(&memoria, "session", 10)
                     .await

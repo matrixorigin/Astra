@@ -4139,6 +4139,7 @@ async fn ensure_core_schema_while_leased(
             session_id VARCHAR(64) NOT NULL,
             event_type VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NOT NULL,
+            invocation_supersession_scope_key VARCHAR(64) NULL,
             agent_id VARCHAR(255) NULL,
             subject_run_id VARCHAR(64) NULL,
             interaction_request_id VARCHAR(128) NULL,
@@ -4153,6 +4154,7 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_run_event_idx (user_id, run_id, event_idx),
             UNIQUE KEY uq_run_event_idempotency (user_id, run_id, idempotency_key),
             INDEX idx_agent_run_events_control_type_idx (user_id, run_id, event_type, event_idx),
+            INDEX idx_agent_run_events_invocation_control (invocation_supersession_scope_key),
             INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx),
             INDEX idx_agent_run_events_owner_session_subject (user_id, session_id, event_type, subject_run_id, event_idx),
             INDEX idx_agent_run_events_interaction (user_id, run_id, interaction_request_id, event_type, event_idx),
@@ -5978,17 +5980,30 @@ async fn verify_core_schema_shape(
     // CREATE IF NOT EXISTS does not validate existing tables. Reject missing
     // runtime fields without restoring the historical ALTER/repair path.
     let columns = query(
-        "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?",
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH
+         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?",
     )
     .bind(database)
     .fetch_all(pool)
     .await?
     .into_iter()
     .map(|row| {
-        Ok((
-            row.try_get::<String, _>("TABLE_NAME")?,
-            row.try_get::<String, _>("COLUMN_NAME")?,
-        ))
+        let table: String = row.try_get("TABLE_NAME")?;
+        let column: String = row.try_get("COLUMN_NAME")?;
+        if table == "agent_run_events"
+            && column == "invocation_supersession_scope_key"
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+        {
+            return Err(sqlx::Error::Protocol(
+                "agent_run_events.invocation_supersession_scope_key must be nullable VARCHAR(64)"
+                    .into(),
+            ));
+        }
+        Ok((table, column))
     })
     .collect::<Result<BTreeSet<_>, sqlx::Error>>()?;
     for (table, required) in [
@@ -6015,7 +6030,11 @@ async fn verify_core_schema_shape(
         ("session_weighted_admission_gates", &["capacity_hash"][..]),
         (
             "agent_run_events",
-            &["subject_run_id", "interaction_request_id"][..],
+            &[
+                "subject_run_id",
+                "interaction_request_id",
+                "invocation_supersession_scope_key",
+            ][..],
         ),
         (
             "tool_invocation_ledger",
@@ -6303,6 +6322,10 @@ async fn verify_core_schema_shape(
         (
             "idx_agent_run_events_control_type_idx",
             &["user_id", "run_id", "event_type", "event_idx"][..],
+        ),
+        (
+            "idx_agent_run_events_invocation_control",
+            &["invocation_supersession_scope_key"][..],
         ),
         (
             "idx_agent_run_events_owner_session_run_idx",

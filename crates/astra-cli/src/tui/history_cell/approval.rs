@@ -95,6 +95,7 @@ fn compact_reason(reason: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalCell {
+    pub invocation_scoped: bool,
     pub id: u64,
     pub tool: String,
     pub header: String,
@@ -151,6 +152,7 @@ impl ApprovalCell {
             reason,
             focused,
             buttons: ButtonRow::primary(),
+            invocation_scoped: false,
             risk_tag_labels: Vec::new(),
             remember_preview: None,
             source_agent: None,
@@ -230,6 +232,9 @@ impl ApprovalCell {
     /// using only the labels we render in the cell — keeps the
     /// view layer free of the engine's `RiskTag` enum.
     pub fn always_disabled_reason(&self) -> Option<&'static str> {
+        if self.invocation_scoped {
+            return Some("this invocation only");
+        }
         // Sub-agent requests can never persist on the parent's
         // permissions.json.
         if self.source_agent.is_some() {
@@ -336,6 +341,9 @@ impl ApprovalCell {
     }
 
     fn scope_available(&self, scope: astra_turn_core::permission::scope::AllowScope) -> bool {
+        if self.invocation_scoped {
+            return scope == astra_turn_core::permission::scope::AllowScope::OnceThisCall;
+        }
         astra_turn_core::permission::scope::permitted_scopes(&self.scope_context())
             .into_iter()
             .any(|entry| entry.scope == scope && entry.available)
@@ -846,6 +854,22 @@ mod tests {
     }
 
     // ── Issue #326 P3 / R2 Major 1: scope-picker policy ──────
+
+    #[test]
+    fn runtime_dependency_approval_displays_invocation_scope() {
+        let mut cell = ApprovalCell::new(
+            1,
+            "sandbox_expand:runtime".into(),
+            "Read runtime dependencies".into(),
+            None,
+            "exact dependencies".into(),
+            true,
+        );
+        cell.invocation_scoped = true;
+        assert!(cell.always_action_disabled());
+        assert_eq!(cell.always_disabled_reason(), Some("this invocation only"));
+        assert!(render(&cell).contains("this invocation only"));
+    }
 
     #[test]
     fn always_disabled_for_destructive_risk() {

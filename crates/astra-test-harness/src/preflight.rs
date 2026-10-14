@@ -41,6 +41,28 @@ const OWNER_READINESS_PROBE_USER: &str = "astra-owner-readiness-probe";
 const OWNER_READINESS_PROBE_QUERY: &str = "__astra_owner_auth_readiness_probe__";
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Persist only typed preflight facts beside an opted-in report. Provider error
+/// details remain private; a missing supplementary model must be diagnosable.
+pub fn write_preflight_result(
+    report: Option<&Path>,
+    models: &[String],
+    result: &Result<Option<String>, PreflightError>,
+) -> std::io::Result<()> {
+    let Some(report) = report else {
+        return Ok(());
+    };
+    let unavailable = match result {
+        Err(PreflightError::ModelUnavailable { model, .. }) => Some(model),
+        _ => None,
+    };
+    let summary = serde_json::json!({
+        "status": if result.is_ok() { "passed" } else { "failed" },
+        "models": models,
+        "unavailable_model": unavailable,
+    });
+    std::fs::write(report.with_extension("preflight.json"), summary.to_string())
+}
+
 fn stderr_indicates_cli_auth_failure(stderr: &str) -> bool {
     stderr.contains("Could not validate credentials")
         || stderr.contains("Unable to obtain a valid access token")
@@ -1026,6 +1048,38 @@ async fn try_auto_register(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preflight_sidecar_reports_typed_dependency_without_private_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let models = vec!["glm-5.2".into(), "glm-5.3".into()];
+        for result in [
+            Ok(Some("default".into())),
+            Err(super::PreflightError::ModelUnavailable {
+                model: "glm-5.2".into(),
+                detail: "private-provider-sentinel".into(),
+            }),
+        ] {
+            super::write_preflight_result(Some(&report), &models, &result).unwrap();
+            let raw = std::fs::read_to_string(report.with_extension("preflight.json")).unwrap();
+            assert!(!raw.contains("private-provider-sentinel"));
+            let summary: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(summary["models"], serde_json::json!(models));
+            assert_eq!(
+                summary["status"],
+                if result.is_ok() { "passed" } else { "failed" }
+            );
+            assert_eq!(
+                summary["unavailable_model"],
+                if result.is_ok() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("glm-5.2")
+                }
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn public_preflight_resolves_profile_before_health_without_reusing_it_for_auto_auth() {
@@ -1444,7 +1498,11 @@ esac
                 matches!(error, super::PreflightError::BuildIdentity { .. }),
                 "{error}"
             );
-            assert_eq!(std::fs::read_to_string(&calls).unwrap(), expected_calls);
+            assert_eq!(
+                std::fs::read_to_string(&calls)
+                    .unwrap_or_else(|failure| panic!("{failure}; probe failed with {error}")),
+                expected_calls
+            );
             std::fs::remove_file(&calls).unwrap();
         }
     }

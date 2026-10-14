@@ -213,6 +213,7 @@ test("keeps a pending Work question actionable after the TUI is gone", async () 
               questions: [
                 {
                   header: "Environment",
+                  id: "placement",
                   question: "Where should this run?",
                   options: [{ label: "staging" }, { label: "production" }],
                   multi_select: false,
@@ -236,6 +237,7 @@ test("keeps a pending Work question actionable after the TUI is gone", async () 
       answers: {
         answers: [
           {
+            id: "placement",
             question: "Where should this run?",
             answers: ["staging"],
             multi_select: false,

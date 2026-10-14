@@ -253,13 +253,25 @@ fn probe_child() {
                     interrupted: true, ..
                 } if case == "resize_timeout" => {
                     tx.send(()).await.unwrap();
-                    assert!(
-                        matches!(
-                            tokio::time::timeout(Duration::from_millis(50), stream.next()).await,
-                            Ok(Some(crate::tui::event::TuiEvent::Draw))
-                        ),
-                        "cursor query blocked draw delivery"
-                    );
+                    // Input/draw polling alternates. A ready cursor report or
+                    // key may win once; it does not mean draw delivery blocked.
+                    // Preserve that event for the ordinary assertions below.
+                    let competing = tokio::time::timeout(Duration::from_millis(50), async {
+                        let first = stream.next().await.expect("input stream ended");
+                        if matches!(first, crate::tui::event::TuiEvent::Draw) {
+                            return None;
+                        }
+                        assert!(
+                            matches!(stream.next().await, Some(crate::tui::event::TuiEvent::Draw)),
+                            "ready drawing must not be starved by input"
+                        );
+                        Some(first)
+                    })
+                    .await
+                    .expect("cursor query blocked draw delivery");
+                    if let Some(event) = competing {
+                        stream.push_front(event);
+                    }
                 }
                 crate::tui::event::TuiEvent::Resize {
                     cursor,

@@ -370,7 +370,25 @@ impl ChatComposer {
             .clamp(2, 4)
     }
 
+    pub(super) fn is_explicit_followup_key(key: KeyEvent) -> bool {
+        matches!(key.code, crossterm::event::KeyCode::Char('q' | 'Q'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
+        if Self::is_explicit_followup_key(key) {
+            // Never clear a draft while part of a non-bracketed paste is
+            // still buffered. A due burst can join this submission; an
+            // ongoing burst stays in the composer for a later keypress.
+            self.flush_paste_burst();
+            return if self.textarea.paste_burst_active() || self.textarea.text().trim().is_empty() {
+                ComposerAction::Consumed
+            } else {
+                ComposerAction::QueueFollowUp
+            };
+        }
         if key.code == crossterm::event::KeyCode::Char('e')
             && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
             && !key
@@ -460,11 +478,9 @@ impl ChatComposer {
         let content_h = area.height.saturating_sub(top_inset);
         let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
 
-        // Mode-shift feedback: when a deferred follow-up is queued, the
-        // composer's Enter semantics change from "send now" to "enqueue".
-        // That shift must be visible at a glance — otherwise the user
-        // hits Enter expecting a send and the input silently lands in a
-        // queue they didn't realize was active. Two signals combine:
+        // Pending input feedback. This is a backlog indicator, not an
+        // Enter-routing mode: explicitly queued follow-ups can coexist with
+        // current-run guidance. Two signals combine:
         //   1. the prefix glyph flips `›` → `↳` (queued follow-up), and
         //   2. the prefix color brightens from accent_dim to accent, so
         //      the chrome reads as "armed" rather than "idle prompt".
@@ -540,6 +556,7 @@ impl ChatComposer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ComposerAction {
     Submit,
+    QueueFollowUp,
     OpenExternalEditor,
     Interrupt,
     Quit,
@@ -679,6 +696,26 @@ mod paste_tests {
         );
         assert_eq!(c.text(), "  \n\t");
         assert!(!c.is_flashing());
+    }
+
+    #[test]
+    fn explicit_followup_flushes_due_paste_and_keeps_an_ongoing_burst() {
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut composer = ChatComposer::new_ephemeral();
+        composer.set_text("prefix ");
+        composer.force_pending_paste_burst_for_test("pasted suffix", Instant::now());
+        assert_eq!(composer.handle_key(key), ComposerAction::QueueFollowUp);
+        assert_eq!(composer.clear_and_submit(), "prefix pasted suffix");
+
+        composer.set_text("another prefix ");
+        // Keep the simulated burst fresh for this keypress, without sleeps.
+        composer.force_pending_paste_burst_for_test(
+            "still buffered",
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(composer.handle_key(key), ComposerAction::Consumed);
+        assert_eq!(composer.text(), "another prefix ");
+        assert!(composer.textarea.paste_burst_active());
     }
 
     #[tokio::test]

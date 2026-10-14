@@ -319,9 +319,9 @@ pub enum UserIntentStatus {
     AcceptedLocal,
     AcceptedRemote,
     Applied,
-    /// The run reached a terminal boundary before applying the intent. The
-    /// server has durably relinquished delivery ownership; interactive
-    /// clients may restore the exact input as an unsent draft.
+    /// The server durably relinquished delivery ownership without applying
+    /// the intent, after a terminal boundary or a conclusive provider refusal.
+    /// Interactive clients may restore the exact input as an unsent draft.
     Returned,
 }
 

@@ -9,7 +9,10 @@
 use regex::{Regex, bytes::Regex as BytesRegex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use uuid::Uuid;
 
 struct CredentialPattern {
@@ -44,8 +47,9 @@ fn credential_patterns() -> &'static [CredentialPattern] {
         vec![
             pat!(r"AKIA[0-9A-Z]{16}", "AWS_ACCESS_KEY"),
             pat!(
-                r#"(?i)(?:aws_secret_access_key|aws_secret_key|\[\s*['"]?(?:aws_secret_access_key|aws_secret_key)['"]?\s*\]|['"](?:aws_secret_access_key|aws_secret_key)['"])\s*[=:]\s*['"]?[A-Za-z0-9/+=._-]{30,}"#,
-                "AWS_SECRET_KEY"
+                r#"(?i)(?:aws_secret_access_key|aws_secret_key|\[\s*['"]?(?:aws_secret_access_key|aws_secret_key)['"]?\s*\]|['"](?:aws_secret_access_key|aws_secret_key)['"])\s*[=:]\s*['"]?(?P<secret>[A-Za-z0-9/+=._-]{30,})"#,
+                "AWS_SECRET_KEY",
+                "secret"
             ),
             pat!(
                 r#"(?i)(?:--?(?:token|api[-_]?key|access[-_]?token|auth[-_]?token))(?:\s+|=)\s*['"]?(?P<secret>[A-Za-z0-9._\-/+=]{20,})"#,
@@ -65,8 +69,9 @@ fn credential_patterns() -> &'static [CredentialPattern] {
             ),
             pat!(r"://[^:@\s/]+:[^:@\s/]+@", "CONNECTION_CREDENTIAL"),
             pat!(
-                r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?[^\s'"]{12,}"#,
-                "SECRET_ASSIGNMENT"
+                r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?(?P<secret>[^\s'"]{12,})"#,
+                "SECRET_ASSIGNMENT",
+                "secret"
             ),
         ]
     })
@@ -80,19 +85,15 @@ fn credential_secret_spans<'a>(
         pattern
             .regex
             .captures_iter(text)
-            .filter(|captures| {
-                captures.get(0).is_some_and(|whole| {
-                    !span_is_generated_marker(text, whole.start(), whole.end())
-                })
-            })
             .filter_map(|captures| captures.name(secret_capture))
+            .filter(|matched| !span_is_redaction_envelope(text, matched.start(), matched.end()))
             .filter(|matched| !credential_match_is_explicit_placeholder(matched.as_str()))
             .collect()
     } else {
         pattern
             .regex
             .find_iter(text)
-            .filter(|matched| !span_is_generated_marker(text, matched.start(), matched.end()))
+            .filter(|matched| !span_is_redaction_envelope(text, matched.start(), matched.end()))
             .filter(|matched| !credential_match_is_explicit_placeholder(matched.as_str()))
             .collect()
     }
@@ -181,7 +182,7 @@ pub fn private_key_header_markers(text: &str) -> Vec<(usize, usize, String)> {
     pem_header_regex()
         .find_iter(text)
         .filter_map(|matched| {
-            if span_is_generated_marker(text, matched.start(), matched.end()) {
+            if span_is_redaction_envelope(text, matched.start(), matched.end()) {
                 return None;
             }
             pem_marker_kind(matched.as_str(), "-----BEGIN ")
@@ -195,7 +196,7 @@ pub fn private_key_end_markers(text: &str) -> Vec<(usize, usize, String)> {
     pem_end_regex()
         .find_iter(text)
         .filter_map(|matched| {
-            if span_is_generated_marker(text, matched.start(), matched.end()) {
+            if span_is_redaction_envelope(text, matched.start(), matched.end()) {
                 return None;
             }
             pem_marker_kind(matched.as_str(), "-----END ")
@@ -392,7 +393,7 @@ fn redact_pem_blocks(
     let mut search_from = 0usize;
 
     while let Some(header) = pem_header_regex().find_at(text, search_from) {
-        if span_is_generated_marker(text, header.start(), header.end()) {
+        if span_is_redaction_envelope(text, header.start(), header.end()) {
             search_from = header.end();
             continue;
         }
@@ -472,9 +473,9 @@ fn redact_json_value(value: &mut Value, object_key: Option<&str>) -> usize {
             // boundary parses valid tool arguments separately; this fallback
             // only performs display redaction and never rewrites JSON inside a
             // string.
-            let exact_trusted_marker = is_exact_trusted_marker(&original);
+            let exact_opaque_reference = is_exact_opaque_reference(&original);
             if count == 0
-                && !exact_trusted_marker
+                && !exact_opaque_reference
                 && !is_explicit_placeholder_value(&original)
                 && is_high_confidence_secret_key(object_key, &original)
                 && !original.trim().is_empty()
@@ -1004,13 +1005,42 @@ fn redaction_marker_ranges(text: &str) -> Vec<(usize, usize)> {
     merged
 }
 
-fn span_is_generated_marker(text: &str, start: usize, end: usize) -> bool {
+fn span_is_redaction_envelope(text: &str, start: usize, end: usize) -> bool {
     marker_regex().find_iter(text).any(|marker| {
         if !(marker.start() <= start && end <= marker.end()) {
             return false;
         }
-        trusted_marker(marker.as_str())
+        opaque_reference(marker.as_str())
+    }) || display_marker_regex().find_iter(text).any(|marker| {
+        marker.start() <= start
+            && end <= marker.end()
+            && marker
+                .as_str()
+                .strip_prefix(MARKER_PREFIX)
+                .and_then(|value| value.strip_suffix(']'))
+                .is_some_and(|label| {
+                    label == "PRIVATE_KEY"
+                        || credential_patterns()
+                            .iter()
+                            .any(|pattern| pattern.label == label)
+                })
     })
+}
+
+// Transport preserves a constrained, non-secret envelope without asserting
+// authenticity. Only the original executor may authenticate and resolve it.
+fn opaque_reference(marker: &str) -> bool {
+    let Some(captures) = marker_regex().captures(marker) else {
+        return false;
+    };
+    let Some(label) = captures.get(1) else {
+        return false;
+    };
+    captures.get(4).is_some()
+        && (label.as_str() == "K1"
+            || credential_patterns()
+                .iter()
+                .any(|pattern| marker_label_code(pattern.label) == Some(label.as_str())))
 }
 
 fn trusted_marker(marker: &str) -> bool {
@@ -1025,18 +1055,17 @@ fn trusted_marker(marker: &str) -> bool {
         // still resolved below when the owner supplies the raw source.
         return false;
     };
-    // A syntactically valid marker from an untrusted callback is still
-    // ordinary text. Only an executor-issued marker with a valid
-    // process-bound MAC may suppress a second redaction pass.
+    // Authentication is process-local. Presentation separately preserves
+    // constrained opaque envelopes, without granting edit authority.
     marker_issuer_matches(label.as_str(), nonce.as_str(), issuer_mac.as_str())
 }
 
-fn is_exact_trusted_marker(text: &str) -> bool {
+fn is_exact_opaque_reference(text: &str) -> bool {
     let trimmed = text.trim();
     let Some(matched) = marker_regex().find(trimmed) else {
         return false;
     };
-    matched.start() == 0 && matched.end() == trimmed.len() && trusted_marker(matched.as_str())
+    matched.start() == 0 && matched.end() == trimmed.len() && opaque_reference(matched.as_str())
 }
 
 /// Return `(trusted_executor_marker, any_marker)` for presentation notes.
@@ -1048,40 +1077,6 @@ pub fn redaction_marker_status(text: &str) -> (bool, bool) {
         .any(|marker| trusted_marker(marker.as_str()));
     let any = marker_regex().is_match(text) || display_marker_regex().is_match(text);
     (trusted, any)
-}
-
-fn pattern_for_label(label: &str) -> Option<&'static str> {
-    match label {
-        "C1" => Some(r"AKIA[0-9A-Z]{16}"),
-        "C2" => Some(
-            r#"(?i)(?:aws_secret_access_key|aws_secret_key|\[\s*['"]?(?:aws_secret_access_key|aws_secret_key)['"]?\s*\]|['"](?:aws_secret_access_key|aws_secret_key)['"])\s*[=:]\s*['"]?[A-Za-z0-9/+=._-]{30,}"#,
-        ),
-        "C7" => Some(r#"[A-Za-z0-9._\-/+=]{20,}"#),
-        "C3" => Some(r"gh[pousr]_[A-Za-z0-9_]{36,255}"),
-        "C8" => Some(r"hf_[A-Za-z0-9]{34,255}"),
-        "C4" => Some(r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{40,}"),
-        "C5" => Some(r"://[^:@\s/]+:[^:@\s/]+@"),
-        "C6" => Some(
-            r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?[^\s'"]{12,}"#,
-        ),
-        // Bound the captured span after matching in `resolve_redacted_anchor`.
-        // A counted `{0,65536}` here exceeds regex's compiled-size limit and
-        // makes valid PEM references silently unresolvable.
-        "K1" => Some(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
-        "PRIVATE_KEY" => Some(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-        "AWS_ACCESS_KEY" => Some(r"AKIA[0-9A-Z]{16}"),
-        "AWS_SECRET_KEY" => Some(
-            r#"(?i)(?:aws_secret_access_key|aws_secret_key)\s*[=:]\s*['"]?[A-Za-z0-9/+=]{30,}"#,
-        ),
-        "GITHUB_TOKEN" => Some(r"gh[pousr]_[A-Za-z0-9_]{36,255}"),
-        "HUGGINGFACE_TOKEN" => Some(r"hf_[A-Za-z0-9]{34,255}"),
-        "BEARER_TOKEN" => Some(r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{40,}"),
-        "CONNECTION_CREDENTIAL" => Some(r"://[^:@\s/]+:[^:@\s/]+@"),
-        "SECRET_ASSIGNMENT" => Some(
-            r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)\s*[=:]\s*['"]?[^\s'"]{12,}"#,
-        ),
-        _ => None,
-    }
 }
 
 fn marker_label_code(label: &str) -> Option<&'static str> {
@@ -1193,6 +1188,7 @@ pub fn resolve_redacted_anchor(
     let mut cursor = 0usize;
     let mut saw_marker = false;
     let mut marker_specs = Vec::new();
+    let mut source_matches = HashMap::new();
     for (capture_group, matched) in (1usize..).zip(marker_regex().captures_iter(anchor)) {
         let whole = matched
             .get(0)
@@ -1220,12 +1216,33 @@ pub fn resolve_redacted_anchor(
         if !marker_issuer_matches(label, nonce, issuer_mac) {
             return Err(REDACTION_REFERENCE_ERROR.to_string());
         }
-        let Some(label_pattern) = pattern_for_label(label) else {
-            return Err(REDACTION_REFERENCE_ERROR.to_string());
+        let label_pattern = if label == "K1" {
+            // Keep the existing bounded PEM check below the matcher; a large
+            // counted repetition exceeds regex's compiled-size limit.
+            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----".to_string()
+        } else {
+            let Some(pat) = credential_patterns()
+                .iter()
+                .find(|pat| marker_label_code(pat.label) == Some(label))
+            else {
+                return Err(REDACTION_REFERENCE_ERROR.to_string());
+            };
+            let spans = source_matches
+                .entry(pat.label)
+                .or_insert_with(|| credential_secret_spans(content, pat));
+            let Some(value) = spans
+                .iter()
+                .find(|span| marker_mac_matches(label, nonce, span.as_str(), mac))
+            else {
+                return Err(REDACTION_REFERENCE_ERROR.to_string());
+            };
+            // Authenticate value bytes, not an occurrence. The full-anchor
+            // matcher still rejects duplicates unless context selects one.
+            regex::escape(value.as_str())
         };
         pattern.push_str(&regex::escape(&anchor[cursor..whole.start()]));
         pattern.push('(');
-        pattern.push_str(label_pattern);
+        pattern.push_str(&label_pattern);
         pattern.push(')');
         marker_specs.push((
             capture_group,
@@ -1350,6 +1367,55 @@ mod tests {
             .expect("indexed assignment reference should parse")
             .expect("indexed assignment marker should resolve");
         assert_eq!(resolved, raw);
+    }
+
+    #[test]
+    fn assignment_references_preserve_public_syntax_and_bind_only_the_value() {
+        let secret = "synthetic-sensitive-value-0123456789";
+        for (prefix, suffix) in [
+            ("export AWS_SECRET_ACCESS_KEY='", "'\nnext=42\n"),
+            ("AWS_SECRET_KEY=", "\nnext=42\n"),
+            (
+                "os.environ[\"AWS_SECRET_ACCESS_KEY\"] = \"",
+                "\"\nnext=42\n",
+            ),
+            ("password = \"", "\";\nnext=42\n"),
+            ("auth_token=", "\nnext=42\n"),
+            ("config['api_key'] = '", "'\nnext=42\n"),
+        ] {
+            let raw = format!("{prefix}{secret}{suffix}");
+            let (view, count) = redact_credentials_in_text(&raw);
+            assert_eq!(count, 1);
+            assert!(!view.contains(secret));
+            assert!(
+                view.starts_with(prefix),
+                "public assignment prefix was hidden"
+            );
+            assert!(view.ends_with(suffix), "public trailing syntax was hidden");
+            let marker = &view[prefix.len()..view.len() - suffix.len()];
+            assert_eq!(
+                resolve_redacted_anchor(&raw, marker, false)
+                    .unwrap()
+                    .unwrap(),
+                secret
+            );
+            assert_eq!(
+                resolve_redacted_anchor(&raw, &view, false)
+                    .unwrap()
+                    .unwrap(),
+                raw
+            );
+            assert_eq!(redact_credentials_in_text(&view), (view.clone(), 0));
+            let (display, count) = redact_credentials_for_display(&raw);
+            assert_eq!(count, 1, "overlapping rules must not count one value twice");
+            assert_eq!(
+                redact_credentials_for_display(&display),
+                (display.clone(), 0)
+            );
+            assert!(resolve_redacted_anchor(&raw, &display, false).is_err());
+            assert!(display.starts_with(prefix) && display.ends_with(suffix));
+            assert!(!display.contains(secret));
+        }
     }
 
     #[test]
@@ -1630,6 +1696,102 @@ mod tests {
         let (display, count) = redact_credentials_for_display(&issued);
         assert_eq!(count, 0);
         assert_eq!(display, issued);
+    }
+
+    #[test]
+    fn reference_round_trip_crosses_processes_without_transferring_edit_authority() {
+        use std::io::{BufRead, Write};
+        const CHILD: &str = "ASTRA_TEST_REFERENCE_SOURCE_PROCESS";
+        let raw = "password=\"synthetic-sensitive-body-long-enough\";\n";
+        if std::env::var_os(CHILD).is_some() {
+            let issued = redact_credentials_in_text(raw).0;
+            println!(
+                "ASTRA_REFERENCE {}",
+                serde_json::to_string(&issued).unwrap()
+            );
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            let returned: String = serde_json::from_str(&line).unwrap();
+            assert_eq!(returned, issued);
+            assert_eq!(
+                resolve_redacted_anchor(raw, &returned, false)
+                    .unwrap()
+                    .as_deref(),
+                Some(raw)
+            );
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "credential_redaction::tests::reference_round_trip_crosses_processes_without_transferring_edit_authority", "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let reference = loop {
+            let mut line = String::new();
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "source failed before issuing a reference"
+            );
+            if let Some(json) = line.strip_prefix("ASTRA_REFERENCE ") {
+                break serde_json::from_str::<String>(json).unwrap();
+            }
+        };
+        let safe = redact_credentials_for_display(&reference).0;
+        assert_eq!(safe, reference);
+        assert_eq!(redaction_marker_status(&safe), (false, true));
+        assert!(resolve_redacted_anchor(raw, &safe, false).is_err());
+        let mut nested = serde_json::json!({"output": safe});
+        redact_credentials_in_json(&mut nested);
+        let mut input = child.stdin.take().unwrap();
+        writeln!(
+            input,
+            "{}",
+            serde_json::to_string(nested["output"].as_str().unwrap()).unwrap()
+        )
+        .unwrap();
+        drop(input);
+        for line in output.lines() {
+            line.unwrap();
+        }
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn transport_opacity_never_grants_edit_authenticity_or_hides_adjacent_secrets() {
+        let foreign = "[REDACTED:C6:00000000000000000000000000000000:00000000000000000000000000000000:00000000000000000000000000000000]";
+        let raw = "password=\"synthetic-sensitive-body-long-enough\"";
+        assert_eq!(redact_credentials_for_display(foreign).0, foreign);
+        assert_eq!(redaction_marker_status(foreign), (false, true));
+        assert!(resolve_redacted_anchor(raw, foreign, false).is_err());
+        let mut nested = serde_json::json!({"nested": {"password": foreign}});
+        assert_eq!(redact_credentials_in_json(&mut nested), 0);
+        assert_eq!(nested["nested"]["password"], foreign);
+        for suffix in ["adjacent-sensitive-body", " adjacent-sensitive-body"] {
+            let mut value = serde_json::json!({"password": format!("{foreign}{suffix}")});
+            assert!(redact_credentials_in_json(&mut value) > 0);
+            assert!(!value.to_string().contains("adjacent-sensitive-body"));
+        }
+        for malformed in [
+            foreign.replace(":C6:", ":UNKNOWN:"),
+            foreign.replace(":000", ":GGG"),
+        ] {
+            let mut value = serde_json::json!({"password": malformed});
+            assert!(redact_credentials_in_json(&mut value) > 0);
+            assert_eq!(value["password"], DISPLAY_SECRET_FIELD_MARKER);
+        }
+        for marker in [
+            "[REDACTED:AWS_SECRET_KEY]",
+            "[REDACTED:UNKNOWN]",
+            "[REDACTED:AWS_SECRET_KEY",
+        ] {
+            let wrapped = format!("password=\"{marker}adjacent-sensitive-body\"");
+            let (safe, count) = redact_credentials_for_display(&wrapped);
+            assert_eq!(count, 1);
+            assert!(!safe.contains("adjacent-sensitive-body"));
+        }
     }
 
     #[test]

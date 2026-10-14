@@ -84,6 +84,9 @@ impl ReplyObligations {
     /// question. Unrelated text, wrong IDs and wrong senders cannot settle it.
     #[cfg(test)]
     pub fn observe_response(&self, owner_run_id: &str, message: &AgentMessage) -> bool {
+        if astra_messaging::types::is_non_adoption_response(&message.payload) {
+            return false;
+        }
         let MessagePayload::Response { request_id, .. } = &message.payload else {
             return false;
         };
@@ -188,6 +191,9 @@ impl ReplyObligations {
     /// its sender and ID before it is presented as an answer to the model.
     /// Runs with no question retain the ordinary response-message behavior.
     pub fn should_expose_response(&self, owner_run_id: &str, message: &AgentMessage) -> bool {
+        if astra_messaging::types::is_non_adoption_response(&message.payload) {
+            return true;
+        }
         let MessagePayload::Response { request_id, .. } = &message.payload else {
             return true;
         };
@@ -227,6 +233,22 @@ mod tests {
                 data: None,
             },
         )
+    }
+
+    #[test]
+    fn non_adoption_feedback_is_visible_without_settling_an_unrelated_question() {
+        let replies = ReplyObligations::default();
+        let sender = AgentAddress::new("native", "collaborator");
+        replies.reserve("parent", "q1", sender.clone()).unwrap();
+        let mut receipt = response(sender, "q1");
+        receipt.payload = MessagePayload::Response {
+            request_id: "q1".into(),
+            accepted: false,
+            data: Some(serde_json::json!({"disposition":"not_adopted", "message_id":"q1"})),
+        };
+        assert!(replies.should_expose_response("parent", &receipt));
+        assert!(!replies.observe_response("parent", &receipt));
+        assert!(replies.has_pending("parent"));
     }
 
     #[test]

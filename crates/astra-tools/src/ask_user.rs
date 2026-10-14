@@ -22,6 +22,9 @@ pub struct AskUserChoice {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskUserQuestion {
+    /// Protocol identity when supplied; display text is not an identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub header: String,
     pub question: String,
     pub options: Vec<AskUserChoice>,
@@ -39,6 +42,8 @@ pub struct AskUserPrompt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskUserQuestionAnswer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub question: String,
     pub answers: Vec<String>,
     pub multi_select: bool,
@@ -66,7 +71,8 @@ impl AskUserAnswers {
             } else {
                 Value::String(answer.answers.first().cloned().unwrap_or_default())
             };
-            answers.insert(answer.question.clone(), value);
+            let key = answer.id.as_ref().unwrap_or(&answer.question);
+            answers.insert(key.clone(), value);
             if let Some(annotation) = &answer.annotation {
                 let mut entry = Map::new();
                 if let Some(notes) = &annotation.notes {
@@ -76,7 +82,7 @@ impl AskUserAnswers {
                     entry.insert("preview".into(), Value::String(preview.clone()));
                 }
                 if !entry.is_empty() {
-                    annotations.insert(answer.question.clone(), Value::Object(entry));
+                    annotations.insert(key.clone(), Value::Object(entry));
                 }
             }
         }
@@ -207,6 +213,8 @@ fn parse_questions(value: &Value) -> Result<Vec<AskUserQuestion>, String> {
     }
 
     let mut questions = Vec::with_capacity(items.len());
+    let mut seen_ids = HashSet::new();
+    let mut identified = None;
     let mut seen_headers = HashSet::new();
     let mut seen_questions = HashSet::new();
     for item in items {
@@ -214,6 +222,19 @@ fn parse_questions(value: &Value) -> Result<Vec<AskUserQuestion>, String> {
             .as_object()
             .ok_or_else(|| ask_user_contract_error("each ask_user question must be an object"))?;
         let parsed = parse_question_object(obj)?;
+        if identified.is_some_and(|identified| identified != parsed.id.is_some()) {
+            return Err(ask_user_contract_error(
+                "question IDs must be supplied for every question or none",
+            ));
+        }
+        identified = Some(parsed.id.is_some());
+        if let Some(id) = &parsed.id {
+            if !seen_ids.insert(id.clone()) {
+                return Err(ask_user_contract_error("duplicate question ID"));
+            }
+            questions.push(parsed);
+            continue;
+        }
         let header = parsed.header.clone();
         let question = parsed.question.clone();
         if !seen_headers.insert(header.clone()) {
@@ -233,6 +254,16 @@ fn parse_questions(value: &Value) -> Result<Vec<AskUserQuestion>, String> {
 }
 
 fn parse_question_object(obj: &serde_json::Map<String, Value>) -> Result<AskUserQuestion, String> {
+    let id = obj
+        .get("id")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| ask_user_contract_error("question ID must be a nonempty string"))
+        })
+        .transpose()?;
     let question = required_string(obj, "question")?;
     let header = optional_string(obj, "header").unwrap_or_else(|| derive_header(&question));
     let multi_select = obj
@@ -260,6 +291,7 @@ fn parse_question_object(obj: &serde_json::Map<String, Value>) -> Result<AskUser
         ));
     }
     Ok(AskUserQuestion {
+        id,
         header,
         question,
         options,
@@ -468,7 +500,8 @@ fn parse_answers_for_prompt(prompt: &AskUserPrompt, value: &Value) -> Option<Ask
     let annotations = obj.get("annotations").and_then(Value::as_object);
     let mut collected = Vec::with_capacity(prompt.questions.len());
     for question in &prompt.questions {
-        let value = answers.get(&question.question)?;
+        let key = question.id.as_ref().unwrap_or(&question.question);
+        let value = answers.get(key)?;
         let parsed_answers = if question.multi_select {
             let parsed_answers = value
                 .as_array()?
@@ -494,9 +527,10 @@ fn parse_answers_for_prompt(prompt: &AskUserPrompt, value: &Value) -> Option<Ask
             vec![answer.to_string()]
         };
         let annotation = annotations
-            .and_then(|items| items.get(&question.question))
+            .and_then(|items| items.get(key))
             .and_then(parse_annotation_value);
         collected.push(AskUserQuestionAnswer {
+            id: question.id.clone(),
             question: question.question.clone(),
             answers: parsed_answers,
             multi_select: question.multi_select,
@@ -513,7 +547,7 @@ pub fn normalize_ask_user_answers(
     let mut by_question = HashMap::with_capacity(answers.answers.len());
     for answer in &answers.answers {
         if by_question
-            .insert(answer.question.as_str(), answer)
+            .insert(answer.id.as_deref().unwrap_or(&answer.question), answer)
             .is_some()
         {
             return Err(ask_user_response_error(format!(
@@ -525,12 +559,18 @@ pub fn normalize_ask_user_answers(
 
     let mut normalized = Vec::with_capacity(prompt.questions.len());
     for question in &prompt.questions {
-        let Some(answer) = by_question.remove(question.question.as_str()) else {
+        let Some(answer) = by_question.remove(question.id.as_deref().unwrap_or(&question.question))
+        else {
             return Err(ask_user_response_error(format!(
                 "missing answer for question '{}'",
                 question.question
             )));
         };
+        if answer.id != question.id || answer.question != question.question {
+            return Err(ask_user_response_error(
+                "answer identity or display text does not match its question",
+            ));
+        }
 
         let option_labels = question
             .options
@@ -598,6 +638,7 @@ pub fn normalize_ask_user_answers(
         };
 
         normalized.push(AskUserQuestionAnswer {
+            id: question.id.clone(),
             question: question.question.clone(),
             answers: normalized_answers,
             multi_select: question.multi_select,
@@ -632,10 +673,9 @@ fn ask_user_response_summary(
                 .answers
                 .iter()
                 .map(|answer| {
-                    let prompt_question = prompt
-                        .questions
-                        .iter()
-                        .find(|question| question.question == answer.question);
+                    let prompt_question = prompt.questions.iter().find(|question| {
+                        question.id == answer.id && question.question == answer.question
+                    });
                     let option_labels = prompt_question
                         .map(|question| {
                             question
@@ -946,6 +986,7 @@ mod tests {
     fn tool_result_includes_annotations_when_present() {
         let value = AskUserAnswers {
             answers: vec![AskUserQuestionAnswer {
+                id: None,
                 question: "Which layout?".into(),
                 answers: vec!["Cards".into()],
                 multi_select: false,
@@ -1040,6 +1081,7 @@ mod tests {
             &AskUserAnswers {
                 answers: vec![
                     AskUserQuestionAnswer {
+                        id: None,
                         question: "Which features should we include first?".into(),
                         answers: vec!["Reports".into(), "Custom".into(), "Reports".into()],
                         multi_select: false,
@@ -1049,6 +1091,7 @@ mod tests {
                         }),
                     },
                     AskUserQuestionAnswer {
+                        id: None,
                         question: "Which layout should we ship?".into(),
                         answers: vec!["Cards".into()],
                         multi_select: true,
@@ -1124,6 +1167,7 @@ mod tests {
             &prompt,
             &AskUserAnswers {
                 answers: vec![AskUserQuestionAnswer {
+                    id: None,
                     question: "Which scope should we ship first?".into(),
                     answers: vec!["Core flow".into()],
                     multi_select: false,
@@ -1151,6 +1195,7 @@ mod tests {
             &prompt,
             &AskUserAnswers {
                 answers: vec![AskUserQuestionAnswer {
+                    id: None,
                     question: "Which scope should we ship first?".into(),
                     answers: vec![RESERVED_OTHER_SENTINEL.into()],
                     multi_select: false,

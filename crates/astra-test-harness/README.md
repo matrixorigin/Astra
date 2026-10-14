@@ -182,6 +182,125 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 ## Quick start
 
+### Manual GitHub Actions run
+
+The **Harness (manual GLM)** workflow builds the selected Git revision's
+Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
+then runs the existing YAML cases against GLM-5.3. It is manual-only; normal
+PR checks do not spend provider tokens or require secrets.
+
+In the repository's **Settings → Secrets and variables → Actions**, create:
+
+- `HARNESS_GLM_BASE_URL`: the API base URL from the `glm-5.3` entry in your
+  `.models.yaml` (HTTPS, without credentials, query parameters or fragments).
+- `HARNESS_GLM_API_KEY`: that entry's API key.
+- Optional `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of genuine supplementary
+  model entries in the existing admin model-file format. Each entry supplies its
+  own endpoint, credentials, protocol and capacity; nothing is inherited from
+  GLM-5.3. Duplicate names and overrides of GLM-5.3 are rejected. Only cases that
+  explicitly require another model need this secret; ordinary delegation uses
+  the selected matrix model, not a fixed GLM version.
+
+Open **Actions → Harness (manual GLM) → Run workflow**. Source inputs default to
+`repository: matrixorigin/astra`, `ref: main` (its latest commit at checkout).
+For a fork, enter e.g. `XuPeng-SH/Astra`; `ref` accepts a branch, tag or exact
+commit SHA available in that repository. The workflow-dispatch branch selects
+the workflow definition, not the source under test. Build checks and the report
+use the actual checked-out SHA. Only select trusted source: its build scripts,
+local actions and executables can access the provider credentials. The checkout
+token must have read access; arbitrary private repositories are not guaranteed.
+Managed build-cache uploads are disabled for this workflow (both rust-cache and
+sccache); existing rust-cache artifacts may still be restored.
+There is no additional actor or repository allowlist: manual dispatch relies on
+GitHub's repository write-access requirement. No organization membership token
+is needed. This restricts who starts the workflow, not the code they select;
+selected code can read and exfiltrate the provider key, so run only trusted commits.
+
+The case-name filter defaults to `*` (all top-level YAML cases, not recursive),
+with 1–3 repetitions. Use `hello*` for a small smoke test. Running all cases can
+incur significant cost and requires each case's additional capabilities. Execution is
+serial, with a 60-minute suite limit and a 120-minute job limit. Cases execute
+in an independent Git clone with the selected SHA and actual origin history.
+Historical-fixture cases still require that history to exist in the selected
+repository. Filters match case names,
+not filenames. No match, unavailable cases and failed cases are not passes.
+
+During execution, Actions displays each case's start, periodic elapsed-time
+heartbeat, terminal result, harness lifecycle duration, error classification,
+failed root/step checks and cumulative counts. A heartbeat proves the harness
+is still waiting, not that the model is making progress. For example:
+
+```text
+[harness] PASSED [12/63] "delegation / glm-5.3 / run 1" · 62.90s · exit=0 · error=none · counts: 10 passed, 2 failed, 0 cancelled, 0 unavailable
+```
+
+The inner run budget is 55 minutes, followed by up to two minutes for existing
+cancellation and settlement before the outer 60-minute Actions limit. Completed
+results are saved incrementally; timeout/crash summaries retain completed rows,
+the last observed active case/elapsed time and queued cases. Unfinished cases
+remain unfinished, not passing or falsely certified as cancelled. Follow-up
+turns are shown under their owning case, not counted as additional cases.
+Deadline termination is unsuccessful even if its completed rows passed.
+The CI command runs inside the existing Linux harness process supervisor, so
+separately grouped or daemonized descendants are also reaped after hard stop.
+Final success requires the supervised Actions step to succeed, not merely a
+complete-looking inner report. The CI helper refuses unsupervised execution.
+
+`astra-test --progress-file PATH` opts into this same secret-free, versioned
+JSONL stream; it requires a new file and cannot be combined with dashboard mode.
+The CLI drains its observer before normal or failing suite exit. Observation
+loss or file-write failure cancels via the existing runner and fails closed.
+Selected custom source revisions must support this option and the repository
+helper; unsupported sources fail explicitly, without an old-log fallback.
+
+The registered model uses the local GLM-5.3 deployment's declared
+`reasoning_effort` protocol, 128,000-token context and 84,000-token output
+ceiling. Prices are deliberately omitted: supply deployment pricing separately
+before making monetary comparisons. Both advisory and required LLM graders run,
+using GLM-5.3 unless a criterion explicitly selects another model. Grading adds
+provider calls and cost; a same-model judge is not independent quality evidence.
+CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answer
+minimum); the Server bounds the effective request by the admitted Offering's
+output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
+remain failures/unknown evidence, never accepted truncated answers or automatic retries.
+Cases may declare `required_models` for supplementary models, independently of
+their parent `models` matrix. These are checked by the existing fail-fast
+preflight after filtering and are not replaced by `--force-model`.
+Prompts and assertion string values can use the explicit `{{model}}` marker,
+bound independently to each resolved matrix model (including `--force-model`).
+This includes follow-up prompts and criteria, nested assertions and exact child
+model identity checks. Unknown or malformed markers fail before execution.
+Model lists, grader model overrides, shell hooks and environment are literal,
+not templates. The delegation follow-up uses this binding and needs no second model.
+The safe preflight sidecar identifies selected model IDs and the unavailable
+model without provider error details. Default all-case selection is not a claim
+that a GLM-5.3-only deployment can run every case.
+Cases requiring other models, external clients or special policy need those
+capabilities and must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
+these runs do not certify production embedding quality.
+
+The job summary and seven-day artifact contain per-case status, timing,
+terminal-reported token/cache counters, binary hashes and root/step criterion
+results with severity and scores. An advisory judge without a score is explicitly
+`unscored`, with `passed: null`, not a successful evaluation. Required judges may
+return a boolean acceptance without a numeric score: their canonical pass/fail
+remains `reported`, without claiming evaluation provenance. Non-judge booleans
+also remain reported harness results, not a new execution certificate. These counters are
+not complete task-tree cost or certified cache ratios; consult usage coverage,
+and never interpret missing evidence as zero. Provider credentials are written
+only into a private temporary model file and removed during cleanup. Raw
+transcripts, Server logs, model configuration and full reports are **not**
+uploaded, because they may contain sensitive provider responses. A setup failure
+without a report fails the workflow. Safe failure diagnostics retain local
+Server readiness status, model registration/activation, lookup exit code and
+step outcomes, without retaining arbitrary provider error text.
+Artifacts also contain a validated safe progress prefix (`progress.safe.jsonl`)
+and complete or explicitly incomplete `summary.json`. A truncated trailing
+record or malformed stream never erases previously validated results and never
+turns an incomplete run into a pass. Raw progress input is not uploaded if its
+schema cannot be certified. Timing distinguishes whole-case lifecycle elapsed
+from agent-reported duration; token counters keep the existing coverage limits.
+
 ```sh
 # Local smoke: one case, no judger, parallel 4
 ./target/release/astra-test \

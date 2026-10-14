@@ -655,6 +655,17 @@ impl<'a> SuiteRunner<'a> {
     }
 
     async fn run_one(&self, case: &Case, model: &str, run_index: u32) -> CaseRunReport {
+        let bound = match case.bind_model(model) {
+            Ok(bound) => bound,
+            Err(error) => {
+                let mut report =
+                    self.model_resolution_unavailable(case, &error.to_string(), run_index);
+                report.model = model.to_owned();
+                report.outcome.model = model.to_owned();
+                return report;
+            }
+        };
+        let case = &bound;
         if let Some(report) = self.skip_for_unsupported_cache_scope(case, model) {
             eprintln!(
                 "[astra-test] [UNAVAILABLE] {} × {} (unsupported cache scope)",
@@ -765,6 +776,7 @@ impl<'a> SuiteRunner<'a> {
                     prompt: step.prompt.clone(),
                     prompt_variants: vec![],
                     models: Some(vec![model.to_string()]),
+                    required_models: case.required_models.clone(),
                     criteria: vec![],
                     debug_log: case.debug_log,
                     extra_cli_args: {
@@ -1392,7 +1404,17 @@ impl<'a> SuiteRunner<'a> {
 
         loop {
             tokio::select! {
-                report = &mut execution => return report,
+                report = &mut execution => {
+                    if let Some(ref tx) = self.dashboard_tx {
+                        let _ = tx.send(crate::dashboard::DashboardEvent::CaseProgress {
+                            run_id: run_id.to_string(), case_name: case.name.clone(),
+                            model: model.to_string(), run_index, phase: "settled".into(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                            sequence: crate::dashboard::next_dashboard_event_sequence(),
+                        });
+                    }
+                    return report;
+                },
                 _ = heartbeat.tick() => {
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     eprintln!(
@@ -1705,6 +1727,7 @@ mod tests {
             prompt: format!("prompt-for-{name}"),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria,
             debug_log: false,
             extra_cli_args: vec![],
@@ -1721,6 +1744,136 @@ mod tests {
             cleanup_memory_records: false,
             requires_memoria: false,
         }
+    }
+
+    #[tokio::test]
+    async fn matrix_binding_reaches_execution_steps_grading_and_reproducer() {
+        struct Echo;
+        #[async_trait]
+        impl CaseExecutor for Echo {
+            async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+                assert!(!case.prompt.contains("{{model}}"));
+                outcome_ok(model, &case.prompt, &[])
+            }
+            fn reproducer(&self, case: &Case, _: &str) -> String {
+                case.prompt.clone()
+            }
+        }
+        let mut case = case_with(
+            "binding",
+            vec![Criterion::TextContains {
+                needle: "root {{model}}".into(),
+            }],
+        );
+        case.prompt = "root {{model}}".into();
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow-up {{model}}".into(),
+            criteria: vec![Criterion::TextContains {
+                needle: "follow-up {{model}}".into(),
+            }],
+            timeout_seconds: None,
+        }];
+        let exec = Echo;
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        for parallel in [1, 2] {
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                    .with_fallback_models(vec!["model-a".into(), "model-b".into()]),
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig {
+                    parallel,
+                    runs: 2,
+                    ..SuiteConfig::default()
+                },
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let report = runner.run_all(std::slice::from_ref(&case)).await;
+            assert_eq!(report.runs.len(), 4);
+            for run in report.runs {
+                assert_eq!(run.status, CaseRunStatus::Passed, "{run:?}");
+                assert_eq!(run.reproducer.unwrap(), format!("root {}", run.model));
+                assert_eq!(run.steps[0].prompt, format!("follow-up {}", run.model));
+            }
+            let mut invalid = case.clone();
+            invalid.prompt = "{{unknown}}".into();
+            invalid.setup_cmd = Some("exit 99".into());
+            let report = runner.run_all(&[invalid]).await;
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .all(|run| run.status == CaseRunStatus::Unavailable)
+            );
+        }
+        assert_eq!(case.prompt, "root {{model}}");
+    }
+
+    #[tokio::test]
+    async fn public_runner_progress_is_incremental_before_suite_publication() {
+        let exec = FakeExecutor::new();
+        exec.seed("passing", "m", outcome_ok("m", "answer", &[]));
+        exec.seed("failing", "m", outcome_ok("m", "answer", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observer = tokio::spawn(crate::progress::observe(
+            std::fs::File::create(&path).unwrap(),
+            rx,
+            cancel.clone(),
+        ));
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new("astra").with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: Some(tx.clone()),
+            run_id: "cli".into(),
+            cancel_flag: Some(cancel.clone()),
+        };
+        let report = runner
+            .run_all(&[
+                case_with("passing", vec![]),
+                case_with(
+                    "failing",
+                    vec![Criterion::TextContains {
+                        needle: "private-sentinel".into(),
+                    }],
+                ),
+            ])
+            .await;
+        tokio::task::yield_now().await;
+        let prefix = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(prefix.matches("case_completed").count(), 2);
+        assert!(!prefix.contains("private-sentinel"));
+        assert!(!prefix.contains("suite_completed"));
+        tx.send(crate::dashboard::DashboardEvent::SuiteCompleted {
+            run_id: "cli".into(),
+            report: Arc::new(report),
+            sequence: crate::dashboard::next_dashboard_event_sequence(),
+        })
+        .unwrap();
+        observer.await.unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("suite_completed")
+        );
+        assert!(!cancel.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2845,6 +2998,7 @@ mod tests {
                 "suite_started",
                 "case_queued",
                 "case_started",
+                "case_progress",
                 "case_completed"
             ],
             "a case must never look started before its queue admission is visible"

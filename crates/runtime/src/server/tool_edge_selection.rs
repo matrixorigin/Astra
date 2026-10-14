@@ -117,6 +117,56 @@ fn edge_advertised_tool_check(
             ),
         ))
     })?;
+    if let Some(policy) = request.policy.resolved_provider_policy.as_ref() {
+        // The registration is current availability evidence, not authority to
+        // replace the descriptor already used for this invocation's admission.
+        // Re-resolve through the canonical conservative resolver and require an
+        // exact match; refreshed schemas or requirements need fresh admission.
+        use astra_turn_core::provider_resolution::{
+            ProviderClaimTrustPolicy, ResolvedProviderPolicyIndex, resolve_provider_snapshot,
+        };
+        let matches_admission = advert.schema_version
+            == astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+            && advert.binding.executor.executor_id == request.executor.executor_id
+            && advert.binding.workspace.cwd == request.workspace.cwd
+            && advert.binding.capabilities.executor.reachable
+            && advert.binding.capabilities.runtime.runtime_has_process
+            && advert.binding.capabilities.workspace.readable
+            && advert.provider_discovery.iter().any(|snapshot| {
+                if snapshot.protocol.as_str() != "cli-local"
+                    || snapshot.binding_ref != policy.descriptor.identity.provider_binding
+                {
+                    return false;
+                }
+                let aliases = snapshot
+                    .tool_declarations
+                    .iter()
+                    .map(|tool| {
+                        astra_turn_types::PublicToolAlias::new(tool.native_tool_name.clone())
+                            .map(|alias| (tool.native_tool_id.clone(), alias))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, _>>();
+                let Ok(aliases) = aliases else {
+                    return false;
+                };
+                resolve_provider_snapshot(snapshot, &ProviderClaimTrustPolicy::default(), &aliases)
+                    .ok()
+                    .and_then(|resolved| {
+                        ResolvedProviderPolicyIndex::from_snapshots(&[resolved]).ok()
+                    })
+                    .is_some_and(|index| index.resolve(&request.tool_name) == Some(policy))
+            });
+        return if matches_admission {
+            Ok(())
+        } else {
+            Err(Box::new((
+                advert.binding,
+                astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
+                    "provider_discovery_does_not_match_admission".to_string(),
+                ),
+            )))
+        };
+    }
     astra_runtime_env::CapabilityResolver
         .check_tool_call_for_surface(
             registry,
