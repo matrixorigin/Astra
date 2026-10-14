@@ -184,9 +184,9 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 ### Manual GitHub Actions run
 
-The **Harness (manual GLM)** workflow builds the selected Git revision's
+The **Harness (live models)** workflow builds the selected Git revision's
 Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
-then runs the existing YAML cases against GLM-5.3. Dispatch defaults to the
+then runs the existing YAML cases with DeepSeek-v4.1-Flash and a GLM-5.3 judge. Dispatch defaults to the
 full suite. The same execution job is reused by the automatic live regression
 described below; offline PR checks still work without provider secrets.
 
@@ -197,12 +197,13 @@ In the repository's **Settings → Secrets and variables → Actions**, create:
 - `HARNESS_GLM_API_KEY`: that entry's API key.
 - Optional `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of genuine supplementary
   model entries in the existing admin model-file format. Each entry supplies its
-  own endpoint, credentials, protocol and capacity; nothing is inherited from
-  GLM-5.3. Duplicate names and overrides of GLM-5.3 are rejected. Only cases that
-  explicitly require another model need this secret; ordinary delegation uses
+  own endpoint, credentials, protocol and capacity. An explicit Flash entry
+  replaces its shared-endpoint default; other entries inherit nothing.
+  Duplicate names and overrides of GLM-5.3 are rejected. Only cases that
+  require additional models need this secret; ordinary delegation uses
   the selected matrix model, not a fixed GLM version.
 
-Open **Actions → Harness (manual GLM) → Run workflow**. Source inputs default to
+Open **Actions → Harness (live models) → Run workflow**. Source inputs default to
 `repository: matrixorigin/astra`, `ref: main` (its latest commit at checkout).
 For a fork, enter e.g. `XuPeng-SH/Astra`; `ref` accepts a branch, tag or exact
 commit SHA available in that repository. The workflow-dispatch branch selects
@@ -268,9 +269,11 @@ GLM-5.2 rather than the configured GLM-5.3.
 | `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
 | `multi_model_fanout_handoff` | Medium: GLM-5.3 + DeepSeek-v4.1-Flash, exact slot identities, real child results and parent adoption |
 
-All parents and judges use GLM-5.3. Configure `deepseek-v4.1-flash` in
-`HARNESS_ADDITIONAL_MODELS_JSON`; it may explicitly use the same URL/key when
-that endpoint serves both models. Missing/unavailable models fail preflight;
+All parents use DeepSeek-v4.1-Flash; the independent judge uses GLM-5.3.
+Both default models use `HARNESS_GLM_BASE_URL` and `HARNESS_GLM_API_KEY`.
+An explicit `deepseek-v4.1-flash` entry in `HARNESS_ADDITIONAL_MODELS_JSON`
+replaces its default configuration unchanged; other additional models remain
+self-contained. Missing/unavailable models fail preflight;
 they are never silently substituted or omitted. No Jev configuration is required.
 
 Run once, serially, with an aggregate **15-minute execution budget** plus at most
@@ -293,7 +296,7 @@ python3 scripts/ci/select_harness_cases.py \
 # Against a fresh, same-revision Server and a disposable checkout as workspace:
 target/debug/astra-test --suite "$run_dir/cases" \
   --astra-bin "$PWD/target/debug/astra" --working-dir "$HARNESS_WORKSPACE" \
-  --force-model glm-5.3 --judger-model glm-5.3 --parallel 1 --runs 1 \
+  --force-model deepseek-v4.1-flash --judger-model glm-5.3 --parallel 1 --runs 1 \
   --progress-file "$run_dir/progress.jsonl" --report-file "$run_dir/report.json"
 ```
 

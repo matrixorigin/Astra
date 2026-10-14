@@ -988,7 +988,8 @@ impl<'a> SuiteRunner<'a> {
                     .duration_ms
                     .saturating_add(first_attempt.duration_ms);
                 outcome.explain_capture = None;
-                outcome.stream_capture = None;
+                // Only the retry has execution identity. Its stream still
+                // belongs to this run; aggregate usage is kept separately.
                 if !first_attempt.stderr.is_empty() {
                     outcome.stderr = format!(
                         "[attempt 0 stderr]\n{}\n[attempt 1 stderr]\n{}",
@@ -1273,7 +1274,8 @@ impl<'a> SuiteRunner<'a> {
         let product_failure_class = if setup_failed {
             Some(crate::classify::FailureClass::PlatformSetupFailed)
         } else if !product_passed {
-            Some(classify(&outcome, &classification_criteria))
+            let terminal = if attempts.len() > 1 { root } else { &outcome };
+            Some(classify(terminal, &classification_criteria))
         } else {
             None
         };
@@ -5226,6 +5228,7 @@ mod tests {
     struct SemanticCaptureJudger {
         hits: AtomicUsize,
         child_bodies: std::sync::Mutex<Vec<String>>,
+        accepted: bool,
     }
 
     impl SemanticCaptureJudger {
@@ -5233,6 +5236,7 @@ mod tests {
             Self {
                 hits: AtomicUsize::new(0),
                 child_bodies: std::sync::Mutex::new(Vec::new()),
+                accepted: true,
             }
         }
     }
@@ -5256,7 +5260,7 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .push(body.into());
             Ok(JudgerResult {
-                assessment: JudgerAssessment::Acceptance(true),
+                assessment: JudgerAssessment::Acceptance(self.accepted),
                 rationale: "affirmative semantic fixture".into(),
                 full_rationale: "affirmative semantic fixture".into(),
                 votes: Vec::new(),
@@ -5335,6 +5339,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn semantic_retry_retains_the_only_execution_and_classifies_its_result() {
+        futures::future::join_all(["success", "missing", "contradiction", "rejected"].map(
+            |fault| async move {
+                let mut first = RunOutcome::new("m")
+                    .with_exit_code(1)
+                    .with_final_state("interrupted")
+                    .with_interruption_kind("rate_limit")
+                    .with_stderr("HTTP 429; earlier diagnostic: 401 Unauthorized");
+                first.prompt_tokens = 7;
+                first.completion_tokens = 3;
+                first.duration_ms = 11;
+                let mut capture = bound_semantic_capture();
+                if fault == "contradiction" {
+                    capture.reflection.graph_slice.nodes[0]
+                        .metadata
+                        .as_mut()
+                        .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+                        "wrong-digest".into();
+                }
+                let mut second = semantic_outcome((fault != "missing").then_some(capture));
+                second.prompt_tokens = 13;
+                second.completion_tokens = 5;
+                second.duration_ms = 17;
+                let exec = SequenceExecutor {
+                    outcomes: std::sync::Mutex::new(vec![first, second]),
+                    calls: AtomicUsize::new(0),
+                };
+                let mut judger = SemanticCaptureJudger::new();
+                judger.accepted = fault != "rejected";
+                let loader = NoopSessionLoader;
+                let mut runner = semantic_runner(&exec, &judger, &loader);
+                runner.suite_cfg.retry_on_429 = true;
+                let mut case = semantic_case("semantic-retry");
+                case.criteria.push(Criterion::AllOf {
+                    criteria: vec![Criterion::ExecutionChildCount { min: 1, max: 1 }],
+                });
+                let report = runner.run_all(&[case]).await;
+                let run = &report.runs[0];
+                assert_eq!(exec.calls.load(Ordering::Relaxed), 2, "{fault}");
+                assert_eq!(run.attempts.len(), 2, "{fault}");
+                assert_eq!(run.outcome.prompt_tokens, 20);
+                assert_eq!(run.outcome.completion_tokens, 8);
+                assert_eq!(run.outcome.duration_ms, 28);
+                assert!(run.outcome.stderr.contains("401 Unauthorized"));
+                assert!(run.outcome.explain_capture.is_none());
+                assert_eq!(run.outcome.stream_capture.is_some(), fault != "missing");
+                assert_eq!(
+                    judger.hits.load(Ordering::Relaxed),
+                    usize::from(matches!(fault, "success" | "rejected")),
+                    "{fault}",
+                );
+                assert_eq!(run.is_passed(), fault == "success", "{fault}: {run:?}");
+                let expected = match fault {
+                    "missing" => Some(FailureClass::InfraVerificationUnavailable),
+                    "contradiction" => Some(FailureClass::BehaviorContractViolation),
+                    "rejected" => Some(FailureClass::ModelQualityLow),
+                    _ => None,
+                };
+                assert_eq!(run.failure_class, expected, "{fault}: {run:?}");
+                if fault == "success" {
+                    assert!(run.criteria.iter().all(|criterion| criterion.passed));
+                    assert_eq!(*judger.child_bodies.lock().unwrap(), ["observed-value"]);
+                }
+            },
+        ))
+        .await;
     }
 
     #[tokio::test]

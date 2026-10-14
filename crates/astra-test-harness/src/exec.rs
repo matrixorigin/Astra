@@ -186,7 +186,7 @@ fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String
     args
 }
 
-fn shell_escape(s: String) -> String {
+pub(crate) fn shell_escape(s: String) -> String {
     // POSIX single-quote escape: wrap in `'…'` and replace any inner
     // `'` with `'\''` (close, escaped-quote, re-open). This produces
     // a string that a POSIX shell ingests byte-for-byte — every other

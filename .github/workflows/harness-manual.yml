@@ -1,4 +1,4 @@
-name: Harness (manual GLM)
+name: Harness (live models)
 
 on:
   workflow_dispatch:
@@ -132,6 +132,14 @@ jobs:
               if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
                   raise SystemExit("Additional models need unique nonempty names, excluding glm-5.3")
               names.add(name.casefold())
+          if "deepseek-v4.1-flash" not in names:
+              additional.append({"name": "deepseek-v4.1-flash", "provider": "openai",
+                  "base_url": url, "api_key": key, "context_window": 128000,
+                  "max_completion_tokens": 84000, "thinking_protocol": "reasoning_effort",
+                  "supported_parameters": ["tools"],
+                  "prompt_cache_capability": {"schema_version": 2,
+                      "protocol": "openai_auto_prefix", "volatile_placement": "append_only_user_tail",
+                      "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           model = {"name": "glm-5.3", "provider": "openai", "base_url": url,
@@ -140,8 +148,8 @@ jobs:
                    "supported_parameters": ["tools"], "tags": ["code", "chat", "reasoning"]}
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
           with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
-              # Supplementary entries are self-contained; never inherit another
-              # model's credentials, protocol or capacity. The admin loader owns validation.
+              # Explicit supplementary entries stay self-contained. The two
+              # default models share this endpoint by configuration; loading probes both.
               json.dump([model, *additional], out)
           Path(".env").touch()
           PY
@@ -213,14 +221,14 @@ jobs:
             exit 1
           fi
           python3 scripts/harness/process_supervisor.py run \
-            --owner-pid "$$" --identity "manual-glm-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" -- \
+            --owner-pid "$$" --identity "live-harness-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" -- \
             python3 scripts/ci/manual_harness.py run \
             --root "$RUNNER_TEMP/harness" --started-at "$run_started" \
             --timeout-seconds "$budget" --grace-seconds 120 -- ./target/debug/astra-test \
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
             --suite "$suite" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
-            --filter "$CASE_FILTER" --force-model glm-5.3 \
+            --filter "$CASE_FILTER" --force-model deepseek-v4.1-flash \
             --judger-model glm-5.3 --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json"
 
@@ -237,7 +245,7 @@ jobs:
           model_status=127
           if [ -x ./target/debug/astra ]; then
             model_status=0
-            timeout 30 ./target/debug/astra admin model show glm-5.3 \
+            timeout 30 ./target/debug/astra admin model show deepseek-v4.1-flash \
               > "$RUNNER_TEMP/harness/model-status.json" \
               2> "$RUNNER_TEMP/harness/model-status.log" || model_status=$?
           fi
@@ -268,7 +276,7 @@ jobs:
                         "model_active": model.get("is_active") if isinstance(model.get("is_active"), bool) else None,
                         "model_load_step": os.environ["MODEL_LOAD_OUTCOME"],
                         "harness_step": os.environ["HARNESS_OUTCOME"],
-                        "model_lookup_name": "glm-5.3", "preflight": preflight or None}
+                        "model_lookup_name": "deepseek-v4.1-flash", "preflight": preflight or None}
           text = json.dumps(diagnostic, indent=2) + "\n"
           (root / "diagnostic.json").write_text(text)
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:

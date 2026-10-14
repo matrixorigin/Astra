@@ -887,6 +887,47 @@ impl ExternalCmdJudger {
     }
 }
 
+// Keep the unreaped child as the group identity until its pipes close. Dropping
+// a cancelled judgment must stop descendants that could otherwise retain them.
+struct ExternalJudgeProcess(tokio::process::Child);
+
+impl Drop for ExternalJudgeProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id().filter(|pid| *pid <= i32::MAX as u32) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        let _ = self.0.start_kill();
+    }
+}
+
+async fn read_judge_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+    reject_overflow: bool,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(output);
+        }
+        let retained = count.min(limit.saturating_sub(output.len()));
+        output.extend_from_slice(&chunk[..retained]);
+        if reject_overflow && retained != count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "judger stdout exceeds capture limit",
+            ));
+        }
+    }
+}
+
 #[async_trait]
 impl Judger for ExternalCmdJudger {
     async fn judge(
@@ -930,31 +971,59 @@ impl Judger for ExternalCmdJudger {
             return Err("judger-cmd is empty".to_string());
         }
 
-        let mut child = Command::new("sh")
+        let payload = serde_json::to_vec(&input).map_err(|e| e.to_string())?;
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(self.timeout_seconds);
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(&self.cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("spawn judger-cmd {}: {e}", self.cmd))?;
-
-        // Write input
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let payload = serde_json::to_vec(&input).unwrap();
-            // Ignore BrokenPipe — the child may not read stdin (e.g.,
-            // a simple `echo` script). We still proceed to read stdout.
-            let _ = stdin.write_all(&payload).await;
-            drop(stdin);
-        }
-
-        let timeout = std::time::Duration::from_secs(self.timeout_seconds);
-        let output = tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .map_err(|_| format!("judger-cmd timed out after {}s", self.timeout_seconds))?
-            .map_err(|e| format!("judger-cmd wait: {e}"))?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut process = ExternalJudgeProcess(
+            command
+                .spawn()
+                .map_err(|e| format!("spawn judger-cmd {}: {e}", self.cmd))?,
+        );
+        let group_id = process.0.id();
+        let mut stdin = process.0.stdin.take().expect("piped stdin");
+        let stdout = process.0.stdout.take().expect("piped stdout");
+        let stderr = process.0.stderr.take().expect("piped stderr");
+        let result = tokio::time::timeout_at(deadline, async {
+            let (_, stdout, stderr) = tokio::try_join!(
+                async move {
+                    use tokio::io::AsyncWriteExt;
+                    match stdin.write_all(&payload).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                },
+                read_judge_output(stdout, 256 * 1024, true),
+                read_judge_output(stderr, JUDGER_STDERR_CAP, false),
+            )?;
+            let status = process.0.wait().await?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        })
+        .await;
+        let output = match result {
+            Ok(Ok(output)) => output,
+            error => {
+                crate::exec::kill_process_group_and_reap(&mut process.0, group_id).await;
+                return Err(match error {
+                    Ok(Err(error)) => format!("judger-cmd I/O: {error}"),
+                    _ => format!("judger-cmd timed out after {}s", self.timeout_seconds),
+                });
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2139,6 +2208,61 @@ print({response:?})
             .await
             .expect_err("timeout must fail");
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_judger_bounds_input_output_and_descendant_pipes() {
+        futures::future::join_all([
+            ("exec sleep 10", "timed out"),
+            ("sleep 10 & echo '{\"score\":1.0,\"rationale\":\"ok\"}'", "timed out"),
+            ("head -c 524288 /dev/zero", "capture limit"),
+            ("head -c 131072 /dev/zero >&2; cat >/dev/null; echo '{\"score\":1.0,\"rationale\":\"ok\"}'", ""),
+        ].map(|(command, expected)| async move {
+            let judge = ExternalCmdJudger::new(command, 1);
+            let outcome = dummy_outcome().with_text("x".repeat(2 * 1024 * 1024));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                judge.judge(&quality_criterion("q"), &outcome, None),
+            ).await.expect("all judge pipe I/O must have a deadline");
+            if expected.is_empty() {
+                assert_eq!(grade(&result.unwrap()), 1.0);
+            } else {
+                assert!(result.unwrap_err().contains(expected), "{command}");
+            }
+        })).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_judger_cancellation_stops_owned_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let leaked = dir.path().join("leaked");
+        let command = format!(
+            "(sleep 1; printf leaked > {}) & printf started > {}; wait",
+            crate::exec::shell_escape(leaked.display().to_string()),
+            crate::exec::shell_escape(started.display().to_string()),
+        );
+        let task = tokio::spawn(async move {
+            ExternalCmdJudger::new(command, 10)
+                .judge(&quality_criterion("q"), &dummy_outcome(), None)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !started.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the actual external judge must start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !leaked.exists(),
+            "cancelled judge descendant performed a late write"
+        );
     }
 
     #[tokio::test]

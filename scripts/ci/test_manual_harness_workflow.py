@@ -114,15 +114,27 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             model = json.loads(path.read_text())[0]
             self.assertEqual(model["api_key"], "sentinel-secret")
             self.assertEqual(model["thinking_protocol"], "reasoning_effort")
+            flash = json.loads(path.read_text())[1]
+            self.assertEqual(flash["name"], "deepseek-v4.1-flash")
+            self.assertEqual(flash["api_key"], "sentinel-secret")
+            self.assertEqual(flash["base_url"], "https://example.invalid/v1")
+            self.assertEqual(flash["thinking_protocol"], "reasoning_effort")
+            self.assertEqual(flash["prompt_cache_capability"], {
+                "schema_version": 2, "protocol": "openai_auto_prefix",
+                "volatile_placement": "append_only_user_tail", "volatile_delivery": "required_only",
+                "reuse_scope": "conversation_turns"})
             self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
 
     def test_additional_model_configs_are_optional_independent_and_private(self):
         entry = {"name": "secondary-judge", "provider": "openai",
                  "base_url": "https://secondary.example.invalid/v1", "api_key": "secondary-sentinel",
                  "context_window": 64000, "thinking_protocol": "enable_thinking"}
+        explicit_flash = {**entry, "name": "deepseek-v4.1-flash"}
         for extra, accepted in [("", True), ("[]", True), (json.dumps([entry]), True),
+                                 (json.dumps([explicit_flash]), True),
                                  ("{}", False), ("[null]", False), ("not-json-sentinel", False),
                                  ('[{"name":"GLM-5.3"}]', False),
+                                 ('[{"name":"deepseek-v4.1-flash"},{"name":"DEEPSEEK-V4.1-FLASH"}]', False),
                                  ('[{"name":"x"},{"name":"X"}]', False)]:
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -134,9 +146,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                     self.assertNotIn(secret, result.stdout + result.stderr)
                 if accepted:
                     models = json.loads((root / "harness/models.yaml").read_text())
-                    self.assertEqual(len(models), 2 if extra == json.dumps([entry]) else 1)
-                    if len(models) == 2:
+                    self.assertEqual(len(models), 3 if extra == json.dumps([entry]) else 2)
+                    if extra == json.dumps([entry]):
                         self.assertEqual(models[1], entry)
+                    if extra == json.dumps([explicit_flash]):
+                        self.assertEqual(models[1], explicit_flash)
                 else:
                     self.assertFalse((root / "harness/models.yaml").exists())
 
@@ -162,7 +176,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertTrue(diagnostic["model_registered"])
             self.assertFalse(diagnostic["model_active"])
             self.assertEqual(diagnostic["harness_step"], "skipped")
-            self.assertEqual(diagnostic["model_lookup_name"], "glm-5.3")
+            self.assertEqual(diagnostic["model_lookup_name"], "deepseek-v4.1-flash")
             self.assertEqual(diagnostic["preflight"], {"status": "failed", "models": ["glm-5.2", "glm-5.3"],
                                                      "unavailable_model": "glm-5.2"})
             (root / "harness/model-status.json").unlink()
@@ -236,6 +250,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
             self.assertEqual(args[args.index("--judger-model") + 1], "glm-5.3")
+            self.assertEqual(args[args.index("--force-model") + 1], "deepseek-v4.1-flash")
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])
             if profile == "regression":
