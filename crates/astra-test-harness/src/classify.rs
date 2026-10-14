@@ -491,9 +491,9 @@ mod tests {
     fn execution_verification_classification_follows_composed_criteria() {
         let proof = Criterion::ExecutionChildResultsAdopted {
             children: vec![crate::criteria::ChildExecutionExpectation {
-                expected_result: crate::criteria::ChildResultExpectation::Text(
+                expected_result: Some(crate::criteria::ChildResultExpectation::Text(
                     "missing-result".into(),
-                ),
+                )),
                 model: "test-model".into(),
                 initial_thinking: None,
                 answered_question: false,
@@ -535,9 +535,9 @@ mod tests {
             );
             let matching = Criterion::ExecutionChildResultsAdopted {
                 children: vec![crate::criteria::ChildExecutionExpectation {
-                    expected_result: crate::criteria::ChildResultExpectation::Text(
+                    expected_result: Some(crate::criteria::ChildResultExpectation::Text(
                         "observed-value".into(),
-                    ),
+                    )),
                     model: "test-model".into(),
                     initial_thinking: None,
                     answered_question: false,

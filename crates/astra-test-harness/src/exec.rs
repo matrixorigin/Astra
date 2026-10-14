@@ -2072,9 +2072,9 @@ cat "$TERMINAL_FILE"
         let mut case = simple_case();
         case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
             children: vec![crate::criteria::ChildExecutionExpectation {
-                expected_result: crate::criteria::ChildResultExpectation::Text(
+                expected_result: Some(crate::criteria::ChildResultExpectation::Text(
                     "observed-value".into(),
-                ),
+                )),
                 model: "test-model".into(),
                 initial_thinking: None,
                 answered_question: false,
@@ -2111,9 +2111,9 @@ cat "$TERMINAL_FILE"
         assert!(crate::criteria::evaluate_deterministic(&case.criteria, &outcome)[0].passed);
         case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
             children: vec![crate::criteria::ChildExecutionExpectation {
-                expected_result: crate::criteria::ChildResultExpectation::Text(
+                expected_result: Some(crate::criteria::ChildResultExpectation::Text(
                     "wrong-result".into(),
-                ),
+                )),
                 model: "test-model".into(),
                 initial_thinking: None,
                 answered_question: false,

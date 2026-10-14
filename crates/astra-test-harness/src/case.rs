@@ -563,6 +563,30 @@ impl Case {
             || super::criteria::requires_memoria_subsystem_health(&self.criteria)
     }
 
+    pub(crate) fn validate_execution_scope(&self) -> Result<(), String> {
+        super::criteria::validate_criteria(&self.criteria)?;
+        for (i, step) in self.steps.iter().enumerate() {
+            super::criteria::validate_criteria(&step.criteria)
+                .map_err(|error| format!("steps[{i}].{error}"))?;
+        }
+        if super::criteria::semantic_child_adoption(&self.criteria).is_some()
+            && !self.steps.is_empty()
+        {
+            return Err(
+                "semantic child adoption cannot be combined with steps; execution evidence must have one boundary"
+                    .into(),
+            );
+        }
+        for (i, step) in self.steps.iter().enumerate() {
+            if super::criteria::semantic_child_adoption(&step.criteria).is_some() {
+                return Err(format!(
+                    "steps[{i}] cannot contain semantic child adoption; move it to case-level criteria"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Load a case from a YAML file on disk.
     pub fn from_path(path: &Path) -> Result<Self, anyhow::Error> {
         // Cheap size guard so a pathological YAML (or a wrong file
@@ -671,7 +695,7 @@ impl Case {
         // A case author's YAML typo would otherwise turn into a
         // permanent-FAIL / permanent-PASS that looks like a real
         // regression.
-        crate::criteria::validate_criteria(&case.criteria)
+        case.validate_execution_scope()
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         for (i, step) in case.steps.iter().enumerate() {
             if step.prompt.trim().is_empty() {
@@ -685,10 +709,6 @@ impl Case {
                     "case {}: steps[{i}].timeout_seconds must be >= 1",
                     path.display()
                 );
-            }
-            // Validate step criteria at load time.
-            if let Err(e) = crate::criteria::validate_criteria(&step.criteria) {
-                anyhow::bail!("case {}: steps[{i}].{e}", path.display(),);
             }
             if crate::criteria::requires_session_capture(&step.criteria) {
                 anyhow::bail!(
@@ -1336,6 +1356,61 @@ steps:
                 .to_string()
                 .contains("steps[0] contains a session/journal criterion")
         );
+    }
+
+    #[test]
+    fn semantic_child_adoption_requires_one_case_level_execution_boundary() {
+        let dir = tempdir().unwrap();
+        let valid = r#"name: semantic
+prompt: answer the task
+criteria:
+  - type: execution_child_results_adopted
+    children:
+      - model: test-model
+  - type: hard_judger
+    question: Does the child answer the task?
+"#;
+        let valid_path = dir.path().join("valid.yaml");
+        std::fs::write(&valid_path, valid).unwrap();
+        assert!(Case::from_path(&valid_path).is_ok());
+
+        for (name, source) in [
+            (
+                "top-level-with-step.yaml",
+                r#"name: semantic
+prompt: answer
+steps:
+  - prompt: follow up
+criteria:
+  - type: execution_child_results_adopted
+    children:
+      - model: test-model
+  - type: hard_judger
+    question: Does the child answer the task?
+"#,
+            ),
+            (
+                "step-semantic.yaml",
+                r#"name: semantic
+prompt: answer
+criteria:
+  - type: text_contains
+    needle: answer
+steps:
+  - prompt: follow up
+    criteria:
+      - type: execution_child_results_adopted
+        children:
+          - model: test-model
+      - type: hard_judger
+        question: Does the child answer the task?
+"#,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source).unwrap();
+            assert!(Case::from_path(&path).is_err(), "{name} must be rejected");
+        }
     }
 
     #[test]

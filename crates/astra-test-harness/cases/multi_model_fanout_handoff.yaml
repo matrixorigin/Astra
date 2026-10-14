@@ -5,9 +5,9 @@ description: |
   than accepting a launch receipt or a parent-generated marker as completion.
 prompt: |
   Use one agent_fanout.start group named mixed-model-handoff with two explore
-  slots. Ask a glm-5.3 child to compute 17 * 19 - 281 and reply with only the
-  integer. Ask a deepseek-v4.1-flash child to sort [8, 3, 5] ascending and reply
-  with only the compact JSON array. Do not give either child its answer.
+  slots. Ask a glm-5.3 child to compute 17 * 19 - 281. Ask a
+  deepseek-v4.1-flash child to sort [8, 3, 5] ascending.
+  Do not give either child its answer.
   Wait for both actual results, then report them and the settlement ratio 2/2.
   Do not retry, replace slots, or perform the child tasks yourself.
 required_models: [glm-5.3, deepseek-v4.1-flash]
@@ -34,14 +34,18 @@ criteria:
     fanout_group: mixed-model-handoff
     children:
       - slot_index: 0
-        expected_result: {text: "42"}
         model: glm-5.3
       - slot_index: 1
-        expected_result: {text: "[3,5,8]"}
         model: deepseek-v4.1-flash
-  - type: text_contains
-    needle: "42"
-  - type: text_contains
-    needle: "[3,5,8]"
-  - type: text_contains
-    needle: "2/2"
+  - type: hard_judger
+    threshold: 1.0
+    question: |
+      Require every condition below, using verified_child_evidence rather than
+      the parent's claims alone. The actual slot 0 child must correctly compute
+      17 * 19 - 281 as 42, and the actual slot 1 child must correctly sort the
+      input as [3, 5, 8]. Accept equivalent prose, explanations, whitespace and
+      presentation; no exact text or JSON-only output format is required.
+      Reject incorrect or contradictory child answers even if the parent gives
+      the correct answer. The parent's actual requests must not supply the child
+      answers. The parent must faithfully report both observed child results and
+      the completed settlement ratio 2/2, not merely claim that work was launched.

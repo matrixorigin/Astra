@@ -524,6 +524,20 @@ focus without duplicating the whole scripted journey.
 
 ### Criterion severity levels
 
+Use deterministic execution criteria for child identity, actual model execution,
+completion, and original-result custody. For natural-language task correctness,
+omit `expected_result` in one top-level `execution_child_results_adopted` and add
+a required `hard_judger`. The existing judge then receives the complete verified
+child bodies, identities, original-result digests, parent requests and response.
+Its rubric should evaluate each child's own answer and faithful parent reporting;
+a correct parent answer cannot compensate for an incorrect child.
+
+This mode requires a single execution, not follow-up steps. Missing, conflicting,
+oversized or truncated required evidence cannot pass, and `--no-judger` cannot
+disable the requirement. Existing explicit `text`, `contains`, and `json` child
+expectations remain deterministic; use them only when that output contract is
+actually required, not to enforce incidental prose or JSON whitespace.
+
 Each criterion has a severity that controls how failures are treated:
 
 | Severity    | Meaning                                                                                                                            | Criteria types                                                                                                                                  |

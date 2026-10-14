@@ -51,6 +51,15 @@ a bounded error preview is presentation, and cannot contradict an identical
 complete failure body. Error-only records remain failure evidence, and conflicting
 bodies, artifacts, dispositions or typed failure facts are rejected.
 
+For live multi-agent capability tests, execution identity and original result
+custody are deterministic prerequisites; natural-language answer correctness is
+a separate required semantic judgment. An omitted child `expected_result` must
+be paired with a required judge. Both built-in and external judges receive the
+same complete, verified child bodies and identities, separately from parent
+claims. Missing, oversized, or contradictory evidence cannot authorize a pass.
+Explicit text and JSON expectations remain available for actual output-format
+contracts; they must not be imposed accidentally on general collaboration tests.
+
 ## Replay modes
 
 | Mode | Meaning |

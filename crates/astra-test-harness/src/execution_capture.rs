@@ -44,6 +44,17 @@ pub struct SessionExecutionCapture {
     pub run_projections: Option<Vec<Value>>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct VerifiedChildEvidence<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) agent_id: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) offering_id: Option<&'a str>,
+    pub(crate) slot_index: Option<u32>,
+    pub(crate) content: &'a str,
+    pub(crate) result_sha256: String,
+}
+
 /// Joined canonical transcript evidence, not a reconstructed journal event.
 pub(crate) struct ExecutionToolCall<'a> {
     pub run_id: &'a str,
@@ -431,13 +442,13 @@ impl SessionExecutionCapture {
     /// Positive evidence may survive partial reflection. A truncated run tree
     /// cannot establish the required direct-child cardinality; missing request
     /// groups or boundary facts cannot establish execution or adoption.
-    pub(crate) fn proves_children(
-        &self,
+    pub(crate) fn verified_children<'a>(
+        &'a self,
         root: &str,
         expected: &[crate::criteria::ChildExecutionExpectation],
         fanout_group: Option<&str>,
-    ) -> Result<bool, &'static str> {
-        use crate::criteria::{ChildResultExpectation, ChildThinkingExpectation};
+    ) -> Result<Option<Vec<VerifiedChildEvidence<'a>>>, &'static str> {
+        use crate::criteria::ChildThinkingExpectation;
         let runs = self.validated_runs(root)?;
         let children: Vec<_> = runs
             .values()
@@ -445,13 +456,13 @@ impl SessionExecutionCapture {
             .copied()
             .collect();
         if children.len() != expected.len() || expected.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         if children
             .iter()
             .any(|child| child.status != SessionRunLifecycleStatus::Completed)
         {
-            return Ok(false);
+            return Ok(None);
         }
         if self
             .reflection
@@ -476,7 +487,7 @@ impl SessionExecutionCapture {
                 })
             })
         {
-            return Ok(false);
+            return Ok(None);
         }
         if fanout_group.is_none() {
             let mut remaining = std::collections::BTreeMap::new();
@@ -490,7 +501,7 @@ impl SessionExecutionCapture {
                 .filter_map(|child| child.runtime.model_name.as_deref())
             {
                 let Some(count) = remaining.get_mut(model).filter(|count| **count > 0) else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 *count -= 1;
             }
@@ -507,20 +518,20 @@ impl SessionExecutionCapture {
                         .is_some_and(|args| args["action"] == "start" && args["group_id"] == group)
             });
             let Some(start) = starts.next() else {
-                return Ok(false);
+                return Ok(None);
             };
             if starts.next().is_some() || start.ok != Some(true) {
-                return Ok(false);
+                return Ok(None);
             }
             let receipt = start.result.as_ref().ok_or("fanout receipt unavailable")?;
             if receipt["group_id"] != group {
-                return Ok(false);
+                return Ok(None);
             }
             let agents = receipt["agents"]
                 .as_array()
                 .ok_or("fanout child identities unavailable")?;
             if agents.len() != children.len() {
-                return Ok(false);
+                return Ok(None);
             }
             let mut returned_runs = std::collections::BTreeSet::new();
             let mut returned_agents = std::collections::BTreeSet::new();
@@ -541,7 +552,7 @@ impl SessionExecutionCapture {
                         .as_str()
                         .is_none_or(|label| label.is_empty() || !returned_labels.insert(label))
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 if run_id.is_empty()
                     || agent_id.is_empty()
@@ -553,11 +564,11 @@ impl SessionExecutionCapture {
                             || child.agent_id.as_deref() != Some(agent_id)
                     })
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
             if returned_runs != children.iter().map(|child| child.run_id.as_str()).collect() {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let facts: Vec<_> = self
@@ -585,15 +596,16 @@ impl SessionExecutionCapture {
                             .is_some_and(|agent| fact["agent_id"] != agent))
             })
         }) {
-            return Ok(false);
+            return Ok(None);
         }
         let mut selected = std::collections::BTreeSet::new();
         let mut latest_adoption = None;
         let mut unavailable = None;
+        let mut verified = Vec::with_capacity(expected.len());
         for expectation in expected {
             let child = if fanout_group.is_some() {
                 let Some(run_id) = expectation.slot_index.and_then(|slot| slots.get(&slot)) else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 runs[run_id.as_str()]
             } else {
@@ -608,10 +620,10 @@ impl SessionExecutionCapture {
                         unavailable = Some("child model identity unavailable");
                         continue;
                     }
-                    return Ok(false);
+                    return Ok(None);
                 };
                 if matching.next().is_some() {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 *child
             };
@@ -622,7 +634,7 @@ impl SessionExecutionCapture {
                     .as_deref()
                     .is_some_and(|model| model != expectation.model)
             {
-                return Ok(false);
+                return Ok(None);
             }
             if child.runtime.model_name.is_none() {
                 unavailable = Some("child model identity unavailable");
@@ -632,7 +644,7 @@ impl SessionExecutionCapture {
                     ChildThinkingExpectation::Exact { config } => Ok(config.clone()),
                     ChildThinkingExpectation::SameAsRoot => {
                         match (&runs[root].runtime.offering_id, &child.runtime.offering_id) {
-                            (Some(parent), Some(current)) if parent != current => return Ok(false),
+                            (Some(parent), Some(current)) if parent != current => return Ok(None),
                             (None, _) | (_, None) => {
                                 unavailable = Some("inherited offering identity unavailable");
                             }
@@ -645,7 +657,7 @@ impl SessionExecutionCapture {
                     self.run_initial_thinking(root, &child.run_id)
                         .map(|actual| actual == expected)
                 }) {
-                    Ok(false) => return Ok(false),
+                    Ok(false) => return Ok(None),
                     Err(reason) => unavailable = Some(reason),
                     _ => {}
                 }
@@ -660,7 +672,7 @@ impl SessionExecutionCapture {
                     >(fact["workspace_mutation"].clone())
                     {
                         if actual != expected {
-                            return Ok(false);
+                            return Ok(None);
                         }
                         observed = true;
                     }
@@ -671,35 +683,41 @@ impl SessionExecutionCapture {
             }
             if expectation.answered_question {
                 match self.proves_answered_question(root, child) {
-                    Ok(false) => return Ok(false),
+                    Ok(false) => return Ok(None),
                     Err(reason) => unavailable = Some(reason),
                     _ => {}
                 }
             }
             if let Some(rounds) = expectation.logical_rounds {
                 match self.run_logical_rounds(root, &child.run_id) {
-                    Ok(actual) if actual != rounds => return Ok(false),
+                    Ok(actual) if actual != rounds => return Ok(None),
                     Err(reason) => unavailable = Some(reason),
                     _ => {}
                 }
             }
             let content = match self.run_terminal_content(root, &child.run_id) {
                 Ok(Some(raw)) => raw,
-                Ok(None) => return Ok(false),
+                Ok(None) => return Ok(None),
                 Err(reason) => {
                     unavailable = Some(reason);
                     continue;
                 }
             };
-            let result_matches = match &expectation.expected_result {
-                ChildResultExpectation::Text(text) => content == text,
-                ChildResultExpectation::Contains(needle) => content.contains(needle),
-                ChildResultExpectation::Json(value) => {
-                    serde_json::from_str::<Value>(content).ok().as_ref() == Some(value)
-                }
-            };
+            let result_matches =
+                expectation
+                    .expected_result
+                    .as_ref()
+                    .is_none_or(|expected| match expected {
+                        crate::criteria::ChildResultExpectation::Text(text) => content == text,
+                        crate::criteria::ChildResultExpectation::Contains(needle) => {
+                            content.contains(needle)
+                        }
+                        crate::criteria::ChildResultExpectation::Json(value) => {
+                            serde_json::from_str::<Value>(content).ok().as_ref() == Some(value)
+                        }
+                    });
             if !result_matches {
-                return Ok(false);
+                return Ok(None);
             }
             let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
             let observed_digests: Vec<_> = facts
@@ -721,7 +739,7 @@ impl SessionExecutionCapture {
                 .filter_map(|entry| entry["result_sha256"].as_str())
                 .collect();
             if !observed_digests.is_empty() && !observed_digests.contains(&digest.as_str()) {
-                return Ok(false);
+                return Ok(None);
             }
             match self.child_adoption_time(root, child, &digest, &expectation.model, &facts) {
                 Ok(time) => {
@@ -730,8 +748,31 @@ impl SessionExecutionCapture {
                             .map_or(time, |latest: chrono::NaiveDateTime| latest.max(time)),
                     )
                 }
-                Err(reason) => unavailable = Some(reason),
+                Err(reason) => {
+                    unavailable = Some(reason);
+                    continue;
+                }
             }
+            let agent_id = child
+                .agent_id
+                .as_deref()
+                .ok_or("child agent identity unavailable")?;
+            let Some(model) = child.runtime.model_name.as_deref() else {
+                // Keep checking later siblings: a missing model is an
+                // unavailable witness, not permission to hide a known
+                // contradiction in another requested child.
+                unavailable = Some("child model identity unavailable");
+                continue;
+            };
+            verified.push(VerifiedChildEvidence {
+                run_id: child.run_id.as_str(),
+                agent_id,
+                model,
+                offering_id: child.runtime.offering_id.as_deref(),
+                slot_index: expectation.slot_index,
+                content,
+                result_sha256: digest,
+            });
         }
         let finalizations: Vec<_> = facts
             .iter()
@@ -746,7 +787,7 @@ impl SessionExecutionCapture {
         if latest_adoption.is_some_and(|latest| {
             !finalizations.is_empty() && finalizations.iter().all(|time| *time <= latest)
         }) {
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(reason) = unavailable {
             return Err(reason);
@@ -755,7 +796,22 @@ impl SessionExecutionCapture {
         if finalizations.is_empty() {
             return Err("parent finalization unavailable");
         }
-        Ok(finalizations.iter().any(|time| *time > latest))
+        if !finalizations.iter().any(|time| *time > latest) {
+            return Ok(None);
+        }
+        Ok(Some(verified))
+    }
+
+    /// Preserve the deterministic consumer's boolean API over the canonical
+    /// custody proof.
+    pub(crate) fn proves_children(
+        &self,
+        root: &str,
+        expected: &[crate::criteria::ChildExecutionExpectation],
+        fanout_group: Option<&str>,
+    ) -> Result<bool, &'static str> {
+        self.verified_children(root, expected, fanout_group)
+            .map(|evidence| evidence.is_some())
     }
 
     /// A queued answer is not observation. Exact durable communication plus
@@ -1093,7 +1149,7 @@ pub(crate) mod tests {
         slot_index: Option<u32>,
     ) -> crate::criteria::ChildExecutionExpectation {
         crate::criteria::ChildExecutionExpectation {
-            expected_result: crate::criteria::ChildResultExpectation::Text(text.into()),
+            expected_result: Some(crate::criteria::ChildResultExpectation::Text(text.into())),
             model: model.into(),
             initial_thinking: None,
             answered_question: false,
@@ -1300,16 +1356,38 @@ pub(crate) mod tests {
             unlabelled.proves_children("root", &expected, Some("group")),
             Ok(true)
         );
-        let mut missing_model = capture.clone();
-        missing_model.run_tree.runs[1].runtime.model_name = None;
+        let mut missing_model_for_order = capture.clone();
+        missing_model_for_order.run_tree.runs[1].runtime.model_name = None;
         assert_eq!(
-            proof_failure(missing_model, expected.to_vec(), Some("group")),
+            proof_failure(
+                missing_model_for_order.clone(),
+                expected.to_vec(),
+                Some("group")
+            ),
             Some(crate::classify::FailureClass::InfraVerificationUnavailable)
         );
         assert_eq!(
             capture.proves_children("root", &expected[..1], Some("group")),
             Ok(false)
         );
+        for expectations in [
+            [
+                expectation("observed-value", "test-model", Some(0)),
+                expectation("wrong sibling output", "test-model", Some(1)),
+            ],
+            [
+                expectation("wrong sibling output", "test-model", Some(1)),
+                expectation("observed-value", "test-model", Some(0)),
+            ],
+        ] {
+            assert!(
+                matches!(
+                    missing_model_for_order.verified_children("root", &expectations, Some("group")),
+                    Ok(None)
+                ),
+                "missing-model sibling must not hide a known contradiction"
+            );
+        }
         assert_eq!(
             capture.proves_children(
                 "root",
@@ -1426,8 +1504,9 @@ pub(crate) mod tests {
             Some(crate::criteria::ChildThinkingExpectation::Exact {
                 config: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
             });
-        contradictions[1].expected_result =
-            crate::criteria::ChildResultExpectation::Text("wrong sibling output".into());
+        contradictions[1].expected_result = Some(crate::criteria::ChildResultExpectation::Text(
+            "wrong sibling output".into(),
+        ));
         for expectations in [
             contradictions.clone(),
             [contradictions[1].clone(), contradictions[0].clone()],
@@ -1472,6 +1551,81 @@ pub(crate) mod tests {
         assert!(capture.awaiting_completion_evidence(Some("root")));
         capture.run_tree.runs[2].status = SessionRunLifecycleStatus::Paused;
         assert!(!capture.awaiting_completion_evidence(Some("root")));
+    }
+
+    #[test]
+    fn semantic_child_evidence_keeps_prose_custody_and_rejects_identity_gaps() {
+        let prose = "The child returned observed-value with an explanation.";
+        let mut capture = capture();
+        capture.transcript.as_mut().unwrap().items[0].content = prose.into();
+        capture.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(prose.as_bytes())));
+        let mut expected = expectation("ignored", "test-model", None);
+        expected.expected_result = None;
+
+        let evidence = capture
+            .verified_children("root", &[expected.clone()], None)
+            .expect("complete semantic custody evidence")
+            .expect("valid semantic custody evidence");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].content, prose);
+        assert_eq!(evidence[0].model, "test-model");
+        assert_eq!(
+            evidence[0].result_sha256,
+            format!("{:x}", Sha256::digest(prose.as_bytes()))
+        );
+        let serialized = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(serialized[0]["content"], prose);
+
+        let mut wrong_model = capture.clone();
+        wrong_model.run_tree.runs[1].runtime.model_name = Some("wrong-model".into());
+        assert!(matches!(
+            wrong_model.verified_children("root", &[expected.clone()], None),
+            Ok(None)
+        ));
+
+        let mut wrong_digest = capture.clone();
+        wrong_digest.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+            serde_json::json!("wrong");
+        assert!(matches!(
+            wrong_digest.verified_children("root", &[expected.clone()], None),
+            Ok(None)
+        ));
+
+        let mut missing_output = capture.clone();
+        missing_output.transcript.as_mut().unwrap().items.clear();
+        assert!(
+            missing_output
+                .verified_children("root", std::slice::from_ref(&expected), None)
+                .is_err()
+        );
+
+        let mut fanout = tool_capture();
+        fanout.transcript.as_mut().unwrap().items[0].tool_calls[0].name = "agent_fanout".into();
+        fanout.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
+            serde_json::json!({"action":"start", "group_id":"group"}).to_string();
+        fanout.transcript.as_mut().unwrap().items[1]
+            .tool_result
+            .as_mut()
+            .unwrap()
+            .name = Some("agent_fanout".into());
+        fanout.transcript.as_mut().unwrap().items[1].content = serde_json::json!({
+            "group_id":"group",
+            "agents":[{"slot_index":0,"id":"slot-0","run_id":"child","agent_id":"member"}]
+        })
+        .to_string();
+        let mut wrong_slot = expected;
+        wrong_slot.slot_index = Some(1);
+        assert!(matches!(
+            fanout.verified_children("root", &[wrong_slot], Some("group")),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -1678,7 +1832,7 @@ pub(crate) mod tests {
                 .collect(),
         );
         let mut expected = expectation("observed-value", "test-model", None);
-        expected.expected_result = ChildResultExpectation::Contains("observed".into());
+        expected.expected_result = Some(ChildResultExpectation::Contains("observed".into()));
         expected.initial_thinking = Some(ChildThinkingExpectation::SameAsRoot);
         assert_eq!(
             proof_failure(original.clone(), vec![expected.clone()], None),

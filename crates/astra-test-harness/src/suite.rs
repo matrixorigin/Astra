@@ -290,6 +290,13 @@ impl<'a> SuiteRunner<'a> {
         let mut work: Vec<(&Case, String, u32)> = Vec::new();
         let mut unavailable: Vec<CaseRunReport> = Vec::new();
         for case in cases {
+            let invalid = case.validate_execution_scope().err();
+            if let Some(error) = invalid {
+                for run_index in 0..self.suite_cfg.runs.max(1) {
+                    unavailable.push(self.unavailable_case_report(case, &error, run_index));
+                }
+                continue;
+            }
             match resolve_models(case, &self.runner_cfg) {
                 Ok(models) => {
                     for m in models {
@@ -304,9 +311,9 @@ impl<'a> SuiteRunner<'a> {
                         case.name
                     );
                     for run_index in 0..self.suite_cfg.runs.max(1) {
-                        unavailable.push(self.model_resolution_unavailable(
+                        unavailable.push(self.unavailable_case_report(
                             case,
-                            &e.to_string(),
+                            &format!("could not resolve a model: {e}"),
                             run_index,
                         ));
                     }
@@ -658,8 +665,7 @@ impl<'a> SuiteRunner<'a> {
         let bound = match case.bind_model(model) {
             Ok(bound) => bound,
             Err(error) => {
-                let mut report =
-                    self.model_resolution_unavailable(case, &error.to_string(), run_index);
+                let mut report = self.unavailable_case_report(case, &error.to_string(), run_index);
                 report.model = model.to_owned();
                 report.outcome.model = model.to_owned();
                 return report;
@@ -819,7 +825,7 @@ impl<'a> SuiteRunner<'a> {
                             criterion,
                             Criterion::Judger { .. } | Criterion::HardJudger { .. }
                         ) && let Some(result) =
-                            evaluate_judger(self.judger, criterion, &step_outcome).await
+                            evaluate_judger(self.judger, criterion, &step_outcome, None).await
                         {
                             step_criteria_results[criterion_index] = result;
                         }
@@ -1193,12 +1199,38 @@ impl<'a> SuiteRunner<'a> {
             &primary_executions,
         );
 
+        let semantic_evidence =
+            crate::criteria::semantic_child_adoption(&criteria).map(|adoption| {
+                crate::judger::semantic_child_evidence(&case.prompt, &outcome, adoption)
+            });
+
         // Always run the judger (unless --no-judger) — the quality
         // score is useful for diagnostics even when Hard criteria fail.
         if !self.no_judger {
             for (i, c) in criteria.iter().enumerate() {
-                if matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. })
-                    && let Some(res) = evaluate_judger(self.judger, c, &judger_outcome).await
+                if !matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. }) {
+                    continue;
+                }
+                let evidence = if matches!(c, Criterion::HardJudger { .. }) {
+                    match semantic_evidence.as_ref() {
+                        Some(Ok(Some(evidence))) => Some(evidence),
+                        Some(Ok(None)) => {
+                            det[i].passed = false;
+                            det[i].detail =
+                                "judger not run: child execution or custody contradicted".into();
+                            continue;
+                        }
+                        Some(Err(reason)) => {
+                            det[i].passed = false;
+                            det[i].detail = format!("required judger unavailable: {reason}");
+                            continue;
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(res) = evaluate_judger(self.judger, c, &judger_outcome, evidence).await
                 {
                     det[i] = res;
                 }
@@ -1535,13 +1567,8 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
-    fn model_resolution_unavailable(
-        &self,
-        case: &Case,
-        detail: &str,
-        run_index: u32,
-    ) -> CaseRunReport {
-        let reason = format!("unavailable: could not resolve a model for case: {detail}");
+    fn unavailable_case_report(&self, case: &Case, detail: &str, run_index: u32) -> CaseRunReport {
+        let reason = format!("unavailable: {detail}");
         let criteria = case
             .criteria
             .iter()
@@ -2000,6 +2027,7 @@ mod tests {
                 model: None,
             },
             &outcome,
+            None,
         )
         .unwrap();
         assert_eq!(request.state["text"], text);
@@ -2358,6 +2386,7 @@ mod tests {
             &self,
             _criterion: &Criterion,
             _o: &RunOutcome,
+            _evidence: Option<&crate::judger::SemanticJudgerEvidence>,
         ) -> Result<JudgerResult, String> {
             Ok(JudgerResult {
                 assessment: JudgerAssessment::Grade(self.score),
@@ -3214,6 +3243,7 @@ mod tests {
                 &self,
                 _criterion: &Criterion,
                 _o: &RunOutcome,
+                _evidence: Option<&crate::judger::SemanticJudgerEvidence>,
             ) -> Result<JudgerResult, String> {
                 *self.hits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 Ok(JudgerResult {
@@ -4702,6 +4732,7 @@ mod tests {
                 &self,
                 criterion: &Criterion,
                 outcome: &RunOutcome,
+                evidence: Option<&crate::judger::SemanticJudgerEvidence>,
             ) -> Result<crate::judger::JudgerResult, String> {
                 self.questions
                     .lock()
@@ -4714,7 +4745,7 @@ mod tests {
                 self.states
                     .lock()
                     .unwrap()
-                    .push(crate::judger::build_judger_request(criterion, outcome)?.state);
+                    .push(crate::judger::build_judger_request(criterion, outcome, evidence)?.state);
                 Ok(crate::judger::JudgerResult {
                     assessment: JudgerAssessment::Acceptance(true),
                     rationale: "ok".into(),
@@ -5108,6 +5139,253 @@ mod tests {
         assert!(
             !report.runs[0].steps[0].criteria[0].passed,
             "soft criterion should report as failed"
+        );
+    }
+
+    const SEMANTIC_SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn semantic_adoption() -> Criterion {
+        Criterion::ExecutionChildResultsAdopted {
+            children: vec![crate::criteria::ChildExecutionExpectation {
+                expected_result: None,
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        }
+    }
+
+    fn semantic_case(name: &str) -> Case {
+        case_with(
+            name,
+            vec![
+                semantic_adoption(),
+                Criterion::HardJudger {
+                    question: "Does the parent faithfully report the child result?".into(),
+                    threshold: 1.0,
+                    model: None,
+                },
+            ],
+        )
+    }
+
+    fn bound_semantic_capture() -> crate::execution_capture::SessionExecutionCapture {
+        let mut capture = crate::execution_capture::tests::capture();
+        capture.session_id = SEMANTIC_SESSION_ID.into();
+        capture.run_tree.session_id = SEMANTIC_SESSION_ID.into();
+        capture.reflection.session_id = SEMANTIC_SESSION_ID.into();
+        let transcript = capture.transcript.as_mut().expect("fixture transcript");
+        transcript.session_id = SEMANTIC_SESSION_ID.into();
+        for item in &mut transcript.items {
+            item.session_id = SEMANTIC_SESSION_ID.into();
+        }
+        capture
+    }
+
+    fn semantic_outcome(
+        capture: Option<crate::execution_capture::SessionExecutionCapture>,
+    ) -> RunOutcome {
+        let mut outcome = outcome_ok("m", "The child reported observed-value.", &[]);
+        outcome.run_id = Some("root".into());
+        if let Some(capture) = capture {
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.session_id = Some(SEMANTIC_SESSION_ID.into());
+            stream.root_run_id = Some("root".into());
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+        }
+        outcome
+    }
+
+    fn semantic_runner<'a>(
+        executor: &'a dyn CaseExecutor,
+        judger: &'a dyn Judger,
+        loader: &'a dyn SessionLoader,
+    ) -> SuiteRunner<'a> {
+        SuiteRunner {
+            executor,
+            judger,
+            session_loader: loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: false,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        }
+    }
+
+    struct SemanticCaptureJudger {
+        hits: AtomicUsize,
+        child_bodies: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SemanticCaptureJudger {
+        fn new() -> Self {
+            Self {
+                hits: AtomicUsize::new(0),
+                child_bodies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Judger for SemanticCaptureJudger {
+        async fn judge(
+            &self,
+            criterion: &Criterion,
+            outcome: &RunOutcome,
+            evidence: Option<&crate::judger::SemanticJudgerEvidence>,
+        ) -> Result<JudgerResult, String> {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            let evidence = evidence.ok_or("semantic evidence missing")?;
+            let request = crate::judger::build_judger_request(criterion, outcome, Some(evidence))?;
+            let body = request.state["verified_child_evidence"]["children"][0]["content"]
+                .as_str()
+                .ok_or("verified child body missing")?;
+            self.child_bodies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(body.into());
+            Ok(JudgerResult {
+                assessment: JudgerAssessment::Acceptance(true),
+                rationale: "affirmative semantic fixture".into(),
+                full_rationale: "affirmative semantic fixture".into(),
+                votes: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_suite_passes_verified_child_body_to_required_judger() {
+        let exec = FakeExecutor::new();
+        exec.seed(
+            "semantic-intact",
+            "m",
+            semantic_outcome(Some(bound_semantic_capture())),
+        );
+        let judger = SemanticCaptureJudger::new();
+        let loader = NoopSessionLoader;
+        let runner = semantic_runner(&exec, &judger, &loader);
+
+        let report = runner.run_all(&[semantic_case("semantic-intact")]).await;
+
+        assert_eq!(report.runs[0].status, CaseRunStatus::Passed, "{report:?}");
+        assert_eq!(judger.hits.load(Ordering::Relaxed), 1);
+        let child_bodies = judger
+            .child_bodies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            child_bodies.as_slice(),
+            [String::from("observed-value")].as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_suite_gates_judger_on_contradiction_or_missing_capture() {
+        let mut contradiction = bound_semantic_capture();
+        contradiction.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+            "known-wrong-digest".into();
+
+        for (name, capture, detail, unavailable) in [
+            (
+                "semantic-contradiction",
+                Some(contradiction),
+                "child execution or custody contradicted",
+                false,
+            ),
+            (
+                "semantic-missing-capture",
+                None,
+                "required judger unavailable",
+                true,
+            ),
+        ] {
+            let exec = FakeExecutor::new();
+            exec.seed(name, "m", semantic_outcome(capture));
+            let judger = SemanticCaptureJudger::new();
+            let loader = NoopSessionLoader;
+            let runner = semantic_runner(&exec, &judger, &loader);
+
+            let report = runner.run_all(&[semantic_case(name)]).await;
+
+            assert!(!report.runs[0].is_passed(), "{name}: {report:?}");
+            assert_eq!(judger.hits.load(Ordering::Relaxed), 0, "{name}");
+            assert!(report.runs[0].criteria.iter().any(|result| {
+                matches!(result.criterion, Criterion::HardJudger { .. })
+                    && result.detail.contains(detail)
+            }));
+            if unavailable {
+                assert_eq!(
+                    report.runs[0].failure_class,
+                    Some(FailureClass::InfraVerificationUnavailable),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_suite_rejects_programmatic_invalid_criterion_before_execution() {
+        let exec = FakeExecutor::new();
+        let judger = SemanticCaptureJudger::new();
+        let loader = NoopSessionLoader;
+        let runner = semantic_runner(&exec, &judger, &loader);
+        let case = case_with("semantic-invalid", vec![semantic_adoption()]);
+        let mut step_case = semantic_case("semantic-step-invalid");
+        let step_criteria = std::mem::take(&mut step_case.criteria);
+        step_case.criteria = vec![Criterion::TextContains {
+            needle: "answer".into(),
+        }];
+        step_case.steps = vec![crate::case::CaseStep {
+            prompt: "follow up".into(),
+            criteria: step_criteria,
+            timeout_seconds: None,
+        }];
+        let mut nested_step_case = step_case.clone();
+        nested_step_case.name = "semantic-nested-step-invalid".into();
+        let nested_adoption = nested_step_case.steps[0].criteria[0].clone();
+        nested_step_case.steps[0].criteria[0] = Criterion::AnyOf {
+            criteria: vec![nested_adoption],
+        };
+
+        let report = runner.run_all(&[case, step_case, nested_step_case]).await;
+
+        assert_eq!(report.runs.len(), 3);
+        assert!(
+            report
+                .runs
+                .iter()
+                .all(|run| run.status == CaseRunStatus::Unavailable)
+        );
+        assert!(exec.calls.lock().unwrap().is_empty());
+        assert_eq!(judger.hits.load(Ordering::Relaxed), 0);
+        assert!(
+            report.runs[0].criteria[0]
+                .detail
+                .contains("top-level HardJudger companion")
+        );
+        assert!(
+            report.runs[1].criteria[0]
+                .detail
+                .contains("steps[0] cannot contain semantic child adoption")
+        );
+        assert!(
+            report.runs[2].criteria[0]
+                .detail
+                .contains("semantic child adoption cannot be nested under AnyOf or AllOf")
         );
     }
 }

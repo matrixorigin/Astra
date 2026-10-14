@@ -84,8 +84,14 @@ pub enum ChildThinkingExpectation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildExecutionExpectation {
-    #[serde(with = "serde_yaml_ng::with::singleton_map")]
-    pub expected_result: ChildResultExpectation,
+    /// Omit only for a top-level adoption proof paired with a hard semantic
+    /// judge; exact text, contains, and JSON answers remain deterministic.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_yaml_ng::with::singleton_map"
+    )]
+    pub expected_result: Option<ChildResultExpectation>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_thinking: Option<ChildThinkingExpectation>,
@@ -695,6 +701,39 @@ pub enum Criterion {
     /// Useful for making a set of normally-soft metric bounds a hard case
     /// requirement without changing their default severity globally.
     AllOf { criteria: Vec<Criterion> },
+}
+
+/// Return the single top-level child-adoption proof that delegates answer
+/// comparison to a required hard judger.
+pub(crate) fn semantic_child_adoption(criteria: &[Criterion]) -> Option<&Criterion> {
+    criteria.iter().find(|criterion| {
+        matches!(
+            criterion,
+            Criterion::ExecutionChildResultsAdopted { children, .. }
+                if children.iter().any(|child| child.expected_result.is_none())
+        )
+    })
+}
+
+fn contains_omitted_child_result(criterion: &Criterion) -> bool {
+    match criterion {
+        Criterion::ExecutionChildResultsAdopted { children, .. } => {
+            children.iter().any(|child| child.expected_result.is_none())
+        }
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            criteria.iter().any(contains_omitted_child_result)
+        }
+        _ => false,
+    }
+}
+
+fn is_composite_with_omitted_child_result(criterion: &Criterion) -> bool {
+    match criterion {
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            criteria.iter().any(contains_omitted_child_result)
+        }
+        _ => false,
+    }
 }
 
 fn default_cache_min_calls() -> u32 {
@@ -5615,18 +5654,23 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                 return Err("fanout_group must be a bounded nonempty identity".into());
             }
             for child in children {
-                let expected_bytes = match &child.expected_result {
-                    ChildResultExpectation::Text(text) | ChildResultExpectation::Contains(text) => {
-                        text.len()
+                if let Some(expected_result) = &child.expected_result {
+                    let expected_bytes = match expected_result {
+                        ChildResultExpectation::Text(text)
+                        | ChildResultExpectation::Contains(text) => text.len(),
+                        ChildResultExpectation::Json(value) => value.to_string().len(),
+                    };
+                    if expected_bytes == 0 || expected_bytes > 4096 {
+                        return Err(
+                            "ExecutionChildResultsAdopted requires a 1..=4096 byte result and a bounded model name"
+                                .into(),
+                        );
                     }
-                    ChildResultExpectation::Json(value) => value.to_string().len(),
-                };
-                if expected_bytes == 0
-                    || expected_bytes > 4096
-                    || child.model.trim().is_empty()
-                    || child.model.len() > 128
-                {
-                    return Err("ExecutionChildResultsAdopted requires a 1..=4096 byte result and a bounded model name".into());
+                }
+                if child.model.trim().is_empty() || child.model.len() > 128 {
+                    return Err(
+                        "ExecutionChildResultsAdopted requires a 1..=4096 byte result and a bounded model name".into(),
+                    );
                 }
                 let identity = match fanout_group {
                     Some(_) => child
@@ -5903,6 +5947,28 @@ fn validate_composite_criteria(
 /// Validate every criterion in a list. Returns the first offender's
 /// error with a 1-based index so the case author can find the line.
 pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
+    let contains_omitted_result = criteria.iter().any(contains_omitted_child_result);
+    if contains_omitted_result {
+        if criteria.iter().any(is_composite_with_omitted_child_result) {
+            return Err("semantic child adoption cannot be nested under AnyOf or AllOf".into());
+        }
+        let adoption_count = criteria
+            .iter()
+            .filter(|criterion| matches!(criterion, Criterion::ExecutionChildResultsAdopted { .. }))
+            .count();
+        if adoption_count != 1 {
+            return Err(
+                "semantic child adoption requires exactly one top-level ExecutionChildResultsAdopted"
+                    .into(),
+            );
+        }
+        if !criteria
+            .iter()
+            .any(|criterion| matches!(criterion, Criterion::HardJudger { .. }))
+        {
+            return Err("semantic child adoption requires a top-level HardJudger companion".into());
+        }
+    }
     for (i, c) in criteria.iter().enumerate() {
         validate_criterion(c).map_err(|e| format!("criteria[{}]: {e}", i + 1))?;
     }
@@ -6089,7 +6155,7 @@ mod tests {
         use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
         let criterion = Criterion::ExecutionChildResultsAdopted {
             children: vec![ChildExecutionExpectation {
-                expected_result: ChildResultExpectation::Text("observed-value".into()),
+                expected_result: Some(ChildResultExpectation::Text("observed-value".into())),
                 model: "test-model".into(),
                 initial_thinking: Some(ChildThinkingExpectation::Exact {
                     config: ThinkingConfig::Adaptive {
@@ -6172,7 +6238,7 @@ mod tests {
             if fault == "wrong-result" {
                 if let Criterion::ExecutionChildResultsAdopted { children, .. } = &mut requested {
                     children[0].expected_result =
-                        ChildResultExpectation::Text("not-delivered".into());
+                        Some(ChildResultExpectation::Text("not-delivered".into()));
                 }
                 outcome
                     .stream_capture
@@ -6197,7 +6263,9 @@ mod tests {
     fn json_child_adoption_checks_original_bytes_before_semantic_value() {
         let criterion = Criterion::ExecutionChildResultsAdopted {
             children: vec![ChildExecutionExpectation {
-                expected_result: ChildResultExpectation::Json(serde_json::json!({"value":42})),
+                expected_result: Some(ChildResultExpectation::Json(
+                    serde_json::json!({"value":42}),
+                )),
                 model: "test-model".into(),
                 initial_thinking: None,
                 answered_question: false,
@@ -6207,13 +6275,63 @@ mod tests {
             }],
             fanout_group: None,
         };
+        let omitted: Criterion = serde_yaml_ng::from_str(
+            "type: execution_child_results_adopted\nchildren:\n  - model: test-model\n",
+        )
+        .unwrap();
+        let explicit_null: Criterion = serde_yaml_ng::from_str(
+            "type: execution_child_results_adopted\nchildren:\n  - model: test-model\n    expected_result: {json: null}\n",
+        )
+        .unwrap();
+        let Criterion::ExecutionChildResultsAdopted {
+            children: omitted_children,
+            ..
+        } = &omitted
+        else {
+            panic!("expected child adoption criterion");
+        };
+        let Criterion::ExecutionChildResultsAdopted {
+            children: explicit_children,
+            ..
+        } = &explicit_null
+        else {
+            panic!("expected child adoption criterion");
+        };
+        assert!(omitted_children[0].expected_result.is_none());
+        assert!(matches!(
+            explicit_children[0].expected_result.as_ref(),
+            Some(ChildResultExpectation::Json(value)) if value.is_null()
+        ));
+        let omitted_json = serde_json::to_value(&omitted).unwrap();
+        assert!(omitted_json["children"][0].get("expected_result").is_none());
+        let omitted_round_trip: Criterion =
+            serde_yaml_ng::from_str(&serde_yaml_ng::to_string(&omitted).unwrap()).unwrap();
+        let Criterion::ExecutionChildResultsAdopted {
+            children: omitted_round_trip_children,
+            ..
+        } = omitted_round_trip
+        else {
+            panic!("expected child adoption criterion");
+        };
+        assert!(omitted_round_trip_children[0].expected_result.is_none());
+        let explicit_json = serde_json::to_value(&explicit_null).unwrap();
+        assert_eq!(
+            explicit_json["children"][0]["expected_result"]["json"],
+            serde_json::Value::Null
+        );
+        let explicit_round_trip: Criterion =
+            serde_yaml_ng::from_str(&serde_yaml_ng::to_string(&explicit_null).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&explicit_round_trip).unwrap(),
+            explicit_json
+        );
         for expected_result in [
             ChildResultExpectation::Text("literal".into()),
             ChildResultExpectation::Json(serde_json::json!({"value":42})),
         ] {
             let typed = Criterion::ExecutionChildResultsAdopted {
                 children: vec![ChildExecutionExpectation {
-                    expected_result,
+                    expected_result: Some(expected_result),
                     model: "test-model".into(),
                     initial_thinking: None,
                     answered_question: false,
@@ -8239,7 +8357,7 @@ mod tests {
                 model,
                 ..
             } = &children[0];
-            let ChildResultExpectation::Text(expected_result) = expected_result else {
+            let Some(ChildResultExpectation::Text(expected_result)) = expected_result else {
                 panic!("literal marker journey must have a text expectation");
             };
             let mut parent_marker = outcome.clone();
@@ -11125,6 +11243,32 @@ mod tests {
 
         let err = validate_criterion(&criterion).expect_err("over-depth composite should fail");
         assert!(err.contains("max composite depth"), "err = {err}");
+    }
+
+    #[test]
+    fn semantic_child_adoption_requires_unambiguous_hard_judger_companion() {
+        let adoption: Criterion = serde_yaml_ng::from_str(
+            "type: execution_child_results_adopted\nchildren:\n  - model: test-model\n",
+        )
+        .unwrap();
+        let hard = Criterion::HardJudger {
+            question: "Does the child answer the task?".into(),
+            threshold: 0.7,
+            model: None,
+        };
+        assert!(semantic_child_adoption(&[adoption.clone(), hard.clone()]).is_some());
+        assert!(validate_criteria(&[adoption.clone(), hard.clone()]).is_ok());
+        assert!(validate_criteria(std::slice::from_ref(&adoption)).is_err());
+        assert!(validate_criteria(&[adoption.clone(), adoption.clone(), hard.clone()]).is_err());
+        assert!(
+            validate_criteria(&[
+                Criterion::AnyOf {
+                    criteria: vec![adoption],
+                },
+                hard,
+            ])
+            .is_err()
+        );
     }
 
     #[test]
