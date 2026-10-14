@@ -349,7 +349,7 @@ def publish(root):
     def cell(value):
         return html.escape(str(value)).replace("|", "&#124;").replace("\n", " ")
     with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
-        out.write("## GLM-5.3 harness\n\n" + ("Complete — passed" if summary["success"] else
+        out.write("## Live harness\n\n" + ("Complete — passed" if summary["success"] else
                   "Complete — failed" if summary["complete"] else "**Incomplete — not a pass**") +
                   "; termination: " + cell(execution["termination"]) + ".\n\n")
         if summary["incomplete_reason"]:
