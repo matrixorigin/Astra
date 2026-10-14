@@ -1,0 +1,47 @@
+name: multi_model_fanout_handoff
+description: |
+  A small heterogeneous fanout with one GLM child and one DeepSeek child.
+  Check the actual child models, terminal results and parent adoption rather
+  than accepting a launch receipt or a parent-generated marker as completion.
+prompt: |
+  Use one agent_fanout.start group named mixed-model-handoff with two explore
+  slots. Ask a glm-5.3 child to compute 17 * 19 - 281 and reply with only the
+  integer. Ask a deepseek-v4.1-flash child to sort [8, 3, 5] ascending and reply
+  with only the compact JSON array. Do not give either child its answer.
+  Wait for both actual results, then report them and the settlement ratio 2/2.
+  Do not retry, replace slots, or perform the child tasks yourself.
+required_models: [glm-5.3, deepseek-v4.1-flash]
+capability: delegation
+difficulty: 3
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: agent_fanout
+    root_only: true
+    ok: true
+    min: 1
+    max: 1
+    predicates:
+      - {document: arguments, path: /action, equals: start}
+      - {document: arguments, path: /target_count, equals: 2}
+  - type: execution_child_count
+    min: 2
+    max: 2
+  - type: execution_child_results_adopted
+    fanout_group: mixed-model-handoff
+    children:
+      - slot_index: 0
+        expected_result: {text: "42"}
+        model: glm-5.3
+      - slot_index: 1
+        expected_result: {text: "[3,5,8]"}
+        model: deepseek-v4.1-flash
+  - type: text_contains
+    needle: "42"
+  - type: text_contains
+    needle: "[3,5,8]"
+  - type: text_contains
+    needle: "2/2"

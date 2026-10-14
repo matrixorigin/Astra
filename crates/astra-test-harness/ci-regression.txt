@@ -1,0 +1,10 @@
+# Small live-provider regression suite. Paths are relative to cases/.
+# Keep assertions and prompts in the original cases, not copies here.
+hello_text_contains.yaml
+reasoning_multi_step_logic.yaml
+parallel_readonly_batching.yaml
+task_agent_profile_callable.yaml
+recovered_validation_user_facing_completion.yaml
+cache_provider_matrix_regression.yaml
+subagent_model_selection/flash_missing_child_model_fail_closed.yaml
+multi_model_fanout_handoff.yaml

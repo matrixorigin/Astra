@@ -341,6 +341,7 @@ class WorkflowSecurityContractTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         expected = "${{ github.event.pull_request.number"
         for relative in (
+            ".github/workflows/harness-regression.yml",
             ".github/workflows/pr-title.yml",
             ".github/workflows/static-checks.yml",
             ".github/workflows/test.yml",
@@ -359,7 +360,7 @@ class WorkflowSecurityContractTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(pull_request_workflows),
-            ["pr-title.yml", "static-checks.yml", "test.yml"],
+            ["harness-regression.yml", "pr-title.yml", "static-checks.yml", "test.yml"],
         )
         self.assertLessEqual(len(pull_request_workflows), MAX_SUPERSEDED_RUNS)
 

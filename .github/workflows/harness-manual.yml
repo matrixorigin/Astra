@@ -23,6 +23,35 @@ on:
         default: "1"
         type: choice
         options: ["1", "2", "3"]
+      profile:
+        description: "full uses filter; regression uses the fixed ci-regression.txt list (15-minute execution budget)"
+        default: full
+        type: choice
+        options: [full, regression]
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: true
+      profile:
+        type: string
+        default: regression
+      filter:
+        type: string
+        default: "*"
+      runs:
+        type: string
+        default: "1"
+    secrets:
+      HARNESS_GLM_BASE_URL:
+        required: true
+      HARNESS_GLM_API_KEY:
+        required: true
+      HARNESS_ADDITIONAL_MODELS_JSON:
+        required: false
 
 permissions:
   contents: read
@@ -119,14 +148,12 @@ jobs:
           shared-key: ci-harness
           install-nextest: false
           use-sccache: false
-          # A custom checkout must not publish artifacts into the trusted main cache.
-          save-cache: false
+          # Only the automatic main push may publish; custom/manual source cannot.
+          save-cache: ${{ github.event_name == 'push' && github.repository == 'matrixorigin/Astra' && inputs.repository == github.repository && inputs.ref == github.sha }}
 
       - name: Build current Server, CLI and harness
         run: |
-          cargo build --locked -p astra-runtime --bin astra-server
-          cargo build --locked -p astra-cli --bin astra
-          cargo build --locked -p astra-test-harness --bin astra-test
+          cargo build --locked -p astra-runtime --bin astra-server -p astra-cli --bin astra -p astra-test-harness --bin astra-test
 
       - name: Start disposable dependencies and candidate Server
         timeout-minutes: 15
@@ -152,10 +179,11 @@ jobs:
 
       - name: Run real harness
         id: harness
-        timeout-minutes: 60
+        timeout-minutes: ${{ inputs.profile == 'regression' && 18 || 60 }}
         env:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
+          CASE_PROFILE: ${{ inputs.profile }}
         run: |
           run_started=$(date +%s)
           workspace="$RUNNER_TEMP/harness/workspace"
@@ -167,13 +195,27 @@ jobs:
           git -C "$workspace" remote set-url origin "$(git remote get-url origin)"
           git -C "$workspace" checkout --quiet --detach "$ASTRA_BUILD_SOURCE_GIT_SHA"
           sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
+          suite="$GITHUB_WORKSPACE/crates/astra-test-harness/cases"
+          budget=3300
+          if [ "${CASE_PROFILE:-full}" = regression ]; then
+            python3 scripts/ci/select_harness_cases.py --cases "$suite" \
+              --list crates/astra-test-harness/ci-regression.txt \
+              --destination "$RUNNER_TEMP/harness/selected-cases"
+            suite="$RUNNER_TEMP/harness/selected-cases"
+            CASE_FILTER='*'
+            CASE_RUNS=1
+            budget=900
+          elif [ "${CASE_PROFILE:-full}" != full ]; then
+            echo 'Unknown harness profile' >&2
+            exit 1
+          fi
           python3 scripts/harness/process_supervisor.py run \
             --owner-pid "$$" --identity "manual-glm-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" -- \
             python3 scripts/ci/manual_harness.py run \
             --root "$RUNNER_TEMP/harness" --started-at "$run_started" \
-            --timeout-seconds 3300 --grace-seconds 120 -- ./target/debug/astra-test \
+            --timeout-seconds "$budget" --grace-seconds 120 -- ./target/debug/astra-test \
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
-            --suite "$GITHUB_WORKSPACE/crates/astra-test-harness/cases" \
+            --suite "$suite" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
             --filter "$CASE_FILTER" --force-model glm-5.3 \
             --judger-model glm-5.3 --parallel 1 --runs "$CASE_RUNS" \

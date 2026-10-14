@@ -21,6 +21,18 @@ def python_block(step):
 
 
 class ManualHarnessWorkflowTests(unittest.TestCase):
+    def test_automatic_lane_reuses_execution_and_keeps_fork_secrets_boundary(self):
+        workflow = (WORKFLOW.parent / "harness-regression.yml").read_text()
+        self.assertIn("\n  push:\n    branches: [main]", workflow)
+        self.assertIn("\n  pull_request:\n    branches: [main]", workflow)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", workflow)
+        self.assertIn("github.actor != 'dependabot[bot]'", workflow)
+        self.assertNotIn("\n  pull_request_target:", workflow)
+        self.assertIn("uses: ./.github/workflows/harness-manual.yml", workflow)
+        self.assertIn("ref: ${{ github.sha }}", workflow)
+        self.assertIn("profile: regression", workflow)
+        self.assertNotIn("secrets: inherit", workflow)
+
     def test_source_identity_uses_checkout_not_dispatch_commit(self):
         section = WORKFLOW.read_text().split("- name: Record checked-out source identity\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
@@ -127,6 +139,13 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):
+        self.run_live_command("full")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
+    def test_regression_runs_reviewed_cases_without_disabling_grading(self):
+        self.run_live_command("regression")
+
+    def run_live_command(self, profile):
         section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +179,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             helpers = root / "scripts/ci"
             helpers.mkdir(parents=True)
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/ci/manual_harness.py", helpers / "manual_harness.py")
+            shutil.copyfile(WORKFLOW.parents[2] / "scripts/ci/select_harness_cases.py", helpers / "select_harness_cases.py")
+            harness = root / "crates/astra-test-harness"
+            harness.mkdir(parents=True)
+            shutil.copyfile(WORKFLOW.parents[2] / "crates/astra-test-harness/ci-regression.txt", harness / "ci-regression.txt")
+            shutil.copytree(WORKFLOW.parents[2] / "crates/astra-test-harness/cases", harness / "cases")
             supervisor = root / "scripts/harness"
             supervisor.mkdir()
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/harness/process_supervisor.py", supervisor / "process_supervisor.py")
@@ -168,13 +192,20 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                                     env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
                                          "ASTRA_BUILD_SOURCE_GIT_SHA": sha,
-                                         "CASE_FILTER": filter_value, "CASE_RUNS": "1"},
+                                         "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile},
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
             self.assertEqual(args[args.index("--judger-model") + 1], "glm-5.3")
-            self.assertEqual(args[args.index("--filter") + 1], filter_value)
+            self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
+            suite = Path(args[args.index("--suite") + 1])
+            if profile == "regression":
+                selected = [line for line in (harness / "ci-regression.txt").read_text().splitlines()
+                            if line and not line.startswith("#")]
+                self.assertEqual(sorted(p.name for p in suite.iterdir()), sorted(Path(p).name for p in selected))
+                for path in selected:
+                    self.assertEqual((suite / Path(path).name).read_bytes(), (harness / "cases" / path).read_bytes())
             self.assertFalse((root / "unexpected").exists())
             workspace = root / "harness/workspace"
             self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip(), sha)
