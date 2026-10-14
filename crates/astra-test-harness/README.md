@@ -220,13 +220,36 @@ selected code can read and exfiltrate the provider key, so run only trusted comm
 
 ### Small automatic live regression
 
-**Harness regression (live)** runs on relevant `main` pushes and same-repository
-PRs. Fork and Dependabot PRs cannot receive these repository secrets and are explicitly skipped, not
-certified as tested. Their merged revision runs on `main`; before merge, a
-maintainer can manually dispatch a reviewed exact SHA with `profile: regression`.
-There is no `pull_request_target` execution of fork code. Keep this lane optional
-in branch protection: offline required checks retain their existing coverage.
-Superseded runs are cancelled to avoid paying for obsolete revisions.
+**Harness regression (live)** runs on relevant `main` pushes, same-repository
+PRs and explicitly trusted forks. Its `pull_request_target` caller is taken from
+the trusted base, not the PR. Before granting credentials it checks both the
+head repository's full name and immutable GitHub ID:
+
+| Trusted fork | Repository ID |
+| --- | --- |
+| `XuPeng-SH/Astra` | `1355430593` |
+| `gouhongshen/Astra` | `1355443432` |
+| `loveRhythm1990/Astra` | `1355489820` |
+
+The allowlist lives in
+[harness-regression.yml](../../.github/workflows/harness-regression.yml).
+A fork cannot grant itself access by editing its copy. Recreated/lookalike
+repositories fail the ID/name check. Adding a fork **trusts everyone who can
+write code to that fork**: its build scripts, cases and executables run with
+model credentials and can leak them. Log masking does not provide isolation.
+This is deliberate credential access for these repositories, not safe execution
+of arbitrary fork code. Revoke an entry if that trust changes.
+
+Other forks and Dependabot PRs are explicitly skipped, not certified as tested.
+Their merged revision runs on `main`; a maintainer can also manually dispatch a
+reviewed exact SHA. Automatic PR execution checks out the accepted fork's exact
+**head SHA**, not the base SHA or a movable branch. The reusable workflow and
+gate remain base-owned; checkout's explicit fork opt-in is reached only after
+authorization. Token permissions stay `contents: read`, checkout credentials
+are not persisted, and PR runs cannot save the shared build cache. The runner
+is disposable. Keep this lane optional in branch protection: offline required
+checks retain existing coverage. Superseded runs are cancelled by PR number.
+Allowlist changes take effect only after they reach the trusted base branch.
 
 The authoritative selection is [ci-regression.txt](ci-regression.txt). The
 selector stages those original files unchanged into one suite; it does not copy

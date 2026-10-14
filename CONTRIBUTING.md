@@ -95,8 +95,12 @@ CLI tests build and run their complete inventory once, after building the
 standalone mock MCP server. Five protected check labels require that same
 completed job; they do not repeat setup, builds, archive downloads, or tests.
 Failed, cancelled, or unexpectedly skipped required execution fails closed.
-Caches retain existing trust boundaries, and fork PRs run without privileged
-access. JUnit timings are retained on success and failure to assess total CI
+Caches retain existing trust boundaries, and ordinary fork PR tests run without
+privileged access. The separate optional live-model regression grants provider
+credentials only to explicitly trusted fork name/ID pairs from its base-owned
+workflow. Trusting a fork also trusts its code writers; see the
+[harness guide](crates/astra-test-harness/README.md#small-automatic-live-regression).
+JUnit timings are retained on success and failure to assess total CI
 cost. Rerunning a failed CLI execution repeats the combined build/test job;
 there is no archived-test fallback or artifact-expiry dependency.
 On macOS, the default terminal-reader lane also runs the CLI Bash regression
@@ -110,7 +114,7 @@ replacement test run can enter the normal concurrency group. A separate
 trusted-workflow-revision controller cancels active runs for earlier heads
 without waiting for replacement-run approval. The controller never checks out
 or executes pull request code; the
-test workflows remain low-privilege `pull_request` workflows. Normal concurrency
+required test workflows remain low-privilege `pull_request` workflows. Normal concurrency
 groups use the pull request number, so identically named branches in different
 forks remain isolated. Each synchronize event cancels only its exact `before`
 head and is intentionally not coalesced, so rapid pushes cannot make an older

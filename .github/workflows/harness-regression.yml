@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths: ["crates/**", "Cargo.*", "rust-toolchain.toml", ".cargo/**", "Makefile", "scripts/dev/**", "scripts/lib/**", "scripts/harness/**", "scripts/ci/**", ".github/workflows/**", ".github/actions/**", "deployment/all-in-one/**", "fixtures/harness/**"]
-  pull_request:
+  pull_request_target:
     branches: [main]
     paths: ["crates/**", "Cargo.*", "rust-toolchain.toml", ".cargo/**", "Makefile", "scripts/dev/**", "scripts/lib/**", "scripts/harness/**", "scripts/ci/**", ".github/workflows/**", ".github/actions/**", "deployment/all-in-one/**", "fixtures/harness/**"]
 
@@ -17,14 +17,26 @@ concurrency:
 
 jobs:
   regression:
-    # Never run fork source with repository secrets. Fork changes are tested
-    # automatically after merge; maintainers can dispatch the manual workflow
-    # for a reviewed exact SHA beforehand. Do not use pull_request_target.
-    if: ${{ github.repository == 'matrixorigin/Astra' && github.actor != 'dependabot[bot]' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # This gate comes from the trusted base, never the PR's workflow. These
+    # explicitly trusted repositories may execute code with model credentials.
+    # Bind names AND immutable IDs: a lookalike or recreated fork is not trusted.
+    if: >-
+      ${{ github.repository == 'matrixorigin/Astra' &&
+          (github.event_name == 'push' ||
+           (github.actor != 'dependabot[bot]' &&
+            github.event.pull_request.user.login != 'dependabot[bot]' &&
+            ((github.event.pull_request.head.repo.full_name == github.repository &&
+              github.event.pull_request.head.repo.id == github.event.repository.id) ||
+             (github.event.pull_request.head.repo.full_name == 'XuPeng-SH/Astra' &&
+              github.event.pull_request.head.repo.id == 1355430593) ||
+             (github.event.pull_request.head.repo.full_name == 'gouhongshen/Astra' &&
+              github.event.pull_request.head.repo.id == 1355443432) ||
+             (github.event.pull_request.head.repo.full_name == 'loveRhythm1990/Astra' &&
+              github.event.pull_request.head.repo.id == 1355489820)))) }}
     uses: ./.github/workflows/harness-manual.yml
     with:
-      repository: ${{ github.repository }}
-      ref: ${{ github.sha }}
+      repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
       profile: regression
     secrets:
       HARNESS_GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}

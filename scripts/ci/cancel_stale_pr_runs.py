@@ -20,7 +20,7 @@ ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "in_progress", "pending", "requested", "waiting"}
 )
 # These caps keep the worst-case request path within the workflow's five-minute
-# timeout while leaving headroom over Astra's four pull-request workflows.
+# timeout while leaving headroom over Astra's three pull-request workflows.
 MAX_PAGES = 5
 MAX_SUPERSEDED_RUNS = 5
 REQUEST_TIMEOUT_SECONDS = 10

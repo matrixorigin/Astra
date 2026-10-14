@@ -360,7 +360,7 @@ class WorkflowSecurityContractTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(pull_request_workflows),
-            ["harness-regression.yml", "pr-title.yml", "static-checks.yml", "test.yml"],
+            ["pr-title.yml", "static-checks.yml", "test.yml"],
         )
         self.assertLessEqual(len(pull_request_workflows), MAX_SUPERSEDED_RUNS)
 

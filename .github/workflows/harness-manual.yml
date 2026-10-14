@@ -94,6 +94,9 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           persist-credentials: false
+          # The trusted caller's name+ID gate explicitly authorizes these forks
+          # to execute with provider credentials; unlisted forks never reach here.
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - name: Record checked-out source identity
         run: |

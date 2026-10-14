@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 
@@ -21,17 +22,54 @@ def python_block(step):
 
 
 class ManualHarnessWorkflowTests(unittest.TestCase):
-    def test_automatic_lane_reuses_execution_and_keeps_fork_secrets_boundary(self):
+    def test_automatic_lane_reuses_execution_and_keeps_trust_boundary(self):
         workflow = (WORKFLOW.parent / "harness-regression.yml").read_text()
         self.assertIn("\n  push:\n    branches: [main]", workflow)
-        self.assertIn("\n  pull_request:\n    branches: [main]", workflow)
+        self.assertIn("\n  pull_request_target:\n    branches: [main]", workflow)
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", workflow)
         self.assertIn("github.actor != 'dependabot[bot]'", workflow)
-        self.assertNotIn("\n  pull_request_target:", workflow)
+        self.assertIn("github.event.pull_request.user.login != 'dependabot[bot]'", workflow)
+        self.assertNotIn("\n  pull_request:\n", workflow)
         self.assertIn("uses: ./.github/workflows/harness-manual.yml", workflow)
-        self.assertIn("ref: ${{ github.sha }}", workflow)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", workflow)
+        self.assertIn("repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}", workflow)
         self.assertIn("profile: regression", workflow)
         self.assertNotIn("secrets: inherit", workflow)
+
+    def test_actual_trust_expression_rejects_name_or_id_spoofing(self):
+        workflow = (WORKFLOW.parent / "harness-regression.yml").read_text()
+        # Evaluate the actual workflow's Boolean/equality-only subset, not a
+        # second policy function. GitHub also compares these strings ignoring
+        # case; every canonical fixture below uses GitHub's actual casing.
+        expression = re.search(r"if: >-\n\s*\$\{\{(.*?)\}\}", workflow, re.S)[1]
+        expression = " ".join(expression.replace("&&", "and").replace("||", "or").split())
+        trusted = {"XuPeng-SH/Astra": 1355430593, "gouhongshen/Astra": 1355443432,
+                   "loveRhythm1990/Astra": 1355489820}
+
+        def allowed(name, repo_id, *, event="pull_request_target", actor="contributor", author="contributor",
+                    destination="matrixorigin/Astra"):
+            github = SimpleNamespace(repository=destination, event_name=event, actor=actor,
+                event=SimpleNamespace(repository=SimpleNamespace(id=100),
+                    pull_request=SimpleNamespace(user=SimpleNamespace(login=author), head=SimpleNamespace(
+                        repo=SimpleNamespace(full_name=name, id=repo_id)))))
+            return eval(expression, {"__builtins__": {}}, {"github": github})
+
+        for name, repo_id in trusted.items():
+            with self.subTest(name=name):
+                self.assertTrue(allowed(name, repo_id))
+                self.assertFalse(allowed(name, repo_id + 1))
+                self.assertFalse(allowed("attacker/Astra", repo_id))
+                self.assertFalse(allowed(name, repo_id, actor="dependabot[bot]"))
+                self.assertFalse(allowed(name, repo_id, actor="maintainer", author="dependabot[bot]"))
+                self.assertFalse(allowed(name, repo_id, destination="attacker/Astra"))
+        self.assertFalse(allowed("attacker/Astra", 999))
+        self.assertFalse(allowed("", 0))  # Deleted/absent head repository.
+        self.assertTrue(allowed("matrixorigin/Astra", 100))
+        self.assertFalse(allowed("matrixorigin/Astra", 101))
+        self.assertFalse(allowed("matrixorigin/Astra", 100, actor="maintainer", author="dependabot[bot]"))
+        self.assertTrue(allowed("", 0, event="push", actor="dependabot[bot]"))
+        self.assertIn("allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}",
+                      WORKFLOW.read_text())
 
     def test_source_identity_uses_checkout_not_dispatch_commit(self):
         section = WORKFLOW.read_text().split("- name: Record checked-out source identity\n", 1)[1].split("\n      - ", 1)[0]
