@@ -2198,8 +2198,11 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
     let result = find_events(&events, "tool_call_end")
         .into_iter()
         .find(|event| event["call_id"].as_str() == Some("call-fanout"))
-        .and_then(|event| event["result"].as_str())
-        .and_then(|result| serde_json::from_str::<Value>(result).ok())
+        .and_then(|event| match &event["result"] {
+            Value::String(result) => serde_json::from_str::<Value>(result).ok(),
+            result @ Value::Object(_) => Some(result.clone()),
+            _ => None,
+        })
         .expect("fanout must return structured launch receipts");
     // Primary-model proposals use canonical admission without an auxiliary selector.
     assert_eq!(result["status"], "started");
