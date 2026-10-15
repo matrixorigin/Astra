@@ -879,6 +879,9 @@ omitted. Multiple matching starts are ambiguous. The successful `started`
 receipt must agree with the request and its canonical fanout/observation
 identity projections, including the exact parent. Missing identity evidence is
 unavailable; contradictory identity evidence fails. String selectors are not accepted.
+Producer-typed pre-execution rejections are not launch candidates, but remain
+visible to call-count checks and the judge. Unknown execution is not a rejection;
+contradictory rejection/execution facts fail rather than being discarded.
 One successful root start receipt
 must bind unique slot indexes, agent and run IDs to exactly the authoritative children;
 optional slot labels are not execution identities.

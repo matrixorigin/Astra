@@ -3,6 +3,11 @@
 use crate::criteria::FanoutGroupSelector;
 use astra_server_types::{SessionRunLifecycleStatus, SessionRunTreeSnapshot};
 use astra_services::reflect::ReflectReport;
+use astra_services::session_journal::ToolCallDisposition;
+use astra_turn_core::orchestration::agent_result_wire::{
+    AgentFanoutControlExecutionFact, agent_control_result_value,
+    agent_fanout_control_execution_fact,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -71,6 +76,7 @@ pub(crate) struct ExecutionToolCall<'a> {
     pub arguments: Option<Value>,
     pub result: Option<Value>,
     pub raw_result: &'a str,
+    pub disposition: ToolCallDisposition,
     pub ok: Option<bool>,
 }
 
@@ -336,12 +342,16 @@ impl SessionExecutionCapture {
             if item.item_seq <= seq || result.name.as_deref() != Some(call.name.as_str()) {
                 return Err("tool result is not bound to its request");
             }
-            // The transcript producer uses ToolCallDisposition, not the Edge
-            // callback vocabulary. Non-executed dispositions do not carry ok.
-            let ok = match result.status.as_deref() {
-                Some("completed") => Some(true),
-                Some("failed" | "rejected") => Some(false),
-                Some("reused" | "suppressed" | "deferred") => None,
+            // Preserve the transcript producer's disposition, not the Edge
+            // callback vocabulary. Rejections report failure; reuse,
+            // suppression and deferral carry no execution outcome.
+            let (disposition, ok) = match result.status.as_deref() {
+                Some("completed") => (ToolCallDisposition::Executed, Some(true)),
+                Some("failed") => (ToolCallDisposition::Executed, Some(false)),
+                Some("rejected") => (ToolCallDisposition::Rejected, Some(false)),
+                Some("reused") => (ToolCallDisposition::Reused, None),
+                Some("suppressed") => (ToolCallDisposition::Suppressed, None),
+                Some("deferred") => (ToolCallDisposition::Deferred, None),
                 _ => return Err("tool terminal disposition unavailable"),
             };
             ordered.push((
@@ -354,6 +364,7 @@ impl SessionExecutionCapture {
                     arguments: serde_json::from_str(&call.arguments).ok(),
                     result: serde_json::from_str(&item.content).ok(),
                     raw_result: &item.content,
+                    disposition,
                     ok,
                 },
             ));
@@ -523,6 +534,23 @@ impl SessionExecutionCapture {
                         .as_ref()
                         .is_some_and(|args| args["action"] == "start")
             }) {
+                if call.disposition == ToolCallDisposition::Rejected {
+                    // A pre-execution rejection is not another launch, even
+                    // when it references an existing group. Contradictory or
+                    // explicitly unknown execution cannot be discarded.
+                    if agent_control_result_value(call.raw_result)
+                        .is_some_and(|value| value["status"] == "started")
+                    {
+                        return Ok(None);
+                    }
+                    match agent_fanout_control_execution_fact(call.raw_result) {
+                        Some(AgentFanoutControlExecutionFact::Executed) => return Ok(None),
+                        Some(AgentFanoutControlExecutionFact::Unknown) => {
+                            return Err("fanout rejection execution unknown");
+                        }
+                        None | Some(AgentFanoutControlExecutionFact::NotExecuted) => continue,
+                    }
+                }
                 match call.result.as_ref().and_then(|receipt| receipt.get(field)) {
                     None | Some(Value::Null) => missing_selection = true,
                     Some(Value::String(actual)) if actual == group.value().trim() => {
@@ -1623,6 +1651,62 @@ pub(crate) mod tests {
             Ok(false),
             "a display title cannot disambiguate multiple launches"
         );
+        for (status, content, proof) in [
+            ("rejected", "{}", Ok(true)),
+            ("rejected", "not JSON", Ok(true)),
+            (
+                "rejected",
+                r#"{"executed":false,"group_id":"group","title":"group"}"#,
+                Ok(true),
+            ),
+            ("rejected", r#"{"executed":true}"#, Ok(false)),
+            ("rejected", r#"{"status":"started"}"#, Ok(false)),
+            (
+                "rejected",
+                "{\"status\":\"started\",\"group_id\":\"group\"}\nRecovery guidance",
+                Ok(false),
+            ),
+            (
+                "rejected",
+                r#"{"executed":null}"#,
+                Err("fanout rejection execution unknown"),
+            ),
+            ("failed", "{}", Err("fanout selection identity unavailable")),
+            (
+                "failed",
+                "not JSON",
+                Err("fanout selection identity unavailable"),
+            ),
+            (
+                "failed",
+                r#"{"executed":null}"#,
+                Err("fanout selection identity unavailable"),
+            ),
+        ] {
+            let mut altered = ambiguous.clone();
+            let page = altered.transcript.as_mut().unwrap();
+            // Move the second attempt before the successful launch, retaining
+            // distinct, ordered request/result identities and both children.
+            for item in &mut page.items {
+                item.item_seq = if item.item_seq >= 5 {
+                    item.item_seq - 4
+                } else {
+                    item.item_seq + 2
+                };
+            }
+            let receipt = page.items.last_mut().unwrap();
+            receipt.tool_result.as_mut().unwrap().status = Some(status.into());
+            receipt.content = content.into();
+            page.items.sort_by_key(|item| item.item_seq);
+            assert_eq!(altered.tools("root").unwrap().len(), 2);
+            for selector in [&group, &named] {
+                assert_eq!(
+                    altered.proves_children("root", &expected, Some(selector)),
+                    proof,
+                    "{status}: {content} / {selector:?}"
+                );
+            }
+        }
         let mut missing_selection = ambiguous.clone();
         let page = missing_selection.transcript.as_mut().unwrap();
         let mut receipt: Value = serde_json::from_str(&page.items.last().unwrap().content).unwrap();
