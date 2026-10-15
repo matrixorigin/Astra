@@ -1462,9 +1462,12 @@ pub async fn compact_with_memoria(
     // Step 5: Optionally generate an LLM summary. Session working memory is
     // owned by `session_memory::runner`; compaction must not create a second
     // raw-message-derived `working` format.
+    // Pressure alone is not history loss: do not summarize an intact or fully
+    // protected working set merely because its tier is elevated.
     if let Some(cfg) = compact_config
         && let Some(s_client) = summary_client
         && cfg.should_summarize(params.tier)
+        && result.boundary.is_some()
     {
         match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
             Some(summary) => {
@@ -2208,6 +2211,22 @@ mod tests {
         }
     }
 
+    fn history_requiring_compaction() -> Vec<Value> {
+        let call = |id: &str| {
+            json!({"role":"assistant", "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]})
+        };
+        vec![
+            user("old request"),
+            call("old"),
+            json!({"role":"tool", "tool_call_id":"old", "content":"old evidence ".repeat(2000)}),
+            user("current request"),
+            call("current"),
+            json!({"role":"tool", "tool_call_id":"current", "content":"current evidence"}),
+        ]
+    }
+
     #[tokio::test]
     async fn compaction_authority_denial_skips_summary_but_transport_failure_does_not() {
         for (error, summary_calls) in [
@@ -2229,8 +2248,8 @@ mod tests {
                 current_tokens: 6000,
                 session_facts: None,
             };
-            compact_with_memoria(
-                &[user("implement OAuth"), assistant("working on it")],
+            let result = compact_with_memoria(
+                &history_requiring_compaction(),
                 Some("session"),
                 &MemoriaCompactConfig {
                     min_tokens_for_retrieval: 100,
@@ -2246,6 +2265,7 @@ mod tests {
                 Some(&summary),
             )
             .await;
+            assert!(result.boundary.is_some(), "the fixture must really compact");
             assert_eq!(
                 memoria
                     .admissions
@@ -2260,111 +2280,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_with_summary_when_enabled() {
-        let msgs = vec![
-            user("implement OAuth"),
-            assistant("I'll help with OAuth. Here's a plan..."),
-            user("use JWT instead"),
-            assistant("Sure, switching to JWT tokens for auth."),
+    async fn summary_io_requires_history_loss_and_explicit_enablement() {
+        let mut authority = user("current Work contract");
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "work",
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        );
+        let protected = vec![
+            user("current goal"),
+            authority,
+            assistant(&"evidence ".repeat(4000)),
         ];
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaPort::new(vec![MemoriaMemory {
-            memory_id: "m1".to_string(),
-            content: "Working on auth module".to_string(),
-            memory_type: "working".to_string(),
-            retrieval_score: Some(0.8),
-            ..Default::default()
-        }]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::AggressivePrune, // Meets summary_min_tier
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_facts: None,
-        };
+        for (msgs, tier, enabled, changed, summarized) in [
+            (
+                vec![user("hello"), assistant("hi")],
+                CompactionTier::AggressivePrune,
+                true,
+                false,
+                false,
+            ),
+            (
+                protected,
+                CompactionTier::AggressivePrune,
+                true,
+                false,
+                false,
+            ),
+            (
+                history_requiring_compaction(),
+                CompactionTier::AggressivePrune,
+                true,
+                true,
+                true,
+            ),
+            (
+                history_requiring_compaction(),
+                CompactionTier::AggressivePrune,
+                false,
+                true,
+                false,
+            ),
+            (
+                history_requiring_compaction(),
+                CompactionTier::TrimSchemas,
+                true,
+                true,
+                false,
+            ),
+        ] {
+            let mock = MockMemoriaPort::new(if summarized {
+                vec![MemoriaMemory {
+                    memory_id: "m1".into(),
+                    content: "Working on auth module".into(),
+                    memory_type: "working".into(),
+                    retrieval_score: Some(0.8),
+                    ..Default::default()
+                }]
+            } else {
+                vec![]
+            });
+            let params = MemoriaCompactParams {
+                budget_chars: 10000,
+                keep_chars: 2000,
+                tier,
+                keep_recent_turns: 4,
+                current_tokens: 6000,
+                session_facts: None,
+            };
 
-        let compact_config = CompactConfig {
-            enable_summary: true,
-            summary_min_tier: CompactionTier::AggressivePrune,
-            ..Default::default()
-        };
-        let summary_client = MockSummaryClient::success(
-            "### Primary Request\nImplement authentication.\n### Pending Tasks\nNone.\n### Current Work\nSwitched from OAuth to JWT auth.\n### Current State\nJWT auth selected.",
-        );
+            let compact_config = CompactConfig {
+                enable_summary: enabled,
+                summary_min_tier: CompactionTier::AggressivePrune,
+                ..Default::default()
+            };
+            let summary_client = MockSummaryClient::success(
+                "### Primary Request\nImplement authentication.\n### Pending Tasks\nNone.\n### Current Work\nSwitched from OAuth to JWT auth.\n### Current State\nJWT auth selected.",
+            );
 
-        let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
-            &params,
-            Some(&mock),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-        )
-        .await;
+            let result = compact_with_memoria(
+                &msgs,
+                Some("sess1"),
+                &config,
+                &params,
+                Some(&mock),
+                Some(&compact_config),
+                Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            )
+            .await;
 
-        assert_eq!(result.messages, msgs, "summary must not become history");
-        assert_eq!(result.runtime_contexts.len(), 1);
-        assert!(result.runtime_contexts[0].contains("Switched from OAuth to JWT auth"));
-        assert!(
-            result.session_memory_context.is_none(),
-            "raw legacy working text is not canonical session memory"
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_summary_disabled_skips_llm() {
-        let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            ..Default::default()
-        };
-        let mock = MockMemoriaPort::new(vec![]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::AggressivePrune,
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_facts: None,
-        };
-
-        let compact_config = CompactConfig {
-            enable_summary: false, // Disabled
-            ..Default::default()
-        };
-        let summary_client = MockSummaryClient::success("should not appear");
-
-        let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
-            &params,
-            Some(&mock),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-        )
-        .await;
-
-        let has_summary = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Conversation summary"))
-                .unwrap_or(false)
-        });
-        assert!(
-            !has_summary,
-            "summary should not be generated when disabled"
-        );
+            assert_eq!(result.boundary.is_some(), changed);
+            assert_eq!(result.messages != msgs, changed);
+            assert_eq!(
+                result.messages.last(),
+                msgs.last(),
+                "latest evidence survives"
+            );
+            let expected_calls = if summarized { 1 } else { 0 };
+            assert_eq!(
+                summary_client
+                    .calls
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                expected_calls
+            );
+            assert_eq!(result.runtime_contexts.len(), expected_calls);
+            if summarized {
+                assert!(result.runtime_contexts[0].contains("Switched from OAuth to JWT auth"));
+                assert!(
+                    result.messages.iter().all(|message| !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("Switched from OAuth to JWT auth")),
+                    "summary stays out of history"
+                );
+                assert!(
+                    result.session_memory_context.is_none(),
+                    "raw working text is not canonical session memory"
+                );
+            }
+        }
     }
 
     #[tokio::test]
     async fn compact_summary_failure_falls_back() {
-        let msgs = vec![user("hello"), assistant("hi")];
+        let msgs = history_requiring_compaction();
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
             ..Default::default()
@@ -2397,59 +2441,19 @@ mod tests {
         )
         .await;
 
-        // Should still have the original messages (truncated), no summary
-        assert_eq!(result.messages.len(), 2);
-        let has_summary = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Conversation summary"))
-                .unwrap_or(false)
-        });
-        assert!(!has_summary, "failed summary should not inject message");
-    }
-
-    #[tokio::test]
-    async fn compact_summary_below_tier_threshold_skips() {
-        let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            ..Default::default()
-        };
-        let mock = MockMemoriaPort::new(vec![]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::TrimSchemas, // Below AggressivePrune threshold
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_facts: None,
-        };
-
-        let compact_config = CompactConfig {
-            enable_summary: true,
-            summary_min_tier: CompactionTier::AggressivePrune, // Requires AggressivePrune
-            ..Default::default()
-        };
-        let summary_client = MockSummaryClient::success("should not appear");
-
-        let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
-            &params,
-            Some(&mock),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-        )
-        .await;
-
-        let has_summary = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Conversation summary"))
-                .unwrap_or(false)
-        });
-        assert!(!has_summary, "tier below threshold should skip summary");
+        assert!(result.boundary.is_some());
+        assert_eq!(
+            summary_client
+                .calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(result.runtime_contexts.is_empty());
+        assert_eq!(
+            result.messages.last(),
+            msgs.last(),
+            "latest evidence survives summary failure"
+        );
     }
 
     // ──────────────────────────────────────────────────────────
