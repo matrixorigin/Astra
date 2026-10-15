@@ -141,8 +141,9 @@ Retention is a product contract:
   existence; it does not need a separate existence query in that transaction.
 - Run status snapshots omit checkpoint bodies and read their canonical binding
   and accounting facts in one bounded event query after the metadata lookup.
-  Each of the three binding types selects its earliest event; accounting selects
-  the latest finalized fact, or the latest finished fact only when none exists.
+  A narrow type/index aggregate selects the earliest event of each binding type
+  and the latest finalized fact, or latest finished fact only when none exists;
+  the selected positions then join back to their owner-scoped payloads.
   At most four payloads are returned. Selection precedes decoding, so corruption
   of a selected fact remains an error rather than authorizing fallback. This is
   a read optimization, not a cache, new authority, retention change, or atomic

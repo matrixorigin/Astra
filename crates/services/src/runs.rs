@@ -11633,6 +11633,23 @@ const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, eve
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
+// Select positions using narrow columns before reading any payload. In
+// particular, an existing finalized row excludes finished even if its JSON is
+// corrupt or has no data. NULL means absent; event index zero remains valid.
+const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
+ SELECT MIN(CASE WHEN event_type='run_started' THEN event_idx END) AS started,
+        MIN(CASE WHEN event_type='workspace_bound' THEN event_idx END) AS workspace,
+        MIN(CASE WHEN event_type='executor_bound' THEN event_idx END) AS executor,
+        COALESCE(MAX(CASE WHEN event_type='run_accounting_finalized' THEN event_idx END),
+                 MAX(CASE WHEN event_type='run_finished' THEN event_idx END)) AS accounting
+ FROM agent_run_events WHERE user_id=? AND run_id=?
+   AND event_type IN ('run_started','workspace_bound','executor_bound','run_accounting_finalized','run_finished')
+ ) SELECT e.payload_json,e.event_idx FROM agent_run_events e JOIN selected s
+ ON e.event_idx IN (s.started,s.workspace,s.executor,s.accounting)
+ WHERE e.user_id=? AND e.run_id=?
+   AND e.event_type IN ('run_started','workspace_bound','executor_bound','run_accounting_finalized','run_finished')
+ ORDER BY e.event_idx";
+
 const RUN_OBSERVATION_EVENTS_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
         WHERE user_id = ? AND run_id = ? AND event_idx <= ?
@@ -20721,36 +20738,14 @@ impl RunStateStore for DatabaseRunStateStore {
         else {
             return Ok(None);
         };
-        // Five indexed LIMIT-1 probes, one round trip, at most four payloads.
-        // Choose accounting by row presence before decoding: a corrupt or
-        // incomplete finalized fact must never silently fall back to finished.
-        let mut query = QueryBuilder::<MySql>::new("SELECT payload_json, event_idx FROM (");
-        for event_type in ["run_started", "workspace_bound", "executor_bound"] {
-            query.push("(SELECT payload_json, event_idx FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx) WHERE user_id = ")
-                .push_bind(user_id).push(" AND run_id = ").push_bind(run_id)
-                .push(" AND event_type = ").push_bind(event_type)
-                .push(" ORDER BY event_idx ASC LIMIT 1) UNION ALL ");
-        }
-        query.push("(SELECT payload_json, event_idx FROM (");
-        for (priority, event_type) in ["run_accounting_finalized", "run_finished"]
-            .iter()
-            .enumerate()
-        {
-            if priority > 0 {
-                query.push(" UNION ALL ");
-            }
-            query.push("(SELECT payload_json, event_idx, ").push(priority)
-                .push(" AS priority FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx) WHERE user_id = ")
-                .push_bind(user_id).push(" AND run_id = ").push_bind(run_id)
-                .push(" AND event_type = ").push_bind(*event_type)
-                .push(" ORDER BY event_idx DESC LIMIT 1)");
-        }
-        query.push(") AS accounting_candidates ORDER BY priority LIMIT 1)) AS status_facts ORDER BY event_idx ASC");
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| db_error("acquire_run_status_facts", run_id, source).to_string())?;
-        let rows = query
-            .build()
+        let rows = sqlx::query(RUN_STATUS_FACTS_SELECT_SQL)
+            .bind(user_id)
+            .bind(run_id)
+            .bind(user_id)
+            .bind(run_id)
             .fetch_all(connection.connection_mut())
             .await
             .map_err(|source| db_error("load_run_status_facts", run_id, source).to_string())?;

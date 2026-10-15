@@ -1808,6 +1808,63 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_corruption() {
+    let (pool, store) = setup().await;
+    let user = common::id("status-zero");
+    for event in [
+        json!({"event_type":"run_finished","data":{"prompt_tokens":0}}),
+        json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":0}}),
+        json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}}),
+    ] {
+        let run = common::id("status-run");
+        let session = common::id("status-session");
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record_with_events(
+                run.clone(),
+                user.clone(),
+                session.clone(),
+                "agent",
+                vec![event.clone()],
+            ),
+        )
+        .await;
+        let snapshot = store
+            .load_run_status_snapshot(&user, &run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.last_event_idx, 0);
+        if event["event_type"] == "workspace_bound" {
+            assert_eq!(snapshot.workspace.as_ref().unwrap()["id"], "only-workspace");
+            assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
+            store
+                .append_events_batch(
+                    &user,
+                    &session,
+                    &run,
+                    &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+                .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+            let after = store
+                .load_run_status_snapshot(&user, &run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.workspace, snapshot.workspace);
+        } else {
+            assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 0);
+            assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
+        }
+    }
+}
+
 /// Count real SQL rather than simulating the batching implementation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
@@ -2150,34 +2207,76 @@ async fn thousand_session_append_preserves_results_across_independent_pools() {
                     .unwrap();
             assert_eq!(count, 1000);
         }
-        // Status is also a cross-replica read, not a warmed process-local projection.
-        let started = std::time::Instant::now();
-        let statuses = identities
-            .iter()
-            .enumerate()
-            .map(|(n, (user, session, run))| {
-                let store = &stores[(n + 1) % replicas];
-                async move {
-                    let status = store
-                        .load_run_status_snapshot(user, run)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(
-                        (&status.user_id, &status.session_id, &status.run_id),
-                        (user, session, run)
-                    );
-                    assert_eq!(status.last_event_idx, 16);
-                    assert!(status.accounting.is_none());
-                }
-            });
-        tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
-            .await
-            .unwrap();
-        eprintln!(
-            "status_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 wall_ms={}",
-            started.elapsed().as_millis()
-        );
+        let facts = [
+            json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
+            json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
+            json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
+            json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
+            json!({"event_type":"run_accounting_finalized","idempotency_key":"status-accounting","data":{"prompt_tokens":20}}),
+            json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
+        ];
+        eprintln!("status_fixture replicas={replicas} prefix={prefix}");
+        // Both empty and populated facts must work through another pool owner.
+        for populated in [false, true] {
+            if populated {
+                stream::iter(identities.iter().enumerate())
+                    .for_each_concurrent(32, |(n, (user, session, run))| {
+                        let store = &stores[n % replicas];
+                        let facts = &facts;
+                        async move {
+                            store
+                                .append_events_batch(user, session, run, facts)
+                                .await
+                                .unwrap();
+                        }
+                    })
+                    .await;
+            }
+            let started = std::time::Instant::now();
+            let statuses = identities
+                .iter()
+                .enumerate()
+                .map(|(n, (user, session, run))| {
+                    let store = &stores[(n + 1) % replicas];
+                    async move {
+                        let started = std::time::Instant::now();
+                        let status = store
+                            .load_run_status_snapshot(user, run)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            (&status.user_id, &status.session_id, &status.run_id),
+                            (user, session, run)
+                        );
+                        assert_eq!(status.last_event_idx, if populated { 22 } else { 16 });
+                        assert_eq!(status.explain_requested, populated);
+                        if populated {
+                            assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
+                            assert_eq!(status.executor.unwrap()["id"], "scale-executor");
+                            assert_eq!(status.transport.as_deref(), Some("edge"));
+                            assert_eq!(status.accounting.unwrap()["prompt_tokens"], 20);
+                        } else {
+                            assert!(
+                                status.workspace.is_none()
+                                    && status.executor.is_none()
+                                    && status.accounting.is_none()
+                            );
+                        }
+                        started.elapsed().as_micros()
+                    }
+                });
+            let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
+                .await
+                .unwrap();
+            latencies.sort_unstable();
+            eprintln!(
+                "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
+                started.elapsed().as_millis(),
+                latencies[499],
+                latencies[949]
+            );
+        }
         drop(stores);
         for pool in pools {
             pool.close().await;
