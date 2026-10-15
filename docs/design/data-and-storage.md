@@ -128,6 +128,14 @@ Retention is a product contract:
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
 - Slot/lease semantics must avoid permanent deadlock through expiry or repair.
+- Run-event append checks persisted idempotency identities in bounded windows
+  (64 keys, 16 KiB of key bytes; an indivisible key is queried alone), under
+  the existing owner/session/run transaction. Database column equality maps
+  matches to input ordinals; Rust does not normalize persisted identities.
+  Conflicting immutable payloads abort the entire batch, including across
+  windows. Unkeyed events remain distinct. This reduces preflight round trips,
+  not retained event rows or payload bytes; commit reconciliation and display
+  projection repair retain their existing owners.
 - Run mutations retain the deletion-fence → session → execution-slot → run
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.

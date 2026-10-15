@@ -1590,11 +1590,34 @@ async fn session_deletion_competes_safely_with_run_admission() {
     }
 }
 
-/// Large batch: 50 events in a single `append_events_batch` must all be stored
-/// with contiguous event_idx.
-#[tokio::test]
+/// Count real SQL rather than simulating the batching implementation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-async fn large_batch_50_events_contiguous() {
+async fn keyed_batches_bound_probe_queries_and_preserve_replay() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Default)]
+    struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
+    impl tracing::field::Visit for Queries {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "db.statement" {
+                self.0.lock().unwrap().push(value.to_owned());
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "sqlx::query" {
+                event.record(&mut self.clone());
+            }
+        }
+    }
     let (_pool, store) = setup().await;
     let run_id = format!("large_batch_{}", uuid::Uuid::new_v4());
     let user_id = "test_user".to_string();
@@ -1612,22 +1635,75 @@ async fn large_batch_50_events_contiguous() {
     )
     .await;
 
-    let n: usize = 50;
-    let batch: Vec<_> = (0..n)
-        .map(|i| {
-            serde_json::json!({
-                "type": "test_event",
-                "event_id": format!("ev_{i}"),
-                "data": {"n": i},
-                "ignored": "timestamp column removed",
+    let mut n = 0;
+    let wide_prefix = "界".repeat(112);
+    for (size, prefix, expected_probes) in [
+        (0_usize, "", 0),
+        (1, "", 1),
+        (64, "", 1),
+        (65, "", 2),
+        (129, "", 3),
+        (64, wide_prefix.as_str(), 2),
+    ] {
+        let batch: Vec<_> = (0..size)
+            .map(|i| {
+                make_idempotent_event(
+                    "test_event",
+                    &format!("{prefix}batch-{size}-{i}"),
+                    json!({"n": i}),
+                )
             })
-        })
-        .collect();
-
-    store
-        .append_events_batch(&user_id, &session_id, &run_id, &batch)
-        .await
-        .unwrap();
+            .collect();
+        for replay in [false, true] {
+            let queries = Queries::default();
+            let subscriber =
+                tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+            let started = std::time::Instant::now();
+            store
+                .append_events_batch(&user_id, &session_id, &run_id, &batch)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            let queries = queries.0.lock().unwrap();
+            let probes = queries
+                .iter()
+                .filter(|sql| {
+                    let sql = sql.trim_start();
+                    (sql.starts_with("SELECT") || sql.starts_with("WITH"))
+                        && sql.contains("agent_run_events")
+                        && sql.contains("idempotency_key")
+                        && sql.contains("payload_json")
+                })
+                .count();
+            eprintln!(
+                "run_event_probe size={size} wide={} replay={replay} probes={probes} statements={} elapsed_us={}",
+                !prefix.is_empty(),
+                queries.len(),
+                started.elapsed().as_micros()
+            );
+            assert_eq!(
+                probes, expected_probes,
+                "idempotency reads must be bounded per window"
+            );
+            if size == 0 {
+                assert!(
+                    queries.is_empty(),
+                    "empty append must not access the database"
+                );
+            }
+        }
+        n += size;
+        let shape: (i64, i64) = sqlx::query_as(
+            "SELECT CAST(COUNT(*) AS SIGNED), CAST(SUM(OCTET_LENGTH(payload_json)) AS SIGNED) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        ).bind(&user_id).bind(&run_id).fetch_one(_pool.get()).await.unwrap();
+        assert_eq!(shape.0, n as i64 + 1);
+        eprintln!(
+            "run_event_storage size={size} wide={} rows={} payload_bytes={}",
+            !prefix.is_empty(),
+            shape.0,
+            shape.1
+        );
+    }
 
     let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(
@@ -1657,6 +1733,234 @@ async fn large_batch_50_events_contiguous() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atomicity() {
+    let (pool, store) = setup().await;
+    let user = common::id("batch-owner");
+    let session = common::id("batch-session");
+    let run = common::id("batch-run");
+    insert_run_fixture(
+        &pool,
+        store.as_ref(),
+        durable_run_record(run.clone(), user.clone(), session.clone()),
+    )
+    .await;
+    let original: Vec<_> = (0..130)
+        .map(|n| make_idempotent_event("agent_progress", &format!("original-{n}"), json!({"n": n})))
+        .collect();
+    store
+        .append_events_batch(&user, &session, &run, &original)
+        .await
+        .unwrap();
+    let before = store.load_run(&user, &run).await.unwrap().unwrap();
+    for persisted in [false, true] {
+        let mut incoming: Vec<_> = (0..130)
+            .map(|n| make_idempotent_event("agent_progress", &format!("new-{n}"), json!({"n": n})))
+            .collect();
+        let mut conflict = if persisted {
+            original[129].clone()
+        } else {
+            incoming[0].clone()
+        };
+        conflict["data"]["n"] = json!("conflict");
+        incoming.push(conflict);
+        assert!(
+            store
+                .append_events_batch(&user, &session, &run, &incoming)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(&user, &run).await.unwrap().unwrap(),
+            before,
+            "a later-window conflict must not change events, counter or run metadata"
+        );
+    }
+    // Compare with the column itself, not an assumption about the DB's
+    // case/accent/trailing-space collation or Rust's string equality.
+    for alias in ["ORIGINAL-0", "original-0 "] {
+        let equal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND idempotency_key = ?",
+        ).bind(&user).bind(&run).bind(alias).fetch_one(pool.get()).await.unwrap();
+        let mut event = original[0].clone();
+        event["idempotency_key"] = json!(alias);
+        let before_alias = store.load_run(&user, &run).await.unwrap().unwrap();
+        let result = store
+            .append_events_batch(&user, &session, &run, &[event])
+            .await;
+        if equal > 0 {
+            assert!(
+                result.is_err(),
+                "SQL-equivalent key with different immutable JSON must conflict"
+            );
+            assert_eq!(
+                store.load_run(&user, &run).await.unwrap().unwrap(),
+                before_alias
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+    let repeated = make_idempotent_event("agent_progress", "repeated", json!({"n": 42}));
+    store
+        .append_events_batch(&user, &session, &run, &vec![repeated; 130])
+        .await
+        .unwrap();
+    let before_parallel = store.load_run(&user, &run).await.unwrap().unwrap();
+    let parallel: Vec<_> = (0..130)
+        .map(|n| make_idempotent_event("agent_progress", &format!("parallel-{n}"), json!({"n": n})))
+        .collect();
+    let another_store = DatabaseRunStateStore::new(pool.clone());
+    let (left, right) = tokio::join!(
+        store.append_events_batch(&user, &session, &run, &parallel),
+        another_store.append_events_batch(&user, &session, &run, &parallel),
+    );
+    left.unwrap();
+    right.unwrap();
+    let after = store.load_run(&user, &run).await.unwrap().unwrap();
+    assert_eq!(
+        after.events.len(),
+        before_parallel.events.len() + parallel.len()
+    );
+    assert_eq!(after.last_event_idx, after.events.len() as i64 - 1);
+    for (index, event) in after.events.iter().enumerate() {
+        assert_eq!(event["index"], index as i64);
+    }
+    for table in [
+        "agent_run_events",
+        "run_display_projections",
+        "agent_session_execution_slots",
+        "agent_runs",
+        "agent_sessions",
+        "agent_session_lifecycle_fences",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+}
+
+/// Opt-in database capacity probe, not a claim about 1,000 running LLM loops.
+/// Compare one and four independent pool/store owners at the same total quota.
+#[cfg(feature = "capacity-probes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
+async fn thousand_session_append_preserves_results_across_independent_pools() {
+    use futures_util::{StreamExt, future::join_all, stream};
+    let (bootstrap, mut settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    for replicas in [1_usize, 4] {
+        let prefix = common::id("append-scale");
+        settings.db_pool_max_connections = 32 / replicas as u32;
+        settings.db_pool_min_connections = 0;
+        let mut pools = Vec::new();
+        let mut stores = Vec::new();
+        for replica in 0..replicas {
+            let pool = SharedPool::new(&settings).await.unwrap();
+            stores.push(
+                DatabaseRunStateStore::new(pool.clone())
+                    .with_owner_pod_id(format!("scale-{replica}")),
+            );
+            pools.push(pool);
+        }
+        let identities: Vec<_> = (0..1000)
+            .map(|n| {
+                (
+                    format!("{prefix}-u{}", n / 10),
+                    format!("{prefix}-s{n}"),
+                    format!("{prefix}-r{n}"),
+                )
+            })
+            .collect();
+        stream::iter(identities.iter().enumerate())
+            .for_each_concurrent(32, |(n, (user, session, run))| {
+                let pool = &pools[n % replicas];
+                let store = &stores[n % replicas];
+                async move {
+                    insert_run_fixture(
+                        pool,
+                        store,
+                        durable_run_record(run.clone(), user.clone(), session.clone()),
+                    )
+                    .await;
+                }
+            })
+            .await;
+        let batch: Vec<_> = (0..16)
+            .map(|n| make_idempotent_event("agent_progress", &format!("scale-{n}"), json!({"n":n})))
+            .collect();
+        for replay in [false, true] {
+            let barrier = Arc::new(tokio::sync::Barrier::new(1000));
+            let started = std::time::Instant::now();
+            let calls = identities
+                .iter()
+                .enumerate()
+                .map(|(n, (user, session, run))| {
+                    // Replay through a different replica, not an instance-local cache.
+                    let store = &stores[(n + usize::from(replay)) % replicas];
+                    let batch = &batch;
+                    let barrier = barrier.clone();
+                    async move {
+                        barrier.wait().await;
+                        let started = std::time::Instant::now();
+                        let result = store.append_events_batch(user, session, run, batch).await;
+                        (result, started.elapsed().as_micros())
+                    }
+                });
+            let results = tokio::time::timeout(Duration::from_secs(120), join_all(calls))
+                .await
+                .unwrap();
+            let mut latencies: Vec<_> = results
+                .into_iter()
+                .map(|(result, elapsed)| {
+                    result.unwrap();
+                    elapsed
+                })
+                .collect();
+            latencies.sort_unstable();
+            eprintln!(
+                "append_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 replay={replay} wall_ms={} p50_us={} p95_us={} p99_us={}",
+                started.elapsed().as_millis(),
+                latencies[499],
+                latencies[949],
+                latencies[989]
+            );
+            let bad: i64 = sqlx::query_scalar(
+                "SELECT CAST(COUNT(*) AS SIGNED) FROM (
+                   SELECT runs.run_id FROM agent_runs runs
+                   LEFT JOIN agent_run_events events
+                     ON events.user_id = runs.user_id AND events.run_id = runs.run_id
+                   WHERE runs.user_id LIKE ? GROUP BY runs.run_id
+                   HAVING COUNT(events.id) <> 17 OR MIN(events.event_idx) <> 0
+                       OR MAX(events.event_idx) <> 16 OR MAX(runs.last_event_idx) <> 16
+                 ) invalid_runs",
+            )
+            .bind(format!("{prefix}%"))
+            .fetch_one(bootstrap.get())
+            .await
+            .unwrap();
+            assert_eq!(
+                bad, 0,
+                "every run must retain its exact contiguous result after cross-replica replay"
+            );
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id LIKE ?")
+                    .bind(format!("{prefix}%"))
+                    .fetch_one(bootstrap.get())
+                    .await
+                    .unwrap();
+            assert_eq!(count, 1000);
+        }
+        drop(stores);
+        for pool in pools {
+            pool.close().await;
+        }
+    }
 }
 
 /// Dedup + non-keyed events: events without idempotency_key are never affected

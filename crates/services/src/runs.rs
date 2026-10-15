@@ -15,6 +15,7 @@ pub use astra_turn_types::{
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
@@ -11158,6 +11159,8 @@ impl RunStateStore for InMemoryRunStateStore {
 const DEFAULT_RETRY_SCOPE: &str = "node";
 const MAX_TOOL_OUTPUT_BATCH_ROWS: usize = 500;
 const MAX_TOOL_OUTPUT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const RUN_EVENT_IDEMPOTENCY_WINDOW_KEYS: usize = 64;
+const RUN_EVENT_IDEMPOTENCY_WINDOW_BYTES: usize = 16 * 1024;
 const FALLBACK_PREVIEW_BYTES: usize = 400;
 const BUILTIN_GENERIC_PREVIEW_BYTES: usize = 1200;
 
@@ -14644,36 +14647,105 @@ impl DatabaseRunStateStore {
                 )
             })?;
 
-        let mut staged = Vec::<&serde_json::Value>::with_capacity(events.len());
-        for event in events {
-            if let Some(key) = extract_optional_string(event, "idempotency_key") {
-                let existing = sqlx::query(
-                    "SELECT payload_json, event_idx FROM agent_run_events
-                     WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(run_id)
-                .bind(&key)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|source| db_error("load_batch_append_idempotency", run_id, source))?;
-                if let Some(existing) = existing {
-                    let existing = decode_run_event_payload(&existing, run_id)?;
-                    if !run_events_have_same_immutable_payload(&existing, event) {
-                        return Err(DatabaseRunStateStoreError::Database {
-                            operation: "append_run_events_immutable_conflict",
-                            entity: run_id.to_string(),
-                            source: sqlx::Error::Protocol(format!(
-                                "immutable run event conflict for idempotency key {key}"
-                            )),
-                        });
-                    }
-                    continue;
+        // Keep equality on the persisted column, not a Rust-normalized key.
+        // Ordinals associate even collation-equivalent spellings with their
+        // exact input. The empty arm supplies the column type/collation.
+        let keys: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                extract_optional_string(event, "idempotency_key").map(|key| (index, key))
+            })
+            .collect();
+        let mut replayed = HashSet::new();
+        let mut offset = 0;
+        while offset < keys.len() {
+            let mut end = offset;
+            let mut bytes = 0_usize;
+            while end < keys.len() && end - offset < RUN_EVENT_IDEMPOTENCY_WINDOW_KEYS {
+                let next_bytes = keys[end].1.len();
+                if end > offset
+                    && bytes.saturating_add(next_bytes) > RUN_EVENT_IDEMPOTENCY_WINDOW_BYTES
+                {
+                    break;
                 }
-                if let Some(existing) = staged.iter().find(|existing| {
-                    extract_optional_string(existing, "idempotency_key").as_deref()
-                        == Some(key.as_str())
-                }) {
+                bytes = bytes.saturating_add(next_bytes);
+                end += 1;
+            }
+            let mut query = QueryBuilder::<MySql>::new(
+                "WITH candidates AS (
+                   SELECT -1 AS input_ordinal, idempotency_key
+                   FROM agent_run_events WHERE 1 = 0 UNION ALL VALUES ",
+            );
+            let mut candidates = query.separated(", ");
+            for (index, key) in &keys[offset..end] {
+                candidates
+                    .push("ROW(")
+                    .push_bind_unseparated(*index as i64)
+                    .push_unseparated(", ")
+                    .push_bind_unseparated(key)
+                    .push_unseparated(")");
+            }
+            query
+                .push(
+                    ") SELECT CAST(c.input_ordinal AS SIGNED) AS input_ordinal,
+                              stored.payload_json, stored.event_idx
+                 FROM candidates c JOIN agent_run_events stored
+                   ON stored.idempotency_key = c.idempotency_key
+                 WHERE stored.user_id = ",
+                )
+                .push_bind(user_id)
+                .push(" AND stored.run_id = ")
+                .push_bind(run_id);
+            // Filter before the ordinal join so an old run's unrelated large
+            // payloads never become hash-join input. Equality still belongs
+            // to the persisted column, including for collation aliases.
+            query.push(" AND stored.idempotency_key IN (");
+            let mut selected = query.separated(", ");
+            for (_, key) in &keys[offset..end] {
+                selected.push_bind(key);
+            }
+            selected.push_unseparated(")");
+            let mut rows = query.build().fetch(&mut *tx);
+            while let Some(row) = rows
+                .try_next()
+                .await
+                .map_err(|source| db_error("load_batch_append_idempotency", run_id, source))?
+            {
+                let index: i64 = row
+                    .try_get("input_ordinal")
+                    .map_err(|source| db_error("decode_batch_append_ordinal", run_id, source))?;
+                let index = usize::try_from(index)
+                    .ok()
+                    .filter(|index| *index < events.len())
+                    .ok_or_else(|| {
+                        db_error(
+                            "decode_batch_append_ordinal",
+                            run_id,
+                            sqlx::Error::Protocol("run event input ordinal out of bounds".into()),
+                        )
+                    })?;
+                let existing = decode_run_event_payload(&row, run_id)?;
+                if !run_events_have_same_immutable_payload(&existing, &events[index]) {
+                    return Err(db_error(
+                        "append_run_events_immutable_conflict",
+                        run_id,
+                        sqlx::Error::Protocol("immutable run event conflict".into()),
+                    ));
+                }
+                replayed.insert(index);
+            }
+            offset = end;
+        }
+
+        let mut staged = Vec::<&serde_json::Value>::with_capacity(events.len());
+        let mut staged_keys: HashMap<String, &serde_json::Value> = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
+            if replayed.contains(&index) {
+                continue;
+            }
+            if let Some(key) = extract_optional_string(event, "idempotency_key") {
+                if let Some(existing) = staged_keys.get(&key) {
                     if !run_events_have_same_immutable_payload(existing, event) {
                         return Err(DatabaseRunStateStoreError::Database {
                             operation: "append_run_events_staged_conflict",
@@ -14685,6 +14757,7 @@ impl DatabaseRunStateStore {
                     }
                     continue;
                 }
+                staged_keys.insert(key, event);
             }
             staged.push(event);
         }
