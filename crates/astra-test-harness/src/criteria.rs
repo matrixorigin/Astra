@@ -6915,11 +6915,15 @@ mod tests {
     }
 
     #[test]
-    fn shipped_rejection_cases_reject_extra_attempts_with_different_outcomes() {
-        for name in [
-            "flash_missing_child_model_fail_closed",
-            "flash_near_version_must_not_substitute",
-            "flash_rejected_delegation_preserves_parent_tools",
+    fn shipped_rejection_cases_require_valid_unexecuted_admission_without_extra_attempts() {
+        use astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind;
+        for (name, model) in [
+            ("flash_missing_child_model_fail_closed", "glm-99.99"),
+            ("flash_near_version_must_not_substitute", "glm-5.3"),
+            (
+                "flash_rejected_delegation_preserves_parent_tools",
+                "glm-99.99",
+            ),
         ] {
             let case = crate::case::Case::from_path(
                 &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6935,14 +6939,27 @@ mod tests {
                         Criterion::ExecutionToolCount { .. }
                             | Criterion::ExecutionToolSequence { .. }
                             | Criterion::ExecutionChildCount { .. }
+                            | Criterion::AnyOf { .. }
                     )
                 })
                 .collect();
             let mut capture = crate::execution_capture::tests::tool_capture();
             capture.run_tree.runs.truncate(1);
+            let args = serde_json::json!({"action":"spawn","description":"Read value","prompt":"Reply OK",
+                "requested_model_policy":{"mode":"fixed","selector":{"kind":"configured_name","model_name":model}}});
+            let mut input = args.clone();
+            input.as_object_mut().unwrap().remove("action");
+            let input: astra_turn_core::orchestration::spawn_tool::SpawnAgentInput =
+                serde_json::from_value(input).unwrap();
+            input.validate_execution_request().unwrap();
+            let rejection = render_agent_tool_admission_error_with_kind(
+                "model selection rejected",
+                Some(astra_core::ErrorKind::InvalidRequest),
+            );
             let page = capture.transcript.as_mut().unwrap();
             page.items[1].tool_result.as_mut().unwrap().status = Some("rejected".into());
-            page.items[1].content = r#"{"error_kind":"invalid_request","status":"failed"}"#.into();
+            page.items[0].tool_calls[0].arguments = args.to_string();
+            page.items[1].content = rejection.clone();
             let append = |capture: &mut crate::execution_capture::SessionExecutionCapture,
                           name: &str,
                           args: &str,
@@ -6978,8 +6995,8 @@ mod tests {
                 append(
                     &mut capture,
                     "agent",
-                    r#"{"action":"spawn"}"#,
-                    r#"{"error_kind":"invalid_request","status":"failed"}"#,
+                    &args.to_string(),
+                    &rejection,
                     "rejected",
                 );
                 append(
@@ -7003,6 +7020,91 @@ mod tests {
                     .all(|result| result.passed),
                 "{name}"
             );
+            for fault in [
+                "scope-binding",
+                "malformed-policy",
+                "substitution",
+                "invalid-arguments",
+                "authentication",
+                "backend",
+                "executed",
+                "missing-execution-proof",
+                "wrong-status",
+                "successful-tool",
+                "child-started",
+                "missing-capture",
+            ] {
+                let mut changed = baseline.clone();
+                let page = changed.transcript.as_mut().unwrap();
+                let request = page
+                    .items
+                    .iter_mut()
+                    .flat_map(|item| &mut item.tool_calls)
+                    .find(|call| call.name == "agent")
+                    .unwrap();
+                let mut arguments: serde_json::Value =
+                    serde_json::from_str(&request.arguments).unwrap();
+                match fault {
+                    "malformed-policy" => {
+                        arguments["requested_model_policy"] = serde_json::json!({"model":model})
+                    }
+                    "substitution" => {
+                        arguments["requested_model_policy"]["selector"]["model_name"] =
+                            "another-model".into()
+                    }
+                    _ => {}
+                }
+                request.arguments = arguments.to_string();
+                let response = page
+                    .items
+                    .iter_mut()
+                    .find(|item| {
+                        item.tool_result
+                            .as_ref()
+                            .is_some_and(|result| result.name.as_deref() == Some("agent"))
+                    })
+                    .unwrap();
+                let mut result: serde_json::Value =
+                    serde_json::from_str(&response.content).unwrap();
+                match fault {
+                    "scope-binding" => {
+                        result = serde_json::json!({"status":"failed",
+                        "error_kind":"delegation_model_scope_unresolved","advisory":{"executed":false}})
+                    }
+                    "invalid-arguments" => result["error_kind"] = "tool_invalid_args".into(),
+                    "authentication" => result["error_kind"] = "auth".into(),
+                    "backend" => result["error_kind"] = "server_error".into(),
+                    "executed" => result["executed"] = true.into(),
+                    "missing-execution-proof" => {
+                        result.as_object_mut().unwrap().remove("executed");
+                    }
+                    "wrong-status" => result["status"] = "rejected".into(),
+                    "successful-tool" => {
+                        response.tool_result.as_mut().unwrap().status = Some("completed".into())
+                    }
+                    _ => {}
+                }
+                response.content = result.to_string();
+                if fault == "child-started" {
+                    changed.run_tree.runs.push(
+                        crate::execution_capture::tests::tool_capture()
+                            .run_tree
+                            .runs[1]
+                            .clone(),
+                    );
+                }
+                let mut candidate = outcome.clone();
+                candidate.stream_capture.as_mut().unwrap().execution = Some(changed);
+                if fault == "missing-capture" {
+                    candidate.stream_capture = None;
+                }
+                let evaluated = evaluate_deterministic(&criteria, &candidate);
+                assert_eq!(
+                    evaluated.iter().all(|check| check.passed),
+                    fault == "scope-binding",
+                    "{name}/{fault}: {evaluated:?}"
+                );
+            }
             for (extra_name, arguments) in [
                 ("agent", r#"{"action":"spawn"}"#),
                 ("agent", r#"{"action":"get_status"}"#),

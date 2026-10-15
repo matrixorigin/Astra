@@ -1,9 +1,12 @@
 name: flash_missing_child_model_fail_closed
 description: |
-  An unavailable fixed model must not silently fall back to the parent model.
+  Protocol negative control: a valid fixed-model request for an unavailable
+  identity is rejected before any child starts, without model substitution.
 prompt: |
   下一步必须只调用一次 agent(action="spawn")，请求 glm-99.99 模型的子代理
-  回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。这个 spawn 应由运行时 admission
+  回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。使用合法的模型选择参数：
+  requested_model_policy={"mode":"fixed","selector":{"kind":"configured_name","model_name":"glm-99.99"}}。
+  不要设置 execution 或自行编造其他模型字段。这个 spawn 应由运行时 admission
   拒绝；不要先调用 model_catalog，不要换模型，不要重试，也不要用文字模拟
   拒绝。最终如实说明失败原因，并包含 ASTRA-MISSING-MODEL-NOT-AVAILABLE。
 debug_log: true
@@ -17,16 +20,6 @@ criteria:
     min: 1
     max: 1
     root_only: true
-    predicates:
-      - document: arguments
-        path: /action
-        equals: spawn
-  - type: execution_tool_count
-    name: agent
-    min: 1
-    max: 1
-    root_only: true
-    ok: false
   - type: execution_tool_count
     name: agent
     min: 1
@@ -37,12 +30,34 @@ criteria:
       - document: arguments
         path: /action
         equals: spawn
-      - document: result
-        path: /error_kind
-        equals: invalid_request
+      - document: arguments
+        path: /requested_model_policy
+        equals: {mode: fixed, selector: {kind: configured_name, model_name: glm-99.99}}
       - document: result
         path: /status
         equals: failed
+  - type: any_of
+    criteria:
+      - type: execution_tool_count
+        name: agent
+        min: 1
+        max: 1
+        root_only: true
+        ok: false
+        predicates:
+          - {document: arguments, path: /action, equals: spawn}
+          - {document: result, path: /error_kind, equals: invalid_request}
+          - {document: result, path: /executed, equals: false}
+      - type: execution_tool_count
+        name: agent
+        min: 1
+        max: 1
+        root_only: true
+        ok: false
+        predicates:
+          - {document: arguments, path: /action, equals: spawn}
+          - {document: result, path: /error_kind, equals: delegation_model_scope_unresolved}
+          - {document: result, path: /advisory/executed, equals: false}
   - type: text_contains
     needle: ASTRA-MISSING-MODEL-NOT-AVAILABLE
   - type: execution_child_count

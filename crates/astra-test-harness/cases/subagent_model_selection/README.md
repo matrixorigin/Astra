@@ -146,10 +146,16 @@ GLM-only deployments. `flash_rejected_delegation_preserves_parent_tools` checks
 that an unavailable child model is still rejected, followed by a successful
 parent catalog query rather than a forced text-only turn.
 
-`flash_missing_child_model_fail_closed` uses an unavailable fixed identity and
-requires one attempted spawn to receive the typed admission rejection. It does
-not accept an omitted child or a parent-only explanation as evidence. The
-separate catalog journey covers explicit availability discovery.
+`flash_missing_child_model_fail_closed` is a protocol negative control: it supplies
+a valid fixed selector for an unavailable identity and requires that exact selector
+on one attempted spawn. Both existing pre-start rejection owners are valid:
+selector admission (`invalid_request`, `executed: false`) and hard-requirement
+binding (`delegation_model_scope_unresolved`, `advisory.executed: false`). Both
+must report `failed` and create zero children. Malformed arguments, unrelated
+failures, a substituted model, omission, and a parent-only explanation cannot
+pass. The near-version and parent-tool recovery controls use the same contract.
+These explicit protocol prompts do not certify natural-language model selection;
+the separate catalog and model-selection journeys cover that user behavior.
 `flash_near_version_must_not_substitute` checks the harder adjacent-version
 case: where the authorized catalog has GLM 5.2 but no GLM 5.3, a direct request
 for 5.3 must be rejected before execution and must not spawn a 5.2 child or
