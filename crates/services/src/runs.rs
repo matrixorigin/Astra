@@ -20840,8 +20840,18 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         query.push(
             ") requested(ordinal, requested_user_id, requested_run_id)
-             LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id",
+             LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id
+             AND run_id IN (",
         );
+        // Give the database an independently pushable candidate filter. Join
+        // equality alone can scan every historical run for each small batch.
+        for (ordinal, key) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query.push_bind(&key.run_id);
+        }
+        query.push(")");
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| db_error("acquire_run_control_batch", "batch", source).to_string())?;

@@ -5404,7 +5404,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
     SpawnRunConfig {
         max_output_tokens: None,
         run_id: "child-run".to_string(),
-        cancellation_binding_id: "test-child-binding".to_string(),
+        cancellation_binding_id: Uuid::new_v4().to_string(),
         agent_id: "child@1234".to_string(),
         spawn_tool_call_id: None,
         recursion_depth: 1,

@@ -1631,6 +1631,20 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         )
         .await;
     }
+    // Historical runs must not become work for unrelated active observations.
+    let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
+    );
+    history.push_values(0..256, |mut row, i| {
+        let id = format!("control-history-{nonce}-{i}");
+        row.push_bind(&other)
+            .push_bind(format!("session-{bad}"))
+            .push_bind(id.clone())
+            .push_bind(id.clone())
+            .push_bind(format!("/{id}"))
+            .push_bind("completed");
+    });
+    history.build().execute(pool.get()).await.unwrap();
     let key = |user: &str, run: &str| RunControlReadKey {
         user_id: user.into(),
         run_id: run.into(),
@@ -1681,6 +1695,105 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
             .await
             .is_err()
     );
+
+    for size in [1, 128] {
+        let requested = keys.iter().cycle().take(size).cloned().collect::<Vec<_>>();
+        let queries = Queries::default();
+        let subscriber = tracing_subscriber::registry().with(queries.clone());
+        let result = store
+            .load_run_control_batch(&requested)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            expected
+                .iter()
+                .cycle()
+                .take(size)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        let statements = queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 1);
+        let mut connection = pool.get().acquire().await.unwrap();
+        let mut arguments = Vec::with_capacity(size * 3);
+        for (ordinal, key) in requested.iter().enumerate() {
+            for value in [&key.user_id, &key.run_id] {
+                assert!(
+                    value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                );
+            }
+            sqlx::raw_sql(&format!(
+                "SET @control_u{ordinal}='{}',@control_r{ordinal}='{}'",
+                key.user_id, key.run_id
+            ))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            arguments.push(format!("@control_u{ordinal}"));
+            arguments.push(format!("@control_r{ordinal}"));
+        }
+        arguments.extend((0..size).map(|ordinal| format!("@control_r{ordinal}")));
+        // A removed candidate predicate must fail on scans, not bind count.
+        arguments.truncate(statements[0].matches('?').count());
+        // Inspect the emitted production SELECT, not a test-owned query copy.
+        // MatrixOne supports this prepared diagnostic but not JSON EXPLAIN.
+        sqlx::raw_sql(&format!(
+            "PREPARE control_scan FROM '{}'",
+            statements[0].replace('\'', "''")
+        ))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        let rows = sqlx::raw_sql(&format!(
+            "EXPLAIN ANALYZE FORCE EXECUTE control_scan USING {}",
+            arguments.join(",")
+        ))
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::raw_sql("DEALLOCATE PREPARE control_scan")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+        let table = format!("Table Scan on {}.agent_runs", pool.settings().database);
+        let scans = plan
+            .windows(2)
+            .filter(|lines| lines[0].contains(&table))
+            .map(|lines| {
+                lines[1]
+                    .split("inputRows=")
+                    .nth(1)
+                    .expect("base scan must report input rows")
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(!scans.is_empty(), "missing base scan counters: {plan:?}");
+        let scanned = scans.iter().sum::<u64>();
+        assert!(
+            (1..=size as u64).contains(&scanned),
+            "{size} lookups scanned {scanned} rows including unrelated history: {plan:?}"
+        );
+        eprintln!("control_batch requests={size} base_scan_rows={scanned}");
+    }
 
     let independent = SharedPool::new(pool.settings()).await.unwrap();
     sqlx::query("UPDATE agent_runs SET status='paused', last_event_idx=7, cancellation_requested_at=NOW(6) WHERE user_id=? AND run_id=?")

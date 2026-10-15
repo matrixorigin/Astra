@@ -120,8 +120,11 @@ waited that window dispatch without another collection delay.
 The queue admits at most 8,192 outstanding reads and 4,096 per owner, including
 in-flight queries, with bounded identity bytes and owner-rotating dispatch.
 Database equality associates each request with its result; missing or malformed
-rows do not leak into another request. Observations are never cached, polling
-intervals and ancestor controls remain unchanged, and no idle queue issues SQL.
+rows do not leak into another request. A bound candidate run-ID filter keeps
+unrelated historical runs out of the base-row join work; query-count reduction
+must be validated together with the actual scan plan. Observations are never
+cached, polling intervals and ancestor controls remain unchanged, and no idle
+queue issues SQL.
 Overload and storage failures are explicit; this queue is not execution
 authorization. Lease renewal and provider/action fences retain their owners.
 The collection window is not a total-latency guarantee: query attempts have a
