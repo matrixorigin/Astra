@@ -52,7 +52,7 @@ pub(crate) fn semantic_child_evidence(
         .as_ref()
         .ok_or("Server execution not captured")?;
     let root = outcome.run_id.as_deref().ok_or("root not captured")?;
-    let Some(verified) = capture.verified_children(root, children, fanout_group.as_deref())? else {
+    let Some(verified) = capture.verified_children(root, children, fanout_group.as_ref())? else {
         return Ok(None);
     };
     if task.trim().is_empty() || outcome.text.trim().is_empty() {

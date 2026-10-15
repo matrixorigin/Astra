@@ -40,7 +40,7 @@ criteria:
         path: /target_count
         equals: 2
   - type: execution_child_results_adopted
-    fanout_group: two-model-marker
+    fanout_group: {kind: id, value: two-model-marker}
     children:
       - slot_index: 0
         expected_result: {text: GLM-SLOT-MARKER-OK}

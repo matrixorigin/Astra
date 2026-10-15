@@ -105,6 +105,27 @@ pub struct ChildExecutionExpectation {
     pub slot_index: Option<u32>,
 }
 
+/// Select a fanout by execution identity or display title, never by guessing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FanoutGroupSelector {
+    Id(String),
+    Title(String),
+}
+
+impl FanoutGroupSelector {
+    pub(crate) fn value(&self) -> &str {
+        match self {
+            Self::Id(value) | Self::Title(value) => value,
+        }
+    }
+}
+
 /// One declarative success check, serialized with `type: <variant>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -114,7 +135,7 @@ pub enum Criterion {
     ExecutionChildResultsAdopted {
         children: Vec<ChildExecutionExpectation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        fanout_group: Option<String>,
+        fanout_group: Option<FanoutGroupSelector>,
     },
     /// Count joined tool requests/results from the complete Server transcript.
     ExecutionToolCount {
@@ -1015,7 +1036,7 @@ pub(crate) fn execution_contract_proof(
     } = c
     {
         return capture
-            .proves_children(root, children, fanout_group.as_deref())
+            .proves_children(root, children, fanout_group.as_ref())
             .map(|passed| (passed, serde_json::json!({"kind":"proof", "proven":passed})));
     }
     if let Criterion::ExecutionChildCount { min, max } = c {
@@ -5694,7 +5715,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             let mut identities = std::collections::BTreeSet::new();
             if fanout_group
                 .as_ref()
-                .is_some_and(|group| group.trim().is_empty() || group.len() > 256)
+                .is_some_and(|group| group.value().trim().is_empty() || group.value().len() > 256)
             {
                 return Err("fanout_group must be a bounded nonempty identity".into());
             }
@@ -6186,6 +6207,44 @@ mod tests {
                 *error_contains = Some(needle.into());
             }
             assert!(validate_criteria(&[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn fanout_selectors_require_explicit_bounded_identity_kind() {
+        for (selector, valid) in [
+            (serde_json::json!({"kind":"id","value":"group"}), true),
+            (serde_json::json!({"kind":"title","value":"group"}), true),
+            (serde_json::json!("group"), false),
+            (serde_json::json!({"kind":"title","value":" "}), false),
+            (
+                serde_json::json!({"kind":"title","value":"x".repeat(257)}),
+                false,
+            ),
+            (serde_json::json!({"kind":"other","value":"group"}), false),
+            (
+                serde_json::json!({"kind":"title","value":"group","id":"other"}),
+                false,
+            ),
+        ] {
+            let wire = serde_json::json!({"type":"execution_child_results_adopted",
+                "fanout_group":selector,"children":[{"slot_index":0,"model":"test",
+                "expected_result":{"text":"result"}}]});
+            let criterion = serde_json::from_value::<Criterion>(wire.clone());
+            assert_eq!(
+                criterion
+                    .as_ref()
+                    .is_ok_and(|c| validate_criterion(c).is_ok()),
+                valid,
+                "{selector}"
+            );
+            if valid {
+                let criterion = criterion.unwrap();
+                let expected = serde_json::to_value(&criterion).unwrap();
+                let yaml = serde_yaml_ng::to_string(&criterion).unwrap();
+                let round_trip: Criterion = serde_yaml_ng::from_str(&yaml).unwrap();
+                assert_eq!(serde_json::to_value(round_trip).unwrap(), expected);
+            }
         }
     }
 
