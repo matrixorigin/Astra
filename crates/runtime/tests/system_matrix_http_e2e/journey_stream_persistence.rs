@@ -3015,16 +3015,41 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
     loop {
         let chunk = tokio::time::timeout_at(deadline, stream.next())
             .await
-            .expect("bounded child failure delivery")
+            .unwrap_or_else(|_| {
+                let mut counts = std::collections::BTreeMap::new();
+                for event in parse_sse_events(&String::from_utf8_lossy(&bytes)) {
+                    if let Some(kind) = event["type"].as_str() {
+                        *counts.entry(kind.to_string()).or_insert(0_usize) += 1;
+                    }
+                }
+                panic!("bounded child failure delivery; observed SSE event counts: {counts:?}");
+            })
             .expect("live stream before child failures")
             .unwrap();
         bytes.extend_from_slice(&chunk);
-        if parse_sse_events(&String::from_utf8_lossy(&bytes))
+        let events = parse_sse_events(&String::from_utf8_lossy(&bytes));
+        // Observe actual terminals, not only the desired outcome. Otherwise
+        // an unexpected interruption or cancellation is hidden as a timeout.
+        let terminals = events
             .iter()
-            .filter(|event| event["type"] == "agent_failed")
-            .count()
-            == 3
-        {
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some(
+                        "agent_failed"
+                            | "agent_completed"
+                            | "agent_interrupted"
+                            | "agent_cancelled"
+                    )
+                )
+            })
+            .map(|event| (event["agent_id"].clone(), event["type"].clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            terminals.iter().all(|(_, kind)| kind == "agent_failed"),
+            "provider rejection produced unexpected child terminals: {terminals:?}"
+        );
+        if terminals.len() >= 3 {
             break;
         }
     }

@@ -1750,7 +1750,19 @@ async fn handle_agent_fanout_start_action_with_deadline(
         .any(|agent| agent.get("status").and_then(Value::as_str) == Some("launched"));
     let terminal_causes = FanoutStartTerminalCauses::from_agents(&agents);
     if any_launched {
-        let group = find_fanout_group(ctx, &group_id).await;
+        let Some(group) = find_fanout_group(ctx, &group_id).await else {
+            return json!({
+                "status": "unknown", "executed": null, "group_id": group_id,
+                "error": "Accepted fanout group is unavailable for lifecycle reconciliation",
+                "instruction": "Children may already be running. Do not retry start or spawn replacements."
+            }).to_string();
+        };
+        // Accepted launches are lifecycle receipts too. The bounded external
+        // projection needs the canonical observation to retain control facts
+        // instead of reducing a large launch receipt to an unusable preview.
+        let observation = group
+            .work_unit_observation()
+            .expect("accepted fanout groups have valid canonical lifecycle facts");
         let mut resp = json!({
             "status": "started",
             "group_id": group_id,
@@ -1761,13 +1773,11 @@ async fn handle_agent_fanout_start_action_with_deadline(
             // `agents` is the one per-child launch list in this receipt. Keep
             // the fanout object aggregate-only so a three-slot launch cannot
             // be misread as six agents by a client that renders both fields.
-            "fanout": group
-                .as_ref()
-                .map(fanout_group_summary_to_json)
-                .unwrap_or(Value::Null),
+            "fanout": fanout_group_summary_to_json(&group),
             "delivery": "parent_owned_concurrent",
             "instruction": format!("Fanout children are running concurrently; do not claim child completion yet. {CHILD_OUTCOME_GUIDANCE}"),
         });
+        resp[WORK_UNIT_OBSERVATION_FIELD] = observation.to_value();
         if terminal_causes.has_stopped_slots() {
             let obj = resp.as_object_mut().unwrap();
             terminal_causes.insert_json_fields(obj);
@@ -2389,6 +2399,7 @@ async fn handle_agent_fanout_stop_slot_action(
             "status": "completed",
             "stop_outcome": "not_stoppable",
             "reason": "no_accepted_agent",
+            WORK_UNIT_OBSERVATION_FIELD: group.work_unit_observation(),
             "group_id": group_id,
             "target_count": group.target_count,
             "title": group.title,
@@ -2407,6 +2418,7 @@ async fn handle_agent_fanout_stop_slot_action(
             "status": "completed",
             "stop_outcome": "not_stoppable",
             "reason": "already_terminal",
+            WORK_UNIT_OBSERVATION_FIELD: group.work_unit_observation(),
             "group_id": group_id,
             "target_count": group.target_count,
             "title": group.title,
@@ -2451,6 +2463,7 @@ async fn handle_agent_fanout_stop_slot_action(
         },
         "stop_outcome": stop_outcome,
         "group_id": group_id,
+        WORK_UNIT_OBSERVATION_FIELD: updated.work_unit_observation(),
         "target_count": updated.target_count,
         "title": updated.title,
         "slot_index": input.slot_index,
@@ -2592,6 +2605,7 @@ async fn handle_agent_fanout_stop_group_action(
         "target_count": updated.target_count,
         "title": updated.title,
         "stopped_count": stopped_agent_ids.len(),
+        WORK_UNIT_OBSERVATION_FIELD: updated.work_unit_observation(),
         "stopped_agent_ids": stopped_agent_ids,
         "cancellation_pending_count": cancellation_pending_agent_ids.len(),
         "cancellation_pending_agent_ids": cancellation_pending_agent_ids,
@@ -2745,6 +2759,8 @@ fn fanout_start_replay_receipt(
         "fanout": fanout_group_summary_to_json(group),
         "delivery": "parent_owned_concurrent",
         "idempotent_replay": true,
+        WORK_UNIT_OBSERVATION_FIELD: group.work_unit_observation()
+            .expect("accepted fanout groups have valid canonical lifecycle facts").to_value(),
         "instruction": "This fanout start was already accepted. Observe the existing group with agent_fanout.get_results; no replacement agents were launched."
     })
 }
@@ -5773,6 +5789,10 @@ pub(crate) mod tests {
         assert_eq!(receipt["fanout"]["parent_run_id"], "run-parent");
         assert!(receipt["fanout"].get("slots").is_none());
         assert_eq!(receipt["transcript_location"], "local_journal");
+        assert_eq!(
+            receipt[WORK_UNIT_OBSERVATION_FIELD],
+            group.work_unit_observation().unwrap().to_value()
+        );
     }
 
     #[tokio::test]
@@ -6017,6 +6037,35 @@ pub(crate) mod tests {
                 .all(|agent| { agent["status"].as_str() == Some("launched") })
         );
         assert_eq!(value["agents"][0]["requested_description"], "Review A");
+        let group = spawner.fanout_group("review-gated").await.unwrap();
+        let observation = WorkUnitObservation::from_fields(value.as_object().unwrap())
+            .expect("accepted launch carries canonical lifecycle facts");
+        assert_eq!(observation.id, group.group_id);
+        assert_eq!(observation.revision, group.revision);
+        assert_eq!(observation.status, group.work_unit_status());
+        // Exercise the shared wire projector with the real producer receipt,
+        // under a budget that forces compaction even for this two-slot group.
+        let project = |receipt: Value| {
+            astra_services::runs::project_tool_terminal_presentation(
+                json!({"type":"tool_call_end", "call_id":"launch", "tool":"agent_fanout",
+                    "success":true, "result":receipt.to_string()}),
+                1024,
+            )
+        };
+        let compact = project(value.clone());
+        assert!(compact.to_string().len() <= 1024);
+        assert_eq!(compact["result"]["group_id"], group.group_id);
+        assert!(astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable(
+            &compact["result"].to_string()
+        ));
+        let mut missing_observation = value;
+        missing_observation
+            .as_object_mut()
+            .unwrap()
+            .remove(WORK_UNIT_OBSERVATION_FIELD);
+        assert!(!astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable(
+            &project(missing_observation)["result"].to_string()
+        ));
 
         release_a.send(()).expect("release first child");
         release_b.send(()).expect("release second child");
@@ -7797,6 +7846,7 @@ pub(crate) mod tests {
         assert_eq!(value["status"], "completed");
         assert_eq!(value["stop_outcome"], "not_stoppable");
         assert_eq!(value["reason"], "already_terminal");
+        assert_eq!(value[WORK_UNIT_OBSERVATION_FIELD]["status"], "completed");
         assert_eq!(value["slot_status"], "completed");
         assert_eq!(value["fanout"]["completed"], 1);
         assert_eq!(value["agents"][0]["status"], "completed");
@@ -7857,6 +7907,10 @@ pub(crate) mod tests {
         assert_eq!(stop_value["status"], "completed");
         assert_eq!(stop_value["stop_outcome"], "stopped");
         assert_eq!(stop_value["slot_status"], "cancelled_by_runtime");
+        assert_eq!(
+            stop_value[WORK_UNIT_OBSERVATION_FIELD]["status"],
+            "completed_with_issues"
+        );
         assert_eq!(stop_value["fanout"]["cancelled_by_runtime"], 1);
         assert_eq!(stop_value["fanout"]["cancelled_by_user"], 0);
         assert_eq!(stop_value["target_count"], 1);
@@ -7922,6 +7976,10 @@ pub(crate) mod tests {
         assert_eq!(stop_value["status"], "completed");
         assert_eq!(stop_value["stop_outcome"], "stopped");
         assert_eq!(stop_value["stopped_count"], 2);
+        assert_eq!(
+            stop_value[WORK_UNIT_OBSERVATION_FIELD]["status"],
+            "completed_with_issues"
+        );
         assert_eq!(stop_value["fanout"]["cancelled_by_runtime"], 2);
         assert_eq!(stop_value["fanout"]["cancelled_by_user"], 0);
         assert_eq!(stop_value["target_count"], 2);

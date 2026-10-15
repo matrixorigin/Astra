@@ -22,6 +22,9 @@ work, admitting a wait, queuing a message, or listing children does not prove
 that a child completed. An accepted control receipt is neutral coordination:
 it neither creates a failed-child obligation nor supplies positive validation
 evidence. Child results retain their terminal status and output requirements.
+Fanout launch and replay receipts carry the group's canonical work-unit
+observation. Bounded terminal-event projection must preserve its exact control
+identity so presentation compaction cannot leave an accepted tool call open.
 
 Malformed, unknown, rejected, or uncertain-delivery receipts must not gain
 accepted-control authority. Existing run/call ownership checks, child completion
