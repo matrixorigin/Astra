@@ -31,6 +31,8 @@
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
+#[path = "control_reads.rs"]
+mod control_reads;
 #[path = "remote_child_wake.rs"]
 mod remote_child_wake;
 
@@ -359,6 +361,7 @@ fn restart_session_continuation_event(
 #[derive(Clone)]
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
+    control_reads: Arc<control_reads::ControlReads>,
     remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
@@ -1266,6 +1269,7 @@ impl RunEngine {
     /// Create a new engine backed by the given store.
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
+            control_reads: control_reads::ControlReads::new(store.clone()),
             remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
             metrics_registry: None,
@@ -3330,7 +3334,7 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
-        let record = match self.store.load_run_control(user_id, run_id).await {
+        let record = match self.control_reads.get(user_id, run_id).await {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
                 record

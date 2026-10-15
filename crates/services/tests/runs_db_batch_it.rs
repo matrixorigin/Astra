@@ -10,7 +10,7 @@ mod isolated_database;
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunRecord, RunStateStore, ToolOutputBatchItem,
+    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore, ToolOutputBatchItem,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, mysql::MySqlConnection};
@@ -1611,6 +1611,114 @@ async fn session_deletion_competes_safely_with_run_admission() {
             .await
             .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn control_batch_preserves_database_identity_positions_and_isolates_corruption() {
+    let (pool, store) = setup().await;
+    let nonce = uuid::Uuid::new_v4();
+    let (user, other) = (format!("control-a-{nonce}"), format!("control-b-{nonce}"));
+    let (run, bad) = (
+        format!("control-run-{nonce}"),
+        format!("control-bad-{nonce}"),
+    );
+    for (owner, id) in [(&user, &run), (&other, &bad)] {
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(id.clone(), owner.clone(), format!("session-{id}")),
+        )
+        .await;
+    }
+    let key = |user: &str, run: &str| RunControlReadKey {
+        user_id: user.into(),
+        run_id: run.into(),
+    };
+    let keys = vec![
+        key(&user, &run),
+        key(&other, &run),
+        key(&user, "missing"),
+        key(&other, &bad),
+        key(&user.to_uppercase(), &run.to_uppercase()),
+        key(&user, &run),
+    ];
+    let mut expected = Vec::new();
+    for key in &keys {
+        expected.push(
+            store
+                .load_run_control(&key.user_id, &key.run_id)
+                .await
+                .unwrap(),
+        );
+    }
+    let queries = Queries::default();
+    let subscriber = tracing_subscriber::registry().with(queries.clone());
+    let results = store
+        .load_run_control_batch(&keys)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+        expected
+    );
+    assert!(expected[0].is_some() && expected[1].is_none() && expected[2].is_none());
+    assert_eq!(
+        queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .count(),
+        1
+    );
+    assert!(store.load_run_control_batch(&[]).await.unwrap().is_empty());
+    assert!(
+        store
+            .load_run_control_batch(&vec![key(&user, &run); 129])
+            .await
+            .is_err()
+    );
+
+    let independent = SharedPool::new(pool.settings()).await.unwrap();
+    sqlx::query("UPDATE agent_runs SET status='paused', last_event_idx=7, cancellation_requested_at=NOW(6) WHERE user_id=? AND run_id=?")
+        .bind(&user).bind(&run).execute(independent.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET run_generation=-1,status='failed' WHERE user_id=? AND run_id=?",
+    )
+    .bind(&other)
+    .bind(&bad)
+    .execute(independent.get())
+    .await
+    .unwrap();
+    let results = store.load_run_control_batch(&keys).await.unwrap();
+    let fresh = results[0].as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        (
+            fresh.status.as_str(),
+            fresh.last_event_idx,
+            fresh.cancellation_requested
+        ),
+        ("paused", 7, true)
+    );
+    assert!(
+        results[3].is_err(),
+        "malformed row fails only its request position"
+    );
+    assert_eq!(results[0], results[5]);
+    assert!(results[1].as_ref().unwrap().is_none());
+    for table in ["agent_runs", "agent_sessions"] {
+        for owner in [&user, &other] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
+                .bind(owner)
+                .execute(independent.get())
+                .await
+                .unwrap();
+        }
+    }
+    independent.close().await;
 }
 
 /// The status reader must stay independent of history size and checkpoint bytes.

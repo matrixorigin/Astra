@@ -28127,6 +28127,160 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
     assert_eq!(provider.calls(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: 1000 real control watchers, not 1000 LLM loops"]
+async fn thousand_control_watchers_batch_across_owners_and_observe_remote_changes() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let prefix = format!("cw-{}", Uuid::new_v4());
+    let ids = (0..1000)
+        .map(|i| format!("{prefix}-{i}"))
+        .collect::<Vec<_>>();
+    let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_sessions (user_id,session_id,status) ",
+    );
+    sessions.push_values(&ids, |mut row, id| {
+        row.push_bind(id).push_bind(id).push_bind("active");
+    });
+    sessions.build().execute(pool.get()).await.unwrap();
+    let mut runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status,run_generation,last_event_idx) ",
+    );
+    runs.push_values(&ids, |mut row, id| {
+        row.push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(format!("/{id}"))
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    runs.build().execute(pool.get()).await.unwrap();
+    let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
+    let control: Arc<dyn RunControlProvider> = Arc::new(engine);
+    // Hot-checkout telemetry excludes newly established physical connections.
+    // Preopen the whole bounded pool before counting the observer's reads.
+    let mut warmed = Vec::new();
+    for _ in 0..pool.settings().db_pool_max_connections {
+        warmed.push(pool.get().acquire().await.unwrap());
+    }
+    drop(warmed);
+    let before = astra_core::matrixone_pool_telemetry_snapshot();
+    let started = Instant::now();
+    let mut watchers = Vec::new();
+    for id in &ids {
+        let cancel = Arc::new(CancellationToken::new());
+        let pause = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::watch::channel(-1);
+        let guard = start_active_run_control_watcher(
+            Some(control.clone()),
+            id.clone(),
+            id.clone(),
+            id.clone(),
+            Some(1),
+            Arc::new(AtomicBool::new(false)),
+            pause.clone(),
+            cancel.clone(),
+            lost.clone(),
+            sender,
+        )
+        .unwrap();
+        watchers.push((guard, cancel, pause, lost, receiver));
+    }
+    tokio::time::timeout(
+        Duration::from_secs(7),
+        futures_util::future::join_all(watchers.iter_mut().map(
+            |(_, _, _, _, receiver)| async move {
+                while *receiver.borrow_and_update() < 7 {
+                    receiver.changed().await.unwrap();
+                }
+            },
+        )),
+    )
+    .await
+    .expect("first shared control sweep");
+    let first_reads =
+        astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    assert!(
+        (8..=12).contains(&first_reads),
+        "1000 roots must batch, got {first_reads} checkouts"
+    );
+    let initial_ms = started.elapsed().as_millis();
+
+    // A separate pool represents a different control-plane process. The live
+    // observers receive no local notification of these durable changes.
+    let independent = SharedPool::new(pool.settings()).await.unwrap();
+    for group in 0..4 {
+        let update = match group {
+            0 => "cancellation_requested_at=NOW(6)",
+            1 => "run_generation=2",
+            2 => "status='paused',waiting_for='user_pause'",
+            _ => "status='running'",
+        };
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+        ));
+        {
+            let mut selected = query.separated(",");
+            for (index, id) in ids.iter().enumerate() {
+                if index % 4 == group {
+                    selected.push_bind(id);
+                }
+            }
+        }
+        query
+            .push(")")
+            .build()
+            .execute(independent.get())
+            .await
+            .unwrap();
+    }
+    let before = astra_core::matrixone_pool_telemetry_snapshot();
+    let changed = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(7),
+        futures_util::future::join_all(watchers.iter_mut().enumerate().map(
+            |(index, (_, cancel, pause, lost, receiver))| async move {
+                if index % 4 < 2 {
+                    cancel.cancelled().await;
+                    assert_eq!(lost.load(Ordering::Acquire), index % 4 == 1);
+                } else {
+                    while *receiver.borrow_and_update() < 9 {
+                        receiver.changed().await.unwrap();
+                    }
+                    assert_eq!(pause.load(Ordering::Acquire), index % 4 == 2);
+                    assert!(!cancel.is_cancelled());
+                }
+            },
+        )),
+    )
+    .await
+    .expect("cross-pool cancellation, ownership fence, pause and input watermark");
+    let next_reads =
+        astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    assert!(
+        (8..=12).contains(&next_reads),
+        "changed sweep must also batch: {next_reads}"
+    );
+    println!(
+        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        changed.elapsed().as_millis()
+    );
+    drop(watchers);
+    drop(control);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for table in ["agent_runs", "agent_sessions"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id LIKE ?"))
+            .bind(format!("{prefix}-%"))
+            .execute(independent.get())
+            .await
+            .unwrap();
+    }
+    independent.close().await;
+    pool.close().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
     let provider = Arc::new(StaticRunControlProvider::new(Some(
