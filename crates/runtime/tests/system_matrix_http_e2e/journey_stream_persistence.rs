@@ -166,7 +166,15 @@ async fn captured_tool_receipt(
         assert_eq!(terminal["result"], output);
     } else {
         let summary = &terminal["result"];
-        assert_eq!(summary["type"], "astra.external_tool_result_summary.v1");
+        if let Some(observation) = receipt.get("work_unit_observation") {
+            assert_eq!(summary["type"], "astra.external_tool_lifecycle_summary.v1");
+            assert_eq!(summary["work_unit_observation"], *observation);
+            for key in ["status", "group_id", "target_count", "transcript_location"] {
+                assert_eq!(summary[key], receipt[key], "projected control fact {key}");
+            }
+        } else {
+            assert_eq!(summary["type"], "astra.external_tool_result_summary.v1");
+        }
         assert_eq!(summary["truncated"], true);
         assert_eq!(terminal["result_truncated"], true);
         assert_eq!(summary["original_bytes"], encoded.len());
@@ -749,8 +757,11 @@ async fn assert_concurrent_fanout_stream(
             event["type"].as_str() == Some("tool_call_end")
                 && event["call_id"].as_str() == Some(call_id.as_str())
         })
-        .and_then(|event| event["result"].as_str())
-        .and_then(|result| serde_json::from_str::<Value>(result).ok())
+        .and_then(|event| match &event["result"] {
+            Value::String(result) => serde_json::from_str::<Value>(result).ok(),
+            result @ Value::Object(_) => Some(result.clone()),
+            _ => None,
+        })
         .unwrap_or_else(|| panic!("{}: missing canonical fanout result: {raw_sse}", case.name));
     assert_eq!(aggregate["group_id"].as_str(), Some(shared_group_id));
     assert_eq!(aggregate["target_count"].as_u64(), Some(2));
