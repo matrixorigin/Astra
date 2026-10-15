@@ -124,6 +124,15 @@ fn work_plan_error(code: &str, message: &str, retryable: bool) -> astra_tools::T
     result
 }
 
+fn work_plan_rejection(code: &str, message: &str, retryable: bool) -> astra_tools::ToolResult {
+    let mut result = work_plan_error(code, message, retryable);
+    let metadata = result.metadata.as_mut().expect("Work error metadata");
+    metadata.insert("rejection_code".into(), Value::String(code.into()));
+    metadata.insert("execution_started".into(), Value::Bool(false));
+    metadata.insert("side_effects_maybe".into(), Value::Bool(false));
+    result
+}
+
 /// A stale Work context is an optimistic-precondition rejection: the requested
 /// graph mutation was never applied and is safe to retry after refreshing the
 /// canonical context. Preserve that execution boundary in the shared ledger so
@@ -134,15 +143,7 @@ fn work_plan_context_stale_error(message: &str) -> astra_tools::ToolResult {
          then use its returned context_id for pagination or a corrected proposal. \
          branch_id and work_id are not context_id."
     );
-    let mut result = work_plan_error("work_plan_context_stale", &message, true);
-    let metadata = result.metadata.get_or_insert_with(Default::default);
-    metadata.insert(
-        "rejection_code".to_string(),
-        Value::String("work_plan_context_stale".to_string()),
-    );
-    metadata.insert("execution_started".to_string(), Value::Bool(false));
-    metadata.insert("side_effects_maybe".to_string(), Value::Bool(false));
-    result
+    work_plan_rejection("work_plan_context_stale", &message, true)
 }
 
 fn map_repository_error(error: WorkRepositoryError) -> astra_tools::ToolResult {
@@ -166,20 +167,27 @@ fn map_repository_error(error: WorkRepositoryError) -> astra_tools::ToolResult {
                 }
                 other => format!("Invalid Work graph mutation: {other}"),
             };
-            work_plan_error("work_plan_proposal_invalid", &message, false)
+            work_plan_rejection("work_plan_proposal_invalid", &message, false)
         }
         WorkRepositoryError::InvalidWorkProposalBasis {
             resource:
                 WorkProposalBasisResource::DependencyEndpoint
                 | WorkProposalBasisResource::NewItemIdentity,
-        } => work_plan_error(
+        } => work_plan_rejection(
             "work_plan_proposal_invalid",
             "A proposed new item_id already exists or a dependency endpoint is not present in the resulting graph. Revise an existing item by revision; use a fresh item_id for a replacement addition.",
             false,
         ),
         WorkRepositoryError::InvalidWorkProposalBasis {
+            resource: WorkProposalBasisResource::DependencyIdentity,
+        } => work_plan_rejection(
+            "work_plan_proposal_invalid",
+            "Dependency changes must match the inspected graph: remove only existing edges and add only absent edges. Correct the proposal; refreshing an unchanged context will not fix these operations.",
+            false,
+        ),
+        WorkRepositoryError::InvalidWorkProposalBasis {
             resource: WorkProposalBasisResource::BranchIdentity,
-        } => work_plan_error(
+        } => work_plan_rejection(
             "work_plan_binding_changed",
             "The session is no longer bound to the validated Work branch",
             false,
@@ -951,35 +959,47 @@ mod tests {
     static TEST_POOL: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
 
     #[test]
-    fn stale_context_is_a_retryable_nonexecution_rejection() {
-        let result = work_plan_context_stale_error(
-            "The Work plan changed; inspect the current context before proposing again",
-        );
-        assert!(result.is_error);
-        let metadata = result.metadata.as_ref().expect("typed conflict metadata");
-        assert_eq!(metadata["rejection_code"], "work_plan_context_stale");
-        assert_eq!(metadata["execution_started"], false);
-        assert_eq!(metadata["side_effects_maybe"], false);
-        assert_eq!(metadata["retryable"], true);
-
-        let disposition =
-            astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
-                metadata.get("disposition"),
-                metadata.get("execution_started").and_then(Value::as_bool),
-                astra_services::session_journal::ToolCallDisposition::Executed,
+    fn work_plan_basis_rejections_preserve_classification_and_nonexecution() {
+        for (resource, expected_code, expected_retryable) in [
+            (
+                WorkProposalBasisResource::DependencyIdentity,
+                "work_plan_proposal_invalid",
+                false,
+            ),
+            (
+                WorkProposalBasisResource::GraphRevision,
+                "work_plan_context_stale",
+                true,
+            ),
+            (
+                WorkProposalBasisResource::BranchIdentity,
+                "work_plan_binding_changed",
+                false,
+            ),
+        ] {
+            let result =
+                map_repository_error(WorkRepositoryError::InvalidWorkProposalBasis { resource });
+            assert!(result.is_error);
+            let metadata = result.metadata.as_ref().expect("typed rejection metadata");
+            assert_eq!(metadata["rejection_code"], expected_code);
+            assert_eq!(metadata["execution_started"], false);
+            assert_eq!(metadata["side_effects_maybe"], false);
+            assert_eq!(metadata["retryable"], expected_retryable);
+            assert_eq!(
+                astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+                    metadata.get("disposition"),
+                    metadata.get("execution_started").and_then(Value::as_bool),
+                    astra_services::session_journal::ToolCallDisposition::Executed,
+                ),
+                astra_services::session_journal::ToolCallDisposition::Rejected
             );
-        assert_eq!(
-            disposition,
-            astra_services::session_journal::ToolCallDisposition::Rejected
-        );
-        assert!(matches!(
-            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&result),
-            astra_turn_types::ToolInvocationTerminalOutcome::Rejected {
-                rejection_code: Some(code),
-                retryable: true,
-                ..
-            } if code == "work_plan_context_stale"
-        ));
+            assert!(matches!(
+                crate::server::tool_invocation_runtime::terminal_outcome_from_result(&result),
+                astra_turn_types::ToolInvocationTerminalOutcome::Rejected {
+                    rejection_code: Some(code), retryable, ..
+                } if code == expected_code && retryable == expected_retryable
+            ));
+        }
     }
 
     fn id(prefix: &str) -> String {
@@ -1374,6 +1394,23 @@ mod tests {
             serde_json::from_str::<Value>(&missing_identity.output).unwrap()["error"]["code"],
             "work_plan_invocation_identity_required"
         );
+        let mut missing_edge = first_args.clone();
+        missing_edge["dependency_removals"] = json!([{
+            "predecessor_item_id": "root", "successor_item_id": "task-first"
+        }]);
+        let invalid = propose(
+            &executor,
+            &missing_edge,
+            invocation("call-missing-edge"),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&invalid),
+            astra_turn_types::ToolInvocationTerminalOutcome::Rejected {
+                rejection_code: Some(code), retryable: false, ..
+            } if code == "work_plan_proposal_invalid"
+        ));
         let proposal_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM work_proposals WHERE owner_id = ? AND work_id = ?",
         )
@@ -1384,7 +1421,7 @@ mod tests {
         .expect("proposal count before trusted invocation");
         assert_eq!(
             proposal_count, 0,
-            "untrusted identity must leave no residue"
+            "untrusted identity and invalid dependency must leave no residue"
         );
         let first = propose(&executor, &first_args, invocation("call-first"), None).await;
         assert!(!first.is_error, "first proposal failed: {first:?}");

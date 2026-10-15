@@ -389,6 +389,9 @@ An optimistic Work-context mismatch is a retryable non-execution rejection:
 the proposed graph mutation has not started and carries no possible side
 effect. Refreshing the canonical context may safely retry without leaving an
 unresolved execution failure in the turn outcome.
+An invalid dependency operation against that current context is instead a
+non-retryable proposal rejection: correct the edge changes, not the context.
+It carries the same explicit non-execution evidence; no graph change occurred.
 
 Task identities are not execution-order authority. Admission retains explicit
 `after_initial_tasks` prerequisites as dependency edges; omitted prerequisites
