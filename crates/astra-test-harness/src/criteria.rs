@@ -987,7 +987,12 @@ pub(crate) fn execution_verification_unavailable(
     }
 }
 
-fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool, &'static str> {
+/// The verdict and its public numeric evidence come from the same proof. Never
+/// include tool arguments, result strings, predicate values or provider errors.
+pub(crate) fn execution_contract_proof(
+    c: &Criterion,
+    outcome: &RunOutcome,
+) -> Result<(bool, serde_json::Value), &'static str> {
     let stream = outcome
         .stream_capture
         .as_ref()
@@ -1009,13 +1014,18 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
         fanout_group,
     } = c
     {
-        return capture.proves_children(root, children, fanout_group.as_deref());
+        return capture
+            .proves_children(root, children, fanout_group.as_deref())
+            .map(|passed| (passed, serde_json::json!({"kind":"proof", "proven":passed})));
     }
     if let Criterion::ExecutionChildCount { min, max } = c {
         let count = capture
             .child_count(root)
             .ok_or("complete tree unavailable")? as u32;
-        return Ok(count >= *min && count <= *max);
+        return Ok((
+            count >= *min && count <= *max,
+            serde_json::json!({"kind":"count", "min":min, "max":max, "actual":count}),
+        ));
     }
     let calls = capture.tools(root)?;
     match c {
@@ -1054,27 +1064,49 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
                     }
                 }
             }
+            let mut considered = 0;
+            let mut outcome_matches = 0;
+            let mut error_matches = 0;
+            let mut predicate_matches = vec![0usize; predicates.len()];
             let count = calls
                 .iter()
                 .filter(|call| {
-                    call.name == name
-                        && (!root_only || call.run_id == root)
-                        && ok.is_none_or(|expected| call.ok == Some(expected))
-                        && error_contains.as_ref().is_none_or(|needle| {
-                            call.ok == Some(false) && call.raw_result.contains(needle)
-                        })
-                        && predicates.iter().all(|predicate| {
-                            let document = match predicate.document {
-                                JournalToolDocument::Arguments => call.arguments.as_ref(),
-                                JournalToolDocument::Result => call.result.as_ref(),
-                                _ => None,
-                            };
-                            predicate
-                                .matches(document.and_then(|value| value.pointer(&predicate.path)))
-                        })
+                    if call.name != name || (*root_only && call.run_id != root) {
+                        return false;
+                    }
+                    considered += 1;
+                    if ok.is_some_and(|expected| call.ok != Some(expected)) {
+                        return false;
+                    }
+                    outcome_matches += 1;
+                    let error_match = error_contains.as_ref().is_none_or(|needle| {
+                        call.ok == Some(false) && call.raw_result.contains(needle)
+                    });
+                    error_matches += usize::from(error_match);
+                    let mut all_match = error_match;
+                    for (index, predicate) in predicates.iter().enumerate() {
+                        let document = match predicate.document {
+                            JournalToolDocument::Arguments => call.arguments.as_ref(),
+                            JournalToolDocument::Result => call.result.as_ref(),
+                            _ => None,
+                        };
+                        let matched = predicate
+                            .matches(document.and_then(|value| value.pointer(&predicate.path)));
+                        predicate_matches[index] += usize::from(matched);
+                        all_match &= matched;
+                    }
+                    all_match
                 })
                 .count() as u32;
-            Ok(count >= *min && count <= *max)
+            Ok((
+                count >= *min && count <= *max,
+                serde_json::json!({
+                    "kind":"tool_count", "min":min, "max":max, "actual":count,
+                    "considered":considered, "expected_ok":ok, "outcome_matches":outcome_matches,
+                    "error_matches":error_contains.as_ref().map(|_| error_matches),
+                    "predicate_matches":predicate_matches,
+                }),
+            ))
         }
         Criterion::ExecutionToolSequence {
             tools,
@@ -1100,11 +1132,17 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
                         && (!final_call || last_ok.is_none_or(|expected| call.ok == Some(expected)))
                 });
                 if last_call.is_none() {
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        serde_json::json!({"kind":"sequence", "matched":position, "expected":tools.len()}),
+                    ));
                 }
                 previous_terminal_seq = last_call.map(|call| call.terminal_seq);
             }
-            Ok(last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)))
+            Ok((
+                last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)),
+                serde_json::json!({"kind":"sequence", "matched":tools.len(), "expected":tools.len()}),
+            ))
         }
         _ => unreachable!(),
     }
@@ -2723,7 +2761,7 @@ fn evaluate_one_with_primary_cache(
                 } else {
                     format!("any_of failed ({detail})")
                 },
-                full_detail: (!passed && requires_execution_capture(criteria))
+                full_detail: (!passed)
                     .then(|| serde_json::to_string(&nested).expect("evaluated criteria serialize")),
                 score: None,
             }
@@ -2766,7 +2804,7 @@ fn evaluate_one_with_primary_cache(
                 } else {
                     format!("all_of failed ({detail})")
                 },
-                full_detail: (!passed && requires_execution_capture(criteria))
+                full_detail: (!passed)
                     .then(|| serde_json::to_string(&nested).expect("evaluated criteria serialize")),
                 score: None,
             }
@@ -2907,9 +2945,11 @@ fn evaluate_one_with_primary_cache(
             CriterionResult {
                 criterion: c.clone(),
                 severity: CriterionSeverity::Hard,
-                passed: proof == Ok(true),
-                detail: match proof {
-                    Ok(passed) => format!("complete Server execution contract proven={passed}"),
+                passed: proof.as_ref().is_ok_and(|(passed, _)| *passed),
+                detail: match &proof {
+                    Ok((passed, diagnostic)) => {
+                        format!("complete Server execution contract proven={passed}; {diagnostic}")
+                    }
                     Err(reason) => format!("Server verification unavailable: {reason}"),
                 },
                 full_detail: None,

@@ -100,6 +100,39 @@ pub enum JudgerAssessment {
     Acceptance(bool),
 }
 
+/// Full private diagnostics retain the typed decision independently of prose.
+/// Public progress publishes only the decision category, never `detail`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgerDiagnostics {
+    assessment: Option<JudgerAssessment>,
+    detail: String,
+}
+
+pub(crate) fn assessment_status(result: &CriterionResult) -> &'static str {
+    let Some(diagnostic) = result
+        .full_detail
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<JudgerDiagnostics>(raw).ok())
+    else {
+        return "unreported";
+    };
+    match diagnostic.assessment {
+        Some(JudgerAssessment::Grade(score)) if result.score == Some(score) => "graded",
+        Some(JudgerAssessment::Acceptance(accepted))
+            if result.score.is_none() && result.passed == accepted =>
+        {
+            if accepted {
+                "accepted"
+            } else {
+                "rejected"
+            }
+        }
+        None if result.score.is_none() && !result.passed => "unavailable",
+        _ => "unreported",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct JudgerResult {
@@ -198,11 +231,13 @@ pub async fn evaluate_judger(
             // Carry the full judge text into `full_detail` so the
             // report can surface it on FAIL without re-running the
             // judger. Short `rationale` stays in the inline detail.
-            let full_detail = if score.full_rationale == score.rationale {
-                None
-            } else {
-                Some(format!("{label}\n{}", score.full_rationale))
-            };
+            let full_detail = Some(
+                serde_json::to_string(&JudgerDiagnostics {
+                    assessment: Some(score.assessment),
+                    detail: format!("{label}\n{}", score.full_rationale),
+                })
+                .expect("judge diagnostics serialize"),
+            );
             // Render quorum votes inline when the judger aggregated
             // across multiple runs. A reviewer seeing `votes=[0.4,
             // 0.4, 1.0]` alongside `judger=0.4` (median) immediately
@@ -227,7 +262,13 @@ pub async fn evaluate_judger(
             severity: crate::criteria::criterion_severity(criterion),
             passed: false,
             detail: format!("judger call failed: {}", truncate_for_judger(&e, 200)),
-            full_detail: Some(format!("judger call failed: {e}")),
+            full_detail: Some(
+                serde_json::to_string(&JudgerDiagnostics {
+                    assessment: None,
+                    detail: format!("judger call failed: {e}"),
+                })
+                .expect("judge diagnostics serialize"),
+            ),
             score: None,
         }),
     }

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v1"
+SCHEMA = "astra.harness_progress.v2"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -40,13 +40,53 @@ def unique_fields(pairs):
     return fields
 
 
-def safe_criteria(items, *, owner_passed):
+def safe_diagnostic(value, depth):
+    if value is None:
+        return
+    kind = value.get("kind")
+    fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
+              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches"},
+              "sequence": {"matched", "expected"}, "proof": {"proven"},
+              "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"}}
+    if kind not in fields or set(value) != {"kind"} | fields[kind]:
+        raise ValueError("unexpected diagnostic payload")
+    if kind == "composite":
+        safe_criteria(value["checks"], owner_passed=False, depth=depth+1)
+    elif kind == "judge":
+        if value["assessment"] not in ("graded", "accepted", "rejected", "unavailable", "unreported"):
+            raise ValueError("invalid judge assessment")
+        if type(value["threshold"]) not in (int, float) or not math.isfinite(value["threshold"]) or not 0 <= value["threshold"] <= 1:
+            raise ValueError("invalid judge threshold")
+    elif kind == "proof":
+        if type(value["proven"]) is not bool:
+            raise ValueError("invalid proof")
+    elif kind == "exit":
+        if any(type(value[k]) is not int or not -(1 << 31) <= value[k] < (1 << 31) for k in fields[kind]):
+            raise ValueError("invalid exit diagnostic")
+    else:
+        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches"}:
+            integer(value[key])
+        if kind == "tool_count":
+            if value["expected_ok"] is not None and type(value["expected_ok"]) is not bool:
+                raise ValueError("invalid expected outcome")
+            if value["error_matches"] is not None:
+                integer(value["error_matches"])
+            if not isinstance(value["predicate_matches"], list) or len(value["predicate_matches"]) > 16:
+                raise ValueError("invalid predicate counts")
+            for count in value["predicate_matches"]:
+                integer(count)
+
+
+def safe_criteria(items, *, owner_passed, depth=0):
+    if depth > 32:
+        raise ValueError("excessive diagnostic nesting")
     if not isinstance(items, list):
         raise ValueError("invalid criteria")
     for item in items:
-        if set(item) != {"type", "severity", "score", "passed", "evaluation"}:
+        if set(item) != {"type", "severity", "score", "passed", "evaluation", "diagnostic"}:
             raise ValueError("unexpected criterion payload")
         identity(item["type"])
+        safe_diagnostic(item["diagnostic"], depth)
         if (item["severity"] not in ("hard", "soft", "quality")
             or item["evaluation"] not in ("scored", "unscored", "reported")
             or (item["passed"] is not None and type(item["passed"]) is not bool)
@@ -65,6 +105,63 @@ def safe_criteria(items, *, owner_passed):
         if owner_passed and item["severity"] == "hard" and item["passed"] is False:
             raise ValueError("passed owner contradicts required check")
     return items
+
+
+def check_lines(items, prefix):
+    """Explain already-graded facts, never regrade or infer a root cause."""
+    for index, check in enumerate(items, 1):
+        judge = check["type"] in ("judger", "hard_judger")
+        if check["passed"] is not False and not judge:
+            continue
+        location = f"{prefix}.{index} {check['type']} ({check['severity']})"
+        diagnostic = check["diagnostic"] or {}
+        kind = diagnostic.get("kind")
+        if judge:
+            threshold = diagnostic.get("threshold", "unknown")
+            assessment = diagnostic.get("assessment")
+            if assessment == "unavailable":
+                reason = "LLM judge unavailable: evaluation failed; this is NOT a negative quality verdict"
+            elif assessment in ("accepted", "rejected"):
+                reason = f"LLM judge {assessment} the declared criterion (acceptance verdict, not a numeric grade)"
+            elif check["evaluation"] == "scored":
+                reason = f"LLM judge score={check['score']}, threshold={threshold}; passed={check['passed']}"
+            elif check["evaluation"] == "unscored":
+                reason = "LLM judge unscored; no usable score (not a pass)"
+            else:
+                reason = f"Required judge passed={check['passed']}; decision diagnostics unreported (do not infer a model verdict)"
+        elif kind in ("count", "tool_count"):
+            reason = f"expected {diagnostic['min']}..{diagnostic['max']}, observed {diagnostic['actual']}"
+            if kind == "tool_count":
+                reason += (f"; tool/scope candidates={diagnostic['considered']}; "
+                           f"expected ok={diagnostic['expected_ok']}, matching outcomes={diagnostic['outcome_matches']}")
+                if diagnostic["error_matches"] is not None:
+                    reason += f"; error-text matches={diagnostic['error_matches']}"
+                reason += f"; independent predicate matches (YAML order)={diagnostic['predicate_matches']}"
+                reason += "; all predicates must match the SAME call"
+        elif kind == "exit":
+            reason = f"expected exit={diagnostic['expected']}, observed exit={diagnostic['actual']}"
+        elif kind == "sequence":
+            reason = f"matched {diagnostic['matched']} of {diagnostic['expected']} ordered tool receipts"
+        elif kind == "unavailable":
+            reason = "Canonical execution evidence unavailable or incomplete; cannot verify this contract"
+        elif kind == "proof":
+            reason = f"Canonical child identity/result adoption proven={diagnostic['proven']}"
+        elif kind == "composite":
+            yield from check_lines(diagnostic["checks"], f"{prefix}.{index}")
+            continue
+        else:
+            reason = "Condition not met; detailed payload is private (not included in public CI artifacts)"
+        yield f"{location}: {reason}"
+
+
+def row_checks(row):
+    lines = list(check_lines(row["criteria"], "root"))
+    for step in row["steps"]:
+        lines.extend(check_lines(step["criteria"], f"step[{step['step_index']}]"))
+    if not any(c["type"] in ("judger", "hard_judger") for checks in
+               [row["criteria"], *(s["criteria"] for s in row["steps"])] for c in checks):
+        lines.append("LLM judge: not configured for this case; checks are deterministic, not an LLM assessment.")
+    return lines
 
 
 def safe_row(row):
@@ -209,9 +306,6 @@ class Replay:
         kind = event["type"]
         if kind == "case_completed":
             row = self.rows[key(event["row"])]
-            failed = [f"root:{i}:{c['type']}" for i, c in enumerate(row["criteria"]) if c["passed"] is False]
-            failed += [f"step:{s['step_index']}:{i}:{c['type']}" for s in row["steps"]
-                       for i, c in enumerate(s["criteria"]) if c["passed"] is False]
             counts = self.counts()
             elapsed = "not executed" if row["case_elapsed_ms"] is None else f"{row['case_elapsed_ms']/1000:.2f}s"
             label = json.dumps(f"{row['case']} / {row['model']} / run {row['run_index']+1}", ensure_ascii=False)
@@ -219,8 +313,8 @@ class Replay:
                   f" · exit={row['exit_code']} · error={row['failure_class'] or 'none'}"
                   f" · counts: {counts['passed']} passed, {counts['failed']} failed,"
                   f" {counts['cancelled']} cancelled, {counts['unavailable']} unavailable", flush=True)
-            if failed:
-                print("  Failed checks: " + json.dumps(failed), flush=True)
+            for line in row_checks(row):
+                print("  " + json.dumps(line, ensure_ascii=False), flush=True)
         elif kind in ("suite_started", "case_started", "suite_completed") or (
             kind == "case_progress" and event["phase"] != "settled" and event["elapsed_ms"] % 30000 < 5000):
             print("[harness] " + json.dumps(event, ensure_ascii=False), flush=True)
@@ -362,7 +456,14 @@ def publish(root):
         for group in ("running", "waiting"):
             for item in summary[group]:
                 out.write(f"| {cell(item['case'])} / {cell(item['model'])} / {item['run_index']+1} | {group} (not completed) | {item.get('elapsed_ms',0)/1000:.2f}s last observed | — |\n")
-        out.write("\nSee summary.json for failed checks, step results, token/cache counters and unknown coverage.\n")
+        out.write("\n### Check evidence and LLM judgments\n\n"
+                  "Observed facts, not inferred root causes. Predicate numbers follow YAML order; raw prompts, tool results and judge/provider payloads remain private.\n\n")
+        for row in summary["runs"]:
+            out.write(f"#### {cell(row['case'])} / {cell(row['model'])} / {row['run_index']+1}\n\n")
+            for line in row_checks(row):
+                out.write(f"- {cell(line)}\n")
+            out.write("\n")
+        out.write("See summary.json for these diagnostics, step results, token/cache counters and unknown coverage.\n")
     return 0 if summary["success"] else 1
 
 

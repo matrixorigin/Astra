@@ -219,6 +219,23 @@ GitHub's repository write-access requirement. No organization membership token
 is needed. This restricts who starts the workflow, not the code they select;
 selected code can read and exfiltrate the provider key, so run only trusted commits.
 
+The live log and Actions Summary show failed checks with numeric expected/observed
+evidence: tool counts, outcome matches, individual JSON predicate matches (in YAML
+order), ordered-receipt progress and duration limits, including failed composites.
+Predicate counts are independent; a passing tool-count check still requires all
+conditions on the **same** canonical call. Missing canonical evidence is reported
+as unavailable, not as zero matches. No additional model or database calls are
+made for this projection.
+
+LLM summaries report the existing judge's grade/threshold or acceptance verdict,
+and distinguish an evaluation error from a negative quality judgment. A case
+without an explicit `judger`/`hard_judger` says **not configured**; a deterministic
+failure does not automatically trigger another LLM diagnosis. These are observed
+check results, not a claimed root-cause analysis. Raw prompts, tool/provider bodies
+and free-form judge diagnostics remain private; public artifacts do not include
+them. Checks without a safe numeric projection explicitly say that their detailed
+payload is withheld. Full private diagnostics remain in the local suite report.
+
 ### Small automatic live regression
 
 **Harness regression (live)** runs on relevant `main` pushes, same-repository

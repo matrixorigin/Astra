@@ -25,9 +25,9 @@ def supervised(command):
 
 def row(name, status="passed"):
     checks = [{"type":"judger", "severity":"quality", "score":None,
-               "passed":None, "evaluation":"unscored"},
+               "passed":None, "evaluation":"unscored", "diagnostic":None},
               {"type":"hard_judger", "severity":"hard", "score":None,
-               "passed":status == "passed", "evaluation":"reported"}]
+               "passed":status == "passed", "evaluation":"reported", "diagnostic":None}]
     return {"case":name, "model":"model", "run_index":0, "status":status,
             "has_warnings":False, "failure_class":None if status == "passed" else "Unknown",
             "exit_code":0 if status == "passed" else 1, "criteria":checks,
@@ -58,6 +58,37 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_failure_summary_explains_observations_and_judges_without_regrading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            result["steps"] = []
+            check = {"type":"execution_tool_count", "severity":"hard", "score":None,
+                     "passed":False, "evaluation":"reported", "diagnostic":{
+                         "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
+                         "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0]}}
+            result["criteria"] = [check]
+            write_events(root, data)
+            (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
+            code, _ = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            summary = (root / "job-summary").read_text()
+            self.assertIn("expected 1..1, observed 0", summary)
+            self.assertIn("[1, 0, 0]", summary)
+            self.assertIn("not configured", summary)
+            for assessment in ("rejected", "unavailable"):
+                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment})
+                write_events(root, data)
+                code, _ = self.publish(root, "failure")
+                self.assertEqual(code, 1)
+                self.assertIn(f"LLM judge {assessment}", (root / "job-summary").read_text())
+            check["diagnostic"]["detail"] = "private-sentinel"
+            write_events(root, data)
+            _, summary = self.publish(root, "failure")
+            self.assertEqual(summary["observation_error"], "invalid_progress")
+            self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
     def publish(self, root, outcome="success", *, cli=False):
         with patch.dict(os.environ, {"ASTRA_BUILD_SOURCE_GIT_SHA":SHA, "GITHUB_STEP_SUMMARY":str(root / "job-summary"),
                                     "HARNESS_OUTCOME":outcome}):
