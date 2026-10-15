@@ -2,7 +2,7 @@
 //! between batches, and this queue never polls or grants execution authority.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, LinkedList, VecDeque},
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
     time::Duration,
@@ -40,7 +40,8 @@ struct State {
 
 #[derive(Default)]
 struct Owner {
-    pending: VecDeque<Request>,
+    // Release each queue node rather than retaining a user's historic peak.
+    pending: LinkedList<Request>,
     outstanding: usize,
 }
 
