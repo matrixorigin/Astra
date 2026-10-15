@@ -353,6 +353,11 @@ CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answ
 minimum); the Server bounds the effective request by the admitted Offering's
 output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
 remain failures/unknown evidence, never accepted truncated answers or automatic retries.
+Complete semantic child evidence has one 64 KiB serialized-request ceiling,
+including questions, escaping, metadata and backend wrappers. It is never
+truncated to obtain a verdict; over-budget requests remain unjudged failures.
+This input allowance is separate from ordinary 8,000-byte text/stderr previews
+and does not increase output limits, deadlines or retry counts.
 Cases may declare `required_models` for supplementary models, independently of
 their parent `models` matrix. These are checked by the existing fail-fast
 preflight after filtering and are not replaced by `--force-model`.

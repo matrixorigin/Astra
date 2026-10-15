@@ -269,7 +269,6 @@ impl SessionExecutionCapture {
                 && item.tool_result.is_none()
                 && item.evidence.is_none()
                 && (item.content.is_empty()
-                    || item.content.len() > 4096
                     || item.source_event_id.as_deref().is_none_or(str::is_empty)
                     || content.replace(item.content.as_str()).is_some())
             {
@@ -2145,6 +2144,12 @@ pub(crate) mod tests {
             capture.run_terminal_content("root", "child").unwrap(),
             Some(terminal.content.as_str())
         );
+        terminal.content = "x".repeat(4097);
+        capture.transcript.as_mut().unwrap().items[2] = terminal.clone();
+        assert_eq!(
+            capture.run_terminal_content("root", "child").unwrap(),
+            Some(terminal.content.as_str())
+        );
         let mut siblings = capture.clone();
         let mut sibling = siblings.run_tree.runs[1].clone();
         sibling.run_id = "sibling".into();
@@ -2171,14 +2176,7 @@ pub(crate) mod tests {
         );
         assert!(siblings.run_terminal_content("root", "root").is_err());
         assert!(siblings.run_terminal_content("root", "unknown").is_err());
-        for change in [
-            "foreign",
-            "missing",
-            "duplicate",
-            "unidentified",
-            "oversized",
-            "partial",
-        ] {
+        for change in ["foreign", "missing", "duplicate", "unidentified", "partial"] {
             let mut altered = capture.clone();
             let page = altered.transcript.as_mut().unwrap();
             match change {
@@ -2193,7 +2191,6 @@ pub(crate) mod tests {
                     page.items.push(duplicate);
                 }
                 "unidentified" => page.items[2].source_event_id = None,
-                "oversized" => page.items[2].content = "x".repeat(4097),
                 "partial" => page.has_more = true,
                 _ => unreachable!(),
             }

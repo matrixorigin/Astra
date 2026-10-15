@@ -55,13 +55,8 @@ pub(crate) fn semantic_child_evidence(
     let Some(verified) = capture.verified_children(root, children, fanout_group.as_deref())? else {
         return Ok(None);
     };
-    if task.trim().is_empty()
-        || outcome.text.trim().is_empty()
-        || task.len() > JUDGER_TEXT_CAP
-        || outcome.text.len() > JUDGER_TEXT_CAP
-        || verified.iter().any(|child| child.content.len() > 4096)
-    {
-        return Err("complete semantic evidence exceeds judge budget");
+    if task.trim().is_empty() || outcome.text.trim().is_empty() {
+        return Err("complete semantic evidence is empty");
     }
     let requests = capture
         .tools(root)?
@@ -75,13 +70,6 @@ pub(crate) fn semantic_child_evidence(
     let evidence = serde_json::json!({"parent_run_id":root,"fanout_group":fanout_group,
         "task":task,"parent_response":outcome.text,"children":verified,
         "parent_requests":requests});
-    if serde_json::to_vec(&evidence)
-        .map_err(|_| "semantic evidence serialization failed")?
-        .len()
-        > JUDGER_TEXT_CAP
-    {
-        return Err("complete semantic evidence exceeds judge budget");
-    }
     Ok(Some(SemanticJudgerEvidence(evidence)))
 }
 
@@ -286,6 +274,9 @@ const ACCEPTANCE_ID: &str = "criterion_accepted";
 
 pub(crate) const JUDGER_STDERR_CAP: usize = 8_000;
 pub(crate) const JUDGER_TEXT_CAP: usize = 8_000;
+// Complete child evidence is never truncated. Bound the actual serialized
+// request, not each child's valid terminal document or an intermediate view.
+const SEMANTIC_JUDGER_REQUEST_CAP: usize = 64 * 1024;
 
 const RUBRIC: &[(&str, f64, &str)] = &[
     (
@@ -374,7 +365,7 @@ pub(crate) fn build_judger_request(
         if serde_json::to_vec(&request)
             .map_err(|e| e.to_string())?
             .len()
-            > JUDGER_TEXT_CAP + JUDGER_STDERR_CAP
+            > SEMANTIC_JUDGER_REQUEST_CAP
         {
             return Err("complete semantic judgment exceeds judge budget".into());
         }
@@ -962,7 +953,7 @@ impl Judger for ExternalCmdJudger {
             input["outcome"]["text"] = evidence.0["parent_response"].clone();
             input["outcome"]["stderr"] = serde_json::json!("");
             if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len()
-                > JUDGER_TEXT_CAP + JUDGER_STDERR_CAP
+                > SEMANTIC_JUDGER_REQUEST_CAP
             {
                 return Err("complete semantic judgment exceeds judge budget".into());
             }
@@ -1088,8 +1079,8 @@ mod tests {
         (outcome, adoption)
     }
 
-    #[test]
-    fn semantic_request_keeps_wrong_child_even_when_parent_is_correct() {
+    #[tokio::test]
+    async fn semantic_request_keeps_wrong_child_even_when_parent_is_correct() {
         let (mut outcome, adoption) = semantic_fixture();
         let evidence = semantic_child_evidence("Compute six times seven", &outcome, &adoption)
             .unwrap()
@@ -1110,24 +1101,56 @@ mod tests {
         assert!(semantic_child_evidence("task", &outcome, &adoption).is_err());
         outcome.stream_capture.as_mut().unwrap().identity_verified = true;
         outcome.text = "x".repeat(JUDGER_TEXT_CAP + 1);
-        assert!(semantic_child_evidence("task", &outcome, &adoption).is_err());
-        outcome.text = "parent answer".into();
-        let capture = outcome
-            .stream_capture
-            .as_mut()
-            .unwrap()
-            .execution
-            .as_mut()
-            .unwrap();
-        let oversized = "x".repeat(4097);
-        capture.transcript.as_mut().unwrap().items[2].content = oversized.clone();
         use sha2::{Digest, Sha256};
-        capture.reflection.graph_slice.nodes[0]
-            .metadata
-            .as_mut()
-            .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
-            serde_json::json!(format!("{:x}", Sha256::digest(oversized.as_bytes())));
-        assert!(semantic_child_evidence("task", &outcome, &adoption).is_err());
+        for content in [
+            "x".repeat(4097),
+            "x".repeat(SEMANTIC_JUDGER_REQUEST_CAP - 2 * JUDGER_TEXT_CAP),
+            "x".repeat(SEMANTIC_JUDGER_REQUEST_CAP),
+            "\0".repeat(SEMANTIC_JUDGER_REQUEST_CAP / 2),
+        ] {
+            let capture = outcome
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap();
+            capture.transcript.as_mut().unwrap().items[2].content = content.clone();
+            capture.reflection.graph_slice.nodes[0]
+                .metadata
+                .as_mut()
+                .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+                serde_json::json!(format!("{:x}", Sha256::digest(content.as_bytes())));
+            let evidence = semantic_child_evidence("task", &outcome, &adoption)
+                .unwrap()
+                .unwrap();
+            let request = build_judger_request(&hard_criterion(1.0), &outcome, Some(&evidence));
+            if content.len() == 4097 {
+                let request = request.unwrap();
+                assert_eq!(
+                    request.state["verified_child_evidence"]["children"][0]["content"],
+                    content
+                );
+                assert_eq!(
+                    request.state["verified_child_evidence"]["parent_response"],
+                    outcome.text
+                );
+            } else {
+                if content.len() == SEMANTIC_JUDGER_REQUEST_CAP - 2 * JUDGER_TEXT_CAP {
+                    assert!(
+                        request.is_ok(),
+                        "built-in request fits before the external wrapper"
+                    );
+                } else {
+                    assert!(request.unwrap_err().contains("exceeds judge budget"));
+                }
+                let error = ExternalCmdJudger::new("", 1)
+                    .judge(&hard_criterion(1.0), &outcome, Some(&evidence))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("exceeds judge budget"), "{error}");
+            }
+        }
     }
 
     #[tokio::test]
