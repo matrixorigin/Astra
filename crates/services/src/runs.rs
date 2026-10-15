@@ -3689,9 +3689,8 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      runtime_profile, start_request_fingerprint, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
-// Recovery only projects agent identity, lifecycle, and result metadata. A
-// checkpoint is never executed from this read-only path, so avoid pulling the
-// potentially large JSON column for cancellation/event candidates.
+// Status, observation and recovery-candidate reads need metadata, not the
+// potentially large checkpoint body. Executable recovery loads it separately.
 const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
@@ -11633,14 +11632,6 @@ const GUIDANCE_LATEST_FENCE_SELECT_SQL: &str =
 const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, event_type, event_id, idempotency_key, event_hash, \
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
-
-const RUN_STATUS_BINDING_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM agent_run_events
-     WHERE user_id = ? AND run_id = ? AND event_type = ?
-     ORDER BY event_idx ASC LIMIT 1";
-
-const RUN_STATUS_ACCOUNTING_SELECT_SQL: &str = "SELECT payload_json FROM agent_run_events
-     WHERE user_id = ? AND run_id = ? AND event_type = ?
-     ORDER BY event_idx DESC LIMIT 1";
 
 const RUN_OBSERVATION_EVENTS_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
@@ -20724,81 +20715,51 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
     ) -> Result<Option<DurableRunStatusSnapshot>, String> {
         let Some(mut run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, AGENT_RUN_RECOVERY_COLUMNS)
             .await
             .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
-        let mut binding_events = Vec::with_capacity(3);
+        // Five indexed LIMIT-1 probes, one round trip, at most four payloads.
+        // Choose accounting by row presence before decoding: a corrupt or
+        // incomplete finalized fact must never silently fall back to finished.
+        let mut query = QueryBuilder::<MySql>::new("SELECT payload_json, event_idx FROM (");
         for event_type in ["run_started", "workspace_bound", "executor_bound"] {
-            let binding_row = sqlx::query(RUN_STATUS_BINDING_SELECT_SQL)
-                .bind(user_id)
-                .bind(run_id)
-                .bind(event_type)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("load_run_status_binding", run_id, source).to_string()
-                })?;
-            if let Some(row) = binding_row {
-                let event_idx: i64 = row.try_get("event_idx").map_err(|source| {
-                    db_error("decode_run_status_binding_index", run_id, source).to_string()
-                })?;
-                let payload_json: String = row.try_get("payload_json").map_err(|source| {
-                    db_error("decode_run_status_binding", run_id, source).to_string()
-                })?;
-                let payload = serde_json::from_str(&payload_json).map_err(|source| {
-                    DatabaseRunStateStoreError::Json {
-                        operation: "decode_run_status_binding",
-                        entity: run_id.to_string(),
-                        source,
-                    }
-                    .to_string()
-                })?;
-                binding_events.push((event_idx, payload));
+            query.push("(SELECT payload_json, event_idx FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx) WHERE user_id = ")
+                .push_bind(user_id).push(" AND run_id = ").push_bind(run_id)
+                .push(" AND event_type = ").push_bind(event_type)
+                .push(" ORDER BY event_idx ASC LIMIT 1) UNION ALL ");
+        }
+        query.push("(SELECT payload_json, event_idx FROM (");
+        for (priority, event_type) in ["run_accounting_finalized", "run_finished"]
+            .iter()
+            .enumerate()
+        {
+            if priority > 0 {
+                query.push(" UNION ALL ");
             }
+            query.push("(SELECT payload_json, event_idx, ").push(priority)
+                .push(" AS priority FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx) WHERE user_id = ")
+                .push_bind(user_id).push(" AND run_id = ").push_bind(run_id)
+                .push(" AND event_type = ").push_bind(*event_type)
+                .push(" ORDER BY event_idx DESC LIMIT 1)");
         }
-        binding_events.sort_by_key(|(event_idx, _)| *event_idx);
-        let mut bounded_events = binding_events
-            .into_iter()
-            .map(|(_, payload)| payload)
-            .collect::<Vec<_>>();
-
-        let finalized = sqlx::query(RUN_STATUS_ACCOUNTING_SELECT_SQL)
-            .bind(user_id)
-            .bind(run_id)
-            .bind("run_accounting_finalized")
-            .fetch_optional(self.pool.get())
+        query.push(") AS accounting_candidates ORDER BY priority LIMIT 1)) AS status_facts ORDER BY event_idx ASC");
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
-            .map_err(|source| db_error("load_run_status_accounting", run_id, source).to_string())?;
-        let accounting_row = if finalized.is_some() {
-            finalized
-        } else {
-            sqlx::query(RUN_STATUS_ACCOUNTING_SELECT_SQL)
-                .bind(user_id)
-                .bind(run_id)
-                .bind("run_finished")
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("load_run_status_finished_fallback", run_id, source).to_string()
-                })?
-        };
-        if let Some(row) = accounting_row {
-            let payload_json: String = row.try_get("payload_json").map_err(|source| {
-                db_error("decode_run_status_accounting", run_id, source).to_string()
-            })?;
-            bounded_events.push(serde_json::from_str(&payload_json).map_err(|source| {
-                DatabaseRunStateStoreError::Json {
-                    operation: "decode_run_status_accounting",
-                    entity: run_id.to_string(),
-                    source,
-                }
-                .to_string()
-            })?);
-        }
-        run.events = bounded_events;
+            .map_err(|source| db_error("acquire_run_status_facts", run_id, source).to_string())?;
+        let rows = query
+            .build()
+            .fetch_all(connection.connection_mut())
+            .await
+            .map_err(|source| db_error("load_run_status_facts", run_id, source).to_string())?;
+        connection.release();
+        run.events = rows
+            .iter()
+            .map(|row| decode_run_event_payload(row, run_id))
+            .collect::<DbStoreResult<_>>()
+            .map_err(|error| error.to_string())?;
         Ok(Some(run_status_snapshot_from_run(&run)))
     }
 
@@ -49293,21 +49254,6 @@ mod tests {
         );
         assert_eq!(snapshot.executor.expect("executor")["kind"], "edge_agent");
         assert_eq!(snapshot.transport.as_deref(), Some("edge_ws"));
-    }
-
-    #[test]
-    fn run_status_database_queries_are_indexed_and_bounded() {
-        for sql in [
-            RUN_STATUS_BINDING_SELECT_SQL,
-            RUN_STATUS_ACCOUNTING_SELECT_SQL,
-        ] {
-            assert!(sql.contains("user_id = ? AND run_id = ?"));
-            assert!(sql.contains("event_type"));
-            assert!(sql.contains("ORDER BY event_idx"));
-            assert!(!sql.contains("SELECT *"));
-        }
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("event_type IN"));
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("LIMIT 1"));
     }
 
     #[test]
