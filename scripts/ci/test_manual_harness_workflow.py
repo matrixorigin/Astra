@@ -179,6 +179,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(diagnostic["model_lookup_name"], "deepseek-v4.1-flash")
             self.assertEqual(diagnostic["preflight"], {"status": "failed", "models": ["glm-5.2", "glm-5.3"],
                                                      "unavailable_model": "glm-5.2"})
+            (root / "harness/report.preflight.json").write_text(json.dumps({
+                "status": "failed", "models": ["glm-5.3"], "unavailable_model": None,
+                "failure": {"model": "glm-5.3", "stage": "execution", "exit_code": 3,
+                            "error_kind": "api_error", "error_code": "execution_binding_provider_required",
+                            "detail": "sentinel-secret"}}))
             (root / "harness/model-status.json").unlink()
             result = self.run_block("Diagnose failure without exposing provider responses", root,
                                     GITHUB_STEP_SUMMARY=str(root / "job-summary"),
@@ -188,6 +193,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             diagnostic = json.loads((root / "harness/diagnostic.json").read_text())
             self.assertIsNone(diagnostic["model_registered"])
             self.assertIsNone(diagnostic["model_active"])
+            self.assertEqual(diagnostic["preflight"]["failure"], {
+                "model": "glm-5.3", "stage": "execution", "exit_code": 3,
+                "error_kind": "api_error", "error_code": "execution_binding_provider_required"})
+            self.assertNotIn("sentinel-secret", (root / "harness/diagnostic.json").read_text()
+                             + (root / "job-summary").read_text())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):

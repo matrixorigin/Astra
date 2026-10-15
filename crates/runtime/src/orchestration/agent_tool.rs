@@ -7054,6 +7054,57 @@ pub(crate) mod tests {
             !result.contains("artifact://session/tool-result"),
             "fanout recovery must point at the owning tool window API, not internal artifacts: {result}"
         );
+        // Exercise the real producer and observation sink, not a hand-made
+        // full-result adoption fact. Each read remains a window, including
+        // the last page whose truncated flag is still true.
+        use crate::turn::agentic_loop::execution_phase::record_observed_child_reads;
+        use crate::turn::agentic_loop::host::tests::{MockHost, make_state};
+        use astra_services::session_journal::TurnEventBuffer;
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.current_run_id = Some(ctx.run_id.clone());
+        state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(Some("session"), 1));
+        for (round, offset) in [0, 8192, 16384].into_iter().enumerate() {
+            let raw = handle_agent_fanout_tool(
+                &json!({"action":"get_results",
+                "group_id":"review-large","slot_index":0,"offset":offset}),
+                Some(&ctx),
+            )
+            .await;
+            let receipt: Value = serde_json::from_str(&raw).unwrap();
+            let slot = &receipt["results"][0];
+            let mut message = json!({"role":"tool","content":raw,"_tool_name":"agent_fanout",
+                "_round_index":round,"tool_call_id":format!("page-{round}")});
+            astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+                &mut message,
+                Some(&ctx.run_id),
+            )
+            .unwrap();
+            record_observed_child_reads(&mut host, &mut state, &[message.clone()], Instant::now());
+            let events = state.turn_event_buffer.as_mut().unwrap().drain();
+            assert_eq!(events.len(), 1);
+            let attrs = &events[0].metadata.as_ref().unwrap()["attrs"];
+            assert_eq!(attrs["outcome"], "results_adopted");
+            let children: Value =
+                serde_json::from_str(attrs["children"].as_str().unwrap()).unwrap();
+            assert_eq!(children[0]["run_id"], slot["run_id"]);
+            assert_eq!(
+                children[0]["result_range"],
+                json!([offset, (offset + 8192).min(18000), 18000])
+            );
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                children[0]["result_sha256"],
+                format!(
+                    "{:x}",
+                    Sha256::digest(slot["result"]["result"].as_str().unwrap())
+                )
+            );
+            state.current_run_id = Some("other-parent".into());
+            record_observed_child_reads(&mut host, &mut state, &[message], Instant::now());
+            assert!(state.turn_event_buffer.as_mut().unwrap().drain().is_empty());
+            state.current_run_id = Some(ctx.run_id.clone());
+        }
     }
 
     #[test]

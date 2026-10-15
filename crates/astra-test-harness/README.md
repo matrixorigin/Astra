@@ -371,6 +371,10 @@ The safe preflight sidecar identifies selected model IDs and the unavailable
 model without provider error details. A nonzero agent probe alone does not prove
 model unavailability. Execution/protocol failures leave `unavailable_model`
 null; validated terminal error kinds and codes appear in the diagnostic.
+The `failure` object identifies the model, stage (`execution`, `terminal_protocol`,
+`probe_process` or `session_cleanup`) and available process exit code. It never
+includes raw provider messages. The manual and regression workflows preserve
+these same fields in the safe artifact and job summary.
 Default all-case selection is not a claim that a GLM-5.3-only deployment can run
 every case.
 Cases requiring other models, external clients or special policy need those
@@ -794,7 +798,12 @@ before cleanup, using the same binary, environment, account and profile as the
 run. The private sidecar also retains the typed Server run tree and Reflect
 response. Its `children` list specifies the complete direct-child set. Every
 child requires an exact model and offering with successful physical provider
-evidence, and its result digest adopted before the same parent finalization.
+evidence, and its result bytes adopted before the same parent finalization.
+Bounded notifications and explicit result reads record byte ranges and hashes
+through the same dependency boundary. Explicit reads count only when present in
+the final request of a successful provider turn. The harness verifies each range
+against the canonical child result and requires gap-free coverage; overlap and
+out-of-order pages are allowed, while a preview alone cannot prove a full read.
 It never falls back to local journal
 events. The run tree must be complete; partial reflection can prove positive
 facts but cannot prove absence. Capture is bounded to 5 MiB and one total
@@ -831,8 +840,12 @@ or `{json: <JSON value>}`. Both expectations require that exact child's bounded,
 unambiguous terminal transcript document. Text compares the actual bytes;
 JSON compares the parsed value. In both cases the untouched observed bytes must
 match the adopted digest; parent output is checked separately.
-Expected serialization and observed raw terminal content are each limited to
-4,096 bytes.
+Literal expected results are limited to 4,096 serialized bytes. Observed content
+uses the bounded capture and semantic-request budgets, not the notification
+preview limit. Semantic judging receives each child's actual tool arguments,
+outcomes and results along with its final answer; custody alone does not certify
+the answer's claims. The complete serialized judge request must fit 64 KiB or
+verification is unavailable, never silently truncated or accepted.
 Whitespace equivalence never excuses a wrong digest, foreign run, missing
 document, or premature finalization. Scalar expectations are not supported.
 Natural parallel children are matched bijectively by distinct model identities,

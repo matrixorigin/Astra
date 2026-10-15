@@ -740,7 +740,7 @@ impl SessionExecutionCapture {
             if !observed_digests.is_empty() && !observed_digests.contains(&digest.as_str()) {
                 return Ok(None);
             }
-            match self.child_adoption_time(root, child, &digest, &expectation.model, &facts) {
+            match self.child_adoption_time(root, child, content, &expectation.model, &facts) {
                 Ok(time) => {
                     latest_adoption = Some(
                         latest_adoption
@@ -946,7 +946,7 @@ impl SessionExecutionCapture {
         &self,
         root_id: &str,
         child: &astra_server_types::SessionRunNode,
-        digest: &str,
+        content: &str,
         model: &str,
         facts: &[&Value],
     ) -> Result<chrono::NaiveDateTime, &'static str> {
@@ -980,27 +980,70 @@ impl SessionExecutionCapture {
         if !physical {
             return Err("child physical execution unavailable");
         }
-        let adopted = facts
-            .iter()
-            .filter(|fact| {
-                fact["kind"] == "agent_dependency_boundary"
-                    && fact["run_id"] == root_id
-                    && fact["parent_run_id"] == root_id
-                    && fact["outcome"] == "results_adopted"
-                    && fact["children"].as_array().is_some_and(|children| {
-                        children.iter().any(|entry| {
-                            entry["agent_id"] == agent
-                                && entry["run_id"] == child.run_id
-                                && entry["status"] == "completed"
-                                && entry["result_truncated"] == false
-                                && entry["result_sha256"] == digest
-                        })
-                    })
-            })
-            .filter_map(|adoption| fact_time(adoption))
-            .min()
-            .ok_or("child result adoption unavailable")?;
-        Ok(adopted)
+        let mut windows = Vec::new();
+        for fact in facts.iter().filter(|fact| {
+            fact["kind"] == "agent_dependency_boundary"
+                && fact["run_id"] == root_id
+                && fact["parent_run_id"] == root_id
+                && fact["outcome"] == "results_adopted"
+        }) {
+            let Some(time) = fact_time(fact) else {
+                continue;
+            };
+            for entry in fact["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|entry| {
+                    entry["agent_id"] == agent
+                        && entry["run_id"] == child.run_id
+                        && entry["status"] == "completed"
+                })
+            {
+                let Some(digest) = entry["result_sha256"].as_str() else {
+                    continue;
+                };
+                let range = if entry["result_range"].is_null() {
+                    if entry["result_truncated"] != false {
+                        continue;
+                    }
+                    [0, content.len(), content.len()]
+                } else {
+                    serde_json::from_value::<[usize; 3]>(entry["result_range"].clone())
+                        .map_err(|_| "child result window unavailable")?
+                };
+                let [start, end, total] = range;
+                if total != content.len() {
+                    return Err("child result window identity conflict");
+                }
+                let slice = content
+                    .get(start..end)
+                    .ok_or("child result window invalid")?;
+                if digest != format!("{:x}", Sha256::digest(slice.as_bytes())) {
+                    return Err("child result window digest conflict");
+                }
+                windows.push((start, end, time));
+            }
+        }
+        // Overlapping/repeated pages are fine; a gap, wrong payload or only a
+        // prefix is not complete custody. No model text participates in this proof.
+        windows.sort_unstable_by_key(|(_, _, time)| *time);
+        let mut ranges = Vec::new();
+        for (start, end, time) in windows {
+            ranges.push((start, end));
+            ranges.sort_unstable();
+            let mut covered = 0;
+            for &(start, end) in &ranges {
+                if start > covered {
+                    break;
+                }
+                covered = covered.max(end);
+            }
+            if covered == content.len() {
+                return Ok(time);
+            }
+        }
+        Err("child result adoption unavailable")
     }
 }
 
@@ -1287,6 +1330,99 @@ pub(crate) mod tests {
         original.transcript = Some(serde_json::from_value(page).unwrap());
         original.transcript.as_mut().unwrap().items.push(terminal);
         original
+    }
+
+    #[test]
+    fn child_custody_requires_matching_complete_windows_before_finalization() {
+        let mut capture = tool_capture();
+        let content = "界".repeat(3000);
+        capture.transcript.as_mut().unwrap().items[2].content = content.clone();
+        let facts = capture.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .pointer_mut("/execution_spine/facts")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let template = facts[1].clone();
+        facts.remove(1);
+        let window = |start: usize, end: usize| {
+            let mut fact = template.clone();
+            fact["children"][0]["result_range"] = serde_json::json!([start, end, content.len()]);
+            fact["children"][0]["result_truncated"] = true.into();
+            fact["children"][0]["result_sha256"] = serde_json::json!(format!(
+                "{:x}",
+                Sha256::digest(&content.as_bytes()[start..end])
+            ));
+            fact
+        };
+        facts.push(window(0, 4095));
+        assert!(!singleton_proven(
+            &capture,
+            Some("root"),
+            &content,
+            "test-model"
+        ));
+        // Overlap and out-of-order reads are legitimate; skipped UTF-8 bytes,
+        // wrong siblings and pages observed after finalization are not.
+        let mut full = capture.clone();
+        full.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .pointer_mut("/execution_spine/facts")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .extend([window(6000, 9000), window(3000, 6000)]);
+        assert!(singleton_proven(
+            &full,
+            Some("root"),
+            &content,
+            "test-model"
+        ));
+        let mut duplicate = window(0, 4095);
+        duplicate["created_at"] = "2026-10-07T00:01:00.000000".into();
+        full.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .pointer_mut("/execution_spine/facts")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(
+            singleton_proven(&full, Some("root"), &content, "test-model"),
+            "later rereads do not erase earlier complete adoption"
+        );
+        for broken in ["gap", "digest", "identity", "late", "utf8", "total"] {
+            let mut bad = capture.clone();
+            let mut page = window(4095, 9000);
+            match broken {
+                "gap" => page = window(4098, 9000),
+                "digest" => page["children"][0]["result_sha256"] = "0".repeat(64).into(),
+                "identity" => page["children"][0]["run_id"] = "other-child".into(),
+                "late" => page["created_at"] = "2026-10-07T00:01:00.000000".into(),
+                "utf8" => page["children"][0]["result_range"][0] = 4096.into(),
+                "total" => page["children"][0]["result_range"][2] = 8999.into(),
+                _ => unreachable!(),
+            }
+            bad.reflection.graph_slice.nodes[0]
+                .metadata
+                .as_mut()
+                .unwrap()
+                .pointer_mut("/execution_spine/facts")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(page);
+            assert!(
+                !singleton_proven(&bad, Some("root"), &content, "test-model"),
+                "{broken}"
+            );
+        }
     }
 
     #[test]

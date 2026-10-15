@@ -22146,6 +22146,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             return Err(error);
         }
 
+        crate::turn::agentic_loop::execution_phase::record_observed_child_reads(
+            self, state, &llm_messages, turn_started,
+        );
         remember_output_cap_action_first(state, output_cap_continuations, &result);
 
         preserve_exhausted_output_cap_as_interruption(state, &result);

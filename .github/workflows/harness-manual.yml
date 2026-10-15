@@ -268,6 +268,17 @@ jobs:
                   and isinstance(raw.get("models"), list) and all(isinstance(m, str) for m in raw["models"])
                   and (raw.get("unavailable_model") is None or isinstance(raw["unavailable_model"], str))):
                   preflight = {k: raw.get(k) for k in ("status", "models", "unavailable_model")}
+                  failure = raw.get("failure")
+                  if isinstance(failure, dict) and failure.get("model") in raw["models"]:
+                      stage = failure.get("stage")
+                      if stage in ("execution", "terminal_protocol", "probe_process", "session_cleanup"):
+                          preflight["failure"] = {"model": failure["model"], "stage": stage}
+                          code = failure.get("exit_code")
+                          preflight["failure"]["exit_code"] = code if type(code) is int and -255 <= code <= 255 else None
+                          for key in ("error_kind", "error_code"):
+                              value = failure.get(key)
+                              preflight["failure"][key] = value if (isinstance(value, str) and 0 < len(value) <= 128
+                                  and all(c in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in value)) else None
           except (OSError, ValueError, AttributeError):
               pass
           diagnostic = {"server_readiness_http_status": int(os.environ["DIAGNOSTIC_HEALTH_STATUS"]),

@@ -812,6 +812,91 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
+    async fn child_read_observation_requires_successful_provider_delivery() {
+        use crate::turn::agentic_loop::host::AgenticLoopHost;
+        use astra_services::session_journal::TurnEventBuffer;
+        for success in [false, true] {
+            let response = if success {
+                ProviderResponse::OpenAi(json!({"id":"read-response","model":"fixture-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"Result received."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":100,"completion_tokens":3,"total_tokens":103}}))
+            } else {
+                ProviderResponse::Json {
+                    status: StatusCode::BAD_REQUEST,
+                    body: json!({"error":{"type":"invalid_request_error","message":"invalid fixture request"}}),
+                }
+            };
+            let gateway = ProviderGateway::start(vec![ProviderScript::new(
+                "child read delivery",
+                |request| request.path == "/v1/chat/completions",
+                vec![response],
+            )])
+            .await;
+            let ledger = InferenceLedgerFixture::default();
+            let session = format!("child-read-{}", uuid::Uuid::new_v4());
+            let mut host =
+                server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
+                    .build();
+            let content = json!({"status":"completed","agent_id":"member","run_id":"child",
+                "result":"界".repeat(2000)})
+            .to_string();
+            let mut message = json!({"role":"tool","tool_call_id":"read-child","_tool_name":"agent",
+                "_round_index":0,"content":content});
+            astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+                &mut message,
+                Some("read-parent"),
+            )
+            .unwrap();
+            let mut state = loop_state(
+                &session,
+                vec![
+                    json!({"role":"user","content":"Read the child result."}),
+                    json!({"role":"assistant","tool_calls":[{"id":"read-child","type":"function",
+                    "function":{"name":"agent","arguments":"{\"action\":\"get_result\",\"agent_id\":\"member\"}"}}]}),
+                    message,
+                ],
+                "Report the result.",
+            );
+            state.current_run_id = Some("read-parent".into());
+            state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(Some(&session), 1));
+            host.prepare_model_selection(&mut state).await.unwrap();
+            let result = host.execute_turn(&mut state).await;
+            assert_eq!(result.is_ok(), success, "{:?}", result.as_ref().err());
+            let requests = gateway.requests.lock().await;
+            assert!(
+                requests[0].body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "tool" && m["content"] == content)
+            );
+            let events = state.turn_event_buffer.as_mut().unwrap().drain();
+            let facts: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event.metadata.as_ref().is_some_and(|meta| {
+                        meta["name"] == "agent_dependency_boundary"
+                            && meta["attrs"]["outcome"] == "results_adopted"
+                    })
+                })
+                .collect();
+            assert_eq!(facts.len(), usize::from(success));
+            if success {
+                let children: Value = serde_json::from_str(
+                    facts[0].metadata.as_ref().unwrap()["attrs"]["children"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(children[0]["result_range"], json!([0, 6000, 6000]));
+            }
+            gateway.assert_complete();
+            ledger.assert_quiescent();
+        }
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
     async fn execute_turn_replans_tier_after_compaction_memory_refresh() {
         use crate::session_memory::runner::{SESSION_MEMORY_PREFIX, encode_session_memory_entry};
         use crate::turn::agentic_loop::host::AgenticLoopHost;
