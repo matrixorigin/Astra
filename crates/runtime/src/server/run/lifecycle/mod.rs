@@ -22008,16 +22008,14 @@ impl ServerSpawnAgentExecutor {
             .get()
             .and_then(Weak::upgrade)
             .ok_or_else(|| "parent's canonical tool executor is no longer available".to_string())?;
-        let policy = match executor.provider_policy_lookup(&request.tool) {
-            runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => policy,
-            runtime_tool_executor::ProviderPolicyLookup::MissingPolicy { .. }
-            | runtime_tool_executor::ProviderPolicyLookup::NotProvider => {
-                return Err("native collaborator requires a resolved provider tool policy".into());
-            }
-        };
-        if !executor.provider_is_collaborator_stage(&request.tool) {
-            return Err("selected provider is not an admitted collaborator stage".into());
-        }
+        let policy = executor
+            .collaborator_policy(&request.tool, request.model.as_deref())
+            .map_err(|reason| {
+                crate::orchestration::SpawnError::Admission(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    reason,
+                ))
+            })?;
         let provider_schema = executor
             .current_edge_provider_schema(&request.tool)
             .ok_or_else(|| {

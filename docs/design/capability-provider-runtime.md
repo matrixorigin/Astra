@@ -751,6 +751,11 @@ execution still requires exact selectors. Registration transport is distinct fro
 the native protocol. Chat `model_catalog` is not a provider-model directory.
 An authorized provider's default execution does not require a model catalog;
 resolving an explicit model does.
+Child preparation checks exact model selectors and declared aliases against the
+same complete catalog in the request-scoped provider policy index, before any
+child is launched. Missing catalog evidence or an absent selector rejects the
+request without substituting a model. The local adapter still checks current
+availability at dispatch; discovery is not a guarantee of future availability.
 Unavailable or ambiguous requirements need clarification, not workspace discovery
 or substitution. A completed child's inline `result` is usable output; only
 explicit artifact/window references require retrieval.

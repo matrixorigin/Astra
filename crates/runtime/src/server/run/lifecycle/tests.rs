@@ -5632,11 +5632,22 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
     let tool_name = "native_codex";
     let protocol = astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer;
     let native_id = NativeToolId::new(tool_name).unwrap();
-    let discovery = ProviderDiscoverySnapshot::new(
-        ProviderIdentity::new("selected-cli-native-provider").unwrap(),
-        ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
-        ProviderProtocolId::new("native-agent-stage").unwrap(),
-        vec![ProviderToolDeclaration {
+    let model_catalog = astra_turn_types::ProviderModelCatalog::new(vec![
+        astra_turn_types::ProviderModelDescriptor {
+            selector: "native-model".into(),
+            display_name: "Native Model".into(),
+            aliases: vec!["native-alias".into()],
+            reasoning_efforts: vec![],
+            hidden: false,
+        },
+    ])
+    .unwrap();
+    let discovery =
+        ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("selected-cli-native-provider").unwrap(),
+            ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
+            ProviderProtocolId::new("native-agent-stage").unwrap(),
+            vec![ProviderToolDeclaration {
             native_tool_id: native_id.clone(),
             native_tool_name: tool_name.into(),
             stable_tool_alias: None,
@@ -5647,6 +5658,7 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             claims: Default::default(),
             task_support: astra_turn_types::ProviderTaskSupport::Required,
             extension_fields: serde_json::Map::from_iter([
+                (astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(), json!(model_catalog)),
                 (
                     astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
                     json!(true),
@@ -5658,12 +5670,12 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
                 ),
             ]),
         }],
-    )
-    .unwrap();
+        )
+        .unwrap();
     let snapshot = resolve_provider_snapshot(
         &discovery,
         &Default::default(),
-        &BTreeMap::from([(native_id, PublicToolAlias::new(tool_name).unwrap())]),
+        &BTreeMap::from([(native_id.clone(), PublicToolAlias::new(tool_name).unwrap())]),
     )
     .unwrap();
     let descriptor = snapshot.descriptors[0].descriptor_ref();
@@ -5693,6 +5705,53 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             ..Default::default()
         },
     ];
+    for (catalog, model, accepted) in [
+        (Some(model_catalog.clone()), Some("native-model"), true),
+        (Some(model_catalog.clone()), Some("native-alias"), true),
+        (Some(model_catalog.clone()), Some("absent-model"), false),
+        (Some(model_catalog.clone()), Some("Native Model"), false),
+        (
+            Some(astra_turn_types::ProviderModelCatalog::unavailable()),
+            Some("native-model"),
+            false,
+        ),
+        (None, Some("native-model"), false),
+        (None, None, true),
+    ] {
+        let mut candidate = discovery.clone();
+        let fields = &mut candidate.tool_declarations[0].extension_fields;
+        fields.remove(astra_turn_types::PROVIDER_MODEL_CATALOG_KEY);
+        if let Some(catalog) = catalog {
+            fields.insert(
+                astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(),
+                json!(catalog),
+            );
+        }
+        let snapshot = resolve_provider_snapshot(
+            &candidate,
+            &Default::default(),
+            &BTreeMap::from([(native_id.clone(), PublicToolAlias::new(tool_name).unwrap())]),
+        )
+        .unwrap();
+        tool_executor.set_provider_policy_index(
+            ResolvedProviderPolicyIndex::from_snapshots(&[snapshot]).unwrap(),
+        );
+        let mut batch = inputs.clone();
+        batch[0].execution.as_mut().unwrap().model = model.map(str::to_owned);
+        let result = executor.clone().prepare_batch(&batch, &context, None).await;
+        assert_eq!(result.is_ok(), accepted, "model={model:?}");
+        if let Err(error) = result {
+            assert_eq!(
+                error.error_kind(),
+                Some(astra_core::ErrorKind::InvalidRequest)
+            );
+        }
+        assert!(
+            edge_rx.try_recv().is_err(),
+            "preparation must not dispatch any child"
+        );
+    }
+    tool_executor.set_provider_policy_index(index.clone());
     let mut prepared = Arc::clone(&executor)
         .prepare_batch(&inputs, &context, None)
         .await
