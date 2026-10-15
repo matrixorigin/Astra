@@ -10689,6 +10689,18 @@ impl AgenticRunLifecycleService {
                 )
             })?;
 
+        // Registration publishes the pool and durable row in separate steps.
+        // Read both views behind the same per-owner/executor barrier used by
+        // REST registration and WebSocket setup/rollback, never its half-state.
+        let registration_lock = self
+            .edge_connection_pool
+            .as_ref()
+            .map(|pool| pool.registration_lock(user_id, executor_id));
+        let _registration_guard = match registration_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         let path_matches = |path: Option<&str>| {
             path.map(str::trim)
                 .is_some_and(|candidate| candidate == root)

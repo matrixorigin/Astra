@@ -363,8 +363,11 @@ model identity checks. Unknown or malformed markers fail before execution.
 Model lists, grader model overrides, shell hooks and environment are literal,
 not templates. The delegation follow-up uses this binding and needs no second model.
 The safe preflight sidecar identifies selected model IDs and the unavailable
-model without provider error details. Default all-case selection is not a claim
-that a GLM-5.3-only deployment can run every case.
+model without provider error details. A nonzero agent probe alone does not prove
+model unavailability. Execution/protocol failures leave `unavailable_model`
+null; validated terminal error kinds and codes appear in the diagnostic.
+Default all-case selection is not a claim that a GLM-5.3-only deployment can run
+every case.
 Cases requiring other models, external clients or special policy need those
 capabilities and must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
 these runs do not certify production embedding quality.

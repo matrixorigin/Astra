@@ -33,6 +33,8 @@ pub enum PreflightError {
     AuthFailed { detail: String },
     #[error("model `{model}` unavailable: {detail}")]
     ModelUnavailable { model: String, detail: String },
+    #[error("agent execution probe failed: {detail}")]
+    ExecutionProbeFailed { detail: String },
     #[error("could not create an isolated preflight workspace: {detail}")]
     ProbeWorkspaceUnavailable { detail: String },
 }
@@ -308,6 +310,30 @@ fn validate_successful_model_probe(
         ));
     }
     Ok(())
+}
+
+// A failed `chat` is not proof that its model is unavailable: admission,
+// execution, or protocol validation can fail before any provider call.
+fn failed_execution_probe(output: &Output, model: &str) -> PreflightError {
+    let exit = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = match parse_strict_cli_outcome(&stdout, model) {
+        Ok(outcome) if outcome.exit_code == exit => {
+            let terminal: serde_json::Value = serde_json::from_str(&stdout)
+                .expect("strict terminal parser already validated JSON");
+            let code = terminal
+                .get("error_code")
+                .and_then(serde_json::Value::as_str);
+            format!(
+                "exit {exit}, error_kind={}, error_code={}",
+                outcome.error_kind.as_deref().unwrap_or("unknown"),
+                code.unwrap_or("unknown")
+            )
+        }
+        Ok(_) => format!("terminal evidence disagrees with process exit {exit}"),
+        Err(error) => format!("exit {exit}; invalid terminal evidence: {error}"),
+    };
+    PreflightError::ExecutionProbeFailed { detail }
 }
 
 /// Revision verification binds the suite to the preflight routing context.
@@ -920,15 +946,7 @@ async fn check_model(
                                 }
                             }
                         }
-                        let retry_stderr = String::from_utf8_lossy(&o.stderr);
-                        return Err(PreflightError::ModelUnavailable {
-                            model: model.to_string(),
-                            detail: format!(
-                                "profile `{auto_profile}` authenticated, but model probe exited {}: {}",
-                                o.status.code().unwrap_or(-1),
-                                retry_stderr.trim()
-                            ),
-                        });
+                        return Err(failed_execution_probe(&o, model));
                     }
                     Err(detail) => {
                         return Err(PreflightError::ModelUnavailable {
@@ -949,14 +967,7 @@ async fn check_model(
     }
 
     if !output.status.success() {
-        return Err(PreflightError::ModelUnavailable {
-            model: model.to_string(),
-            detail: format!(
-                "exit {}: {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            ),
-        });
+        return Err(failed_execution_probe(&output, model));
     }
 
     if let Err(error) =
@@ -2173,6 +2184,65 @@ exec sleep 5
         let failure = br#"{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":"550e8400-e29b-41d4-a716-446655440000","text":"","final_state":"interrupted","interruption_kind":"error","tool_result_class_counts":{},"prompt_tokens":0,"fresh_prompt_tokens":0,"cache":{"hit":false,"read_tokens":0,"creation_tokens":0},"completion_tokens":0,"llm_rounds":0,"tool_calls_count":0,"tools_used":[],"persistence_error":null,"exit_code":3,"success":false,"error_kind":"api_error"}"#;
         let error = validate_successful_model_probe(failure, "deepseek", 0).unwrap_err();
         assert!(error.contains("disagrees with process exit"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_probe_does_not_misclassify_execution_or_protocol_failure_as_model_unavailability()
+     {
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = workspace.path().join("astra");
+        let failure = serde_json::json!({
+            "trace_id": null, "request_id": null, "run_id": null, "session_id": null,
+            "text": "", "final_state": "failed", "interruption_kind": null,
+            "tool_result_class_counts": {}, "prompt_tokens": 0, "fresh_prompt_tokens": 0,
+            "cache": {"hit": false, "read_tokens": 0, "creation_tokens": 0},
+            "completion_tokens": 0, "llm_rounds": 0, "tool_calls_count": 0, "tools_used": [],
+            "persistence_error": null, "exit_code": 3, "success": false,
+            "error_kind": "api_error", "error_code": "execution_binding_provider_required"
+        });
+        for (stdout, expected) in [
+            (failure.to_string(), "execution_binding_provider_required"),
+            ("{}".into(), "invalid terminal evidence"),
+            (
+                {
+                    let mut bad = failure.clone();
+                    bad["exit_code"] = 1.into();
+                    bad.to_string()
+                },
+                "disagrees with process exit",
+            ),
+        ] {
+            crate::test_support::write_executable_shim(&bin, format!(
+                "#!/bin/sh\nprintf '%s' '{stdout}'\nprintf private-stderr-sentinel >&2\nexit 3\n"
+            )).unwrap();
+            let result = super::check_model(
+                &bin,
+                "fixture-model",
+                None,
+                workspace.path(),
+                "harness-auto",
+                None,
+                false,
+            )
+            .await;
+            let error = result.as_ref().unwrap_err();
+            assert!(
+                matches!(error, PreflightError::ExecutionProbeFailed { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!error.to_string().contains("private-stderr-sentinel"));
+            let report = workspace.path().join("report.json");
+            super::write_preflight_result(Some(&report), &["fixture-model".into()], &result)
+                .unwrap();
+            let summary: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(report.with_extension("preflight.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(summary["status"], "failed");
+            assert!(summary["unavailable_model"].is_null());
+        }
     }
 
     #[cfg(unix)]

@@ -18237,6 +18237,26 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
     assert_eq!(executor.status, ExecutorStatus::Online);
 }
 
+fn native_edge_execution_request(executor_id: &str, root: &str) -> ChatRequestData {
+    let mut request = test_request("continue");
+    request.edge_executor_id = Some(executor_id.into());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Owner workspace".into()),
+        root: Some(root.into()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath { path: root.into() }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some(executor_id.into()),
+        display_name: Some("Owner edge".into()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    request
+}
+
 #[tokio::test]
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
@@ -18278,24 +18298,7 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         sender,
     );
     let service = test_service().with_edge_connection_pool(edge_pool);
-    let mut request = test_request("continue");
-    request.edge_executor_id = Some("edge-owner-1".to_string());
-    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-        display_name: Some("Owner workspace".to_string()),
-        root: Some("/workspace/owner".to_string()),
-        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/workspace/owner".to_string(),
-        }),
-        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-    });
-    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-        executor_id: Some("edge-owner-1".to_string()),
-        display_name: Some("Owner edge".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
-        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-    });
+    let mut request = native_edge_execution_request("edge-owner-1", "/workspace/owner");
     let mut discovered = Vec::new();
     let physical_id = service
         .authorize_native_edge_execution("owner-1", &request, &mut discovered)
@@ -18332,6 +18335,162 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         .await
         .expect_err("a different workspace path must not authorize the Edge");
     assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
+}
+
+#[tokio::test]
+async fn native_edge_execution_waits_for_pool_publication_and_cancels_queued_admission() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let service = test_service().with_edge_connection_pool(pool.clone());
+    let request = native_edge_execution_request("edge-publication", "/workspace/publication");
+    let publication = pool.registration_lock("owner", "edge-publication");
+    let publishing = publication.lock().await;
+    let reconnect = pool.begin_reconnect("owner", "edge-publication");
+    {
+        let mut discovery = Vec::new();
+        let mut cancelled =
+            Box::pin(service.authorize_native_edge_execution("owner", &request, &mut discovery));
+        // Without the admission barrier the real method immediately returns
+        // 428 against the not-yet-published pool. No task timing is involved.
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+    }
+    let mut discovery = Vec::new();
+    let mut admission =
+        Box::pin(service.authorize_native_edge_execution("owner", &request, &mut discovery));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    let other_request = native_edge_execution_request("other-edge", "/workspace/publication");
+    for (user, request) in [("other-owner", &request), ("owner", &other_request)] {
+        let mut other_discovery = Vec::new();
+        let mut independent =
+            Box::pin(service.authorize_native_edge_execution(user, request, &mut other_discovery));
+        let std::task::Poll::Ready(denied) = futures_util::poll!(&mut independent) else {
+            panic!("another owner/executor key must not wait for this publication");
+        };
+        assert_eq!(denied.unwrap_err().0, StatusCode::PRECONDITION_REQUIRED);
+    }
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    pool.commit_reconnect_with_registry_and_materialization_id(
+        reconnect,
+        "owner",
+        "edge-publication",
+        None,
+        Some("/workspace/publication".into()),
+        None,
+        None,
+        Some("registry-publication".into()),
+        Some("materialization-publication".into()),
+        Some("ws-publication".into()),
+        sender,
+    );
+    drop(publishing);
+    let physical = admission
+        .await
+        .expect("published materialization must authorize");
+    assert_eq!(
+        physical,
+        Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-publication",
+                "/workspace/publication",
+            ),
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn native_edge_execution_waits_for_aborted_registration_rollback_on_matrixone() {
+    use astra_services::multi_agent::EdgeRegistryService;
+    let db = setup_lifecycle_run_db_it().await;
+    let registry = Arc::new(astra_services::DatabaseEdgeRegistryService::from_shared(
+        &db,
+    ));
+    let user = Uuid::new_v4().to_string();
+    let edge = "edge-rollback";
+    let root = "/workspace/rollback";
+    let initial = registry
+        .register_or_update_with_lease_and_materialization(
+            &user,
+            edge,
+            "rest-predecessor",
+            None,
+            Some(root),
+            None,
+            None,
+            Some("materialization-rollback"),
+        )
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&initial).await.unwrap());
+    assert!(registry.release_registration(&initial).await.unwrap());
+
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let service = test_service()
+        .with_edge_connection_pool(pool.clone())
+        .with_edge_registry_service(registry.clone());
+    let request = native_edge_execution_request(edge, root);
+    let publication = pool.registration_lock(&user, edge);
+    let publishing = publication.lock().await;
+    let reconnect = pool.begin_reconnect(&user, edge);
+    let successor = registry
+        .register_or_update_with_lease_and_materialization(
+            &user,
+            edge,
+            "ws-aborted",
+            None,
+            Some(root),
+            None,
+            None,
+            Some("materialization-rollback"),
+        )
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&successor).await.unwrap());
+    assert!(
+        registry
+            .find_by_user_agent_and_workspace(&user, edge, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "finalized state 2 must remain hidden"
+    );
+
+    let mut discovery = Vec::new();
+    let mut admission =
+        Box::pin(service.authorize_native_edge_execution(&user, &request, &mut discovery));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    pool.abort_reconnect(reconnect, &user, edge);
+    assert!(registry.rollback_registration(&successor).await.unwrap());
+    let restored = registry
+        .find_by_user_agent_and_workspace(&user, edge, None)
+        .await
+        .unwrap()
+        .expect("published predecessor must be restored");
+    assert_eq!(restored.registry_id, initial.current.registry_id);
+    assert_eq!(restored.edge_id, "rest-predecessor");
+    assert_eq!(restored.worktree_path.as_deref(), Some(root));
+    assert_eq!(
+        restored.materialization_id.as_deref(),
+        Some("materialization-rollback")
+    );
+    drop(publishing);
+    assert_eq!(
+        admission.await.unwrap(),
+        Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-rollback",
+                root,
+            ),
+        )
+    );
+
+    sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
+        .bind(&user)
+        .bind(edge)
+        .execute(db.get())
+        .await
+        .unwrap();
+    db.close().await;
 }
 
 #[tokio::test]
