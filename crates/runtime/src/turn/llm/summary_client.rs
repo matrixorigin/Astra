@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use astra_turn_core::cloud_summary::{SummaryLlmClient, SummaryResponse};
-use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+use astra_turn_core::thinking_config::ThinkingConfig;
+#[cfg(test)]
+use astra_turn_core::thinking_config::ThinkingEffort;
 use astra_turn_types::InferencePurpose;
 
 use super::client::{LlmCall, OwnedLlmExecutionRoute};
@@ -225,24 +227,13 @@ impl RuntimeSummaryClient {
                     .unwrap_or(&route.model_name),
             )
         });
-        [
-            ThinkingConfig::Off,
-            ThinkingConfig::Adaptive {
-                effort: ThinkingEffort::Low,
-            },
-            ThinkingConfig::ModelDefault,
-        ]
-        .into_iter()
-        .find(|config| {
-            config.is_supported_by(
-                &route.provider,
-                route
-                    .thinking_capability
-                    .map(|capability| capability.as_str()),
-                protocol,
-            )
-        })
-        .expect("model default is always admissible")
+        ThinkingConfig::bounded_auxiliary(
+            &route.provider,
+            route
+                .thinking_capability
+                .map(|capability| capability.as_str()),
+            protocol,
+        )
     }
 
     fn configured_temperature(route: &OwnedLlmExecutionRoute) -> Result<Option<f64>, String> {

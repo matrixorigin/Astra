@@ -1027,9 +1027,12 @@ reasoning tokens. Truncated/malformed output, ignored controls, transport errors
 or unknown protocols cannot become a successful `both` observation. Unknown
 protocols use a baseline request without guessed controls and can establish only
 observed native reasoning (`native_only`), not suppression support. Declared
-effort protocols send low effort and require observable reasoning (including
+effort protocols send high effort within the same bounded probe budget and require observable reasoning (including
 reported reasoning token usage) before reporting `effort_only`. This confirms
 reasoning under the declared protocol, not a measurement of effort effectiveness.
+Bounded summaries and governed completions share one capability-based preference:
+supported suppression, otherwise supported low effort, otherwise the model default.
+Low effort can legitimately produce zero reasoning tokens; it is not an output-budget guarantee.
 BYOK probing retains the
 same pinned public-endpoint transport and owner authorization as inference.
 

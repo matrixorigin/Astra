@@ -611,6 +611,7 @@ pub enum Criterion {
     /// With `min_creation: 0` and no ceiling, only the provider-observed read
     /// lane is required; unknown creation remains unknown. Creation bounds
     /// still require complete exact input evidence.
+    /// A zero read floor requires measured reads, not a positive cache hit.
     ///
     /// Distinct from `cache_rate_above`, which checks the local idempotent
     /// tool-result cache.
@@ -4738,13 +4739,17 @@ fn evaluate_one_with_primary_cache(
                     .stable_prefix_cache_coverage
                     .is_some_and(|coverage| coverage >= *min || (coverage - *min).abs() <= 1e-12);
                 let evidence_valid = report.invalid_events == 0;
+                let coverage = report
+                    .stable_prefix_cache_coverage
+                    .map(|coverage| format!("{:.2}%", coverage * 100.0))
+                    .unwrap_or_else(|| "unknown".into());
                 CriterionResult {
                     criterion: c.clone(),
                     severity: criterion_severity(c),
                     passed: evidence_valid && enough_observations && coverage_ok,
                     detail: format!(
-                        "provider_stable_prefix_cache_coverage={:.2}% (read={}, eligible={}, provider-prefix observations={}, eligible observations={}, invalid events={}), expected >= {:.2}% and observations >= {}",
-                        report.stable_prefix_cache_coverage.unwrap_or_default() * 100.0,
+                        "provider_stable_prefix_cache_coverage={} (read={}, eligible={}, provider-prefix observations={}, eligible observations={}, invalid events={}), expected >= {:.2}% and observations >= {}",
+                        coverage,
                         report.stable_prefix_cache_read_tokens,
                         report.stable_prefix_cache_eligible_tokens,
                         report.provider_prefix_cache_observations,
@@ -5887,16 +5892,10 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::PromptCacheTokens {
-            min_read,
             min_creation,
             max_creation,
+            ..
         } => {
-            if *min_read == 0 && *min_creation == 0 && max_creation.is_none() {
-                return Err(
-                    "PromptCacheTokens requires min_read, min_creation, or max_creation to be set"
-                        .into(),
-                );
-            }
             if let Some(max) = max_creation
                 && *max < *min_creation
             {
@@ -10227,6 +10226,7 @@ mod tests {
         );
         assert!(!missing[0].passed);
         assert!(missing[0].detail.contains("provider-prefix observations=0"));
+        assert!(missing[0].detail.contains("coverage=unknown"));
 
         let observed = evaluate_deterministic_with_session(
             &[criterion],
@@ -10900,25 +10900,32 @@ mod tests {
     }
 
     #[test]
-    fn deferred_work_creation_case_requires_cache_observation_presence() {
+    fn deferred_work_creation_requires_observed_reads_without_inventing_creation() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/work_auto_decomposition_journey.yaml");
         let case = crate::case::Case::from_path(&path).expect("load shipped Work case");
         let gate = case
             .criteria
             .iter()
-            .find(|criterion| {
-                matches!(criterion, Criterion::AllOf { criteria }
-                if criteria.iter().any(|inner| {
-                    matches!(inner, Criterion::ProviderStablePrefixCacheCoverage { .. })
-                }))
-            })
-            .expect("stable-prefix observation is a required case contract");
+            .find(|criterion| matches!(criterion, Criterion::AllOf { .. }))
+            .expect("cache observation is a required case contract");
+        assert!(validate_criterion(gate).is_ok());
         assert_eq!(criterion_severity(gate), CriterionSeverity::Hard);
-        assert!(matches!(gate, Criterion::AllOf { criteria }
-            if criteria.iter().any(|inner| matches!(inner,
-                Criterion::ProviderStablePrefixCacheCoverage { min, min_observations: 1 }
-                if *min == 0.0))));
+        let no_alerts = mk_session(&[]);
+        let mut observed = cache_request_outcome("run", "turn", &[(100, 0, 0)]);
+        for event in &mut observed.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                usage.cache_creation_tokens = None;
+            }
+        }
+        assert!(evaluate_one(gate, &observed, Some(&no_alerts)).passed);
+        for event in &mut observed.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = None;
+            }
+        }
+        assert!(!evaluate_one(gate, &observed, Some(&no_alerts)).passed);
     }
 
     #[test]

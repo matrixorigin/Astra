@@ -20432,7 +20432,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
         };
         if let Some(rerun) = rerun {
-            debug_assert_eq!(rerun.tier, tier);
+            // Refreshed memory and recorded compaction can change pressure.
+            // The original tier owns compact_result; this rerun owns the final
+            // prompt, schema projection, and pending pipeline snapshot.
             final_context_assembly = crate::turn::llm::context::final_explain_analyze_context_assembly(
                 final_context_assembly,
                 Some(rerun.explain_analyze_context_assembly),

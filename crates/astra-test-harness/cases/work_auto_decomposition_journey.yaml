@@ -63,17 +63,20 @@ criteria:
   - type: execution_child_count
     min: 0
     max: 0
-  # Require a typed stable-prefix observation so a missing feedback row
-  # cannot look like a healthy cache. Runtime feedback measures the final
-  # physical request only; this is not a per-round cache-quality claim.
+  # Require actual provider cache-read evidence, including a measured zero.
+  # Exact creation usage is optional on prefix-cache APIs; its absence must
+  # not invalidate a known cache-read count or silently become zero creation.
   - type: all_of
     criteria:
-      - type: provider_stable_prefix_cache_coverage
-        min: 0.0
-        min_observations: 1
+      - type: prompt_cache_tokens
+        min_read: 0
+        min_creation: 0
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 0
+  - type: provider_stable_prefix_cache_coverage
+    min: 0.0
+    min_observations: 1
   - type: execution_tool_count
     name: ask_user
     min: 0

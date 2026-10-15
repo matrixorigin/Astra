@@ -95,6 +95,25 @@ impl From<&astra_turn_types::DelegationReasoningRequirement> for ThinkingConfig 
 }
 
 impl ThinkingConfig {
+    /// Prefer suppression, then low effort, only when the admitted contract
+    /// supports that control. Low effort does not guarantee an output budget.
+    pub fn bounded_auxiliary(
+        provider: &str,
+        capability: Option<&str>,
+        protocol: astra_core::model_wire::thinking::ThinkingProtocol,
+    ) -> Self {
+        [
+            Self::Off,
+            Self::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            Self::ModelDefault,
+        ]
+        .into_iter()
+        .find(|config| config.is_supported_by(provider, capability, protocol))
+        .expect("model default is always admissible")
+    }
+
     /// One exact control contract for selection and execution admission.
     /// Capability is the catalog's machine-owned value, not provider prose.
     pub fn is_supported_by(

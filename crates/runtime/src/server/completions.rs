@@ -235,7 +235,22 @@ pub(super) async fn completions_handler(
         admitted.clone(),
     );
     // 4. Execute through the same typed provider boundary as agent turns.
-    let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+    let thinking = astra_turn_core::thinking_config::ThinkingConfig::bounded_auxiliary(
+        &admitted.provider,
+        admitted
+            .thinking_capability
+            .map(|capability| capability.as_str()),
+        admitted.thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                &admitted.provider,
+                &admitted.base_url,
+                admitted
+                    .wire_model_name
+                    .as_deref()
+                    .unwrap_or(&admitted.model_name),
+            )
+        }),
+    );
     let parsed = durable_ledger
         .execute_nonstream(
             &state.http_client,
@@ -505,9 +520,12 @@ mod tests {
                     tags: Vec::new(),
                     request_body_overrides: None,
                     fixed_temperature: None,
-                    thinking_protocol: None,
+                    thinking_protocol: (self.provider == "openai").then_some(
+                        astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+                    ),
                     prompt_cache_capability: None,
-                    thinking_capability: None,
+                    thinking_capability: (self.provider == "openai")
+                        .then_some(astra_services::models::ThinkingCapability::EffortOnly),
                     context_window: Some(32_000),
                     max_completion_tokens: Some(if self.provider == "cap-limited" {
                         64
@@ -979,6 +997,7 @@ mod tests {
                             return std::future::pending::<axum::response::Response>().await;
                         }
                         assert_eq!(body["max_completion_tokens"], 1_024);
+                        assert_eq!(body["reasoning_effort"], "low");
                         Json(json!({
                             "id": "provider-session-scope",
                             "choices": [{

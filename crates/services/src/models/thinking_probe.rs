@@ -111,7 +111,9 @@ pub(super) async fn probe_chat_protocol(
     protocol.apply(
         &mut enabled,
         true,
-        (protocol == ThinkingProtocol::ReasoningEffort).then_some("low"),
+        // The enabled leg must make reasoning observable. At low effort a
+        // reasoning-capable model may correctly answer without reasoning.
+        (protocol == ThinkingProtocol::ReasoningEffort).then_some("high"),
     );
     if protocol == ThinkingProtocol::EnableThinking {
         // Some DashScope deployments require streaming when thinking is on.
@@ -475,11 +477,15 @@ mod tests {
             if body["model"] == "native" {
                 assert!(body.get("reasoning_effort").is_none());
                 response["choices"][0]["message"]["reasoning_content"] = serde_json::json!("multiply");
+            } else if body["model"] == "effort-sensitive" {
+                response["usage"] = serde_json::json!({"completion_tokens_details": {
+                    "reasoning_tokens": if body["reasoning_effort"] == "high" { 32 } else { 0 }
+                }});
             } else if let Some((path, value)) = body["model"].as_str().unwrap().split_once('-') {
                 if path == "unknown" {
                     assert!(body.get("reasoning_effort").is_none());
                 } else {
-                    assert_eq!(body["reasoning_effort"], "low");
+                    assert_eq!(body["reasoning_effort"], "high");
                 }
                 let value: Value = serde_json::from_str(value).unwrap();
                 response["usage"] = match path {
@@ -502,6 +508,11 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let mut cases = vec![
+            (
+                "effort-sensitive".to_string(),
+                ThinkingProtocol::ReasoningEffort,
+                Some(ThinkingCapability::EffortOnly),
+            ),
             (
                 "native".to_string(),
                 ThinkingProtocol::Unknown,
