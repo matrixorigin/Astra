@@ -114,7 +114,9 @@ parallel state machine must not be introduced to make a scale test pass.
 
 Fresh run-control observations share an on-demand read queue in `RunEngine`.
 Concurrent requests across owners use at most 128 positional lookups per SQL,
-four concurrent queries, and a maximum 25 ms collection window per batch.
+four concurrent queries, and a maximum 25 ms collection window measured from
+admission. Full batches and partial batches whose oldest request has already
+waited that window dispatch without another collection delay.
 The queue admits at most 8,192 outstanding reads and 4,096 per owner, including
 in-flight queries, with bounded identity bytes and owner-rotating dispatch.
 Database equality associates each request with its result; missing or malformed

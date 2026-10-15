@@ -12,7 +12,7 @@ use astra_services::runs::{
     RUN_CONTROL_READ_BATCH_SIZE, RunControlReadKey, RunControlReadResult, RunStateStore,
 };
 use futures_util::{FutureExt, future::BoxFuture};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 
 const COLLECTION_WINDOW: Duration = Duration::from_millis(25);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -47,6 +47,7 @@ struct Owner {
 
 struct Request {
     key: RunControlReadKey,
+    collect_at: Instant,
     reply: oneshot::Sender<RunControlReadResult>,
 }
 
@@ -101,6 +102,7 @@ impl ControlReads {
         if user_id.len() > 512 || run_id.len() > 512 {
             return Err("run control identity exceeds capacity".into());
         }
+        let queued_at = Instant::now();
         let (reply, receiver) = oneshot::channel();
         let start_worker = {
             let mut state = self
@@ -123,6 +125,7 @@ impl ControlReads {
                     user_id: user_id.into(),
                     run_id: run_id.into(),
                 },
+                collect_at: queued_at + COLLECTION_WINDOW,
                 reply,
             });
             if was_empty {
@@ -139,7 +142,7 @@ impl ControlReads {
             let reads = self.clone();
             tokio::spawn(async move { reads.run().await });
         }
-        tokio::time::timeout(READ_TIMEOUT, receiver)
+        tokio::time::timeout_at(queued_at + READ_TIMEOUT, receiver)
             .await
             .map_err(|_| "run control read timed out".to_string())?
             .map_err(|_| "run control read worker closed".to_string())?
@@ -147,7 +150,32 @@ impl ControlReads {
 
     async fn run(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(COLLECTION_WINDOW).await;
+            let collect_at = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let queued = state
+                    .owners
+                    .values()
+                    .map(|owner| owner.pending.len())
+                    .sum::<usize>();
+                if queued >= RUN_CONTROL_READ_BATCH_SIZE {
+                    None
+                } else {
+                    state
+                        .owners
+                        .values()
+                        .filter_map(|owner| owner.pending.front())
+                        .map(|request| request.collect_at)
+                        .min()
+                }
+            };
+            if let Some(deadline) = collect_at {
+                // Collection is bounded from admission, not renewed every
+                // time a worker reaches an already-waiting partial batch.
+                tokio::time::sleep_until(deadline).await;
+            }
             let batch = {
                 let mut state = self
                     .state
@@ -389,7 +417,14 @@ mod tests {
             let (start, gate, open, counter) =
                 (start.clone(), gate.clone(), open.clone(), counter.clone());
             Box::pin(async move {
-                if counter.fetch_add(1, Ordering::SeqCst) + 1 == MAX_WORKERS {
+                let ordinal = counter.fetch_add(1, Ordering::SeqCst);
+                if keys.iter().any(|key| key.user_id == "cold") {
+                    assert_eq!(
+                        ordinal, MAX_WORKERS,
+                        "the next batch must include the later owner"
+                    );
+                }
+                if ordinal + 1 == MAX_WORKERS {
                     start.notify_one();
                 }
                 if !open.load(Ordering::SeqCst) {
@@ -406,17 +441,24 @@ mod tests {
         }
         entered.notified().await;
         assert_eq!(calls.load(Ordering::SeqCst), MAX_WORKERS);
+        tokio::time::advance(COLLECTION_WINDOW).await;
         let mut cold = Box::pin(reader.get("cold", "run"));
         assert!(futures_util::poll!(cold.as_mut()).is_pending());
+        let released_at = Instant::now();
         ready.store(true, Ordering::SeqCst);
         release.notify_waiters();
         assert!(cold.await.unwrap().is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 8);
         assert!(
             futures_util::future::join_all(pending)
                 .await
                 .into_iter()
                 .all(|result| result.unwrap().is_none())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        assert_eq!(
+            Instant::now(),
+            released_at,
+            "aged backlog must not acquire another collection window"
         );
     }
 }
