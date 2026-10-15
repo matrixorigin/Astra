@@ -146,7 +146,7 @@ fn normalize_args(raw: &str) -> String {
             };
             // Truncate long values (e.g. long file paths are fine, but cap at 80)
             let v = if v.len() > 80 {
-                format!("{}…", &v[..80])
+                format!("{}…", &v[..v.floor_char_boundary(80)])
             } else {
                 v
             };
@@ -2679,6 +2679,20 @@ mod tests {
         // Invalid JSON returns empty
         let result = super::normalize_args("not json");
         assert!(result.is_empty());
+
+        for (value, expected) in [
+            ("界".repeat(40), "界".repeat(26)),
+            ("🦀".repeat(40), "🦀".repeat(20)),
+            (
+                format!("a{}", "界".repeat(40)),
+                format!("a{}", "界".repeat(26)),
+            ),
+        ] {
+            let raw = serde_json::json!({"path":value}).to_string();
+            let result = super::normalize_args(&raw);
+            assert_eq!(result, format!("path={expected}…"));
+            assert!(result.len() <= 88);
+        }
     }
 
     // ─── Optimization: compaction persists cleared content to disk ──────────
