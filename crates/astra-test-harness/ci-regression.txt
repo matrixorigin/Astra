@@ -7,4 +7,4 @@ task_agent_profile_callable.yaml
 recovered_validation_user_facing_completion.yaml
 cache_provider_matrix_regression.yaml
 subagent_model_selection/flash_missing_child_model_fail_closed.yaml
-multi_model_fanout_handoff.yaml
+same_model_fanout_handoff_flash.yaml

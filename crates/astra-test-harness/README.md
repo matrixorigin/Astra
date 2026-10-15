@@ -186,7 +186,7 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 The **Harness (live models)** workflow builds the selected Git revision's
 Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
-then runs the existing YAML cases with DeepSeek-v4.1-Flash and a GLM-5.3 judge. Dispatch defaults to the
+then runs the existing YAML cases with DeepSeek-v4.1-Flash as both agent and judge. Dispatch defaults to the
 full suite. The same execution job is reused by the automatic live regression
 described below; offline PR checks still work without provider secrets.
 
@@ -199,7 +199,7 @@ In the repository's **Settings → Secrets and variables → Actions**, create:
   model entries in the existing admin model-file format. Each entry supplies its
   own endpoint, credentials, protocol and capacity. An explicit Flash entry
   replaces its shared-endpoint default; other entries inherit nothing.
-  Duplicate names and overrides of GLM-5.3 are rejected. Only cases that
+  Duplicate names are rejected. Only cases that
   require additional models need this secret; ordinary delegation uses
   the selected matrix model, not a fixed GLM version.
 
@@ -284,10 +284,15 @@ GLM-5.2 rather than the configured GLM-5.3.
 | `recovered_validation_user_facing_completion` | Medium: failing baseline, edit, successful validation, user-facing delivery |
 | `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
 | `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
-| `multi_model_fanout_handoff` | Medium: GLM-5.3 + DeepSeek-v4.1-Flash, exact slot identities, real child results and parent adoption |
+| `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
 
-All parents use DeepSeek-v4.1-Flash; the independent judge uses GLM-5.3.
-Both default models use `HARNESS_GLM_BASE_URL` and `HARNESS_GLM_API_KEY`.
+All parents and the judge use DeepSeek-v4.1-Flash; this is not independent-model judging.
+Only Flash is registered by default, using the existing `HARNESS_GLM_BASE_URL` and
+`HARNESS_GLM_API_KEY` secrets (the secret names do not select a model).
+GLM-5.3 is temporarily excluded from this regression because its service is unstable.
+The full suite retains `multi_model_fanout_handoff`; explicitly configure its GLM
+dependency in `HARNESS_ADDITIONAL_MODELS_JSON` to run it. The regression does not
+claim heterogeneous-model coverage.
 An explicit `deepseek-v4.1-flash` entry in `HARNESS_ADDITIONAL_MODELS_JSON`
 replaces its default configuration unchanged; other additional models remain
 self-contained. Missing/unavailable models fail preflight;
@@ -313,7 +318,7 @@ python3 scripts/ci/select_harness_cases.py \
 # Against a fresh, same-revision Server and a disposable checkout as workspace:
 target/debug/astra-test --suite "$run_dir/cases" \
   --astra-bin "$PWD/target/debug/astra" --working-dir "$HARNESS_WORKSPACE" \
-  --force-model deepseek-v4.1-flash --judger-model glm-5.3 --parallel 1 --runs 1 \
+  --force-model deepseek-v4.1-flash --judger-model deepseek-v4.1-flash --parallel 1 --runs 1 \
   --progress-file "$run_dir/progress.jsonl" --report-file "$run_dir/report.json"
 ```
 
