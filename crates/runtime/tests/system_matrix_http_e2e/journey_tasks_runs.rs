@@ -740,7 +740,36 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let saved_result = payload["heavy"]["messages"].as_array().unwrap().iter()
             .find(|m| m["role"] == "tool" && m["tool_call_id"] == "handoff-search").unwrap();
         assert_eq!(results[0]["content"], saved_result["content"], "restore exact settled tool output");
+        // Run accounting settles independently of the canonical turn. Hold
+        // its actual head so this ordering cannot depend on database timing.
+        let canonical_key: astra_turn_types::SessionKeyV1 =
+            serde_json::from_value(source["key"].clone()).unwrap();
+        let mut canonical_head = ctx.pool.begin().await.unwrap();
+        let blocked_turn: i64 = sqlx::query_scalar(
+            "SELECT completed_turn FROM session_context_heads
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ? FOR UPDATE"
+        ).bind(&canonical_key.isolation_domain).bind(&canonical_key.owner_user_id)
+            .bind(&canonical_key.session_id).bind(&canonical_key.branch_id)
+            .fetch_one(&mut *canonical_head).await.unwrap();
         gates.0[1].notify_one();
+        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let terminal = store.load_run(&ctx.user_id, &run_id).await?
+                    .ok_or_else(|| "resumed run disappeared before settlement".to_string())?;
+                if terminal.events.iter().any(|event| event["event_type"] == "run_settlement_finished"
+                    && event["data"]["owner_generation"] == active.run_generation) {
+                    break Ok::<_, String>(terminal);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await;
+        // Release even when the bounded observation failed, before unwrapping
+        // it, so fixture teardown cannot wait on our own projection lock.
+        canonical_head.rollback().await.expect("release canonical commit barrier");
+        let terminal = terminal.expect("run accounting settles while canonical commit is blocked")
+            .expect("read exact-generation terminal settlement");
+        assert_eq!(blocked_turn + 1, turn as i64,
+            "the reserved canonical turn was still uncommitted at run settlement");
         assert_eq!(harness::wait_for_run_status(&ctx.app, &run_id, auth, "completed", Duration::from_secs(15)).await,
             "completed");
         let (status, completed) = get_json(&ctx.app, &format!("/chat/runs/{run_id}"), Some(auth), &[]).await;
@@ -752,16 +781,6 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(completed["accounting"]["tool_outcomes"]["succeeded"], 1);
         assert_eq!(completed["accounting"]["last_request_usage"]["prompt_tokens"], 52);
         assert_eq!(completed["accounting"]["last_request_usage"]["completion_tokens"], 11);
-        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let terminal = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
-                if terminal.events.iter().any(|event| event["event_type"] == "run_settlement_finished"
-                    && event["data"]["owner_generation"] == active.run_generation) {
-                    break terminal;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }).await.expect("exact-generation terminal settlement must close");
         assert_eq!((terminal.total_prompt_tokens, terminal.total_completion_tokens), (94, 18));
         assert_eq!(terminal.total_tool_calls, 1, "settled discovery cannot execute again on restore");
         assert_eq!(terminal.events.iter().filter(|e| e["event_type"] == "run_started").count(), 1);
@@ -782,20 +801,24 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
             .bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
         assert_eq!(slots, 0);
-        // The atomic terminal transaction now records settlement_finished
-        // before the canonical context commit. Wait for the actual context
-        // watermark rather than treating the terminal event as that barrier.
+        let mut observed_head = None;
         let completed_turn = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let completed_turn: i64 = sqlx::query_scalar(
-                    "SELECT completed_turn FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?"
-                ).bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
-                if completed_turn >= turn as i64 {
-                    break completed_turn;
-                }
+                let head: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT completed_turn, CAST(active_writer_json IS NULL AS SIGNED),
+                            CAST(active_reservation_json IS NULL AS SIGNED)
+                     FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ?
+                       AND session_id = ? AND branch_id = ?"
+                ).bind(&canonical_key.isolation_domain).bind(&canonical_key.owner_user_id)
+                    .bind(&canonical_key.session_id).bind(&canonical_key.branch_id)
+                    .fetch_one(&ctx.pool).await.unwrap();
+                observed_head = Some(head);
+                if head == (turn as i64, 1, 1) { break head.0; }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("canonical context must commit after terminal settlement");
+        }).await.unwrap_or_else(|_| panic!(
+            "canonical turn {turn} must commit and release writer/reservation; observed {observed_head:?}"
+        ));
         assert_eq!(completed_turn, turn as i64, "same reserved conversation turn commits once");
 
         // The normal terminal checkpoint exposes the restored loop budget;
