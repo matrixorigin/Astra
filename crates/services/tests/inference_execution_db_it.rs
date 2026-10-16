@@ -507,6 +507,18 @@ async fn empty_canonical_wal_retirement_preserves_lifecycle_fencing() {
             .expect_err("an empty WAL must not bypass a committed deletion fence");
     assert_eq!(error.kind, ServiceErrorKind::NotFound);
     cleanup(pool, &user_id, &session_id, &run_id).await;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "fixture cleanup must not leave a delete intent"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3884,6 +3896,10 @@ async fn detailed_auxiliary_capture_decodes_multiple_invocations_and_attempts() 
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for (statement, identity) in [
+        (
+            "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+            session_id,
+        ),
         (
             "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
             session_id,
