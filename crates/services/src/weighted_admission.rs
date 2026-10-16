@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::CancellationSafeTransaction;
-use astra_core::{SharedPool, is_duplicate_key_error};
+use astra_core::SharedPool;
 use astra_turn_types::SessionKeyV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,12 +23,24 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-pub(crate) const DISTRIBUTED_ADMISSION_SCOPE: &str = "canonical_turn_v1";
+pub(crate) const DISTRIBUTED_ADMISSION_PARTITIONS: usize = 16;
+pub(crate) fn distributed_admission_partition(owner: &str) -> usize {
+    let digest = Sha256::digest(owner.as_bytes());
+    usize::from(digest[0]) % DISTRIBUTED_ADMISSION_PARTITIONS
+}
+
+pub(crate) fn distributed_admission_scope(partition: usize) -> String {
+    format!("canonical_turn_v2_{partition:02}")
+}
+
+fn owner_admission_scope(key: &SessionKeyV1) -> String {
+    distributed_admission_scope(distributed_admission_partition(&key.owner_user_id))
+}
 const DISTRIBUTED_ADMISSION_MAX_TTL: Duration = Duration::from_secs(15 * 60);
 const DISTRIBUTED_ADMISSION_IDEMPOTENCY_DOMAIN: &[u8] =
     b"astra.distributed-weighted-admission-idempotency.v1\0";
 const DISTRIBUTED_ADMISSION_CAPACITY_DOMAIN: &[u8] =
-    b"astra.distributed-weighted-admission-capacity.v1\0";
+    b"astra.distributed-weighted-admission-capacity.v2\0";
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdmissionWork {
     pub resident_bytes: u64,
@@ -39,6 +51,25 @@ pub struct AdmissionWork {
 }
 
 impl AdmissionWork {
+    fn components(self) -> [u64; 5] {
+        [
+            self.resident_bytes,
+            self.context_tokens,
+            u64::from(self.provider_slots),
+            self.cpu_units,
+            self.io_bytes,
+        ]
+    }
+
+    fn from_components(values: [u64; 5]) -> Option<Self> {
+        Some(Self {
+            resident_bytes: values[0],
+            context_tokens: values[1],
+            provider_slots: values[2].try_into().ok()?,
+            cpu_units: values[3],
+            io_bytes: values[4],
+        })
+    }
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             resident_bytes: self.resident_bytes.checked_add(other.resident_bytes)?,
@@ -136,13 +167,9 @@ macro_rules! admission_io {
 pub struct DatabaseWeightedAdmissionController {
     pool: SharedPool,
     limits: WeightedAdmissionLimits,
-    /// A durable scope has one gate row, so concurrent callers in this
-    /// process would only queue on the same database lock after already
-    /// consuming a pool connection. Keep that queue in Tokio instead. This
-    /// preserves the durable gate as the cross-process authority while
-    /// preventing a burst of idle requests from exhausting every connection
-    /// and timing out before the gate can run.
-    reservation_gate: Arc<Semaphore>,
+    /// Queue before checking out SQL connections. Unrelated owner partitions
+    /// proceed independently; cold credit transfers acquire these in order.
+    reservation_gates: Arc<[Arc<Semaphore>; DISTRIBUTED_ADMISSION_PARTITIONS]>,
     /// One deadline covers both the in-process gate queue and the subsequent
     /// pool acquire. A request that cannot reach the durable gate in this
     /// budget fails explicitly instead of occupying an unbounded waiter.
@@ -162,10 +189,7 @@ impl DatabaseWeightedAdmissionController {
         Ok(Self {
             pool,
             limits,
-            // One local permit mirrors the single durable gate row. Waiting
-            // callers stay in Tokio instead of holding a database connection
-            // while queued behind the same cross-process lock.
-            reservation_gate: Arc::new(Semaphore::new(1)),
+            reservation_gates: Arc::new(std::array::from_fn(|_| Arc::new(Semaphore::new(1)))),
             admission_wait_timeout,
         })
     }
@@ -196,7 +220,8 @@ impl DatabaseWeightedAdmissionController {
 
     /// Reserve hard capacity across all pods.
     ///
-    /// The single gate row serializes only this short admission transaction.
+    /// Owner partitions serialize only their short admission transactions;
+    /// credit borrowing coordinates the selected durable partitions.
     /// Inference, tools, materialization, and network I/O happen after it is
     /// released. Active rows are bounded by the global provider-slot budget,
     /// so calculating byte/token totals cannot grow with session history.
@@ -235,24 +260,168 @@ impl DatabaseWeightedAdmissionController {
         idempotency_key: &str,
         deadline: std::time::Instant,
     ) -> Result<DistributedAdmissionPermit, DistributedAdmissionError> {
-        // Do not acquire a SQL connection while waiting for the single
-        // durable gate row. All callers sharing this controller use the same
-        // FIFO async queue; independent server processes still contend only
-        // on the durable row and retain the same global invariant. The same
-        // deadline is then applied to pool acquisition, so queueing cannot
-        // silently extend the database wait budget.
-        let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
         let idempotency_hash = distributed_idempotency_hash(idempotency_key);
+        let partition = distributed_admission_partition(&key.owner_user_id);
+        let requested_hash = admission_capacity_hash(self.limits);
+        let mut refill_partitions: Option<Vec<usize>> = None;
+        let mut local_permits = Vec::new();
+        // End each SQL transaction before broadening. Retain localALL only
+        // across a configuration point recheck; partial plans are released.
+        for (exclusive_local, force_all) in [(false, false), (true, false), (true, true)] {
+            let local_partitions: Vec<_> =
+                if force_all || exclusive_local && refill_partitions.is_none() {
+                    (0..DISTRIBUTED_ADMISSION_PARTITIONS).collect()
+                } else if exclusive_local {
+                    refill_partitions.as_ref().expect("planned refill").clone()
+                } else {
+                    vec![partition]
+                };
+            if local_permits.len() != local_partitions.len() {
+                local_permits.clear();
+                for &index in &local_partitions {
+                    local_permits.push(self.acquire_reservation_gate(index, deadline).await?);
+                }
+            }
+            let partitions = if force_all || exclusive_local && refill_partitions.is_some() {
+                local_partitions
+            } else {
+                vec![partition]
+            };
+            match self
+                .attempt_reservation(
+                    key,
+                    work,
+                    ttl,
+                    &idempotency_hash,
+                    &requested_hash,
+                    &partitions,
+                    deadline,
+                )
+                .await?
+            {
+                ReservationAttempt::Granted(reservation) => {
+                    return Ok(DistributedAdmissionPermit::new(self.clone(), reservation));
+                }
+                ReservationAttempt::ConfigurationNeeded => refill_partitions = None,
+                ReservationAttempt::CreditNeeded if !exclusive_local => {
+                    local_permits.clear();
+                    match self
+                        .probe_partition_capacity(
+                            key,
+                            work,
+                            &idempotency_hash,
+                            &requested_hash,
+                            deadline,
+                        )
+                        .await?
+                    {
+                        CapacityProbe::Exhausted => {
+                            return Err(WeightedAdmissionError::GlobalExhausted.into());
+                        }
+                        CapacityProbe::Donors(partitions) => refill_partitions = Some(partitions),
+                        CapacityProbe::Uncertain => {}
+                    }
+                }
+                ReservationAttempt::CreditNeeded => {
+                    tracing::debug!(target: "astra_services::weighted_admission", partition, "stale donor plan requires full capacity authority");
+                }
+            }
+        }
+        unreachable!("full-inventory admission returns a terminal decision")
+    }
+
+    // One transaction owner for point, selected-donor and full-inventory
+    // attempts. A nonterminal result has already rolled back its connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_reservation(
+        &self,
+        key: &SessionKeyV1,
+        work: AdmissionWork,
+        ttl: Duration,
+        idempotency_hash: &str,
+        requested_hash: &str,
+        partitions: &[usize],
+        deadline: std::time::Instant,
+    ) -> Result<ReservationAttempt, DistributedAdmissionError> {
+        let partition = distributed_admission_partition(&key.owner_user_id);
+        let target = partitions
+            .iter()
+            .position(|index| *index == partition)
+            .expect("owner partition is always locked");
+        let all_partitions = partitions.len() == DISTRIBUTED_ADMISSION_PARTITIONS;
         let mut tx = self
             .begin_transaction(deadline, "begin_reservation")
             .await?;
-        let mut gate = self.lock_admission_gate(&mut tx, deadline).await?;
-        reconcile_expired_reservations(&mut tx, &mut gate).await?;
-        ensure_distributed_admission_capacity(&mut tx, self.limits, gate.capacity_hash.as_deref())
-            .await?;
-
-        let expires_at = gate
-            .now
+        let mut gates = Vec::with_capacity(partitions.len());
+        for &index in partitions {
+            gates.push(self.lock_admission_gate(&mut tx, index, deadline).await?);
+        }
+        let now = read_admission_clock(&mut tx).await?;
+        if !all_partitions
+            && gates
+                .iter()
+                .any(|gate| gate.capacity_hash.as_deref() != Some(requested_hash))
+        {
+            tracing::debug!(target: "astra_services::weighted_admission", partition, reason = "configuration", "admission partition escalation");
+            tx.rollback()
+                .await
+                .map_err(|source| distributed_database_error("rollback_escalation", source))?;
+            return Ok(ReservationAttempt::ConfigurationNeeded);
+        }
+        for gate in &mut gates {
+            reconcile_expired_reservations(&mut tx, gate, now).await?;
+            ensure_materialized_admission_usage(&mut tx, gate).await?;
+        }
+        if all_partitions {
+            ensure_partition_allocations(&mut tx, &mut gates, self.limits, requested_hash).await?;
+        } else if gates
+            .iter()
+            .any(|gate| !gate.used.fits_within(gate.allocated))
+        {
+            return Err(DistributedAdmissionError::Invalid(
+                "partition usage exceeds its allocation".into(),
+            ));
+        }
+        if let Some(existing) = load_distributed_reservation(&mut tx, key, idempotency_hash).await?
+        {
+            if existing.work != work {
+                return Err(DistributedAdmissionError::IdempotencyMismatch);
+            }
+            tx.commit()
+                .await
+                .map_err(|source| distributed_database_error("commit_replay", source))?;
+            return Ok(ReservationAttempt::Granted(existing));
+        }
+        let owner_used = load_materialized_owner_usage(&mut tx, key).await?;
+        if !owner_used
+            .checked_add(work)
+            .is_some_and(|next| next.fits_within(self.limits.per_owner))
+        {
+            tx.commit()
+                .await
+                .map_err(|source| distributed_database_error("commit_owner_denial", source))?;
+            return Err(WeightedAdmissionError::OwnerExhausted.into());
+        }
+        if !gates[target]
+            .used
+            .checked_add(work)
+            .is_some_and(|next| next.fits_within(gates[target].allocated))
+            && !transfer_partition_credit(&mut tx, &mut gates, target, work, self.limits.global)
+                .await?
+        {
+            if all_partitions {
+                tx.commit().await.map_err(|source| {
+                    distributed_database_error("commit_capacity_denial", source)
+                })?;
+                return Err(WeightedAdmissionError::GlobalExhausted.into());
+            }
+            tracing::debug!(target: "astra_services::weighted_admission", partition, reason = "credit", "admission partition escalation");
+            tx.rollback()
+                .await
+                .map_err(|source| distributed_database_error("rollback_escalation", source))?;
+            return Ok(ReservationAttempt::CreditNeeded);
+        }
+        let expires_at = now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
             })?)
@@ -264,64 +433,110 @@ impl DatabaseWeightedAdmissionController {
             key: key.clone(),
             work,
             expires_at_unix_ms: expires_at.and_utc().timestamp_millis(),
-            idempotency_hash,
+            idempotency_hash: idempotency_hash.to_owned(),
         };
-        ensure_materialized_admission_usage(&mut tx, &mut gate).await?;
-        // A saturated gate must not write a new identity just to roll it back.
-        // Exact replay still succeeds at capacity; only new work is rejected.
-        let capacity = match gate.global_used.checked_add(work) {
-            Some(next) if next.fits_within(self.limits.global) => {
-                let owner_used = load_materialized_owner_usage(&mut tx, key).await?;
-                validate_available_work(self.limits, gate.global_used, owner_used, work)
-            }
-            _ => Err(WeightedAdmissionError::GlobalExhausted),
-        };
-        if let Err(capacity) = capacity {
-            let existing =
-                load_distributed_reservation(&mut tx, key, &reservation.idempotency_hash).await?;
-            if existing
-                .as_ref()
-                .is_some_and(|existing| existing.work != work)
-            {
-                return Err(DistributedAdmissionError::IdempotencyMismatch);
-            }
-            // No provisional row exists. Persist completed expiry/usage repair
-            // even on rejection, rather than repeating it on every request.
-            tx.commit()
-                .await
-                .map_err(|source| distributed_database_error("commit_capacity_decision", source))?;
-            return existing
-                .map(|existing| DistributedAdmissionPermit::new(self.clone(), existing))
-                .ok_or(DistributedAdmissionError::Capacity(capacity));
-        }
-        // The unique index remains the normal-path idempotency arbiter.
-        match insert_distributed_reservation(&mut tx, &reservation, expires_at).await {
-            Ok(()) => {}
-            Err(DistributedAdmissionError::Database { operation, source })
-                if is_duplicate_key_error(&source) =>
-            {
-                let Some(existing) =
-                    load_distributed_reservation(&mut tx, key, &reservation.idempotency_hash)
-                        .await?
-                else {
-                    return Err(DistributedAdmissionError::Database { operation, source });
-                };
-                if existing.work != work {
-                    return Err(DistributedAdmissionError::IdempotencyMismatch);
-                }
-                tx.commit()
-                    .await
-                    .map_err(|source| distributed_database_error("commit_replay", source))?;
-                return Ok(DistributedAdmissionPermit::new(self.clone(), existing));
-            }
-            Err(error) => return Err(error),
-        }
-
+        insert_distributed_reservation(&mut tx, &reservation, expires_at).await?;
         add_materialized_admission_usage(&mut tx, key, work, expires_at).await?;
         tx.commit()
             .await
             .map_err(|source| distributed_database_error("commit_reservation", source))?;
-        Ok(DistributedAdmissionPermit::new(self.clone(), reservation))
+        tracing::debug!(target: "astra_services::weighted_admission", partition, locked_partitions = gates.len(), "admission reservation committed");
+        Ok(ReservationAttempt::Granted(reservation))
+    }
+
+    /// One fresh snapshot couples counters, expiry and identity absence.
+    /// It may reject or suggest locks, but never authorizes execution.
+    async fn probe_partition_capacity(
+        &self,
+        key: &SessionKeyV1,
+        work: AdmissionWork,
+        idempotency_hash: &str,
+        requested_hash: &str,
+        deadline: std::time::Instant,
+    ) -> Result<CapacityProbe, DistributedAdmissionError> {
+        let mut tx = self
+            .begin_transaction(deadline, "begin_capacity_snapshot")
+            .await?;
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT scope_name, ");
+        query.push(ADMISSION_GATE_COLUMNS).push(", CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now, CAST(EXISTS(SELECT 1 FROM session_weighted_admission_reservations WHERE scope_name = ")
+            .push_bind(owner_admission_scope(key)).push(" AND isolation_domain = ").push_bind(&key.isolation_domain)
+            .push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
+            .push(" AND idempotency_hash = ").push_bind(idempotency_hash)
+            .push(") AS SIGNED) AS identity_exists FROM session_weighted_admission_gates WHERE scope_name IN (");
+        {
+            let mut scopes = query.separated(", ");
+            for partition in 0..DISTRIBUTED_ADMISSION_PARTITIONS {
+                scopes.push_bind(distributed_admission_scope(partition));
+            }
+        }
+        query.push(") ORDER BY scope_name");
+        let rows = admission_io!(tx, query.build().fetch_all(&mut *tx))
+            .map_err(|source| distributed_database_error("read_capacity_snapshot", source))?;
+        tx.commit()
+            .await
+            .map_err(|source| distributed_database_error("commit_capacity_snapshot", source))?;
+        if rows.len() != DISTRIBUTED_ADMISSION_PARTITIONS {
+            return Ok(CapacityProbe::Uncertain);
+        }
+        let mut gates = Vec::with_capacity(rows.len());
+        for (partition, row) in rows.iter().enumerate() {
+            let scope: String = row
+                .try_get("scope_name")
+                .map_err(|source| distributed_database_error("decode_snapshot_scope", source))?;
+            let identity_exists: i64 = row
+                .try_get("identity_exists")
+                .map_err(|source| distributed_database_error("decode_snapshot_identity", source))?;
+            let unix_ms: i64 = row
+                .try_get("database_now")
+                .map_err(|source| distributed_database_error("decode_snapshot_time", source))?;
+            let Some(now) =
+                chrono::DateTime::from_timestamp_millis(unix_ms).map(|time| time.naive_utc())
+            else {
+                return Ok(CapacityProbe::Uncertain);
+            };
+            if scope != distributed_admission_scope(partition) || identity_exists != 0 {
+                return Ok(CapacityProbe::Uncertain);
+            }
+            let Ok(gate) = decode_distributed_admission_gate(row, scope) else {
+                return Ok(CapacityProbe::Uncertain);
+            };
+            if gate.capacity_hash.as_deref() != Some(requested_hash)
+                || !gate.usage_initialized
+                || !gate.used.fits_within(gate.allocated)
+                || gate.earliest_expiry_at.is_some_and(|at| at <= now)
+            {
+                return Ok(CapacityProbe::Uncertain);
+            }
+            gates.push(gate);
+        }
+        let (Ok(allocated), Ok(used)) = (
+            sum_admission_work(gates.iter().map(|gate| gate.allocated)),
+            sum_admission_work(gates.iter().map(|gate| gate.used)),
+        ) else {
+            return Ok(CapacityProbe::Uncertain);
+        };
+        if allocated != self.limits.global {
+            return Ok(CapacityProbe::Uncertain);
+        }
+        if !used
+            .checked_add(work)
+            .is_some_and(|next| next.fits_within(self.limits.global))
+        {
+            return Ok(CapacityProbe::Exhausted);
+        }
+        let Some(free) = gates
+            .iter()
+            .map(|gate| gate.allocated.checked_sub(gate.used))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(CapacityProbe::Uncertain);
+        };
+        Ok(donor_partitions(
+            &free,
+            distributed_admission_partition(&key.owner_user_id),
+            work,
+        )
+        .map_or(CapacityProbe::Uncertain, CapacityProbe::Donors))
     }
 
     pub async fn renew(
@@ -353,10 +568,13 @@ impl DatabaseWeightedAdmissionController {
         ttl: Duration,
         deadline: std::time::Instant,
     ) -> Result<DistributedAdmissionReservation, DistributedAdmissionError> {
-        let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
+        let partition = distributed_admission_partition(&reservation.key.owner_user_id);
+        let _reservation_gate = self.acquire_reservation_gate(partition, deadline).await?;
         let mut tx = self.begin_transaction(deadline, "begin_renewal").await?;
-        let gate = self.lock_admission_gate(&mut tx, deadline).await?;
-        let now = gate.now;
+        let gate = self
+            .lock_admission_gate(&mut tx, partition, deadline)
+            .await?;
+        let now = read_admission_clock(&mut tx).await?;
         let expires_at = now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
@@ -375,7 +593,7 @@ impl DatabaseWeightedAdmissionController {
                    AND idempotency_hash = ? AND expires_at > ?",
             )
             .bind(expires_at)
-            .bind(DISTRIBUTED_ADMISSION_SCOPE)
+            .bind(&gate.scope)
             .bind(&reservation.reservation_id)
             .bind(&reservation.key.isolation_domain)
             .bind(&reservation.key.owner_user_id)
@@ -392,7 +610,7 @@ impl DatabaseWeightedAdmissionController {
         // TTL may be shortened. Extending or releasing a lease may leave a
         // stale-low frontier, but never allow it to miss an earlier expiry.
         if gate.usage_initialized && gate.earliest_expiry_at.is_none_or(|at| expires_at < at) {
-            store_expiry_frontier(&mut tx, Some(expires_at)).await?;
+            store_expiry_frontier(&mut tx, &gate.scope, Some(expires_at)).await?;
         }
         tx.commit()
             .await
@@ -423,9 +641,12 @@ impl DatabaseWeightedAdmissionController {
         reservation: &DistributedAdmissionReservation,
         deadline: std::time::Instant,
     ) -> Result<(), DistributedAdmissionError> {
-        let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
+        let partition = distributed_admission_partition(&reservation.key.owner_user_id);
+        let _reservation_gate = self.acquire_reservation_gate(partition, deadline).await?;
         let mut tx = self.begin_transaction(deadline, "begin_release").await?;
-        let gate = self.lock_admission_gate(&mut tx, deadline).await?;
+        let gate = self
+            .lock_admission_gate(&mut tx, partition, deadline)
+            .await?;
         let deleted = admission_io!(
             tx,
             sqlx::query(
@@ -434,7 +655,7 @@ impl DatabaseWeightedAdmissionController {
                    AND isolation_domain = ? AND owner_user_id = ?
                    AND session_id = ? AND branch_id = ? AND idempotency_hash = ?",
             )
-            .bind(DISTRIBUTED_ADMISSION_SCOPE)
+            .bind(&gate.scope)
             .bind(&reservation.reservation_id)
             .bind(&reservation.key.isolation_domain)
             .bind(&reservation.key.owner_user_id)
@@ -468,15 +689,19 @@ impl DatabaseWeightedAdmissionController {
 
     async fn acquire_reservation_gate(
         &self,
+        partition: usize,
         deadline: std::time::Instant,
     ) -> Result<OwnedSemaphorePermit, DistributedAdmissionError> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        tokio::time::timeout(remaining, self.reservation_gate.clone().acquire_owned())
-            .await
-            .map_err(|_| self.admission_timeout())?
-            .map_err(|_| {
-                DistributedAdmissionError::Invalid("distributed admission gate was closed".into())
-            })
+        tokio::time::timeout(
+            remaining,
+            self.reservation_gates[partition].clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| self.admission_timeout())?
+        .map_err(|_| {
+            DistributedAdmissionError::Invalid("distributed admission gate was closed".into())
+        })
     }
 
     async fn begin_transaction(
@@ -497,11 +722,13 @@ impl DatabaseWeightedAdmissionController {
     async fn lock_admission_gate(
         &self,
         tx: &mut CancellationSafeTransaction,
+        partition: usize,
         deadline: std::time::Instant,
     ) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         tx.mark_io_in_flight();
-        match tokio::time::timeout(remaining, lock_distributed_admission_gate(tx)).await {
+        match tokio::time::timeout(remaining, lock_distributed_admission_gate(tx, partition)).await
+        {
             Ok(result) => {
                 if result.is_ok() {
                     tx.mark_io_complete();
@@ -650,163 +877,291 @@ fn validate_requested_work(
     Ok(())
 }
 
-fn validate_available_work(
-    limits: WeightedAdmissionLimits,
-    global_used: AdmissionWork,
-    owner_used: AdmissionWork,
+#[derive(Debug)]
+enum CapacityProbe {
+    Exhausted,
+    Donors(Vec<usize>),
+    Uncertain,
+}
+
+enum ReservationAttempt {
+    Granted(DistributedAdmissionReservation),
+    ConfigurationNeeded,
+    CreditNeeded,
+}
+
+fn donor_partitions(
+    free: &[AdmissionWork],
+    target: usize,
     work: AdmissionWork,
-) -> Result<(), WeightedAdmissionError> {
-    let global_next = global_used
-        .checked_add(work)
-        .ok_or(WeightedAdmissionError::GlobalExhausted)?;
-    if !global_next.fits_within(limits.global) {
-        return Err(WeightedAdmissionError::GlobalExhausted);
+) -> Option<Vec<usize>> {
+    if target >= free.len() || free.len() > DISTRIBUTED_ADMISSION_PARTITIONS {
+        return None;
     }
-    let owner_next = owner_used
-        .checked_add(work)
-        .ok_or(WeightedAdmissionError::OwnerExhausted)?;
-    if !owner_next.fits_within(limits.per_owner) {
-        return Err(WeightedAdmissionError::OwnerExhausted);
+    let target_free = free[target].components();
+    let mut remaining = work.components();
+    for (need, available) in remaining.iter_mut().zip(target_free) {
+        *need = need.saturating_sub(available);
     }
-    Ok(())
+    let mut plan = vec![target];
+    for offset in 1..free.len() {
+        if remaining.iter().all(|need| *need == 0) {
+            break;
+        }
+        let donor = (target + offset) % free.len();
+        let available = free[donor].components();
+        if !remaining
+            .iter()
+            .zip(available)
+            .any(|(need, free)| *need != 0 && free != 0)
+        {
+            continue;
+        }
+        plan.push(donor);
+        for (need, free) in remaining.iter_mut().zip(available) {
+            *need = need.saturating_sub(free);
+        }
+    }
+    if remaining.iter().any(|need| *need != 0) {
+        return None;
+    }
+    plan.sort_unstable();
+    Some(plan)
 }
 
 struct LockedDistributedAdmissionGate {
-    now: chrono::NaiveDateTime,
+    scope: String,
     capacity_hash: Option<String>,
     usage_initialized: bool,
-    global_used: AdmissionWork,
+    used: AdmissionWork,
+    allocated: AdmissionWork,
     earliest_expiry_at: Option<chrono::NaiveDateTime>,
 }
 
+const ADMISSION_GATE_COLUMNS: &str = "capacity_hash, usage_initialized, earliest_expiry_at,
+    CAST(used_resident_bytes AS CHAR) AS used_resident_bytes,
+    CAST(used_context_tokens AS CHAR) AS used_context_tokens,
+    CAST(used_provider_slots AS CHAR) AS used_provider_slots,
+    CAST(used_cpu_units AS CHAR) AS used_cpu_units,
+    CAST(used_io_bytes AS CHAR) AS used_io_bytes,
+    CAST(allocated_resident_bytes AS CHAR) AS allocated_resident_bytes,
+    CAST(allocated_context_tokens AS CHAR) AS allocated_context_tokens,
+    CAST(allocated_provider_slots AS CHAR) AS allocated_provider_slots,
+    CAST(allocated_cpu_units AS CHAR) AS allocated_cpu_units,
+    CAST(allocated_io_bytes AS CHAR) AS allocated_io_bytes";
+
 async fn lock_distributed_admission_gate(
     tx: &mut CancellationSafeTransaction,
+    partition: usize,
 ) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
-    let row = sqlx::query(
-        "SELECT capacity_hash, usage_initialized, earliest_expiry_at,
-                CAST(global_resident_bytes AS CHAR) AS global_resident_bytes,
-                CAST(global_context_tokens AS CHAR) AS global_context_tokens,
-                CAST(global_provider_slots AS CHAR) AS global_provider_slots,
-                CAST(global_cpu_units AS CHAR) AS global_cpu_units,
-                CAST(global_io_bytes AS CHAR) AS global_io_bytes
-         FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
-    )
-    .bind(DISTRIBUTED_ADMISSION_SCOPE)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| distributed_database_error("lock_gate", source))?;
+    let scope = distributed_admission_scope(partition);
+    let statement = format!(
+        "SELECT {ADMISSION_GATE_COLUMNS} FROM session_weighted_admission_gates WHERE scope_name = ? FOR UPDATE"
+    );
+    let row = sqlx::query(&statement)
+        .bind(&scope)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|source| distributed_database_error("lock_gate", source))?;
+    decode_distributed_admission_gate(&row, scope)
+}
+
+fn decode_distributed_admission_gate(
+    row: &sqlx::mysql::MySqlRow,
+    scope: String,
+) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
     let capacity_hash = row
         .try_get::<Option<String>, _>("capacity_hash")
         .map_err(|source| distributed_database_error("decode_gate_capacity_hash", source))?;
-    // NOW is sampled at statement start, before a contended FOR UPDATE
-    // finishes. Read the database clock only after acquiring the gate: leases
-    // may expire while waiting, including a lease being replayed or renewed.
-    let unix_ms: i64 = sqlx::query_scalar("SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)")
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|source| distributed_database_error("read_locked_gate_database_time", source))?;
-    let now = chrono::DateTime::from_timestamp_millis(unix_ms)
-        .map(|timestamp| timestamp.naive_utc())
-        .ok_or_else(|| {
-            DistributedAdmissionError::Invalid("database time is outside chrono range".into())
-        })?;
     let usage_initialized = row
         .try_get::<i64, _>("usage_initialized")
         .map_err(|source| distributed_database_error("decode_gate_usage_initialized", source))?
         != 0;
-    let global_used = AdmissionWork {
-        resident_bytes: aggregate_admission_u64(&row, "global_resident_bytes")?,
-        context_tokens: aggregate_admission_u64(&row, "global_context_tokens")?,
-        provider_slots: u32::try_from(aggregate_admission_u64(&row, "global_provider_slots")?)
-            .map_err(|_| {
-                DistributedAdmissionError::Invalid(
-                    "materialized distributed provider slots exceed u32".into(),
-                )
-            })?,
-        cpu_units: aggregate_admission_u64(&row, "global_cpu_units")?,
-        io_bytes: aggregate_admission_u64(&row, "global_io_bytes")?,
-    };
+    let used = decode_aggregate_admission_work(row, "used_")?;
+    let allocated = decode_aggregate_admission_work(row, "allocated_")?;
     let earliest_expiry_at: Option<chrono::NaiveDateTime> = row
         .try_get("earliest_expiry_at")
         .map_err(|source| distributed_database_error("decode_gate_expiry_frontier", source))?;
-    if usage_initialized && global_used.provider_slots != 0 && earliest_expiry_at.is_none() {
+    if usage_initialized && used != AdmissionWork::default() && earliest_expiry_at.is_none() {
         return Err(DistributedAdmissionError::Invalid(
             "initialized admission usage has no expiry frontier".into(),
         ));
     }
     Ok(LockedDistributedAdmissionGate {
-        now,
+        scope,
         capacity_hash,
         usage_initialized,
-        global_used,
+        used,
+        allocated,
         earliest_expiry_at,
     })
 }
 
-/// Bind the durable admission scope to one capacity configuration.
-///
-/// Every server sharing this scope must use the same capacity snapshot. The
-/// first server records the snapshot; later servers fail closed while
-/// reservations are active and may adopt a new snapshot only after the active
-/// reservations have drained. A NULL hash is the uninitialized state of the
-/// current capacity protocol.
-async fn ensure_distributed_admission_capacity(
+// Called only while every partition is locked, before any grant or transfer.
+async fn ensure_partition_allocations(
     tx: &mut CancellationSafeTransaction,
+    gates: &mut [LockedDistributedAdmissionGate],
     limits: WeightedAdmissionLimits,
-    active: Option<&str>,
+    requested: &str,
 ) -> Result<(), DistributedAdmissionError> {
-    let requested = admission_capacity_hash(limits);
-    if active == Some(requested.as_str()) {
-        return Ok(());
-    }
-    let active_reservations: i64 = admission_io!(
-        tx,
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_weighted_admission_reservations
-             WHERE scope_name = ?",
-        )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
-        .fetch_one(&mut **tx)
-    )
-    .map_err(|source| distributed_database_error("count_capacity_reservations", source))?;
-    let transition = capacity_gate_transition(active, active_reservations, &requested);
-    let update_operation = match &transition {
-        CapacityGateTransition::Initialize => Some("initialize_capacity_configuration"),
-        CapacityGateTransition::Rotate => Some("rotate_capacity_configuration"),
-        CapacityGateTransition::Accept | CapacityGateTransition::Reject { .. } => None,
-    };
-    match transition {
-        CapacityGateTransition::Accept => Ok(()),
-        CapacityGateTransition::Reject { active, requested } => {
-            Err(DistributedAdmissionError::ConfigurationMismatch { active, requested })
+    let used = sum_admission_work(gates.iter().map(|gate| gate.used))?;
+    let mut reconfigure = false;
+    for gate in gates.iter() {
+        match capacity_gate_transition(
+            gate.capacity_hash.as_deref(),
+            i64::from(used.provider_slots),
+            requested,
+        ) {
+            CapacityGateTransition::Reject { active, requested } => {
+                return Err(DistributedAdmissionError::ConfigurationMismatch { active, requested });
+            }
+            CapacityGateTransition::Accept => {}
+            CapacityGateTransition::Initialize | CapacityGateTransition::Rotate => {
+                reconfigure = true
+            }
         }
-        CapacityGateTransition::Initialize | CapacityGateTransition::Rotate => {
-            admission_io!(
-                tx,
-                sqlx::query(
-                    "UPDATE session_weighted_admission_gates
-                     SET capacity_hash = ?, updated_at = NOW(6)
-                     WHERE scope_name = ?",
-                )
-                .bind(&requested)
-                .bind(DISTRIBUTED_ADMISSION_SCOPE)
-                .execute(&mut **tx)
-            )
-            .map_err(|source| {
-                distributed_database_error(
-                    update_operation.expect("capacity update operation"),
-                    source,
-                )
+    }
+    if reconfigure {
+        for (index, gate) in gates.iter_mut().enumerate() {
+            let values = limits.global.components().map(|value| {
+                value / DISTRIBUTED_ADMISSION_PARTITIONS as u64
+                    + u64::from((index as u64) < value % DISTRIBUTED_ADMISSION_PARTITIONS as u64)
+            });
+            gate.allocated = AdmissionWork::from_components(values).ok_or_else(|| {
+                DistributedAdmissionError::Invalid("partition allocation overflow".into())
             })?;
-            Ok(())
+            store_partition_allocation(tx, gate, requested).await?;
+            gate.capacity_hash = Some(requested.to_owned());
         }
     }
+    if sum_admission_work(gates.iter().map(|gate| gate.allocated))? != limits.global
+        || gates
+            .iter()
+            .any(|gate| !gate.used.fits_within(gate.allocated))
+    {
+        return Err(DistributedAdmissionError::Invalid(
+            "partition capacity conservation violated".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sum_admission_work(
+    values: impl IntoIterator<Item = AdmissionWork>,
+) -> Result<AdmissionWork, DistributedAdmissionError> {
+    values
+        .into_iter()
+        .try_fold(AdmissionWork::default(), |total, work| {
+            total.checked_add(work).ok_or_else(|| {
+                DistributedAdmissionError::Invalid("partition usage overflow".into())
+            })
+        })
+}
+
+async fn store_partition_allocation(
+    tx: &mut CancellationSafeTransaction,
+    gate: &LockedDistributedAdmissionGate,
+    hash: &str,
+) -> Result<(), DistributedAdmissionError> {
+    admission_io!(tx, sqlx::query(
+        "UPDATE session_weighted_admission_gates SET capacity_hash = ?, allocated_resident_bytes = ?, allocated_context_tokens = ?, allocated_provider_slots = ?, allocated_cpu_units = ?, allocated_io_bytes = ?, updated_at = NOW(6) WHERE scope_name = ?"
+    ).bind(hash).bind(gate.allocated.resident_bytes.to_string()).bind(gate.allocated.context_tokens.to_string())
+        .bind(u64::from(gate.allocated.provider_slots).to_string()).bind(gate.allocated.cpu_units.to_string()).bind(gate.allocated.io_bytes.to_string()).bind(&gate.scope).execute(&mut **tx))
+        .map_err(|source| distributed_database_error("store_partition_allocation", source))?;
+    Ok(())
+}
+
+async fn transfer_partition_credit(
+    tx: &mut CancellationSafeTransaction,
+    gates: &mut [LockedDistributedAdmissionGate],
+    target: usize,
+    work: AdmissionWork,
+    global: AdmissionWork,
+) -> Result<bool, DistributedAdmissionError> {
+    let total = sum_admission_work(gates.iter().map(|gate| gate.used))?;
+    let capacity = sum_admission_work(gates.iter().map(|gate| gate.allocated))?;
+    if !total
+        .checked_add(work)
+        .is_some_and(|next| next.fits_within(capacity))
+    {
+        return Ok(false);
+    }
+    let required = gates[target]
+        .used
+        .checked_add(work)
+        .ok_or_else(|| DistributedAdmissionError::Invalid("partition request overflow".into()))?
+        .components();
+    let mut allocations: Vec<_> = gates
+        .iter()
+        .map(|gate| gate.allocated.components())
+        .collect();
+    for (dimension, global_limit) in global.components().into_iter().enumerate() {
+        let deficit = required[dimension].saturating_sub(allocations[target][dimension]);
+        if deficit == 0 {
+            continue;
+        }
+        let mut remaining =
+            deficit.max(global_limit.div_ceil(DISTRIBUTED_ADMISSION_PARTITIONS as u64));
+        for donor in 0..gates.len() {
+            if donor == target {
+                continue;
+            }
+            let free = allocations[donor][dimension] - gates[donor].used.components()[dimension];
+            let transfer = free.min(remaining);
+            allocations[donor][dimension] -= transfer;
+            allocations[target][dimension] += transfer;
+            remaining -= transfer;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if allocations[target][dimension] < required[dimension] {
+            return Err(DistributedAdmissionError::Invalid(
+                "partition credit transfer lost capacity".into(),
+            ));
+        }
+    }
+    let mut changed_rows = 0usize;
+    for (gate, values) in gates.iter_mut().zip(allocations) {
+        let allocated = AdmissionWork::from_components(values).ok_or_else(|| {
+            DistributedAdmissionError::Invalid("partition allocation overflow".into())
+        })?;
+        if gate.allocated != allocated {
+            changed_rows += 1;
+            gate.allocated = allocated;
+            store_partition_allocation(
+                tx,
+                gate,
+                gate.capacity_hash.as_deref().expect("configured partition"),
+            )
+            .await?;
+        }
+    }
+    tracing::debug!(target: "astra_services::weighted_admission", changed_rows, "admission credit transfer prepared");
+    Ok(true)
+}
+
+async fn read_admission_clock(
+    tx: &mut CancellationSafeTransaction,
+) -> Result<chrono::NaiveDateTime, DistributedAdmissionError> {
+    // NOW is sampled before lock waits. Read it only after ALL required locks.
+    let unix_ms: i64 = admission_io!(
+        tx,
+        sqlx::query_scalar("SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)")
+            .fetch_one(&mut **tx)
+    )
+    .map_err(|source| distributed_database_error("read_locked_gate_database_time", source))?;
+    chrono::DateTime::from_timestamp_millis(unix_ms)
+        .map(|time| time.naive_utc())
+        .ok_or_else(|| {
+            DistributedAdmissionError::Invalid("database time is outside chrono range".into())
+        })
 }
 
 fn admission_capacity_hash(limits: WeightedAdmissionLimits) -> String {
     let mut hasher = Sha256::new();
     hasher.update(DISTRIBUTED_ADMISSION_CAPACITY_DOMAIN);
+    hasher.update((DISTRIBUTED_ADMISSION_PARTITIONS as u64).to_be_bytes());
     for value in [
         limits.global.resident_bytes,
         limits.global.context_tokens,
@@ -873,7 +1228,7 @@ async fn load_distributed_reservation(
              WHERE scope_name = ? AND isolation_domain = ? AND owner_user_id = ?
                AND idempotency_hash = ?",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(idempotency_hash)
@@ -909,6 +1264,7 @@ async fn load_distributed_reservation(
 
 async fn store_expiry_frontier(
     tx: &mut CancellationSafeTransaction,
+    scope: &str,
     frontier: Option<chrono::NaiveDateTime>,
 ) -> Result<(), DistributedAdmissionError> {
     admission_io!(
@@ -919,7 +1275,7 @@ async fn store_expiry_frontier(
              WHERE scope_name = ?",
         )
         .bind(frontier)
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(scope)
         .execute(&mut **tx)
     )
     .map_err(|source| distributed_database_error("store_expiry_frontier", source))?;
@@ -929,8 +1285,9 @@ async fn store_expiry_frontier(
 async fn reconcile_expired_reservations(
     tx: &mut CancellationSafeTransaction,
     gate: &mut LockedDistributedAdmissionGate,
+    now: chrono::NaiveDateTime,
 ) -> Result<(), DistributedAdmissionError> {
-    if gate.usage_initialized && gate.earliest_expiry_at.is_none_or(|at| at > gate.now) {
+    if gate.usage_initialized && gate.earliest_expiry_at.is_none_or(|at| at > now) {
         return Ok(());
     }
     let deleted = admission_io!(
@@ -939,7 +1296,7 @@ async fn reconcile_expired_reservations(
             "DELETE FROM session_weighted_admission_reservations
          WHERE scope_name = ? AND expires_at <= NOW(6)",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(&gate.scope)
         .execute(&mut **tx)
     )
     .map_err(|source| distributed_database_error("cleanup_expired", source))?;
@@ -950,9 +1307,9 @@ async fn reconcile_expired_reservations(
     } else if gate.usage_initialized {
         gate.earliest_expiry_at = admission_io!(tx, sqlx::query_scalar(
             "SELECT MIN(expires_at) FROM session_weighted_admission_reservations WHERE scope_name = ?",
-        ).bind(DISTRIBUTED_ADMISSION_SCOPE).fetch_one(&mut **tx))
+        ).bind(&gate.scope).fetch_one(&mut **tx))
             .map_err(|source| distributed_database_error("refresh_expiry_frontier", source))?;
-        store_expiry_frontier(tx, gate.earliest_expiry_at).await?;
+        store_expiry_frontier(tx, &gate.scope, gate.earliest_expiry_at).await?;
     }
     Ok(())
 }
@@ -975,19 +1332,19 @@ async fn ensure_materialized_admission_usage(
         sqlx::query(
             "SELECT
                  MIN(expires_at) AS earliest_expiry_at,
-                 CAST(COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS global_resident_bytes,
-                 CAST(COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0) AS CHAR) AS global_context_tokens,
-                 CAST(COALESCE(SUM(CAST(provider_slots AS DECIMAL(38, 0))), 0) AS CHAR) AS global_provider_slots,
-                 CAST(COALESCE(SUM(CAST(cpu_units AS DECIMAL(38, 0))), 0) AS CHAR) AS global_cpu_units,
-                 CAST(COALESCE(SUM(CAST(io_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS global_io_bytes,
+                 CAST(COALESCE(SUM(CAST(resident_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS used_resident_bytes,
+                 CAST(COALESCE(SUM(CAST(context_tokens AS DECIMAL(38, 0))), 0) AS CHAR) AS used_context_tokens,
+                 CAST(COALESCE(SUM(CAST(provider_slots AS DECIMAL(38, 0))), 0) AS CHAR) AS used_provider_slots,
+                 CAST(COALESCE(SUM(CAST(cpu_units AS DECIMAL(38, 0))), 0) AS CHAR) AS used_cpu_units,
+                 CAST(COALESCE(SUM(CAST(io_bytes AS DECIMAL(38, 0))), 0) AS CHAR) AS used_io_bytes,
                  CAST(COALESCE(SUM(CASE
-                     WHEN resident_bytes < 0 OR context_tokens < 0 OR provider_slots < 0
+                     WHEN resident_bytes < 0 OR context_tokens < 0 OR provider_slots <= 0
                        OR provider_slots > 4294967295 OR cpu_units < 0 OR io_bytes < 0
                      THEN 1 ELSE 0 END), 0) AS SIGNED) AS invalid_rows
              FROM session_weighted_admission_reservations
              WHERE scope_name = ?",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(&gate.scope)
         .fetch_one(&mut **tx)
     )
     .map_err(|source| distributed_database_error("rebuild_active_usage", source))?;
@@ -999,7 +1356,7 @@ async fn ensure_materialized_admission_usage(
             "distributed admission contains {invalid_rows} invalid stored reservation rows"
         )));
     }
-    let global = decode_aggregate_admission_work(&row, "global_")?;
+    let global = decode_aggregate_admission_work(&row, "used_")?;
     let earliest_expiry_at: Option<chrono::NaiveDateTime> = row
         .try_get("earliest_expiry_at")
         .map_err(|source| distributed_database_error("decode_usage_expiry_frontier", source))?;
@@ -1010,7 +1367,7 @@ async fn ensure_materialized_admission_usage(
             "DELETE FROM session_weighted_admission_owner_usage
              WHERE scope_name = ?",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(&gate.scope)
         .execute(&mut **tx)
     )
     .map_err(|source| distributed_database_error("clear_owner_usage", source))?;
@@ -1030,7 +1387,7 @@ async fn ensure_materialized_admission_usage(
              WHERE scope_name = ?
              GROUP BY scope_name, isolation_domain, owner_user_id",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(&gate.scope)
         .execute(&mut **tx)
     )
     .map_err(|source| distributed_database_error("rebuild_owner_usage", source))?;
@@ -1041,11 +1398,11 @@ async fn ensure_materialized_admission_usage(
             "UPDATE session_weighted_admission_gates
              SET usage_initialized = 1,
                  earliest_expiry_at = ?,
-                 global_resident_bytes = ?,
-                 global_context_tokens = ?,
-                 global_provider_slots = ?,
-                 global_cpu_units = ?,
-                 global_io_bytes = ?,
+                 used_resident_bytes = ?,
+                 used_context_tokens = ?,
+                 used_provider_slots = ?,
+                 used_cpu_units = ?,
+                 used_io_bytes = ?,
                  updated_at = NOW(6)
              WHERE scope_name = ?",
         )
@@ -1055,12 +1412,12 @@ async fn ensure_materialized_admission_usage(
         .bind(u64::from(global.provider_slots).to_string())
         .bind(global.cpu_units.to_string())
         .bind(global.io_bytes.to_string())
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(&gate.scope)
         .execute(&mut **tx)
     )
     .map_err(|source| distributed_database_error("publish_materialized_usage", source))?;
     gate.usage_initialized = true;
-    gate.global_used = global;
+    gate.used = global;
     gate.earliest_expiry_at = earliest_expiry_at;
     Ok(())
 }
@@ -1083,7 +1440,7 @@ async fn load_materialized_owner_usage(
              WHERE scope_name = ? AND isolation_domain = ?
                AND owner_user_id = ? AND BINARY owner_user_id = BINARY ?",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.owner_user_id)
@@ -1110,14 +1467,14 @@ async fn add_materialized_admission_usage(
         tx,
         sqlx::query(
             "UPDATE session_weighted_admission_gates
-             SET global_resident_bytes = global_resident_bytes + ?,
+             SET used_resident_bytes = used_resident_bytes + ?,
                  earliest_expiry_at = CASE
                      WHEN earliest_expiry_at IS NULL OR earliest_expiry_at > ? THEN ?
                      ELSE earliest_expiry_at END,
-                 global_context_tokens = global_context_tokens + ?,
-                 global_provider_slots = global_provider_slots + ?,
-                 global_cpu_units = global_cpu_units + ?,
-                 global_io_bytes = global_io_bytes + ?,
+                 used_context_tokens = used_context_tokens + ?,
+                 used_provider_slots = used_provider_slots + ?,
+                 used_cpu_units = used_cpu_units + ?,
+                 used_io_bytes = used_io_bytes + ?,
                  updated_at = NOW(6)
              WHERE scope_name = ? AND usage_initialized = 1",
         )
@@ -1128,10 +1485,10 @@ async fn add_materialized_admission_usage(
         .bind(provider_slots)
         .bind(cpu_units)
         .bind(io_bytes)
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .execute(&mut **tx)
     )
-    .map_err(|source| distributed_database_error("increment_global_usage", source))?;
+    .map_err(|source| distributed_database_error("increment_used_usage", source))?;
     admission_io!(
         tx,
         sqlx::query(
@@ -1147,7 +1504,7 @@ async fn add_materialized_admission_usage(
                  io_bytes = io_bytes + VALUES(io_bytes),
                  updated_at = NOW(6)",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(resident_bytes)
@@ -1175,25 +1532,25 @@ async fn subtract_materialized_admission_usage(
         tx,
         sqlx::query(
             "UPDATE session_weighted_admission_gates
-             SET global_resident_bytes = global_resident_bytes - ?,
-                 global_context_tokens = global_context_tokens - ?,
-                 global_provider_slots = global_provider_slots - ?,
-                 global_cpu_units = global_cpu_units - ?,
-                 global_io_bytes = global_io_bytes - ?,
+             SET used_resident_bytes = used_resident_bytes - ?,
+                 used_context_tokens = used_context_tokens - ?,
+                 used_provider_slots = used_provider_slots - ?,
+                 used_cpu_units = used_cpu_units - ?,
+                 used_io_bytes = used_io_bytes - ?,
                  updated_at = NOW(6)
              WHERE scope_name = ? AND usage_initialized = 1
-               AND global_resident_bytes >= ?
-               AND global_context_tokens >= ?
-               AND global_provider_slots >= ?
-               AND global_cpu_units >= ?
-               AND global_io_bytes >= ?",
+               AND used_resident_bytes >= ?
+               AND used_context_tokens >= ?
+               AND used_provider_slots >= ?
+               AND used_cpu_units >= ?
+               AND used_io_bytes >= ?",
         )
         .bind(resident_bytes)
         .bind(context_tokens)
         .bind(provider_slots)
         .bind(cpu_units)
         .bind(io_bytes)
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .bind(resident_bytes)
         .bind(context_tokens)
         .bind(provider_slots)
@@ -1201,7 +1558,7 @@ async fn subtract_materialized_admission_usage(
         .bind(io_bytes)
         .execute(&mut **tx)
     )
-    .map_err(|source| distributed_database_error("decrement_global_usage", source))?;
+    .map_err(|source| distributed_database_error("decrement_used_usage", source))?;
     if global.rows_affected() != 1 {
         return Err(DistributedAdmissionError::Invalid(
             "materialized global admission usage underflow".into(),
@@ -1230,7 +1587,7 @@ async fn subtract_materialized_admission_usage(
         .bind(provider_slots)
         .bind(cpu_units)
         .bind(io_bytes)
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.owner_user_id)
@@ -1256,7 +1613,7 @@ async fn subtract_materialized_admission_usage(
                AND resident_bytes = 0 AND context_tokens = 0
                AND provider_slots = 0 AND cpu_units = 0 AND io_bytes = 0",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(key))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.owner_user_id)
@@ -1280,7 +1637,7 @@ async fn insert_distributed_reservation(
               provider_slots, cpu_units, io_bytes, expires_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
+        .bind(owner_admission_scope(&reservation.key))
         .bind(&reservation.reservation_id)
         .bind(&reservation.key.isolation_domain)
         .bind(&reservation.key.owner_user_id)
@@ -1699,5 +2056,454 @@ mod tests {
             capacity_gate_transition(Some("requested"), 999, "requested"),
             CapacityGateTransition::Accept
         );
+    }
+
+    async fn admission_test_pool() -> SharedPool {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        crate::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_weighted_admission_reservations")
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+        assert_eq!(
+            retained, 0,
+            "admission fixture must have no retained reservations"
+        );
+        pool
+    }
+
+    #[test]
+    fn donor_plan_is_bounded_multidimensional_and_sorted() {
+        let unit = AdmissionWork {
+            resident_bytes: 1,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        };
+        let mut free = [AdmissionWork::default(); 4];
+        free[1] = AdmissionWork {
+            resident_bytes: 5,
+            provider_slots: 1,
+            ..AdmissionWork::default()
+        };
+        free[3] = AdmissionWork {
+            context_tokens: 5,
+            ..AdmissionWork::default()
+        };
+        let requested = AdmissionWork {
+            resident_bytes: 5,
+            context_tokens: 5,
+            provider_slots: 1,
+            ..AdmissionWork::default()
+        };
+        assert_eq!(donor_partitions(&free, 2, requested), Some(vec![1, 2, 3]));
+        free[2] = requested;
+        assert_eq!(donor_partitions(&free, 2, requested), Some(vec![2]));
+        assert_eq!(donor_partitions(&[], 0, unit), None);
+        assert_eq!(
+            donor_partitions(&[AdmissionWork::default(); 4], 2, unit),
+            None
+        );
+        assert_eq!(
+            donor_partitions(
+                &[unit; 16],
+                10,
+                AdmissionWork {
+                    provider_slots: 16,
+                    ..unit
+                }
+            ),
+            Some((0..16).collect())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::file_serial(admission_scope)]
+    async fn selected_donors_skip_unrelated_locks_and_revalidate_stale_credit() {
+        let pool = admission_test_pool().await;
+        let unit = AdmissionWork {
+            provider_slots: 1,
+            ..AdmissionWork::default()
+        };
+        let global = AdmissionWork {
+            provider_slots: 16,
+            ..unit
+        };
+        let key_for = |partition| {
+            let owner = (0..10000)
+                .map(|n| format!("stale-donor-{n}"))
+                .find(|owner| distributed_admission_partition(owner) == partition)
+                .unwrap();
+            SessionKeyV1::owner_session("server", &owner, "stale-donor", "main")
+        };
+        let key = key_for(15);
+        let reset = DatabaseWeightedAdmissionController::new(
+            pool.clone(),
+            WeightedAdmissionLimits {
+                global: unit,
+                per_owner: unit,
+            },
+        )
+        .unwrap();
+        reset
+            .try_reserve(&key, unit, Duration::from_secs(30), "reset")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let controller = DatabaseWeightedAdmissionController::new(
+            pool.clone(),
+            WeightedAdmissionLimits {
+                global,
+                per_owner: global,
+            },
+        )
+        .unwrap();
+        controller
+            .try_reserve(&key, unit, Duration::from_secs(30), "warm")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let work = AdmissionWork {
+            provider_slots: 2,
+            ..unit
+        };
+        let mut unrelated = CancellationSafeTransaction::begin(pool.get())
+            .await
+            .unwrap();
+        controller
+            .lock_admission_gate(
+                &mut unrelated,
+                8,
+                std::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let borrowed = tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.try_reserve(&key_for(5), work, Duration::from_secs(30), "unrelated-lock"),
+        )
+        .await
+        .expect("borrowing must not wait for an unselected partition")
+        .unwrap();
+        borrowed.release().await.unwrap();
+        unrelated.rollback().await.unwrap();
+        let hash = distributed_idempotency_hash("stale");
+        let capacity = admission_capacity_hash(controller.limits);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let CapacityProbe::Donors(partitions) = controller
+            .probe_partition_capacity(&key, work, &hash, &capacity, deadline)
+            .await
+            .unwrap()
+        else {
+            panic!("fresh snapshot must suggest donors")
+        };
+        assert_eq!(partitions, vec![0, 15]);
+        let donor = controller
+            .try_reserve(&key_for(0), unit, Duration::from_secs(30), "occupy-donor")
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .attempt_reservation(
+                    &key,
+                    work,
+                    Duration::from_secs(30),
+                    &hash,
+                    &capacity,
+                    &partitions,
+                    deadline
+                )
+                .await
+                .unwrap(),
+            ReservationAttempt::CreditNeeded
+        ));
+        let all: Vec<_> = (0..DISTRIBUTED_ADMISSION_PARTITIONS).collect();
+        let ReservationAttempt::Granted(reservation) = controller
+            .attempt_reservation(
+                &key,
+                work,
+                Duration::from_secs(30),
+                &hash,
+                &capacity,
+                &all,
+                deadline,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("full inventory must recover the stale suggestion")
+        };
+        DistributedAdmissionPermit::new(controller.clone(), reservation)
+            .release()
+            .await
+            .unwrap();
+        donor.release().await.unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::file_serial(admission_scope)]
+    async fn cancelled_borrow_rolls_back_transferred_credit() {
+        let pool = admission_test_pool().await;
+        let mut settings = pool.settings().clone();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 0;
+        let waiter_pool = SharedPool::new(&settings).await.unwrap();
+        let global = AdmissionWork {
+            resident_bytes: 16,
+            context_tokens: 16,
+            provider_slots: 16,
+            cpu_units: 16,
+            io_bytes: 16,
+        };
+        let unit = AdmissionWork {
+            resident_bytes: 1,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        };
+        let controller = DatabaseWeightedAdmissionController::new(
+            waiter_pool.clone(),
+            WeightedAdmissionLimits {
+                global,
+                per_owner: global,
+            },
+        )
+        .unwrap();
+        let key = SessionKeyV1::owner_session(
+            "server",
+            "borrow-cancel-owner",
+            "borrow-cancel-session",
+            "main",
+        );
+        // Rotate an empty inventory through a different real configuration so
+        // this test also exercises a transfer when rerun on the same database.
+        let reset = DatabaseWeightedAdmissionController::new(
+            waiter_pool.clone(),
+            WeightedAdmissionLimits {
+                global: unit,
+                per_owner: unit,
+            },
+        )
+        .unwrap();
+        reset
+            .try_reserve(&key, unit, Duration::from_secs(30), "reset")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let warm = controller
+            .try_reserve(&key, unit, Duration::from_secs(30), "warm")
+            .await
+            .unwrap();
+        warm.release().await.unwrap();
+        let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(waiter_pool.get())
+            .await
+            .unwrap();
+        let mut holder = CancellationSafeTransaction::begin(pool.get())
+            .await
+            .unwrap();
+        let expires_at =
+            read_admission_clock(&mut holder).await.unwrap() + chrono::Duration::seconds(60);
+        let work = AdmissionWork {
+            provider_slots: 2,
+            ..unit
+        };
+        let conflict = DistributedAdmissionReservation {
+            reservation_id: Uuid::new_v4().to_string(),
+            key: key.clone(),
+            work,
+            expires_at_unix_ms: expires_at.and_utc().timestamp_millis(),
+            idempotency_hash: distributed_idempotency_hash("cancel-after-transfer"),
+        };
+        // An uncommitted conflicting identity pauses the actual INSERT after
+        // borrowing. It is never published as a valid reservation.
+        insert_distributed_reservation(&mut holder, &conflict, expires_at)
+            .await
+            .unwrap();
+        let pending = tokio::spawn({
+            let controller = controller.clone();
+            let key = key.clone();
+            async move {
+                controller
+                    .try_reserve(&key, work, Duration::from_secs(30), "cancel-after-transfer")
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info LIKE '%INSERT INTO session_weighted_admission_reservations%' AND info NOT LIKE '%information_schema.processlist%'")
+                    .bind(&settings.database).bind(connection_id).fetch_one(pool.get()).await.unwrap();
+                if waiting == 1 { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("the public request must reach INSERT after credit transfer");
+        pending.abort();
+        assert!(matches!(pending.await, Err(error) if error.is_cancelled()));
+        holder.rollback().await.unwrap();
+        let mut check = CancellationSafeTransaction::begin(pool.get())
+            .await
+            .unwrap();
+        for partition in 0..DISTRIBUTED_ADMISSION_PARTITIONS {
+            let gate = controller
+                .lock_admission_gate(
+                    &mut check,
+                    partition,
+                    std::time::Instant::now() + Duration::from_secs(3),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                gate.allocated, unit,
+                "aborted credit transfer must be rolled back"
+            );
+            assert_eq!(gate.used, AdmissionWork::default());
+        }
+        check.commit().await.unwrap();
+        let recovered = controller
+            .try_reserve(&key, work, Duration::from_secs(30), "cancel-after-transfer")
+            .await
+            .unwrap();
+        recovered.release().await.unwrap();
+        let retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_weighted_admission_reservations")
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0);
+        waiter_pool.close().await;
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::file_serial(admission_scope)]
+    async fn capacity_snapshot_observes_atomic_identity_and_usage() {
+        let pool = admission_test_pool().await;
+        let work = AdmissionWork {
+            resident_bytes: 1,
+            context_tokens: 1,
+            provider_slots: 1,
+            cpu_units: 1,
+            io_bytes: 1,
+        };
+        let controller = DatabaseWeightedAdmissionController::new(
+            pool.clone(),
+            WeightedAdmissionLimits {
+                global: work,
+                per_owner: work,
+            },
+        )
+        .unwrap();
+        let key = SessionKeyV1::owner_session(
+            "server",
+            "snapshot-atomic-owner",
+            "snapshot-atomic-session",
+            "main",
+        );
+        let permit = controller
+            .try_reserve(&key, work, Duration::from_secs(900), "atomic")
+            .await
+            .unwrap();
+        let hash = admission_capacity_hash(controller.limits);
+        let identity_hash = permit.reservation().idempotency_hash.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let writer = tokio::spawn({
+            let controller = controller.clone();
+            let pool = pool.clone();
+            let reservation = permit.reservation().clone();
+            let barrier = barrier.clone();
+            async move {
+                let partition = distributed_admission_partition(&reservation.key.owner_user_id);
+                let expires_at =
+                    chrono::DateTime::from_timestamp_millis(reservation.expires_at_unix_ms)
+                        .unwrap()
+                        .naive_utc();
+                barrier.wait().await;
+                for _ in 0..64 {
+                    let mut tx = CancellationSafeTransaction::begin(pool.get())
+                        .await
+                        .unwrap();
+                    controller
+                        .lock_admission_gate(
+                            &mut tx,
+                            partition,
+                            std::time::Instant::now() + Duration::from_secs(10),
+                        )
+                        .await
+                        .unwrap();
+                    let deleted = admission_io!(tx, sqlx::query("DELETE FROM session_weighted_admission_reservations WHERE scope_name = ? AND reservation_id = ?")
+                        .bind(owner_admission_scope(&reservation.key)).bind(&reservation.reservation_id).execute(&mut *tx)).unwrap();
+                    assert_eq!(deleted.rows_affected(), 1);
+                    subtract_materialized_admission_usage(&mut tx, &reservation.key, work)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                    tokio::task::yield_now().await;
+                    let mut tx = CancellationSafeTransaction::begin(pool.get())
+                        .await
+                        .unwrap();
+                    controller
+                        .lock_admission_gate(
+                            &mut tx,
+                            partition,
+                            std::time::Instant::now() + Duration::from_secs(10),
+                        )
+                        .await
+                        .unwrap();
+                    insert_distributed_reservation(&mut tx, &reservation, expires_at)
+                        .await
+                        .unwrap();
+                    add_materialized_admission_usage(&mut tx, &reservation.key, work, expires_at)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                }
+            }
+        });
+        barrier.wait().await;
+        let probe = || {
+            controller.probe_partition_capacity(
+                &key,
+                work,
+                &identity_hash,
+                &hash,
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+        };
+        for _ in 0..256 {
+            // Full + present and empty + absent both forbid rejection.
+            assert!(!matches!(probe().await.unwrap(), CapacityProbe::Exhausted));
+        }
+        writer.await.unwrap();
+        permit.release().await.unwrap();
+        sqlx::query("UPDATE session_weighted_admission_gates SET used_resident_bytes = 1, earliest_expiry_at = NULL WHERE scope_name = ?")
+            .bind(owner_admission_scope(&key)).execute(pool.get()).await.unwrap();
+        assert!(
+            matches!(probe().await.unwrap(), CapacityProbe::Uncertain),
+            "zero slots with charged bytes is not a valid empty partition"
+        );
+        sqlx::query("UPDATE session_weighted_admission_gates SET used_resident_bytes = 0 WHERE scope_name = ?")
+            .bind(owner_admission_scope(&key)).execute(pool.get()).await.unwrap();
+        assert!(
+            !matches!(probe().await.unwrap(), CapacityProbe::Exhausted),
+            "a completed release must be visible to the next fresh snapshot"
+        );
+        pool.close().await;
     }
 }

@@ -9,9 +9,285 @@ use astra_services::{
 use astra_turn_types::SessionKeyV1;
 use chrono::{Duration as ChronoDuration, Utc};
 use serial_test::file_serial;
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 use uuid::Uuid;
 
-const ADMISSION_SCOPE: &str = "canonical_turn_v1";
+const ADMISSION_SCOPE: &str = "canonical_turn_v2_%";
+
+fn owner_scope(owner: &str) -> String {
+    format!(
+        "canonical_turn_v2_{:02}",
+        Sha256::digest(owner.as_bytes())[0] % 16
+    )
+}
+
+fn colocated_key(prefix: &str, owner: &str) -> SessionKeyV1 {
+    key(&(0..)
+        .map(|i| format!("{prefix}-{i}"))
+        .find(|candidate| owner_scope(candidate) == owner_scope(owner))
+        .unwrap())
+}
+
+async fn assert_partition_capacity(pool: &astra_core::SharedPool, global: AdmissionWork) {
+    let dimensions = [
+        "resident_bytes",
+        "context_tokens",
+        "provider_slots",
+        "cpu_units",
+        "io_bytes",
+    ];
+    let columns = dimensions
+        .iter()
+        .flat_map(|dimension| {
+            ["allocated", "used"]
+                .map(|prefix| format!("CAST({prefix}_{dimension} AS CHAR) AS {prefix}_{dimension}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows = sqlx::query(&format!(
+        "SELECT scope_name, {columns} FROM session_weighted_admission_gates ORDER BY scope_name"
+    ))
+    .fetch_all(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        16,
+        "there is no singleton or unbounded gate registry"
+    );
+    let mut allocated = [0u64; 5];
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.get::<String, _>("scope_name"),
+            format!("canonical_turn_v2_{index:02}")
+        );
+        for (dimension, name) in dimensions.iter().enumerate() {
+            let capacity = row
+                .get::<String, _>(format!("allocated_{name}").as_str())
+                .parse::<u64>()
+                .unwrap();
+            let used = row
+                .get::<String, _>(format!("used_{name}").as_str())
+                .parse::<u64>()
+                .unwrap();
+            assert!(
+                used <= capacity,
+                "{name} is overallocated in partition {index}"
+            );
+            allocated[dimension] = allocated[dimension].checked_add(capacity).unwrap();
+        }
+    }
+    assert_eq!(
+        allocated,
+        [
+            global.resident_bytes,
+            global.context_tokens,
+            u64::from(global.provider_slots),
+            global.cpu_units,
+            global.io_bytes
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(admission_scope)]
+async fn held_owner_partition_does_not_block_another_owner_partition() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    reset_admission_scope(&pool).await;
+    let mut controller =
+        DatabaseWeightedAdmissionController::new(pool.clone(), limits(16)).unwrap();
+    let first_key = key("held-owner");
+    let first = controller
+        .try_reserve(&first_key, work(), Duration::from_secs(30), "first")
+        .await
+        .unwrap();
+    let other = (0..)
+        .map(|i| key(&format!("independent-{i}")))
+        .find(|key| owner_scope(&key.owner_user_id) != owner_scope(&first_key.owner_user_id))
+        .unwrap();
+    let mut holder = pool.get().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM session_weighted_admission_gates WHERE scope_name = ? FOR UPDATE")
+        .bind(owner_scope(&first_key.owner_user_id))
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    controller.with_admission_wait_timeout(Duration::from_secs(2));
+    let blocked = tokio::spawn({
+        let controller = controller.clone();
+        let first_key = first_key.clone();
+        async move {
+            controller
+                .try_reserve(&first_key, work(), Duration::from_secs(30), "blocked")
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.processlist WHERE db = ? AND info LIKE '%used_resident_bytes%' AND info LIKE '%FOR UPDATE%' AND info NOT LIKE '%information_schema.processlist%'")
+                .bind(&settings.database).fetch_one(pool.get()).await.unwrap();
+            if waiting > 0 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the public controller must be waiting on the held gate");
+    let independent = tokio::time::timeout(
+        Duration::from_secs(1),
+        controller.try_reserve(&other, work(), Duration::from_secs(30), "independent"),
+    )
+    .await
+    .expect("another partition must commit while the first remains held")
+    .unwrap();
+    assert!(!blocked.is_finished());
+    assert!(matches!(
+        blocked.await.unwrap(),
+        Err(DistributedAdmissionError::AdmissionTimeout { .. })
+    ));
+    holder.rollback().await.unwrap();
+    assert_partition_capacity(&pool, limits(16).global).await;
+    independent.release().await.unwrap();
+    first.release().await.unwrap();
+    reset_admission_scope(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(admission_scope)]
+async fn borrowed_partition_credit_conserves_each_resource_limit() {
+    let pool = common::setup_pool().await;
+    for dimension in 0..5 {
+        reset_admission_scope(&pool).await;
+        let global = AdmissionWork {
+            resident_bytes: 16,
+            context_tokens: 16,
+            provider_slots: 16,
+            cpu_units: 16,
+            io_bytes: 16,
+        };
+        let controller = DatabaseWeightedAdmissionController::new(
+            pool.clone(),
+            WeightedAdmissionLimits {
+                global,
+                per_owner: global,
+            },
+        )
+        .unwrap();
+        let make_work = |value| {
+            let mut values = [1; 5];
+            values[dimension] = value;
+            AdmissionWork {
+                resident_bytes: values[0],
+                context_tokens: values[1],
+                provider_slots: values[2] as u32,
+                cpu_units: values[3],
+                io_bytes: values[4],
+            }
+        };
+        let first = controller
+            .try_reserve(
+                &key("borrower"),
+                make_work(15),
+                Duration::from_secs(30),
+                "large",
+            )
+            .await
+            .unwrap();
+        assert_partition_capacity(&pool, global).await;
+        let denied = controller
+            .try_reserve(
+                &key("another-owner"),
+                make_work(2),
+                Duration::from_secs(30),
+                "over-limit",
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(DistributedAdmissionError::Capacity(
+                astra_services::WeightedAdmissionError::GlobalExhausted
+            ))
+        ));
+        assert_partition_capacity(&pool, global).await;
+        first.release().await.unwrap();
+    }
+    reset_admission_scope(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+#[file_serial(admission_scope)]
+async fn saturated_snapshot_rejects_without_locking_unrelated_partitions() {
+    let (pool, mut settings) = common::setup_pool_and_settings().await;
+    reset_admission_scope(&pool).await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 0;
+    let single = astra_core::SharedPool::new(&settings).await.unwrap();
+    let mut controller =
+        DatabaseWeightedAdmissionController::new(single.clone(), limits(1)).unwrap();
+    controller.with_admission_wait_timeout(Duration::from_secs(2));
+    let existing_key = key("snapshot-existing");
+    let new_key = key("snapshot-new");
+    let first = controller
+        .try_reserve(&existing_key, work(), Duration::from_secs(30), "existing")
+        .await
+        .unwrap();
+    let held_scope: String = sqlx::query_scalar("SELECT scope_name FROM session_weighted_admission_gates WHERE scope_name NOT IN (?, ?) ORDER BY scope_name LIMIT 1")
+        .bind(owner_scope(&existing_key.owner_user_id)).bind(owner_scope(&new_key.owner_user_id)).fetch_one(pool.get()).await.unwrap();
+    let mut holder = pool.get().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM session_weighted_admission_gates WHERE scope_name = ? FOR UPDATE")
+        .bind(held_scope)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let denied = tokio::time::timeout(
+        Duration::from_secs(1),
+        controller.try_reserve(&new_key, work(), Duration::from_secs(30), "new"),
+    )
+    .await
+    .expect("a proven saturated miss must not wait for all partition locks");
+    assert!(matches!(
+        denied,
+        Err(DistributedAdmissionError::Capacity(
+            astra_services::WeightedAdmissionError::GlobalExhausted
+        ))
+    ));
+    let replay = controller
+        .try_reserve(&existing_key, work(), Duration::from_secs(30), "existing")
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.reservation().reservation_id,
+        first.reservation().reservation_id
+    );
+    let mismatch = controller
+        .try_reserve(
+            &existing_key,
+            AdmissionWork {
+                resident_bytes: 2,
+                ..work()
+            },
+            Duration::from_secs(30),
+            "existing",
+        )
+        .await;
+    assert!(matches!(
+        mismatch,
+        Err(DistributedAdmissionError::IdempotencyMismatch)
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query("SELECT 1").execute(single.get()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    holder.rollback().await.unwrap();
+    replay.release().await.unwrap();
+    first.release().await.unwrap();
+    assert_partition_capacity(&pool, limits(1).global).await;
+    reset_admission_scope(&pool).await;
+    single.close().await;
+}
 
 #[derive(Clone, Copy)]
 struct StoredAdmissionWork {
@@ -65,7 +341,7 @@ fn key(owner: &str) -> SessionKeyV1 {
 }
 
 async fn reset_admission_scope(pool: &astra_core::SharedPool) {
-    sqlx::query("DELETE FROM session_weighted_admission_reservations WHERE scope_name = ?")
+    sqlx::query("DELETE FROM session_weighted_admission_reservations WHERE scope_name LIKE ?")
         .bind(ADMISSION_SCOPE)
         .execute(pool.get())
         .await
@@ -73,7 +349,7 @@ async fn reset_admission_scope(pool: &astra_core::SharedPool) {
     sqlx::query(
         "UPDATE session_weighted_admission_gates
          SET capacity_hash = NULL, usage_initialized = 0
-         WHERE scope_name = ?",
+         WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .execute(pool.get())
@@ -94,7 +370,7 @@ async fn insert_reservation_row(
           provider_slots, cpu_units, io_bytes, expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(ADMISSION_SCOPE)
+    .bind(owner_scope(&key.owner_user_id))
     .bind(Uuid::new_v4().to_string())
     .bind(&key.isolation_domain)
     .bind(&key.owner_user_id)
@@ -113,9 +389,9 @@ async fn insert_reservation_row(
     sqlx::query(
         "UPDATE session_weighted_admission_gates
          SET usage_initialized = 0
-         WHERE scope_name = ?",
+         WHERE scope_name LIKE ?",
     )
-    .bind(ADMISSION_SCOPE)
+    .bind(owner_scope(&key.owner_user_id))
     .execute(pool.get())
     .await
     .expect("invalidate materialized admission usage");
@@ -233,68 +509,70 @@ async fn uninitialized_capacity_hash_with_active_reservation_fails_closed() {
 #[file_serial(admission_scope)]
 async fn invalid_signed_reservation_rows_fail_closed_in_aggregate_path() {
     let pool = common::setup_pool().await;
-    reset_admission_scope(&pool).await;
-    let controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(4)).unwrap();
-    let seed = controller
-        .try_reserve(
-            &key("seed-owner"),
-            work(),
-            Duration::from_secs(30),
-            "seed-turn",
+    for (resident_bytes, provider_slots) in [(-5, 1), (1, 0)] {
+        reset_admission_scope(&pool).await;
+        let controller = DatabaseWeightedAdmissionController::new(pool.clone(), limits(4)).unwrap();
+        let seed = controller
+            .try_reserve(
+                &key("seed-owner"),
+                work(),
+                Duration::from_secs(30),
+                "seed-turn",
+            )
+            .await
+            .expect("seed capacity hash");
+        seed.release().await.expect("seed reservation release");
+        insert_reservation_row(
+            &pool,
+            &key("invalid-owner"),
+            "negative-row",
+            StoredAdmissionWork {
+                resident_bytes,
+                context_tokens: 1,
+                provider_slots,
+                cpu_units: 1,
+                io_bytes: 1,
+            },
         )
-        .await
-        .expect("seed capacity hash");
-    seed.release().await.expect("seed reservation release");
-    insert_reservation_row(
-        &pool,
-        &key("invalid-owner"),
-        "negative-row",
-        StoredAdmissionWork {
-            resident_bytes: -5,
-            context_tokens: 1,
-            provider_slots: 1,
-            cpu_units: 1,
-            io_bytes: 1,
-        },
-    )
-    .await;
-    insert_reservation_row(
-        &pool,
-        &key("positive-owner"),
-        "positive-row",
-        StoredAdmissionWork {
-            resident_bytes: 10,
-            context_tokens: 1,
-            provider_slots: 1,
-            cpu_units: 1,
-            io_bytes: 1,
-        },
-    )
-    .await;
+        .await;
+        insert_reservation_row(
+            &pool,
+            &colocated_key("positive-owner", "invalid-owner"),
+            "positive-row",
+            StoredAdmissionWork {
+                resident_bytes: 10,
+                context_tokens: 1,
+                provider_slots: 1,
+                cpu_units: 1,
+                io_bytes: 1,
+            },
+        )
+        .await;
 
-    let error = match controller
-        .try_reserve(
-            &key("next-owner"),
-            work(),
-            Duration::from_secs(30),
-            "next-turn",
-        )
-        .await
-    {
-        Err(error) => error,
-        Ok(permit) => {
-            permit
-                .release()
-                .await
-                .expect("unexpected reservation release");
-            panic!("negative stored work must not be hidden by positive aggregation");
-        }
-    };
-    assert!(
-        matches!(error, DistributedAdmissionError::Invalid(_)),
-        "unexpected invalid-row result: {error}"
-    );
-    reset_admission_scope(&pool).await;
+        let error = match controller
+            .try_reserve(
+                &colocated_key("next-owner", "invalid-owner"),
+                work(),
+                Duration::from_secs(30),
+                "next-turn",
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(permit) => {
+                permit
+                    .release()
+                    .await
+                    .expect("unexpected reservation release");
+                panic!("invalid stored work must not be hidden by aggregation");
+            }
+        };
+        assert!(
+            matches!(error, DistributedAdmissionError::Invalid(_)),
+            "unexpected invalid-row result: {error}"
+        );
+        reset_admission_scope(&pool).await;
+    }
 }
 
 #[tokio::test]
@@ -302,121 +580,72 @@ async fn invalid_signed_reservation_rows_fail_closed_in_aggregate_path() {
 #[file_serial(admission_scope)]
 async fn aggregate_totals_preserve_values_above_i64_max() {
     let pool = common::setup_pool().await;
-    reset_admission_scope(&pool).await;
-    let budget = AdmissionWork {
-        // Two legal BIGINT rows exceed i64::MAX in aggregate but remain below
-        // u64::MAX. The aggregate path must preserve that exact total.
-        resident_bytes: 10_000_000_000_000_000_000,
-        context_tokens: 100,
-        provider_slots: 3,
-        cpu_units: 100,
-        io_bytes: 100,
-    };
-    let controller = DatabaseWeightedAdmissionController::new(
-        pool.clone(),
-        WeightedAdmissionLimits {
-            global: budget,
-            per_owner: budget,
-        },
-    )
-    .unwrap();
-    let seed = controller
-        .try_reserve(
-            &key("large-seed-owner"),
-            work(),
-            Duration::from_secs(30),
-            "large-seed-turn",
+    for same_owner in [false, true] {
+        reset_admission_scope(&pool).await;
+        let budget = AdmissionWork {
+            resident_bytes: u64::MAX,
+            context_tokens: 100,
+            provider_slots: 3,
+            cpu_units: 100,
+            io_bytes: 100,
+        };
+        let controller = DatabaseWeightedAdmissionController::new(
+            pool.clone(),
+            WeightedAdmissionLimits {
+                global: budget,
+                per_owner: budget,
+            },
         )
-        .await
-        .expect("seed capacity hash");
-    seed.release().await.expect("seed reservation release");
-    let huge_row = 6_000_000_000_000_000_000;
-    insert_reservation_row(
-        &pool,
-        &key("large-owner-a"),
-        "large-row-a",
-        StoredAdmissionWork {
-            resident_bytes: huge_row,
-            context_tokens: 1,
-            provider_slots: 1,
-            cpu_units: 1,
-            io_bytes: 1,
-        },
-    )
-    .await;
-    insert_reservation_row(
-        &pool,
-        &key("large-owner-b"),
-        "large-row-b",
-        StoredAdmissionWork {
-            resident_bytes: huge_row,
-            context_tokens: 1,
-            provider_slots: 1,
-            cpu_units: 1,
-            io_bytes: 1,
-        },
-    )
-    .await;
-
-    let error = match controller
-        .try_reserve(
-            &key("large-next-owner"),
-            work(),
-            Duration::from_secs(30),
-            "large-next-turn",
-        )
-        .await
-    {
-        Err(error) => error,
-        Ok(permit) => {
-            permit
-                .release()
-                .await
-                .expect("unexpected reservation release");
-            panic!("aggregate total above the configured global budget was truncated");
-        }
-    };
-    assert!(
-        matches!(
-            error,
-            DistributedAdmissionError::Capacity(
-                astra_services::WeightedAdmissionError::GlobalExhausted
+        .unwrap();
+        let first_key = key("large-owner");
+        let second_key = if same_owner {
+            first_key.clone()
+        } else {
+            colocated_key("other-large-owner", "large-owner")
+        };
+        let large_work = AdmissionWork {
+            resident_bytes: 6_000_000_000_000_000_000,
+            ..work()
+        };
+        let first = controller
+            .try_reserve(&first_key, large_work, Duration::from_secs(30), "large-a")
+            .await
+            .unwrap();
+        let second = controller
+            .try_reserve(&second_key, large_work, Duration::from_secs(30), "large-b")
+            .await
+            .unwrap();
+        // Rebuild a VALID charged partition above i64::MAX, not an injected
+        // overallocated state that the conservation guard would reject first.
+        sqlx::query("UPDATE session_weighted_admission_gates SET usage_initialized = 0 WHERE scope_name = ?")
+            .bind(owner_scope(&first_key.owner_user_id)).execute(pool.get()).await.unwrap();
+        let next_key = if same_owner {
+            first_key.clone()
+        } else {
+            colocated_key("next-large-owner", "large-owner")
+        };
+        let error = controller
+            .try_reserve(
+                &next_key,
+                AdmissionWork {
+                    resident_bytes: 7_000_000_000_000_000_000,
+                    ..work()
+                },
+                Duration::from_secs(30),
+                "over-budget",
             )
-        ),
-        "expected exact aggregate capacity rejection, got {error:?}"
-    );
-
-    // Rebuild per-owner totals above i64::MAX too, not only the global sum.
-    insert_reservation_row(
-        &pool,
-        &key("large-owner-a"),
-        "large-row-c",
-        StoredAdmissionWork {
-            resident_bytes: huge_row,
-            context_tokens: 1,
-            provider_slots: 1,
-            cpu_units: 1,
-            io_bytes: 1,
-        },
-    )
-    .await;
-    let result = controller
-        .try_reserve(
-            &key("large-owner-a"),
-            work(),
-            Duration::from_secs(30),
-            "large-owner-next-turn",
-        )
-        .await;
-    assert!(
-        matches!(
-            result,
-            Err(DistributedAdmissionError::Capacity(
-                astra_services::WeightedAdmissionError::GlobalExhausted
-            ))
-        ),
-        "owner aggregate must rebuild without int64 overflow"
-    );
+            .await;
+        assert!(
+            matches!(error, Err(DistributedAdmissionError::Capacity(kind))
+            if kind == if same_owner { astra_services::WeightedAdmissionError::OwnerExhausted } else { astra_services::WeightedAdmissionError::GlobalExhausted })
+        );
+        let rebuilt: String = sqlx::query_scalar("SELECT CAST(used_resident_bytes AS CHAR) FROM session_weighted_admission_gates WHERE scope_name = ?")
+            .bind(owner_scope(&first_key.owner_user_id)).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(rebuilt, "12000000000000000000");
+        assert_partition_capacity(&pool, budget).await;
+        first.release().await.unwrap();
+        second.release().await.unwrap();
+    }
     reset_admission_scope(&pool).await;
 }
 
@@ -449,7 +678,7 @@ async fn owner_usage_aggregation_preserves_case_sensitive_identity() {
     upper.release().await.expect("upper owner release");
     let lower_usage: i64 = sqlx::query_scalar(
         "SELECT CAST(provider_slots AS SIGNED) FROM session_weighted_admission_owner_usage
-         WHERE scope_name = ? AND isolation_domain = 'server'
+         WHERE scope_name LIKE ? AND isolation_domain = 'server'
            AND owner_user_id = 'caseowner' AND BINARY owner_user_id = BINARY 'caseowner'",
     )
     .bind(ADMISSION_SCOPE)
@@ -561,7 +790,7 @@ async fn rejected_large_request_does_not_block_small_request_or_idempotent_repla
         "replay must return the original durable reservation"
     );
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(pool.get())
@@ -624,7 +853,7 @@ async fn dirty_delete_rebuilds_global_and_owner_usage_before_admission() {
     let reservation_id = first.reservation().reservation_id.clone();
     sqlx::query(
         "DELETE FROM session_weighted_admission_reservations
-         WHERE scope_name = ? AND reservation_id = ?",
+         WHERE scope_name LIKE ? AND reservation_id = ?",
     )
     .bind(ADMISSION_SCOPE)
     .bind(&reservation_id)
@@ -634,7 +863,7 @@ async fn dirty_delete_rebuilds_global_and_owner_usage_before_admission() {
     sqlx::query(
         "UPDATE session_weighted_admission_gates
          SET usage_initialized = 0
-         WHERE scope_name = ?",
+         WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .execute(pool.get())
@@ -646,8 +875,8 @@ async fn dirty_delete_rebuilds_global_and_owner_usage_before_admission() {
         .await
         .expect("dirty usage must be rebuilt before owner admission");
     let global_slots: String = sqlx::query_scalar(
-        "SELECT CAST(global_provider_slots AS CHAR)
-         FROM session_weighted_admission_gates WHERE scope_name = ?",
+        "SELECT CAST(SUM(used_provider_slots) AS CHAR)
+         FROM session_weighted_admission_gates WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(pool.get())
@@ -695,7 +924,7 @@ async fn gate_first_session_delete_does_not_deadlock_with_release() {
     let mut gate_holder = pool.begin().await.expect("begin gate-order test holder");
     sqlx::query(
         "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
+         WHERE scope_name LIKE ? FOR UPDATE",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(&mut *gate_holder)
@@ -734,7 +963,7 @@ async fn gate_first_session_delete_does_not_deadlock_with_release() {
     .expect("canonical gate-first delete and release must not deadlock");
     let remaining_reservations: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_weighted_admission_reservations
-         WHERE scope_name = ? AND session_id = ? AND owner_user_id = ?",
+         WHERE scope_name LIKE ? AND session_id = ? AND owner_user_id = ?",
     )
     .bind(ADMISSION_SCOPE)
     .bind(&session_id)
@@ -771,7 +1000,7 @@ async fn session_delete_without_reservation_keeps_materialized_usage_clean() {
     sqlx::query(
         "UPDATE session_weighted_admission_gates
          SET usage_initialized = 1
-         WHERE scope_name = ?",
+         WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .execute(&pool)
@@ -796,8 +1025,8 @@ async fn session_delete_without_reservation_keeps_materialized_usage_clean() {
         .await
         .expect("canonical delete without reservation");
     let usage_initialized: i64 = sqlx::query_scalar(
-        "SELECT usage_initialized FROM session_weighted_admission_gates
-         WHERE scope_name = ?",
+        "SELECT MIN(usage_initialized) FROM session_weighted_admission_gates
+         WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(&pool)
@@ -917,7 +1146,7 @@ async fn durable_gate_wait_obeys_admission_budget() {
     let mut gate_tx = pool.get().begin().await.expect("begin gate holder");
     sqlx::query(
         "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
+         WHERE scope_name LIKE ? FOR UPDATE",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(&mut *gate_tx)
@@ -995,7 +1224,7 @@ async fn release_timeout_can_be_retried_after_gate_unblocks() {
     let mut gate_holder = pool.get().begin().await.expect("begin release gate holder");
     sqlx::query(
         "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
+         WHERE scope_name LIKE ? FOR UPDATE",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(&mut *gate_holder)
@@ -1021,7 +1250,7 @@ async fn release_timeout_can_be_retried_after_gate_unblocks() {
         .expect("a timed-out release must remain retryable");
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_weighted_admission_reservations
-         WHERE scope_name = ? AND reservation_id = ?",
+         WHERE scope_name LIKE ? AND reservation_id = ?",
     )
     .bind(ADMISSION_SCOPE)
     .bind(reservation_id)
@@ -1075,7 +1304,7 @@ async fn repeated_gate_timeouts_do_not_exhaust_waiter_pool() {
         .expect("begin durable gate holder");
     sqlx::query(
         "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
+         WHERE scope_name LIKE ? FOR UPDATE",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(&mut *holder_tx)
@@ -1099,7 +1328,7 @@ async fn repeated_gate_timeouts_do_not_exhaust_waiter_pool() {
     // on the durable FOR UPDATE before we exercise outer cancellation.
     let waiting_before: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.processlist
-         WHERE db = ? AND info LIKE '%global_resident_bytes%'
+         WHERE db = ? AND info LIKE '%used_resident_bytes%'
            AND info LIKE '%FOR UPDATE%'
            AND info NOT LIKE '%information_schema.processlist%'
            AND conn_id = ?",
@@ -1131,7 +1360,7 @@ async fn repeated_gate_timeouts_do_not_exhaust_waiter_pool() {
     while Instant::now() < observation_deadline {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.processlist
-             WHERE db = ? AND info LIKE '%global_resident_bytes%'
+             WHERE db = ? AND info LIKE '%used_resident_bytes%'
                AND info LIKE '%FOR UPDATE%'
                AND info NOT LIKE '%information_schema.processlist%'
                AND conn_id = ?",
@@ -1188,7 +1417,7 @@ async fn repeated_gate_timeouts_do_not_exhaust_waiter_pool() {
     .expect("unrelated waiter-pool query must remain available")
     .expect("unrelated waiter-pool query");
     let reservations: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(holder_pool.get())
@@ -1234,7 +1463,7 @@ async fn gate_wait_crossing_expiry_fences_replay_and_renewal() {
         let old = original.reservation().clone();
         let mut holder = pool.get().begin().await.unwrap();
         sqlx::query(
-            "SELECT 1 FROM session_weighted_admission_gates WHERE scope_name = ? FOR UPDATE",
+            "SELECT 1 FROM session_weighted_admission_gates WHERE scope_name LIKE ? FOR UPDATE",
         )
         .bind(ADMISSION_SCOPE)
         .fetch_one(&mut *holder)
@@ -1266,7 +1495,7 @@ async fn gate_wait_crossing_expiry_fences_replay_and_renewal() {
             loop {
                 let waiting: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM information_schema.processlist
-                     WHERE db = ? AND conn_id = ? AND info LIKE '%global_resident_bytes%'
+                     WHERE db = ? AND conn_id = ? AND info LIKE '%used_resident_bytes%'
                        AND info LIKE '%FOR UPDATE%'",
                 )
                 .bind(&settings.database)
@@ -1315,14 +1544,14 @@ async fn gate_wait_crossing_expiry_fences_replay_and_renewal() {
             ));
             original.release().await.unwrap();
             let rows: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+                "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name LIKE ?",
             )
             .bind(ADMISSION_SCOPE)
             .fetch_one(pool.get())
             .await
             .unwrap();
             assert_eq!(rows, 1, "old generation must not release replacement");
-            let slots: i64 = sqlx::query_scalar("SELECT CAST(global_provider_slots AS SIGNED) FROM session_weighted_admission_gates WHERE scope_name = ?")
+            let slots: i64 = sqlx::query_scalar("SELECT CAST(SUM(used_provider_slots) AS SIGNED) FROM session_weighted_admission_gates WHERE scope_name LIKE ?")
                 .bind(ADMISSION_SCOPE).fetch_one(pool.get()).await.unwrap();
             assert_eq!(slots, 1, "replacement must be charged exactly once");
             replacement.release().await.unwrap();
@@ -1346,7 +1575,12 @@ async fn expiry_frontier_is_conservative_across_shorter_renewal_and_release() {
         .await
         .unwrap();
     let early = controller
-        .try_reserve(&key("early"), work(), Duration::from_secs(300), "early")
+        .try_reserve(
+            &colocated_key("early", "long"),
+            work(),
+            Duration::from_secs(300),
+            "early",
+        )
         .await
         .unwrap();
     let shortened = controller
@@ -1355,8 +1589,9 @@ async fn expiry_frontier_is_conservative_across_shorter_renewal_and_release() {
         .unwrap();
     let frontier = || {
         sqlx::query_scalar::<_, Option<chrono::NaiveDateTime>>(
-            "SELECT earliest_expiry_at FROM session_weighted_admission_gates WHERE scope_name = 'canonical_turn_v1'",
+            "SELECT earliest_expiry_at FROM session_weighted_admission_gates WHERE scope_name = ?",
         )
+        .bind(owner_scope("long"))
     };
     let short_at = chrono::DateTime::from_timestamp_millis(shortened.expires_at_unix_ms)
         .unwrap()
@@ -1381,10 +1616,15 @@ async fn expiry_frontier_is_conservative_across_shorter_renewal_and_release() {
     );
     // Model an already released earliest lease whose conservative deadline has
     // passed, without sleeping or expiring the still-live independent lease.
-    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name = ?")
+    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name LIKE ?")
         .bind(ADMISSION_SCOPE).execute(pool.get()).await.unwrap();
     let next = controller
-        .try_reserve(&key("next"), work(), Duration::from_secs(900), "next")
+        .try_reserve(
+            &colocated_key("next", "long"),
+            work(),
+            Duration::from_secs(900),
+            "next",
+        )
         .await
         .unwrap();
     let early_at = chrono::DateTime::from_timestamp_millis(early.reservation().expires_at_unix_ms)
@@ -1407,7 +1647,7 @@ async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay(
     reset_admission_scope(&pool).await;
     let controller =
         DatabaseWeightedAdmissionController::new(pool.clone(), limits_with_owner(2, 1)).unwrap();
-    let expired_key = key("expired");
+    let expired_key = colocated_key("expired", "live");
     let expired = controller
         .try_reserve(&expired_key, work(), Duration::from_secs(900), "expired")
         .await
@@ -1418,9 +1658,9 @@ async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay(
         .await
         .unwrap();
     let mut tx = pool.get().begin().await.unwrap();
-    sqlx::query("UPDATE session_weighted_admission_reservations SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name = ? AND reservation_id = ?")
+    sqlx::query("UPDATE session_weighted_admission_reservations SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name LIKE ? AND reservation_id = ?")
         .bind(ADMISSION_SCOPE).bind(&expired.reservation().reservation_id).execute(&mut *tx).await.unwrap();
-    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name = ?")
+    sqlx::query("UPDATE session_weighted_admission_gates SET earliest_expiry_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE scope_name LIKE ?")
         .bind(ADMISSION_SCOPE).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
     assert!(matches!(
@@ -1437,7 +1677,7 @@ async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay(
         ))
     ));
     let retained: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(pool.get())
@@ -1447,7 +1687,7 @@ async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay(
         retained, 1,
         "rejected new work must not roll back expiry cleanup"
     );
-    let total: i64 = sqlx::query_scalar("SELECT CAST(global_provider_slots AS SIGNED) FROM session_weighted_admission_gates WHERE scope_name = ? AND usage_initialized = 1")
+    let total: i64 = sqlx::query_scalar("SELECT CAST(SUM(used_provider_slots) AS SIGNED) FROM session_weighted_admission_gates WHERE scope_name LIKE ? AND usage_initialized = 1")
         .bind(ADMISSION_SCOPE).fetch_one(pool.get()).await.unwrap();
     assert_eq!(total, 1);
     let replay = controller
@@ -1501,7 +1741,7 @@ async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay(
         Err(DistributedAdmissionError::Fenced)
     ));
     let retained: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(pool.get())
@@ -1515,7 +1755,7 @@ async fn denied_new_identity_commits_expiry_repair_without_breaking_full_replay(
     live.release().await.unwrap();
     reclaimed.release().await.unwrap();
     let owners: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_owner_usage WHERE scope_name = ?",
+        "SELECT COUNT(*) FROM session_weighted_admission_owner_usage WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(pool.get())

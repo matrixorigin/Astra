@@ -33943,11 +33943,15 @@ async fn db_stream_terminal_precedes_blocked_quota_cleanup() {
         astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
     let mut stream = ok(service.stream_chat(owner.clone(), request).await);
     let run_id = stream.run_id.clone();
+    let admission_scope: String = sqlx::query_scalar(
+        "SELECT scope_name FROM session_weighted_admission_reservations WHERE owner_user_id = ? LIMIT 1",
+    ).bind(&owner).fetch_one(pool.get()).await.unwrap();
     let mut gate = pool.get().begin().await.unwrap();
     sqlx::query(
         "SELECT scope_name FROM session_weighted_admission_gates
-         WHERE scope_name = 'canonical_turn_v1' FOR UPDATE",
+         WHERE scope_name = ? FOR UPDATE",
     )
+    .bind(admission_scope)
     .fetch_one(&mut *gate)
     .await
     .unwrap();

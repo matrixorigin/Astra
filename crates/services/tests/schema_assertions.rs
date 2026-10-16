@@ -1703,11 +1703,16 @@ async fn phase1_run_durability_schema_contract() {
     for expected in [
         "usage_initialized",
         "earliest_expiry_at",
-        "global_resident_bytes",
-        "global_context_tokens",
-        "global_provider_slots",
-        "global_cpu_units",
-        "global_io_bytes",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
     ] {
         assert!(
             admission_gate_columns

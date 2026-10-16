@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-16-v104";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-17-v105";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1888,11 +1888,16 @@ async fn reject_obsolete_weighted_admission_schema(
     const REQUIRED_GATE_COLUMNS: &[&str] = &[
         "usage_initialized",
         "earliest_expiry_at",
-        "global_resident_bytes",
-        "global_context_tokens",
-        "global_provider_slots",
-        "global_cpu_units",
-        "global_io_bytes",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
     ];
 
     if !table_exists(pool, database, GATE).await? {
@@ -1937,11 +1942,16 @@ async fn reject_obsolete_weighted_admission_schema(
         ));
     }
     for name in [
-        "global_resident_bytes",
-        "global_context_tokens",
-        "global_provider_slots",
-        "global_cpu_units",
-        "global_io_bytes",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
     ] {
         if let Some(column) = gate_columns.get(name)
             && (!column.data_type.eq_ignore_ascii_case("decimal")
@@ -4129,21 +4139,34 @@ async fn ensure_core_schema_while_leased(
             capacity_hash CHAR(64) NULL,
             usage_initialized TINYINT NOT NULL DEFAULT 0,
             earliest_expiry_at DATETIME(6) NULL,
-            global_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (scope_name)
         )",
     )
     .execute(&pool)
     .await?;
-    sqlx::query("INSERT IGNORE INTO session_weighted_admission_gates (scope_name) VALUES (?)")
-        .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
-        .execute(&pool)
-        .await?;
+    let mut gates = sqlx::QueryBuilder::<MySql>::new(
+        "INSERT IGNORE INTO session_weighted_admission_gates (scope_name) ",
+    );
+    gates.push_values(
+        0..crate::weighted_admission::DISTRIBUTED_ADMISSION_PARTITIONS,
+        |mut row, partition| {
+            row.push_bind(crate::weighted_admission::distributed_admission_scope(
+                partition,
+            ));
+        },
+    );
+    gates.build().execute(&pool).await?;
 
     core_schema_create!(
         pool,

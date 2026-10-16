@@ -18,7 +18,7 @@ const SESSION_COUNT: usize = 1_000;
 const OWNER_COUNT: usize = 100;
 const GLOBAL_PROVIDER_SLOTS: u32 = 40;
 const OWNER_PROVIDER_SLOTS: u32 = 8;
-const ADMISSION_SCOPE: &str = "canonical_turn_v1";
+const ADMISSION_SCOPE: &str = "canonical_turn_v2_%";
 
 fn limits() -> WeightedAdmissionLimits {
     WeightedAdmissionLimits {
@@ -50,7 +50,7 @@ fn work() -> AdmissionWork {
 }
 
 async fn reset_scope(pool: &astra_core::SharedPool) {
-    sqlx::query("DELETE FROM session_weighted_admission_reservations WHERE scope_name = ?")
+    sqlx::query("DELETE FROM session_weighted_admission_reservations WHERE scope_name LIKE ?")
         .bind(ADMISSION_SCOPE)
         .execute(pool.get())
         .await
@@ -58,7 +58,7 @@ async fn reset_scope(pool: &astra_core::SharedPool) {
     sqlx::query(
         "UPDATE session_weighted_admission_gates
          SET capacity_hash = NULL, usage_initialized = 0
-         WHERE scope_name = ?",
+         WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .execute(pool.get())
@@ -146,7 +146,7 @@ async fn independent_server_pools_bound_one_thousand_sessions() {
             .expect("multi-server reservation release");
     }
     let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name = ?",
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations WHERE scope_name LIKE ?",
     )
     .bind(ADMISSION_SCOPE)
     .fetch_one(pools[0].get())
