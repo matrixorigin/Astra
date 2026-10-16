@@ -792,6 +792,13 @@ inflate `executed_tool_calls` or settlement success.
 
 ## FAIL report artifacts
 
+CI prints failure analysis both when a case settles and in the final summary.
+Tool-count failures include bounded counts of actual disposition, success,
+recognized result status/error category and explicit execution facts. Arbitrary
+tags and result prose remain private. These facts distinguish argument rejection
+from a model-admission error without claiming an unobserved root cause; missing
+evidence remains unavailable. Original criteria and verdicts are unchanged.
+
 On FAIL, each case report includes:
 
 - `text:` / `stderr:` preview (head of each, truncated).

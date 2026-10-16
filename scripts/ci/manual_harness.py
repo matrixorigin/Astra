@@ -17,6 +17,19 @@ MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
 METRICS = ("duration_ms", "ttft_ms", "turn_rounds", "tool_calls_count", "prompt_tokens",
            "cached_input_tokens", "cache_creation_tokens", "completion_tokens")
+OUTCOME_STATUSES = {"completed", "failed", "rejected", "blocked", "started", "unknown",
+                    "waiting", "paused", "cancelled", "interrupted", "timed_out", "incomplete",
+                    "completed_with_issues", "timeout", "still_running", "launched", "other", "not_reported"}
+ERROR_KINDS = {"rate_limit", "payment_required", "server_error", "auth", "context_window",
+               "invalid_request", "contract_violation", "stream_idle", "provider_deadline",
+               "stream_transport", "connection_pool_exhausted", "budget_exhausted",
+               "tool_rounds_exhausted", "network", "tool_not_found", "tool_invalid_args",
+               "policy_denied", "tool_timeout", "tool_unavailable", "tool_binding",
+               "tool_outcome_unknown", "resource_limit", "database_error", "stall",
+               "missing_model_selection", "cancelled", "unknown", "other", "not_reported",
+               "delegation_model_scope_unresolved", "delegation_model_unavailable",
+               "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
+               "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
 
 
 def integer(value):
@@ -45,7 +58,7 @@ def safe_diagnostic(value, depth):
         return
     kind = value.get("kind")
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
-              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches"},
+              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "observed_outcomes", "outcomes_omitted"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
               "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"}}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
@@ -64,7 +77,7 @@ def safe_diagnostic(value, depth):
         if any(type(value[k]) is not int or not -(1 << 31) <= value[k] < (1 << 31) for k in fields[kind]):
             raise ValueError("invalid exit diagnostic")
     else:
-        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches"}:
+        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "observed_outcomes"}:
             integer(value[key])
         if kind == "tool_count":
             if value["expected_ok"] is not None and type(value["expected_ok"]) is not bool:
@@ -75,6 +88,24 @@ def safe_diagnostic(value, depth):
                 raise ValueError("invalid predicate counts")
             for count in value["predicate_matches"]:
                 integer(count)
+            outcomes = value["observed_outcomes"]
+            if not isinstance(outcomes, list) or len(outcomes) > 16:
+                raise ValueError("invalid outcome observations")
+            observed = value["outcomes_omitted"]
+            for entry in outcomes:
+                if set(entry) != {"outcome", "count"} or integer(entry["count"]) == 0:
+                    raise ValueError("invalid outcome count")
+                outcome = entry["outcome"]
+                if (set(outcome) != {"disposition", "ok", "status", "error_kind", "execution"}
+                    or (outcome["ok"] is not None and type(outcome["ok"]) is not bool)
+                    or outcome["disposition"] not in ("executed", "rejected", "reused", "suppressed", "deferred")
+                    or outcome["status"] not in OUTCOME_STATUSES
+                    or outcome["error_kind"] not in ERROR_KINDS
+                    or outcome["execution"] not in ("executed", "not_executed", "unknown", "not_reported")):
+                    raise ValueError("invalid outcome tags")
+                observed += entry["count"]
+            if observed != value["considered"]:
+                raise ValueError("incomplete outcome accounting")
 
 
 def safe_criteria(items, *, owner_passed, depth=0):
@@ -138,6 +169,18 @@ def check_lines(items, prefix):
                     reason += f"; error-text matches={diagnostic['error_matches']}"
                 reason += f"; independent predicate matches (YAML order)={diagnostic['predicate_matches']}"
                 reason += "; all predicates must match the SAME call"
+                reason += "; observed outcomes=" + json.dumps(diagnostic["observed_outcomes"], sort_keys=True)
+                if diagnostic["outcomes_omitted"]:
+                    reason += f"; omitted observations={diagnostic['outcomes_omitted']}"
+                kinds = {item["outcome"]["error_kind"] for item in diagnostic["observed_outcomes"]}
+                if "tool_invalid_args" in kinds:
+                    reason += "; Attribution: argument validation error reported; this does not prove the requested model was checked"
+                elif kinds & {"delegation_model_scope_unresolved", "delegation_model_unavailable", "invalid_delegation_model_scope"}:
+                    reason += "; Attribution: delegation model admission error reported; child execution is a separate check"
+                elif "invalid_request" in kinds:
+                    reason += "; Attribution: invalid request reported; the safe code alone does not identify which input was invalid"
+                else:
+                    reason += "; Attribution: contract mismatch observed; root cause is not established by these counts"
         elif kind == "exit":
             reason = f"expected exit={diagnostic['expected']}, observed exit={diagnostic['actual']}"
         elif kind == "sequence":
@@ -440,6 +483,15 @@ def publish(root):
     summary = replay.summary(execution, outcome)
     write_json(root / "summary.json", summary)
     (root / "progress.safe.jsonl").write_bytes(b"".join(replay.records))
+    if not summary["success"]:
+        print("[harness] Final failure analysis: " + json.dumps({
+            "complete":summary["complete"], "termination":execution["termination"],
+            "observation_error":summary["observation_error"], "counts":summary["counts"]}), flush=True)
+        for row in summary["runs"]:
+            if row["status"] != "passed":
+                print("[harness] " + json.dumps({"case":row["case"], "model":row["model"],
+                    "run_index":row["run_index"], "failure_class":row["failure_class"],
+                    "analysis":row_checks(row)}, ensure_ascii=False), flush=True)
     def cell(value):
         return html.escape(str(value)).replace("|", "&#124;").replace("\n", " ")
     with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:

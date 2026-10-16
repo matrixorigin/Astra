@@ -67,7 +67,10 @@ class ManualHarnessProgressTests(unittest.TestCase):
             check = {"type":"execution_tool_count", "severity":"hard", "score":None,
                      "passed":False, "evaluation":"reported", "diagnostic":{
                          "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
-                         "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0]}}
+                         "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0],
+                         "observed_outcomes":[{"count":1,"outcome":{"disposition":"rejected","ok":False,
+                             "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed"}}],
+                         "outcomes_omitted":0}}
             result["criteria"] = [check]
             write_events(root, data)
             (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
@@ -77,6 +80,34 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("expected 1..1, observed 0", summary)
             self.assertIn("[1, 0, 0]", summary)
             self.assertIn("not configured", summary)
+            self.assertIn("tool_invalid_args", summary)
+            self.assertIn("argument validation error reported", summary)
+            command = subprocess.run([sys.executable, str(SCRIPT), "summary", "--root", str(root)],
+                env={**os.environ, "ASTRA_BUILD_SOURCE_GIT_SHA":SHA,
+                     "GITHUB_STEP_SUMMARY":str(root / "job-summary"), "HARNESS_OUTCOME":"failure"},
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(command.returncode, 1)
+            self.assertIn("Final failure analysis", command.stdout)
+            self.assertIn("tool_invalid_args", command.stdout)
+            self.assertIn("does not prove the requested model was checked", command.stdout)
+            self.assertEqual(json.loads((root / "summary.json").read_text())["runs"][0]["criteria"][0]
+                             ["diagnostic"]["observed_outcomes"], check["diagnostic"]["observed_outcomes"])
+            outcome = check["diagnostic"]["observed_outcomes"][0]["outcome"]
+            for status in ("timeout", "still_running", "launched"):
+                outcome["status"] = status
+                write_events(root, data)
+                _, accepted = self.publish(root, "failure")
+                self.assertIsNone(accepted["observation_error"])
+                self.assertIn(status, (root / "job-summary").read_text())
+            outcome["status"] = "rejected"
+            for field in ("status", "error_kind", "execution", "disposition", "ok"):
+                prior = outcome[field]
+                outcome[field] = "private-sentinel"
+                write_events(root, data)
+                _, invalid = self.publish(root, "failure")
+                self.assertEqual(invalid["observation_error"], "invalid_progress")
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                outcome[field] = prior
             for assessment in ("rejected", "unavailable"):
                 check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment})
                 write_events(root, data)

@@ -1089,6 +1089,8 @@ pub(crate) fn execution_contract_proof(
             let mut outcome_matches = 0;
             let mut error_matches = 0;
             let mut predicate_matches = vec![0usize; predicates.len()];
+            let mut observed_outcomes: Vec<serde_json::Value> = Vec::new();
+            let mut outcomes_omitted = 0usize;
             let count = calls
                 .iter()
                 .filter(|call| {
@@ -1096,6 +1098,17 @@ pub(crate) fn execution_contract_proof(
                         return false;
                     }
                     considered += 1;
+                    let outcome = call.safe_outcome();
+                    if let Some(existing) = observed_outcomes
+                        .iter_mut()
+                        .find(|entry| entry["outcome"] == outcome)
+                    {
+                        existing["count"] = (existing["count"].as_u64().unwrap() + 1).into();
+                    } else if observed_outcomes.len() < 16 {
+                        observed_outcomes.push(serde_json::json!({"outcome":outcome,"count":1}));
+                    } else {
+                        outcomes_omitted += 1;
+                    }
                     if ok.is_some_and(|expected| call.ok != Some(expected)) {
                         return false;
                     }
@@ -1126,6 +1139,7 @@ pub(crate) fn execution_contract_proof(
                     "considered":considered, "expected_ok":ok, "outcome_matches":outcome_matches,
                     "error_matches":error_contains.as_ref().map(|_| error_matches),
                     "predicate_matches":predicate_matches,
+                    "observed_outcomes":observed_outcomes, "outcomes_omitted":outcomes_omitted,
                 }),
             ))
         }

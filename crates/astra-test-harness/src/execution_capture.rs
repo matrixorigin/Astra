@@ -80,6 +80,58 @@ pub(crate) struct ExecutionToolCall<'a> {
     pub ok: Option<bool>,
 }
 
+impl ExecutionToolCall<'_> {
+    /// Public diagnostics contain only recognized machine tags, never result prose.
+    pub(crate) fn safe_outcome(&self) -> Value {
+        let result = agent_control_result_value(self.raw_result);
+        let status = match result.as_ref().and_then(|value| value["status"].as_str()) {
+            Some(
+                status @ ("completed"
+                | "failed"
+                | "rejected"
+                | "blocked"
+                | "started"
+                | "unknown"
+                | "waiting"
+                | "paused"
+                | "cancelled"
+                | "interrupted"
+                | "timeout"
+                | "timed_out"
+                | "still_running"
+                | "launched"
+                | "incomplete"
+                | "completed_with_issues"),
+            ) => status,
+            Some(_) => "other",
+            None => "not_reported",
+        };
+        let error_kind = result.as_ref().and_then(|value| value.get("error_kind"));
+        let error_kind = match error_kind.and_then(Value::as_str) {
+            Some(
+                code @ ("delegation_model_scope_unresolved"
+                | "delegation_model_unavailable"
+                | "delegation_preparation_unavailable"
+                | "delegation_model_assessment_unavailable"
+                | "invalid_delegation_model_scope"
+                | "execution_time_budget_exhausted"),
+            ) => code,
+            _ => error_kind.map_or("not_reported", |value| {
+                serde_json::from_value::<astra_core::ErrorKind>(value.clone())
+                    .map_or("other", astra_core::ErrorKind::as_str)
+            }),
+        };
+        let execution = match agent_fanout_control_execution_fact(self.raw_result) {
+            Some(AgentFanoutControlExecutionFact::Executed) => "executed",
+            Some(AgentFanoutControlExecutionFact::NotExecuted) => "not_executed",
+            Some(AgentFanoutControlExecutionFact::Unknown) => "unknown",
+            None => "not_reported",
+        };
+        serde_json::json!({"disposition":self.disposition, "ok":self.ok, "status":status,
+            "error_kind":error_kind, "execution":execution})
+    }
+}
+
 impl SessionExecutionCapture {
     fn validated_runs(
         &self,

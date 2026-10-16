@@ -252,7 +252,10 @@ mod tests {
             projected[0]["diagnostic"],
             json!({
                 "kind":"tool_count", "min":1,"max":1,"actual":0,"considered":1,
-                "expected_ok":false,"outcome_matches":1,"error_matches":null,"predicate_matches":[1,0,0]
+                "expected_ok":false,"outcome_matches":1,"error_matches":null,"predicate_matches":[1,0,0],
+                "observed_outcomes":[{"count":1,"outcome":{"disposition":"executed","ok":false,
+                    "status":"rejected","error_kind":"tool_invalid_args","execution":"not_reported"}}],
+                "outcomes_omitted":0
             })
         );
         assert!(
@@ -260,6 +263,67 @@ mod tests {
                 .unwrap()
                 .contains("private-sentinel")
         );
+        for (content, status, error, execution) in [
+            (
+                r#"{"status":"timeout"}"#,
+                "timeout",
+                "not_reported",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"still_running"}"#,
+                "still_running",
+                "not_reported",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"launched"}"#,
+                "launched",
+                "not_reported",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"private-sentinel","error_kind":"private-sentinel","executed":null}"#,
+                "other",
+                "other",
+                "unknown",
+            ),
+            (
+                r#"{"status":{},"error_kind":{},"executed":"private-sentinel"}"#,
+                "not_reported",
+                "other",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"blocked","error_kind":"delegation_model_scope_unresolved","advisory":{"executed":false}}"#,
+                "blocked",
+                "delegation_model_scope_unresolved",
+                "not_executed",
+            ),
+        ] {
+            outcome
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap()
+                .transcript
+                .as_mut()
+                .unwrap()
+                .items[1]
+                .content = content.into();
+            let value = criteria(&results, &outcome).unwrap();
+            let observed = &value[0]["diagnostic"]["observed_outcomes"][0]["outcome"];
+            assert_eq!(observed["status"], status);
+            assert_eq!(observed["error_kind"], error);
+            assert_eq!(observed["execution"], execution);
+            assert!(
+                !serde_json::to_string(&value)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
         outcome.stream_capture = None;
         assert_eq!(
             criteria(&results, &outcome).unwrap()[0]["diagnostic"]["kind"],
@@ -283,6 +347,78 @@ mod tests {
         assert_eq!(
             nested[0]["diagnostic"]["checks"][1]["diagnostic"],
             json!({"kind":"count", "min":0,"max":45_000,"actual":80_000})
+        );
+    }
+
+    #[test]
+    fn tool_outcome_buckets_are_bounded_without_changing_exact_counts() {
+        let mut capture = crate::execution_capture::tests::tool_capture();
+        let kinds = [
+            "rate_limit",
+            "payment_required",
+            "server_error",
+            "auth",
+            "context_window",
+            "invalid_request",
+            "contract_violation",
+            "stream_idle",
+            "provider_deadline",
+            "stream_transport",
+            "connection_pool_exhausted",
+            "budget_exhausted",
+            "tool_rounds_exhausted",
+            "network",
+            "tool_not_found",
+            "tool_invalid_args",
+            "policy_denied",
+        ];
+        capture.run_tree.runs[0].total_tool_calls = 20;
+        let page = capture.transcript.as_mut().unwrap();
+        let (request, result) = (page.items[0].clone(), page.items[1].clone());
+        page.items.drain(..2);
+        for index in 0..20 {
+            let mut request = request.clone();
+            let mut result = result.clone();
+            let id = format!("call-{index}");
+            request.item_seq = 10 + index * 2;
+            result.item_seq = request.item_seq + 1;
+            request.tool_calls[0].tool_use_id = id.clone();
+            result.tool_result.as_mut().unwrap().tool_use_id = id;
+            result.tool_result.as_mut().unwrap().status = Some("failed".into());
+            result.content = json!({"error_kind":kinds[if index < 17 {index as usize} else {0}],
+                "status":"failed", "error":"private-sentinel"})
+            .to_string();
+            page.items.extend([request, result]);
+        }
+        let mut outcome = RunOutcome::new("model");
+        outcome.run_id = Some("root".into());
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(capture);
+        outcome.stream_capture = Some(stream);
+        let criterion: Criterion = serde_json::from_value(json!({"type":"execution_tool_count",
+            "name":"agent", "min":1,"max":1,"ok":true,"root_only":true}))
+        .unwrap();
+        let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+        let projected = criteria(&results, &outcome).unwrap();
+        let diagnostic = &projected[0]["diagnostic"];
+        assert_eq!(diagnostic["considered"], 20);
+        assert_eq!(diagnostic["actual"], 0);
+        assert_eq!(diagnostic["outcome_matches"], 0);
+        assert_eq!(diagnostic["outcomes_omitted"], 1);
+        let buckets = diagnostic["observed_outcomes"].as_array().unwrap();
+        assert_eq!(buckets.len(), 16);
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|b| b["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            19
+        );
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-sentinel")
         );
     }
 
