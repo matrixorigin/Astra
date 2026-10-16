@@ -1380,11 +1380,16 @@ impl RuntimeToolExecutor {
         }
     }
 
-    pub(crate) fn provider_is_collaborator_stage(&self, public_alias: &str) -> bool {
+    pub(crate) fn collaborator_policy(
+        &self,
+        public_alias: &str,
+        model: Option<&str>,
+    ) -> Result<astra_turn_core::provider_resolution::ResolvedInvocationPolicy, String> {
         self.provider_policy_index
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_collaborator_stage(public_alias)
+            .resolve_collaborator(public_alias, model)
+            .cloned()
     }
 
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {

@@ -635,6 +635,7 @@ pub fn server_host_builder(
     .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
     .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
     .with_static_tool_catalog_admissible(false)
+    .with_explain_analyze_requested(true)
 }
 
 pub fn loop_state(
@@ -809,6 +810,250 @@ impl astra_services::ModelService for OfferingCatalogFixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn child_read_observation_requires_successful_provider_delivery() {
+        use crate::turn::agentic_loop::host::AgenticLoopHost;
+        use astra_services::session_journal::TurnEventBuffer;
+        for success in [false, true] {
+            let response = if success {
+                ProviderResponse::OpenAi(json!({"id":"read-response","model":"fixture-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"Result received."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":100,"completion_tokens":3,"total_tokens":103}}))
+            } else {
+                ProviderResponse::Json {
+                    status: StatusCode::BAD_REQUEST,
+                    body: json!({"error":{"type":"invalid_request_error","message":"invalid fixture request"}}),
+                }
+            };
+            let gateway = ProviderGateway::start(vec![ProviderScript::new(
+                "child read delivery",
+                |request| request.path == "/v1/chat/completions",
+                vec![response],
+            )])
+            .await;
+            let ledger = InferenceLedgerFixture::default();
+            let session = format!("child-read-{}", uuid::Uuid::new_v4());
+            let mut host =
+                server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
+                    .build();
+            let content = json!({"status":"completed","agent_id":"member","run_id":"child",
+                "result":"界".repeat(2000)})
+            .to_string();
+            let mut message = json!({"role":"tool","tool_call_id":"read-child","_tool_name":"agent",
+                "_round_index":0,"content":content});
+            astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+                &mut message,
+                Some("read-parent"),
+            )
+            .unwrap();
+            let mut state = loop_state(
+                &session,
+                vec![
+                    json!({"role":"user","content":"Read the child result."}),
+                    json!({"role":"assistant","tool_calls":[{"id":"read-child","type":"function",
+                    "function":{"name":"agent","arguments":"{\"action\":\"get_result\",\"agent_id\":\"member\"}"}}]}),
+                    message,
+                ],
+                "Report the result.",
+            );
+            state.current_run_id = Some("read-parent".into());
+            state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(Some(&session), 1));
+            host.prepare_model_selection(&mut state).await.unwrap();
+            let result = host.execute_turn(&mut state).await;
+            assert_eq!(result.is_ok(), success, "{:?}", result.as_ref().err());
+            let requests = gateway.requests.lock().await;
+            assert!(
+                requests[0].body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "tool" && m["content"] == content)
+            );
+            let events = state.turn_event_buffer.as_mut().unwrap().drain();
+            let facts: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event.metadata.as_ref().is_some_and(|meta| {
+                        meta["name"] == "agent_dependency_boundary"
+                            && meta["attrs"]["outcome"] == "results_adopted"
+                    })
+                })
+                .collect();
+            assert_eq!(facts.len(), usize::from(success));
+            if success {
+                let children: Value = serde_json::from_str(
+                    facts[0].metadata.as_ref().unwrap()["attrs"]["children"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(children[0]["result_range"], json!([0, 6000, 6000]));
+            }
+            gateway.assert_complete();
+            ledger.assert_quiescent();
+        }
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn execute_turn_replans_tier_after_compaction_memory_refresh() {
+        use crate::session_memory::runner::{SESSION_MEMORY_PREFIX, encode_session_memory_entry};
+        use crate::turn::agentic_loop::host::AgenticLoopHost;
+        use astra_memoria::{MemoriaMemory, MemoriaOperationError, MemoriaPort};
+        use astra_turn_core::cloud::compact_prompt::COMPACT_SYSTEM_PROMPT;
+        use astra_turn_core::compaction_types::CompactionTier;
+
+        struct RefreshingSessionMemory {
+            session_id: String,
+            initial: String,
+            refreshed: String,
+            snapshot_reads: Mutex<Vec<bool>>,
+        }
+
+        #[async_trait::async_trait]
+        impl MemoriaPort for RefreshingSessionMemory {
+            async fn retrieve_for_prompt(
+                &self,
+                _query: &str,
+                user_id: &str,
+                session_id: &str,
+                _top_k: usize,
+            ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
+                assert_eq!(user_id, "provider-fixture-user");
+                assert_eq!(session_id, self.session_id);
+                Ok(Vec::new())
+            }
+
+            async fn retrieve_ext(
+                &self,
+                query: &str,
+                session_id: Option<&str>,
+                _top_k: usize,
+                filter_session: bool,
+            ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
+                assert_eq!(session_id, Some(self.session_id.as_str()));
+                assert!(filter_session);
+                // Initial prompt recall and snapshot loading run concurrently.
+                // Identify the canonical snapshot query, never their call order.
+                let initial = query.starts_with(SESSION_MEMORY_PREFIX);
+                self.snapshot_reads.lock().unwrap().push(initial);
+                Ok(vec![MemoriaMemory {
+                    memory_id: "session-snapshot".into(),
+                    session_id: Some(self.session_id.clone()),
+                    memory_type: "working".into(),
+                    content: if initial {
+                        self.initial.clone()
+                    } else {
+                        self.refreshed.clone()
+                    },
+                    ..Default::default()
+                }])
+            }
+
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                panic!("context assembly must not write memory")
+            }
+
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                panic!("context assembly must not purge memory")
+            }
+        }
+
+        let gateway = ProviderGateway::start(vec![
+            ProviderScript::new(
+                "one existing compaction summary",
+                |request| request.path == "/v1/chat/completions"
+                    && request.body["stream"] == true
+                    && request.body["messages"][0]["content"] == COMPACT_SYSTEM_PROMPT,
+                vec![ProviderResponse::OpenAi(json!({
+                    "id":"compaction-summary", "model":"fixture-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":
+                        "<summary>### Primary Request\nReview the historical evidence.\n### Pending Tasks\nReport the review.\n### Current Work\nReading the supplied evidence.\n### Current State\nThe review remains active.</summary>"
+                    },"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":100,"completion_tokens":30,"total_tokens":130}
+                }))],
+            ),
+            ProviderScript::new(
+                "one terminal provider response after memory refresh",
+                |request| request.path == "/v1/chat/completions"
+                    && request.body["stream"] == true
+                    && request.body["messages"][0]["content"] != COMPACT_SYSTEM_PROMPT,
+                vec![ProviderResponse::OpenAi(json!({
+                    "id":"memory-refresh-response", "model":"fixture-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"Review complete."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":100,"completion_tokens":3,"total_tokens":103}
+                }))],
+            ),
+        ])
+        .await;
+        let ledger = InferenceLedgerFixture::default();
+        let session = format!("memory-refresh-{}", uuid::Uuid::new_v4());
+        let memory = Arc::new(RefreshingSessionMemory {
+            session_id: session.clone(),
+            // The initial bound snapshot alone exceeds the Offering's input
+            // window; the refreshed snapshot leaves this fixed history small.
+            initial: encode_session_memory_entry(
+                &session,
+                &format!(
+                    "## Current State\n- Initial snapshot: {}",
+                    "earlier detail ".repeat(40_000)
+                ),
+            ),
+            refreshed: encode_session_memory_entry(
+                &session,
+                "## Current State\n- Refreshed snapshot: review remains active.",
+            ),
+            snapshot_reads: Mutex::new(Vec::new()),
+        });
+        let mut host =
+            server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
+                .with_memoria_client(Some(memory.clone()))
+                .build();
+        let history = (0..12)
+            .map(|index| json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(200)),
+            }))
+            .collect();
+        let mut state = loop_state(&session, history, "Summarize the review evidence.");
+        host.prepare_model_selection(&mut state).await.unwrap();
+        let result = host
+            .execute_turn(&mut state)
+            .await
+            .expect("refreshed turn must finish");
+
+        // Compaction retrieves only at a non-Normal initial tier. Ending at
+        // Normal proves the real execute_turn rerun crossed the old assertion.
+        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [true, false]);
+        assert_eq!(
+            state.last_llm_context_manifest_trace.as_ref().unwrap()["compaction_tier"],
+            "Normal"
+        );
+        assert_eq!(state.compact_tier_applied, CompactionTier::AggressivePrune);
+        assert_eq!(result.accum.full_text, "Review complete.");
+        assert_eq!(result.accum.finish_reason.as_deref(), Some("stop"));
+        gateway.assert_complete();
+        ledger.assert_quiescent();
+        assert_eq!(
+            ledger.attempt_count(),
+            2,
+            "one summary and one main request"
+        );
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let messages = serde_json::to_string(&requests[1].body["messages"]).unwrap();
+        assert!(messages.contains("Refreshed snapshot"));
+        assert!(!messages.contains("Initial snapshot"));
+        assert!(messages.contains("Summarize the review evidence."));
+    }
 
     #[tokio::test]
     async fn wrong_endpoint_or_method_is_captured_after_script_completion() {

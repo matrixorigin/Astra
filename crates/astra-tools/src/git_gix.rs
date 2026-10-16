@@ -124,7 +124,7 @@ struct GitBinding {
 
 #[cfg(unix)]
 fn open_directory_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    let root = std::fs::File::open("/")?;
+    let root = astra_sandbox::open_filesystem_root()?;
     astra_sandbox::open_directory_beneath(
         &root,
         path.strip_prefix("/").map_err(std::io::Error::other)?,

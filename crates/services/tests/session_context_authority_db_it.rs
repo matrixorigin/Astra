@@ -17,6 +17,227 @@ use astra_turn_types::{
 use serial_test::serial;
 use uuid::Uuid;
 
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn canonical_commit_releases_only_its_own_completed_writer() {
+    let pool = common::setup_pool().await;
+    let owner = format!("commit-release-owner-{}", Uuid::new_v4());
+    let session = format!("commit-release-session-{}", Uuid::new_v4());
+    let key = SessionKeyV1::owner_session("server", &owner, &session, "main");
+    let actor = ActorContextV1::owner_user(
+        &owner,
+        "commit-release-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let (lease, reservation) = match coordinator
+        .acquire_writer_and_reserve_turn(
+            &key,
+            None,
+            &actor,
+            Duration::from_secs(30),
+            "writer-1",
+            "turn-1",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    let delta = |turn| CanonicalTurnDeltaV1 {
+        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        completed_turn: turn,
+        journal_event_seq: u64::from(turn),
+        conversation_seq: u64::from(turn),
+        compaction_generation: 0,
+        config_version_id: None,
+        mode: CanonicalDeltaModeV1::Append,
+        logical_segments: vec![vec![
+            serde_json::json!({"role":"assistant", "content":"hi"}),
+        ]],
+    };
+    assert!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(2), "invalid-turn",)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(lease)
+    );
+    assert!(coordinator.load_head(&key).await.unwrap().is_none());
+    let (first, concurrent_retry) = tokio::join!(
+        coordinator.commit_turn_and_release_writer(&reservation, delta(1), "commit-1"),
+        coordinator.commit_turn_and_release_writer(&reservation, delta(1), "commit-1"),
+    );
+    let outcomes = [first.unwrap(), concurrent_retry.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, CoordinatorMutationV1::Applied { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, CoordinatorMutationV1::AlreadyApplied { .. }))
+            .count(),
+        1
+    );
+    let cursor = match &outcomes[0] {
+        CoordinatorMutationV1::Applied { cursor }
+        | CoordinatorMutationV1::AlreadyApplied { cursor } => cursor.clone(),
+        other => panic!("unexpected commit: {other:?}"),
+    };
+    let commit_actor: Option<String> = sqlx::query_scalar(
+        "SELECT actor_id FROM session_context_authority_events
+         WHERE owner_user_id = ? AND session_id = ?
+           AND operation_kind = 'commit_turn' AND outcome = 'committed'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(commit_actor.as_deref(), Some(actor.actor_id.as_str()));
+    assert!(
+        coordinator
+            .load_active_writer(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(1), "commit-1",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    let (next_lease, next_reservation) = match coordinator
+        .acquire_writer_and_reserve_turn(
+            &key,
+            Some(&cursor),
+            &actor,
+            Duration::from_secs(30),
+            "writer-2",
+            "turn-2",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
+        other => panic!("unexpected next admission: {other:?}"),
+    };
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(1), "commit-1",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(next_lease.clone())
+    );
+    // The next reservation must still be valid, not just the writer row.
+    let next_cursor = match coordinator
+        .commit_turn(&next_reservation, delta(2), "commit-2")
+        .await
+        .unwrap()
+    {
+        CoordinatorMutationV1::Applied { cursor } => cursor,
+        other => panic!("unexpected retained commit: {other:?}"),
+    };
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(next_lease.clone())
+    );
+    let third = match coordinator
+        .reserve_turn(
+            &next_lease,
+            Some(&next_cursor),
+            Duration::from_secs(30),
+            "turn-3",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        ReserveTurnOutcome::Reserved(reservation) => reservation,
+        other => panic!("unexpected third reservation: {other:?}"),
+    };
+    // An older retained commit may share this lease but must not erase turn 3.
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&next_reservation, delta(2), "commit-2",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(next_lease)
+    );
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&third, delta(3), "commit-3",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::Applied { .. }
+    ));
+    assert!(
+        coordinator
+            .load_active_writer(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Exercise the archived receipt path after a newer turn has committed.
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(1), "commit-1",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    assert_eq!(
+        coordinator
+            .load_head(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor
+            .completed_turn,
+        3
+    );
+    for table in [
+        "conversation_manifest_segments",
+        "conversation_manifest_nodes",
+        "conversation_segments",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ?"
+        ))
+        .bind(&key.isolation_domain)
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 #[serial]

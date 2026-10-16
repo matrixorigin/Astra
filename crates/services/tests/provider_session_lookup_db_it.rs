@@ -16,7 +16,7 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
     };
     let (pool, settings) = common::setup_pool_and_settings().await;
     let first = DatabaseSessionService::new(settings.clone()).with_pool(pool.clone());
-    let second = DatabaseSessionService::new(settings).with_pool(pool);
+    let second = DatabaseSessionService::new(settings).with_pool(pool.clone());
     let user_id = format!("creation-{}", Uuid::new_v4().simple());
     let principal = AuthPrincipal {
         user: AuthUserRecord {
@@ -52,6 +52,18 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
     let b = b.expect("second replica");
     assert_eq!(a.session.session_id, b.session.session_id);
     assert_ne!(a.created, b.created, "exactly one call creates the session");
+    assert_eq!(a.admission_facts.active_plan_id, None);
+    assert_eq!(b.admission_facts.active_plan_id, None);
+    let active_plan_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "UPDATE agent_sessions SET active_plan_id = ? WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&active_plan_id)
+    .bind(&user_id)
+    .bind(&a.session.session_id)
+    .execute(pool.get())
+    .await
+    .expect("record changed admission fact before response-loss replay");
     let denied = LimitCheck::Denied {
         limit: ResourceLimitKind::DailySessions,
         reason: "limit reached".to_string(),
@@ -62,6 +74,7 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
         .expect("response-loss retry must remain usable at quota");
     assert!(!replay.created);
     assert_eq!(replay.session.session_id, a.session.session_id);
+    assert_eq!(replay.admission_facts.active_plan_id, Some(active_plan_id));
     let mut changed = request.clone();
     changed.title = Some("different payload".to_string());
     let conflict = second

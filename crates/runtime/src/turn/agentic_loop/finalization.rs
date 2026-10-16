@@ -677,9 +677,13 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     finalize_turn_trace(state).await;
 
     // Background session-memory extraction. Fire-and-forget; service
-    // handles LLM vs. rule-based decision, event emission, UX broker,
-    // and debounce. See `crate::session_memory::MemoryExtractionService`.
-    maybe_run_memory_extraction(state);
+    // handles LLM vs. rule-based decision, event emission, UX broker, and
+    // debounce. Server runs own a later post-loop settlement boundary that
+    // is already detached from terminal delivery and must remain the sole
+    // extraction admission point for that surface.
+    if !host.owns_post_loop_memory_settlement() {
+        maybe_run_memory_extraction(state);
+    }
 
     // Desired-state convergence authority is deliberately live-only. A
     // terminal turn (successful, interrupted, or cancelled) must not leave a
@@ -2514,6 +2518,40 @@ mod tests {
         assert!(
             !memoria.stored.lock().unwrap().is_empty(),
             "structured freshness, not message length, admits extraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_defers_memory_to_post_loop_owner() {
+        let sid = format!(
+            "finalize-defers-memory-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let mut host = MockHost::new(Vec::new()).with_post_loop_memory_settlement_owner();
+        let mut state = make_state();
+        state.current_session_id = Some(sid);
+        state.context_manifest_user_id = Some("test-user".into());
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "server turn"}));
+        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        let pending = state
+            .memory_extraction_service
+            .as_ref()
+            .expect("memory extraction service")
+            .wait_for_pending(std::time::Duration::from_millis(20))
+            .await;
+        assert_eq!(pending, 0);
+        assert!(
+            memoria.stored.lock().unwrap().is_empty(),
+            "the post-loop settlement owner must admit extraction at its own boundary"
         );
     }
 

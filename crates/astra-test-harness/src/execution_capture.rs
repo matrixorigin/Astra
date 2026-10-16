@@ -1,7 +1,13 @@
 //! Bounded, owner-bound Server evidence acquired before suite cleanup.
 
+use crate::criteria::FanoutGroupSelector;
 use astra_server_types::{SessionRunLifecycleStatus, SessionRunTreeSnapshot};
 use astra_services::reflect::ReflectReport;
+use astra_services::session_journal::ToolCallDisposition;
+use astra_turn_core::orchestration::agent_result_wire::{
+    AgentFanoutControlExecutionFact, agent_control_result_value,
+    agent_fanout_control_execution_fact,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -70,7 +76,60 @@ pub(crate) struct ExecutionToolCall<'a> {
     pub arguments: Option<Value>,
     pub result: Option<Value>,
     pub raw_result: &'a str,
+    pub disposition: ToolCallDisposition,
     pub ok: Option<bool>,
+}
+
+impl ExecutionToolCall<'_> {
+    /// Public diagnostics contain only recognized machine tags, never result prose.
+    pub(crate) fn safe_outcome(&self) -> Value {
+        let result = agent_control_result_value(self.raw_result);
+        let status = match result.as_ref().and_then(|value| value["status"].as_str()) {
+            Some(
+                status @ ("completed"
+                | "failed"
+                | "rejected"
+                | "blocked"
+                | "started"
+                | "unknown"
+                | "waiting"
+                | "paused"
+                | "cancelled"
+                | "interrupted"
+                | "timeout"
+                | "timed_out"
+                | "still_running"
+                | "launched"
+                | "incomplete"
+                | "completed_with_issues"),
+            ) => status,
+            Some(_) => "other",
+            None => "not_reported",
+        };
+        let error_kind = result.as_ref().and_then(|value| value.get("error_kind"));
+        let error_kind = match error_kind.and_then(Value::as_str) {
+            Some(
+                code @ ("delegation_model_scope_unresolved"
+                | "delegation_model_unavailable"
+                | "delegation_preparation_unavailable"
+                | "delegation_model_assessment_unavailable"
+                | "invalid_delegation_model_scope"
+                | "execution_time_budget_exhausted"),
+            ) => code,
+            _ => error_kind.map_or("not_reported", |value| {
+                serde_json::from_value::<astra_core::ErrorKind>(value.clone())
+                    .map_or("other", astra_core::ErrorKind::as_str)
+            }),
+        };
+        let execution = match agent_fanout_control_execution_fact(self.raw_result) {
+            Some(AgentFanoutControlExecutionFact::Executed) => "executed",
+            Some(AgentFanoutControlExecutionFact::NotExecuted) => "not_executed",
+            Some(AgentFanoutControlExecutionFact::Unknown) => "unknown",
+            None => "not_reported",
+        };
+        serde_json::json!({"disposition":self.disposition, "ok":self.ok, "status":status,
+            "error_kind":error_kind, "execution":execution})
+    }
 }
 
 impl SessionExecutionCapture {
@@ -269,7 +328,6 @@ impl SessionExecutionCapture {
                 && item.tool_result.is_none()
                 && item.evidence.is_none()
                 && (item.content.is_empty()
-                    || item.content.len() > 4096
                     || item.source_event_id.as_deref().is_none_or(str::is_empty)
                     || content.replace(item.content.as_str()).is_some())
             {
@@ -336,12 +394,16 @@ impl SessionExecutionCapture {
             if item.item_seq <= seq || result.name.as_deref() != Some(call.name.as_str()) {
                 return Err("tool result is not bound to its request");
             }
-            // The transcript producer uses ToolCallDisposition, not the Edge
-            // callback vocabulary. Non-executed dispositions do not carry ok.
-            let ok = match result.status.as_deref() {
-                Some("completed") => Some(true),
-                Some("failed" | "rejected") => Some(false),
-                Some("reused" | "suppressed" | "deferred") => None,
+            // Preserve the transcript producer's disposition, not the Edge
+            // callback vocabulary. Rejections report failure; reuse,
+            // suppression and deferral carry no execution outcome.
+            let (disposition, ok) = match result.status.as_deref() {
+                Some("completed") => (ToolCallDisposition::Executed, Some(true)),
+                Some("failed") => (ToolCallDisposition::Executed, Some(false)),
+                Some("rejected") => (ToolCallDisposition::Rejected, Some(false)),
+                Some("reused") => (ToolCallDisposition::Reused, None),
+                Some("suppressed") => (ToolCallDisposition::Suppressed, None),
+                Some("deferred") => (ToolCallDisposition::Deferred, None),
                 _ => return Err("tool terminal disposition unavailable"),
             };
             ordered.push((
@@ -354,6 +416,7 @@ impl SessionExecutionCapture {
                     arguments: serde_json::from_str(&call.arguments).ok(),
                     result: serde_json::from_str(&item.content).ok(),
                     raw_result: &item.content,
+                    disposition,
                     ok,
                 },
             ));
@@ -446,7 +509,7 @@ impl SessionExecutionCapture {
         &'a self,
         root: &str,
         expected: &[crate::criteria::ChildExecutionExpectation],
-        fanout_group: Option<&str>,
+        fanout_group: Option<&FanoutGroupSelector>,
     ) -> Result<Option<Vec<VerifiedChildEvidence<'a>>>, &'static str> {
         use crate::criteria::ChildThinkingExpectation;
         let runs = self.validated_runs(root)?;
@@ -509,23 +572,100 @@ impl SessionExecutionCapture {
         let mut slots = std::collections::BTreeMap::new();
         if let Some(group) = fanout_group {
             let tools = self.tools(root)?;
-            let mut starts = tools.iter().filter(|call| {
+            let field = match group {
+                FanoutGroupSelector::Id(_) => "group_id",
+                FanoutGroupSelector::Title(_) => "title",
+            };
+            let mut start = None;
+            let mut missing_selection = false;
+            for call in tools.iter().filter(|call| {
                 call.run_id == root
                     && call.name == "agent_fanout"
                     && call
                         .arguments
                         .as_ref()
-                        .is_some_and(|args| args["action"] == "start" && args["group_id"] == group)
-            });
-            let Some(start) = starts.next() else {
+                        .is_some_and(|args| args["action"] == "start")
+            }) {
+                if call.disposition == ToolCallDisposition::Rejected {
+                    // A pre-execution rejection is not another launch, even
+                    // when it references an existing group. Contradictory or
+                    // explicitly unknown execution cannot be discarded.
+                    if agent_control_result_value(call.raw_result)
+                        .is_some_and(|value| value["status"] == "started")
+                    {
+                        return Ok(None);
+                    }
+                    match agent_fanout_control_execution_fact(call.raw_result) {
+                        Some(AgentFanoutControlExecutionFact::Executed) => return Ok(None),
+                        Some(AgentFanoutControlExecutionFact::Unknown) => {
+                            return Err("fanout rejection execution unknown");
+                        }
+                        None | Some(AgentFanoutControlExecutionFact::NotExecuted) => continue,
+                    }
+                }
+                match call.result.as_ref().and_then(|receipt| receipt.get(field)) {
+                    None | Some(Value::Null) => missing_selection = true,
+                    Some(Value::String(actual)) if actual == group.value().trim() => {
+                        if start.replace(call).is_some() {
+                            return Ok(None);
+                        }
+                    }
+                    Some(Value::String(_)) => {}
+                    _ => return Ok(None),
+                }
+            }
+            if missing_selection {
+                return Err("fanout selection identity unavailable");
+            }
+            let Some(start) = start else {
                 return Ok(None);
             };
-            if starts.next().is_some() || start.ok != Some(true) {
+            if start.ok != Some(true) {
                 return Ok(None);
             }
             let receipt = start.result.as_ref().ok_or("fanout receipt unavailable")?;
-            if receipt["group_id"] != group {
-                return Ok(None);
+            // Selection is not identity proof. Every current start receipt
+            // carries the same canonical identity in these producer projections.
+            let receipt_id = match &receipt["group_id"] {
+                Value::Null => return Err("fanout group identity unavailable"),
+                Value::String(id) if !id.trim().is_empty() && id.trim() == id => id.as_str(),
+                _ => return Ok(None),
+            };
+            let args = start.arguments.as_ref().expect("selected start arguments");
+            match &args["group_id"] {
+                Value::Null => {}
+                Value::String(id) if !id.trim().is_empty() && id.trim() == receipt_id => {}
+                _ => return Ok(None),
+            }
+            let expected_title = match &args["title"] {
+                Value::Null => receipt_id,
+                Value::String(title) => {
+                    if title.trim().is_empty() {
+                        receipt_id
+                    } else {
+                        title.trim()
+                    }
+                }
+                _ => return Ok(None),
+            };
+            let mut missing_identity = false;
+            for (path, expected) in [
+                ("/status", "started"),
+                ("/title", expected_title),
+                ("/fanout/group_id", receipt_id),
+                ("/fanout/title", expected_title),
+                ("/fanout/parent_run_id", root),
+                ("/work_unit_observation/id", receipt_id),
+                ("/work_unit_observation/kind", "agent_fanout"),
+            ] {
+                match receipt.pointer(path) {
+                    None | Some(Value::Null) => missing_identity = true,
+                    Some(Value::String(actual)) if actual == expected => {}
+                    _ => return Ok(None),
+                }
+            }
+            if missing_identity {
+                return Err("fanout receipt identity projections unavailable");
             }
             let agents = receipt["agents"]
                 .as_array()
@@ -741,7 +881,7 @@ impl SessionExecutionCapture {
             if !observed_digests.is_empty() && !observed_digests.contains(&digest.as_str()) {
                 return Ok(None);
             }
-            match self.child_adoption_time(root, child, &digest, &expectation.model, &facts) {
+            match self.child_adoption_time(root, child, content, &expectation.model, &facts) {
                 Ok(time) => {
                     latest_adoption = Some(
                         latest_adoption
@@ -808,7 +948,7 @@ impl SessionExecutionCapture {
         &self,
         root: &str,
         expected: &[crate::criteria::ChildExecutionExpectation],
-        fanout_group: Option<&str>,
+        fanout_group: Option<&FanoutGroupSelector>,
     ) -> Result<bool, &'static str> {
         self.verified_children(root, expected, fanout_group)
             .map(|evidence| evidence.is_some())
@@ -947,7 +1087,7 @@ impl SessionExecutionCapture {
         &self,
         root_id: &str,
         child: &astra_server_types::SessionRunNode,
-        digest: &str,
+        content: &str,
         model: &str,
         facts: &[&Value],
     ) -> Result<chrono::NaiveDateTime, &'static str> {
@@ -981,27 +1121,70 @@ impl SessionExecutionCapture {
         if !physical {
             return Err("child physical execution unavailable");
         }
-        let adopted = facts
-            .iter()
-            .filter(|fact| {
-                fact["kind"] == "agent_dependency_boundary"
-                    && fact["run_id"] == root_id
-                    && fact["parent_run_id"] == root_id
-                    && fact["outcome"] == "results_adopted"
-                    && fact["children"].as_array().is_some_and(|children| {
-                        children.iter().any(|entry| {
-                            entry["agent_id"] == agent
-                                && entry["run_id"] == child.run_id
-                                && entry["status"] == "completed"
-                                && entry["result_truncated"] == false
-                                && entry["result_sha256"] == digest
-                        })
-                    })
-            })
-            .filter_map(|adoption| fact_time(adoption))
-            .min()
-            .ok_or("child result adoption unavailable")?;
-        Ok(adopted)
+        let mut windows = Vec::new();
+        for fact in facts.iter().filter(|fact| {
+            fact["kind"] == "agent_dependency_boundary"
+                && fact["run_id"] == root_id
+                && fact["parent_run_id"] == root_id
+                && fact["outcome"] == "results_adopted"
+        }) {
+            let Some(time) = fact_time(fact) else {
+                continue;
+            };
+            for entry in fact["children"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|entry| {
+                    entry["agent_id"] == agent
+                        && entry["run_id"] == child.run_id
+                        && entry["status"] == "completed"
+                })
+            {
+                let Some(digest) = entry["result_sha256"].as_str() else {
+                    continue;
+                };
+                let range = if entry["result_range"].is_null() {
+                    if entry["result_truncated"] != false {
+                        continue;
+                    }
+                    [0, content.len(), content.len()]
+                } else {
+                    serde_json::from_value::<[usize; 3]>(entry["result_range"].clone())
+                        .map_err(|_| "child result window unavailable")?
+                };
+                let [start, end, total] = range;
+                if total != content.len() {
+                    return Err("child result window identity conflict");
+                }
+                let slice = content
+                    .get(start..end)
+                    .ok_or("child result window invalid")?;
+                if digest != format!("{:x}", Sha256::digest(slice.as_bytes())) {
+                    return Err("child result window digest conflict");
+                }
+                windows.push((start, end, time));
+            }
+        }
+        // Overlapping/repeated pages are fine; a gap, wrong payload or only a
+        // prefix is not complete custody. No model text participates in this proof.
+        windows.sort_unstable_by_key(|(_, _, time)| *time);
+        let mut ranges = Vec::new();
+        for (start, end, time) in windows {
+            ranges.push((start, end));
+            ranges.sort_unstable();
+            let mut covered = 0;
+            for &(start, end) in &ranges {
+                if start > covered {
+                    break;
+                }
+                covered = covered.max(end);
+            }
+            if covered == content.len() {
+                return Ok(time);
+            }
+        }
+        Err("child result adoption unavailable")
     }
 }
 
@@ -1173,7 +1356,7 @@ pub(crate) mod tests {
     fn proof_failure(
         capture: SessionExecutionCapture,
         children: Vec<crate::criteria::ChildExecutionExpectation>,
-        group: Option<&str>,
+        group: Option<&FanoutGroupSelector>,
     ) -> Option<crate::classify::FailureClass> {
         let mut outcome = crate::runner::RunOutcome::new("test-model").with_exit_code(0);
         outcome.session_id = Some(capture.session_id.clone());
@@ -1185,7 +1368,7 @@ pub(crate) mod tests {
         let results = crate::criteria::evaluate_deterministic(
             &[crate::criteria::Criterion::ExecutionChildResultsAdopted {
                 children,
-                fanout_group: group.map(str::to_owned),
+                fanout_group: group.cloned(),
             }],
             &outcome,
         );
@@ -1291,7 +1474,102 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn child_custody_requires_matching_complete_windows_before_finalization() {
+        let mut capture = tool_capture();
+        let content = "界".repeat(3000);
+        capture.transcript.as_mut().unwrap().items[2].content = content.clone();
+        let facts = capture.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .pointer_mut("/execution_spine/facts")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let template = facts[1].clone();
+        facts.remove(1);
+        let window = |start: usize, end: usize| {
+            let mut fact = template.clone();
+            fact["children"][0]["result_range"] = serde_json::json!([start, end, content.len()]);
+            fact["children"][0]["result_truncated"] = true.into();
+            fact["children"][0]["result_sha256"] = serde_json::json!(format!(
+                "{:x}",
+                Sha256::digest(&content.as_bytes()[start..end])
+            ));
+            fact
+        };
+        facts.push(window(0, 4095));
+        assert!(!singleton_proven(
+            &capture,
+            Some("root"),
+            &content,
+            "test-model"
+        ));
+        // Overlap and out-of-order reads are legitimate; skipped UTF-8 bytes,
+        // wrong siblings and pages observed after finalization are not.
+        let mut full = capture.clone();
+        full.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .pointer_mut("/execution_spine/facts")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .extend([window(6000, 9000), window(3000, 6000)]);
+        assert!(singleton_proven(
+            &full,
+            Some("root"),
+            &content,
+            "test-model"
+        ));
+        let mut duplicate = window(0, 4095);
+        duplicate["created_at"] = "2026-10-07T00:01:00.000000".into();
+        full.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .pointer_mut("/execution_spine/facts")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(
+            singleton_proven(&full, Some("root"), &content, "test-model"),
+            "later rereads do not erase earlier complete adoption"
+        );
+        for broken in ["gap", "digest", "identity", "late", "utf8", "total"] {
+            let mut bad = capture.clone();
+            let mut page = window(4095, 9000);
+            match broken {
+                "gap" => page = window(4098, 9000),
+                "digest" => page["children"][0]["result_sha256"] = "0".repeat(64).into(),
+                "identity" => page["children"][0]["run_id"] = "other-child".into(),
+                "late" => page["created_at"] = "2026-10-07T00:01:00.000000".into(),
+                "utf8" => page["children"][0]["result_range"][0] = 4096.into(),
+                "total" => page["children"][0]["result_range"][2] = 8999.into(),
+                _ => unreachable!(),
+            }
+            bad.reflection.graph_slice.nodes[0]
+                .metadata
+                .as_mut()
+                .unwrap()
+                .pointer_mut("/execution_spine/facts")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(page);
+            assert!(
+                !singleton_proven(&bad, Some("root"), &content, "test-model"),
+                "{broken}"
+            );
+        }
+    }
+
+    #[test]
     fn sibling_custody_requires_exact_children_before_one_root_finalization() {
+        let group = FanoutGroupSelector::Id("group".into());
+        let named = FanoutGroupSelector::Title("group".into());
         let mut capture = tool_capture();
         let mut sibling = capture.run_tree.runs[1].clone();
         sibling.run_id = "sibling".into();
@@ -1302,7 +1580,11 @@ pub(crate) mod tests {
         page.items[0].tool_calls[0].arguments =
             serde_json::json!({"action":"start", "group_id":"group"}).to_string();
         page.items[1].tool_result.as_mut().unwrap().name = Some("agent_fanout".into());
-        page.items[1].content = serde_json::json!({"group_id":"group", "agents":[
+        page.items[1].content = serde_json::json!({
+            "status":"started", "group_id":"group", "title":"group",
+            "fanout":{"group_id":"group", "title":"group", "parent_run_id":"root"},
+            "work_unit_observation":{"id":"group", "kind":"agent_fanout"},
+            "agents":[
             {"slot_index":0,"id":"slot-0","run_id":"child","agent_id":"member"},
             {"slot_index":1,"id":"slot-1","run_id":"sibling","agent_id":"sibling-agent"},
         ]})
@@ -1340,9 +1622,183 @@ pub(crate) mod tests {
             expectation("second-value", "test-model", Some(1)),
         ];
         assert_eq!(
-            capture.proves_children("root", &expected, Some("group")),
+            capture.proves_children("root", &expected, Some(&group)),
             Ok(true)
         );
+        // A requested title is independent of an optional explicit ID. All
+        // launch forms must pass the same identity and custody proof.
+        for (arguments, receipt_id, proven) in [
+            (r#"{"action":"start","title":"group"}"#, "generated", true),
+            (r#"{"action":"start","title":" group "}"#, "generated", true),
+            (
+                r#"{"action":"start","group_id":null,"title":"group"}"#,
+                "generated",
+                true,
+            ),
+            (r#"{"action":"start","group_id":" group "}"#, "group", true),
+            (
+                r#"{"action":"start","group_id":"group","title":""}"#,
+                "group",
+                true,
+            ),
+            (
+                r#"{"action":"start","group_id":"group","title":" "}"#,
+                "group",
+                true,
+            ),
+            (r#"{"action":"start","group_id":"group"}"#, "other", false),
+            (
+                r#"{"action":"start","group_id":"other","title":"group"}"#,
+                "other",
+                true,
+            ),
+            (
+                r#"{"action":"start","group_id":"","title":"group"}"#,
+                "generated",
+                false,
+            ),
+            (
+                r#"{"action":"start","group_id":42,"title":"group"}"#,
+                "generated",
+                false,
+            ),
+            (r#"{"action":"start","title":"other"}"#, "generated", false),
+        ] {
+            let mut altered = capture.clone();
+            let page = altered.transcript.as_mut().unwrap();
+            page.items[0].tool_calls[0].arguments = arguments.into();
+            let mut receipt: Value = serde_json::from_str(&page.items[1].content).unwrap();
+            receipt["group_id"] = receipt_id.into();
+            receipt["fanout"]["group_id"] = receipt_id.into();
+            receipt["work_unit_observation"]["id"] = receipt_id.into();
+            page.items[1].content = receipt.to_string();
+            assert_eq!(
+                altered.proves_children("root", &expected, Some(&named)),
+                Ok(proven),
+                "{arguments}"
+            );
+            let exact = FanoutGroupSelector::Id(receipt_id.into());
+            assert_eq!(
+                altered.proves_children("root", &expected, Some(&exact)),
+                Ok(proven),
+                "{arguments}"
+            );
+        }
+        let mut ambiguous = capture.clone();
+        ambiguous.run_tree.runs[0].total_tool_calls = 2;
+        let page = ambiguous.transcript.as_mut().unwrap();
+        page.items[0].tool_calls[0].arguments =
+            serde_json::json!({"action":"start", "title":"group"}).to_string();
+        let mut request = page.items[0].clone();
+        request.item_seq = 5;
+        request.tool_calls[0].tool_use_id = "second-call".into();
+        request.tool_calls[0].arguments =
+            serde_json::json!({"action":"start", "title":"other"}).to_string();
+        let mut receipt = page.items[1].clone();
+        receipt.item_seq = 6;
+        receipt.tool_result.as_mut().unwrap().tool_use_id = "second-call".into();
+        page.items.extend([request, receipt]);
+        assert_eq!(
+            ambiguous.proves_children("root", &expected, Some(&named)),
+            Ok(false),
+            "a display title cannot disambiguate multiple launches"
+        );
+        for (status, content, proof) in [
+            ("rejected", "{}", Ok(true)),
+            ("rejected", "not JSON", Ok(true)),
+            (
+                "rejected",
+                r#"{"executed":false,"group_id":"group","title":"group"}"#,
+                Ok(true),
+            ),
+            ("rejected", r#"{"executed":true}"#, Ok(false)),
+            ("rejected", r#"{"status":"started"}"#, Ok(false)),
+            (
+                "rejected",
+                "{\"status\":\"started\",\"group_id\":\"group\"}\nRecovery guidance",
+                Ok(false),
+            ),
+            (
+                "rejected",
+                r#"{"executed":null}"#,
+                Err("fanout rejection execution unknown"),
+            ),
+            ("failed", "{}", Err("fanout selection identity unavailable")),
+            (
+                "failed",
+                "not JSON",
+                Err("fanout selection identity unavailable"),
+            ),
+            (
+                "failed",
+                r#"{"executed":null}"#,
+                Err("fanout selection identity unavailable"),
+            ),
+        ] {
+            let mut altered = ambiguous.clone();
+            let page = altered.transcript.as_mut().unwrap();
+            // Move the second attempt before the successful launch, retaining
+            // distinct, ordered request/result identities and both children.
+            for item in &mut page.items {
+                item.item_seq = if item.item_seq >= 5 {
+                    item.item_seq - 4
+                } else {
+                    item.item_seq + 2
+                };
+            }
+            let receipt = page.items.last_mut().unwrap();
+            receipt.tool_result.as_mut().unwrap().status = Some(status.into());
+            receipt.content = content.into();
+            page.items.sort_by_key(|item| item.item_seq);
+            assert_eq!(altered.tools("root").unwrap().len(), 2);
+            for selector in [&group, &named] {
+                assert_eq!(
+                    altered.proves_children("root", &expected, Some(selector)),
+                    proof,
+                    "{status}: {content} / {selector:?}"
+                );
+            }
+        }
+        let mut missing_selection = ambiguous.clone();
+        let page = missing_selection.transcript.as_mut().unwrap();
+        let mut receipt: Value = serde_json::from_str(&page.items.last().unwrap().content).unwrap();
+        receipt.as_object_mut().unwrap().remove("title");
+        page.items.last_mut().unwrap().content = receipt.to_string();
+        assert!(
+            missing_selection
+                .proves_children("root", &expected, Some(&named))
+                .is_err()
+        );
+        for path in [
+            "/group_id",
+            "/status",
+            "/title",
+            "/fanout/group_id",
+            "/fanout/title",
+            "/fanout/parent_run_id",
+            "/work_unit_observation/id",
+            "/work_unit_observation/kind",
+        ] {
+            let mut altered = capture.clone();
+            let mut receipt: Value =
+                serde_json::from_str(&altered.transcript.as_ref().unwrap().items[1].content)
+                    .unwrap();
+            *receipt.pointer_mut(path).unwrap() = "wrong".into();
+            altered.transcript.as_mut().unwrap().items[1].content = receipt.to_string();
+            assert_eq!(
+                altered.proves_children("root", &expected, Some(&named)),
+                Ok(false),
+                "{path}"
+            );
+            *receipt.pointer_mut(path).unwrap() = Value::Null;
+            altered.transcript.as_mut().unwrap().items[1].content = receipt.to_string();
+            assert!(
+                altered
+                    .proves_children("root", &expected, Some(&named))
+                    .is_err(),
+                "{path}"
+            );
+        }
         // A slot's optional display label is not its identity: the group and
         // slot index bind the authoritative child run even when labels are null.
         let mut unlabelled = capture.clone();
@@ -1353,7 +1809,7 @@ pub(crate) mod tests {
         }
         *content = receipt.to_string();
         assert_eq!(
-            unlabelled.proves_children("root", &expected, Some("group")),
+            unlabelled.proves_children("root", &expected, Some(&group)),
             Ok(true)
         );
         let mut missing_model_for_order = capture.clone();
@@ -1362,12 +1818,12 @@ pub(crate) mod tests {
             proof_failure(
                 missing_model_for_order.clone(),
                 expected.to_vec(),
-                Some("group")
+                Some(&group)
             ),
             Some(crate::classify::FailureClass::InfraVerificationUnavailable)
         );
         assert_eq!(
-            capture.proves_children("root", &expected[..1], Some("group")),
+            capture.proves_children("root", &expected[..1], Some(&group)),
             Ok(false)
         );
         for expectations in [
@@ -1382,7 +1838,7 @@ pub(crate) mod tests {
         ] {
             assert!(
                 matches!(
-                    missing_model_for_order.verified_children("root", &expectations, Some("group")),
+                    missing_model_for_order.verified_children("root", &expectations, Some(&group)),
                     Ok(None)
                 ),
                 "missing-model sibling must not hide a known contradiction"
@@ -1392,7 +1848,7 @@ pub(crate) mod tests {
             capture.proves_children(
                 "root",
                 &[expected[0].clone(), expected[0].clone()],
-                Some("group")
+                Some(&group)
             ),
             Ok(false)
         );
@@ -1403,7 +1859,7 @@ pub(crate) mod tests {
                     expectation("second-value", "test-model", Some(0)),
                     expectation("observed-value", "test-model", Some(1)),
                 ],
-                Some("group")
+                Some(&group)
             ),
             Ok(false)
         );
@@ -1435,7 +1891,7 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             }
             assert_ne!(
-                altered.proves_children("root", &expected, Some("group")),
+                altered.proves_children("root", &expected, Some(&group)),
                 Ok(true),
                 "{fault}"
             );
@@ -1480,7 +1936,7 @@ pub(crate) mod tests {
                 *content = receipt.to_string();
             }
             assert_eq!(
-                altered.proves_children("root", &expected, Some("group")),
+                altered.proves_children("root", &expected, Some(&group)),
                 Ok(false),
                 "{fault}"
             );
@@ -1495,7 +1951,7 @@ pub(crate) mod tests {
             .pop();
         assert!(
             missing
-                .proves_children("root", &expected, Some("group"))
+                .proves_children("root", &expected, Some(&group))
                 .is_err(),
             "successful collection and parent finalization cannot replace one missing adoption"
         );
@@ -1512,7 +1968,7 @@ pub(crate) mod tests {
             [contradictions[1].clone(), contradictions[0].clone()],
         ] {
             assert_eq!(
-                capture.proves_children("root", &expectations, Some("group")),
+                capture.proves_children("root", &expectations, Some(&group)),
                 Ok(false),
                 "missing thinking on one child cannot hide another child's wrong output"
             );
@@ -1555,6 +2011,7 @@ pub(crate) mod tests {
 
     #[test]
     fn semantic_child_evidence_keeps_prose_custody_and_rejects_identity_gaps() {
+        let group = FanoutGroupSelector::Id("group".into());
         let prose = "The child returned observed-value with an explanation.";
         let mut capture = capture();
         capture.transcript.as_mut().unwrap().items[0].content = prose.into();
@@ -1616,14 +2073,16 @@ pub(crate) mod tests {
             .unwrap()
             .name = Some("agent_fanout".into());
         fanout.transcript.as_mut().unwrap().items[1].content = serde_json::json!({
-            "group_id":"group",
+            "status":"started", "group_id":"group", "title":"group",
+            "fanout":{"group_id":"group", "title":"group", "parent_run_id":"root"},
+            "work_unit_observation":{"id":"group", "kind":"agent_fanout"},
             "agents":[{"slot_index":0,"id":"slot-0","run_id":"child","agent_id":"member"}]
         })
         .to_string();
         let mut wrong_slot = expected;
         wrong_slot.slot_index = Some(1);
         assert!(matches!(
-            fanout.verified_children("root", &[wrong_slot], Some("group")),
+            fanout.verified_children("root", &[wrong_slot], Some(&group)),
             Ok(None)
         ));
     }
@@ -2145,6 +2604,12 @@ pub(crate) mod tests {
             capture.run_terminal_content("root", "child").unwrap(),
             Some(terminal.content.as_str())
         );
+        terminal.content = "x".repeat(4097);
+        capture.transcript.as_mut().unwrap().items[2] = terminal.clone();
+        assert_eq!(
+            capture.run_terminal_content("root", "child").unwrap(),
+            Some(terminal.content.as_str())
+        );
         let mut siblings = capture.clone();
         let mut sibling = siblings.run_tree.runs[1].clone();
         sibling.run_id = "sibling".into();
@@ -2171,14 +2636,7 @@ pub(crate) mod tests {
         );
         assert!(siblings.run_terminal_content("root", "root").is_err());
         assert!(siblings.run_terminal_content("root", "unknown").is_err());
-        for change in [
-            "foreign",
-            "missing",
-            "duplicate",
-            "unidentified",
-            "oversized",
-            "partial",
-        ] {
+        for change in ["foreign", "missing", "duplicate", "unidentified", "partial"] {
             let mut altered = capture.clone();
             let page = altered.transcript.as_mut().unwrap();
             match change {
@@ -2193,7 +2651,6 @@ pub(crate) mod tests {
                     page.items.push(duplicate);
                 }
                 "unidentified" => page.items[2].source_event_id = None,
-                "oversized" => page.items[2].content = "x".repeat(4097),
                 "partial" => page.has_more = true,
                 _ => unreachable!(),
             }

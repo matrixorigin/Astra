@@ -500,6 +500,13 @@ are never added to physical model-attempt cache denominators.
 - Durable append is ordered before event publication. Reconnect replays after
   the last durable index and hands off to live delivery without a missing
   interval or duplicate graph mutation.
+- Server live fanout coalesces pending facts for up to 250 ms from the first
+  queued fact, or until the existing 64-event / 256-KiB flush threshold is
+  reached. Interleaved transient frames share the bounded queue and preserve
+  delivery order without becoming durable rows or forcing their own commit.
+  Approval persistence, explicit drain, and channel close flush immediately;
+  a live-only frame with no pending fact remains immediate. The coalescing
+  interval is not a bound on database commit or client delivery latency.
 - Structural start/terminal facts are emitted before/after their corresponding
   slow work. In the local loopback fixture, measure from runtime creation of a
   structural event through its application by the client graph reducer: p95 is

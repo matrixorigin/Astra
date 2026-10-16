@@ -224,6 +224,61 @@ impl DatabaseRunStateStore {
         Ok(RunPermissionModeSnapshot { requested, applied })
     }
 
+    async fn permission_snapshot_row(
+        pool: &sqlx::Pool<MySql>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        let row = sqlx::query(
+            "SELECT requested.payload_json AS requested_payload, requested.event_idx AS requested_idx, \
+             applied.payload_json AS applied_payload \
+             FROM agent_runs AS run \
+             LEFT JOIN (SELECT event_idx, payload_json FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND event_type=? ORDER BY event_idx DESC LIMIT 1) AS requested ON TRUE \
+             LEFT JOIN (SELECT payload_json FROM agent_run_events \
+             WHERE user_id=? AND run_id=? AND event_type=? ORDER BY event_idx DESC LIMIT 1) AS applied ON TRUE \
+             WHERE run.user_id=? AND run.session_id=? AND run.run_id=? AND run.depth=0 LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(REQUESTED)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(APPLIED)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let requested_payload: Option<String> = row
+            .try_get("requested_payload")
+            .map_err(|e| e.to_string())?;
+        let requested_idx: Option<i64> = row.try_get("requested_idx").map_err(|e| e.to_string())?;
+        let applied_payload: Option<String> =
+            row.try_get("applied_payload").map_err(|e| e.to_string())?;
+        let requested = requested_payload
+            .zip(requested_idx)
+            .map(|(payload, idx)| {
+                let event: serde_json::Value =
+                    serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                selection(&event, idx)
+            })
+            .transpose()?;
+        let applied = applied_payload
+            .map(|payload| {
+                let event: serde_json::Value =
+                    serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                serde_json::from_value(event["data"].clone()).map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        Ok(Some(RunPermissionModeSnapshot { requested, applied }))
+    }
+
     async fn append_permission_event_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, MySql>,
@@ -339,38 +394,11 @@ impl DatabaseRunStateStore {
         session_id: &str,
         run_id: &str,
     ) -> Result<Option<RunPermissionModeSnapshot>, String> {
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(|e| e.to_string())?;
-        // This hot round-boundary lookup must not fetch checkpoint_json or
-        // hydrate the run history. Retain the canonical session/run ownership
-        // fence, then read only the root marker and two indexed event rows.
-        match crate::storage::admit_session_execution_write(&mut tx, session_id, user_id).await {
-            Ok(()) => {}
-            Err(sqlx::Error::RowNotFound) => {
-                tx.rollback().await.map_err(|e| e.to_string())?;
-                connection.release();
-                return Ok(None);
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-        let root: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM agent_runs WHERE user_id=? AND session_id=? AND run_id=? AND depth=0 LIMIT 1 FOR UPDATE",
-        ).bind(user_id).bind(session_id).bind(run_id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
-        if root.is_none() {
-            tx.rollback().await.map_err(|e| e.to_string())?;
-            connection.release();
-            return Ok(None);
-        }
-        let snapshot = Self::permission_snapshot_tx(&mut tx, user_id, run_id).await?;
-        tx.rollback().await.map_err(|e| e.to_string())?;
-        connection.release();
-        Ok(Some(snapshot))
+        // This hot round-boundary lookup is read-only. It must not fetch
+        // checkpoint_json, hydrate run history, or take session/run write
+        // fences. A request committed before this point is observed; one
+        // committed after it waits for the next round boundary.
+        Self::permission_snapshot_row(self.pool.get(), user_id, session_id, run_id).await
     }
 
     #[allow(clippy::too_many_arguments)]

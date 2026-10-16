@@ -1121,6 +1121,8 @@ struct ExecutionChild {
     result_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_range: Option<[u64; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1331,6 +1333,12 @@ impl EvidenceEvent {
                             hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
                         }),
                         result_truncated: child.get("result_truncated").and_then(|v| v.as_bool()),
+                        result_range: child
+                            .get("result_range")
+                            .and_then(|range| {
+                                serde_json::from_value::<[u64; 3]>(range.clone()).ok()
+                            })
+                            .filter(|[start, end, total]| start <= end && end <= total),
                     });
                 }
             }

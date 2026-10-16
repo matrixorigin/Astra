@@ -112,6 +112,24 @@ The existing owner lease and durable Edge dispatch relay own cross-pod
 execution. A new scheduler, sticky-session requirement, or process-local
 parallel state machine must not be introduced to make a scale test pass.
 
+Fresh run-control observations share an on-demand read queue in `RunEngine`.
+Concurrent requests across owners use at most 128 positional lookups per SQL,
+four concurrent queries, and a maximum 25 ms collection window measured from
+admission. Full batches and partial batches whose oldest request has already
+waited that window dispatch without another collection delay.
+The queue admits at most 8,192 outstanding reads and 4,096 per owner, including
+in-flight queries, with bounded identity bytes and owner-rotating dispatch.
+Database equality associates each request with its result; missing or malformed
+rows do not leak into another request. A bound candidate run-ID filter keeps
+unrelated historical runs out of the base-row join work; query-count reduction
+must be validated together with the actual scan plan. Observations are never
+cached, polling intervals and ancestor controls remain unchanged, and no idle
+queue issues SQL.
+Overload and storage failures are explicit; this queue is not execution
+authorization. Lease renewal and provider/action fences retain their owners.
+The collection window is not a total-latency guarantee: query attempts have a
+three-second deadline and callers have a four-second overall read budget.
+
 Direct-child completion waits are a delivery concern, not a new lifecycle
 authority. Local children notify their parent in memory. Remotely owned
 children are observed by one Server-instance coordinator that batches exact

@@ -50,7 +50,7 @@ pub use shell_hardening::{
 mod workspace_inspection;
 #[cfg(unix)]
 pub use workspace_inspection::{
-    OpenedWorkspaceFile, PinnedWorkspaceInspection, open_directory_beneath,
+    OpenedWorkspaceFile, PinnedWorkspaceInspection, open_directory_beneath, open_filesystem_root,
 };
 
 mod sync_process;

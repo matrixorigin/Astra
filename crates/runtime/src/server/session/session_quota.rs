@@ -14,14 +14,17 @@ pub(crate) async fn create_session_with_resource_quota(
     state: &AppState,
     user_id: String,
     request: SessionCreateRequestData,
-) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<
+    (SessionRecord, Option<astra_services::SessionAdmissionFacts>),
+    (StatusCode, Json<ErrorResponse>),
+> {
     astra_services::resource_governor::enforce_session_create_quota(
         &state.resource_governor.check_session_create(&user_id).await,
     )?;
 
     let session = state
         .session_service
-        .create_session(user_id.clone(), request)
+        .create_session_with_admission_facts(user_id.clone(), request)
         .await?;
     state
         .resource_governor

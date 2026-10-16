@@ -196,7 +196,7 @@ const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
 const DURABLE_LIVE_BATCH_MAX_EVENTS: usize = 64;
 const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
-const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
 
 /// Machine code shared by every "session already has an active run" 409:
@@ -287,10 +287,6 @@ fn durable_event_index(event: &Value, position: usize) -> i64 {
         .get("index")
         .and_then(Value::as_i64)
         .unwrap_or(position as i64)
-}
-
-fn durable_event_is_settlement_finished(event: &Value) -> bool {
-    durable_event_type(event) == Some("run_settlement_finished")
 }
 
 fn durable_event_is_valid_explain_publication(event: &Value) -> bool {
@@ -490,8 +486,13 @@ impl ValidatedWorkRuntimeBinding {
 
 #[derive(Default)]
 struct PendingDurableLiveEvents {
-    events: Vec<Value>,
+    events: Vec<PendingLiveEvent>,
     estimated_bytes: usize,
+}
+
+struct PendingLiveEvent {
+    event: Value,
+    requires_persistence: bool,
 }
 
 #[derive(Clone, Default)]
@@ -547,9 +548,16 @@ impl DurableToolTerminalTracker {
 
 impl PendingDurableLiveEvents {
     fn push(&mut self, event: Value) {
+        self.push_ordered(event, true);
+    }
+
+    fn push_ordered(&mut self, event: Value, requires_persistence: bool) {
         let event_bytes = serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
         self.estimated_bytes = self.estimated_bytes.saturating_add(event_bytes);
-        self.events.push(event);
+        self.events.push(PendingLiveEvent {
+            event,
+            requires_persistence,
+        });
     }
 
     fn should_flush(&self) -> bool {
@@ -557,7 +565,7 @@ impl PendingDurableLiveEvents {
             || self.estimated_bytes >= DURABLE_LIVE_BATCH_MAX_BYTES
     }
 
-    fn take(&mut self) -> Vec<Value> {
+    fn take(&mut self) -> Vec<PendingLiveEvent> {
         self.estimated_bytes = 0;
         std::mem::take(&mut self.events)
     }
@@ -959,20 +967,25 @@ async fn flush_durable_live_events(
         return Ok(());
     }
     let events = pending.take();
+    let durable_events = events
+        .iter()
+        .filter(|entry| entry.requires_persistence)
+        .map(|entry| entry.event.clone())
+        .collect::<Vec<_>>();
     run_engine
-        .append_events_batch(user_id, expected_session_id, run_id, &events)
+        .append_events_batch(user_id, expected_session_id, run_id, &durable_events)
         .await?;
-    durable_tool_terminals.record_committed(&events);
+    durable_tool_terminals.record_committed(&durable_events);
     {
         let mut runs = runs.write().await;
         if let Some(run) = runs.get_mut(run_id) {
-            for event in &events {
+            for event in &durable_events {
                 push_active_run_live_event(run, event.clone());
             }
         }
     }
-    for event in events {
-        deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+    for entry in events {
+        deliver_live_fanout_event(live_tx, client_event_tx, run_id, entry.event).await;
     }
     Ok(())
 }
@@ -1086,8 +1099,41 @@ async fn process_ordered_live_fanout_event(
             })?;
     }
 
-    if !durable_event_committed && live_delta_event_for_persistence(&event) {
-        pending.push(event);
+    let requires_persistence = !durable_event_committed && live_delta_event_for_persistence(&event);
+    let interaction_delivery_boundary = !canonical_edge_interaction_events(&event).is_empty();
+    if interaction_delivery_boundary && !requires_persistence {
+        // Interactions unblock a human or executor even when their canonical
+        // fact was already committed by the interaction sink. Preserve that
+        // boundary; only uncommitted replay facts wait for batch persistence.
+        flush_durable_live_events(
+            pending,
+            run_engine,
+            runs,
+            user_id,
+            expected_session_id,
+            run_id,
+            live_tx,
+            client_event_tx,
+            durable_tool_terminals,
+        )
+        .await
+        .map_err(|detail| LiveFanoutPersistenceError {
+            code: "live_event_persistence_failed",
+            message: "live run event could not be recorded durably",
+            detail,
+        })?;
+        deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+        return Ok(());
+    }
+    if requires_persistence || !pending.is_empty() {
+        // Preserve presentation order without letting a transient frame split
+        // the durable batch. Both kinds count towards the same byte/row bounds;
+        // only replay facts are inserted and all delivery follows that commit.
+        if requires_persistence {
+            pending.push(event);
+        } else {
+            pending.push_ordered(event, false);
+        }
         if pending.should_flush() {
             flush_durable_live_events(
                 pending,
@@ -1110,24 +1156,7 @@ async fn process_ordered_live_fanout_event(
         return Ok(());
     }
 
-    // A non-durable event may not overtake an earlier durable batch.
-    flush_durable_live_events(
-        pending,
-        run_engine,
-        runs,
-        user_id,
-        expected_session_id,
-        run_id,
-        live_tx,
-        client_event_tx,
-        durable_tool_terminals,
-    )
-    .await
-    .map_err(|detail| LiveFanoutPersistenceError {
-        code: "live_event_persistence_failed",
-        message: "live run event could not be recorded durably",
-        detail,
-    })?;
+    // A live-only event with no earlier pending fact remains immediate.
     deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
     Ok(())
 }
@@ -6701,16 +6730,19 @@ impl AgenticRunLifecycleService {
                 mode,
                 logical_segments,
             };
-            match admission
-                .coordinator
-                .commit_turn(
-                    &admission.reservation,
-                    delta,
-                    &format!("server-run:{run_id}:commit"),
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            {
+            let idempotency_key = format!("server-run:{run_id}:commit");
+            let commit = if admission.release_writer_on_finish {
+                admission
+                    .coordinator
+                    .commit_turn_and_release_writer(&admission.reservation, delta, &idempotency_key)
+                    .await
+            } else {
+                admission
+                    .coordinator
+                    .commit_turn(&admission.reservation, delta, &idempotency_key)
+                    .await
+            };
+            match commit.map_err(|error| error.to_string())? {
                 astra_turn_types::CoordinatorMutationV1::Applied { cursor }
                 | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { cursor } => {
                     Ok(Some(cursor))
@@ -6722,30 +6754,21 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
-        if result.as_ref().is_ok_and(Option::is_some)
-            && let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
-                &admission.inference_pool,
-                &admission.lease.key.owner_user_id,
-                &admission.lease.key.session_id,
-                admission.reservation.reserved_turn,
-            )
-            .await
-        {
-            // The canonical commit is authoritative and must not be reported
-            // as failed because payload retirement is lagging. A later
-            // session boundary retries cleanup for all absorbed turns.
-            tracing::warn!(
-                target: "astra_runtime::canonical_wal",
-                user_id = %admission.lease.key.owner_user_id,
-                session_id = %admission.lease.key.session_id,
-                turn = admission.reservation.reserved_turn,
-                %error,
-                "canonical commit succeeded but provider WAL payload retirement is pending"
-            );
-        }
-        if admission.release_writer_on_finish {
+        // A successful commit already released this exact writer atomically.
+        // Empty/failed commits retain the existing explicit cleanup path.
+        if admission.release_writer_on_finish && !result.as_ref().is_ok_and(Option::is_some) {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
         }
+        admission.release_started.store(true, Ordering::Release);
+        result.map_err(|message| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Unknown,
+                format!("canonical turn commit failed: {message}"),
+            )
+        })
+    }
+
+    async fn finish_canonical_turn_cleanup(admission: &CanonicalTurnAdmission, committed: bool) {
         if let Err(error) = admission.distributed_permit.release().await {
             tracing::warn!(
                 target: "astra_runtime::canonical_wal",
@@ -6756,13 +6779,27 @@ impl AgenticRunLifecycleService {
                 "distributed admission release is pending; the permit will retry on drop"
             );
         }
-        admission.release_started.store(true, Ordering::Release);
-        result.map_err(|message| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Unknown,
-                format!("canonical turn commit failed: {message}"),
+        if committed
+            && let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
+                &admission.inference_pool,
+                &admission.lease.key.owner_user_id,
+                &admission.lease.key.session_id,
+                admission.reservation.reserved_turn,
             )
-        })
+            .await
+        {
+            // The canonical commit is authoritative. Payload retirement
+            // is lagging work; the next session boundary retries all
+            // absorbed turns instead of broadening this commit contract.
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                turn = admission.reservation.reserved_turn,
+                %error,
+                "provider WAL payload retirement is pending"
+            );
+        }
     }
 
     pub fn with_memory_extraction_service(
@@ -9026,6 +9063,11 @@ impl AgenticRunLifecycleService {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn settlement_finished_test_event(execution_owner_generation: u64) -> Value {
+        Self::settlement_finished_event(execution_owner_generation)
+    }
+
     fn durable_settlement_is_in_progress(run: &DurableRunRecord) -> bool {
         let generation = run.run_generation;
         let started_key = format!("run-settlement-started:{generation}");
@@ -10688,6 +10730,18 @@ impl AgenticRunLifecycleService {
                     "execution_binding_provider_unavailable",
                 )
             })?;
+
+        // Registration publishes the pool and durable row in separate steps.
+        // Read both views behind the same per-owner/executor barrier used by
+        // REST registration and WebSocket setup/rollback, never its half-state.
+        let registration_lock = self
+            .edge_connection_pool
+            .as_ref()
+            .map(|pool| pool.registration_lock(user_id, executor_id));
+        let _registration_guard = match registration_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
 
         let path_matches = |path: Option<&str>| {
             path.map(str::trim)
@@ -12856,6 +12910,7 @@ impl AgenticRunLifecycleService {
             .expect("request constraints validated before host construction");
         let authorization =
             LoopEnvironmentAuthorization::fresh(request, &constraints, execution_bindings);
+        let explain = request.explain;
         let mut host = self.build_authorized_host(
             user_id,
             session_id,
@@ -12867,6 +12922,7 @@ impl AgenticRunLifecycleService {
             request.full_llm_capture,
             request.execution_policy.turn_intent,
             request.execution_policy.skill_auto_route,
+            explain,
             request.interactive_client,
             edge_tools,
             edge_profile,
@@ -12901,6 +12957,7 @@ impl AgenticRunLifecycleService {
         full_llm_capture: bool,
         turn_intent_policy: astra_services::runs::TurnIntentExecutionPolicy,
         skill_auto_route_policy: astra_services::runs::SkillAutoRouteExecutionPolicy,
+        explain: bool,
         interactive_client: bool,
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
@@ -12927,6 +12984,7 @@ impl AgenticRunLifecycleService {
         .with_admitted_model_execution(authorization.model_execution.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
         .with_full_llm_capture(full_llm_capture)
+        .with_explain_analyze_requested(explain)
         .with_edge_tools(edge_tools)
         .with_server_service_tool_catalog_enabled(server_service_tool_catalog_enabled)
         .with_static_tool_catalog_admissible(static_tool_catalog_admissible)
@@ -15770,6 +15828,7 @@ impl AgenticRunLifecycleService {
                 );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                let settlement_timing_started = Instant::now();
                 host.release_execution_capacity_for_wait();
                 if let Some(model) = state.current_model_identity() {
                     persist_ctx.model_name = Some(model.to_owned());
@@ -15785,6 +15844,7 @@ impl AgenticRunLifecycleService {
                     execution_owner_generation,
                 )
                 .await;
+                let settlement_fence_elapsed = settlement_timing_started.elapsed();
                 #[cfg(feature = "e2e-hooks")]
                 if !streaming && bg_test_post_loop_settlement_delay_ms > 0 {
                     run_engine
@@ -15915,6 +15975,7 @@ impl AgenticRunLifecycleService {
                 });
                 park_server_root_mailbox(&mut state).await;
                 host.on_loop_terminal(&state, &loop_result).await;
+                let settlement_drain_elapsed = settlement_timing_started.elapsed();
                 let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
                 enforce_completed_tool_ledger_closure(&loop_result, &mut state);
                 let allow_empty_delta =
@@ -16238,6 +16299,7 @@ impl AgenticRunLifecycleService {
                 }
 
                 let mut durable_status_committed = !persist_status_update && live_events_flushed;
+                let settlement_preparation_elapsed = settlement_timing_started.elapsed();
                 let mut owner_terminal_committed = false;
                 let mut atomic_terminal_committed = false;
                 let mut streaming_events_committed = false;
@@ -16251,10 +16313,18 @@ impl AgenticRunLifecycleService {
                     );
                 }
                 if persist_status_update {
+                    let settlement_finished =
+                        Self::settlement_finished_event(execution_owner_generation);
+                    let mut atomic_terminal_events = streaming_events_for_durable.clone();
+                    atomic_terminal_events.push(settlement_finished);
                     let events_for_transition: &[Value] = if persist_streaming_events {
-                        streaming_events_for_durable.as_slice()
+                        atomic_terminal_events.as_slice()
                     } else {
-                        &[]
+                        std::slice::from_ref(
+                            atomic_terminal_events
+                                .last()
+                                .expect("atomic terminal settlement always carries its fence"),
+                        )
                     };
                     let terminal_expected_statuses: &[&str] =
                         if persisted_status == RunStatus::Cancelled {
@@ -16464,6 +16534,7 @@ impl AgenticRunLifecycleService {
                     }
                 }
 
+                let settlement_terminal_elapsed = settlement_timing_started.elapsed();
                 if owner_terminal_committed {
                     if let Some(run) = runs.write().await.get_mut(&bg_run_id)
                         && let Some(data) = run.events.iter_mut().rev().find_map(|event| {
@@ -16684,14 +16755,15 @@ impl AgenticRunLifecycleService {
                     streaming_events_committed,
                 );
                 let settlement_closed = all_settlement_facts_committed
-                    && Self::persist_settlement_finished(
-                        &run_engine,
-                        &bg_user_id,
-                        &bg_session_id,
-                        &bg_run_id,
-                        execution_owner_generation,
-                    )
-                    .await;
+                    && (atomic_terminal_committed
+                        || Self::persist_settlement_finished(
+                            &run_engine,
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                        )
+                        .await);
                 let durable_fence_closed = durable_settlement_fence_closed(
                     control_terminal_settlement_committed,
                     settlement_closed,
@@ -16704,6 +16776,18 @@ impl AgenticRunLifecycleService {
                 // release it before client fanout and post-loop cleanup. These
                 // side effects must not advertise a live resume/input consumer.
                 drop(_owner_lease_heartbeat);
+
+                tracing::debug!(
+                    target: "astra_runtime::run_settlement",
+                    run_id = %bg_run_id,
+                    fence_ms = settlement_fence_elapsed.as_millis(),
+                    drain_ms = settlement_drain_elapsed.saturating_sub(settlement_fence_elapsed).as_millis(),
+                    preparation_ms = settlement_preparation_elapsed.saturating_sub(settlement_drain_elapsed).as_millis(),
+                    terminal_ms = settlement_terminal_elapsed.saturating_sub(settlement_preparation_elapsed).as_millis(),
+                    canonical_ms = settlement_timing_started.elapsed().saturating_sub(settlement_terminal_elapsed).as_millis(),
+                    owner_terminal_committed,
+                    "run settlement phases completed"
+                );
 
                 if let Some(event_tx) = event_tx.as_ref() {
                     if publish_stream_terminal {
@@ -16773,6 +16857,9 @@ impl AgenticRunLifecycleService {
                 }
 
                 // Drop event_tx — signals end-of-stream to the HTTP handler.
+                // The finished host also owns interaction-sink sender clones.
+                // Release them before any post-terminal storage cleanup.
+                drop(host);
                 drop(event_tx);
 
                 if !streaming {
@@ -16880,6 +16967,18 @@ impl AgenticRunLifecycleService {
                 .await;
                 if let Some(guard) = bg_root_runtime_context_guard.as_mut() {
                     guard.settle().await;
+                }
+                drop(state);
+                drop(bg_root_runtime_context_guard);
+                // Release resident capacity after dropping the resident
+                // context and its interaction sender clones. This run task
+                // retains cleanup custody without keeping the stream open.
+                if let Some(admission) = canonical_turn.as_ref() {
+                    Self::finish_canonical_turn_cleanup(
+                        admission,
+                        canonical_context_cursor.is_some(),
+                    )
+                    .await;
                 }
             },
             "agentic_loop_owned_execution",
@@ -18308,17 +18407,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     durable_event_index(event, position) <= after_event_idx
                         && durable_event_is_valid_explain_publication(event)
                 });
-        let mut settlement_finished = replay_events
-            .iter()
-            .any(durable_event_is_settlement_finished)
-            || durable_run
-                .events
-                .iter()
-                .enumerate()
-                .any(|(position, event)| {
-                    durable_event_index(event, position) <= after_event_idx
-                        && durable_event_is_settlement_finished(event)
-                });
         let turn_id = explain_turn_id_from_durable_run(&durable_run);
         let owner_generation = durable_run.run_generation;
         let latest_complete = Self::durable_live_attach_complete(
@@ -18333,20 +18421,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 event_rx: None,
             });
         }
-        if latest_complete && explain_requested && settlement_finished && !publication_seen {
-            replay_events.push(explain_publication_unavailable_event(
-                &run_id,
-                &turn_id,
-                owner_generation,
-                "publication_outcome_unrecorded",
-                "The Explain Analyze run completed, but the server did not retain a publication outcome.",
-            ));
-            return Ok(ChatStreamRecord {
-                session_id: initial.session_id,
-                run_id,
-                events: replay_events,
-                event_rx: None,
-            });
+        if latest_complete && explain_requested && !publication_seen {
+            // Settlement is not the publication boundary. A terminal Explain
+            // run still owes its bounded publication outcome, so a reconnect
+            // follows the same grace as an already-attached poller.
         }
 
         // The executor may live on another pod, or a concurrent winning start
@@ -18466,7 +18544,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             event_cursor = event_cursor.saturating_add(1);
                         }
                         publication_seen |= durable_event_is_valid_explain_publication(&event);
-                        settlement_finished |= durable_event_is_settlement_finished(&event);
                         if !send_durable_live_attach_event(&event_tx, event, delivery_deadline)
                             .await
                         {
@@ -18498,7 +18575,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             return;
                         }
                         if durable_run_status_kind(&delta.status) == DurableRunStatusKind::Paused
-                            || settlement_finished
                             || publication_deadline
                                 .is_some_and(|deadline| Instant::now() >= deadline)
                         {
@@ -18510,8 +18586,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     == DurableRunStatusKind::Paused
                                 {
                                     "run_paused_before_publication"
-                                } else if settlement_finished {
-                                    "publication_outcome_unrecorded"
                                 } else {
                                     "publication_timeout"
                                 },
@@ -18519,8 +18593,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     == DurableRunStatusKind::Paused
                                 {
                                     "The Explain Analyze run paused before the server could publish a report."
-                                } else if settlement_finished {
-                                    "The Explain Analyze run completed, but the server did not retain a publication outcome."
                                 } else {
                                     "The Explain Analyze run completed, but its publication did not arrive before the bounded wait expired."
                                 },
@@ -21996,16 +22068,14 @@ impl ServerSpawnAgentExecutor {
             .get()
             .and_then(Weak::upgrade)
             .ok_or_else(|| "parent's canonical tool executor is no longer available".to_string())?;
-        let policy = match executor.provider_policy_lookup(&request.tool) {
-            runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => policy,
-            runtime_tool_executor::ProviderPolicyLookup::MissingPolicy { .. }
-            | runtime_tool_executor::ProviderPolicyLookup::NotProvider => {
-                return Err("native collaborator requires a resolved provider tool policy".into());
-            }
-        };
-        if !executor.provider_is_collaborator_stage(&request.tool) {
-            return Err("selected provider is not an admitted collaborator stage".into());
-        }
+        let policy = executor
+            .collaborator_policy(&request.tool, request.model.as_deref())
+            .map_err(|reason| {
+                crate::orchestration::SpawnError::Admission(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    reason,
+                ))
+            })?;
         let provider_schema = executor
             .current_edge_provider_schema(&request.tool)
             .ok_or_else(|| {

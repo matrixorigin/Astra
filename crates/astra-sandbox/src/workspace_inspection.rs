@@ -15,6 +15,13 @@ mod unix {
 
     const MAX_STEPS: usize = 512;
 
+    // Traversal and identity checks do not enumerate directories. On Linux,
+    // O_PATH avoids requesting READ_DIR from an enclosing Landlock policy.
+    #[cfg(target_os = "linux")]
+    const DIRECTORY_FLAGS: i32 = libc::O_PATH | libc::O_DIRECTORY;
+    #[cfg(not(target_os = "linux"))]
+    const DIRECTORY_FLAGS: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+
     #[derive(Clone, Debug)]
     pub struct PinnedWorkspaceInspection {
         root: Arc<File>,
@@ -59,16 +66,21 @@ mod unix {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
+    /// Open the filesystem traversal anchor (O_PATH on Linux).
+    pub fn open_filesystem_root() -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(DIRECTORY_FLAGS | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open("/")
+    }
+
     pub fn open_directory_beneath(root: &File, relative: &Path) -> io::Result<File> {
         let mut current = root.try_clone()?;
         for component in relative.components() {
             match component {
                 Component::Normal(name) => {
-                    current = open_at(
-                        &current,
-                        Path::new(name),
-                        libc::O_RDONLY | libc::O_DIRECTORY,
-                    )?
+                    current = open_at(&current, Path::new(name), DIRECTORY_FLAGS)?
                 }
                 Component::CurDir => {}
                 _ => return Err(invalid("directory path is not relative and normalized")),
@@ -109,7 +121,7 @@ mod unix {
         }
 
         pub fn from_paths(root: &Path, cwd: &Path) -> io::Result<Self> {
-            let filesystem = File::open("/")?;
+            let filesystem = open_filesystem_root()?;
             let root_path = root.canonicalize()?;
             let cwd_path = cwd.canonicalize()?;
             let root = open_directory_beneath(
@@ -135,11 +147,7 @@ mod unix {
                 if same(&current, &self.root)? {
                     return Ok(true);
                 }
-                let parent = open_at(
-                    &current,
-                    Path::new(".."),
-                    libc::O_RDONLY | libc::O_DIRECTORY,
-                )?;
+                let parent = open_at(&current, Path::new(".."), DIRECTORY_FLAGS)?;
                 if same(&current, &parent)? {
                     return Ok(false);
                 }
@@ -158,7 +166,7 @@ mod unix {
             no_final_symlink: bool,
         ) -> io::Result<(File, Option<OsString>)> {
             let mut directory = if path.is_absolute() {
-                File::open("/")?
+                open_filesystem_root()?
             } else if from_root {
                 self.root.try_clone()?
             } else {
@@ -173,7 +181,7 @@ mod unix {
                     return Err(invalid("path exceeds inspection limit"));
                 }
                 let component = Path::new(&name);
-                match open_at(&directory, component, libc::O_RDONLY | libc::O_DIRECTORY) {
+                match open_at(&directory, component, DIRECTORY_FLAGS) {
                     Ok(next) => directory = next,
                     Err(error) => {
                         let c_name = CString::new(name.as_bytes())
@@ -198,7 +206,7 @@ mod unix {
                             buffer.truncate(len as usize);
                             let target = PathBuf::from(OsString::from_vec(buffer));
                             if target.is_absolute() {
-                                directory = File::open("/")?;
+                                directory = open_filesystem_root()?;
                             }
                             let mut expanded = components(&target);
                             expanded.append(&mut pending);
@@ -283,7 +291,7 @@ mod unix {
         }
 
         pub fn matches_root_path(&self, path: &Path) -> io::Result<bool> {
-            let filesystem = File::open("/")?;
+            let filesystem = open_filesystem_root()?;
             let absolute = path
                 .strip_prefix("/")
                 .map_err(|_| invalid("workspace root is not absolute"))?;
@@ -435,7 +443,9 @@ mod unix {
     }
 }
 #[cfg(unix)]
-pub use unix::{OpenedWorkspaceFile, PinnedWorkspaceInspection, open_directory_beneath};
+pub use unix::{
+    OpenedWorkspaceFile, PinnedWorkspaceInspection, open_directory_beneath, open_filesystem_root,
+};
 
 #[cfg(all(test, unix))]
 mod tests {

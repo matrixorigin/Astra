@@ -5715,14 +5715,11 @@ async fn call_llm_and_collect_with_total_budget(
             return Err(error);
         }
 
-        // Auth errors: redact the body in logs and return a generic message
-        // so provider-echoed secrets cannot leak through error propagation.
+        // Auth responses can echo arbitrary credentials; do not log the body.
         if status == 401 || status == 403 {
-            let truncated = &text[..text.len().min(80)];
-            let redacted = redact_provider_secrets(truncated);
             tracing::warn!(
                 target: "astra_runtime::llm_client",
-                "LLM auth error ({status}) on {model_key}: {redacted}",
+                "LLM auth error ({status}) on {model_key}",
             );
             let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Auth,
@@ -7512,12 +7509,14 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         } else {
             astra_core::ErrorKind::Unknown
         };
-        let detail = redact_provider_secrets(&text);
-        let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-        let error = astra_core::ClassifiedError::new(
-            kind,
-            format!("LLM non-stream request error {status}: {detail}"),
-        );
+        let message = if kind == astra_core::ErrorKind::Auth {
+            "LLM provider authentication failed".to_owned()
+        } else {
+            let detail = redact_provider_secrets(&text);
+            let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
+            format!("LLM non-stream request error {status}: {detail}")
+        };
+        let error = astra_core::ClassifiedError::new(kind, message);
         finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
         return Err(error);
     }
@@ -15335,14 +15334,6 @@ mod tests {
         );
     }
 
-    /// Mock server that returns 401 Unauthorized.
-    async fn mock_401() -> Response {
-        Response::builder()
-            .status(401)
-            .body(Body::from("Unauthorized"))
-            .unwrap()
-    }
-
     async fn mock_402_moi_model_gateway() -> Response {
         Response::builder()
             .status(402)
@@ -15585,43 +15576,69 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_returns_auth_error_kind() {
         reset_rate_limit_cooldown_for_tests();
-        let app = Router::new().route("/chat/completions", post(mock_401));
-        let base = spawn_local_http_server(app).await;
-        let messages = vec![json!({"role":"user","content":"x"})];
-        let err = call_llm_and_collect(
-            LlmCall {
-                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-                messages: &messages,
-                tools: &[],
-                cache_capability: None,
-                route: LlmExecutionRoute {
-                    fixed_temperature: None,
-                    thinking_protocol: None,
-                    model_name: "m",
-                    wire_model_name: None,
-                    api_key: "k",
-                    base_url: &base,
-                    provider: "openai",
-                    header_overrides: None,
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
-                max_output_tokens: None,
-                temperature: None,
-                thinking: &ThinkingConfig::Off,
-            },
-            LlmCancel::None,
-        )
-        .await
-        .expect_err("should fail with auth");
-        assert_eq!(err.kind, astra_core::ErrorKind::Auth);
-        assert!(
-            !err.message.contains("Unauthorized"),
-            "auth error message must not echo provider body, got: {}",
-            err.message
-        );
-        assert!(err.message.contains("authentication failed"));
+        for status in [401, 403] {
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = hits.clone();
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let hits = captured.clone();
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // UTF-8 crosses byte 80; arbitrary credentials must not be echoed.
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(format!(
+                                "{}private-credential-without-a-known-prefix",
+                                "余额不足".repeat(20)
+                            )))
+                            .unwrap()
+                    }
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            let messages = vec![json!({"role":"user","content":"x"})];
+            for streaming in [true, false] {
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let err = if streaming {
+                    call_llm_and_collect(call, LlmCancel::None)
+                        .await
+                        .unwrap_err()
+                } else {
+                    call_llm_nonstream(global_llm_client(), call, std::time::Duration::from_secs(5))
+                        .await
+                        .unwrap_err()
+                };
+                assert_eq!(err.kind, astra_core::ErrorKind::Auth);
+                assert_eq!(err.message, "LLM provider authentication failed");
+            }
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "auth errors must not be retried"
+            );
+        }
     }
 
     #[test]
@@ -17476,19 +17493,6 @@ mod tests {
         let out = redact_provider_secrets(input);
         assert!(!out.contains("abcXYZ"), "leaked sk- secret in JSON: {out}");
         assert!(out.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn redact_provider_secrets_simulates_auth_log_path() {
-        // Simulate what the auth-error path logs: a truncated body containing a key.
-        let body = r#"{"error":{"message":"Incorrect API key sk-abc12345 provided"}}"#;
-        let truncated = &body[..body.len().min(80)];
-        let log_line = format!(
-            "LLM auth error (401): {}",
-            redact_provider_secrets(truncated)
-        );
-        assert!(!log_line.contains("sk-abc12345"));
-        assert!(log_line.contains("[REDACTED]"));
     }
 
     /// audit-C1: global_llm_client must not use .expect() — a TLS backend

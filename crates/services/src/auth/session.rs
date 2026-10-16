@@ -130,6 +130,20 @@ pub trait SessionService: Send + Sync {
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Create a Session and return any facts observed in the same insert
+    /// transaction. The default preserves the older create/read contract for
+    /// custom implementations.
+    async fn create_session_with_admission_facts(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.create_session(user_id, request)
+            .await
+            .map(|session| (session, None))
+    }
+
     async fn create_provider_session(
         &self,
         _identity: ProviderSessionCreationIdentity,
@@ -269,6 +283,7 @@ impl ProviderSessionCreationIdentity {
 pub struct SessionCreationResult {
     pub session: SessionRecord,
     pub created: bool,
+    pub admission_facts: SessionAdmissionFacts,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -583,8 +598,8 @@ impl DatabaseSessionService {
                         "session_creation_conflict",
                     ));
                 }
-                let record = self
-                    .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+                let (record, admission_facts) = self
+                    .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
                 tx.commit().await.map_err(internal_error)?;
@@ -592,6 +607,7 @@ impl DatabaseSessionService {
                 return Ok(SessionCreationResult {
                     session: record,
                     created: false,
+                    admission_facts,
                 });
             }
             crate::resource_governor::enforce_session_create_quota(quota)?;
@@ -615,10 +631,11 @@ impl DatabaseSessionService {
         // can use an older MatrixOne snapshot and miss a successfully committed
         // session. Keep database-generated fields, but only return after commit
         // succeeds so a commit failure cannot be reported as successful creation.
-        let record = self
-            .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+        let (record, admission_facts) = self
+            .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
+        debug_assert_eq!(admission_facts.active_plan_id, None);
         tx.commit().await.map_err(internal_error)?;
         connection.release();
         let details = serde_json::json!({
@@ -629,6 +646,7 @@ impl DatabaseSessionService {
         Ok(SessionCreationResult {
             session: record,
             created: true,
+            admission_facts,
         })
     }
 
@@ -779,6 +797,17 @@ impl SessionService for DatabaseSessionService {
         self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
             .await
             .map(|result| result.session)
+    }
+
+    async fn create_session_with_admission_facts(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
+            .await
+            .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn create_provider_session(

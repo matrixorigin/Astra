@@ -154,6 +154,8 @@ Compaction should preserve:
 - links to recoverable artifacts.
 
 Compaction should not turn transient tool output into permanent truth without attribution.
+Generate a compaction summary only after history actually changes. An elevated
+pressure tier alone does not authorize an LLM call for intact or protected history.
 
 ## Memory injection
 

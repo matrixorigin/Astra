@@ -316,7 +316,7 @@ mod tests {
                     json!([{"agent_id":format!("agent-{}", index % 2),
                         "run_id":format!("child-{}", index % 2), "status":"completed",
                         "result_sha256":format!("{:x}", Sha256::digest(format!("result-{}", index % 2))),
-                        "result_truncated":false}])
+                        "result_truncated":false,"result_range":[0,8,8]}])
                 };
                 EvidenceEvent {
                     event_id: format!("boundary-{index}"),
@@ -359,6 +359,7 @@ mod tests {
                     && fact["children"][0]["run_id"] == format!("child-{index}")
                     && fact["children"][0]["result_sha256"]
                         == format!("{:x}", Sha256::digest(format!("result-{index}")))
+                    && fact["children"][0]["result_range"] == json!([0, 8, 8])
             }));
         }
         assert!(

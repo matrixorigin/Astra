@@ -51,7 +51,6 @@ use super::{
 };
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
-const TERMINAL_PROJECTION_REPAIR_MAX_WAIT: Duration = Duration::from_secs(5);
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
 const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
 static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
@@ -665,35 +664,6 @@ pub(crate) struct CanonicalTerminalSettlementCommit {
     pub(crate) terminal_assistant_source_event_id: Option<String>,
 }
 
-async fn finish_terminal_with_projection<F>(
-    commit: CanonicalTerminalSettlementCommit,
-    projection: F,
-    user_id: &str,
-    run_id: &str,
-    timeout: Duration,
-) -> CanonicalTerminalSettlementCommit
-where
-    F: std::future::Future<Output = Result<(), String>>,
-{
-    match tokio::time::timeout(timeout, projection).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            user_id,
-            run_id,
-            error = %error,
-            "canonical terminal committed but display projection repair failed"
-        ),
-        Err(_) => tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            user_id,
-            run_id,
-            "canonical terminal committed but display projection repair timed out"
-        ),
-    }
-    commit
-}
-
 fn atomic_terminal_request<'a>(
     append: &'a CanonicalLoopAppend<'a>,
     settlement: CanonicalTerminalSettlement<'a>,
@@ -1015,8 +985,7 @@ pub(crate) async fn persist_server_loop_canonical_append(
 }
 
 /// Atomically commit canonical loop evidence, semantic run usage, and the
-/// exact-generation durable terminal. Derived projections run only after the
-/// database commit and cannot reverse it.
+/// exact-generation durable terminal and display projection.
 pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     pool: &SharedPool,
     append: CanonicalLoopAppend<'_>,
@@ -1024,9 +993,6 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     settlement: CanonicalTerminalSettlement<'_>,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    let user_id = append.user_id;
-    let session_id = append.session_id;
-    let run_id = append.run_id;
     // Once an exact-generation terminal transaction may have reached COMMIT,
     // dropping its future at the lease deadline would bypass the existing
     // lost-acknowledgement resolution and report a committed run as failed.
@@ -1040,15 +1006,7 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
         terminal_operation,
     )
     .await?;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    Ok(finish_terminal_with_projection(
-        commit,
-        store.repair_projection_after_atomic_terminal_settlement(user_id, session_id, run_id),
-        user_id,
-        run_id,
-        TERMINAL_PROJECTION_REPAIR_MAX_WAIT,
-    )
-    .await)
+    Ok(commit)
 }
 
 async fn persist_server_loop_canonical_append_inner(
@@ -1094,14 +1052,44 @@ async fn persist_server_loop_canonical_append_inner(
             return Err(msg);
         }
     };
-    astra_services::storage::admit_session_scoped_run_write(
-        &mut tx,
-        append.session_id,
-        append.user_id,
-        append.run_id,
-    )
-    .await
-    .map_err(|error| format!("canonical session admission failed: {error}"))?;
+    let terminal_admission = if settlement.is_some() {
+        Some(
+            DatabaseRunStateStore::new(pool.clone())
+                .admit_terminal_settlement_in_transaction(
+                    &mut tx,
+                    append.user_id,
+                    append.session_id,
+                    append.run_id,
+                )
+                .await
+                .map_err(|error| format!("canonical session admission failed: {error}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "canonical session admission failed: {}",
+                        sqlx::Error::RowNotFound
+                    )
+                })?,
+        )
+    } else {
+        if append.expected_owner_generation.is_some() {
+            astra_services::storage::admit_session_execution_write(
+                &mut tx,
+                append.session_id,
+                append.user_id,
+            )
+            .await
+        } else {
+            astra_services::storage::admit_session_scoped_run_write(
+                &mut tx,
+                append.session_id,
+                append.user_id,
+                append.run_id,
+            )
+            .await
+        }
+        .map_err(|error| format!("canonical session admission failed: {error}"))?;
+        None
+    };
 
     if let Some(expected_owner_generation) = append.expected_owner_generation {
         let Some(lease_duration) = append.owner_lease_duration else {
@@ -1116,19 +1104,20 @@ async fn persist_server_loop_canonical_append_inner(
             if settlement.is_some_and(|settlement| settlement.status == STATUS_CANCELLED) {
                 "UPDATE agent_runs
              SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
-             WHERE user_id = ? AND run_id = ? AND run_generation = ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
                AND owner_lease_expires_at >= NOW(6)
                AND status IN ('running', 'waiting', 'paused')"
             } else {
                 "UPDATE agent_runs
              SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
-             WHERE user_id = ? AND run_id = ? AND run_generation = ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?
                AND owner_lease_expires_at >= NOW(6)
                AND status IN ('running', 'waiting')"
             };
         let fenced = sqlx::query(owner_fence_sql)
             .bind(lease_micros)
             .bind(append.user_id)
+            .bind(append.session_id)
             .bind(append.run_id)
             .bind(expected_owner_generation as i64)
             .execute(&mut *tx)
@@ -1289,9 +1278,10 @@ async fn persist_server_loop_canonical_append_inner(
     let terminal_commit = if let Some(settlement) = settlement {
         let store = DatabaseRunStateStore::new(pool.clone());
         match store
-            .settle_terminal_in_existing_transaction(
+            .settle_terminal_in_admitted_transaction(
                 &mut tx,
                 atomic_terminal_request(&append, settlement),
+                terminal_admission.expect("terminal evidence owns its transaction admission"),
             )
             .await
         {
@@ -3549,54 +3539,37 @@ mod tests {
     use sqlx::Row;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
     use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct PersistenceQueries(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::field::Visit for PersistenceQueries {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "db.statement" {
+                self.0.lock().unwrap().push(value.to_owned());
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PersistenceQueries {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "sqlx::query" {
+                event.record(&mut self.clone());
+            }
+        }
+    }
 
     // Cache schema bootstrap, not sockets owned by a previous test's Tokio runtime.
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
-
-    #[tokio::test(start_paused = true)]
-    async fn confirmed_terminal_receipt_survives_stalled_projection() {
-        let receipt = CanonicalTerminalSettlementCommit {
-            terminal_events: vec![json!({"event_type": "run_finished"})],
-            terminal_assistant_source_event_id: Some("answer-1".into()),
-        };
-        let task = tokio::spawn(finish_terminal_with_projection(
-            receipt,
-            std::future::pending::<Result<(), String>>(),
-            "user-1",
-            "run-1",
-            Duration::from_secs(5),
-        ));
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(5)).await;
-        let result = task.await.expect("bounded projection");
-        assert_eq!(
-            result.terminal_assistant_source_event_id.as_deref(),
-            Some("answer-1")
-        );
-        assert_eq!(result.terminal_events.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn confirmed_terminal_receipt_survives_projection_error() {
-        let receipt = CanonicalTerminalSettlementCommit {
-            terminal_events: vec![],
-            terminal_assistant_source_event_id: Some("answer-2".into()),
-        };
-        let result = finish_terminal_with_projection(
-            receipt,
-            async { Err("projection unavailable".into()) },
-            "user-1",
-            "run-2",
-            Duration::from_secs(5),
-        )
-        .await;
-        assert_eq!(
-            result.terminal_assistant_source_event_id.as_deref(),
-            Some("answer-2")
-        );
-    }
 
     async fn assert_session_event_count(
         db: &sqlx::MySqlPool,
@@ -3638,6 +3611,7 @@ mod tests {
             }],
             last_event_idx: 7,
             latest_event_type: Some("run_finished".to_string()),
+            projection_hash: "projection-hash".to_string(),
         }
     }
 
@@ -5884,7 +5858,6 @@ mod tests {
             .start_run(&run_id, &user_id, &session_id)
             .await
             .expect("start durable run");
-
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.session_turn = 7;
         state.final_text = "assistant final".to_string();
@@ -6326,6 +6299,146 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_append_identity_and_authority_rejections_leave_no_effects() {
+        let pool = setup_pool().await;
+        let db = pool.get();
+        let user = Uuid::new_v4().to_string();
+        let foreign = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        let other_session = Uuid::new_v4().to_string();
+        let foreign_session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        for (owner, session) in [
+            (&user, &session),
+            (&user, &other_session),
+            (&foreign, &foreign_session),
+        ] {
+            sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count) VALUES (?, ?, 'active', 0)")
+                .bind(session).bind(owner).execute(db).await.unwrap();
+        }
+        let engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            DatabaseRunStateStore::new(pool.clone()),
+        ));
+        let authority = engine.start_run(&run, &user, &session).await.unwrap();
+        let state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut persist = test_post_loop_persist_context(&session, None);
+        persist.shared_pool = Some(pool.clone());
+        persist.user_id = user.clone();
+        persist.run_id = run.clone();
+        persist.expected_owner_generation = Some(authority.owner_generation);
+        persist.owner_lease_duration = Some(Duration::from_secs(45));
+        for case in [
+            "session",
+            "owner",
+            "missing",
+            "generation",
+            "expired",
+            "paused",
+            "terminal",
+            "unowned_missing",
+        ] {
+            persist.user_id = if case == "owner" {
+                foreign.clone()
+            } else {
+                user.clone()
+            };
+            persist.session_id = match case {
+                "owner" => foreign_session.clone(),
+                "session" => other_session.clone(),
+                _ => session.clone(),
+            };
+            persist.run_id = if case.ends_with("missing") {
+                Uuid::new_v4().to_string()
+            } else {
+                run.clone()
+            };
+            persist.expected_owner_generation = (case != "unowned_missing")
+                .then_some(authority.owner_generation + u64::from(case == "generation"));
+            sqlx::query("UPDATE agent_runs SET status = ?, owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND) WHERE user_id = ? AND run_id = ?")
+                .bind(match case { "paused" => "paused", "terminal" => "completed", _ => "running" })
+                .bind(if case == "expired" { -60_i64 } else { 60_i64 }).bind(&user).bind(&run).execute(db).await.unwrap();
+            let snapshot_sql = "SELECT status, owner_lease_expires_at, total_prompt_tokens, total_completion_tokens, total_tool_calls, last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?";
+            let before: (String, Option<chrono::NaiveDateTime>, i64, i64, i64, i64) =
+                sqlx::query_as(snapshot_sql)
+                    .bind(&user)
+                    .bind(&run)
+                    .fetch_one(db)
+                    .await
+                    .unwrap();
+            let queries = PersistenceQueries::default();
+            let subscriber = tracing_subscriber::registry().with(queries.clone());
+            persist
+                .persist_core_and_trace_in_transaction(&state)
+                .with_subscriber(subscriber)
+                .await
+                .expect_err(case);
+            let after: (String, Option<chrono::NaiveDateTime>, i64, i64, i64, i64) =
+                sqlx::query_as(snapshot_sql)
+                    .bind(&user)
+                    .bind(&run)
+                    .fetch_one(db)
+                    .await
+                    .unwrap();
+            assert_eq!(before, after, "{case}: rejected append changed run");
+            for table in ["agent_events", "session_transcript_items"] {
+                let count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE user_id IN (?, ?)"
+                ))
+                .bind(&user)
+                .bind(&foreign)
+                .fetch_one(db)
+                .await
+                .unwrap();
+                assert_eq!(count, 0, "{case}: unexpected {table}");
+            }
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_sessions WHERE user_id IN (?, ?) AND event_count <> 0",
+            )
+            .bind(&user)
+            .bind(&foreign)
+            .fetch_one(db)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{case}: rejected append changed session counters");
+            let statements = queries.0.lock().unwrap();
+            assert_eq!(
+                statements
+                    .iter()
+                    .filter(|sql| sql.trim_start().starts_with("SELECT 1 FROM agent_runs"))
+                    .count(),
+                usize::from(case == "unowned_missing"),
+                "{case}: existence admission"
+            );
+        }
+        for (owner, session) in [
+            (&user, &session),
+            (&user, &other_session),
+            (&foreign, &foreign_session),
+        ] {
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(owner)
+            .bind(session)
+            .execute(db)
+            .await
+            .unwrap();
+            cleanup_core_persist_fixture_for_owner(db, session, owner).await;
+        }
+        for table in ["agent_run_events", "run_display_projections", "agent_runs"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
+            ))
+            .bind(&user)
+            .bind(&run)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_append_rejects_a_superseded_execution_generation() {
         let pool = setup_pool().await;
         let db = pool.get().clone();
@@ -6656,7 +6769,7 @@ mod tests {
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_success_commits_evidence_usage_and_terminal_together() {
         for with_buffer in [false, true] {
-            assert_canonical_terminal_replay(with_buffer, None).await;
+            assert_canonical_terminal_replay(with_buffer, None, astra_core::STATUS_COMPLETED).await;
         }
     }
 
@@ -6671,11 +6784,22 @@ mod tests {
             "tool_call_started",
             "tool_call_completed",
         ] {
-            assert_canonical_terminal_replay(true, Some(event_type)).await;
+            assert_canonical_terminal_replay(true, Some(event_type), astra_core::STATUS_COMPLETED)
+                .await;
         }
     }
 
-    async fn assert_canonical_terminal_replay(with_buffer: bool, collision: Option<&str>) {
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_paused_cancellation_preserves_evidence_and_replay() {
+        assert_canonical_terminal_replay(false, None, astra_core::STATUS_CANCELLED).await;
+    }
+
+    async fn assert_canonical_terminal_replay(
+        with_buffer: bool,
+        collision: Option<&str>,
+        terminal_status: &str,
+    ) {
         let pool = setup_pool().await;
         let db = pool.get().clone();
         let user_id = Uuid::new_v4().to_string();
@@ -6695,11 +6819,21 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("canonical-terminal-success-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
             .expect("start durable run");
+        store
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"fixture-terminal-projection"}"#,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+            })
+            .await
+            .expect("persist pre-terminal checkpoint");
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
@@ -6774,16 +6908,30 @@ mod tests {
         } else {
             None
         };
-        let terminal_events = vec![
+        let mut terminal_events = vec![
             json!({
                 "event_type": "text_done",
                 "data": { "full_text": state.final_text }
             }),
             json!({
                 "event_type": "run_finished",
-                "data": { "status": astra_core::STATUS_COMPLETED }
+                "data": { "status": terminal_status }
             }),
         ];
+        let initial_status = if terminal_status == astra_core::STATUS_CANCELLED {
+            sqlx::query("UPDATE agent_runs SET status = 'paused' WHERE user_id = ? AND run_id = ?")
+                .bind(&user_id)
+                .bind(&run_id)
+                .execute(&db)
+                .await
+                .unwrap();
+            terminal_events[1]["data"]["cancellation_origin"] = json!("runtime");
+            terminal_events[1]["data"]["cancelled"] = json!(true);
+            astra_core::STATUS_PAUSED
+        } else {
+            astra_core::STATUS_RUNNING
+        };
+        terminal_events.push(crate::server::run::lifecycle::AgenticRunLifecycleService::settlement_finished_test_event(authority.owner_generation));
         let append = || CanonicalLoopAppend {
             user_id: &user_id,
             session_id: &session_id,
@@ -6800,9 +6948,9 @@ mod tests {
             include_terminal_assistant: true,
         };
         let settlement = CanonicalTerminalSettlement {
-            expected_statuses: &[astra_core::STATUS_RUNNING],
+            expected_statuses: &[initial_status],
             expected_owner_generation: authority.owner_generation,
-            status: astra_core::STATUS_COMPLETED,
+            status: terminal_status,
             waiting_for: None,
             error_message: None,
             events: &terminal_events,
@@ -6901,6 +7049,9 @@ mod tests {
             .await
             .unwrap();
         }
+        let queries = PersistenceQueries::default();
+        let subscriber = tracing_subscriber::registry().with(queries.clone());
+        let started = std::time::Instant::now();
         let commit = persist_server_loop_canonical_terminal_settlement(
             &pool,
             append(),
@@ -6908,12 +7059,119 @@ mod tests {
             settlement,
             None,
         )
+        .with_subscriber(subscriber)
         .await
         .expect("commit canonical terminal settlement");
+        {
+            let statements = queries.0.lock().unwrap();
+            assert!(
+                !statements.is_empty(),
+                "SQL capture must observe the real writer"
+            );
+            assert!(
+                !statements
+                    .iter()
+                    .any(|sql| sql.trim_start().starts_with("SELECT 1 FROM agent_runs")),
+                "owner fence must replace the preflight existence read"
+            );
+            eprintln!(
+                "canonical_terminal statements={} elapsed_us={}",
+                statements.len(),
+                started.elapsed().as_micros()
+            );
+        }
         let committed_count = assert_session_event_count(&db, &user_id, &session_id).await;
         assert!(committed_count > 0);
         assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
+        let commit_hash = sqlx::query_scalar::<_, String>(
+            "SELECT projection_hash FROM run_display_projections
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("read committed terminal projection hash");
+        let projection_row = sqlx::query(
+            "SELECT status, waiting_for, projection_event_idx, latest_event_type,
+                    latest_checkpoint_id, latest_checkpoint_kind, latest_checkpoint_version,
+                    total_prompt_tokens, total_completion_tokens, total_tool_calls,
+                    projection_hash
+             FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("terminal settlement must commit its display projection");
+        assert_eq!(
+            projection_row.try_get::<String, _>("status").unwrap(),
+            terminal_status
+        );
+        assert!(
+            projection_row
+                .try_get::<Option<String>, _>("waiting_for")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            projection_row
+                .try_get::<i64, _>("projection_event_idx")
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_event_type")
+                .unwrap()
+                .as_deref(),
+            Some("run_settlement_finished")
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<i64, _>("total_prompt_tokens")
+                .unwrap(),
+            37
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<i64, _>("total_completion_tokens")
+                .unwrap(),
+            17
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<i64, _>("total_tool_calls")
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<String, _>("projection_hash")
+                .unwrap(),
+            commit_hash
+        );
+        assert!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_id")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_kind")
+                .unwrap()
+                .as_deref(),
+            Some("resume")
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_version")
+                .unwrap()
+                .as_deref(),
+            Some("checkpoint_v1")
+        );
         if let Some(execution_started_at) = execution_started_at {
             let timestamps = sqlx::query(
                 "SELECT event_type, created_at FROM agent_events
@@ -7053,7 +7311,7 @@ mod tests {
         assert_eq!(terminal_event_count, 2);
         assert_eq!(
             run_row.try_get::<String, _>("status").unwrap(),
-            astra_core::STATUS_COMPLETED
+            terminal_status
         );
         assert_eq!(
             run_row.try_get::<i64, _>("total_prompt_tokens").unwrap(),

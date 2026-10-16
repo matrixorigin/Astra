@@ -1,0 +1,50 @@
+name: same_model_fanout_handoff_flash
+description: |
+  Flash-only regression variant of multi_model_fanout_handoff.
+  Verifies two real children and parent adoption, not heterogeneous models.
+prompt: |
+  Use one agent_fanout.start group named mixed-model-handoff with two explore
+  slots. Ask a deepseek-v4.1-flash child to compute 17 * 19 - 281. Ask a
+  deepseek-v4.1-flash child to sort [8, 3, 5] ascending.
+  Do not give either child its answer.
+  Wait for both actual results, then report them and the settlement ratio 2/2.
+  Do not retry, replace slots, or perform the child tasks yourself.
+required_models: [deepseek-v4.1-flash]
+capability: delegation
+difficulty: 3
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: agent_fanout
+    root_only: true
+    ok: true
+    min: 1
+    max: 1
+    predicates:
+      - {document: arguments, path: /action, equals: start}
+      - {document: arguments, path: /target_count, equals: 2}
+  - type: execution_child_count
+    min: 2
+    max: 2
+  - type: execution_child_results_adopted
+    fanout_group: {kind: title, value: mixed-model-handoff}
+    children:
+      - slot_index: 0
+        model: deepseek-v4.1-flash
+      - slot_index: 1
+        model: deepseek-v4.1-flash
+  - type: hard_judger
+    threshold: 1.0
+    question: |
+      Require every condition below, using verified_child_evidence rather than
+      the parent's claims alone. The actual slot 0 child must correctly compute
+      17 * 19 - 281 as 42, and the actual slot 1 child must correctly sort the
+      input as [3, 5, 8]. Accept equivalent prose, explanations, whitespace and
+      presentation; no exact text or JSON-only output format is required.
+      Reject incorrect or contradictory child answers even if the parent gives
+      the correct answer. The parent's actual requests must not supply the child
+      answers. The parent must faithfully report both observed child results and
+      the completed settlement ratio 2/2, not merely claim that work was launched.

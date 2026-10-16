@@ -9875,22 +9875,36 @@ mod tests {
         assert!(host.server_tool_calls.contains_key("fanout-call"));
         assert!(!host.server_tool_completed_ids.contains("fanout-call"));
 
-        // Compatibility envelopes may reserve `output: null` and carry the
-        // canonical receipt in `result`. The meaningful receipt must win, and
-        // an accepted running group means the launch action completed.
-        host.on_accepted_sse_event(&serde_json::json!({
-            "type": "tool_call_end",
-            "call_id": "fanout-call",
-            "tool": "agent_fanout",
-            "status": "running",
-            "output": null,
-            "result": {"status": "running", "group_id": "fanout-group"},
-            "duration_ms": 1_250,
-            "transport": "server_local",
-            "executor": {"kind": "server_local"}
-        }))
-        .await
-        .expect("typed fanout receipt accepted");
+        // Real launch metadata can exceed the terminal event budget. Exercise
+        // the shared projector, not a hand-written compact completion, so the
+        // launch closes before [DONE] without weakening receipt validation.
+        let launch = serde_json::json!({
+            "status":"started", "group_id":"fanout-group", "target_count":3,
+            "instruction":"launch guidance ".repeat(400),
+            "work_unit_observation": {
+                "id":"fanout-group", "kind":"agent_fanout", "status":"running",
+                "revision":4, "mode":"current", "wake_policy":"on_attention_or_terminal"
+            }
+        });
+        let projected = astra_services::runs::project_tool_terminal_presentation(
+            serde_json::json!({
+                "type": "tool_call_end",
+                "call_id": "fanout-call",
+                "tool": "agent_fanout",
+                "status": "running",
+                "output": null,
+                "result": launch.to_string(),
+                "duration_ms": 1_250,
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }),
+            3968,
+        );
+        assert!(projected.to_string().len() <= 3968);
+        assert_eq!(projected["result"]["group_id"], "fanout-group");
+        host.on_accepted_sse_event(&projected)
+            .await
+            .expect("typed fanout receipt accepted");
         assert!(matches!(
             rx.recv().await,
             Some(chat_stream::StreamEvent::ToolCompleted {
@@ -9905,18 +9919,10 @@ mod tests {
         assert!(!host.server_tool_calls.contains_key("fanout-call"));
         assert!(host.server_tool_completed_ids.contains("fanout-call"));
 
+        let mut conflicting_replay = projected.clone();
+        conflicting_replay["executed"] = serde_json::json!(false);
         let replay_execution_conflict = host
-            .on_accepted_sse_event(&serde_json::json!({
-                "type": "tool_call_end",
-                "call_id": "fanout-call",
-                "tool": "agent_fanout",
-                "status": "running",
-                "output": null,
-                "result": {"status": "running", "group_id": "fanout-group"},
-                "executed": false,
-                "transport": "server_local",
-                "executor": {"kind": "server_local"}
-            }))
+            .on_accepted_sse_event(&conflicting_replay)
             .await
             .expect_err("a replayed terminal with a different execution fact must fail closed");
         assert!(replay_execution_conflict.contains("conflicting terminal outcome"));

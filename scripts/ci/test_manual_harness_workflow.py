@@ -114,7 +114,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             model = json.loads(path.read_text())[0]
             self.assertEqual(model["api_key"], "sentinel-secret")
             self.assertEqual(model["thinking_protocol"], "reasoning_effort")
-            flash = json.loads(path.read_text())[1]
+            self.assertEqual(len(json.loads(path.read_text())), 1)
+            flash = model
             self.assertEqual(flash["name"], "deepseek-v4.1-flash")
             self.assertEqual(flash["api_key"], "sentinel-secret")
             self.assertEqual(flash["base_url"], "https://example.invalid/v1")
@@ -133,7 +134,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         for extra, accepted in [("", True), ("[]", True), (json.dumps([entry]), True),
                                  (json.dumps([explicit_flash]), True),
                                  ("{}", False), ("[null]", False), ("not-json-sentinel", False),
-                                 ('[{"name":"GLM-5.3"}]', False),
+                                 (json.dumps([{**entry, "name": "glm-5.3"}]), True),
                                  ('[{"name":"deepseek-v4.1-flash"},{"name":"DEEPSEEK-V4.1-FLASH"}]', False),
                                  ('[{"name":"x"},{"name":"X"}]', False)]:
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
@@ -146,11 +147,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                     self.assertNotIn(secret, result.stdout + result.stderr)
                 if accepted:
                     models = json.loads((root / "harness/models.yaml").read_text())
-                    self.assertEqual(len(models), 3 if extra == json.dumps([entry]) else 2)
+                    self.assertEqual(len(models), 1 if extra in ("", "[]", json.dumps([explicit_flash])) else 2)
                     if extra == json.dumps([entry]):
-                        self.assertEqual(models[1], entry)
+                        self.assertEqual(models[0], entry)
                     if extra == json.dumps([explicit_flash]):
-                        self.assertEqual(models[1], explicit_flash)
+                        self.assertEqual(models[0], explicit_flash)
                 else:
                     self.assertFalse((root / "harness/models.yaml").exists())
 
@@ -179,6 +180,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(diagnostic["model_lookup_name"], "deepseek-v4.1-flash")
             self.assertEqual(diagnostic["preflight"], {"status": "failed", "models": ["glm-5.2", "glm-5.3"],
                                                      "unavailable_model": "glm-5.2"})
+            (root / "harness/report.preflight.json").write_text(json.dumps({
+                "status": "failed", "models": ["glm-5.3"], "unavailable_model": None,
+                "failure": {"model": "glm-5.3", "stage": "execution", "exit_code": 3,
+                            "error_kind": "api_error", "error_code": "execution_binding_provider_required",
+                            "detail": "sentinel-secret"}}))
             (root / "harness/model-status.json").unlink()
             result = self.run_block("Diagnose failure without exposing provider responses", root,
                                     GITHUB_STEP_SUMMARY=str(root / "job-summary"),
@@ -188,6 +194,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             diagnostic = json.loads((root / "harness/diagnostic.json").read_text())
             self.assertIsNone(diagnostic["model_registered"])
             self.assertIsNone(diagnostic["model_active"])
+            self.assertEqual(diagnostic["preflight"]["failure"], {
+                "model": "glm-5.3", "stage": "execution", "exit_code": 3,
+                "error_kind": "api_error", "error_code": "execution_binding_provider_required"})
+            self.assertNotIn("sentinel-secret", (root / "harness/diagnostic.json").read_text()
+                             + (root / "job-summary").read_text())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):
@@ -224,7 +235,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                             "Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n"
                             "Path(sys.argv[sys.argv.index('--report-file')+1]).write_text('{}')\n"
                             "import os\n"
-                            "e={'schema':'astra.harness_progress.v1','type':'suite_started',"
+                            "e={'schema':'astra.harness_progress.v2','type':'suite_started',"
                             "'run_id':'cli','sequence':1,'total':1,'commit':os.environ['ASTRA_BUILD_SOURCE_GIT_SHA']}\n"
                             "Path(sys.argv[sys.argv.index('--progress-file')+1]).write_text(json.dumps(e)+'\\n')\n")
             stub.chmod(0o700)
@@ -249,7 +260,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
-            self.assertEqual(args[args.index("--judger-model") + 1], "glm-5.3")
+            self.assertEqual(args[args.index("--judger-model") + 1], "deepseek-v4.1-flash")
             self.assertEqual(args[args.index("--force-model") + 1], "deepseek-v4.1-flash")
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])

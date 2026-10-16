@@ -476,7 +476,7 @@ pub(crate) async fn create_session_handler(
         };
         return Ok((status, Json(SessionResponse::from(result.session))));
     }
-    let session = super::session_quota::create_session_with_resource_quota(
+    let (session, _) = super::session::session_quota::create_session_with_resource_quota(
         &state,
         principal.user.user_id,
         data,

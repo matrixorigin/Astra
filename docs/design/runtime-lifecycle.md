@@ -389,6 +389,9 @@ An optimistic Work-context mismatch is a retryable non-execution rejection:
 the proposed graph mutation has not started and carries no possible side
 effect. Refreshing the canonical context may safely retry without leaving an
 unresolved execution failure in the turn outcome.
+An invalid dependency operation against that current context is instead a
+non-retryable proposal rejection: correct the edge changes, not the context.
+It carries the same explicit non-execution evidence; no graph change occurred.
 
 Task identities are not execution-order authority. Admission retains explicit
 `after_initial_tasks` prerequisites as dependency edges; omitted prerequisites
@@ -559,6 +562,13 @@ including slots, active execution, generation-scoped durable settlement fences
 unresolved invocations and unfinished execution-binding switches. Run statuses
 remain truthful when completion wins a cancellation race.
 
+At normal completion, a Server-owned turn commits its canonical context and
+releases its internally acquired writer in one coordinator transaction. Both
+authority audit facts remain durable with that commit. Externally retained
+writers keep the ordinary commit-without-release contract. An exact commit
+replay cannot release a newer writer or a later reservation held by the same
+writer; failure or cancellation cannot expose a half-committed context/release.
+
 An orphan's terminal transition does not itself retire its canonical writer.
 Cleanup rechecks the terminal Run generation and owner under the Session
 execution fence, then releases only the exact internally acquired writer and
@@ -700,7 +710,37 @@ admission. Cancellation and completion use the same slot as task startup.
 
 The source-only turn core/tool event writers, activity writer, and reflection
 state/lesson writer assembly are retired. Canonical loop append and atomic
-terminal settlement own the transcript and accepted trace-event projections;
+terminal settlement own the transcript, accepted trace-event projections, and
+the terminal display projection in one authoritative transaction; a terminal
+projection must preserve the latest committed checkpoint metadata. The
+resolution path rereads the committed projection hash after a lost commit
+acknowledgement instead of synthesizing one.
+
+Terminal evidence admission reads exact run metadata and its cancellation
+marker under the session/execution/run locks once. Settlement consumes those
+transaction-owned facts; a root's already-locked marker is its complete
+cancellation lineage, while children still validate and lock their ancestors.
+Provider admission likewise needs no later-guidance lookup when its admitted
+control epoch equals the current locked run event frontier. Event append and
+frontier advance remain atomic; a lagging epoch retains the indexed guidance
+query and all owner/generation/lease/cancellation checks still apply.
+
+The completed stream follows the durable terminal, canonical conversation
+commit and exact writer release. After its remaining projections and hooks, the
+owning run task drops the resident context and its interaction sender handles,
+then releases distributed capacity and retires absorbed provider WAL payloads.
+Until that cleanup completes, capacity is conservatively reserved. Existing
+permit-drop and expiry handling recover an
+interrupted release, while a later session boundary retries WAL retirement.
+An empty retirement on a writable owned session needs no child-write transaction;
+nonempty or unavailable snapshots retain the canonical lifecycle lock and checks.
+
+The Explain Analyze graph is produced only for a root run that explicitly
+requested it. Ordinary runs keep their lifecycle, transcript, trace, and
+recovery events; they do not create the second product graph stream, persist
+its typed graph facts, or publish a graph artifact. Resume carries the run's
+durable Explain request so recovery cannot accidentally change that capture
+policy. Delegated child runs do not inherit the root's Explain request.
 hook DB writes, observer extraction, and auxiliary events keep their existing
 owners. Removing the unused snapshot-link updater does not remove context
 snapshots or their introspection reads. Automatic request/response attribution

@@ -18,9 +18,11 @@ fn reads_insert_before_committing(source: &str) -> bool {
         return false;
     };
     let insert = create.find(".execute(&mut*tx).await.map_err(internal_error)?;");
-    let read = create.find(".fetch_session_for_user(&mut*tx,&session_id,&user_id)");
+    let read =
+        create.find(".fetch_session_for_user_with_admission_facts(&mut*tx,&session_id,&user_id)");
     let commit = create.find("tx.commit().await.map_err(internal_error)?;");
-    let returned = create.find("Ok(SessionCreationResult{session:record,created:true,})");
+    let returned =
+        create.find("Ok(SessionCreationResult{session:record,created:true,admission_facts,})");
     matches!((insert, read, commit, returned), (Some(i), Some(r), Some(c), Some(o)) if i < r && r < c && c < o)
         && !create.contains(".fetch_session_for_user(&pool,")
 }
@@ -35,8 +37,8 @@ fn session_creation_reads_its_insert_and_propagates_commit_failure() {
 #[test]
 fn transaction_contract_rejects_pooled_read_and_ignored_commit_error() {
     assert!(!reads_insert_before_committing(&SOURCE.replace(
-        ".fetch_session_for_user(&mut *tx, &session_id, &user_id)",
-        ".fetch_session_for_user(&pool, &session_id, &user_id)",
+        ".fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)",
+        ".fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id)",
     )));
     assert!(!reads_insert_before_committing(&SOURCE.replace(
         "tx.commit().await.map_err(internal_error)?;",

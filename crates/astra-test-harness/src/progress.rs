@@ -3,6 +3,7 @@ use crate::{
     criteria::{Criterion, CriterionResult},
     dashboard::DashboardEvent,
     report::CaseRunReport,
+    runner::RunOutcome,
 };
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -12,10 +13,10 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v1";
+pub const SCHEMA: &str = "astra.harness_progress.v2";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
-fn criteria(values: &[CriterionResult]) -> io::Result<Vec<Value>> {
+fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<Value>> {
     values
         .iter()
         .map(|c| {
@@ -25,7 +26,36 @@ fn criteria(values: &[CriterionResult]) -> io::Result<Vec<Value>> {
             let tag = serde_json::to_value(&c.criterion)?["type"].clone();
             let advisory = matches!(c.criterion, Criterion::Judger { .. });
             let judge = advisory || matches!(c.criterion, Criterion::HardJudger { .. });
+            let diagnostic = match &c.criterion {
+                Criterion::ExecutionToolCount { .. }
+                | Criterion::ExecutionToolSequence { .. }
+                | Criterion::ExecutionChildCount { .. }
+                | Criterion::ExecutionChildResultsAdopted { .. } =>
+                    crate::criteria::execution_contract_proof(&c.criterion, outcome)
+                        .map(|(_, diagnostic)| diagnostic)
+                        .unwrap_or_else(|_| json!({"kind":"unavailable"})),
+                Criterion::DurationBetween { min_ms, max_ms } =>
+                    json!({"kind":"count", "min":min_ms, "max":max_ms, "actual":outcome.duration_ms}),
+                Criterion::ToolsCountBetween { min, max } =>
+                    json!({"kind":"count", "min":min, "max":max, "actual":outcome.tool_calls_count}),
+                Criterion::TurnRoundsBetween { min, max } =>
+                    json!({"kind":"count", "min":min, "max":max, "actual":outcome.turn_rounds}),
+                Criterion::ExitCode { code } =>
+                    json!({"kind":"exit", "expected":code, "actual":outcome.exit_code}),
+                Criterion::Judger { threshold, .. } | Criterion::HardJudger { threshold, .. } =>
+                    json!({"kind":"judge", "threshold":threshold, "assessment":crate::judger::assessment_status(c)}),
+                Criterion::AllOf { .. } | Criterion::AnyOf { .. } => {
+                    let nested = c.full_detail.as_deref()
+                        .and_then(|raw| serde_json::from_str::<Vec<CriterionResult>>(raw).ok());
+                    match nested {
+                        Some(nested) => json!({"kind":"composite", "checks":criteria(&nested, outcome)?}),
+                        None => Value::Null,
+                    }
+                }
+                _ => Value::Null,
+            };
             Ok(json!({"type":tag, "severity":c.severity, "score":c.score,
+            "diagnostic":diagnostic,
             "passed": if advisory && c.score.is_none() {None} else {Some(c.passed)},
             "evaluation": if judge && c.score.is_some() {"scored"}
                 else if advisory {"unscored"} else {"reported"}}))
@@ -47,7 +77,7 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         .map(|s| {
             Ok(json!({
                 "step_index":s.step_index, "passed":s.passed, "duration_ms":s.duration_ms,
-                "criteria":criteria(&s.criteria)?
+                "criteria":criteria(&s.criteria, &s.outcome)?
             }))
         })
         .collect();
@@ -55,7 +85,7 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         json!({"case":report.case_name, "model":report.model, "run_index":report.run_index,
         "status":report.status, "has_warnings":report.has_warnings,
         "failure_class":failure, "exit_code":o.exit_code,
-        "criteria":criteria(&report.criteria)?, "steps":steps?,
+        "criteria":criteria(&report.criteria, o)?, "steps":steps?,
         "token_usage_coverage":o.token_usage_coverage,
         "terminal_reported":{"duration_ms":o.duration_ms, "ttft_ms":o.ttft_ms,
             "turn_rounds":o.turn_rounds, "tool_calls_count":o.tool_calls_count,
@@ -191,6 +221,250 @@ pub async fn observe(
 mod tests {
     use super::*;
     use crate::{report::StepResult, runner::RunOutcome};
+
+    #[test]
+    fn canonical_predicate_failure_reports_counts_without_publishing_documents() {
+        let mut capture =
+            serde_json::to_value(crate::execution_capture::tests::tool_capture()).unwrap();
+        capture["transcript"]["items"][1]["tool_result"]["status"] = json!("failed");
+        capture["transcript"]["items"][1]["content"] = json!(
+            r#"{"error_kind":"tool_invalid_args","status":"rejected","secret":"private-sentinel"}"#
+        );
+        let mut outcome = RunOutcome::new("model");
+        outcome.run_id = Some("root".into());
+        outcome.session_id = Some("session".into());
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(serde_json::from_value(capture).unwrap());
+        outcome.stream_capture = Some(stream);
+        let criterion: Criterion = serde_json::from_value(json!({
+            "type":"execution_tool_count", "name":"agent", "min":1,"max":1,"root_only":true,"ok":false,
+            "predicates":[
+                {"document":"arguments","path":"/action","equals":"spawn"},
+                {"document":"result","path":"/error_kind","equals":"invalid_request"},
+                {"document":"result","path":"/status","equals":"failed"}
+            ]
+        })).unwrap();
+        let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+        let projected = criteria(&results, &outcome).unwrap();
+        assert_eq!(projected[0]["passed"], false);
+        assert_eq!(
+            projected[0]["diagnostic"],
+            json!({
+                "kind":"tool_count", "min":1,"max":1,"actual":0,"considered":1,
+                "expected_ok":false,"outcome_matches":1,"error_matches":null,"predicate_matches":[1,0,0],
+                "observed_outcomes":[{"count":1,"outcome":{"disposition":"executed","ok":false,
+                    "status":"rejected","error_kind":"tool_invalid_args","execution":"not_reported"}}],
+                "outcomes_omitted":0
+            })
+        );
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-sentinel")
+        );
+        for (content, status, error, execution) in [
+            (
+                r#"{"status":"timeout"}"#,
+                "timeout",
+                "not_reported",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"still_running"}"#,
+                "still_running",
+                "not_reported",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"launched"}"#,
+                "launched",
+                "not_reported",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"private-sentinel","error_kind":"private-sentinel","executed":null}"#,
+                "other",
+                "other",
+                "unknown",
+            ),
+            (
+                r#"{"status":{},"error_kind":{},"executed":"private-sentinel"}"#,
+                "not_reported",
+                "other",
+                "not_reported",
+            ),
+            (
+                r#"{"status":"blocked","error_kind":"delegation_model_scope_unresolved","advisory":{"executed":false}}"#,
+                "blocked",
+                "delegation_model_scope_unresolved",
+                "not_executed",
+            ),
+        ] {
+            outcome
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap()
+                .transcript
+                .as_mut()
+                .unwrap()
+                .items[1]
+                .content = content.into();
+            let value = criteria(&results, &outcome).unwrap();
+            let observed = &value[0]["diagnostic"]["observed_outcomes"][0]["outcome"];
+            assert_eq!(observed["status"], status);
+            assert_eq!(observed["error_kind"], error);
+            assert_eq!(observed["execution"], execution);
+            assert!(
+                !serde_json::to_string(&value)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
+        outcome.stream_capture = None;
+        assert_eq!(
+            criteria(&results, &outcome).unwrap()[0]["diagnostic"]["kind"],
+            "unavailable"
+        );
+
+        outcome.duration_ms = 80_000;
+        let composite = Criterion::AllOf {
+            criteria: vec![
+                Criterion::ExitCode {
+                    code: outcome.exit_code,
+                },
+                Criterion::DurationBetween {
+                    min_ms: 0,
+                    max_ms: 45_000,
+                },
+            ],
+        };
+        let results = crate::criteria::evaluate_deterministic(&[composite], &outcome);
+        let nested = criteria(&results, &outcome).unwrap();
+        assert_eq!(
+            nested[0]["diagnostic"]["checks"][1]["diagnostic"],
+            json!({"kind":"count", "min":0,"max":45_000,"actual":80_000})
+        );
+    }
+
+    #[test]
+    fn tool_outcome_buckets_are_bounded_without_changing_exact_counts() {
+        let mut capture = crate::execution_capture::tests::tool_capture();
+        let kinds = [
+            "rate_limit",
+            "payment_required",
+            "server_error",
+            "auth",
+            "context_window",
+            "invalid_request",
+            "contract_violation",
+            "stream_idle",
+            "provider_deadline",
+            "stream_transport",
+            "connection_pool_exhausted",
+            "budget_exhausted",
+            "tool_rounds_exhausted",
+            "network",
+            "tool_not_found",
+            "tool_invalid_args",
+            "policy_denied",
+        ];
+        capture.run_tree.runs[0].total_tool_calls = 20;
+        let page = capture.transcript.as_mut().unwrap();
+        let (request, result) = (page.items[0].clone(), page.items[1].clone());
+        page.items.drain(..2);
+        for index in 0..20 {
+            let mut request = request.clone();
+            let mut result = result.clone();
+            let id = format!("call-{index}");
+            request.item_seq = 10 + index * 2;
+            result.item_seq = request.item_seq + 1;
+            request.tool_calls[0].tool_use_id = id.clone();
+            result.tool_result.as_mut().unwrap().tool_use_id = id;
+            result.tool_result.as_mut().unwrap().status = Some("failed".into());
+            result.content = json!({"error_kind":kinds[if index < 17 {index as usize} else {0}],
+                "status":"failed", "error":"private-sentinel"})
+            .to_string();
+            page.items.extend([request, result]);
+        }
+        let mut outcome = RunOutcome::new("model");
+        outcome.run_id = Some("root".into());
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(capture);
+        outcome.stream_capture = Some(stream);
+        let criterion: Criterion = serde_json::from_value(json!({"type":"execution_tool_count",
+            "name":"agent", "min":1,"max":1,"ok":true,"root_only":true}))
+        .unwrap();
+        let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+        let projected = criteria(&results, &outcome).unwrap();
+        let diagnostic = &projected[0]["diagnostic"];
+        assert_eq!(diagnostic["considered"], 20);
+        assert_eq!(diagnostic["actual"], 0);
+        assert_eq!(diagnostic["outcome_matches"], 0);
+        assert_eq!(diagnostic["outcomes_omitted"], 1);
+        let buckets = diagnostic["observed_outcomes"].as_array().unwrap();
+        assert_eq!(buckets.len(), 16);
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|b| b["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            19
+        );
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-sentinel")
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_summary_distinguishes_rejection_from_evaluation_failure() {
+        struct Judge(bool);
+        #[async_trait::async_trait]
+        impl crate::judger::Judger for Judge {
+            async fn judge(
+                &self,
+                _: &Criterion,
+                _: &RunOutcome,
+                _: Option<&crate::judger::SemanticJudgerEvidence>,
+            ) -> Result<crate::judger::JudgerResult, String> {
+                if self.0 {
+                    return Err("private-sentinel".into());
+                }
+                Ok(crate::judger::JudgerResult {
+                    assessment: crate::judger::JudgerAssessment::Acceptance(false),
+                    rationale: "private-sentinel".into(),
+                    full_rationale: "private-sentinel".into(),
+                    votes: vec![],
+                })
+            }
+        }
+        let outcome = RunOutcome::new("model");
+        let criterion = Criterion::HardJudger {
+            question: "private-sentinel".into(),
+            threshold: 0.8,
+            model: None,
+        };
+        for (unavailable, expected) in [(false, "rejected"), (true, "unavailable")] {
+            let result =
+                crate::judger::evaluate_judger(&Judge(unavailable), &criterion, &outcome, None)
+                    .await
+                    .unwrap();
+            let projected = criteria(&[result], &outcome).unwrap();
+            assert_eq!(projected[0]["passed"], false);
+            assert_eq!(projected[0]["diagnostic"]["assessment"], expected);
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
+    }
 
     #[test]
     fn terminal_projection_preserves_grading_and_excludes_every_private_payload() {

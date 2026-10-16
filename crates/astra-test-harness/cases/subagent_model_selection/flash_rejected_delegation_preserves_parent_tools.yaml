@@ -4,6 +4,7 @@ description: |
   starting a substitute child.
 prompt: |
   先通过 model_catalog 查询当前可用的 Chat 模型，然后只尝试一次委派，让 glm-99.99 模型的子代理回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。
+  使用 requested_model_policy={"mode":"fixed","selector":{"kind":"configured_name","model_name":"glm-99.99"}}，不要设置 execution 或其他模型字段。
   若委派失败，不要重试或换模型。之后由当前代理再次调用 model_catalog，确认父代理工具仍可用，
   再使用这次真实返回的目录结果，
   如实告诉我委派结果及可用模型；最后包含 ASTRA-PARENT-CATALOG-CHECKED。
@@ -18,16 +19,6 @@ criteria:
     min: 1
     max: 1
     root_only: true
-    predicates:
-      - document: arguments
-        path: /action
-        equals: spawn
-  - type: execution_tool_count
-    name: agent
-    min: 1
-    max: 1
-    root_only: true
-    ok: false
   - type: execution_tool_count
     name: agent
     min: 1
@@ -38,12 +29,34 @@ criteria:
       - document: arguments
         path: /action
         equals: spawn
-      - document: result
-        path: /error_kind
-        equals: invalid_request
+      - document: arguments
+        path: /requested_model_policy
+        equals: {mode: fixed, selector: {kind: configured_name, model_name: glm-99.99}}
       - document: result
         path: /status
         equals: failed
+  - type: any_of
+    criteria:
+      - type: execution_tool_count
+        name: agent
+        min: 1
+        max: 1
+        root_only: true
+        ok: false
+        predicates:
+          - {document: arguments, path: /action, equals: spawn}
+          - {document: result, path: /error_kind, equals: invalid_request}
+          - {document: result, path: /executed, equals: false}
+      - type: execution_tool_count
+        name: agent
+        min: 1
+        max: 1
+        root_only: true
+        ok: false
+        predicates:
+          - {document: arguments, path: /action, equals: spawn}
+          - {document: result, path: /error_kind, equals: delegation_model_scope_unresolved}
+          - {document: result, path: /advisory/executed, equals: false}
   - type: text_contains
     needle: ASTRA-PARENT-CATALOG-CHECKED
   - type: execution_child_count

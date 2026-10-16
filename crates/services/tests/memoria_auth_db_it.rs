@@ -82,6 +82,41 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         HeaderValue::from_str(&format!("Bearer {}", refreshed.access_token)).unwrap(),
     );
     auth.current_user(&headers).await.unwrap();
+    let principal = auth.current_principal(&headers).await.unwrap();
+    assert_eq!(principal.user.user_id, tokens.user_id);
+    assert!(matches!(
+        principal.origin,
+        astra_services::AuthPrincipalOrigin::VerifiedProvider { .. }
+    ));
+    sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let inactive = auth.current_principal(&headers).await.unwrap_err();
+    assert_eq!(inactive.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(inactive.1.0.detail, "User is inactive");
+    sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let expired = auth.current_principal(&headers).await.unwrap_err();
+    assert_eq!(expired.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        expired.1.0.detail, "Session expired or revoked",
+        "session rejection retains precedence over the inactive user"
+    );
+    sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 0 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE auth_users SET is_active = 1 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     revoked.store(true, Ordering::SeqCst);
     assert_eq!(
         auth.refresh(AuthRefreshRequestData {
@@ -135,6 +170,11 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
             assert_eq!(
                 auth.current_user(&headers).await.unwrap_err().0,
                 StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                auth.current_principal(&headers).await.unwrap_err().0,
+                StatusCode::UNAUTHORIZED,
+                "parallel principal reads retain the legacy Memoria access window"
             );
         }
     }

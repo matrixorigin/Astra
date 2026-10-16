@@ -105,6 +105,27 @@ pub struct ChildExecutionExpectation {
     pub slot_index: Option<u32>,
 }
 
+/// Select a fanout by execution identity or display title, never by guessing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FanoutGroupSelector {
+    Id(String),
+    Title(String),
+}
+
+impl FanoutGroupSelector {
+    pub(crate) fn value(&self) -> &str {
+        match self {
+            Self::Id(value) | Self::Title(value) => value,
+        }
+    }
+}
+
 /// One declarative success check, serialized with `type: <variant>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -114,7 +135,7 @@ pub enum Criterion {
     ExecutionChildResultsAdopted {
         children: Vec<ChildExecutionExpectation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        fanout_group: Option<String>,
+        fanout_group: Option<FanoutGroupSelector>,
     },
     /// Count joined tool requests/results from the complete Server transcript.
     ExecutionToolCount {
@@ -611,6 +632,7 @@ pub enum Criterion {
     /// With `min_creation: 0` and no ceiling, only the provider-observed read
     /// lane is required; unknown creation remains unknown. Creation bounds
     /// still require complete exact input evidence.
+    /// A zero read floor requires measured reads, not a positive cache hit.
     ///
     /// Distinct from `cache_rate_above`, which checks the local idempotent
     /// tool-result cache.
@@ -986,7 +1008,12 @@ pub(crate) fn execution_verification_unavailable(
     }
 }
 
-fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool, &'static str> {
+/// The verdict and its public numeric evidence come from the same proof. Never
+/// include tool arguments, result strings, predicate values or provider errors.
+pub(crate) fn execution_contract_proof(
+    c: &Criterion,
+    outcome: &RunOutcome,
+) -> Result<(bool, serde_json::Value), &'static str> {
     let stream = outcome
         .stream_capture
         .as_ref()
@@ -1008,13 +1035,18 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
         fanout_group,
     } = c
     {
-        return capture.proves_children(root, children, fanout_group.as_deref());
+        return capture
+            .proves_children(root, children, fanout_group.as_ref())
+            .map(|passed| (passed, serde_json::json!({"kind":"proof", "proven":passed})));
     }
     if let Criterion::ExecutionChildCount { min, max } = c {
         let count = capture
             .child_count(root)
             .ok_or("complete tree unavailable")? as u32;
-        return Ok(count >= *min && count <= *max);
+        return Ok((
+            count >= *min && count <= *max,
+            serde_json::json!({"kind":"count", "min":min, "max":max, "actual":count}),
+        ));
     }
     let calls = capture.tools(root)?;
     match c {
@@ -1053,27 +1085,63 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
                     }
                 }
             }
+            let mut considered = 0;
+            let mut outcome_matches = 0;
+            let mut error_matches = 0;
+            let mut predicate_matches = vec![0usize; predicates.len()];
+            let mut observed_outcomes: Vec<serde_json::Value> = Vec::new();
+            let mut outcomes_omitted = 0usize;
             let count = calls
                 .iter()
                 .filter(|call| {
-                    call.name == name
-                        && (!root_only || call.run_id == root)
-                        && ok.is_none_or(|expected| call.ok == Some(expected))
-                        && error_contains.as_ref().is_none_or(|needle| {
-                            call.ok == Some(false) && call.raw_result.contains(needle)
-                        })
-                        && predicates.iter().all(|predicate| {
-                            let document = match predicate.document {
-                                JournalToolDocument::Arguments => call.arguments.as_ref(),
-                                JournalToolDocument::Result => call.result.as_ref(),
-                                _ => None,
-                            };
-                            predicate
-                                .matches(document.and_then(|value| value.pointer(&predicate.path)))
-                        })
+                    if call.name != name || (*root_only && call.run_id != root) {
+                        return false;
+                    }
+                    considered += 1;
+                    let outcome = call.safe_outcome();
+                    if let Some(existing) = observed_outcomes
+                        .iter_mut()
+                        .find(|entry| entry["outcome"] == outcome)
+                    {
+                        existing["count"] = (existing["count"].as_u64().unwrap() + 1).into();
+                    } else if observed_outcomes.len() < 16 {
+                        observed_outcomes.push(serde_json::json!({"outcome":outcome,"count":1}));
+                    } else {
+                        outcomes_omitted += 1;
+                    }
+                    if ok.is_some_and(|expected| call.ok != Some(expected)) {
+                        return false;
+                    }
+                    outcome_matches += 1;
+                    let error_match = error_contains.as_ref().is_none_or(|needle| {
+                        call.ok == Some(false) && call.raw_result.contains(needle)
+                    });
+                    error_matches += usize::from(error_match);
+                    let mut all_match = error_match;
+                    for (index, predicate) in predicates.iter().enumerate() {
+                        let document = match predicate.document {
+                            JournalToolDocument::Arguments => call.arguments.as_ref(),
+                            JournalToolDocument::Result => call.result.as_ref(),
+                            _ => None,
+                        };
+                        let matched = predicate
+                            .matches(document.and_then(|value| value.pointer(&predicate.path)));
+                        predicate_matches[index] += usize::from(matched);
+                        all_match &= matched;
+                    }
+                    all_match
                 })
                 .count() as u32;
-            Ok(count >= *min && count <= *max)
+            Ok((
+                count >= *min && count <= *max,
+                serde_json::json!({
+                    "kind":"tool_count", "min":min, "max":max, "actual":count,
+                    "considered":considered, "expected_ok":ok, "outcome_matches":outcome_matches,
+                    "error_matches":error_contains.as_ref().map(|_| error_matches),
+                    "predicate_matches":predicate_matches,
+                    "observed_outcomes":observed_outcomes, "outcomes_omitted":outcomes_omitted,
+                }),
+            ))
         }
         Criterion::ExecutionToolSequence {
             tools,
@@ -1099,11 +1167,17 @@ fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool,
                         && (!final_call || last_ok.is_none_or(|expected| call.ok == Some(expected)))
                 });
                 if last_call.is_none() {
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        serde_json::json!({"kind":"sequence", "matched":position, "expected":tools.len()}),
+                    ));
                 }
                 previous_terminal_seq = last_call.map(|call| call.terminal_seq);
             }
-            Ok(last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)))
+            Ok((
+                last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)),
+                serde_json::json!({"kind":"sequence", "matched":tools.len(), "expected":tools.len()}),
+            ))
         }
         _ => unreachable!(),
     }
@@ -2722,7 +2796,7 @@ fn evaluate_one_with_primary_cache(
                 } else {
                     format!("any_of failed ({detail})")
                 },
-                full_detail: (!passed && requires_execution_capture(criteria))
+                full_detail: (!passed)
                     .then(|| serde_json::to_string(&nested).expect("evaluated criteria serialize")),
                 score: None,
             }
@@ -2765,7 +2839,7 @@ fn evaluate_one_with_primary_cache(
                 } else {
                     format!("all_of failed ({detail})")
                 },
-                full_detail: (!passed && requires_execution_capture(criteria))
+                full_detail: (!passed)
                     .then(|| serde_json::to_string(&nested).expect("evaluated criteria serialize")),
                 score: None,
             }
@@ -2906,9 +2980,11 @@ fn evaluate_one_with_primary_cache(
             CriterionResult {
                 criterion: c.clone(),
                 severity: CriterionSeverity::Hard,
-                passed: proof == Ok(true),
-                detail: match proof {
-                    Ok(passed) => format!("complete Server execution contract proven={passed}"),
+                passed: proof.as_ref().is_ok_and(|(passed, _)| *passed),
+                detail: match &proof {
+                    Ok((passed, diagnostic)) => {
+                        format!("complete Server execution contract proven={passed}; {diagnostic}")
+                    }
                     Err(reason) => format!("Server verification unavailable: {reason}"),
                 },
                 full_detail: None,
@@ -4738,13 +4814,17 @@ fn evaluate_one_with_primary_cache(
                     .stable_prefix_cache_coverage
                     .is_some_and(|coverage| coverage >= *min || (coverage - *min).abs() <= 1e-12);
                 let evidence_valid = report.invalid_events == 0;
+                let coverage = report
+                    .stable_prefix_cache_coverage
+                    .map(|coverage| format!("{:.2}%", coverage * 100.0))
+                    .unwrap_or_else(|| "unknown".into());
                 CriterionResult {
                     criterion: c.clone(),
                     severity: criterion_severity(c),
                     passed: evidence_valid && enough_observations && coverage_ok,
                     detail: format!(
-                        "provider_stable_prefix_cache_coverage={:.2}% (read={}, eligible={}, provider-prefix observations={}, eligible observations={}, invalid events={}), expected >= {:.2}% and observations >= {}",
-                        report.stable_prefix_cache_coverage.unwrap_or_default() * 100.0,
+                        "provider_stable_prefix_cache_coverage={} (read={}, eligible={}, provider-prefix observations={}, eligible observations={}, invalid events={}), expected >= {:.2}% and observations >= {}",
+                        coverage,
                         report.stable_prefix_cache_read_tokens,
                         report.stable_prefix_cache_eligible_tokens,
                         report.provider_prefix_cache_observations,
@@ -5649,7 +5729,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             let mut identities = std::collections::BTreeSet::new();
             if fanout_group
                 .as_ref()
-                .is_some_and(|group| group.trim().is_empty() || group.len() > 256)
+                .is_some_and(|group| group.value().trim().is_empty() || group.value().len() > 256)
             {
                 return Err("fanout_group must be a bounded nonempty identity".into());
             }
@@ -5887,16 +5967,10 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::PromptCacheTokens {
-            min_read,
             min_creation,
             max_creation,
+            ..
         } => {
-            if *min_read == 0 && *min_creation == 0 && max_creation.is_none() {
-                return Err(
-                    "PromptCacheTokens requires min_read, min_creation, or max_creation to be set"
-                        .into(),
-                );
-            }
             if let Some(max) = max_creation
                 && *max < *min_creation
             {
@@ -6147,6 +6221,44 @@ mod tests {
                 *error_contains = Some(needle.into());
             }
             assert!(validate_criteria(&[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn fanout_selectors_require_explicit_bounded_identity_kind() {
+        for (selector, valid) in [
+            (serde_json::json!({"kind":"id","value":"group"}), true),
+            (serde_json::json!({"kind":"title","value":"group"}), true),
+            (serde_json::json!("group"), false),
+            (serde_json::json!({"kind":"title","value":" "}), false),
+            (
+                serde_json::json!({"kind":"title","value":"x".repeat(257)}),
+                false,
+            ),
+            (serde_json::json!({"kind":"other","value":"group"}), false),
+            (
+                serde_json::json!({"kind":"title","value":"group","id":"other"}),
+                false,
+            ),
+        ] {
+            let wire = serde_json::json!({"type":"execution_child_results_adopted",
+                "fanout_group":selector,"children":[{"slot_index":0,"model":"test",
+                "expected_result":{"text":"result"}}]});
+            let criterion = serde_json::from_value::<Criterion>(wire.clone());
+            assert_eq!(
+                criterion
+                    .as_ref()
+                    .is_ok_and(|c| validate_criterion(c).is_ok()),
+                valid,
+                "{selector}"
+            );
+            if valid {
+                let criterion = criterion.unwrap();
+                let expected = serde_json::to_value(&criterion).unwrap();
+                let yaml = serde_yaml_ng::to_string(&criterion).unwrap();
+                let round_trip: Criterion = serde_yaml_ng::from_str(&yaml).unwrap();
+                assert_eq!(serde_json::to_value(round_trip).unwrap(), expected);
+            }
         }
     }
 
@@ -6876,11 +6988,15 @@ mod tests {
     }
 
     #[test]
-    fn shipped_rejection_cases_reject_extra_attempts_with_different_outcomes() {
-        for name in [
-            "flash_missing_child_model_fail_closed",
-            "flash_near_version_must_not_substitute",
-            "flash_rejected_delegation_preserves_parent_tools",
+    fn shipped_rejection_cases_require_valid_unexecuted_admission_without_extra_attempts() {
+        use astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind;
+        for (name, model) in [
+            ("flash_missing_child_model_fail_closed", "glm-99.99"),
+            ("flash_near_version_must_not_substitute", "glm-5.3"),
+            (
+                "flash_rejected_delegation_preserves_parent_tools",
+                "glm-99.99",
+            ),
         ] {
             let case = crate::case::Case::from_path(
                 &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6896,14 +7012,27 @@ mod tests {
                         Criterion::ExecutionToolCount { .. }
                             | Criterion::ExecutionToolSequence { .. }
                             | Criterion::ExecutionChildCount { .. }
+                            | Criterion::AnyOf { .. }
                     )
                 })
                 .collect();
             let mut capture = crate::execution_capture::tests::tool_capture();
             capture.run_tree.runs.truncate(1);
+            let args = serde_json::json!({"action":"spawn","description":"Read value","prompt":"Reply OK",
+                "requested_model_policy":{"mode":"fixed","selector":{"kind":"configured_name","model_name":model}}});
+            let mut input = args.clone();
+            input.as_object_mut().unwrap().remove("action");
+            let input: astra_turn_core::orchestration::spawn_tool::SpawnAgentInput =
+                serde_json::from_value(input).unwrap();
+            input.validate_execution_request().unwrap();
+            let rejection = render_agent_tool_admission_error_with_kind(
+                "model selection rejected",
+                Some(astra_core::ErrorKind::InvalidRequest),
+            );
             let page = capture.transcript.as_mut().unwrap();
             page.items[1].tool_result.as_mut().unwrap().status = Some("rejected".into());
-            page.items[1].content = r#"{"error_kind":"invalid_request","status":"failed"}"#.into();
+            page.items[0].tool_calls[0].arguments = args.to_string();
+            page.items[1].content = rejection.clone();
             let append = |capture: &mut crate::execution_capture::SessionExecutionCapture,
                           name: &str,
                           args: &str,
@@ -6939,8 +7068,8 @@ mod tests {
                 append(
                     &mut capture,
                     "agent",
-                    r#"{"action":"spawn"}"#,
-                    r#"{"error_kind":"invalid_request","status":"failed"}"#,
+                    &args.to_string(),
+                    &rejection,
                     "rejected",
                 );
                 append(
@@ -6964,6 +7093,91 @@ mod tests {
                     .all(|result| result.passed),
                 "{name}"
             );
+            for fault in [
+                "scope-binding",
+                "malformed-policy",
+                "substitution",
+                "invalid-arguments",
+                "authentication",
+                "backend",
+                "executed",
+                "missing-execution-proof",
+                "wrong-status",
+                "successful-tool",
+                "child-started",
+                "missing-capture",
+            ] {
+                let mut changed = baseline.clone();
+                let page = changed.transcript.as_mut().unwrap();
+                let request = page
+                    .items
+                    .iter_mut()
+                    .flat_map(|item| &mut item.tool_calls)
+                    .find(|call| call.name == "agent")
+                    .unwrap();
+                let mut arguments: serde_json::Value =
+                    serde_json::from_str(&request.arguments).unwrap();
+                match fault {
+                    "malformed-policy" => {
+                        arguments["requested_model_policy"] = serde_json::json!({"model":model})
+                    }
+                    "substitution" => {
+                        arguments["requested_model_policy"]["selector"]["model_name"] =
+                            "another-model".into()
+                    }
+                    _ => {}
+                }
+                request.arguments = arguments.to_string();
+                let response = page
+                    .items
+                    .iter_mut()
+                    .find(|item| {
+                        item.tool_result
+                            .as_ref()
+                            .is_some_and(|result| result.name.as_deref() == Some("agent"))
+                    })
+                    .unwrap();
+                let mut result: serde_json::Value =
+                    serde_json::from_str(&response.content).unwrap();
+                match fault {
+                    "scope-binding" => {
+                        result = serde_json::json!({"status":"failed",
+                        "error_kind":"delegation_model_scope_unresolved","advisory":{"executed":false}})
+                    }
+                    "invalid-arguments" => result["error_kind"] = "tool_invalid_args".into(),
+                    "authentication" => result["error_kind"] = "auth".into(),
+                    "backend" => result["error_kind"] = "server_error".into(),
+                    "executed" => result["executed"] = true.into(),
+                    "missing-execution-proof" => {
+                        result.as_object_mut().unwrap().remove("executed");
+                    }
+                    "wrong-status" => result["status"] = "rejected".into(),
+                    "successful-tool" => {
+                        response.tool_result.as_mut().unwrap().status = Some("completed".into())
+                    }
+                    _ => {}
+                }
+                response.content = result.to_string();
+                if fault == "child-started" {
+                    changed.run_tree.runs.push(
+                        crate::execution_capture::tests::tool_capture()
+                            .run_tree
+                            .runs[1]
+                            .clone(),
+                    );
+                }
+                let mut candidate = outcome.clone();
+                candidate.stream_capture.as_mut().unwrap().execution = Some(changed);
+                if fault == "missing-capture" {
+                    candidate.stream_capture = None;
+                }
+                let evaluated = evaluate_deterministic(&criteria, &candidate);
+                assert_eq!(
+                    evaluated.iter().all(|check| check.passed),
+                    fault == "scope-binding",
+                    "{name}/{fault}: {evaluated:?}"
+                );
+            }
             for (extra_name, arguments) in [
                 ("agent", r#"{"action":"spawn"}"#),
                 ("agent", r#"{"action":"get_status"}"#),
@@ -10227,6 +10441,7 @@ mod tests {
         );
         assert!(!missing[0].passed);
         assert!(missing[0].detail.contains("provider-prefix observations=0"));
+        assert!(missing[0].detail.contains("coverage=unknown"));
 
         let observed = evaluate_deterministic_with_session(
             &[criterion],
@@ -10900,25 +11115,32 @@ mod tests {
     }
 
     #[test]
-    fn deferred_work_creation_case_requires_cache_observation_presence() {
+    fn deferred_work_creation_requires_observed_reads_without_inventing_creation() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/work_auto_decomposition_journey.yaml");
         let case = crate::case::Case::from_path(&path).expect("load shipped Work case");
         let gate = case
             .criteria
             .iter()
-            .find(|criterion| {
-                matches!(criterion, Criterion::AllOf { criteria }
-                if criteria.iter().any(|inner| {
-                    matches!(inner, Criterion::ProviderStablePrefixCacheCoverage { .. })
-                }))
-            })
-            .expect("stable-prefix observation is a required case contract");
+            .find(|criterion| matches!(criterion, Criterion::AllOf { .. }))
+            .expect("cache observation is a required case contract");
+        assert!(validate_criterion(gate).is_ok());
         assert_eq!(criterion_severity(gate), CriterionSeverity::Hard);
-        assert!(matches!(gate, Criterion::AllOf { criteria }
-            if criteria.iter().any(|inner| matches!(inner,
-                Criterion::ProviderStablePrefixCacheCoverage { min, min_observations: 1 }
-                if *min == 0.0))));
+        let no_alerts = mk_session(&[]);
+        let mut observed = cache_request_outcome("run", "turn", &[(100, 0, 0)]);
+        for event in &mut observed.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                usage.cache_creation_tokens = None;
+            }
+        }
+        assert!(evaluate_one(gate, &observed, Some(&no_alerts)).passed);
+        for event in &mut observed.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = None;
+            }
+        }
+        assert!(!evaluate_one(gate, &observed, Some(&no_alerts)).passed);
     }
 
     #[test]

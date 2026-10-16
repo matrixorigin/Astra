@@ -395,6 +395,60 @@ async fn assert_independent_query_can_replace_cancelled_checkout(pool: &sqlx::Po
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn empty_canonical_wal_retirement_preserves_lifecycle_fencing() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("empty-retire-user-{suffix}");
+    let session_id = format!("empty-retire-session-{suffix}");
+    let run_id = format!("empty-retire-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    assert_eq!(
+        retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .unwrap(),
+        0,
+        "a missing lifecycle fence still uses ordinary session admission"
+    );
+    let mut locked = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT session_id FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&mut *locked)
+    .await
+    .unwrap();
+    let empty = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1),
+    )
+    .await
+    .expect("an empty retirement must not open a child-write transaction")
+    .unwrap();
+    assert_eq!(empty, 0);
+    locked.rollback().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let error =
+        retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .expect_err("an empty WAL must not bypass a committed deletion fence");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
     let (bootstrap_pool, mut settings) = common::setup_pool_and_settings().await;
     drop(bootstrap_pool);
@@ -4241,6 +4295,13 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
         plan_inference_invocation(input).expect("plan fenced invocation")
     };
     let exact = run_authority().expect("run authority fixture");
+
+    admit_inference_invocation(
+        &shared_pool,
+        &plan_for("exact_empty_control_frontier", exact.clone()),
+    )
+    .await
+    .expect("an exact locked empty control frontier admits without later guidance");
 
     let mut wrong_generation = exact.clone();
     wrong_generation.expected_owner_generation = 1;

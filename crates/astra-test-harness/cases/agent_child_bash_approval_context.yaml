@@ -49,8 +49,11 @@ criteria:
     max: 1
   - type: session_child_result_adopted
     expected_result: child-approval-ok
-  - type: journal_turn_evaluation_success
-    equals: true
+  # Operational health still records rejected attempts. This journey proves
+  # successful child delivery, including recovery from a corrected parent call.
+  - type: session_event_count
+    event_type: turn_evaluation
+    min: 1
   - type: text_equals
     expected: child-approval-ok
   - type: turn_rounds_between

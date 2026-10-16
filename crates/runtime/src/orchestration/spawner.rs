@@ -1089,6 +1089,7 @@ impl serde::Serialize for DirectChildCompletion {
             "result": preview,
             "result_sha256": format!("{:x}", Sha256::digest(preview.as_bytes())),
             "result_bytes": result.len(),
+            "result_range": [0, preview.len(), result.len()],
             "result_truncated": preview.len() < result.len(),
             "get_result": {"action": "get_result", "agent_id": self.agent_id},
         })

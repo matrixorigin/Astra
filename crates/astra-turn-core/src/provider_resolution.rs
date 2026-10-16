@@ -142,8 +142,13 @@ impl ResolvedInvocationPolicy {
 /// other's descriptor version or execution policy.
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedProviderPolicyIndex {
-    by_alias: BTreeMap<String, ResolvedInvocationPolicy>,
-    collaborator_stage_aliases: std::collections::BTreeSet<String>,
+    by_alias: BTreeMap<String, ResolvedProviderEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedProviderEntry {
+    policy: ResolvedInvocationPolicy,
+    model_catalog: Option<std::sync::Arc<astra_turn_types::ProviderModelCatalog>>,
 }
 
 impl ResolvedProviderPolicyIndex {
@@ -151,7 +156,6 @@ impl ResolvedProviderPolicyIndex {
         snapshots: &[ResolvedProviderSnapshot],
     ) -> Result<Self, ProviderResolutionError> {
         let mut by_alias = BTreeMap::new();
-        let mut collaborator_stage_aliases = std::collections::BTreeSet::new();
         for snapshot in snapshots {
             let descriptors = snapshot
                 .descriptors
@@ -198,30 +202,22 @@ impl ResolvedProviderPolicyIndex {
                     semantic_cache: semantics.semantic_cache,
                     diagnostics: semantics.diagnostics.clone(),
                 };
-                if by_alias.insert(alias.to_string(), policy).is_some() {
+                let entry = ResolvedProviderEntry {
+                    policy,
+                    model_catalog: descriptor.model_catalog.clone().map(std::sync::Arc::new),
+                };
+                if by_alias.insert(alias.to_string(), entry).is_some() {
                     return Err(ProviderResolutionError::CrossSnapshotAliasCollision {
                         alias: alias.to_string(),
                     });
                 }
-                if descriptor
-                    .extension_fields
-                    .get(astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY)
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-                    && descriptor.task_support == astra_turn_types::ProviderTaskSupport::Required
-                {
-                    collaborator_stage_aliases.insert(alias.to_string());
-                }
             }
         }
-        Ok(Self {
-            by_alias,
-            collaborator_stage_aliases,
-        })
+        Ok(Self { by_alias })
     }
 
     pub fn resolve(&self, public_alias: &str) -> Option<&ResolvedInvocationPolicy> {
-        self.by_alias.get(public_alias)
+        self.by_alias.get(public_alias).map(|entry| &entry.policy)
     }
 
     pub fn len(&self) -> usize {
@@ -232,8 +228,31 @@ impl ResolvedProviderPolicyIndex {
         self.by_alias.is_empty()
     }
 
-    pub fn is_collaborator_stage(&self, public_alias: &str) -> bool {
-        self.collaborator_stage_aliases.contains(public_alias)
+    /// Prepare against the same immutable discovery as visibility and policy,
+    /// before allocating a child. This checks exact execution selectors, not
+    /// human wording. The adapter still owns live availability at dispatch.
+    pub fn resolve_collaborator(
+        &self,
+        public_alias: &str,
+        model: Option<&str>,
+    ) -> Result<&ResolvedInvocationPolicy, String> {
+        let entry = self
+            .by_alias
+            .get(public_alias)
+            .filter(|entry| entry.policy.is_collaborator_stage())
+            .ok_or("selected provider is not an admitted collaborator stage")?;
+        if let Some(model) = model {
+            let catalog = entry.model_catalog.as_ref().filter(|catalog| catalog.is_complete())
+                .ok_or("explicit provider model selection requires a complete current catalog; refresh provider discovery before selecting a model")?;
+            if !catalog.models.iter().any(|item| {
+                item.selector == model || item.aliases.iter().any(|alias| alias == model)
+            }) {
+                return Err(format!(
+                    "requested model '{model}' is not in the selected provider catalog; use an exact advertised selector, without substituting a different model"
+                ));
+            }
+        }
+        Ok(&entry.policy)
     }
 }
 

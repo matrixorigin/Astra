@@ -10,11 +10,34 @@ mod isolated_database;
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunRecord, RunStateStore, ToolOutputBatchItem,
+    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore, ToolOutputBatchItem,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, mysql::MySqlConnection};
 use std::{sync::Arc, time::Duration};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
+
+/// Capture actual statements only within the instrumented store call.
+#[derive(Clone, Default)]
+struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for Queries {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0.lock().unwrap().push(value.to_owned());
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            event.record(&mut self.clone());
+        }
+    }
+}
 
 async fn setup() -> (SharedPool, Arc<DatabaseRunStateStore>) {
     let (pool, _settings) = common::setup_pool_and_settings().await;
@@ -570,6 +593,145 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
+}
+
+/// Event appends must not fetch a recovery body they never consume.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let run = uuid::Uuid::new_v4().to_string();
+    let other_session = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')")
+        .bind(&user)
+        .bind(&other_session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record(run.clone(), user.clone(), session.clone()),
+    )
+    .await;
+    let baseline_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let baseline_index: i64 = sqlx::query_scalar(
+        "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    for bytes in [0, 128, 512 * 1024] {
+        let body = (bytes > 0).then(|| {
+            json!({"version":"checkpoint_v1", "graceful":true, "payload":"x".repeat(bytes)})
+                .to_string()
+        });
+        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(&body)
+            .bind(&user)
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let event = make_idempotent_event(
+            "agent_progress",
+            &format!("body-{bytes}"),
+            json!({"bytes":bytes}),
+        );
+        for replay in [false, true] {
+            let queries = Queries::default();
+            let subscriber = tracing_subscriber::registry().with(queries.clone());
+            let started = std::time::Instant::now();
+            store
+                .append_events_batch(&user, &session, &run, std::slice::from_ref(&event))
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            let statements = queries.0.lock().unwrap();
+            let locked_run = statements
+                .iter()
+                .find(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
+                .expect("actual run-lock statement");
+            assert!(
+                locked_run.contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+                "append must omit recovery body: {locked_run}"
+            );
+            eprintln!(
+                "event_append checkpoint_bytes={bytes} replay={replay} statements={} elapsed_us={}",
+                statements.len(),
+                started.elapsed().as_micros()
+            );
+        }
+        let retained: Option<String> = sqlx::query_scalar(
+            "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user)
+        .bind(&run)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, body,
+            "read optimization must not remove recovery data"
+        );
+        assert!(
+            store
+                .append_events_batch(&user, &other_session, &run, std::slice::from_ref(&event))
+                .await
+                .is_err()
+        );
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        count,
+        baseline_count + 3,
+        "replay and rejected requests cannot insert events"
+    );
+    let index: i64 = sqlx::query_scalar(
+        "SELECT last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(index, baseline_index + 3);
+    for table in [
+        "agent_run_events",
+        "run_display_projections",
+        "agent_runs",
+        "agent_session_execution_slots",
+        "agent_session_lifecycle_fences",
+        "agent_sessions",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id IN (?, ?)"
+        ))
+        .bind(&user)
+        .bind(&session)
+        .bind(&other_session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
 }
 
 /// Owner isolation: a dirty checkpoint row for another user with the same run_id
@@ -1590,11 +1752,483 @@ async fn session_deletion_competes_safely_with_run_admission() {
     }
 }
 
-/// Large batch: 50 events in a single `append_events_batch` must all be stored
-/// with contiguous event_idx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn control_batch_preserves_database_identity_positions_and_isolates_corruption() {
+    let (pool, store) = setup().await;
+    let nonce = uuid::Uuid::new_v4();
+    let (user, other) = (format!("control-a-{nonce}"), format!("control-b-{nonce}"));
+    let (run, bad) = (
+        format!("control-run-{nonce}"),
+        format!("control-bad-{nonce}"),
+    );
+    for (owner, id) in [(&user, &run), (&other, &bad)] {
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(id.clone(), owner.clone(), format!("session-{id}")),
+        )
+        .await;
+    }
+    // Historical runs must not become work for unrelated active observations.
+    let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
+    );
+    history.push_values(0..256, |mut row, i| {
+        let id = format!("control-history-{nonce}-{i}");
+        row.push_bind(&other)
+            .push_bind(format!("session-{bad}"))
+            .push_bind(id.clone())
+            .push_bind(id.clone())
+            .push_bind(format!("/{id}"))
+            .push_bind("completed");
+    });
+    history.build().execute(pool.get()).await.unwrap();
+    let key = |user: &str, run: &str| RunControlReadKey {
+        user_id: user.into(),
+        run_id: run.into(),
+    };
+    let keys = vec![
+        key(&user, &run),
+        key(&other, &run),
+        key(&user, "missing"),
+        key(&other, &bad),
+        key(&user.to_uppercase(), &run.to_uppercase()),
+        key(&user, &run),
+    ];
+    let mut expected = Vec::new();
+    for key in &keys {
+        expected.push(
+            store
+                .load_run_control(&key.user_id, &key.run_id)
+                .await
+                .unwrap(),
+        );
+    }
+    let queries = Queries::default();
+    let subscriber = tracing_subscriber::registry().with(queries.clone());
+    let results = store
+        .load_run_control_batch(&keys)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+        expected
+    );
+    assert!(expected[0].is_some() && expected[1].is_none() && expected[2].is_none());
+    assert_eq!(
+        queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .count(),
+        1
+    );
+    assert!(store.load_run_control_batch(&[]).await.unwrap().is_empty());
+    assert!(
+        store
+            .load_run_control_batch(&vec![key(&user, &run); 129])
+            .await
+            .is_err()
+    );
+
+    for size in [1, 128] {
+        let requested = keys.iter().cycle().take(size).cloned().collect::<Vec<_>>();
+        let queries = Queries::default();
+        let subscriber = tracing_subscriber::registry().with(queries.clone());
+        let result = store
+            .load_run_control_batch(&requested)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            expected
+                .iter()
+                .cycle()
+                .take(size)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        let statements = queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 1);
+        let mut connection = pool.get().acquire().await.unwrap();
+        let mut arguments = Vec::with_capacity(size * 3);
+        for (ordinal, key) in requested.iter().enumerate() {
+            for value in [&key.user_id, &key.run_id] {
+                assert!(
+                    value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                );
+            }
+            sqlx::raw_sql(&format!(
+                "SET @control_u{ordinal}='{}',@control_r{ordinal}='{}'",
+                key.user_id, key.run_id
+            ))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            arguments.push(format!("@control_u{ordinal}"));
+            arguments.push(format!("@control_r{ordinal}"));
+        }
+        arguments.extend((0..size).map(|ordinal| format!("@control_r{ordinal}")));
+        // A removed candidate predicate must fail on scans, not bind count.
+        arguments.truncate(statements[0].matches('?').count());
+        // Inspect the emitted production SELECT, not a test-owned query copy.
+        // MatrixOne supports this prepared diagnostic but not JSON EXPLAIN.
+        sqlx::raw_sql(&format!(
+            "PREPARE control_scan FROM '{}'",
+            statements[0].replace('\'', "''")
+        ))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        let rows = sqlx::raw_sql(&format!(
+            "EXPLAIN ANALYZE FORCE EXECUTE control_scan USING {}",
+            arguments.join(",")
+        ))
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::raw_sql("DEALLOCATE PREPARE control_scan")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+        let table = format!("Table Scan on {}.agent_runs", pool.settings().database);
+        let scans = plan
+            .windows(2)
+            .filter(|lines| lines[0].contains(&table))
+            .map(|lines| {
+                lines[1]
+                    .split("inputRows=")
+                    .nth(1)
+                    .expect("base scan must report input rows")
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(!scans.is_empty(), "missing base scan counters: {plan:?}");
+        let scanned = scans.iter().sum::<u64>();
+        assert!(
+            (1..=size as u64).contains(&scanned),
+            "{size} lookups scanned {scanned} rows including unrelated history: {plan:?}"
+        );
+        eprintln!("control_batch requests={size} base_scan_rows={scanned}");
+    }
+
+    let independent = SharedPool::new(pool.settings()).await.unwrap();
+    sqlx::query("UPDATE agent_runs SET status='paused', last_event_idx=7, cancellation_requested_at=NOW(6) WHERE user_id=? AND run_id=?")
+        .bind(&user).bind(&run).execute(independent.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET run_generation=-1,status='failed' WHERE user_id=? AND run_id=?",
+    )
+    .bind(&other)
+    .bind(&bad)
+    .execute(independent.get())
+    .await
+    .unwrap();
+    let results = store.load_run_control_batch(&keys).await.unwrap();
+    let fresh = results[0].as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        (
+            fresh.status.as_str(),
+            fresh.last_event_idx,
+            fresh.cancellation_requested
+        ),
+        ("paused", 7, true)
+    );
+    assert!(
+        results[3].is_err(),
+        "malformed row fails only its request position"
+    );
+    assert_eq!(results[0], results[5]);
+    assert!(results[1].as_ref().unwrap().is_none());
+    for table in ["agent_runs", "agent_sessions"] {
+        for owner in [&user, &other] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
+                .bind(owner)
+                .execute(independent.get())
+                .await
+                .unwrap();
+        }
+    }
+    independent.close().await;
+}
+
+/// The status reader must stay independent of history size and checkpoint bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
+    let (pool, store) = setup().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let user = format!("status-{id}");
+    let session = format!("session-{id}");
+    let run = format!("run-{id}");
+    let mut events = vec![
+        json!({"event_type":"run_started", "data":{"explain_analyze_requested":true,"transport":"edge"}}),
+        json!({"event_type":"executor_bound", "data":{"executor":{"id":"original"}}}),
+        json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"original"},"transport":"ignored"}}),
+        json!({"event_type":"executor_bound", "data":{"executor":{"id":"replacement"}}}),
+        json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"replacement"}}}),
+        json!({"event_type":"run_finished", "data":{"prompt_tokens":10}}),
+        json!({"event_type":"run_finished", "data":{"prompt_tokens":20}}),
+    ];
+    events.extend((0..256).map(
+        |i| json!({"event_type":"agent_progress", "data":{"index":i,"text":"x".repeat(2048)}}),
+    ));
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record_with_events(run.clone(), user.clone(), session.clone(), "agent", events),
+    )
+    .await;
+    let checkpoint = "x".repeat(256 * 1024);
+    sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+        .bind(&checkpoint)
+        .bind(&user)
+        .bind(&run)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let (_, replica) = setup().await;
+    for (phase, expected_tokens) in [(0, 20), (1, 30)] {
+        if phase == 1 {
+            store.append_events_batch(&user, &session, &run, &[
+                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":25}}),
+                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":30}}),
+                json!({"event_type":"run_finished","data":{"prompt_tokens":99}}),
+            ]).await.unwrap();
+        }
+        let queries = Queries::default();
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+        let snapshot = replica
+            .load_run_status_snapshot(&user, &run)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.explain_requested);
+        assert_eq!(snapshot.workspace.unwrap()["id"], "original");
+        assert_eq!(snapshot.executor.unwrap()["id"], "original");
+        assert_eq!(snapshot.transport.as_deref(), Some("edge"));
+        assert_eq!(
+            snapshot.accounting.unwrap()["prompt_tokens"],
+            expected_tokens
+        );
+        assert_eq!(snapshot.last_event_idx, 262 + phase * 3);
+        let queries = queries.0.lock().unwrap();
+        let reads: Vec<_> = queries
+            .iter()
+            .filter(|q| q.contains("FROM agent_runs") || q.contains("FROM agent_run_events"))
+            .collect();
+        eprintln!(
+            "status_snapshot phase={phase} store_reads={} checkpoint_bytes={}",
+            reads.len(),
+            checkpoint.len()
+        );
+        assert_eq!(reads.len(), 2, "one metadata and one bounded facts read");
+        assert!(
+            queries
+                .iter()
+                .all(|q| !q.trim_start().starts_with("UPDATE")),
+            "status reads cannot write"
+        );
+        assert!(
+            reads[0].contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+            "status must not hydrate recovery bodies"
+        );
+    }
+    for (owner, requested_run) in [("foreign", run.as_str()), (user.as_str(), "missing")] {
+        let queries = Queries::default();
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+        assert!(
+            replica
+                .load_run_status_snapshot(owner, requested_run)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|q| q.contains("FROM agent_runs") || q.contains("FROM agent_run_events"))
+                .count(),
+            1,
+            "missing authority cannot read events"
+        );
+    }
+    let retained: String = sqlx::query_scalar(
+        "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, checkpoint,
+        "read optimization cannot delete recovery data"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn status_snapshot_preserves_selected_fact_failure_semantics() {
+    let (pool, store) = setup().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let user = format!("status-{id}");
+    let session = format!("session-{id}");
+    let run = format!("run-{id}");
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record(run.clone(), user.clone(), session.clone()),
+    )
+    .await;
+    let empty = store
+        .load_run_status_snapshot(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!empty.explain_requested);
+    assert!(empty.workspace.is_none() && empty.executor.is_none() && empty.accounting.is_none());
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[
+                json!({"event_type":"agent_progress","data":{}}),
+                json!({"event_type":"run_finished","data":{"prompt_tokens":19}}),
+            ],
+        )
+        .await
+        .unwrap();
+    // A bad unrelated payload cannot poison the bounded status read.
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'agent_progress'")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    let finished = store
+        .load_run_status_snapshot(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.accounting.unwrap()["prompt_tokens"], 19);
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(store.load_run_status_snapshot(&user, &run).await.is_err());
+
+    // Presence, not a successfully decoded 'data', selects finalized accounting.
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[json!({"event_type":"run_accounting_finalized"})],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .load_run_status_snapshot(&user, &run)
+            .await
+            .unwrap()
+            .unwrap()
+            .accounting
+            .is_none()
+    );
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(
+        store.load_run_status_snapshot(&user, &run).await.is_err(),
+        "selected corruption must not become missing accounting"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-async fn large_batch_50_events_contiguous() {
+async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_corruption() {
+    let (pool, store) = setup().await;
+    let user = common::id("status-zero");
+    for event in [
+        json!({"event_type":"run_finished","data":{"prompt_tokens":0}}),
+        json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":0}}),
+        json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}}),
+    ] {
+        let run = common::id("status-run");
+        let session = common::id("status-session");
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record_with_events(
+                run.clone(),
+                user.clone(),
+                session.clone(),
+                "agent",
+                vec![event.clone()],
+            ),
+        )
+        .await;
+        let snapshot = store
+            .load_run_status_snapshot(&user, &run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.last_event_idx, 0);
+        if event["event_type"] == "workspace_bound" {
+            assert_eq!(snapshot.workspace.as_ref().unwrap()["id"], "only-workspace");
+            assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
+            store
+                .append_events_batch(
+                    &user,
+                    &session,
+                    &run,
+                    &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+                .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+            let after = store
+                .load_run_status_snapshot(&user, &run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.workspace, snapshot.workspace);
+        } else {
+            assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 0);
+            assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
+        }
+    }
+}
+
+/// Count real SQL rather than simulating the batching implementation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn keyed_batches_bound_probe_queries_and_preserve_replay() {
     let (_pool, store) = setup().await;
     let run_id = format!("large_batch_{}", uuid::Uuid::new_v4());
     let user_id = "test_user".to_string();
@@ -1612,22 +2246,75 @@ async fn large_batch_50_events_contiguous() {
     )
     .await;
 
-    let n: usize = 50;
-    let batch: Vec<_> = (0..n)
-        .map(|i| {
-            serde_json::json!({
-                "type": "test_event",
-                "event_id": format!("ev_{i}"),
-                "data": {"n": i},
-                "ignored": "timestamp column removed",
+    let mut n = 0;
+    let wide_prefix = "界".repeat(112);
+    for (size, prefix, expected_probes) in [
+        (0_usize, "", 0),
+        (1, "", 1),
+        (64, "", 1),
+        (65, "", 2),
+        (129, "", 3),
+        (64, wide_prefix.as_str(), 2),
+    ] {
+        let batch: Vec<_> = (0..size)
+            .map(|i| {
+                make_idempotent_event(
+                    "test_event",
+                    &format!("{prefix}batch-{size}-{i}"),
+                    json!({"n": i}),
+                )
             })
-        })
-        .collect();
-
-    store
-        .append_events_batch(&user_id, &session_id, &run_id, &batch)
-        .await
-        .unwrap();
+            .collect();
+        for replay in [false, true] {
+            let queries = Queries::default();
+            let subscriber =
+                tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+            let started = std::time::Instant::now();
+            store
+                .append_events_batch(&user_id, &session_id, &run_id, &batch)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            let queries = queries.0.lock().unwrap();
+            let probes = queries
+                .iter()
+                .filter(|sql| {
+                    let sql = sql.trim_start();
+                    (sql.starts_with("SELECT") || sql.starts_with("WITH"))
+                        && sql.contains("agent_run_events")
+                        && sql.contains("idempotency_key")
+                        && sql.contains("payload_json")
+                })
+                .count();
+            eprintln!(
+                "run_event_probe size={size} wide={} replay={replay} probes={probes} statements={} elapsed_us={}",
+                !prefix.is_empty(),
+                queries.len(),
+                started.elapsed().as_micros()
+            );
+            assert_eq!(
+                probes, expected_probes,
+                "idempotency reads must be bounded per window"
+            );
+            if size == 0 {
+                assert!(
+                    queries.is_empty(),
+                    "empty append must not access the database"
+                );
+            }
+        }
+        n += size;
+        let shape: (i64, i64) = sqlx::query_as(
+            "SELECT CAST(COUNT(*) AS SIGNED), CAST(SUM(OCTET_LENGTH(payload_json)) AS SIGNED) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        ).bind(&user_id).bind(&run_id).fetch_one(_pool.get()).await.unwrap();
+        assert_eq!(shape.0, n as i64 + 1);
+        eprintln!(
+            "run_event_storage size={size} wide={} rows={} payload_bytes={}",
+            !prefix.is_empty(),
+            shape.0,
+            shape.1
+        );
+    }
 
     let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(
@@ -1657,6 +2344,304 @@ async fn large_batch_50_events_contiguous() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atomicity() {
+    let (pool, store) = setup().await;
+    let user = common::id("batch-owner");
+    let session = common::id("batch-session");
+    let run = common::id("batch-run");
+    insert_run_fixture(
+        &pool,
+        store.as_ref(),
+        durable_run_record(run.clone(), user.clone(), session.clone()),
+    )
+    .await;
+    let original: Vec<_> = (0..130)
+        .map(|n| make_idempotent_event("agent_progress", &format!("original-{n}"), json!({"n": n})))
+        .collect();
+    store
+        .append_events_batch(&user, &session, &run, &original)
+        .await
+        .unwrap();
+    let before = store.load_run(&user, &run).await.unwrap().unwrap();
+    for persisted in [false, true] {
+        let mut incoming: Vec<_> = (0..130)
+            .map(|n| make_idempotent_event("agent_progress", &format!("new-{n}"), json!({"n": n})))
+            .collect();
+        let mut conflict = if persisted {
+            original[129].clone()
+        } else {
+            incoming[0].clone()
+        };
+        conflict["data"]["n"] = json!("conflict");
+        incoming.push(conflict);
+        assert!(
+            store
+                .append_events_batch(&user, &session, &run, &incoming)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(&user, &run).await.unwrap().unwrap(),
+            before,
+            "a later-window conflict must not change events, counter or run metadata"
+        );
+    }
+    // Compare with the column itself, not an assumption about the DB's
+    // case/accent/trailing-space collation or Rust's string equality.
+    for alias in ["ORIGINAL-0", "original-0 "] {
+        let equal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND idempotency_key = ?",
+        ).bind(&user).bind(&run).bind(alias).fetch_one(pool.get()).await.unwrap();
+        let mut event = original[0].clone();
+        event["idempotency_key"] = json!(alias);
+        let before_alias = store.load_run(&user, &run).await.unwrap().unwrap();
+        let result = store
+            .append_events_batch(&user, &session, &run, &[event])
+            .await;
+        if equal > 0 {
+            assert!(
+                result.is_err(),
+                "SQL-equivalent key with different immutable JSON must conflict"
+            );
+            assert_eq!(
+                store.load_run(&user, &run).await.unwrap().unwrap(),
+                before_alias
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+    let repeated = make_idempotent_event("agent_progress", "repeated", json!({"n": 42}));
+    store
+        .append_events_batch(&user, &session, &run, &vec![repeated; 130])
+        .await
+        .unwrap();
+    let before_parallel = store.load_run(&user, &run).await.unwrap().unwrap();
+    let parallel: Vec<_> = (0..130)
+        .map(|n| make_idempotent_event("agent_progress", &format!("parallel-{n}"), json!({"n": n})))
+        .collect();
+    let another_store = DatabaseRunStateStore::new(pool.clone());
+    let (left, right) = tokio::join!(
+        store.append_events_batch(&user, &session, &run, &parallel),
+        another_store.append_events_batch(&user, &session, &run, &parallel),
+    );
+    left.unwrap();
+    right.unwrap();
+    let after = store.load_run(&user, &run).await.unwrap().unwrap();
+    assert_eq!(
+        after.events.len(),
+        before_parallel.events.len() + parallel.len()
+    );
+    assert_eq!(after.last_event_idx, after.events.len() as i64 - 1);
+    for (index, event) in after.events.iter().enumerate() {
+        assert_eq!(event["index"], index as i64);
+    }
+    for table in [
+        "agent_run_events",
+        "run_display_projections",
+        "agent_session_execution_slots",
+        "agent_runs",
+        "agent_sessions",
+        "agent_session_lifecycle_fences",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+}
+
+/// Opt-in database capacity probe, not a claim about 1,000 running LLM loops.
+/// Compare one and four independent pool/store owners at the same total quota.
+#[cfg(feature = "capacity-probes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne; opt in with --features capacity-probes"]
+async fn thousand_session_append_preserves_results_across_independent_pools() {
+    use futures_util::{StreamExt, future::join_all, stream};
+    let (bootstrap, mut settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    for replicas in [1_usize, 4] {
+        let prefix = common::id("append-scale");
+        settings.db_pool_max_connections = 32 / replicas as u32;
+        settings.db_pool_min_connections = 0;
+        let mut pools = Vec::new();
+        let mut stores = Vec::new();
+        for replica in 0..replicas {
+            let pool = SharedPool::new(&settings).await.unwrap();
+            stores.push(
+                DatabaseRunStateStore::new(pool.clone())
+                    .with_owner_pod_id(format!("scale-{replica}")),
+            );
+            pools.push(pool);
+        }
+        let identities: Vec<_> = (0..1000)
+            .map(|n| {
+                (
+                    format!("{prefix}-u{}", n / 10),
+                    format!("{prefix}-s{n}"),
+                    format!("{prefix}-r{n}"),
+                )
+            })
+            .collect();
+        stream::iter(identities.iter().enumerate())
+            .for_each_concurrent(32, |(n, (user, session, run))| {
+                let pool = &pools[n % replicas];
+                let store = &stores[n % replicas];
+                async move {
+                    insert_run_fixture(
+                        pool,
+                        store,
+                        durable_run_record(run.clone(), user.clone(), session.clone()),
+                    )
+                    .await;
+                }
+            })
+            .await;
+        let batch: Vec<_> = (0..16)
+            .map(|n| make_idempotent_event("agent_progress", &format!("scale-{n}"), json!({"n":n})))
+            .collect();
+        for replay in [false, true] {
+            let barrier = Arc::new(tokio::sync::Barrier::new(1000));
+            let started = std::time::Instant::now();
+            let calls = identities
+                .iter()
+                .enumerate()
+                .map(|(n, (user, session, run))| {
+                    // Replay through a different replica, not an instance-local cache.
+                    let store = &stores[(n + usize::from(replay)) % replicas];
+                    let batch = &batch;
+                    let barrier = barrier.clone();
+                    async move {
+                        barrier.wait().await;
+                        let started = std::time::Instant::now();
+                        let result = store.append_events_batch(user, session, run, batch).await;
+                        (result, started.elapsed().as_micros())
+                    }
+                });
+            let results = tokio::time::timeout(Duration::from_secs(120), join_all(calls))
+                .await
+                .unwrap();
+            let mut latencies: Vec<_> = results
+                .into_iter()
+                .map(|(result, elapsed)| {
+                    result.unwrap();
+                    elapsed
+                })
+                .collect();
+            latencies.sort_unstable();
+            eprintln!(
+                "append_scale replicas={replicas} total_connections=32 sessions=1000 owners=100 replay={replay} wall_ms={} p50_us={} p95_us={} p99_us={}",
+                started.elapsed().as_millis(),
+                latencies[499],
+                latencies[949],
+                latencies[989]
+            );
+            let bad: i64 = sqlx::query_scalar(
+                "SELECT CAST(COUNT(*) AS SIGNED) FROM (
+                   SELECT runs.run_id FROM agent_runs runs
+                   LEFT JOIN agent_run_events events
+                     ON events.user_id = runs.user_id AND events.run_id = runs.run_id
+                   WHERE runs.user_id LIKE ? GROUP BY runs.run_id
+                   HAVING COUNT(events.id) <> 17 OR MIN(events.event_idx) <> 0
+                       OR MAX(events.event_idx) <> 16 OR MAX(runs.last_event_idx) <> 16
+                 ) invalid_runs",
+            )
+            .bind(format!("{prefix}%"))
+            .fetch_one(bootstrap.get())
+            .await
+            .unwrap();
+            assert_eq!(
+                bad, 0,
+                "every run must retain its exact contiguous result after cross-replica replay"
+            );
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id LIKE ?")
+                    .bind(format!("{prefix}%"))
+                    .fetch_one(bootstrap.get())
+                    .await
+                    .unwrap();
+            assert_eq!(count, 1000);
+        }
+        let facts = [
+            json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
+            json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
+            json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
+            json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
+            json!({"event_type":"run_accounting_finalized","idempotency_key":"status-accounting","data":{"prompt_tokens":20}}),
+            json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
+        ];
+        eprintln!("status_fixture replicas={replicas} prefix={prefix}");
+        // Both empty and populated facts must work through another pool owner.
+        for populated in [false, true] {
+            if populated {
+                stream::iter(identities.iter().enumerate())
+                    .for_each_concurrent(32, |(n, (user, session, run))| {
+                        let store = &stores[n % replicas];
+                        let facts = &facts;
+                        async move {
+                            store
+                                .append_events_batch(user, session, run, facts)
+                                .await
+                                .unwrap();
+                        }
+                    })
+                    .await;
+            }
+            let started = std::time::Instant::now();
+            let statuses = identities
+                .iter()
+                .enumerate()
+                .map(|(n, (user, session, run))| {
+                    let store = &stores[(n + 1) % replicas];
+                    async move {
+                        let started = std::time::Instant::now();
+                        let status = store
+                            .load_run_status_snapshot(user, run)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            (&status.user_id, &status.session_id, &status.run_id),
+                            (user, session, run)
+                        );
+                        assert_eq!(status.last_event_idx, if populated { 22 } else { 16 });
+                        assert_eq!(status.explain_requested, populated);
+                        if populated {
+                            assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
+                            assert_eq!(status.executor.unwrap()["id"], "scale-executor");
+                            assert_eq!(status.transport.as_deref(), Some("edge"));
+                            assert_eq!(status.accounting.unwrap()["prompt_tokens"], 20);
+                        } else {
+                            assert!(
+                                status.workspace.is_none()
+                                    && status.executor.is_none()
+                                    && status.accounting.is_none()
+                            );
+                        }
+                        started.elapsed().as_micros()
+                    }
+                });
+            let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
+                .await
+                .unwrap();
+            latencies.sort_unstable();
+            eprintln!(
+                "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
+                started.elapsed().as_millis(),
+                latencies[499],
+                latencies[949]
+            );
+        }
+        drop(stores);
+        for pool in pools {
+            pool.close().await;
+        }
+    }
 }
 
 /// Dedup + non-keyed events: events without idempotency_key are never affected

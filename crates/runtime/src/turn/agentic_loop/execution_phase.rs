@@ -65,6 +65,7 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
                 "status": child["status"],
                 "result_sha256": child["result_sha256"],
                 "result_truncated": child["result_truncated"],
+                "result_range": child["result_range"],
             })
         })
         .collect();
@@ -121,6 +122,112 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
             .with_producer_scope(Some(parent_run_id));
         buffer.record(event);
     }
+}
+
+/// Record only result bytes present in the final request of a successful
+/// provider turn. Collection, artifact storage and a completed child alone do
+/// not prove delivery. Reuse the dependency boundary, not a second read ledger.
+pub(crate) fn record_observed_child_reads<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    messages: &[serde_json::Value],
+    started: Instant,
+) {
+    let Some(parent) = state.current_run_id.clone() else {
+        return;
+    };
+    let children = observed_child_read_windows(messages, &parent);
+    if !children.is_empty() {
+        record_direct_child_barrier(
+            host,
+            state,
+            &parent,
+            "results_adopted",
+            &serde_json::Value::Array(children),
+            started,
+            None,
+        );
+    }
+}
+
+fn observed_child_read_windows(
+    messages: &[serde_json::Value],
+    parent: &str,
+) -> Vec<serde_json::Value> {
+    use astra_turn_core::tool_result_storage::{TOOL_RESULT_TOOL_NAME_FIELD, tool_result_run_id};
+    use serde_json::{Value, json};
+    let latest_round = messages
+        .iter()
+        .filter(|message| tool_result_run_id(message) == Some(parent))
+        .filter_map(|message| message["_round_index"].as_u64())
+        .max();
+    let mut children = Vec::new();
+    for message in messages {
+        if message["role"] != "tool"
+            || tool_result_run_id(message) != Some(parent)
+            || message["_round_index"].as_u64() != latest_round
+        {
+            continue;
+        }
+        let Some(name @ ("agent" | "agent_fanout")) = message[TOOL_RESULT_TOOL_NAME_FIELD].as_str()
+        else {
+            continue;
+        };
+        let Some(content) = message["content"].as_str() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let items = if name == "agent_fanout" {
+            value["results"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            std::slice::from_ref(&value)
+        };
+        for item in items {
+            let result = if name == "agent_fanout" {
+                &item["result"]
+            } else {
+                item
+            };
+            let (Some(agent), Some(run), Some(text)) = (
+                result["agent_id"].as_str(),
+                result["run_id"].as_str(),
+                result["result"].as_str(),
+            ) else {
+                continue;
+            };
+            if result["status"] != "completed" || agent.is_empty() || run.is_empty() {
+                continue;
+            }
+            let range = if name == "agent_fanout" {
+                let (Some(start), Some(end), Some(total)) = (
+                    item["result_start_offset"].as_u64(),
+                    item["result_end_offset"].as_u64(),
+                    item["result_bytes"].as_u64(),
+                ) else {
+                    continue;
+                };
+                if item["agent_id"] != agent
+                    || item["run_id"] != run
+                    || end > total
+                    || end.checked_sub(start) != Some(text.len() as u64)
+                {
+                    continue;
+                }
+                [start, end, total]
+            } else {
+                [0, text.len() as u64, text.len() as u64]
+            };
+            children.push(json!({"agent_id":agent,"run_id":run,"status":"completed",
+                "result_sha256":format!("{:x}",Sha256::digest(text.as_bytes())),
+                "result_range":range,"result_truncated":range[0] != 0 || range[1] < range[2]}));
+        }
+    }
+    children
 }
 
 fn stage_direct_child_results<H: AgenticLoopHost>(

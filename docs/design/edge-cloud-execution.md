@@ -114,6 +114,9 @@ Connection publication follows these invariants:
 - durable registration failure leaves no active in-memory route;
 - reconnect uses a generation-fenced handoff so stale cleanup cannot remove a
   newer connection;
+- native admission reads local and durable registration views behind the
+  existing per-user/Edge registration barrier, after setup commits or rolls
+  back, without extending that lock into inference;
 - heartbeats and disconnect cleanup are scoped to the exact connection
   identity and generation;
 - an Edge is not eligible for unsafe local dispatch until registration and

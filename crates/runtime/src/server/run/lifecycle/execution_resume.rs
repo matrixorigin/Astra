@@ -498,6 +498,7 @@ impl AgenticRunLifecycleService {
             false,
             admission_field(admission, "turn_intent_policy")?,
             admission_field(admission, "skill_auto_route_policy")?,
+            astra_services::runs::run_requested_explain_analyze(run),
             interactive,
             handoff.edge_provider_tool_schemas.clone(),
             handoff.edge_profile.clone(),

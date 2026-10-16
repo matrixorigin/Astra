@@ -124,13 +124,13 @@ jobs:
               additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
           except ValueError:
               raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries") from None
-          names = {"glm-5.3"}
+          names = set()
           if not isinstance(additional, list):
               raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries")
           for entry in additional:
               name = entry.get("name") if isinstance(entry, dict) else None
               if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
-                  raise SystemExit("Additional models need unique nonempty names, excluding glm-5.3")
+                  raise SystemExit("Additional models need unique nonempty names")
               names.add(name.casefold())
           if "deepseek-v4.1-flash" not in names:
               additional.append({"name": "deepseek-v4.1-flash", "provider": "openai",
@@ -142,15 +142,10 @@ jobs:
                       "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
-          model = {"name": "glm-5.3", "provider": "openai", "base_url": url,
-                   "api_key": key, "thinking_protocol": "reasoning_effort",
-                   "context_window": 128000, "max_completion_tokens": 84000,
-                   "supported_parameters": ["tools"], "tags": ["code", "chat", "reasoning"]}
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
           with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
-              # Explicit supplementary entries stay self-contained. The two
-              # default models share this endpoint by configuration; loading probes both.
-              json.dump([model, *additional], out)
+              # Only Flash is configured by default; supplementary models are explicit.
+              json.dump(additional, out)
           Path(".env").touch()
           PY
 
@@ -229,7 +224,7 @@ jobs:
             --suite "$suite" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
             --filter "$CASE_FILTER" --force-model deepseek-v4.1-flash \
-            --judger-model glm-5.3 --parallel 1 --runs "$CASE_RUNS" \
+            --judger-model deepseek-v4.1-flash --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json"
 
       - name: Diagnose failure without exposing provider responses
@@ -268,6 +263,17 @@ jobs:
                   and isinstance(raw.get("models"), list) and all(isinstance(m, str) for m in raw["models"])
                   and (raw.get("unavailable_model") is None or isinstance(raw["unavailable_model"], str))):
                   preflight = {k: raw.get(k) for k in ("status", "models", "unavailable_model")}
+                  failure = raw.get("failure")
+                  if isinstance(failure, dict) and failure.get("model") in raw["models"]:
+                      stage = failure.get("stage")
+                      if stage in ("execution", "terminal_protocol", "probe_process", "session_cleanup"):
+                          preflight["failure"] = {"model": failure["model"], "stage": stage}
+                          code = failure.get("exit_code")
+                          preflight["failure"]["exit_code"] = code if type(code) is int and -255 <= code <= 255 else None
+                          for key in ("error_kind", "error_code"):
+                              value = failure.get(key)
+                              preflight["failure"][key] = value if (isinstance(value, str) and 0 < len(value) <= 128
+                                  and all(c in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in value)) else None
           except (OSError, ValueError, AttributeError):
               pass
           diagnostic = {"server_readiness_http_status": int(os.environ["DIAGNOSTIC_HEALTH_STATUS"]),

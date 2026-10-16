@@ -14,7 +14,7 @@ prompt: |
   branch (not the current working-tree changes) from two independent angles:
   (1) correctness, data integrity, and
   lifecycle risks; (2) tests, API contracts, and regression coverage. Use
-  exactly one two-agent fanout with defaults.agent_type="task"
+  exactly one two-agent fanout with group_id="historical-commit-review", defaults.agent_type="task"
   and defaults.complexity="normal". Each child must inspect the commit with git
   evidence and return bounded findings. Then synthesize one report
   that cites the commit hash and distinguishes evidence from recommendations.
@@ -25,7 +25,7 @@ prompt_variants:
     prompt: |
       请只审查 main 分支历史提交 449b13b95，不要审查当前工作区改动。用两个独立视角：
       （1）正确性、数据完整性和生命周期风险；（2）测试、API 契约和回归覆盖。
-      只进行一次 two-agent fanout，defaults.agent_type="task"，
+      只进行一次 two-agent fanout，group_id="historical-commit-review"，defaults.agent_type="task"，
       defaults.complexity="normal"；两个子 agent 都必须用 git 证据审查该提交，最后综合成一份报告，
       并明确区分证据和建议。不要修改文件。
 models:
@@ -72,16 +72,11 @@ criteria:
     equals: 2
   # Launch receipts are not terminal results. Check that each exact slot's
   # completed result was adopted by the owning parent before finalization.
-  - type: session_child_result_adopted
-    allow_get_result: true
-    spawn_match:
-      path: /metadata/fanout_slot/slot_index
-      equals: 0
-  - type: session_child_result_adopted
-    allow_get_result: true
-    spawn_match:
-      path: /metadata/fanout_slot/slot_index
-      equals: 1
+  - type: execution_child_results_adopted
+    fanout_group: {kind: id, value: historical-commit-review}
+    children:
+      - {slot_index: 0, model: "{{model}}"}
+      - {slot_index: 1, model: "{{model}}"}
   - type: journal_tool_outcome_count
     name: agent_fanout
     ok: false
@@ -98,8 +93,6 @@ criteria:
     document: arguments
     path: /action
     equals: spawn
-  - type: journal_turn_evaluation_success
-    equals: true
   - type: text_contains
     needle: "449b13b95"
   - type: journal_child_tool_call_count
@@ -119,3 +112,15 @@ criteria:
   - type: turn_rounds_between
     min: 2
     max: 12
+  - type: hard_judger
+    threshold: 1.0
+    question: |
+      Use verified_child_evidence, not the parent's claims alone. Both actual
+      children must review the requested historical commit, cite concrete Git
+      or file evidence, and cover their complementary correctness/lifecycle
+      and tests/API/regression perspectives. The parent must synthesize their
+      observed findings into one report, cite the requested commit, and
+      distinguish evidence from recommendations and unverified conclusions.
+      Disclosed verification limits and recovered tool errors are allowed;
+      launch-only claims, fabricated child findings, and treating an
+      unverified recommendation as an established defect are not.

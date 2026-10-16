@@ -39,6 +39,17 @@ cargo test --manifest-path Cargo.toml -q
 cargo check --manifest-path Cargo.toml
 ```
 
+On a Linux kernel with Landlock enabled, explicitly run the Bash workdir regression:
+
+```bash
+cargo test -p astra-tools --lib shell_ops::landlock_tests::bash_workdir_under_landlock -- --ignored
+```
+
+It installs a ruleset in an isolated test subprocess, denies reads of the filesystem
+root and workspace ancestors, and checks pinned Bash execution, source inspection,
+and rejection of outside-workspace access. It fails if Landlock is unavailable;
+ordinary offline runs leave this kernel-specific test ignored.
+
 MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable.
 `make test-offline` builds this fixture before the workspace tests. For direct
 `cargo test` or `cargo nextest` invocations that include MCP CLI tests, first run

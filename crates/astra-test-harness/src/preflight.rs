@@ -33,6 +33,15 @@ pub enum PreflightError {
     AuthFailed { detail: String },
     #[error("model `{model}` unavailable: {detail}")]
     ModelUnavailable { model: String, detail: String },
+    #[error("agent execution probe for `{model}` failed at {stage}: {detail}")]
+    ExecutionProbeFailed {
+        model: String,
+        stage: &'static str,
+        exit_code: Option<i32>,
+        error_kind: Option<String>,
+        error_code: Option<String>,
+        detail: String,
+    },
     #[error("could not create an isolated preflight workspace: {detail}")]
     ProbeWorkspaceUnavailable { detail: String },
 }
@@ -59,6 +68,15 @@ pub fn write_preflight_result(
         "status": if result.is_ok() { "passed" } else { "failed" },
         "models": models,
         "unavailable_model": unavailable,
+        "failure": match result {
+            Err(PreflightError::ExecutionProbeFailed {
+                model, stage, exit_code, error_kind, error_code, ..
+            }) => Some(serde_json::json!({
+                "model": model, "stage": stage, "exit_code": exit_code,
+                "error_kind": error_kind, "error_code": error_code,
+            })),
+            _ => None,
+        },
     });
     std::fs::write(report.with_extension("preflight.json"), summary.to_string())
 }
@@ -308,6 +326,54 @@ fn validate_successful_model_probe(
         ));
     }
     Ok(())
+}
+
+// A failed `chat` is not proof that its model is unavailable: admission,
+// execution, or protocol validation can fail before any provider call.
+fn failed_execution_probe(output: &Output, model: &str) -> PreflightError {
+    let exit = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stage = "terminal_protocol";
+    let mut error_kind = None;
+    let mut error_code = None;
+    let detail = match parse_strict_cli_outcome(&stdout, model) {
+        Ok(outcome) if outcome.exit_code == exit => {
+            let terminal: serde_json::Value = serde_json::from_str(&stdout)
+                .expect("strict terminal parser already validated JSON");
+            // Only bounded machine identifiers may leave the private log.
+            // Neither the provider message nor arbitrary terminal fields are diagnostics.
+            let identifier = |key: &str| {
+                terminal[key]
+                    .as_str()
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 128
+                            && value.bytes().all(|byte| {
+                                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                            })
+                    })
+                    .map(str::to_owned)
+            };
+            stage = "execution";
+            error_kind = identifier("error_kind");
+            error_code = identifier("error_code");
+            format!(
+                "exit {exit}, error_kind={}, error_code={}",
+                error_kind.as_deref().unwrap_or("unknown"),
+                error_code.as_deref().unwrap_or("unknown")
+            )
+        }
+        Ok(_) => format!("terminal evidence disagrees with process exit {exit}"),
+        Err(error) => format!("exit {exit}; invalid terminal evidence: {error}"),
+    };
+    PreflightError::ExecutionProbeFailed {
+        model: model.to_owned(),
+        stage,
+        exit_code: output.status.code(),
+        error_kind,
+        error_code,
+        detail,
+    }
 }
 
 /// Revision verification binds the suite to the preflight routing context.
@@ -789,6 +855,39 @@ async fn release_model_probe_session(
     delete_server_session(astra_bin, profile, session_id).await
 }
 
+fn probe_boundary_error(model: &str, stage: &'static str, detail: String) -> PreflightError {
+    PreflightError::ExecutionProbeFailed {
+        model: model.into(),
+        stage,
+        detail,
+        exit_code: None,
+        error_kind: None,
+        error_code: None,
+    }
+}
+
+async fn finish_model_probe(
+    output: &Output,
+    astra_bin: &Path,
+    profile: Option<&str>,
+    model: &str,
+) -> Result<(), PreflightError> {
+    let result =
+        validate_successful_model_probe(&output.stdout, model, output.status.code().unwrap_or(-1))
+            .map_err(|_| failed_execution_probe(output, model));
+    // A failed turn can still own a session. Settle it through the same owner
+    // as a successful probe; preserve the original failure if cleanup also fails.
+    if let Ok(outcome) = parse_strict_cli_outcome(&String::from_utf8_lossy(&output.stdout), model)
+        && outcome.exit_code == output.status.code().unwrap_or(-1)
+        && let Err(error) =
+            release_model_probe_session(astra_bin, profile, outcome.session_id.as_deref()).await
+        && result.is_ok()
+    {
+        return Err(probe_boundary_error(model, "session_cleanup", error));
+    }
+    result
+}
+
 async fn check_model(
     astra_bin: &Path,
     model: &str,
@@ -817,10 +916,7 @@ async fn check_model(
         MODEL_PROBE_TIMEOUT,
     )
     .await
-    .map_err(|detail| PreflightError::ModelUnavailable {
-        model: model.to_string(),
-        detail,
-    })?;
+    .map_err(|detail| probe_boundary_error(model, "probe_process", detail))?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr_indicates_model_inactive(&stderr, model) {
@@ -879,62 +975,14 @@ async fn check_model(
                 .await;
                 match retry {
                     Ok(o) => {
-                        if o.status.success() {
-                            match validate_successful_model_probe(
-                                &o.stdout,
-                                model,
-                                o.status.code().unwrap_or(-1),
-                            ) {
-                                Ok(_) => {
-                                    let outcome = parse_strict_cli_outcome(
-                                        &String::from_utf8_lossy(&o.stdout),
-                                        model,
-                                    )
-                                    .expect("successful model probe was already validated");
-                                    if let Err(error) = release_model_probe_session(
-                                        astra_bin,
-                                        Some(auto_profile),
-                                        outcome.session_id.as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        return Err(PreflightError::ModelUnavailable {
-                                            model: model.to_string(),
-                                            detail: format!(
-                                                "model probe session cleanup failed: {error}"
-                                            ),
-                                        });
-                                    }
-                                    eprintln!(
-                                        "[astra-test] preflight: profile `{auto_profile}` authenticated, model `{model}` OK"
-                                    );
-                                    return Ok(Some(auto_profile.to_string()));
-                                }
-                                Err(error) => {
-                                    return Err(PreflightError::ModelUnavailable {
-                                        model: model.to_string(),
-                                        detail: format!(
-                                            "profile `{auto_profile}` authenticated, but model probe returned invalid terminal evidence: {error}"
-                                        ),
-                                    });
-                                }
-                            }
-                        }
-                        let retry_stderr = String::from_utf8_lossy(&o.stderr);
-                        return Err(PreflightError::ModelUnavailable {
-                            model: model.to_string(),
-                            detail: format!(
-                                "profile `{auto_profile}` authenticated, but model probe exited {}: {}",
-                                o.status.code().unwrap_or(-1),
-                                retry_stderr.trim()
-                            ),
-                        });
+                        finish_model_probe(&o, astra_bin, Some(auto_profile), model).await?;
+                        eprintln!(
+                            "[astra-test] preflight: profile `{auto_profile}` authenticated, model `{model}` OK"
+                        );
+                        return Ok(Some(auto_profile.to_string()));
                     }
                     Err(detail) => {
-                        return Err(PreflightError::ModelUnavailable {
-                            model: model.to_string(),
-                            detail: format!("retry {detail}"),
-                        });
+                        return Err(probe_boundary_error(model, "probe_process", detail));
                     }
                 }
             }
@@ -948,36 +996,7 @@ async fn check_model(
         }
     }
 
-    if !output.status.success() {
-        return Err(PreflightError::ModelUnavailable {
-            model: model.to_string(),
-            detail: format!(
-                "exit {}: {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            ),
-        });
-    }
-
-    if let Err(error) =
-        validate_successful_model_probe(&output.stdout, model, output.status.code().unwrap_or(-1))
-    {
-        return Err(PreflightError::ModelUnavailable {
-            model: model.to_string(),
-            detail: format!("model probe returned invalid terminal evidence: {error}"),
-        });
-    }
-
-    let outcome = parse_strict_cli_outcome(&String::from_utf8_lossy(&output.stdout), model)
-        .expect("successful model probe was already validated");
-    if let Err(error) =
-        release_model_probe_session(astra_bin, profile, outcome.session_id.as_deref()).await
-    {
-        return Err(PreflightError::ModelUnavailable {
-            model: model.to_string(),
-            detail: format!("model probe session cleanup failed: {error}"),
-        });
-    }
+    finish_model_probe(&output, astra_bin, profile, model).await?;
 
     eprintln!("[astra-test] preflight: model `{model}` responded OK");
     Ok(profile.map(str::to_string))
@@ -1291,7 +1310,13 @@ esac
                 // Invalid model evidence is intentional: reaching chat on the
                 // verified profile proves routing without live model work.
                 assert!(
-                    matches!(error, super::PreflightError::ModelUnavailable { .. }),
+                    matches!(
+                        error,
+                        super::PreflightError::ExecutionProbeFailed {
+                            stage: "terminal_protocol",
+                            ..
+                        }
+                    ),
                     "{error}"
                 );
                 assert!(log.contains("--profile local chat "), "{log}");
@@ -1837,7 +1862,10 @@ esac
         .await;
         assert!(matches!(
             result,
-            Err(PreflightError::ModelUnavailable { .. })
+            Err(PreflightError::ExecutionProbeFailed {
+                stage: "probe_process",
+                ..
+            })
         ));
     }
 
@@ -2173,6 +2201,103 @@ exec sleep 5
         let failure = br#"{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":"550e8400-e29b-41d4-a716-446655440000","text":"","final_state":"interrupted","interruption_kind":"error","tool_result_class_counts":{},"prompt_tokens":0,"fresh_prompt_tokens":0,"cache":{"hit":false,"read_tokens":0,"creation_tokens":0},"completion_tokens":0,"llm_rounds":0,"tool_calls_count":0,"tools_used":[],"persistence_error":null,"exit_code":3,"success":false,"error_kind":"api_error"}"#;
         let error = validate_successful_model_probe(failure, "deepseek", 0).unwrap_err();
         assert!(error.contains("disagrees with process exit"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_probe_does_not_misclassify_execution_or_protocol_failure_as_model_unavailability()
+     {
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = workspace.path().join("astra");
+        let cleanup = workspace.path().join("cleanup");
+        let failure = serde_json::json!({
+            "trace_id": null, "request_id": null, "run_id": null,
+            "session_id": "550e8400-e29b-41d4-a716-446655440000",
+            "text": "", "final_state": "failed", "interruption_kind": null,
+            "tool_result_class_counts": {}, "prompt_tokens": 0, "fresh_prompt_tokens": 0,
+            "cache": {"hit": false, "read_tokens": 0, "creation_tokens": 0},
+            "completion_tokens": 0, "llm_rounds": 0, "tool_calls_count": 0, "tools_used": [],
+            "persistence_error": null, "exit_code": 3, "success": false,
+            "error_kind": "api_error", "error_code": "execution_binding_provider_required"
+        });
+        for (stdout, expected) in [
+            (failure.to_string(), "execution_binding_provider_required"),
+            (
+                {
+                    let mut private = failure.clone();
+                    private["error_code"] =
+                        "https://private-provider-sentinel/?key=private-value".into();
+                    private.to_string()
+                },
+                "error_code=unknown",
+            ),
+            ("{}".into(), "invalid terminal evidence"),
+            (
+                {
+                    let mut bad = failure.clone();
+                    bad["exit_code"] = 1.into();
+                    bad.to_string()
+                },
+                "disagrees with process exit",
+            ),
+        ] {
+            std::fs::write(&cleanup, "").unwrap();
+            crate::test_support::write_executable_shim(&bin, format!(
+                "#!/bin/sh\nif [ \"$1\" = session ]; then printf '%s' \"$*\" >> '{}'; exit 0; fi\nprintf '%s' '{stdout}'\nprintf private-stderr-sentinel >&2\nexit 3\n", cleanup.display()
+            )).unwrap();
+            let result = super::check_model(
+                &bin,
+                "fixture-model",
+                None,
+                workspace.path(),
+                "harness-auto",
+                None,
+                false,
+            )
+            .await;
+            let error = result.as_ref().unwrap_err();
+            assert!(
+                matches!(error, PreflightError::ExecutionProbeFailed { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!error.to_string().contains("private-stderr-sentinel"));
+            assert!(!error.to_string().contains("private-provider-sentinel"));
+            let cleanup_calls = std::fs::read_to_string(&cleanup).unwrap();
+            if matches!(
+                expected,
+                "execution_binding_provider_required" | "error_code=unknown"
+            ) {
+                assert!(cleanup_calls.contains("550e8400-e29b-41d4-a716-446655440000"));
+            } else {
+                assert!(
+                    cleanup_calls.is_empty(),
+                    "untrusted terminal must not authorize cleanup"
+                );
+            }
+            let report = workspace.path().join("report.json");
+            super::write_preflight_result(Some(&report), &["fixture-model".into()], &result)
+                .unwrap();
+            let summary: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(report.with_extension("preflight.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(summary["status"], "failed");
+            assert!(summary["unavailable_model"].is_null());
+            assert_eq!(summary["failure"]["model"], "fixture-model");
+            assert_eq!(summary["failure"]["exit_code"], 3);
+            if expected == "execution_binding_provider_required" {
+                assert_eq!(summary["failure"]["stage"], "execution");
+                assert_eq!(summary["failure"]["error_kind"], "api_error");
+                assert_eq!(summary["failure"]["error_code"], expected);
+            } else if expected == "error_code=unknown" {
+                assert_eq!(summary["failure"]["stage"], "execution");
+                assert!(summary["failure"]["error_code"].is_null());
+            } else {
+                assert_eq!(summary["failure"]["stage"], "terminal_protocol");
+                assert!(summary["failure"]["error_code"].is_null());
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -859,7 +859,7 @@ impl PreparedBashWorkdir {
 }
 
 #[cfg(unix)]
-use astra_sandbox::open_directory_beneath;
+use astra_sandbox::{open_directory_beneath, open_filesystem_root};
 
 /// Resolve one Bash invocation's execution directory without changing the
 /// workspace authority boundary. The directory must already exist and its
@@ -910,7 +910,7 @@ pub fn resolve_bash_workdir(
     {
         use std::os::unix::fs::MetadataExt;
 
-        let filesystem_root = std::fs::File::open("/").map_err(|error| {
+        let filesystem_root = open_filesystem_root().map_err(|error| {
             format!(
                 "Error: cannot open filesystem root while pinning bash `workdir`: {error}; no command was run"
             )
@@ -7893,3 +7893,7 @@ mod workdir_tests {
         assert!(!outside.path().join("marker").exists());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "shell_ops_landlock_tests.rs"]
+mod landlock_tests;

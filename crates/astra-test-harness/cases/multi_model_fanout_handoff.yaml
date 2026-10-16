@@ -31,7 +31,7 @@ criteria:
     min: 2
     max: 2
   - type: execution_child_results_adopted
-    fanout_group: mixed-model-handoff
+    fanout_group: {kind: title, value: mixed-model-handoff}
     children:
       - slot_index: 0
         model: glm-5.3

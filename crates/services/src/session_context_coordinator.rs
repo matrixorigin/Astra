@@ -657,6 +657,15 @@ pub trait SessionContextCoordinator: Send + Sync {
         idempotency_key: &str,
     ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError>;
 
+    /// Commit the turn and release only the writer that owns its reservation
+    /// in the same transaction. Exact replay must not release a newer writer.
+    async fn commit_turn_and_release_writer(
+        &self,
+        reservation: &TurnReservationV1,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+    ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError>;
+
     async fn advance_authority_epochs(
         &self,
         key: &SessionKeyV1,
@@ -670,6 +679,211 @@ pub struct DatabaseSessionContextCoordinator {
 }
 
 impl DatabaseSessionContextCoordinator {
+    async fn commit_turn_inner(
+        &self,
+        reservation: &TurnReservationV1,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+        release_writer: bool,
+    ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
+        delta
+            .validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_idempotency_key(idempotency_key)?;
+        let request_hash = commit_request_hash(reservation, &delta);
+        let mut segments = Vec::with_capacity(delta.logical_segments.len());
+        for messages in delta.logical_segments.iter().cloned() {
+            segments.push(
+                ConversationSegmentV1::new(&reservation.key, messages)
+                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?,
+            );
+        }
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_commit_turn", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_commit_turn", source))?;
+        admit_session_lifecycle_write(&mut tx, &reservation.key).await?;
+        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
+        if let Some(last) = state.last_commit.clone()
+            && last.idempotency_key == idempotency_key
+        {
+            validate_commit_request(&last, reservation, &delta)?;
+            record_database_authority_event(
+                &mut tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "commit_turn",
+                    outcome: "idempotent_replay",
+                    actor: None,
+                    lease_id: Some(&reservation.lease_id),
+                    reservation_id: Some(&reservation.reservation_id),
+                    expected_cursor: reservation.expected_cursor.as_ref(),
+                },
+            )
+            .await?;
+            if release_writer {
+                release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?;
+            }
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_turn_retry", source))?;
+            connection.release();
+            return Ok(CoordinatorMutationV1::AlreadyApplied {
+                cursor: last.cursor.clone(),
+            });
+        }
+        if let Err(error) = validate_active_reservation(&state, reservation, now) {
+            // Archived receipts are only relevant when this is not the current
+            // active reservation. The successful hot path already proves that
+            // the commit has not been applied, so avoid an extra database read.
+            if let Some(receipt) = load_database_receipt::<CommitReceiptV1>(
+                &mut tx,
+                &reservation.key,
+                "commit",
+                idempotency_key,
+                &request_hash,
+            )
+            .await?
+            {
+                record_database_authority_event(
+                    &mut tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "commit_turn",
+                        outcome: "idempotent_replay",
+                        actor: None,
+                        lease_id: Some(&reservation.lease_id),
+                        reservation_id: Some(&reservation.reservation_id),
+                        expected_cursor: reservation.expected_cursor.as_ref(),
+                    },
+                )
+                .await?;
+                if release_writer {
+                    release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|source| database_error("commit_turn_replay", source))?;
+                connection.release();
+                return Ok(CoordinatorMutationV1::AlreadyApplied {
+                    cursor: receipt.cursor,
+                });
+            }
+            record_database_authority_event(
+                &mut tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "commit_turn",
+                    outcome: authority_error_outcome(&error),
+                    actor: None,
+                    lease_id: Some(&reservation.lease_id),
+                    reservation_id: Some(&reservation.reservation_id),
+                    expected_cursor: reservation.expected_cursor.as_ref(),
+                },
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_turn_rejection_audit", source))?;
+            connection.release();
+            return Err(error);
+        }
+        if state.head.as_ref().map(|head| &head.cursor) != reservation.expected_cursor.as_ref() {
+            let current_cursor = state.head.as_ref().map(|head| head.cursor.clone());
+            record_database_authority_event(
+                &mut tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "commit_turn",
+                    outcome: "cursor_conflict",
+                    actor: None,
+                    lease_id: Some(&reservation.lease_id),
+                    reservation_id: Some(&reservation.reservation_id),
+                    expected_cursor: reservation.expected_cursor.as_ref(),
+                },
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_turn_conflict", source))?;
+            connection.release();
+            return Ok(CoordinatorMutationV1::Conflict {
+                current_cursor,
+                safe_options: vec![
+                    CoordinatorConflictOptionV1::Refresh,
+                    CoordinatorConflictOptionV1::Fork,
+                ],
+            });
+        }
+        validate_delta_advance(state.head.as_ref(), reservation, &delta)?;
+        // Build and persist immutable canonical objects from the head held by
+        // this transaction. This removes the duplicate pre-BEGIN head read
+        // while retaining the same row-lock fence.
+        let node =
+            manifest_node_for_delta(&reservation.key, state.head.as_ref(), &delta, &segments)
+                .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let (total_canonical_bytes, total_message_count) =
+            next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
+        self.persist_database_immutables_in_tx(
+            &mut tx,
+            &reservation.key,
+            &segments,
+            &node,
+            total_canonical_bytes,
+            total_message_count,
+        )
+        .await?;
+        if let Some(previous) = &state.last_commit {
+            archive_database_commit(&mut tx, previous).await?;
+        }
+        let cursor = node.cursor();
+        state.head = Some(SessionContextHeadV1 {
+            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+            key: reservation.key.clone(),
+            cursor: cursor.clone(),
+            latest_manifest_root: node.manifest_root,
+            total_canonical_bytes,
+            total_message_count,
+            writer_epoch: reservation.writer_epoch,
+        });
+        state.last_commit = Some(CommitReceiptV1 {
+            idempotency_key: idempotency_key.to_owned(),
+            reservation_id: reservation.reservation_id.clone(),
+            reservation: reservation.clone(),
+            delta_hash: turn_delta_hash(&delta),
+            cursor: cursor.clone(),
+        });
+        state.active_reservation = None;
+        // Capture the commit audit before clearing its writer: the audit
+        // owner and commit-before-release order must remain unchanged.
+        record_database_authority_event(
+            &mut tx,
+            &state,
+            AuthorityAuditFact {
+                operation: "commit_turn",
+                outcome: "committed",
+                actor: None,
+                lease_id: Some(&reservation.lease_id),
+                reservation_id: Some(&reservation.reservation_id),
+                expected_cursor: reservation.expected_cursor.as_ref(),
+            },
+        )
+        .await?;
+        if !release_writer
+            || !release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?
+        {
+            update_database_state(&mut tx, &state).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_turn", source))?;
+        connection.release();
+        Ok(CoordinatorMutationV1::Applied { cursor })
+    }
+
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
     }
@@ -3448,190 +3662,18 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         delta: CanonicalTurnDeltaV1,
         idempotency_key: &str,
     ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
-        delta
-            .validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        validate_idempotency_key(idempotency_key)?;
-        let request_hash = commit_request_hash(reservation, &delta);
-        let mut segments = Vec::with_capacity(delta.logical_segments.len());
-        for messages in delta.logical_segments.iter().cloned() {
-            segments.push(
-                ConversationSegmentV1::new(&reservation.key, messages)
-                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?,
-            );
-        }
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+        self.commit_turn_inner(reservation, delta, idempotency_key, false)
             .await
-            .map_err(|source| database_error("acquire_commit_turn", source))?;
-        let mut tx = connection
-            .begin()
+    }
+
+    async fn commit_turn_and_release_writer(
+        &self,
+        reservation: &TurnReservationV1,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+    ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
+        self.commit_turn_inner(reservation, delta, idempotency_key, true)
             .await
-            .map_err(|source| database_error("begin_commit_turn", source))?;
-        admit_session_lifecycle_write(&mut tx, &reservation.key).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
-        if let Some(last) = state.last_commit.clone()
-            && last.idempotency_key == idempotency_key
-        {
-            validate_commit_request(&last, reservation, &delta)?;
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "commit_turn",
-                    outcome: "idempotent_replay",
-                    actor: None,
-                    lease_id: Some(&reservation.lease_id),
-                    reservation_id: Some(&reservation.reservation_id),
-                    expected_cursor: reservation.expected_cursor.as_ref(),
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_retry", source))?;
-            connection.release();
-            return Ok(CoordinatorMutationV1::AlreadyApplied {
-                cursor: last.cursor.clone(),
-            });
-        }
-        if let Err(error) = validate_active_reservation(&state, reservation, now) {
-            // Archived receipts are only relevant when this is not the current
-            // active reservation. The successful hot path already proves that
-            // the commit has not been applied, so avoid an extra database read.
-            if let Some(receipt) = load_database_receipt::<CommitReceiptV1>(
-                &mut tx,
-                &reservation.key,
-                "commit",
-                idempotency_key,
-                &request_hash,
-            )
-            .await?
-            {
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "commit_turn",
-                        outcome: "idempotent_replay",
-                        actor: None,
-                        lease_id: Some(&reservation.lease_id),
-                        reservation_id: Some(&reservation.reservation_id),
-                        expected_cursor: reservation.expected_cursor.as_ref(),
-                    },
-                )
-                .await?;
-                tx.commit()
-                    .await
-                    .map_err(|source| database_error("commit_turn_replay", source))?;
-                connection.release();
-                return Ok(CoordinatorMutationV1::AlreadyApplied {
-                    cursor: receipt.cursor,
-                });
-            }
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "commit_turn",
-                    outcome: authority_error_outcome(&error),
-                    actor: None,
-                    lease_id: Some(&reservation.lease_id),
-                    reservation_id: Some(&reservation.reservation_id),
-                    expected_cursor: reservation.expected_cursor.as_ref(),
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_rejection_audit", source))?;
-            connection.release();
-            return Err(error);
-        }
-        if state.head.as_ref().map(|head| &head.cursor) != reservation.expected_cursor.as_ref() {
-            let current_cursor = state.head.as_ref().map(|head| head.cursor.clone());
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "commit_turn",
-                    outcome: "cursor_conflict",
-                    actor: None,
-                    lease_id: Some(&reservation.lease_id),
-                    reservation_id: Some(&reservation.reservation_id),
-                    expected_cursor: reservation.expected_cursor.as_ref(),
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_conflict", source))?;
-            connection.release();
-            return Ok(CoordinatorMutationV1::Conflict {
-                current_cursor,
-                safe_options: vec![
-                    CoordinatorConflictOptionV1::Refresh,
-                    CoordinatorConflictOptionV1::Fork,
-                ],
-            });
-        }
-        validate_delta_advance(state.head.as_ref(), reservation, &delta)?;
-        // Build and persist immutable canonical objects from the head held by
-        // this transaction. This removes the duplicate pre-BEGIN head read
-        // while retaining the same row-lock fence.
-        let node =
-            manifest_node_for_delta(&reservation.key, state.head.as_ref(), &delta, &segments)
-                .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        let (total_canonical_bytes, total_message_count) =
-            next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
-        self.persist_database_immutables_in_tx(
-            &mut tx,
-            &reservation.key,
-            &segments,
-            &node,
-            total_canonical_bytes,
-            total_message_count,
-        )
-        .await?;
-        if let Some(previous) = &state.last_commit {
-            archive_database_commit(&mut tx, previous).await?;
-        }
-        let cursor = node.cursor();
-        state.head = Some(SessionContextHeadV1 {
-            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-            key: reservation.key.clone(),
-            cursor: cursor.clone(),
-            latest_manifest_root: node.manifest_root,
-            total_canonical_bytes,
-            total_message_count,
-            writer_epoch: reservation.writer_epoch,
-        });
-        state.last_commit = Some(CommitReceiptV1 {
-            idempotency_key: idempotency_key.to_owned(),
-            reservation_id: reservation.reservation_id.clone(),
-            reservation: reservation.clone(),
-            delta_hash: turn_delta_hash(&delta),
-            cursor: cursor.clone(),
-        });
-        state.active_reservation = None;
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_event(
-            &mut tx,
-            &state,
-            AuthorityAuditFact {
-                operation: "commit_turn",
-                outcome: "committed",
-                actor: None,
-                lease_id: Some(&reservation.lease_id),
-                reservation_id: Some(&reservation.reservation_id),
-                expected_cursor: reservation.expected_cursor.as_ref(),
-            },
-        )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_turn", source))?;
-        connection.release();
-        Ok(CoordinatorMutationV1::Applied { cursor })
     }
 
     async fn advance_authority_epochs(
@@ -4496,6 +4538,45 @@ async fn lock_database_state(
     lock_database_state_at_now(tx, key)
         .await
         .map(|(state, _)| state)
+}
+
+/// The commit receipt authorizes replay of the turn, not release of a later
+/// controller. Only the writer named by this exact reservation may be cleared.
+async fn release_committed_writer_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    state: &mut CoordinatorStateV1,
+    reservation: &TurnReservationV1,
+) -> Result<bool, SessionContextCoordinatorError> {
+    // A retained writer may already own a later turn when an older commit is
+    // replayed. Its lease alone is not authority to discard that reservation.
+    if state.active_reservation.is_some() {
+        return Ok(false);
+    }
+    let Some(lease) = state
+        .active_writer
+        .as_ref()
+        .filter(|lease| {
+            lease.lease_id == reservation.lease_id && lease.writer_epoch == reservation.writer_epoch
+        })
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    clear_writer_authority_in_tx(tx, state).await?;
+    record_database_authority_event(
+        tx,
+        state,
+        AuthorityAuditFact {
+            operation: "release_writer",
+            outcome: "released",
+            actor: Some(&lease.actor),
+            lease_id: Some(&lease.lease_id),
+            reservation_id: None,
+            expected_cursor: lease.expected_cursor.as_ref(),
+        },
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn clear_writer_authority_in_tx(

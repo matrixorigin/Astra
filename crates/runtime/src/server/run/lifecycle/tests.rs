@@ -5404,7 +5404,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
     SpawnRunConfig {
         max_output_tokens: None,
         run_id: "child-run".to_string(),
-        cancellation_binding_id: "test-child-binding".to_string(),
+        cancellation_binding_id: Uuid::new_v4().to_string(),
         agent_id: "child@1234".to_string(),
         spawn_tool_call_id: None,
         recursion_depth: 1,
@@ -5632,11 +5632,22 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
     let tool_name = "native_codex";
     let protocol = astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer;
     let native_id = NativeToolId::new(tool_name).unwrap();
-    let discovery = ProviderDiscoverySnapshot::new(
-        ProviderIdentity::new("selected-cli-native-provider").unwrap(),
-        ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
-        ProviderProtocolId::new("native-agent-stage").unwrap(),
-        vec![ProviderToolDeclaration {
+    let model_catalog = astra_turn_types::ProviderModelCatalog::new(vec![
+        astra_turn_types::ProviderModelDescriptor {
+            selector: "native-model".into(),
+            display_name: "Native Model".into(),
+            aliases: vec!["native-alias".into()],
+            reasoning_efforts: vec![],
+            hidden: false,
+        },
+    ])
+    .unwrap();
+    let discovery =
+        ProviderDiscoverySnapshot::new(
+            ProviderIdentity::new("selected-cli-native-provider").unwrap(),
+            ProviderBindingRef::new("selected-cli-native-binding").unwrap(),
+            ProviderProtocolId::new("native-agent-stage").unwrap(),
+            vec![ProviderToolDeclaration {
             native_tool_id: native_id.clone(),
             native_tool_name: tool_name.into(),
             stable_tool_alias: None,
@@ -5647,6 +5658,7 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             claims: Default::default(),
             task_support: astra_turn_types::ProviderTaskSupport::Required,
             extension_fields: serde_json::Map::from_iter([
+                (astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(), json!(model_catalog)),
                 (
                     astra_turn_types::PROVIDER_COLLABORATOR_STAGE_KEY.into(),
                     json!(true),
@@ -5658,12 +5670,12 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
                 ),
             ]),
         }],
-    )
-    .unwrap();
+        )
+        .unwrap();
     let snapshot = resolve_provider_snapshot(
         &discovery,
         &Default::default(),
-        &BTreeMap::from([(native_id, PublicToolAlias::new(tool_name).unwrap())]),
+        &BTreeMap::from([(native_id.clone(), PublicToolAlias::new(tool_name).unwrap())]),
     )
     .unwrap();
     let descriptor = snapshot.descriptors[0].descriptor_ref();
@@ -5693,6 +5705,53 @@ async fn server_prepare_mixed_native_and_model_children_uses_existing_policy_own
             ..Default::default()
         },
     ];
+    for (catalog, model, accepted) in [
+        (Some(model_catalog.clone()), Some("native-model"), true),
+        (Some(model_catalog.clone()), Some("native-alias"), true),
+        (Some(model_catalog.clone()), Some("absent-model"), false),
+        (Some(model_catalog.clone()), Some("Native Model"), false),
+        (
+            Some(astra_turn_types::ProviderModelCatalog::unavailable()),
+            Some("native-model"),
+            false,
+        ),
+        (None, Some("native-model"), false),
+        (None, None, true),
+    ] {
+        let mut candidate = discovery.clone();
+        let fields = &mut candidate.tool_declarations[0].extension_fields;
+        fields.remove(astra_turn_types::PROVIDER_MODEL_CATALOG_KEY);
+        if let Some(catalog) = catalog {
+            fields.insert(
+                astra_turn_types::PROVIDER_MODEL_CATALOG_KEY.into(),
+                json!(catalog),
+            );
+        }
+        let snapshot = resolve_provider_snapshot(
+            &candidate,
+            &Default::default(),
+            &BTreeMap::from([(native_id.clone(), PublicToolAlias::new(tool_name).unwrap())]),
+        )
+        .unwrap();
+        tool_executor.set_provider_policy_index(
+            ResolvedProviderPolicyIndex::from_snapshots(&[snapshot]).unwrap(),
+        );
+        let mut batch = inputs.clone();
+        batch[0].execution.as_mut().unwrap().model = model.map(str::to_owned);
+        let result = executor.clone().prepare_batch(&batch, &context, None).await;
+        assert_eq!(result.is_ok(), accepted, "model={model:?}");
+        if let Err(error) = result {
+            assert_eq!(
+                error.error_kind(),
+                Some(astra_core::ErrorKind::InvalidRequest)
+            );
+        }
+        assert!(
+            edge_rx.try_recv().is_err(),
+            "preparation must not dispatch any child"
+        );
+    }
+    tool_executor.set_provider_policy_index(index.clone());
     let mut prepared = Arc::clone(&executor)
         .prepare_batch(&inputs, &context, None)
         .await
@@ -18237,6 +18296,26 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
     assert_eq!(executor.status, ExecutorStatus::Online);
 }
 
+fn native_edge_execution_request(executor_id: &str, root: &str) -> ChatRequestData {
+    let mut request = test_request("continue");
+    request.edge_executor_id = Some(executor_id.into());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Owner workspace".into()),
+        root: Some(root.into()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath { path: root.into() }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some(executor_id.into()),
+        display_name: Some("Owner edge".into()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    request
+}
+
 #[tokio::test]
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
@@ -18278,24 +18357,7 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         sender,
     );
     let service = test_service().with_edge_connection_pool(edge_pool);
-    let mut request = test_request("continue");
-    request.edge_executor_id = Some("edge-owner-1".to_string());
-    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-        display_name: Some("Owner workspace".to_string()),
-        root: Some("/workspace/owner".to_string()),
-        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/workspace/owner".to_string(),
-        }),
-        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-    });
-    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-        executor_id: Some("edge-owner-1".to_string()),
-        display_name: Some("Owner edge".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
-        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-    });
+    let mut request = native_edge_execution_request("edge-owner-1", "/workspace/owner");
     let mut discovered = Vec::new();
     let physical_id = service
         .authorize_native_edge_execution("owner-1", &request, &mut discovered)
@@ -18332,6 +18394,162 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         .await
         .expect_err("a different workspace path must not authorize the Edge");
     assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
+}
+
+#[tokio::test]
+async fn native_edge_execution_waits_for_pool_publication_and_cancels_queued_admission() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let service = test_service().with_edge_connection_pool(pool.clone());
+    let request = native_edge_execution_request("edge-publication", "/workspace/publication");
+    let publication = pool.registration_lock("owner", "edge-publication");
+    let publishing = publication.lock().await;
+    let reconnect = pool.begin_reconnect("owner", "edge-publication");
+    {
+        let mut discovery = Vec::new();
+        let mut cancelled =
+            Box::pin(service.authorize_native_edge_execution("owner", &request, &mut discovery));
+        // Without the admission barrier the real method immediately returns
+        // 428 against the not-yet-published pool. No task timing is involved.
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+    }
+    let mut discovery = Vec::new();
+    let mut admission =
+        Box::pin(service.authorize_native_edge_execution("owner", &request, &mut discovery));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    let other_request = native_edge_execution_request("other-edge", "/workspace/publication");
+    for (user, request) in [("other-owner", &request), ("owner", &other_request)] {
+        let mut other_discovery = Vec::new();
+        let mut independent =
+            Box::pin(service.authorize_native_edge_execution(user, request, &mut other_discovery));
+        let std::task::Poll::Ready(denied) = futures_util::poll!(&mut independent) else {
+            panic!("another owner/executor key must not wait for this publication");
+        };
+        assert_eq!(denied.unwrap_err().0, StatusCode::PRECONDITION_REQUIRED);
+    }
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    pool.commit_reconnect_with_registry_and_materialization_id(
+        reconnect,
+        "owner",
+        "edge-publication",
+        None,
+        Some("/workspace/publication".into()),
+        None,
+        None,
+        Some("registry-publication".into()),
+        Some("materialization-publication".into()),
+        Some("ws-publication".into()),
+        sender,
+    );
+    drop(publishing);
+    let physical = admission
+        .await
+        .expect("published materialization must authorize");
+    assert_eq!(
+        physical,
+        Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-publication",
+                "/workspace/publication",
+            ),
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn native_edge_execution_waits_for_aborted_registration_rollback_on_matrixone() {
+    use astra_services::multi_agent::EdgeRegistryService;
+    let db = setup_lifecycle_run_db_it().await;
+    let registry = Arc::new(astra_services::DatabaseEdgeRegistryService::from_shared(
+        &db,
+    ));
+    let user = Uuid::new_v4().to_string();
+    let edge = "edge-rollback";
+    let root = "/workspace/rollback";
+    let initial = registry
+        .register_or_update_with_lease_and_materialization(
+            &user,
+            edge,
+            "rest-predecessor",
+            None,
+            Some(root),
+            None,
+            None,
+            Some("materialization-rollback"),
+        )
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&initial).await.unwrap());
+    assert!(registry.release_registration(&initial).await.unwrap());
+
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let service = test_service()
+        .with_edge_connection_pool(pool.clone())
+        .with_edge_registry_service(registry.clone());
+    let request = native_edge_execution_request(edge, root);
+    let publication = pool.registration_lock(&user, edge);
+    let publishing = publication.lock().await;
+    let reconnect = pool.begin_reconnect(&user, edge);
+    let successor = registry
+        .register_or_update_with_lease_and_materialization(
+            &user,
+            edge,
+            "ws-aborted",
+            None,
+            Some(root),
+            None,
+            None,
+            Some("materialization-rollback"),
+        )
+        .await
+        .unwrap();
+    assert!(registry.finalize_registration(&successor).await.unwrap());
+    assert!(
+        registry
+            .find_by_user_agent_and_workspace(&user, edge, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "finalized state 2 must remain hidden"
+    );
+
+    let mut discovery = Vec::new();
+    let mut admission =
+        Box::pin(service.authorize_native_edge_execution(&user, &request, &mut discovery));
+    assert!(futures_util::poll!(&mut admission).is_pending());
+    pool.abort_reconnect(reconnect, &user, edge);
+    assert!(registry.rollback_registration(&successor).await.unwrap());
+    let restored = registry
+        .find_by_user_agent_and_workspace(&user, edge, None)
+        .await
+        .unwrap()
+        .expect("published predecessor must be restored");
+    assert_eq!(restored.registry_id, initial.current.registry_id);
+    assert_eq!(restored.edge_id, "rest-predecessor");
+    assert_eq!(restored.worktree_path.as_deref(), Some(root));
+    assert_eq!(
+        restored.materialization_id.as_deref(),
+        Some("materialization-rollback")
+    );
+    drop(publishing);
+    assert_eq!(
+        admission.await.unwrap(),
+        Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-rollback",
+                root,
+            ),
+        )
+    );
+
+    sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
+        .bind(&user)
+        .bind(edge)
+        .execute(db.get())
+        .await
+        .unwrap();
+    db.close().await;
 }
 
 #[tokio::test]
@@ -23648,6 +23866,120 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
 }
 
 #[tokio::test]
+async fn durable_live_attach_waits_for_delayed_publication_after_settlement_committed() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::default()));
+    engine
+        .start_run("remote-settled-explain", "user-1", "remote-session")
+        .await
+        .expect("seed remote Explain run");
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain request");
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "remote-session",
+                "remote-settled-explain",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {}}),
+            )
+            .await
+            .expect("complete remote Explain run")
+    );
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({"event_type": "run_settlement_finished", "data": {}}),
+        )
+        .await
+        .expect("commit settlement before publication");
+
+    let mut reconnect = ok(svc
+        .stream_run_live(
+            "remote-settled-explain".to_string(),
+            "user-1".to_string(),
+            0,
+        )
+        .await);
+    let mut reconnect_rx = reconnect
+        .event_rx
+        .take()
+        .expect("settlement must not close an Explain attach before publication");
+
+    let outcome = astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: "remote-settled-explain".into(),
+        turn_id: "turn-1".into(),
+        execution_owner_generation: 1,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result: astra_turn_types::ArtifactPublicationResult::Published {
+            handle: format!("artifact://session/explain-analyze/{}", "c".repeat(64)),
+        },
+    };
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({
+                "event_type": "artifact_publication",
+                "data": serde_json::to_value(&outcome).expect("publication payload")
+            }),
+        )
+        .await
+        .expect("publish after settlement");
+
+    let mut observed_publication = false;
+    let mut observed_settlement = false;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !(observed_publication && observed_settlement) {
+            let event = reconnect_rx
+                .recv()
+                .await
+                .expect("settled Explain attachment must remain open");
+            observed_publication |= event["event_type"] == "artifact_publication";
+            observed_settlement |= event["event_type"] == "run_settlement_finished";
+            assert_ne!(
+                event["event_type"], "artifact_publication_unavailable",
+                "settlement must not replace a later real publication"
+            );
+        }
+    })
+    .await
+    .expect("publication after settlement timeout");
+    assert!(observed_publication && observed_settlement);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), reconnect_rx.recv())
+            .await
+            .expect("attachment close timeout")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn durable_live_attach_replays_publication_added_between_initial_and_metadata_reads() {
     let outcome = astra_turn_types::ArtifactPublicationV1 {
         schema_version: 1,
@@ -23959,6 +24291,71 @@ fn agent_progress_is_live_only_while_agent_lifecycle_is_durable() {
     }
 }
 
+#[tokio::test]
+async fn production_fanout_flushes_sparse_event_before_terminal() {
+    // Keep the model open beyond the event deadline: a terminal-triggered
+    // flush must not make the sparse-event timer test pass accidentally.
+    let llm = spawn_incremental_terminal_test_llm(Duration::from_secs(1)).await;
+    let store = Arc::new(
+        FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(Duration::from_millis(40)),
+    );
+    let mut owner = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        RunEngine::new(store),
+    )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().unwrap()),
+        "fanout-timer-fixture",
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
+    owner.test_inference_ledger = Some(Default::default());
+    let mut request = test_request("sparse live run");
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(owner.stream_chat("user-1".to_owned(), request).await);
+    let mut rx = stream.event_rx.take().unwrap();
+    owner
+        .server_agent_progress_broadcaster
+        .emit(test_agent_spawned(
+            "agent-timer-canary",
+            "child-timer-canary",
+            &stream.run_id,
+            0,
+        ));
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(event) = rx.recv().await {
+            assert_ne!(event["type"], "run_finished");
+            if event["type"] == "agent_spawned" && event["agent_id"] == "agent-timer-canary" {
+                return;
+            }
+        }
+        panic!("stream closed before the sparse event");
+    })
+    .await
+    .expect("sparse durable event must flush within 500ms without capacity or terminal");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut completed = false;
+        while let Some(event) = rx.recv().await {
+            if event["type"] == "run_finished" {
+                assert_eq!(event["status"], "completed");
+                completed = true;
+            }
+        }
+        assert!(completed);
+    })
+    .await
+    .unwrap();
+    owner
+        .test_inference_ledger
+        .as_ref()
+        .unwrap()
+        .assert_quiescent();
+}
+
 #[test]
 fn work_task_board_update_is_a_durable_live_lifecycle_edge() {
     let board_update = json!({
@@ -24151,7 +24548,7 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
 
     assert!(
         store.appended_batches().is_empty(),
-        "structural events must wait for the 25ms or capacity boundary"
+        "structural events must wait for the timer or capacity boundary"
     );
     assert_eq!(
         live_rx.try_recv(),
@@ -24179,6 +24576,174 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
     );
     assert_eq!(live_rx.recv().await.expect("first live explain"), first);
     assert_eq!(live_rx.recv().await.expect("second live explain"), second);
+}
+
+#[tokio::test]
+async fn committed_interactions_remain_immediate_delivery_boundaries() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    engine
+        .start_run("run-1", "user-1", "session-1")
+        .await
+        .expect("seed durable run");
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let mut client_event_tx = AttachedStreamDelivery::detached();
+    let mut pending = PendingDurableLiveEvents::default();
+    let durable_tool_terminals = DurableToolTerminalTracker::default();
+
+    pending.push(json!({"type": "agent_spawned", "agent_id": "agent-1"}));
+    let committed_interaction = json!({
+        "type": "tool_request",
+        "request_id": "request-1",
+        "tool": "bash",
+        HOST_INTERACTION_COMMITTED_FIELD: true,
+    });
+
+    let result = process_ordered_live_fanout_event(
+        committed_interaction.clone(),
+        &mut pending,
+        &engine,
+        &runs,
+        "user-1",
+        "session-1",
+        "run-1",
+        &live_tx,
+        &mut client_event_tx,
+        &durable_tool_terminals,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "deliver committed interaction boundary: {:?}",
+        result.err().map(|error| error.detail)
+    );
+
+    assert_eq!(
+        store.appended_batches(),
+        vec![vec![
+            json!({"type": "agent_spawned", "agent_id": "agent-1"})
+        ]]
+    );
+    assert_eq!(
+        live_rx.recv().await.expect("queued event"),
+        json!({
+            "type": "agent_spawned", "agent_id": "agent-1"
+        })
+    );
+    assert_eq!(
+        live_rx.recv().await.expect("committed interaction"),
+        json!({
+            "type": "tool_request",
+            "request_id": "request-1",
+            "tool": "bash",
+        })
+    );
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
+    for fail_commit in [false, true] {
+        let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-1", "user-1", "session-1")
+            .await
+            .unwrap();
+        drop(engine);
+        let mut owned = Arc::try_unwrap(store).ok().unwrap();
+        // Inject the fanout failure after start-run setup, not into setup.
+        if fail_commit {
+            let next = owned.counters.lock().unwrap().append_calls + 1;
+            owned.fail_append_calls.insert(next);
+        }
+        let store = Arc::new(owned);
+        let engine = RunEngine::new(store.clone());
+        let runs = Arc::new(RwLock::new(HashMap::new()));
+        let (live_tx, mut live_rx) = broadcast::channel(8);
+        let mut delivery = AttachedStreamDelivery::detached();
+        let mut pending = PendingDurableLiveEvents::default();
+        let tracker = DurableToolTerminalTracker::default();
+        let first = json!({"type": "agent_spawned", "agent_id": "agent-1"});
+        let progress = json!({"type": "agent_progress", "agent_id": "agent-1"});
+        let second = json!({"type": "tool_call_end", "call_id": "call-1", "status": "completed"});
+        for event in [first.clone(), progress.clone(), second.clone()] {
+            assert!(
+                process_ordered_live_fanout_event(
+                    event,
+                    &mut pending,
+                    &engine,
+                    &runs,
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    &live_tx,
+                    &mut delivery,
+                    &tracker,
+                )
+                .await
+                .is_ok()
+            );
+        }
+        assert!(store.appended_batches().is_empty());
+        assert_eq!(
+            live_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        );
+        let result = flush_durable_live_events(
+            &mut pending,
+            &engine,
+            &runs,
+            "user-1",
+            "session-1",
+            "run-1",
+            &live_tx,
+            &mut delivery,
+            &tracker,
+        )
+        .await;
+        if fail_commit {
+            assert!(result.is_err());
+            assert!(store.appended_batches().is_empty());
+            assert_eq!(
+                live_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            );
+            let mut retained = [second];
+            tracker.mark_committed_retained_copies(&mut retained);
+            assert!(tool_terminal_requires_settlement_repair(&retained[0]));
+        } else {
+            result.unwrap();
+            assert_eq!(
+                store.appended_batches(),
+                vec![vec![first.clone(), second.clone()]]
+            );
+            for expected in [first, progress, second] {
+                assert_eq!(live_rx.try_recv().unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_microbatch_bounds_include_transient_frames() {
+    let mut pending = PendingDurableLiveEvents::default();
+    pending.push(json!({"type": "agent_spawned"}));
+    for _ in 1..DURABLE_LIVE_BATCH_MAX_EVENTS {
+        assert!(!pending.should_flush());
+        pending.push_ordered(json!({"type": "agent_progress"}), false);
+    }
+    assert!(pending.should_flush());
+    assert_eq!(pending.take().len(), DURABLE_LIVE_BATCH_MAX_EVENTS);
+    assert!(pending.is_empty());
+    assert!(!pending.should_flush());
+    pending.push(json!({"type": "agent_spawned"}));
+    pending.push_ordered(
+        json!({"type": "agent_progress", "text": "x".repeat(DURABLE_LIVE_BATCH_MAX_BYTES)}),
+        false,
+    );
+    assert!(pending.should_flush());
 }
 
 #[test]
@@ -27907,6 +28472,160 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
     assert!(cancel_token.is_cancelled());
     assert!(!pause_flag.load(Ordering::Acquire));
     assert_eq!(provider.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: 1000 real control watchers, not 1000 LLM loops"]
+async fn thousand_control_watchers_batch_across_owners_and_observe_remote_changes() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let prefix = format!("cw-{}", Uuid::new_v4());
+    let ids = (0..1000)
+        .map(|i| format!("{prefix}-{i}"))
+        .collect::<Vec<_>>();
+    let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_sessions (user_id,session_id,status) ",
+    );
+    sessions.push_values(&ids, |mut row, id| {
+        row.push_bind(id).push_bind(id).push_bind("active");
+    });
+    sessions.build().execute(pool.get()).await.unwrap();
+    let mut runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status,run_generation,last_event_idx) ",
+    );
+    runs.push_values(&ids, |mut row, id| {
+        row.push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(format!("/{id}"))
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    runs.build().execute(pool.get()).await.unwrap();
+    let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
+    let control: Arc<dyn RunControlProvider> = Arc::new(engine);
+    // Hot-checkout telemetry excludes newly established physical connections.
+    // Preopen the whole bounded pool before counting the observer's reads.
+    let mut warmed = Vec::new();
+    for _ in 0..pool.settings().db_pool_max_connections {
+        warmed.push(pool.get().acquire().await.unwrap());
+    }
+    drop(warmed);
+    let before = astra_core::matrixone_pool_telemetry_snapshot();
+    let started = Instant::now();
+    let mut watchers = Vec::new();
+    for id in &ids {
+        let cancel = Arc::new(CancellationToken::new());
+        let pause = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::watch::channel(-1);
+        let guard = start_active_run_control_watcher(
+            Some(control.clone()),
+            id.clone(),
+            id.clone(),
+            id.clone(),
+            Some(1),
+            Arc::new(AtomicBool::new(false)),
+            pause.clone(),
+            cancel.clone(),
+            lost.clone(),
+            sender,
+        )
+        .unwrap();
+        watchers.push((guard, cancel, pause, lost, receiver));
+    }
+    tokio::time::timeout(
+        Duration::from_secs(7),
+        futures_util::future::join_all(watchers.iter_mut().map(
+            |(_, _, _, _, receiver)| async move {
+                while *receiver.borrow_and_update() < 7 {
+                    receiver.changed().await.unwrap();
+                }
+            },
+        )),
+    )
+    .await
+    .expect("first shared control sweep");
+    let first_reads =
+        astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    assert!(
+        (8..=12).contains(&first_reads),
+        "1000 roots must batch, got {first_reads} checkouts"
+    );
+    let initial_ms = started.elapsed().as_millis();
+
+    // A separate pool represents a different control-plane process. The live
+    // observers receive no local notification of these durable changes.
+    let independent = SharedPool::new(pool.settings()).await.unwrap();
+    for group in 0..4 {
+        let update = match group {
+            0 => "cancellation_requested_at=NOW(6)",
+            1 => "run_generation=2",
+            2 => "status='paused',waiting_for='user_pause'",
+            _ => "status='running'",
+        };
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+        ));
+        {
+            let mut selected = query.separated(",");
+            for (index, id) in ids.iter().enumerate() {
+                if index % 4 == group {
+                    selected.push_bind(id);
+                }
+            }
+        }
+        query
+            .push(")")
+            .build()
+            .execute(independent.get())
+            .await
+            .unwrap();
+    }
+    let before = astra_core::matrixone_pool_telemetry_snapshot();
+    let changed = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(7),
+        futures_util::future::join_all(watchers.iter_mut().enumerate().map(
+            |(index, (_, cancel, pause, lost, receiver))| async move {
+                if index % 4 < 2 {
+                    cancel.cancelled().await;
+                    assert_eq!(lost.load(Ordering::Acquire), index % 4 == 1);
+                } else {
+                    while *receiver.borrow_and_update() < 9 {
+                        receiver.changed().await.unwrap();
+                    }
+                    assert_eq!(pause.load(Ordering::Acquire), index % 4 == 2);
+                    assert!(!cancel.is_cancelled());
+                }
+            },
+        )),
+    )
+    .await
+    .expect("cross-pool cancellation, ownership fence, pause and input watermark");
+    let next_reads =
+        astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    assert!(
+        (8..=12).contains(&next_reads),
+        "changed sweep must also batch: {next_reads}"
+    );
+    println!(
+        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        changed.elapsed().as_millis()
+    );
+    drop(watchers);
+    drop(control);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for table in ["agent_runs", "agent_sessions"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id LIKE ?"))
+            .bind(format!("{prefix}-%"))
+            .execute(independent.get())
+            .await
+            .unwrap();
+    }
+    independent.close().await;
+    pool.close().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -33188,6 +33907,113 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
         }),
         "short Explain turn did not emit run_finished: {events:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost mock"]
+async fn db_stream_terminal_precedes_blocked_quota_cleanup() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("cleanup-owner-{}", Uuid::new_v4());
+    let session = format!("cleanup-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
+    let llm = spawn_terminal_test_llm().await;
+    let mut service = db_backed_test_service(&pool, "cleanup-test");
+    service
+        .distributed_weighted_admission
+        .as_mut()
+        .unwrap()
+        .with_admission_wait_timeout(Duration::from_secs(60));
+    let mut request = prepared_test_request("hello");
+    request.session_id = Some(session.clone());
+    request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer fake-cleanup".into(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "cleanup-gateway",
+                "model_gateway",
+                &format!("{}/chat/completions", llm.base_url),
+            )),
+            ..Default::default()
+        });
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(service.stream_chat(owner.clone(), request).await);
+    let run_id = stream.run_id.clone();
+    let mut gate = pool.get().begin().await.unwrap();
+    sqlx::query(
+        "SELECT scope_name FROM session_weighted_admission_gates
+         WHERE scope_name = 'canonical_turn_v1' FOR UPDATE",
+    )
+    .fetch_one(&mut *gate)
+    .await
+    .unwrap();
+
+    let mut events = stream.events;
+    let closed = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.event_rx.as_mut().unwrap().recv().await {
+            events.push(event);
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "quota cleanup held the stream open: provider_requests={}, events={:?}",
+        llm.requests.load(Ordering::SeqCst),
+        events
+            .iter()
+            .map(|event| (replay_event_type(event), chat_stream_event_status(event)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        events.iter().any(|event| {
+            replay_event_type(event) == Some("run_finished")
+                && chat_stream_event_status(event) == Some(STATUS_COMPLETED)
+        }),
+        "{events:?}"
+    );
+    let (completed_turn, writer): (i64, Option<String>) = sqlx::query_as(
+        "SELECT completed_turn, active_writer_json FROM session_context_heads
+         WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(completed_turn, 1);
+    assert!(
+        writer.is_none(),
+        "canonical writer must be released before terminal delivery"
+    );
+    let count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM session_weighted_admission_reservations
+             WHERE owner_user_id = ? AND session_id = ?",
+        )
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        count().await,
+        1,
+        "the blocked quota remains conservatively reserved"
+    );
+    gate.rollback().await.unwrap();
+    assert!(
+        service
+            .drain_background_tasks(Duration::from_secs(20))
+            .await
+    );
+    assert_eq!(count().await, 0, "the owning run must finish quota cleanup");
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

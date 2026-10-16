@@ -309,6 +309,10 @@ workspace and working-directory handles used for execution. Directory acquisitio
 walks each component without following symlinks. Target inspection resolves
 symlinks with bounded traversal and checks directory ancestry by identity; it
 does not assume that an existing `/dev/fd` entry supports child-path lookup.
+On Linux, traversal and identity handles use `O_PATH`, so acquiring the filesystem
+root or workspace ancestors does not require directory-read permission from
+Landlock. Actual file reads and directory enumeration still open separate readable
+handles and remain subject to the selected provider's filesystem allowlist.
 The OS sandbox remains responsible for execution-time filesystem confinement.
 
 Source preimages read retained regular-file handles with a bounded byte budget.

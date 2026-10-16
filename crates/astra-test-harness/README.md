@@ -186,7 +186,7 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 The **Harness (live models)** workflow builds the selected Git revision's
 Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
-then runs the existing YAML cases with DeepSeek-v4.1-Flash and a GLM-5.3 judge. Dispatch defaults to the
+then runs the existing YAML cases with DeepSeek-v4.1-Flash as both agent and judge. Dispatch defaults to the
 full suite. The same execution job is reused by the automatic live regression
 described below; offline PR checks still work without provider secrets.
 
@@ -199,7 +199,7 @@ In the repository's **Settings → Secrets and variables → Actions**, create:
   model entries in the existing admin model-file format. Each entry supplies its
   own endpoint, credentials, protocol and capacity. An explicit Flash entry
   replaces its shared-endpoint default; other entries inherit nothing.
-  Duplicate names and overrides of GLM-5.3 are rejected. Only cases that
+  Duplicate names are rejected. Only cases that
   require additional models need this secret; ordinary delegation uses
   the selected matrix model, not a fixed GLM version.
 
@@ -218,6 +218,23 @@ There is no additional actor or repository allowlist: manual dispatch relies on
 GitHub's repository write-access requirement. No organization membership token
 is needed. This restricts who starts the workflow, not the code they select;
 selected code can read and exfiltrate the provider key, so run only trusted commits.
+
+The live log and Actions Summary show failed checks with numeric expected/observed
+evidence: tool counts, outcome matches, individual JSON predicate matches (in YAML
+order), ordered-receipt progress and duration limits, including failed composites.
+Predicate counts are independent; a passing tool-count check still requires all
+conditions on the **same** canonical call. Missing canonical evidence is reported
+as unavailable, not as zero matches. No additional model or database calls are
+made for this projection.
+
+LLM summaries report the existing judge's grade/threshold or acceptance verdict,
+and distinguish an evaluation error from a negative quality judgment. A case
+without an explicit `judger`/`hard_judger` says **not configured**; a deterministic
+failure does not automatically trigger another LLM diagnosis. These are observed
+check results, not a claimed root-cause analysis. Raw prompts, tool/provider bodies
+and free-form judge diagnostics remain private; public artifacts do not include
+them. Checks without a safe numeric projection explicitly say that their detailed
+payload is withheld. Full private diagnostics remain in the local suite report.
 
 ### Small automatic live regression
 
@@ -267,10 +284,15 @@ GLM-5.2 rather than the configured GLM-5.3.
 | `recovered_validation_user_facing_completion` | Medium: failing baseline, edit, successful validation, user-facing delivery |
 | `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
 | `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
-| `multi_model_fanout_handoff` | Medium: GLM-5.3 + DeepSeek-v4.1-Flash, exact slot identities, real child results and parent adoption |
+| `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
 
-All parents use DeepSeek-v4.1-Flash; the independent judge uses GLM-5.3.
-Both default models use `HARNESS_GLM_BASE_URL` and `HARNESS_GLM_API_KEY`.
+All parents and the judge use DeepSeek-v4.1-Flash; this is not independent-model judging.
+Only Flash is registered by default, using the existing `HARNESS_GLM_BASE_URL` and
+`HARNESS_GLM_API_KEY` secrets (the secret names do not select a model).
+GLM-5.3 is temporarily excluded from this regression because its service is unstable.
+The full suite retains `multi_model_fanout_handoff`; explicitly configure its GLM
+dependency in `HARNESS_ADDITIONAL_MODELS_JSON` to run it. The regression does not
+claim heterogeneous-model coverage.
 An explicit `deepseek-v4.1-flash` entry in `HARNESS_ADDITIONAL_MODELS_JSON`
 replaces its default configuration unchanged; other additional models remain
 self-contained. Missing/unavailable models fail preflight;
@@ -296,7 +318,7 @@ python3 scripts/ci/select_harness_cases.py \
 # Against a fresh, same-revision Server and a disposable checkout as workspace:
 target/debug/astra-test --suite "$run_dir/cases" \
   --astra-bin "$PWD/target/debug/astra" --working-dir "$HARNESS_WORKSPACE" \
-  --force-model deepseek-v4.1-flash --judger-model glm-5.3 --parallel 1 --runs 1 \
+  --force-model deepseek-v4.1-flash --judger-model deepseek-v4.1-flash --parallel 1 --runs 1 \
   --progress-file "$run_dir/progress.jsonl" --report-file "$run_dir/report.json"
 ```
 
@@ -353,6 +375,11 @@ CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answ
 minimum); the Server bounds the effective request by the admitted Offering's
 output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
 remain failures/unknown evidence, never accepted truncated answers or automatic retries.
+Complete semantic child evidence has one 64 KiB serialized-request ceiling,
+including questions, escaping, metadata and backend wrappers. It is never
+truncated to obtain a verdict; over-budget requests remain unjudged failures.
+This input allowance is separate from ordinary 8,000-byte text/stderr previews
+and does not increase output limits, deadlines or retry counts.
 Cases may declare `required_models` for supplementary models, independently of
 their parent `models` matrix. These are checked by the existing fail-fast
 preflight after filtering and are not replaced by `--force-model`.
@@ -363,8 +390,15 @@ model identity checks. Unknown or malformed markers fail before execution.
 Model lists, grader model overrides, shell hooks and environment are literal,
 not templates. The delegation follow-up uses this binding and needs no second model.
 The safe preflight sidecar identifies selected model IDs and the unavailable
-model without provider error details. Default all-case selection is not a claim
-that a GLM-5.3-only deployment can run every case.
+model without provider error details. A nonzero agent probe alone does not prove
+model unavailability. Execution/protocol failures leave `unavailable_model`
+null; validated terminal error kinds and codes appear in the diagnostic.
+The `failure` object identifies the model, stage (`execution`, `terminal_protocol`,
+`probe_process` or `session_cleanup`) and available process exit code. It never
+includes raw provider messages. The manual and regression workflows preserve
+these same fields in the safe artifact and job summary.
+Default all-case selection is not a claim that a GLM-5.3-only deployment can run
+every case.
 Cases requiring other models, external clients or special policy need those
 capabilities and must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
 these runs do not certify production embedding quality.
@@ -758,6 +792,13 @@ inflate `executed_tool_calls` or settlement success.
 
 ## FAIL report artifacts
 
+CI prints failure analysis both when a case settles and in the final summary.
+Tool-count failures include bounded counts of actual disposition, success,
+recognized result status/error category and explicit execution facts. Arbitrary
+tags and result prose remain private. These facts distinguish argument rejection
+from a model-admission error without claiming an unobserved root cause; missing
+evidence remains unavailable. Original criteria and verdicts are unchanged.
+
 On FAIL, each case report includes:
 
 - `text:` / `stderr:` preview (head of each, truncated).
@@ -786,7 +827,12 @@ before cleanup, using the same binary, environment, account and profile as the
 run. The private sidecar also retains the typed Server run tree and Reflect
 response. Its `children` list specifies the complete direct-child set. Every
 child requires an exact model and offering with successful physical provider
-evidence, and its result digest adopted before the same parent finalization.
+evidence, and its result bytes adopted before the same parent finalization.
+Bounded notifications and explicit result reads record byte ranges and hashes
+through the same dependency boundary. Explicit reads count only when present in
+the final request of a successful provider turn. The harness verifies each range
+against the canonical child result and requires gap-free coverage; overlap and
+out-of-order pages are allowed, while a preview alone cannot prove a full read.
 It never falls back to local journal
 events. The run tree must be complete; partial reflection can prove positive
 facts but cannot prove absence. Capture is bounded to 5 MiB and one total
@@ -823,13 +869,27 @@ or `{json: <JSON value>}`. Both expectations require that exact child's bounded,
 unambiguous terminal transcript document. Text compares the actual bytes;
 JSON compares the parsed value. In both cases the untouched observed bytes must
 match the adopted digest; parent output is checked separately.
-Expected serialization and observed raw terminal content are each limited to
-4,096 bytes.
+Literal expected results are limited to 4,096 serialized bytes. Observed content
+uses the bounded capture and semantic-request budgets, not the notification
+preview limit. Semantic judging receives each child's actual tool arguments,
+outcomes and results along with its final answer; custody alone does not certify
+the answer's claims. The complete serialized judge request must fit 64 KiB or
+verification is unavailable, never silently truncated or accepted.
 Whitespace equivalence never excuses a wrong digest, foreign run, missing
 document, or premature finalization. Scalar expectations are not supported.
 Natural parallel children are matched bijectively by distinct model identities,
 never by their output. For same-model children or explicit fanout, specify
-`fanout_group` and each child's `slot_index`. One successful root start receipt
+`fanout_group: {kind: id, value: <group-id>}` or
+`fanout_group: {kind: title, value: <group-title>}` and each child's `slot_index`.
+Titles are independent of IDs, including the product's default title when one is
+omitted. Multiple matching starts are ambiguous. The successful `started`
+receipt must agree with the request and its canonical fanout/observation
+identity projections, including the exact parent. Missing identity evidence is
+unavailable; contradictory identity evidence fails. String selectors are not accepted.
+Producer-typed pre-execution rejections are not launch candidates, but remain
+visible to call-count checks and the judge. Unknown execution is not a rejection;
+contradictory rejection/execution facts fail rather than being discarded.
+One successful root start receipt
 must bind unique slot indexes, agent and run IDs to exactly the authoritative children;
 optional slot labels are not execution identities.
 array position and aggregate counts are insufficient. A successful `get_results`

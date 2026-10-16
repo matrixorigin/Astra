@@ -779,6 +779,15 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Whether this host already owns post-loop session-memory settlement.
+    ///
+    /// Server runs schedule extraction and its lifecycle evidence after the
+    /// durable terminal response. Other hosts still use the shared turn
+    /// finalization boundary as their extraction owner.
+    fn owns_post_loop_memory_settlement(&self) -> bool {
+        false
+    }
+
     /// Publish a meaningful lifecycle stage as it begins. `started_at` comes
     /// from the owner that measures the corresponding terminal receipt, so a
     /// live graph and its completed interval share one clock boundary.
@@ -6428,6 +6437,7 @@ pub(crate) mod tests {
         cancel_child_agents_delay: Option<std::time::Duration>,
         terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
         stop_after_success_completion: Option<RuntimeSuccessfulToolCompletion>,
+        owns_post_loop_memory_settlement: bool,
 
         committed_work_synthesis: Result<bool, String>,
         committed_work_synthesis_sequence: std::collections::VecDeque<Result<bool, String>>,
@@ -6494,6 +6504,7 @@ pub(crate) mod tests {
                 cancel_child_agents_delay: None,
                 terminal_control_outcome: None,
                 stop_after_success_completion: None,
+                owns_post_loop_memory_settlement: false,
 
                 committed_work_synthesis: Ok(false),
                 committed_work_synthesis_sequence: std::collections::VecDeque::new(),
@@ -6510,6 +6521,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
+            self
+        }
+
+        pub(crate) fn with_post_loop_memory_settlement_owner(mut self) -> Self {
+            self.owns_post_loop_memory_settlement = true;
             self
         }
 
@@ -6591,6 +6607,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn owns_post_loop_memory_settlement(&self) -> bool {
+            self.owns_post_loop_memory_settlement
+        }
+
         fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
             self.history_artifact_enabled
         }

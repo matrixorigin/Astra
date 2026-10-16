@@ -2204,9 +2204,16 @@ impl AuthService for DatabaseAuthService {
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let session_expires_at_unix = self
-            .refresh_session_is_active(&pool, &user_id, &session_id)
-            .await
+        // All three reads use the already-verified JWT subject/session and
+        // have no side effects. Keep them owned by this request, then consume
+        // their results in the original validation/error-precedence order.
+        // No read result is cached across authentication attempts.
+        let (session_expiry, memoria_binding, database_user) = tokio::join!(
+            self.refresh_session_is_active(&pool, &user_id, &session_id),
+            self.memoria_owner(&pool, &user_id),
+            self.fetch_user_by_id_or_username(&pool, &user_id, None),
+        );
+        let session_expires_at_unix = session_expiry
             .map_err(|e| map_auth_sqlx(e, "current_principal.refresh_session", Some(&pool)))?
             .filter(|expires_at| *expires_at > Utc::now().timestamp())
             .ok_or_else(|| {
@@ -2215,7 +2222,7 @@ impl AuthService for DatabaseAuthService {
 
         // Bound legacy Memoria tokens too: earlier builds issued them with
         // `internal` origin and the self-hosted deployment's longer TTL.
-        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
+        let memoria_owner = memoria_binding?;
         if (token_origin == "memoria" || token_origin.starts_with("verified:memoria:"))
             && memoria_owner.is_none()
         {
@@ -2235,9 +2242,7 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
-        let user = self
-            .fetch_user_by_id_or_username(&pool, &user_id, None)
-            .await
+        let user = database_user
             .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
 
