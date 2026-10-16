@@ -7,9 +7,10 @@ use sqlx::{Acquire, Row};
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
 use crate::model_request_context::{
-    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
-    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestRoute,
-    ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
+    MODEL_REQUEST_CONTEXT_SCHEMA, MODEL_REQUEST_TERMINAL_SCHEMA, ModelRequestContextEvent,
+    ModelRequestContextScope, ModelRequestContextSeed, ModelRequestEventStage,
+    ModelRequestIdentity, ModelRequestRoute, ModelRequestTerminalFact, ModelRequestTopology,
+    ModelRequestUsage, ModelRequestWireComposition, clear_model_request_measured_usage,
     compact_model_request_context_scope,
 };
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
@@ -754,27 +755,16 @@ fn model_request_metric_shard(attempt_id: &str) -> i16 {
     i16::from(Sha256::digest(attempt_id.as_bytes())[0] % 64)
 }
 
-fn model_request_event(
+fn model_request_accepted_event(
     attempt: &InferenceProviderAttemptPlan,
-    stage: ModelRequestEventStage,
-    terminal: Option<&InferenceInvocationTerminal>,
 ) -> ServiceResult<(String, String, ModelRequestContextEvent)> {
-    if matches!(
-        (stage, terminal),
-        (ModelRequestEventStage::Accepted, Some(_)) | (ModelRequestEventStage::Terminal, None)
-    ) {
-        return Err(ServiceError::internal(
-            "model request accepted events cannot carry terminals and terminal events require one",
-        ));
-    }
     let input = &attempt.invocation_input;
     let mut event = ModelRequestContextEvent {
         schema: MODEL_REQUEST_CONTEXT_SCHEMA.to_string(),
-        stage,
+        stage: ModelRequestEventStage::Accepted,
         identity: ModelRequestIdentity {
             request_id: attempt.request_id().to_string(),
-            provider_response_id: terminal
-                .and_then(|terminal| terminal.provider_response_id.clone()),
+            provider_response_id: None,
             owner_scope: input.user_id.clone(),
             session_id: input.scope.session_id().map(str::to_string),
             run_id: input.scope.run_id().map(str::to_string),
@@ -819,24 +809,13 @@ fn model_request_event(
         wire_composition: attempt.wire.composition.clone(),
         cache: attempt.request_context.cache.clone(),
         compaction: attempt.request_context.compaction.clone(),
-        terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
-        usage_status: terminal.map(|terminal| terminal.usage_status.as_str().to_string()),
-        error_kind: terminal.and_then(|terminal| terminal.error_kind.clone()),
+        terminal_status: None,
+        usage_status: None,
+        error_kind: None,
     };
     // Surface diagnostics are not provider measurements. Clear any stale
     // derived values even on the accepted record, before a response exists.
     clear_model_request_measured_usage(&mut event);
-    if let Some(terminal) = terminal {
-        apply_model_request_terminal_usage(
-            &mut event,
-            ModelRequestUsage {
-                input: terminal.usage.input,
-                output_tokens: terminal.usage.output_tokens,
-            },
-            terminal.usage_status.as_str(),
-            "provider_terminal",
-        )?;
-    }
     let event_json = serde_json::to_string(&event).map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Internal,
@@ -844,58 +823,31 @@ fn model_request_event(
             error,
         )
     })?;
-    let event_id = hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]);
+    let event_id = hash_identity(
+        "mrctx",
+        &[
+            attempt.attempt_id.as_str(),
+            ModelRequestEventStage::Accepted.as_str(),
+        ],
+    );
     Ok((event_id, event_json, event))
 }
 
-fn clear_model_request_measured_usage(event: &mut ModelRequestContextEvent) {
-    event.usage = None;
-    event.budget.measured_input_tokens = None;
-    event.budget.usage_source = None;
-    event.budget.estimate_error_tokens = None;
-    event.budget.estimate_error_ratio = None;
-    event.cache.cache_read_share = None;
-}
-
-/// Foreground settlement and recovery must project the same usage coverage.
-/// Partial usage is useful evidence, but cannot measure a full-request budget
-/// error or cache-hit share. Unavailable usage is not measured zero usage.
-fn apply_model_request_terminal_usage(
-    event: &mut ModelRequestContextEvent,
-    usage: ModelRequestUsage,
-    usage_status: &str,
-    source: &str,
-) -> ServiceResult<()> {
-    let exact = match usage_status {
-        "provider_exact" => true,
-        "provider_partial" | "unavailable" => false,
-        _ => return Err(ServiceError::conflict("unknown model request usage status")),
-    };
-    clear_model_request_measured_usage(event);
-    event.usage_status = Some(usage_status.to_string());
-    if usage_status == "unavailable" {
-        return Ok(());
+fn model_request_terminal_fact(terminal: &InferenceInvocationTerminal) -> ModelRequestTerminalFact {
+    ModelRequestTerminalFact {
+        schema: MODEL_REQUEST_TERMINAL_SCHEMA.into(),
+        terminal_status: terminal.status.as_str().into(),
+        provider_response_id: terminal.provider_response_id.clone(),
+        usage_status: terminal.usage_status.as_str().into(),
+        usage: (terminal.usage_status != InferenceUsageStatus::Unavailable).then_some(
+            ModelRequestUsage {
+                input: terminal.usage.input,
+                output_tokens: terminal.usage.output_tokens,
+            },
+        ),
+        error_kind: terminal.error_kind.clone(),
+        usage_source: "provider_terminal".into(),
     }
-    if exact {
-        let measured = usage.total_input_tokens();
-        event.budget.measured_input_tokens = Some(measured);
-        event.budget.usage_source = Some(source.to_string());
-        if let Some(estimated) = event.budget.estimated_input_tokens {
-            let error = i128::from(measured) - i128::from(estimated);
-            event.budget.estimate_error_tokens =
-                Some(i64::try_from(error).unwrap_or(if error.is_negative() {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                }));
-            event.budget.estimate_error_ratio =
-                (estimated > 0).then_some(error as f64 / estimated as f64);
-        }
-        event.cache.cache_read_share =
-            projected_cache_read_share(&event.identity.provider_protocol, usage_status, &usage);
-    }
-    event.usage = Some(usage);
-    Ok(())
 }
 
 async fn insert_model_request_context_event(
@@ -952,8 +904,35 @@ async fn insert_model_request_context_event_with_expiry(
     terminal: Option<&InferenceInvocationTerminal>,
     context_expired_at: Option<chrono::NaiveDateTime>,
 ) -> ServiceResult<()> {
-    let (event_id, event_json, event) = model_request_event(attempt, stage, terminal)?;
-    let usage = event.usage.as_ref();
+    let fact = match (stage, terminal) {
+        (ModelRequestEventStage::Accepted, None) => None,
+        (ModelRequestEventStage::Terminal, Some(terminal)) => {
+            Some(model_request_terminal_fact(terminal))
+        }
+        _ => {
+            return Err(ServiceError::internal(
+                "model request event stage disagrees with terminal facts",
+            ));
+        }
+    };
+    let (event_id, event_json) = if let Some(fact) = fact.as_ref() {
+        fact.validate()?;
+        (
+            hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]),
+            serde_json::to_string(fact).map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Internal,
+                    "serialize model request terminal fact",
+                    error,
+                )
+            })?,
+        )
+    } else {
+        let (id, json, _) = model_request_accepted_event(attempt)?;
+        (id, json)
+    };
+    let usage = fact.as_ref().and_then(|fact| fact.usage.as_ref());
+    let terminal_status = fact.as_ref().map(|fact| fact.terminal_status.as_str());
     let model_family = attempt
         .request_context
         .model_family
@@ -962,7 +941,6 @@ async fn insert_model_request_context_event_with_expiry(
     if context_expired_at.is_none() {
         let session_id = attempt.invocation_input.scope.session_id();
         let run_id = attempt.invocation_input.scope.run_id();
-        let terminal_status = event.terminal_status.as_deref();
         let usage_present = usage.is_some();
         let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO model_request_context_events
@@ -990,10 +968,10 @@ async fn insert_model_request_context_event_with_expiry(
             .bind(run_id)
             .bind(stage.as_str())
             .bind(terminal_status)
-            .bind(event.identity.topology.as_str())
-            .bind(&event.identity.provider)
+            .bind(attempt.request_context.topology.as_str())
+            .bind(&attempt.invocation_input.provider)
             .bind(model_family)
-            .bind(&event.identity.inference_purpose)
+            .bind(attempt.invocation_input.purpose.as_str())
             .bind(checked_optional_i64(
                 usage.map(ModelRequestUsage::total_input_tokens),
                 "model request input_tokens",
@@ -1036,7 +1014,7 @@ async fn insert_model_request_context_event_with_expiry(
     // Count every terminal request, including failures with unavailable
     // usage. Token sums contain observed usage only; coverage remains in the
     // per-request usage_status and must be checked before estimating cost.
-    if let Some(status) = event.terminal_status.as_deref() {
+    if let Some(status) = terminal_status {
         sqlx::query(
             "INSERT INTO model_request_metric_shards
              (metric_shard, topology, provider, model_family, purpose, terminal_status,
@@ -1053,10 +1031,10 @@ async fn insert_model_request_context_event_with_expiry(
               updated_at = NOW(6)",
         )
         .bind(model_request_metric_shard(&attempt.attempt_id))
-        .bind(event.identity.topology.as_str())
-        .bind(&event.identity.provider)
+        .bind(attempt.request_context.topology.as_str())
+        .bind(&attempt.invocation_input.provider)
         .bind(model_family)
-        .bind(&event.identity.inference_purpose)
+        .bind(attempt.invocation_input.purpose.as_str())
         .bind(status)
         .bind(checked_i64(
             usage.map_or(0, ModelRequestUsage::total_input_tokens),
@@ -1114,7 +1092,7 @@ async fn insert_recovered_model_request_terminal_tx(
     terminal: &DurableInferenceTerminal,
 ) -> Result<(), sqlx::Error> {
     let accepted = sqlx::query(
-        "SELECT event_json, model_family
+        "SELECT event_json, model_family, session_id, run_id
          FROM model_request_context_events
          WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
            AND event_stage = 'accepted'",
@@ -1131,10 +1109,20 @@ async fn insert_recovered_model_request_terminal_tx(
     };
     let accepted_json = accepted.try_get::<String, _>("event_json")?;
     let model_family = accepted.try_get::<String, _>("model_family")?;
-    let mut event = serde_json::from_str::<ModelRequestContextEvent>(&accepted_json)
+    let event = serde_json::from_str::<ModelRequestContextEvent>(&accepted_json)
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-    event.stage = ModelRequestEventStage::Terminal;
-    event.identity.provider_response_id = terminal.provider_response_id.clone();
+    event
+        .validate_accepted()
+        .and_then(|()| {
+            event.validate_stored_identity(
+                user_id,
+                accepted.get::<Option<String>, _>("session_id").as_deref(),
+                accepted.get::<Option<String>, _>("run_id").as_deref(),
+                attempt_id,
+                invocation_id,
+            )
+        })
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let fresh_input_tokens = u64::try_from(terminal.input_tokens)
         .map_err(|_| sqlx::Error::Protocol("negative recovered fresh input tokens".to_string()))?;
     let cache_read_tokens = u64::try_from(terminal.cache_read_tokens)
@@ -1152,23 +1140,24 @@ async fn insert_recovered_model_request_terminal_tx(
         ),
         output_tokens,
     };
-    apply_model_request_terminal_usage(
-        &mut event,
-        usage,
-        &terminal.usage_status,
-        "provider_terminal_recovery",
-    )
-    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-    event.terminal_status = Some(terminal.status.clone());
-    event.usage_status = Some(terminal.usage_status.clone());
-    event.error_kind = terminal.error_kind.clone();
+    let fact = ModelRequestTerminalFact {
+        schema: MODEL_REQUEST_TERMINAL_SCHEMA.into(),
+        terminal_status: terminal.status.clone(),
+        provider_response_id: terminal.provider_response_id.clone(),
+        usage_status: terminal.usage_status.clone(),
+        usage: (terminal.usage_status != "unavailable").then_some(usage),
+        error_kind: terminal.error_kind.clone(),
+        usage_source: "provider_terminal_recovery".into(),
+    };
+    fact.validate()
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let event_json =
-        serde_json::to_string(&event).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        serde_json::to_string(&fact).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let event_id = hash_identity(
         "mrctx",
         &[attempt_id, ModelRequestEventStage::Terminal.as_str()],
     );
-    let observed_usage = event.usage.as_ref();
+    let observed_usage = fact.usage.as_ref();
     let total_input_tokens = checked_optional_i64(
         observed_usage.map(ModelRequestUsage::total_input_tokens),
         "recovered model request input tokens",
@@ -1179,31 +1168,24 @@ async fn insert_recovered_model_request_terminal_tx(
     let cache_creation_tokens = observed_usage.map(|_| terminal.cache_creation_tokens);
     let existing_terminal = sqlx::query(
         "SELECT event_json FROM model_request_context_events
-         WHERE event_id = ? FOR UPDATE",
+         WHERE user_id = ? AND event_id = ? FOR UPDATE",
     )
+    .bind(user_id)
     .bind(&event_id)
     .fetch_optional(&mut *connection)
     .await?;
     if let Some(existing_terminal) = existing_terminal {
         let existing_json = existing_terminal.try_get::<String, _>("event_json")?;
-        let existing_event = serde_json::from_str::<ModelRequestContextEvent>(&existing_json)
+        let existing_event = serde_json::from_str::<ModelRequestTerminalFact>(&existing_json)
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        // Older unavailable-usage events stored placeholder zero buckets.
-        // Coverage, rather than those placeholders, is the durable fact.
-        let exact_usage = if terminal.usage_status == "unavailable" {
-            existing_event.usage.is_none()
-                || existing_event.usage.as_ref().is_some_and(|usage| {
-                    usage.total_input_tokens() == 0 && usage.output_tokens == 0
-                })
-        } else {
-            existing_event.usage == event.usage
-        };
-        let exact_terminal = existing_event.stage == ModelRequestEventStage::Terminal
-            && existing_event.terminal_status.as_deref() == Some(terminal.status.as_str())
-            && existing_event.usage_status.as_deref() == Some(terminal.usage_status.as_str())
-            && existing_event.identity.provider_response_id == terminal.provider_response_id
+        existing_event
+            .validate()
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let exact_terminal = existing_event.terminal_status == terminal.status
+            && existing_event.usage_status == terminal.usage_status
+            && existing_event.provider_response_id == terminal.provider_response_id
             && existing_event.error_kind == terminal.error_kind
-            && exact_usage;
+            && existing_event.usage == fact.usage;
         return if exact_terminal {
             Ok(())
         } else {
@@ -7598,18 +7580,6 @@ pub async fn finish_inference_invocation(
     Ok(())
 }
 
-// System One's current usage contract reports input/output only. Normalized
-// ledger cache zeros support accounting; they are not reported cache evidence.
-fn projected_cache_read_share(
-    protocol: &str,
-    status: &str,
-    usage: &ModelRequestUsage,
-) -> Option<f64> {
-    let total = usage.total_input_tokens();
-    (protocol != "typesafe_systemone" && status == "provider_exact" && total > 0)
-        .then(|| usage.input.cache_read_tokens as f64 / total as f64)
-}
-
 pub(crate) fn projected_auxiliary_usage(
     protocol: &str,
     status: &str,
@@ -7870,7 +7840,34 @@ fn project_auxiliary_usage_rows_with_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_request_context::{
+        apply_model_request_terminal_usage, projected_cache_read_share,
+    };
     use serde_json::json;
+
+    fn model_request_event(
+        attempt: &InferenceProviderAttemptPlan,
+        stage: ModelRequestEventStage,
+        terminal: Option<&InferenceInvocationTerminal>,
+    ) -> ServiceResult<(String, String, ModelRequestContextEvent)> {
+        let accepted = model_request_accepted_event(attempt)?;
+        match (stage, terminal) {
+            (ModelRequestEventStage::Accepted, None) => Ok(accepted),
+            (ModelRequestEventStage::Terminal, Some(terminal)) => {
+                let fact = model_request_terminal_fact(terminal);
+                let event = fact.hydrate(accepted.2)?;
+                let json = serde_json::to_string(&fact).unwrap();
+                Ok((
+                    hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]),
+                    json,
+                    event,
+                ))
+            }
+            _ => Err(ServiceError::internal(
+                "test fixture stage disagrees with terminal",
+            )),
+        }
+    }
 
     fn input() -> InferenceInvocationInput {
         InferenceInvocationInput {
@@ -8962,15 +8959,15 @@ mod tests {
             },
             None,
         );
-        let (_, json, event) =
+        let (_, _, event) =
             model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&terminal))
                 .unwrap();
         assert_eq!(event.identity.operation_id, "request_judgment");
         assert_eq!(event.identity.provider_protocol, "typesafe_systemone");
         assert_eq!(event.cache.cache_read_share, None);
-        assert_eq!(event.usage.unwrap().input.fresh_input_tokens, 100);
+        assert_eq!(event.usage.as_ref().unwrap().input.fresh_input_tokens, 100);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&json).unwrap()["identity"]["operation_id"],
+            serde_json::to_value(&event).unwrap()["identity"]["operation_id"],
             "request_judgment"
         );
     }
@@ -9053,7 +9050,25 @@ mod tests {
         assert!(!accepted_json.contains(&invocation.admission_token));
         assert!(!accepted_json.contains(&invocation.owner_token));
         assert!(!accepted_json.contains(&attempt.admission_token));
-        assert!(terminal_json.contains(MODEL_REQUEST_CONTEXT_SCHEMA));
+        let fact: ModelRequestTerminalFact = serde_json::from_str(&terminal_json).unwrap();
+        assert_eq!(fact.hydrate(accepted.clone()).unwrap(), terminal_event);
+        assert!(terminal_json.len() < accepted_json.len() / 2);
+        assert!(
+            serde_json::from_str::<ModelRequestTerminalFact>(
+                &serde_json::to_string(&terminal_event).unwrap()
+            )
+            .is_err()
+        );
+        let mut corrupted = accepted.clone();
+        corrupted.usage_status = Some("provider_exact".into());
+        assert!(fact.hydrate(corrupted).is_err());
+        let mut invalid = fact.clone();
+        invalid.usage_status = "unavailable".into();
+        assert!(invalid.validate().is_err());
+        invalid.usage = None;
+        assert!(invalid.validate().is_ok());
+        invalid.schema = "unsupported".into();
+        assert!(invalid.validate().is_err());
 
         for status in [
             InferenceTerminalStatus::Succeeded,
@@ -9208,10 +9223,10 @@ mod tests {
             let mut recovered = accepted.clone();
             apply_model_request_terminal_usage(
                 &mut recovered,
-                ModelRequestUsage {
+                (status != InferenceUsageStatus::Unavailable).then_some(ModelRequestUsage {
                     input: terminal.usage.input,
                     output_tokens: terminal.usage.output_tokens,
-                },
+                }),
                 status.as_str(),
                 "provider_terminal_recovery",
             )

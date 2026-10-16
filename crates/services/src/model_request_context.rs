@@ -68,18 +68,11 @@ fn oldest_complete_attempts_in_scope_sql(scope: ModelRequestContextScope<'_>) ->
     )
 }
 
-const EXPIRED_ATTEMPT_CANDIDATES_SQL: &str = "SELECT candidate.user_id, candidate.attempt_id
-     FROM model_request_context_events AS candidate
-     WHERE candidate.created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
-       AND NOT EXISTS (
-           SELECT 1
-           FROM model_request_context_events AS newer
-           WHERE newer.user_id = candidate.user_id
-             AND newer.attempt_id = candidate.attempt_id
-             AND newer.created_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)
-       )
-     GROUP BY candidate.user_id, candidate.attempt_id
-     ORDER BY MIN(candidate.created_at) ASC, candidate.user_id ASC, candidate.attempt_id ASC
+const EXPIRED_ATTEMPT_CANDIDATES_SQL: &str = "SELECT user_id, attempt_id
+     FROM model_request_context_events
+     GROUP BY user_id, attempt_id
+     HAVING MAX(created_at) < DATE_SUB(NOW(6), INTERVAL ? DAY)
+     ORDER BY MIN(created_at) ASC, user_id ASC, attempt_id ASC
      LIMIT ?";
 
 fn validate_expired_attempt_keys_query<'a>(
@@ -256,7 +249,6 @@ pub(crate) async fn expire_model_request_context_events(
     batch_limit: u32,
 ) -> ServiceResult<u64> {
     let candidate_rows = sqlx::query_as::<_, (String, String)>(EXPIRED_ATTEMPT_CANDIDATES_SQL)
-        .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
         .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
         .bind(batch_limit)
         .fetch_all(pool.get())
@@ -447,11 +439,15 @@ mod retention_tests {
         assert!(completed_attempts.contains("ORDER BY MIN(created_at) ASC, attempt_id ASC"));
         assert!(delete.sql().contains("AND attempt_id IN"));
         assert!(!delete.sql().contains("event_id IN"));
-        assert!(expired_attempts.contains("WHERE candidate.created_at <"));
-        assert!(expired_attempts.contains("NOT EXISTS"));
-        assert!(expired_attempts.contains("newer.created_at >="));
-        assert!(expired_attempts.contains("GROUP BY candidate.user_id, candidate.attempt_id"));
-        assert!(expired_attempts.contains("ORDER BY MIN(candidate.created_at) ASC"));
+        assert!(expired_attempts.contains("GROUP BY user_id, attempt_id"));
+        assert!(expired_attempts.contains("HAVING MAX(created_at) <"));
+        assert!(
+            !expired_attempts.contains("WHERE"),
+            "a pre-group age filter hides fresh partners"
+        );
+        assert!(
+            expired_attempts.contains("ORDER BY MIN(created_at) ASC, user_id ASC, attempt_id ASC")
+        );
         assert!(
             expiry_validation
                 .sql()
@@ -728,6 +724,180 @@ pub struct ModelRequestContextEvent {
     pub error_kind: Option<String>,
 }
 
+impl ModelRequestContextEvent {
+    pub(crate) fn validate_accepted(&self) -> ServiceResult<()> {
+        validate_model_request_event_projection(
+            ModelRequestEventStage::Accepted,
+            None,
+            &self.schema,
+            self.stage,
+            self.terminal_status.as_deref(),
+        )?;
+        if self.identity.provider_response_id.is_some()
+            || self.usage.is_some()
+            || self.usage_status.is_some()
+            || self.error_kind.is_some()
+            || self.budget.measured_input_tokens.is_some()
+            || self.budget.usage_source.is_some()
+            || self.budget.estimate_error_tokens.is_some()
+            || self.budget.estimate_error_ratio.is_some()
+            || self.cache.cache_read_share.is_some()
+        {
+            return Err(ServiceError::conflict(
+                "accepted request context contains terminal facts",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_stored_identity(
+        &self,
+        user_id: &str,
+        session_id: Option<&str>,
+        run_id: Option<&str>,
+        attempt_id: &str,
+        invocation_id: &str,
+    ) -> ServiceResult<()> {
+        if self.identity.owner_scope != user_id
+            || self.identity.session_id.as_deref() != session_id
+            || self.identity.run_id.as_deref() != run_id
+            || self.identity.request_id != attempt_id
+            || self
+                .route
+                .as_ref()
+                .is_some_and(|route| route.invocation_id != invocation_id)
+        {
+            return Err(ServiceError::conflict(
+                "model request payload disagrees with its stored identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Terminal-only durable facts. Immutable request context belongs to the
+/// accepted row; public observations hydrate both through the shared reader.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ModelRequestTerminalFact {
+    pub schema: String,
+    pub terminal_status: String,
+    pub provider_response_id: Option<String>,
+    pub usage_status: String,
+    pub usage: Option<ModelRequestUsage>,
+    pub error_kind: Option<String>,
+    pub usage_source: String,
+}
+
+pub(crate) const MODEL_REQUEST_TERMINAL_SCHEMA: &str = "model_request_terminal_v1";
+
+impl ModelRequestTerminalFact {
+    pub(crate) fn validate(&self) -> ServiceResult<()> {
+        if self.schema != MODEL_REQUEST_TERMINAL_SCHEMA
+            || !matches!(
+                self.terminal_status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "delivery_unknown"
+            )
+            || !matches!(
+                self.usage_source.as_str(),
+                "provider_terminal" | "provider_terminal_recovery"
+            )
+        {
+            return Err(ServiceError::conflict(
+                "unsupported model request terminal fact",
+            ));
+        }
+        match (self.usage_status.as_str(), self.usage.is_some()) {
+            ("unavailable", false) | ("provider_exact" | "provider_partial", true) => Ok(()),
+            _ => Err(ServiceError::conflict(
+                "model request terminal usage disagrees with coverage",
+            )),
+        }
+    }
+
+    pub(crate) fn hydrate(
+        &self,
+        mut accepted: ModelRequestContextEvent,
+    ) -> ServiceResult<ModelRequestContextEvent> {
+        self.validate()?;
+        accepted.validate_accepted()?;
+        accepted.stage = ModelRequestEventStage::Terminal;
+        accepted
+            .identity
+            .provider_response_id
+            .clone_from(&self.provider_response_id);
+        accepted.terminal_status = Some(self.terminal_status.clone());
+        accepted.error_kind.clone_from(&self.error_kind);
+        apply_model_request_terminal_usage(
+            &mut accepted,
+            self.usage.clone(),
+            &self.usage_status,
+            &self.usage_source,
+        )?;
+        Ok(accepted)
+    }
+}
+
+pub(crate) fn clear_model_request_measured_usage(event: &mut ModelRequestContextEvent) {
+    event.usage = None;
+    event.budget.measured_input_tokens = None;
+    event.budget.usage_source = None;
+    event.budget.estimate_error_tokens = None;
+    event.budget.estimate_error_ratio = None;
+    event.cache.cache_read_share = None;
+}
+
+/// One projection for foreground observations, recovery and database reads.
+pub(crate) fn apply_model_request_terminal_usage(
+    event: &mut ModelRequestContextEvent,
+    usage: Option<ModelRequestUsage>,
+    usage_status: &str,
+    source: &str,
+) -> ServiceResult<()> {
+    clear_model_request_measured_usage(event);
+    event.usage_status = Some(usage_status.to_string());
+    let (exact, usage) = match (usage_status, usage) {
+        ("unavailable", None) => return Ok(()),
+        ("provider_exact", Some(usage)) => (true, usage),
+        ("provider_partial", Some(usage)) => (false, usage),
+        _ => {
+            return Err(ServiceError::conflict(
+                "model request usage disagrees with coverage",
+            ));
+        }
+    };
+    if exact {
+        let measured = usage.total_input_tokens();
+        event.budget.measured_input_tokens = Some(measured);
+        event.budget.usage_source = Some(source.to_string());
+        if let Some(estimated) = event.budget.estimated_input_tokens {
+            let error = i128::from(measured) - i128::from(estimated);
+            event.budget.estimate_error_tokens =
+                Some(i64::try_from(error).unwrap_or(if error.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }));
+            event.budget.estimate_error_ratio =
+                (estimated > 0).then_some(error as f64 / estimated as f64);
+        }
+        event.cache.cache_read_share =
+            projected_cache_read_share(&event.identity.provider_protocol, usage_status, &usage);
+    }
+    event.usage = Some(usage);
+    Ok(())
+}
+
+pub(crate) fn projected_cache_read_share(
+    protocol: &str,
+    status: &str,
+    usage: &ModelRequestUsage,
+) -> Option<f64> {
+    let total = usage.total_input_tokens();
+    (protocol != "typesafe_systemone" && status == "provider_exact" && total > 0)
+        .then(|| usage.input.cache_read_tokens as f64 / total as f64)
+}
+
 /// Non-secret linkage between a physical request and its admitted route.
 ///
 /// Physical retries share an invocation and route. A new logical invocation
@@ -888,16 +1058,33 @@ pub async fn list_model_request_context_events(
             "model request context query requires owner and session identity",
         ));
     }
+    // MatrixOne does not infer tenant predicates through the limited page CTE.
+    // Keep the accepted-side predicates explicit to avoid a global scan.
     let rows = sqlx::query(
-        "SELECT event_id, event_stage, terminal_status, event_json, created_at
-         FROM model_request_context_events
-         WHERE user_id = ? AND session_id = ?
-         ORDER BY created_at DESC, event_id DESC
-         LIMIT ?",
+        "WITH page AS (
+             SELECT event_id, attempt_id, invocation_id, user_id, session_id, run_id,
+                    event_stage, terminal_status, event_json, created_at
+             FROM model_request_context_events
+             WHERE user_id = ? AND session_id = ?
+             ORDER BY created_at DESC, event_id DESC LIMIT ?
+         )
+         SELECT page.*, accepted.event_json AS accepted_json
+         FROM page LEFT JOIN model_request_context_events AS accepted
+           ON page.event_stage = 'terminal'
+          AND accepted.user_id = page.user_id
+          AND accepted.session_id = page.session_id
+          AND accepted.attempt_id = page.attempt_id
+          AND accepted.invocation_id = page.invocation_id
+          AND accepted.run_id <=> page.run_id
+          AND accepted.event_stage = 'accepted'
+          AND accepted.user_id = ? AND accepted.session_id = ?
+         ORDER BY page.created_at DESC, page.event_id DESC",
     )
     .bind(user_id)
     .bind(session_id)
     .bind(bounded_limit(limit))
+    .bind(user_id)
+    .bind(session_id)
     .fetch_all(pool.get())
     .await
     .map_err(|error| {
@@ -932,14 +1119,60 @@ pub async fn list_model_request_context_events(
                 error,
             )
         })?;
-        let event: ModelRequestContextEvent =
-            serde_json::from_str(&event_json).map_err(|error| {
+        let decode_context = |json: &str| -> ServiceResult<ModelRequestContextEvent> {
+            serde_json::from_str(json).map_err(|error| {
                 ServiceError::with_source(
                     ServiceErrorKind::Persistence,
                     "decode model request context event",
                     error,
                 )
-            })?;
+            })
+        };
+        let event = match stage {
+            ModelRequestEventStage::Accepted => {
+                let event = decode_context(&event_json)?;
+                event.validate_accepted()?;
+                event
+            }
+            ModelRequestEventStage::Terminal => {
+                let fact: ModelRequestTerminalFact =
+                    serde_json::from_str(&event_json).map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode model request terminal fact",
+                            error,
+                        )
+                    })?;
+                let accepted_json: Option<String> =
+                    row.try_get("accepted_json").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode model request accepted partner",
+                            error,
+                        )
+                    })?;
+                let accepted = accepted_json.ok_or_else(|| {
+                    ServiceError::conflict("model request terminal has no exact accepted context")
+                })?;
+                fact.hydrate(decode_context(&accepted)?)?
+            }
+        };
+        let attempt_id = row_string(&row, "attempt_id")?;
+        let invocation_id = row_string(&row, "invocation_id")?;
+        let run_id: Option<String> = row.try_get("run_id").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode model request run identity",
+                error,
+            )
+        })?;
+        event.validate_stored_identity(
+            user_id,
+            Some(session_id),
+            run_id.as_deref(),
+            &attempt_id,
+            &invocation_id,
+        )?;
         let terminal_status: Option<String> = row.try_get("terminal_status").map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,

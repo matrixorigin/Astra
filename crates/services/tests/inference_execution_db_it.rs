@@ -31,6 +31,69 @@ use uuid::Uuid;
 
 const TEST_INFERENCE_OWNER_POD_ID: &str = "inference-db-it-owner";
 
+/// Compare identical real-ledger workloads across revisions; no provider calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne; ASTRA_TEST_STORAGE_SCALE=1 selects 1000 sessions"]
+async fn default_request_context_storage_cost() {
+    use futures_util::{StreamExt, stream};
+    let (shared, _) = common::setup_pool_and_settings().await;
+    let scale = std::env::var("ASTRA_TEST_STORAGE_SCALE").as_deref() == Ok("1");
+    let sessions = if scale { 1000 } else { 4 };
+    let rounds = if scale { 1 } else { 8 };
+    let nonce = Uuid::new_v4().simple().to_string();
+    let started = std::time::Instant::now();
+    let results = stream::iter(0..sessions).map(|index| {
+        let shared = shared.clone();
+        let user = format!("context-cost-{}-{}", nonce, index % 100);
+        let session = format!("context-cost-{}-{index}", nonce);
+        async move {
+            let run = Uuid::new_v4().to_string();
+            seed_run(shared.get(), &user, &session, &run).await;
+            let mut latency = Vec::new();
+            for round in 0..rounds {
+                let plan = plan_inference_invocation(run_input(&user, &session, &run, round, "storage_cost")).unwrap();
+                let attempt = provider_attempt(&plan, 0);
+                let terminal = InferenceInvocationTerminal::succeeded(InferenceUsage {
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2), output_tokens:6,
+                }, Some("fixture-response".into()));
+                let start = std::time::Instant::now();
+                admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt).await.unwrap();
+                finish_successful_inference_provider_attempt_and_invocation(&shared, &plan, &attempt, &terminal).await.unwrap();
+                latency.push(start.elapsed().as_micros());
+            }
+            let bytes: i64 = sqlx::query_scalar("SELECT CAST(SUM(OCTET_LENGTH(event_json)) AS SIGNED) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
+                .bind(&user).bind(&session).fetch_one(shared.get()).await.unwrap();
+            let read_start = std::time::Instant::now();
+            let events = astra_services::list_model_request_context_events(&shared, &user, &session, rounds * 2).await.unwrap();
+            let read_us = read_start.elapsed().as_micros();
+            assert_eq!(events.len(), rounds as usize * 2);
+            for record in events {
+                assert_eq!(record.event.identity.owner_scope, user);
+                assert_eq!(record.event.identity.session_id.as_deref(), Some(session.as_str()));
+                assert!(record.event.route.is_some());
+                if record.stage == astra_services::ModelRequestEventStage::Terminal {
+                    let usage = record.event.usage.unwrap();
+                    assert_eq!(usage.total_input_tokens(), 23);
+                    assert_eq!(usage.output_tokens, 6);
+                }
+            }
+            cleanup(shared.get(), &user, &session, &run).await;
+            (bytes, read_us, latency)
+        }
+    }).buffer_unordered(16).collect::<Vec<_>>().await;
+    let bytes: i64 = results.iter().map(|item| item.0).sum();
+    let read_us: u128 = results.iter().map(|item| item.1).sum();
+    let mut latency: Vec<_> = results.into_iter().flat_map(|item| item.2).collect();
+    latency.sort_unstable();
+    eprintln!(
+        "model_context_cost sessions={sessions} rounds={rounds} attempts={} json_bytes={bytes} settlement_p50_us={} settlement_p95_us={} read_total_us={read_us} wall_with_setup_cleanup_ms={}",
+        latency.len(),
+        latency[latency.len() / 2],
+        latency[latency.len() * 95 / 100],
+        started.elapsed().as_millis()
+    );
+}
+
 /// Opt-in measurement fixture, not a provider benchmark. Collect statement_info
 /// separately after this emits its connection IDs and DB-clock window.
 #[tokio::test]
@@ -3015,6 +3078,19 @@ async fn exact_attempt_debt_recovers_success_without_degrading_provider_facts() 
     reconcile_inference_settlements(&shared_pool, 256)
         .await
         .expect("sweeper applies exact physical and logical terminal");
+    let observations =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 2)
+            .await
+            .unwrap();
+    let recovered = observations
+        .iter()
+        .find(|row| row.event.terminal_status.is_some())
+        .unwrap();
+    assert_eq!(
+        recovered.event.budget.usage_source.as_deref(),
+        Some("provider_terminal"),
+        "recovery preserves the first committed foreground measurement source"
+    );
 
     let attempt_row = sqlx::query(
         "SELECT status, terminal_fingerprint, input_tokens, output_tokens,
@@ -3218,6 +3294,19 @@ async fn exact_started_attempt_debt_recovers_interrupted_success() {
     reconcile_inference_settlements(&shared_pool, 256)
         .await
         .expect("reconcile exact started-attempt settlement debt");
+    let observations =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 2)
+            .await
+            .unwrap();
+    let recovered = observations
+        .iter()
+        .find(|row| row.event.terminal_status.is_some())
+        .unwrap();
+    assert_eq!(
+        recovered.event.budget.usage_source.as_deref(),
+        Some("provider_terminal_recovery"),
+        "a terminal first committed by recovery records that measurement source"
+    );
 
     let state = sqlx::query(
         "SELECT invocation.status AS invocation_status,
@@ -5296,6 +5385,37 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     .map(|row| row.get::<i64, _>("round_index"))
     .collect::<Vec<_>>();
     assert_eq!(durable_rounds, vec![2, 3]);
+
+    let page =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        page[0], *successful_context,
+        "a terminal-only page hydrates its accepted partner outside the page"
+    );
+    let original: String = sqlx::query_scalar("SELECT event_json FROM model_request_context_events WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(&user_id).bind(second_attempt.attempt_id()).fetch_one(pool).await.unwrap();
+    let mut corrupt: serde_json::Value = serde_json::from_str(&original).unwrap();
+    corrupt["identity"]["owner_scope"] = serde_json::json!("another-owner");
+    sqlx::query("UPDATE model_request_context_events SET event_json = ? WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(serde_json::to_string(&corrupt).unwrap()).bind(&user_id).bind(second_attempt.attempt_id()).execute(pool).await.unwrap();
+    assert!(
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE model_request_context_events SET event_json = ?, session_id = ? WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(&original).bind(format!("foreign-{session_id}")).bind(&user_id).bind(second_attempt.attempt_id()).execute(pool).await.unwrap();
+    assert!(
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .is_err(),
+        "a foreign accepted partner must not hide a terminal row or authorize hydration"
+    );
+    sqlx::query("UPDATE model_request_context_events SET session_id = ? WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(&session_id).bind(&user_id).bind(second_attempt.attempt_id()).execute(pool).await.unwrap();
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }

@@ -250,6 +250,26 @@ in `model_request_context_events`. These records complement `agent_events` and
 are exposed through the existing owner-scoped request queries and session
 observability projection. They do not require full prompt capture.
 
+The accepted row stores immutable request context once. The terminal row stores
+only a strict `model_request_terminal_v1` fact: outcome, response identity,
+usage coverage and normalized usage, error kind, and measurement source. The
+shared reader hydrates the existing full public event from the exact
+owner/session/run/attempt/invocation partner, even when the accepted row lies
+outside the requested page. Missing or inconsistent evidence is an error, not
+an omitted terminal or fabricated usage. Normal terminal writes do not read
+the accepted row; crash recovery retains its existing accepted-context lookup.
+Metrics and paired retention remain unchanged.
+
+Expiry candidates and locked deletion validation both use the latest timestamp
+of the whole owner/attempt group. Fresh terminal records must exclude an old
+accepted record before applying the batch limit. The existing leader-controlled
+five-minute sweeper owns this aggregate; its batch limit bounds mutations, not
+the number of rows examined. Request writes do not run this global sweep.
+
+This storage encoding requires coordinated producer/reader/recovery deployment.
+It does not decode old full-context terminal payloads or migrate/delete them.
+Stored diagnostics must use this encoding before querying with the new reader.
+
 `ModelRequestContextEvent.route` projects non-secret facts from the admitted
 inference plan:
 
