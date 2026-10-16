@@ -861,6 +861,52 @@ impl PreparedBashWorkdir {
 #[cfg(unix)]
 use astra_sandbox::open_directory_beneath;
 
+// Landlock can allow a workspace without allowing the filesystem root to be
+// opened. On Linux, openat2 pins the absolute workspace path while rejecting
+// symlinks in every component, so bash does not need a readable `/` anchor.
+#[cfg(target_os = "linux")]
+fn open_pinned_workspace_root(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: 0x04, // RESOLVE_NO_SYMLINKS, including ancestor components.
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            // Keep the existing behavior on Linux kernels older than 5.6.
+            let filesystem_root = std::fs::File::open("/")?;
+            let relative = path
+                .strip_prefix("/")
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            return open_directory_beneath(&filesystem_root, relative);
+        }
+        return Err(error);
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) })
+}
+
 /// Resolve one Bash invocation's execution directory without changing the
 /// workspace authority boundary. The directory must already exist and its
 /// canonical path must remain beneath the canonical workspace root, which
@@ -910,20 +956,28 @@ pub fn resolve_bash_workdir(
     {
         use std::os::unix::fs::MetadataExt;
 
-        let filesystem_root = std::fs::File::open("/").map_err(|error| {
+        #[cfg(target_os = "linux")]
+        let root_directory = open_pinned_workspace_root(&canonical_root).map_err(|error| {
             format!(
-                "Error: cannot open filesystem root while pinning bash `workdir`: {error}; no command was run"
+                "Error: cannot pin workspace root for bash `workdir`: {error}; no command was run"
             )
         })?;
-        let root_relative = canonical_root.strip_prefix("/").map_err(|_| {
-            "Error: canonical workspace root is not absolute; no command was run".to_string()
-        })?;
-        let root_directory =
+        #[cfg(not(target_os = "linux"))]
+        let root_directory = {
+            let filesystem_root = std::fs::File::open("/").map_err(|error| {
+                format!(
+                    "Error: cannot open filesystem root while pinning bash `workdir`: {error}; no command was run"
+                )
+            })?;
+            let root_relative = canonical_root.strip_prefix("/").map_err(|_| {
+                "Error: canonical workspace root is not absolute; no command was run".to_string()
+            })?;
             open_directory_beneath(&filesystem_root, root_relative).map_err(|error| {
                 format!(
                     "Error: cannot pin workspace root for bash `workdir`: {error}; no command was run"
                 )
-            })?;
+            })?
+        };
         let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
             format!(
                 "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
@@ -7724,6 +7778,18 @@ printf 'probe.txt:1:needle\n'
 mod workdir_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_workspace_root_rejects_symlinked_ancestor() {
+        let parent = tempdir().unwrap();
+        let actual = parent.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, parent.path().join("alias")).unwrap();
+
+        assert!(open_pinned_workspace_root(&actual).is_ok());
+        assert!(open_pinned_workspace_root(&parent.path().join("alias")).is_err());
+    }
 
     #[test]
     fn bash_workdir_is_call_scoped_and_confined_to_workspace() {
