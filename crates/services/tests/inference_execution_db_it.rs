@@ -1605,11 +1605,51 @@ async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
     let other_session = Uuid::new_v4().to_string();
     let run = Uuid::new_v4().to_string();
     seed_run(pool, &user, &session, &run).await;
-    // 1,023 complete pairs; seed in batches instead of issuing 2,046 writes.
+    let fixture_plan =
+        plan_inference_invocation(run_input(&user, &session, &run, 100, "retention-fixture"))
+            .unwrap();
+    let fixture_attempt = provider_attempt(&fixture_plan, 0);
+    admit_inference_invocation_with_first_provider_attempt(
+        &shared,
+        &fixture_plan,
+        &fixture_attempt,
+    )
+    .await
+    .unwrap();
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared,
+        &fixture_plan,
+        &fixture_attempt,
+        &InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None),
+    )
+    .await
+    .unwrap();
+    let pending_plan =
+        plan_inference_invocation(run_input(&user, &session, &run, 101, "pending-retention"))
+            .unwrap();
+    let pending_attempt = provider_attempt(&pending_plan, 0);
+    admit_inference_invocation_with_first_provider_attempt(
+        &shared,
+        &pending_plan,
+        &pending_attempt,
+    )
+    .await
+    .unwrap();
+    finish_inference_provider_attempt(
+        &shared,
+        &pending_attempt,
+        &InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 2 MINUTE) WHERE user_id=? AND attempt_id=?")
+        .bind(&user).bind(pending_attempt.attempt_id()).execute(pool).await.unwrap();
+    // Two real pairs and 1,021 retention-consumer fixture pairs. The
+    // fixture supplies canonical owners; it does not simulate producer behavior.
     // Foreign owner/session rows must neither trigger nor participate in pruning.
     let mut rows = Vec::new();
     for (owner, sid, pairs) in [
-        (&user, &session, 1023),
+        (&user, &session, 1021),
         (&foreign_user, &session, 1),
         (&user, &other_session, 1),
     ] {
@@ -1627,14 +1667,15 @@ async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
     }
     for chunk in rows.chunks(128) {
         let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "INSERT INTO model_request_context_events (user_id, session_id, event_id, attempt_id, invocation_id, event_stage, terminal_status, topology, provider, model_family, purpose, event_json, created_at) ",
+            "INSERT INTO model_request_context_events (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, terminal_status, topology, provider, model_family, purpose, event_json, created_at) ",
         );
         insert.push_values(chunk, |mut row, (owner, sid, event, attempt, stage)| {
             row.push_bind(owner)
                 .push_bind(sid)
+                .push_bind(&run)
                 .push_bind(event)
                 .push_bind(attempt)
-                .push("'retention-fixture'")
+                .push_bind(fixture_plan.invocation_id())
                 .push_bind(stage)
                 .push(if *stage == "terminal" {
                     "'cancelled'"
@@ -1650,6 +1691,13 @@ async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
         });
         insert.build().execute(pool).await.unwrap();
     }
+    sqlx::query("INSERT INTO inference_provider_attempts
+        (attempt_id,invocation_id,user_id,session_id,run_id,attempt_index,provider,admission_token,provider_protocol,provider_wire_hash,provider_wire_bytes,status,terminal_fingerprint,usage_status)
+        SELECT attempt_id,invocation_id,user_id,session_id,run_id,
+               ROW_NUMBER() OVER (ORDER BY attempt_id),'openai',REPEAT('0',32),'openai_compatible',REPEAT('0',64),2,'cancelled',REPEAT('0',64),'unavailable'
+        FROM model_request_context_events
+        WHERE user_id=? AND session_id=? AND invocation_id=? AND event_stage='accepted' AND attempt_id<>?")
+        .bind(&user).bind(&session).bind(fixture_plan.invocation_id()).bind(fixture_attempt.attempt_id()).execute(pool).await.unwrap();
     for (round, expected) in [(0, 2048_i64), (1, 1538)] {
         let plan = plan_inference_invocation(run_input(
             &user,
@@ -1684,12 +1732,25 @@ async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
             .bind(&user).bind(attempt.attempt_id()).fetch_one(pool).await.unwrap();
         assert_eq!(current, 2, "newest pair survives");
     }
-    let oldest: String = sqlx::query_scalar("SELECT MIN(attempt_id) FROM model_request_context_events WHERE user_id = ? AND session_id = ? AND invocation_id = 'retention-fixture'")
-        .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
+    let oldest: String = sqlx::query_scalar("SELECT MIN(attempt_id) FROM model_request_context_events WHERE user_id = ? AND session_id = ? AND invocation_id = ? AND attempt_id <> ?")
+        .bind(&user).bind(&session).bind(fixture_plan.invocation_id()).bind(fixture_attempt.attempt_id()).fetch_one(pool).await.unwrap();
     assert_eq!(oldest, format!("{session}-0256"));
     let split: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT attempt_id FROM model_request_context_events WHERE user_id = ? AND session_id = ? GROUP BY attempt_id HAVING COUNT(*) <> 2) AS incomplete")
         .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
     assert_eq!(split, 0, "compaction never splits a complete pair");
+    reconcile_inference_settlements(&shared, 256).await.unwrap();
+    let pending_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations WHERE user_id=? AND invocation_id=?",
+    )
+    .bind(&user)
+    .bind(pending_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending_status, "succeeded",
+        "the oldest pending settlement must survive compaction"
+    );
     for (owner, sid) in [(&foreign_user, &session), (&user, &other_session)] {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
             .bind(owner).bind(sid).fetch_one(pool).await.unwrap();
@@ -3988,8 +4049,9 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
         batch_limit: 1_000,
         ..RuntimeMaintenancePolicy::default()
     };
+    let mut context_cursor = Default::default();
     let (maintenance, terminal) = tokio::join!(
-        maintain_runtime_storage(&shared_pool, None, &maintenance_policy),
+        maintain_runtime_storage(&shared_pool, None, &maintenance_policy, &mut context_cursor),
         finish_inference_provider_attempt(&shared_pool, &attempt, &terminal),
     );
     assert!(
@@ -4032,6 +4094,170 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
     }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn context_expiry_preserves_recovery_and_counts_each_terminal_once() {
+    let (shared, _) = common::setup_pool_and_settings().await;
+    let pool = shared.get();
+    for physical_success in [false, true] {
+        let user = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        seed_run(pool, &user, &session, &run).await;
+        let mut input = run_input(&user, &session, &run, 0, "retention-recovery");
+        // Metrics are deliberately low-cardinality, not tenant-scoped. Give
+        // this fixture its own provider dimension to assert exact increments.
+        input.provider = format!("retention-{user}");
+        let provider = input.provider.clone();
+        let plan = plan_inference_invocation(input).unwrap();
+        let attempt = provider_attempt(&plan, 0);
+        admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt)
+            .await
+            .unwrap();
+        if physical_success {
+            finish_inference_provider_attempt(
+                &shared,
+                &attempt,
+                &InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None),
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 31 DAY) WHERE user_id=?")
+            .bind(&user).execute(pool).await.unwrap();
+        let mut cursor = Default::default();
+        let page = astra_services::model_request_context::expire_model_request_context_events(
+            &shared,
+            1000,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+        assert!(page.examined <= 1000);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id=?")
+                .bind(&user)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            if physical_success { 2 } else { 1 },
+            "unsettled evidence stays pinned"
+        );
+        if !physical_success {
+            let mut settings = astra_core::MatrixOneSettings::from_env();
+            settings.db_pool_max_connections = 1;
+            settings.db_pool_min_connections = 0;
+            let starved = astra_core::SharedPool::new(&settings).await.unwrap();
+            let held = starved.get().acquire().await.unwrap();
+            let mut blocked_cursor = Default::default();
+            let bounded = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                astra_services::model_request_context::expire_model_request_context_events(
+                    &starved,
+                    1,
+                    &mut blocked_cursor,
+                ),
+            )
+            .await;
+            assert!(
+                matches!(bounded, Ok(Err(_))),
+                "the page deadline includes pool waiting"
+            );
+            drop(held);
+            astra_services::model_request_context::expire_model_request_context_events(
+                &starved,
+                1,
+                &mut blocked_cursor,
+            )
+            .await
+            .unwrap();
+            starved.close().await;
+        }
+        if !physical_success {
+            sqlx::query("UPDATE inference_invocations SET owner_lease_expires_at=DATE_SUB(NOW(6),INTERVAL 1 MINUTE) WHERE user_id=?")
+                .bind(&user).execute(pool).await.unwrap();
+        }
+        for _ in 0..2 {
+            reconcile_inference_settlements(&shared, 256).await.unwrap();
+        }
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inference_invocations WHERE user_id=?")
+                .bind(&user)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status,
+            if physical_success {
+                "succeeded"
+            } else {
+                "delivery_unknown"
+            }
+        );
+        let debt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_invocation_settlement_debts WHERE user_id=?",
+        )
+        .bind(&user)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(debt, 0);
+        let events = astra_services::list_model_request_context_events(&shared, &user, &session, 2)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let terminal = events
+            .iter()
+            .find(|row| row.stage == astra_services::ModelRequestEventStage::Terminal)
+            .unwrap();
+        assert_eq!(
+            terminal.event.usage_status.as_deref(),
+            Some(if physical_success {
+                "provider_exact"
+            } else {
+                "unavailable"
+            })
+        );
+        assert_eq!(terminal.event.usage.is_some(), physical_success);
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 31 DAY) WHERE user_id=?")
+            .bind(&user).execute(pool).await.unwrap();
+        cursor = Default::default();
+        astra_services::model_request_context::expire_model_request_context_events(
+            &shared,
+            1000,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+        let removed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id=?")
+                .bind(&user)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(removed, 0, "settled evidence can be reclaimed");
+        let marked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id=? AND context_expired_at IS NOT NULL")
+            .bind(&user).fetch_one(pool).await.unwrap();
+        assert_eq!(marked, 1);
+        reconcile_inference_settlements(&shared, 256).await.unwrap();
+        let requests: i64 = sqlx::query_scalar("SELECT CAST(SUM(requests) AS SIGNED) FROM model_request_metric_shards WHERE provider=?")
+            .bind(&provider).fetch_one(pool).await.unwrap();
+        assert_eq!(
+            requests, 1,
+            "reconciliation and pruning never count a request twice"
+        );
+        cleanup(pool, &user, &session, &run).await;
+        sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
+            .bind(&provider)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -4084,6 +4310,9 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     finish_inference_provider_attempt(&shared_pool, &protected_attempt, &failure)
         .await
         .expect("finish protected context attempt");
+    finish_inference_invocation(&shared_pool, &protected_plan, &failure)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE model_request_context_events
          SET created_at = DATE_SUB(NOW(6), INTERVAL 32 DAY)
@@ -4125,6 +4354,9 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     finish_inference_provider_attempt(&shared_pool, &eligible_attempt, &failure)
         .await
         .expect("finish eligible context attempt");
+    finish_inference_invocation(&shared_pool, &eligible_plan, &failure)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE model_request_context_events
          SET created_at = DATE_SUB(NOW(6), INTERVAL 31 DAY)
@@ -4136,6 +4368,28 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     .await
     .expect("age the eligible context attempt");
 
+    let mut pinned = Vec::new();
+    for round in 2..10 {
+        let plan = plan_inference_invocation(run_input(
+            &user_id,
+            &session_id,
+            &run_id,
+            round,
+            "pinned-expiry-prefix",
+        ))
+        .unwrap();
+        let attempt = provider_attempt(&plan, 0);
+        admit_inference_invocation_with_first_provider_attempt(&shared_pool, &plan, &attempt)
+            .await
+            .unwrap();
+        finish_inference_provider_attempt(&shared_pool, &attempt, &failure)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 33 DAY) WHERE user_id=? AND invocation_id=?")
+            .bind(&user_id).bind(plan.invocation_id()).execute(pool).await.unwrap();
+        pinned.push(plan);
+    }
+    let mut expiry_cursor = Default::default();
     let maintenance = maintain_runtime_storage(
         &shared_pool,
         None,
@@ -4143,12 +4397,32 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
             batch_limit: 1,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut expiry_cursor,
     )
     .await;
     assert!(
         maintenance.cleanup_errors.is_empty(),
         "runtime maintenance errors: {:?}",
         maintenance.cleanup_errors
+    );
+    let mut more = maintenance.model_request_context_more;
+    for _ in 0..64 {
+        if !more {
+            break;
+        }
+        let page = astra_services::model_request_context::expire_model_request_context_events(
+            &shared_pool,
+            1,
+            &mut expiry_cursor,
+        )
+        .await
+        .unwrap();
+        assert!(page.examined <= 1);
+        more = page.more;
+    }
+    assert!(
+        !more,
+        "a bounded walk advances even through a fully pinned prefix"
     );
     let protected_stages = sqlx::query_scalar::<_, String>(
         "SELECT event_stage FROM model_request_context_events
@@ -4169,6 +4443,57 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     .await
     .expect("count expired context events");
     assert_eq!(eligible_event_count, 0);
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("SELECT attempt_id FROM inference_provider_attempts WHERE user_id=? AND invocation_id=? FOR UPDATE")
+        .bind(&user_id).bind(pinned[0].invocation_id()).fetch_all(&mut *held).await.unwrap();
+    let unlocked_page = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        astra_services::model_request_context::expire_model_request_context_events(
+            &shared_pool,
+            1000,
+            &mut expiry_cursor,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(unlocked_page, Ok(Ok(_))),
+        "a locked pinned execution must not stall maintenance"
+    );
+    held.rollback().await.unwrap();
+    for plan in &pinned {
+        let records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_request_context_events WHERE user_id=? AND invocation_id=?",
+        )
+        .bind(&user_id)
+        .bind(plan.invocation_id())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(records, 2, "a pending logical invocation retains its pair");
+        finish_inference_invocation(&shared_pool, plan, &failure)
+            .await
+            .unwrap();
+    }
+    // End-of-pass reset revisits previously pinned rows after they settle.
+    astra_services::model_request_context::expire_model_request_context_events(
+        &shared_pool,
+        1000,
+        &mut expiry_cursor,
+    )
+    .await
+    .unwrap();
+    for plan in &pinned {
+        let records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_request_context_events WHERE user_id=? AND invocation_id=?",
+        )
+        .bind(&user_id)
+        .bind(plan.invocation_id())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(records, 0);
+    }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }

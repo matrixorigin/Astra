@@ -8,10 +8,9 @@ use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
 use crate::model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, MODEL_REQUEST_TERMINAL_SCHEMA, ModelRequestContextEvent,
-    ModelRequestContextScope, ModelRequestContextSeed, ModelRequestEventStage,
-    ModelRequestIdentity, ModelRequestRoute, ModelRequestTerminalFact, ModelRequestTopology,
-    ModelRequestUsage, ModelRequestWireComposition, clear_model_request_measured_usage,
-    compact_model_request_context_scope,
+    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestRoute,
+    ModelRequestTerminalFact, ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
+    clear_model_request_measured_usage, compact_model_request_context_scope,
 };
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
@@ -998,17 +997,15 @@ async fn insert_model_request_context_event_with_expiry(
                     error,
                 )
             })?;
-        let scope = match &attempt.invocation_input.scope {
+        let session_id = match &attempt.invocation_input.scope {
             InferenceInvocationScope::Run { session_id, .. }
-            | InferenceInvocationScope::Session { session_id, .. } => {
-                ModelRequestContextScope::Session(session_id)
-            }
+            | InferenceInvocationScope::Session { session_id, .. } => session_id,
         };
         // A normal request appends an accepted/terminal pair. Compact once at
         // the terminal boundary; orphaned accepted rows remain covered by the
         // existing expiry sweeper.
         if stage == ModelRequestEventStage::Terminal {
-            compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+            compact_model_request_context_scope(connection, &attempt.user_id, session_id).await?;
         }
     }
     // Count every terminal request, including failures with unavailable
@@ -1073,6 +1070,28 @@ async fn insert_recovered_model_request_terminal(
     terminal: &DurableInferenceTerminal,
 ) -> Result<(), sqlx::Error> {
     let mut tx = connection.begin().await?;
+    // A competing reconciler can settle after the caller observed admission.
+    // Lock and recheck that authority before touching disposable diagnostics.
+    let owner = sqlx::query(
+        "SELECT status, terminal_fingerprint FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| sqlx::Error::Protocol("request recovery has no invocation owner".into()))?;
+    if owner.try_get::<String, _>("status")? != "admitted" {
+        if owner.try_get::<Option<String>, _>("terminal_fingerprint")?
+            != terminal.terminal_fingerprint
+        {
+            return Err(sqlx::Error::Protocol(
+                "request recovery conflicts with settled invocation".into(),
+            ));
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
     insert_recovered_model_request_terminal_tx(
         &mut tx,
         user_id,
@@ -8384,6 +8403,120 @@ mod tests {
                 .expect("changed plan")
                 .invocation_id
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn delayed_recovery_rechecks_settled_authority_after_diagnostic_pruning() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        crate::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let user = uuid::Uuid::new_v4().to_string();
+        let session = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_sessions (session_id,user_id,status,event_count,project_retention_policy,created_at,updated_at,last_active_at) VALUES (?,?,'active',0,'session',NOW(6),NOW(6),NOW(6))")
+            .bind(&session).bind(&user).execute(pool.get()).await.unwrap();
+        let mut request = input();
+        request.user_id = user.clone();
+        request.provider = format!("delayed-{user}");
+        request.run_authority = None;
+        request.scope = InferenceInvocationScope::Session {
+            session_id: session.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "delayed-recovery".into(),
+            logical_attempt: 0,
+        };
+        let plan = plan_inference_invocation(request.clone()).unwrap();
+        let attempt = plan_inference_provider_attempt(
+            &plan,
+            0,
+            InferenceProviderWireIdentity::new("openai_compatible", "a".repeat(64), 2).unwrap(),
+        );
+        let terminal = InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None);
+        let durable = DurableInferenceTerminal::from_terminal(
+            &terminal,
+            terminal_fingerprint(&terminal).unwrap(),
+        )
+        .unwrap();
+        admit_inference_invocation_with_first_provider_attempt(&pool, &plan, &attempt)
+            .await
+            .unwrap();
+        // The first reconciler has observed admission. Another completes the
+        // invocation and GC prunes before the first enters its cold transaction.
+        finish_successful_inference_provider_attempt_and_invocation(
+            &pool, &plan, &attempt, &terminal,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 31 DAY) WHERE user_id=?")
+            .bind(&user).execute(pool.get()).await.unwrap();
+        let page = crate::model_request_context::expire_model_request_context_events(
+            &pool,
+            1000,
+            &mut Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(page.deleted >= 2);
+        let mut connection = pool.get().acquire().await.unwrap();
+        insert_recovered_model_request_terminal(
+            &mut connection,
+            &user,
+            plan.invocation_id(),
+            attempt.attempt_id(),
+            &durable,
+        )
+        .await
+        .unwrap();
+        let mut conflict = durable.clone();
+        conflict.terminal_fingerprint = Some("b".repeat(64));
+        assert!(
+            insert_recovered_model_request_terminal(
+                &mut connection,
+                &user,
+                plan.invocation_id(),
+                attempt.attempt_id(),
+                &conflict
+            )
+            .await
+            .is_err()
+        );
+        drop(connection);
+        assert!(
+            crate::list_model_request_context_events(&pool, &user, &session, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let requests: i64 = sqlx::query_scalar("SELECT CAST(SUM(requests) AS SIGNED) FROM model_request_metric_shards WHERE provider=?")
+            .bind(&request.provider).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            requests, 1,
+            "a delayed reconciler cannot recreate accounting"
+        );
+        for table in [
+            "model_request_context_events",
+            "inference_provider_attempts",
+            "inference_invocation_settlement_debts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
+                .bind(&user)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
+            .bind(&request.provider)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        pool.close().await;
     }
 
     #[test]

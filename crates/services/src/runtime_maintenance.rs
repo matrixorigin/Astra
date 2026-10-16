@@ -13,7 +13,7 @@ use crate::CancellationSafePoolConnection;
 /// Bounded work configuration for runtime-storage maintenance.
 #[derive(Debug, Clone)]
 pub struct RuntimeMaintenancePolicy {
-    /// Maximum rows examined or collected by each maintenance operation.
+    /// Maximum candidate rows collected by each maintenance operation.
     pub batch_limit: u32,
     /// How long an explicit delete intent must remain untouched before a
     /// background sweep retries an interrupted hard delete.
@@ -38,6 +38,10 @@ pub struct RuntimeMaintenanceSweepResult {
     pub explicit_delete_intents_reconciled: u64,
     /// Old diagnostic request-context records removed after retention.
     pub model_request_context_events_expired: u64,
+    /// Raw old diagnostic rows examined in this page, including pinned rows.
+    pub model_request_context_events_examined: u64,
+    /// Continue after the last examined row, even when no deletion was eligible.
+    pub model_request_context_more: bool,
     /// Expired aggregate observation-identity collision diagnostics.
     pub observation_collision_receipts_expired: u64,
     /// Expired prompt-assembly request diagnostics removed after retention.
@@ -72,6 +76,7 @@ pub async fn maintain_runtime_storage(
     pool: &astra_core::SharedPool,
     fork_coordinator: Option<&crate::DatabaseSessionForkCoordinator>,
     policy: &RuntimeMaintenancePolicy,
+    context_cursor: &mut crate::model_request_context::ModelRequestContextExpiryCursor,
 ) -> RuntimeMaintenanceSweepResult {
     let mut result = RuntimeMaintenanceSweepResult::default();
     match crate::session_lifecycle::reconcile_explicit_session_delete_intents(
@@ -93,12 +98,26 @@ pub async fn maintain_runtime_storage(
             );
         }
     }
-    result.model_request_context_events_expired = record_runtime_storage_maintenance(
-        &mut result.cleanup_errors,
-        "expire_model_request_context_events",
-        crate::model_request_context::expire_model_request_context_events(pool, policy.batch_limit)
-            .await,
-    );
+    match crate::model_request_context::expire_model_request_context_events(
+        pool,
+        policy.batch_limit,
+        context_cursor,
+    )
+    .await
+    {
+        Ok(page) => {
+            result.model_request_context_events_expired = page.deleted;
+            result.model_request_context_events_examined = page.examined;
+            result.model_request_context_more = page.more;
+        }
+        Err(error) => {
+            record_runtime_storage_maintenance(
+                &mut result.cleanup_errors,
+                "expire_model_request_context_events",
+                Err::<u64, _>(error),
+            );
+        }
+    }
     result.observation_collision_receipts_expired = record_runtime_storage_maintenance(
         &mut result.cleanup_errors,
         "expire_observation_collision_receipts",

@@ -260,11 +260,23 @@ an omitted terminal or fabricated usage. Normal terminal writes do not read
 the accepted row; crash recovery retains its existing accepted-context lookup.
 Metrics and paired retention remain unchanged.
 
-Expiry candidates and locked deletion validation both use the latest timestamp
-of the whole owner/attempt group. Fresh terminal records must exclude an old
-accepted record before applying the batch limit. The existing leader-controlled
-five-minute sweeper owns this aggregate; its batch limit bounds mutations, not
-the number of rows examined. Request writes do not run this global sweep.
+Capacity compaction and expiry share one retention owner. Diagnostics remain
+pinned while their invocation is admitted, a physical attempt is open, or any
+settlement debt remains, including quarantined debt. Missing or contradictory
+canonical ownership also prevents deletion. The 2,048-record capacity and
+30-day age are soft limits for unresolved work: diagnostic reclamation must
+not destroy evidence still required for accounting or crash recovery.
+
+Eligible complete pairs are marked and deleted atomically under their physical
+attempt locks. Expiry walks old rows using the existing timestamp/event index,
+then checks the complete bounded owner/attempt groups. A fresh terminal protects
+its old accepted partner. The transient cursor advances past pinned rows even
+when no deletion occurs and wraps after a pass; restart safely repeats work.
+The existing leader sweeper catches up within page/time budgets, checking
+cancellation and leadership between pages. Other cleanup retains its normal
+five-minute cadence. No durable cursor or per-request global sweep is added.
+Unresolved incidents can retain evidence beyond the diagnostic limits; backlog
+convergence still depends on measured service capacity exceeding arrivals.
 
 This storage encoding requires coordinated producer/reader/recovery deployment.
 It does not decode old full-context terminal payloads or migrate/delete them.

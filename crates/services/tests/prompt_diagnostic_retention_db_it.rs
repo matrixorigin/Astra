@@ -41,6 +41,7 @@ async fn prompt_diagnostics_expire_after_ninety_days_without_deleting_active_ses
             batch_limit: 1_000,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut Default::default(),
     )
     .await;
     assert!(
@@ -112,6 +113,7 @@ async fn prompt_expiry_retains_an_expired_reuse_prefix_ancestor() {
             batch_limit: 1_000,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut Default::default(),
     )
     .await;
     assert!(
@@ -222,6 +224,7 @@ async fn prompt_expiry_skips_protected_oldest_request_and_advances_the_batch() {
             batch_limit: 1_000,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut Default::default(),
     )
     .await;
     assert!(
@@ -293,6 +296,7 @@ async fn prompt_expiry_reclaims_completed_delete_diagnostics() {
             batch_limit: 1_000,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut Default::default(),
     )
     .await;
     assert!(
@@ -330,6 +334,7 @@ async fn prompt_expiry_tombstones_a_fenceless_historical_orphan() {
             batch_limit: 1_000,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut Default::default(),
     )
     .await;
     assert!(

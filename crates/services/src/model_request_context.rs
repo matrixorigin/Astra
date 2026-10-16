@@ -27,93 +27,85 @@ const _: () = assert!(
         <= MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE
 );
 
-/// A durable owner scope for bounded request diagnostics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ModelRequestContextScope<'a> {
-    Session(&'a str),
-}
-
-impl<'a> ModelRequestContextScope<'a> {
-    fn column(self) -> &'static str {
-        match self {
-            Self::Session(_) => "session_id",
-        }
+// Physical completion is not logical settlement. These joins also reject
+// orphaned or contradictory diagnostic owners rather than erasing evidence.
+fn push_retention_owner_joins<'a>(query: &mut QueryBuilder<'a, MySql>, owners: &[&'a str]) {
+    // MatrixOne does not propagate the bounded tenant predicates across all
+    // joins. Bind each side explicitly; otherwise even a tiny page scans the
+    // global attempt, invocation and debt tables.
+    for (join, alias) in [
+    (" JOIN inference_provider_attempts physical
+   ON physical.user_id = context.user_id AND physical.attempt_id = context.attempt_id
+  AND physical.invocation_id = context.invocation_id
+  AND physical.session_id = context.session_id AND physical.run_id <=> context.run_id", "physical"),
+    (" JOIN inference_invocations invocation
+   ON invocation.user_id = physical.user_id AND invocation.invocation_id = physical.invocation_id
+  AND invocation.session_id = context.session_id AND invocation.run_id <=> context.run_id", "invocation"),
+    (" LEFT JOIN inference_invocation_settlement_debts debt
+   ON debt.user_id = invocation.user_id AND debt.invocation_id = invocation.invocation_id", "debt"),
+    (" LEFT JOIN inference_provider_attempts open_attempt
+   ON open_attempt.user_id = invocation.user_id AND open_attempt.invocation_id = invocation.invocation_id
+  AND open_attempt.status = 'started'", "open_attempt"),
+    ] {
+        query.push(join).push(" AND ").push(alias).push(".user_id IN (");
+        let mut list = query.separated(", ");
+        for owner in owners { list.push_bind(*owner); }
+        query.push(")");
     }
-
-    fn id(self) -> &'a str {
-        match self {
-            Self::Session(id) => id,
-        }
-    }
 }
 
-fn event_beyond_scope_limit_sql(scope: ModelRequestContextScope<'_>) -> String {
-    format!(
-        "SELECT event_id FROM model_request_context_events
-         WHERE user_id = ? AND {} = ?
-         LIMIT 1 OFFSET ?",
-        scope.column()
-    )
+const RETENTION_SETTLED_PREDICATE: &str = "
+ invocation.status IN ('succeeded','failed','cancelled','delivery_unknown')
+ AND physical.status IN ('succeeded','failed','cancelled','delivery_unknown')
+ AND invocation.terminal_fingerprint IS NOT NULL AND physical.terminal_fingerprint IS NOT NULL
+ AND debt.invocation_id IS NULL AND open_attempt.attempt_id IS NULL";
+
+/// Only a transient scan position; execution and deletion authority stay in SQL.
+#[derive(Debug, Default)]
+pub struct ModelRequestContextExpiryCursor {
+    cutoff: Option<chrono::NaiveDateTime>,
+    after: Option<(chrono::NaiveDateTime, String, String)>,
 }
 
-fn oldest_complete_attempts_in_scope_sql(scope: ModelRequestContextScope<'_>) -> String {
-    format!(
-        "SELECT attempt_id FROM model_request_context_events
-         WHERE user_id = ? AND {} = ?
-         GROUP BY attempt_id
-         HAVING COUNT(*) = 2
-         ORDER BY MIN(created_at) ASC, attempt_id ASC
-         LIMIT ?",
-        scope.column()
-    )
+#[derive(Debug, Default)]
+pub struct ModelRequestContextExpiryPage {
+    pub examined: u64,
+    pub deleted: u64,
+    pub more: bool,
 }
-
-const EXPIRED_ATTEMPT_CANDIDATES_SQL: &str = "SELECT user_id, attempt_id
-     FROM model_request_context_events
-     GROUP BY user_id, attempt_id
-     HAVING MAX(created_at) < DATE_SUB(NOW(6), INTERVAL ? DAY)
-     ORDER BY MIN(created_at) ASC, user_id ASC, attempt_id ASC
-     LIMIT ?";
 
 fn validate_expired_attempt_keys_query<'a>(
     attempt_keys: &'a [(String, String)],
+    cutoff: Option<chrono::NaiveDateTime>,
 ) -> QueryBuilder<'a, MySql> {
     let mut query = QueryBuilder::<MySql>::new(
-        "SELECT user_id, attempt_id FROM model_request_context_events WHERE ",
+        "SELECT context.user_id, context.attempt_id FROM model_request_context_events context",
     );
+    let owners = attempt_keys
+        .iter()
+        .map(|(owner, _)| owner.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    push_retention_owner_joins(&mut query, &owners);
+    query.push(format!(" WHERE {RETENTION_SETTLED_PREDICATE} AND ("));
     for (index, (user_id, attempt_id)) in attempt_keys.iter().enumerate() {
         if index > 0 {
             query.push(" OR ");
         }
         query
-            .push("(user_id = ")
+            .push("(context.user_id = ")
             .push_bind(user_id)
-            .push(" AND attempt_id = ")
+            .push(" AND context.attempt_id = ")
             .push_bind(attempt_id)
             .push(")");
     }
-    query
-        .push(" GROUP BY user_id, attempt_id HAVING MAX(created_at) < DATE_SUB(NOW(6), INTERVAL ")
-        .push_bind(i64::from(MODEL_REQUEST_CONTEXT_RETENTION_DAYS))
-        .push(" DAY)");
-    query
-}
-
-fn delete_complete_attempts_query<'a>(
-    user_id: &'a str,
-    attempt_ids: &'a [String],
-) -> QueryBuilder<'a, MySql> {
-    let mut query =
-        QueryBuilder::<MySql>::new("DELETE FROM model_request_context_events WHERE user_id = ");
-    query.push_bind(user_id);
-    query.push(" AND attempt_id IN (");
-    {
-        let mut attempts = query.separated(", ");
-        for attempt_id in attempt_ids {
-            attempts.push_bind(attempt_id);
-        }
+    query.push(") GROUP BY context.user_id, context.attempt_id HAVING COUNT(*) = 2");
+    if let Some(cutoff) = cutoff {
+        query
+            .push(" AND MAX(context.created_at) < ")
+            .push_bind(cutoff);
     }
-    query.push(")");
     query
 }
 
@@ -131,6 +123,49 @@ fn delete_attempt_keys_query<'a>(attempt_keys: &'a [(String, String)]) -> QueryB
             .push(")");
     }
     query
+}
+
+/// Both retention paths run this inside their existing transaction. Marking and
+/// pair deletion have one owner, and neither can erase an unsettled invocation.
+async fn prune_context_attempts(
+    connection: &mut sqlx::MySqlConnection,
+    keys: &[(String, String)],
+    cutoff: Option<chrono::NaiveDateTime>,
+) -> Result<u64, sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    lock_provider_attempts_for_context_expiry_query(keys)
+        .build()
+        .fetch_all(&mut *connection)
+        .await?;
+    let eligible = eligible_context_attempts(connection, keys, cutoff).await?;
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+    mark_provider_attempt_context_expired_query(&eligible)
+        .build()
+        .execute(&mut *connection)
+        .await?;
+    Ok(delete_attempt_keys_query(&eligible)
+        .build()
+        .execute(&mut *connection)
+        .await?
+        .rows_affected())
+}
+
+async fn eligible_context_attempts(
+    connection: &mut sqlx::MySqlConnection,
+    keys: &[(String, String)],
+    cutoff: Option<chrono::NaiveDateTime>,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_expired_attempt_keys_query(keys, cutoff)
+        .build_query_as()
+        .fetch_all(connection)
+        .await
 }
 
 fn lock_provider_attempts_for_context_expiry_query<'a>(
@@ -180,37 +215,51 @@ fn mark_provider_attempt_context_expired_query<'a>(
 ///
 /// The event rows are diagnostic observability, not user-visible conversation
 /// history. Complete attempts are pruned as accepted/terminal pairs. If the
-/// scope is over the limit but contains only incomplete attempts, it remains
-/// temporarily over the limit until a terminal fact arrives.
+/// scope has unresolved invocations, their accounting evidence stays pinned
+/// until logical settlement; the diagnostic capacity is deliberately soft.
 pub(crate) async fn compact_model_request_context_scope(
     connection: &mut sqlx::MySqlConnection,
     user_id: &str,
-    scope: ModelRequestContextScope<'_>,
+    session_id: &str,
 ) -> ServiceResult<u64> {
-    let probe_sql = event_beyond_scope_limit_sql(scope);
-    let over_limit = sqlx::query_scalar::<_, String>(&probe_sql)
-        .bind(user_id)
-        .bind(scope.id())
-        .bind(MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "probe model request context scope retention",
-                error,
-            )
-        })?;
+    let over_limit = sqlx::query_scalar::<_, String>(
+        "SELECT event_id FROM model_request_context_events
+         WHERE user_id = ? AND session_id = ? LIMIT 1 OFFSET ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "probe model request context scope retention",
+            error,
+        )
+    })?;
 
     if over_limit.is_none() {
         return Ok(0);
     }
 
-    let completed_attempts_sql = oldest_complete_attempts_in_scope_sql(scope);
-    let attempt_ids = sqlx::query_scalar::<_, String>(&completed_attempts_sql)
-        .bind(user_id)
-        .bind(scope.id())
-        .bind(MODEL_REQUEST_CONTEXT_COMPACTION_ATTEMPT_BATCH_LIMIT)
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT context.attempt_id FROM model_request_context_events context",
+    );
+    push_retention_owner_joins(&mut query, &[user_id]);
+    query
+        .push(" WHERE context.user_id = ")
+        .push_bind(user_id)
+        .push(" AND context.session_id = ")
+        .push_bind(session_id)
+        .push(format!(
+            " AND {RETENTION_SETTLED_PREDICATE}
+          GROUP BY context.attempt_id HAVING COUNT(*) = 2
+          ORDER BY MIN(context.created_at), context.attempt_id LIMIT "
+        ))
+        .push_bind(MODEL_REQUEST_CONTEXT_COMPACTION_ATTEMPT_BATCH_LIMIT);
+    let attempt_ids = query
+        .build_query_scalar::<String>()
         .fetch_all(&mut *connection)
         .await
         .map_err(|error| {
@@ -225,12 +274,14 @@ pub(crate) async fn compact_model_request_context_scope(
         return Ok(0);
     }
 
-    let mut delete = delete_complete_attempts_query(user_id, &attempt_ids);
-    delete
-        .build()
-        .execute(&mut *connection)
+    let keys = attempt_ids
+        .into_iter()
+        .map(|id| (user_id.to_owned(), id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    prune_context_attempts(connection, &keys, None)
         .await
-        .map(|result| result.rows_affected())
         .map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
@@ -240,233 +291,67 @@ pub(crate) async fn compact_model_request_context_scope(
         })
 }
 
-/// Delete diagnostic attempts after their explicit retention window.
-/// Each attempt is removed atomically only after its newest diagnostic fact has
-/// exceeded the retention window, so complete pairs remain intact and stale
-/// incomplete attempts cannot survive forever after a process failure.
-pub(crate) async fn expire_model_request_context_events(
+/// Examine one indexed page of old diagnostics. Whole pairs are reclaimed only
+/// after logical settlement; unresolved or inconsistent evidence stays pinned.
+pub async fn expire_model_request_context_events(
     pool: &SharedPool,
     batch_limit: u32,
-) -> ServiceResult<u64> {
-    let candidate_rows = sqlx::query_as::<_, (String, String)>(EXPIRED_ATTEMPT_CANDIDATES_SQL)
-        .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
-        .bind(batch_limit)
-        .fetch_all(pool.get())
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "select bounded model request context expiry candidates",
-                error,
-            )
-        })?;
-    let attempt_keys = candidate_rows
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if attempt_keys.is_empty() {
-        return Ok(0);
+    cursor: &mut ModelRequestContextExpiryCursor,
+) -> ServiceResult<ModelRequestContextExpiryPage> {
+    if batch_limit == 0 {
+        return Ok(ModelRequestContextExpiryPage::default());
     }
-
-    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "acquire model request context expiry connection",
-                error,
-            )
-        })?;
-    let mut tx = connection.begin().await.map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "begin model request context expiry",
-            error,
-        )
-    })?;
-    let mut lock_attempts = lock_provider_attempts_for_context_expiry_query(&attempt_keys);
-    let locked_attempt_keys = lock_attempts
-        .build()
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "lock bounded model request context expiry attempts",
-                error,
-            )
-        })?
-        .into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<String, _>("user_id")?,
-                row.try_get::<String, _>("attempt_id")?,
-            ))
-        })
-        .collect::<Result<BTreeSet<_>, sqlx::Error>>()
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode locked model request context expiry attempts",
-                error,
-            )
-        })?;
-    let mut validate = validate_expired_attempt_keys_query(&attempt_keys);
-    let expired_attempt_keys = validate
-        .build()
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "validate bounded model request context expiry candidates",
-                error,
-            )
-        })?
-        .into_iter()
-        .map(|row| {
-            let user_id = row.try_get::<String, _>("user_id")?;
-            let attempt_id = row.try_get::<String, _>("attempt_id")?;
-            Ok((user_id, attempt_id))
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode validated model request context expiry candidates",
-                error,
-            )
-        })?;
-    if expired_attempt_keys.is_empty() {
-        tx.commit().await.map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "commit empty model request context expiry",
-                error,
-            )
-        })?;
-        connection.release();
-        return Ok(0);
+    let batch_limit = batch_limit.min(1000);
+    let page = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get()).await?;
+    let cutoff = match cursor.cutoff {
+        Some(cutoff) => cutoff,
+        None => sqlx::query_scalar::<_, chrono::NaiveDateTime>(
+            "SELECT CAST(DATE_SUB(NOW(6), INTERVAL ? DAY) AS DATETIME(6))")
+            .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
+            .fetch_one(connection.connection_mut()).await?,
+    };
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT created_at, event_id, user_id, attempt_id FROM model_request_context_events WHERE created_at < ");
+    query.push_bind(cutoff);
+    if let Some((created_at, event_id, user_id)) = &cursor.after {
+        query.push(" AND (created_at > ").push_bind(*created_at)
+            .push(" OR (created_at = ").push_bind(*created_at)
+            .push(" AND event_id > ").push_bind(event_id)
+            .push(") OR (created_at = ").push_bind(*created_at)
+            .push(" AND event_id = ").push_bind(event_id)
+            .push(" AND user_id > ").push_bind(user_id).push("))");
     }
-    let provider_attempts_to_mark = expired_attempt_keys
-        .iter()
-        .filter(|attempt_key| locked_attempt_keys.contains(*attempt_key))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !provider_attempts_to_mark.is_empty() {
-        let mut mark = mark_provider_attempt_context_expired_query(&provider_attempts_to_mark);
-        mark.build().execute(&mut *tx).await.map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "mark model request context attempts expired",
-                error,
-            )
-        })?;
-    }
-    let mut delete = delete_attempt_keys_query(&expired_attempt_keys);
-    let rows_deleted = delete
-        .build()
-        .execute(&mut *tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "expire model request context attempts",
-                error,
-            )
-        })?;
-    tx.commit().await.map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "commit model request context expiry",
-            error,
-        )
-    })?;
+    query.push(" ORDER BY created_at, event_id, user_id LIMIT ").push_bind(batch_limit);
+    let rows = query.build()
+        .fetch_all(connection.connection_mut())
+        .await?;
+    let after = rows.last().map(|row| Ok::<_,sqlx::Error>((row.try_get("created_at")?, row.try_get("event_id")?, row.try_get("user_id")?)))
+        .transpose()?;
+    let keys = rows.iter().map(|row| Ok((row.try_get::<String,_>("user_id")?, row.try_get::<String,_>("attempt_id")?)))
+        .collect::<Result<BTreeSet<_>, sqlx::Error>>()?.into_iter().collect::<Vec<_>>();
+    let mut tx = connection.begin().await?;
+    // Filter without locks first: pinned executions may hold their attempt
+    // locks for unrelated work. Revalidate again under the eligible locks.
+    let eligible = eligible_context_attempts(&mut tx, &keys, Some(cutoff)).await?;
+    let deleted = prune_context_attempts(&mut tx, &eligible, Some(cutoff)).await?;
+    tx.commit().await?;
     connection.release();
-    Ok(rows_deleted)
-}
-
-#[cfg(test)]
-mod retention_tests {
-    use super::*;
-
-    #[test]
-    fn diagnostic_retention_policy_is_explicit_and_bounded() {
-        assert_eq!(MODEL_REQUEST_CONTEXT_RETENTION_DAYS, 30);
-        assert_eq!(MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE, 2048);
-        assert_eq!(MODEL_REQUEST_CONTEXT_COMPACTION_ATTEMPT_BATCH_LIMIT, 256);
+    Ok::<_, sqlx::Error>((cutoff, after, ModelRequestContextExpiryPage {
+        examined: rows.len() as u64,
+        deleted,
+        more: rows.len() == batch_limit as usize,
+    }))
+    }).await.map_err(|error| ServiceError::with_source(ServiceErrorKind::Persistence, "request diagnostic expiry page timed out", error))?
+        .map_err(|error| ServiceError::with_source(ServiceErrorKind::Persistence, "expire request diagnostic page", error))?;
+    let (cutoff, after, page) = page;
+    if page.more {
+        cursor.cutoff = Some(cutoff);
+        cursor.after = after;
+    } else {
+        *cursor = ModelRequestContextExpiryCursor::default();
     }
-
-    #[test]
-    fn diagnostic_scope_selects_the_owner_specific_index_column() {
-        assert_eq!(
-            ModelRequestContextScope::Session("s-1").column(),
-            "session_id"
-        );
-    }
-
-    #[test]
-    fn scope_compaction_and_expiry_keep_attempts_atomic() {
-        use sqlx::Execute;
-
-        let scope = ModelRequestContextScope::Session("s-1");
-        let probe = event_beyond_scope_limit_sql(scope);
-        let completed_attempts = oldest_complete_attempts_in_scope_sql(scope);
-        let attempts = vec!["attempt-1".to_string()];
-        let mut delete_builder = delete_complete_attempts_query("user-1", &attempts);
-        let delete = delete_builder.build();
-        let expired_attempts = EXPIRED_ATTEMPT_CANDIDATES_SQL;
-        let attempt_keys = vec![("user-1".to_string(), "attempt-1".to_string())];
-        let mut expiry_validation_builder = validate_expired_attempt_keys_query(&attempt_keys);
-        let expiry_validation = expiry_validation_builder.build();
-        let mut expiry_delete_builder = delete_attempt_keys_query(&attempt_keys);
-        let expiry_delete = expiry_delete_builder.build();
-        let mut lock_attempts_builder =
-            lock_provider_attempts_for_context_expiry_query(&attempt_keys);
-        let lock_attempts = lock_attempts_builder.build();
-        let mut mark_expired_builder = mark_provider_attempt_context_expired_query(&attempt_keys);
-        let mark_expired = mark_expired_builder.build();
-
-        assert!(probe.contains("LIMIT 1 OFFSET ?"));
-        assert!(
-            !probe.contains("ORDER BY"),
-            "overflow is an existence probe"
-        );
-        assert!(completed_attempts.contains("GROUP BY attempt_id"));
-        assert!(completed_attempts.contains("HAVING COUNT(*) = 2"));
-        assert!(completed_attempts.contains("ORDER BY MIN(created_at) ASC, attempt_id ASC"));
-        assert!(delete.sql().contains("AND attempt_id IN"));
-        assert!(!delete.sql().contains("event_id IN"));
-        assert!(expired_attempts.contains("GROUP BY user_id, attempt_id"));
-        assert!(expired_attempts.contains("HAVING MAX(created_at) <"));
-        assert!(
-            !expired_attempts.contains("WHERE"),
-            "a pre-group age filter hides fresh partners"
-        );
-        assert!(
-            expired_attempts.contains("ORDER BY MIN(created_at) ASC, user_id ASC, attempt_id ASC")
-        );
-        assert!(
-            expiry_validation
-                .sql()
-                .contains("GROUP BY user_id, attempt_id")
-        );
-        assert!(expiry_validation.sql().contains("HAVING MAX(created_at) <"));
-        assert!(
-            expiry_delete
-                .sql()
-                .contains("user_id = ? AND attempt_id = ?")
-        );
-        assert!(
-            lock_attempts
-                .sql()
-                .contains("FROM inference_provider_attempts")
-        );
-        assert!(lock_attempts.sql().ends_with("FOR UPDATE"));
-        assert!(mark_expired.sql().contains("context_expired_at"));
-    }
+    Ok(page)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

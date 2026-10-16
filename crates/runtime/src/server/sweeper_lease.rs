@@ -286,6 +286,7 @@ pub(crate) fn spawn_runtime_sweepers(
             fork_coordinator,
             std::sync::Arc::clone(&lease),
             cancel.clone(),
+            Duration::from_secs(5 * 60),
         ),
         crate::server::device_lease_sweeper::spawn_device_lease_expiry_sweeper(
             shared_pool.clone(),

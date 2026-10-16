@@ -2611,8 +2611,13 @@ async fn work_branch_read_attachment_is_idempotent_owner_scoped_and_reaped() {
         batch_limit: 16,
         ..Default::default()
     };
-    let reaped =
-        astra_services::runtime_maintenance::maintain_runtime_storage(&pool, None, &policy).await;
+    let reaped = astra_services::runtime_maintenance::maintain_runtime_storage(
+        &pool,
+        None,
+        &policy,
+        &mut Default::default(),
+    )
+    .await;
     assert!(reaped.expired_session_attachments_deleted >= 1);
     let retained: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM session_attachments WHERE owner_user_id = ?")
@@ -3567,6 +3572,7 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
             batch_limit: 16,
             ..Default::default()
         },
+        &mut Default::default(),
     )
     .await;
     assert_eq!(reaped.work_branch_control_operations_expired, 2);
