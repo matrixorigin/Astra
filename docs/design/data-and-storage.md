@@ -148,6 +148,24 @@ Retention is a product contract:
   counter update.
 - Terminal capture batches core conversation events and LLM/tool trace events
   through the same writer, sharing session admission and insertion readback.
+- The existing asynchronous ingestion worker combines eligible session heads
+  into count- and charged-byte-bounded transactions. The aggregate event bound
+  or earliest absolute flush deadline triggers dispatch; owner round-robin and
+  one in-flight head per session preserve fairness and ordering. One transaction
+  uses one shared ingestion permit and connection, retaining foreground pool
+  headroom. It inserts event rows together and applies inserted-only counter,
+  session-end and causal-edge effects through set-based writes. Session admission
+  returns stored row identities; input spelling is not a second equality rule.
+  All facts and effects commit before durable delivery is acknowledged.
+- Cross-session batching couples locks for one bounded database attempt. A
+  failed/uncertain batch retains each session's exact retry head; retries use the
+  same executor one group at a time. An authoritative session rejection rolls
+  back the shared transaction, rejects only that session and retries its peers,
+  including during drain. Database failure is not success, and ambiguous commit
+  replay still requires canonical payload-hash classification. A batch bound of
+  one retains independent-session execution. This writer does not batch the
+  synchronous event API or control-plane admission transactions, and fewer SQL
+  statements do not imply fewer stored rows or unlimited concurrent executions.
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
 - Slot/lease semantics must avoid permanent deadlock through expiry or repair.

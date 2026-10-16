@@ -1470,6 +1470,7 @@ struct IngestionBatchOutcome {
     events_dropped_permanent: usize,
     // Input-position aligned: repeated durable IDs still represent distinct deliveries.
     delivery_outcomes: Option<Vec<IngestionDeliveryTerminal>>,
+    rejected_session: Option<IngestionSessionKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1548,8 +1549,14 @@ struct IngestionAttemptCompletion {
     result: Result<IngestionBatchOutcome, String>,
 }
 
+struct IngestionBatchCompletion {
+    groups: Vec<IngestionAttemptCompletion>,
+    committed: bool,
+    admission_rejected: bool,
+}
+
 type IngestionAttemptFuture =
-    Pin<Box<dyn Future<Output = IngestionAttemptCompletion> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = IngestionBatchCompletion> + Send + 'static>>;
 
 /// Convert ISO 8601 / RFC 3339 timestamp to MySQL DATETIME(6) format.
 ///
@@ -1723,15 +1730,6 @@ fn canonical_token_usage_db_fields_or_null(
         token_output: output,
         token_total: total,
     }
-}
-
-fn add_inserted_rows(total: &mut i64, rows_affected: u64, context: &str) -> Result<(), String> {
-    let inserted =
-        crate::storage::rows_affected_to_i64(rows_affected, context).map_err(|e| e.to_string())?;
-    *total = total
-        .checked_add(inserted)
-        .ok_or_else(|| format!("{context}: inserted row total overflow"))?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2157,10 +2155,13 @@ impl EventIngestionWorker {
         &self,
         sessions: &mut BTreeMap<IngestionSessionKey, IngestionSessionQueue>,
         ready: &mut FairSessionReadyQueue,
-        event: IngestionEvent,
+        mut event: IngestionEvent,
         now: tokio::time::Instant,
         draining: bool,
     ) {
+        event
+            .ingestion_enqueued_at
+            .get_or_insert_with(std::time::Instant::now);
         if let Some(observation) = delivery_observation(&event) {
             observation.mark(IngestionMeasurementPhase::WorkerReceived);
         }
@@ -2206,6 +2207,22 @@ impl EventIngestionWorker {
         for key in promoted {
             ready.push(key);
         }
+        // A due head or an aggregate full batch may borrow other eligible
+        // heads. Sparse sessions need not each reach their own count/deadline.
+        let eligible_events = sessions
+            .values()
+            .filter(|queue| {
+                !queue.in_flight && queue.retry_deadline.is_none() && queue.retry_head.is_none()
+            })
+            .map(|queue| queue.pending.len())
+            .sum::<usize>();
+        if !ready.is_empty() || eligible_events >= self.config.batch_size {
+            for (key, queue) in sessions.iter() {
+                if !queue.in_flight && queue.retry_deadline.is_none() && !queue.pending.is_empty() {
+                    ready.push(key.clone());
+                }
+            }
+        }
     }
 
     fn dispatch_ready_sessions(
@@ -2216,32 +2233,64 @@ impl EventIngestionWorker {
     ) {
         let concurrency = self.session_flush_concurrency();
         while in_flight.len() < concurrency {
-            let Some(key) = ready.pop() else { break };
-            let Some(queue) = sessions.get_mut(&key) else {
-                continue;
-            };
-            if queue.in_flight || queue.retry_deadline.is_some() {
-                continue;
-            }
-            let events = if let Some(retry_head) = queue.retry_head.take() {
-                retry_head
-            } else {
-                let take = queue.pending.len().min(self.config.batch_size);
-                let events = queue.pending.drain(..take).collect::<Vec<_>>();
-                if queue.pending.is_empty() {
-                    queue.flush_deadline = None;
+            let mut groups = Vec::new();
+            let mut events = Vec::new();
+            let mut batch_bytes = 0_u64;
+            let byte_limit = self
+                .config
+                .max_event_bytes
+                .min(self.config.max_resident_bytes);
+            while events.len() < self.config.batch_size {
+                let Some(key) = ready.pop() else { break };
+                let Some(queue) = sessions.get_mut(&key) else {
+                    continue;
+                };
+                if queue.in_flight || queue.retry_deadline.is_some() {
+                    continue;
                 }
-                events
-            };
-            if events.is_empty() {
-                continue;
+                if queue.retry_head.is_some() && !groups.is_empty() {
+                    ready.push(key);
+                    break;
+                }
+                let retry = queue.retry_head.is_some();
+                let start = events.len();
+                if let Some(head) = queue.retry_head.take() {
+                    events.extend(head);
+                } else {
+                    while events.len() < self.config.batch_size {
+                        let Some(next) = queue.pending.front() else {
+                            break;
+                        };
+                        // Production events already carry their charged size.
+                        let bytes = delivery_lease(next)
+                            .map_or(self.config.max_event_bytes, |lease| lease.bytes);
+                        if !events.is_empty() && batch_bytes.saturating_add(bytes) > byte_limit {
+                            break;
+                        }
+                        batch_bytes = batch_bytes.saturating_add(bytes);
+                        events.push(queue.pending.pop_front().expect("peeked event"));
+                    }
+                    if queue.pending.is_empty() {
+                        queue.flush_deadline = None;
+                    }
+                }
+                if start == events.len() {
+                    ready.push(key);
+                    break;
+                }
+                queue.in_flight = true;
+                groups.push((key, events.len() - start));
+                if retry {
+                    break;
+                }
             }
-            queue.in_flight = true;
+            if events.is_empty() {
+                break;
+            }
             let pool = self.pool.clone();
             let db_limiter = self.db_limiter.clone();
             let stats = Arc::clone(&self.stats);
             let db_attempt_timeout_secs = self.config.db_attempt_timeout_secs;
-            let attempt_key = key.clone();
             in_flight.push(Box::pin(async move {
                 for observation in events.iter().filter_map(delivery_observation) {
                     observation.mark(IngestionMeasurementPhase::Dispatched);
@@ -2254,7 +2303,7 @@ impl EventIngestionWorker {
                 let result = match permit {
                     Ok(_permit) => {
                         let _attempt = IngestionDbAttemptGuard::begin(stats);
-                        EventIngestionWorker::insert_session_group_on_pool(
+                        EventIngestionWorker::insert_batch_on_pool(
                             &pool,
                             &events,
                             db_attempt_timeout_secs,
@@ -2263,11 +2312,31 @@ impl EventIngestionWorker {
                     }
                     Err(error) => Err(error),
                 };
-                IngestionAttemptCompletion {
-                    key: attempt_key,
-                    events,
-                    result,
-                }
+                let committed = result.as_ref().is_ok_and(|outcome| outcome.rejected_session.is_none());
+                let admission_rejected = result.as_ref().is_ok_and(|outcome| outcome.rejected_session.is_some());
+                let mut deliveries = events.into_iter();
+                let mut offset = 0;
+                let groups = groups.into_iter().map(|(key, count)| {
+                    let events = deliveries.by_ref().take(count).collect::<Vec<_>>();
+                    let group_result = match &result {
+                        Ok(outcome) if outcome.rejected_session.as_ref().is_some_and(|rejected| rejected != &key) => {
+                            Err("shared ingestion attempt rolled back after another session's admission rejection".into())
+                        }
+                        Ok(outcome) => {
+                            let terminals = outcome.delivery_outcomes.as_ref().map(|values| values[offset..offset + count].to_vec());
+                            Ok(IngestionBatchOutcome {
+                                events_resolved: count,
+                                events_dropped_permanent: terminals.as_ref().map_or(0, |values| values.iter().filter(|value| matches!(value, IngestionDeliveryTerminal::Rejected(_))).count()),
+                                delivery_outcomes: terminals,
+                                rejected_session: None,
+                            })
+                        }
+                        Err(error) => Err(error.clone()),
+                    };
+                    offset += count;
+                    IngestionAttemptCompletion { key, events, result: group_result }
+                }).collect();
+                IngestionBatchCompletion { groups, committed, admission_rejected }
             }));
         }
     }
@@ -2423,6 +2492,27 @@ impl EventIngestionWorker {
 
         loop {
             let now = tokio::time::Instant::now();
+            // Observe already accepted work before choosing batch heads. This
+            // bounded drain avoids dispatching a partial sparse head while its
+            // dense tail is already in the channel, and avoids rescanning all
+            // session queues once for every buffered event.
+            for _ in 0..self.config.channel_capacity {
+                match self.rx.try_recv() {
+                    Ok(event) => self.enqueue_scheduled_event(
+                        &mut sessions,
+                        &mut ready,
+                        event,
+                        now,
+                        draining,
+                    ),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        channel_drained = true;
+                        draining = true;
+                        break;
+                    }
+                }
+            }
             self.promote_due_sessions(&mut sessions, &mut ready, now, draining);
             self.dispatch_ready_sessions(&mut sessions, &mut ready, &mut in_flight);
 
@@ -2452,25 +2542,21 @@ impl EventIngestionWorker {
                     self.rx.close();
                 }
                 Some(completion) = in_flight.next(), if !in_flight.is_empty() => {
-                    self.complete_scheduled_attempt(
-                        &mut sessions,
-                        &mut ready,
-                        completion,
-                        tokio::time::Instant::now(),
-                        draining,
-                    );
+                    if completion.committed && let Ok(mut stats) = self.stats.lock() {
+                        stats.flush_count = stats.flush_count.saturating_add(1);
+                    }
+                    let now = tokio::time::Instant::now();
+                    for group in completion.groups {
+                        // A known rollback rejected only one group. Unaffected
+                        // heads still need an isolated attempt, even in drain.
+                        self.complete_scheduled_attempt(&mut sessions, &mut ready, group, now, draining && !completion.admission_rejected);
+                    }
                 }
                 _ = &mut deadline => {}
                 _ = self.scheduler_notify.notified() => {}
                 event = self.rx.recv(), if !channel_drained => {
                     match event {
-                        Some(mut event) => {
-                            // Sender paths normally stamp this before channel admission. Keep
-                            // the scheduler's historical fallback for direct test/internal
-                            // producers while retaining one timestamp on the event for retries.
-                            event
-                                .ingestion_enqueued_at
-                                .get_or_insert_with(std::time::Instant::now);
+                        Some(event) => {
                             self.enqueue_scheduled_event(
                                 &mut sessions,
                                 &mut ready,
@@ -2498,7 +2584,6 @@ impl EventIngestionWorker {
         if let Ok(mut stats) = self.stats.lock() {
             if events_resolved > 0 {
                 stats.events_flushed = stats.events_flushed.saturating_add(events_resolved as u64);
-                stats.flush_count = stats.flush_count.saturating_add(1);
             }
             if events_dropped_permanent > 0 {
                 stats.events_dropped_permanent = stats
@@ -2516,7 +2601,7 @@ impl EventIngestionWorker {
         }
     }
 
-    async fn insert_session_group_on_pool(
+    async fn insert_batch_on_pool(
         pool: &sqlx::Pool<sqlx::MySql>,
         events: &[IngestionEvent],
         db_attempt_timeout_secs: u64,
@@ -2530,7 +2615,7 @@ impl EventIngestionWorker {
             ObservedAttemptTimer::start(events, ObservedAttemptPhase::Transaction);
         let result = tokio::time::timeout_at(
             deadline.at,
-            Self::insert_session_group_on_connection(connection.connection_mut(), events),
+            Self::insert_batch_on_connection(connection.connection_mut(), events),
         )
         .await;
         drop(transaction_timer);
@@ -2539,65 +2624,62 @@ impl EventIngestionWorker {
         Ok(outcome)
     }
 
-    async fn insert_session_group_on_connection(
+    async fn insert_batch_on_connection(
         connection: &mut sqlx::MySqlConnection,
         events: &[IngestionEvent],
     ) -> Result<IngestionBatchOutcome, String> {
-        let first = events
-            .first()
-            .ok_or_else(|| "event_ingestion.session_group: empty event group".to_string())?;
-        let user_id = first.user_id.as_str();
-        let session_id = first.session_id.as_str();
-        if events
-            .iter()
-            .any(|event| event.user_id != user_id || event.session_id != session_id)
-        {
-            return Err("event_ingestion.session_group: mixed owner/session identity".to_string());
+        if events.is_empty() {
+            return Err("event_ingestion.batch: empty event batch".into());
         }
-
         let mut tx = connection
             .begin()
             .await
-            .map_err(|e| format!("begin tx for {user_id}/{session_id}: {e}"))?;
+            .map_err(|e| format!("begin ingestion tx: {e}"))?;
         let session_event_count = events.len();
-        if let Err(error) =
-            crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true).await
-        {
-            if !matches!(error, sqlx::Error::RowNotFound) {
-                return Err(format!(
-                    "session admission check for {user_id}/{session_id}: {error}"
-                ));
-            }
-            tracing::warn!(
-                target: "astra_services::event_ingestion",
-                user_id = %user_id,
-                session_id = %session_id,
-                event_count = session_event_count,
-                "dropping ingestion events rejected by durable session admission"
-            );
-            tx.rollback()
-                .await
-                .map_err(|error| format!("rollback durable admission rejection: {error}"))?;
-            for lease in events.iter().filter_map(delivery_lease) {
-                // The retry has a terminal admission result. Measurement may
-                // retain prior commit uncertainty, but this is not abandonment.
-                lease.finish(false);
-            }
-            return Ok(IngestionBatchOutcome {
-                events_resolved: session_event_count,
-                events_dropped_permanent: session_event_count,
-                delivery_outcomes: events
-                    .iter()
-                    .any(|event| delivery_observation(event).is_some())
-                    .then(|| {
-                        vec![
+        let mut admitted = events
+            .iter()
+            .map(|event| {
+                (
+                    IngestionSessionKey::from_event(event),
+                    (String::new(), String::new()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (key, stored_identity) in &mut admitted {
+            match crate::storage::admit_session_event_write_with_facts(
+                &mut tx,
+                &key.session_id,
+                &key.user_id,
+                true,
+            )
+            .await
+            {
+                Ok(facts) => *stored_identity = (facts.user_id, facts.session_id),
+                Err(sqlx::Error::RowNotFound) => {
+                    tx.rollback().await.map_err(|error| {
+                        format!("rollback durable admission rejection: {error}")
+                    })?;
+                    for event in events.iter().filter(|event| {
+                        event.user_id == key.user_id && event.session_id == key.session_id
+                    }) {
+                        if let Some(lease) = delivery_lease(event) {
+                            lease.finish(false);
+                        }
+                    }
+                    return Ok(IngestionBatchOutcome {
+                        events_resolved: 0,
+                        events_dropped_permanent: 0,
+                        delivery_outcomes: Some(vec![
                             IngestionDeliveryTerminal::Rejected(
                                 IngestionRejectionReason::SessionAdmission
                             );
-                            session_event_count
-                        ]
-                    }),
-            });
+                            events.len()
+                        ]),
+                        rejected_session: Some(key.clone()),
+                    });
+                }
+                Err(error) => return Err(format!("session admission check: {error}")),
+            }
         }
 
         let ingestion_write_id = uuid::Uuid::new_v4().to_string();
@@ -2605,50 +2687,18 @@ impl EventIngestionWorker {
             .iter()
             .map(IngestionEventInsertValues::from_event)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut plain_events = Vec::new();
-        let mut plain_session_end_events = Vec::new();
-        let mut parented_events = Vec::new();
-        for values in &event_rows {
-            let event = values.event;
-            if ingestion_event_has_parent_edges(event) {
-                parented_events.push(values);
-            } else if event.event_type == SESSION_END_EVENT_TYPE {
-                plain_session_end_events.push(values);
-            } else {
-                plain_events.push(values);
-            }
-        }
-
-        let mut reported_rows_inserted = 0_i64;
-        if !plain_events.is_empty() {
-            let inserted_rows = insert_ingestion_rows(
+        let rows = event_rows.iter().collect::<Vec<_>>();
+        let reported_rows_inserted = crate::storage::rows_affected_to_i64(
+            insert_ingestion_rows(
                 &mut tx,
-                &plain_events,
+                &rows,
                 &ingestion_write_id,
-                &format!("batch insert ({user_id}/{session_id})"),
+                "ingestion batch insert",
             )
-            .await?;
-            add_inserted_rows(
-                &mut reported_rows_inserted,
-                inserted_rows,
-                "event_ingestion.batch_insert",
-            )?;
-        }
-
-        for values in plain_session_end_events.into_iter().chain(parented_events) {
-            let inserted_rows = insert_ingestion_rows(
-                &mut tx,
-                std::slice::from_ref(&values),
-                &ingestion_write_id,
-                &format!("event insert ({user_id}/{session_id})"),
-            )
-            .await?;
-            add_inserted_rows(
-                &mut reported_rows_inserted,
-                inserted_rows,
-                "event_ingestion.single_insert",
-            )?;
-        }
+            .await?,
+            "event_ingestion.batch_insert",
+        )
+        .map_err(|error| error.to_string())?;
 
         let capture_attempts = event_rows
             .iter()
@@ -2657,7 +2707,7 @@ impl EventIngestionWorker {
                 payload_hash: values.payload_hash.clone(),
             })
             .collect::<Vec<_>>();
-        let capture_outcomes =
+        let mut capture_outcomes =
             if all_capture_rows_were_inserted(reported_rows_inserted, &capture_attempts) {
                 // INSERT IGNORE reports one affected row per newly inserted row.
                 // When every distinct, untruncated identity was inserted, there is
@@ -2665,36 +2715,54 @@ impl EventIngestionWorker {
                 // an actually committed attempt take the owner-scoped readback path.
                 vec![DurableCaptureOutcome::Inserted; capture_attempts.len()]
             } else {
-                let capture_readbacks =
-                    read_back_ingestion_captures(&mut tx, user_id, &capture_attempts).await?;
-                classify_ingestion_capture_attempts(
-                    &capture_attempts,
-                    &capture_readbacks,
-                    &ingestion_write_id,
-                )?
+                let mut owners = BTreeMap::<&str, Vec<usize>>::new();
+                for (index, event) in events.iter().enumerate() {
+                    owners.entry(&event.user_id).or_default().push(index);
+                }
+                let mut outcomes = vec![DurableCaptureOutcome::Replayed; events.len()];
+                for (user_id, indices) in owners {
+                    let attempts = indices
+                        .iter()
+                        .map(|&index| capture_attempts[index].clone())
+                        .collect::<Vec<_>>();
+                    let readbacks =
+                        read_back_ingestion_captures(&mut tx, user_id, &attempts).await?;
+                    let classified = classify_ingestion_capture_attempts(
+                        &attempts,
+                        &readbacks,
+                        &ingestion_write_id,
+                    )?;
+                    for (index, outcome) in indices.into_iter().zip(classified) {
+                        outcomes[index] = outcome;
+                    }
+                }
+                outcomes
             };
 
-        let delivery_outcomes = events
-            .iter()
-            .any(|event| delivery_observation(event).is_some())
-            .then(|| {
-                capture_outcomes
-                    .iter()
-                    .map(|outcome| match outcome {
-                        DurableCaptureOutcome::Inserted => {
-                            IngestionDeliveryTerminal::CommittedInserted
-                        }
-                        DurableCaptureOutcome::Replayed => {
-                            IngestionDeliveryTerminal::CommittedReplayed
-                        }
-                        DurableCaptureOutcome::Collision { .. } => {
-                            IngestionDeliveryTerminal::Rejected(
-                                IngestionRejectionReason::IdentityCollision,
-                            )
-                        }
-                    })
-                    .collect()
-            });
+        // SQL admission returns stored row identities, including alias spelling.
+        // Effects are applied once across the entire transaction, not per group.
+        let mut inserted_ids = HashSet::new();
+        for (event, outcome) in events.iter().zip(&mut capture_outcomes) {
+            let stored = &admitted[&IngestionSessionKey::from_event(event)];
+            if *outcome == DurableCaptureOutcome::Inserted
+                && !inserted_ids.insert((&stored.0, &event.event_id))
+            {
+                *outcome = DurableCaptureOutcome::Replayed;
+            }
+        }
+
+        let delivery_outcomes = Some({
+            capture_outcomes
+                .iter()
+                .map(|outcome| match outcome {
+                    DurableCaptureOutcome::Inserted => IngestionDeliveryTerminal::CommittedInserted,
+                    DurableCaptureOutcome::Replayed => IngestionDeliveryTerminal::CommittedReplayed,
+                    DurableCaptureOutcome::Collision { .. } => IngestionDeliveryTerminal::Rejected(
+                        IngestionRejectionReason::IdentityCollision,
+                    ),
+                })
+                .collect()
+        });
         let mut inserted_events = Vec::new();
         let mut replayed_events = 0_usize;
         let mut collision_events = 0_usize;
@@ -2711,18 +2779,18 @@ impl EventIngestionWorker {
                 } => {
                     collision_events = collision_events.saturating_add(1);
                     collision_receipts.push(ObservationCollisionReceipt {
-                        user_id,
+                        user_id: &values.event.user_id,
                         domain: ObservationPayloadDomain::AgentEvent,
                         identity_id: &values.event.event_id,
-                        session_id,
+                        session_id: &values.event.session_id,
                         stored_payload_hash,
                         attempted_payload_hash,
                         source: AGENT_EVENT_COLLISION_SOURCE,
                     });
                     tracing::warn!(
                         target: "astra_services::event_ingestion",
-                        user_id = %user_id,
-                        session_id = %session_id,
+                        user_id = %values.event.user_id,
+                        session_id = %values.event.session_id,
                         event_id = %values.event.event_id,
                         stored_payload_hash = %stored_payload_hash,
                         attempted_payload_hash = %attempted_payload_hash,
@@ -2734,9 +2802,7 @@ impl EventIngestionWorker {
 
         record_observation_collisions(&mut tx, &collision_receipts)
             .await
-            .map_err(|error| {
-                format!("record event identity collisions for {user_id}/{session_id}: {error}")
-            })?;
+            .map_err(|error| format!("record event identity collisions: {error}"))?;
 
         let inserted_event_count = u64::try_from(inserted_events.len())
             .map_err(|_| "event_ingestion.inserted_events: len exceeds u64::MAX".to_string())?;
@@ -2745,23 +2811,9 @@ impl EventIngestionWorker {
             "event_ingestion.inserted_events",
         )
         .map_err(|error| error.to_string())?;
-        if inserted_event_count > 0 {
-            crate::storage::bump_agent_session_event_count(
-                &mut *tx,
-                session_id,
-                user_id,
-                inserted_event_count,
-                None,
-            )
-            .await
-            .map_err(|e| format!("event_count delta for {session_id}: {e}"))?;
-        }
-
         if reported_rows_inserted != inserted_event_count {
             tracing::debug!(
                 target: "astra_services::event_ingestion",
-                user_id = %user_id,
-                session_id = %session_id,
                 reported_rows_inserted,
                 classified_rows_inserted = inserted_event_count,
                 "database row count differed from hash-fenced insertion readback"
@@ -2776,39 +2828,29 @@ impl EventIngestionWorker {
             );
         }
 
-        let mut inserted_session_end_sessions =
-            std::collections::BTreeSet::<(String, String)>::new();
+        let mut deltas = BTreeMap::<(String, String), (i64, bool)>::new();
+        let mut edges = Vec::new();
         for event in &inserted_events {
-            if event.event_type == SESSION_END_EVENT_TYPE {
-                inserted_session_end_sessions
-                    .insert((event.user_id.clone(), event.session_id.clone()));
-            }
+            let stored = &admitted[&IngestionSessionKey::from_event(event)];
+            let delta = deltas.entry(stored.clone()).or_default();
+            delta.0 += 1;
+            delta.1 |= event.event_type == SESSION_END_EVENT_TYPE;
             if ingestion_event_has_parent_edges(event) {
-                crate::storage::insert_agent_event_edges(
-                    &mut *tx,
-                    &event.user_id,
-                    &event.session_id,
-                    &event.event_id,
-                    event.parent_event_id.as_deref(),
-                    &event.parent_event_ids,
-                )
-                .await
-                .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+                edges.push(crate::storage::AgentEventEdgeInsert {
+                    user_id: &event.user_id,
+                    session_id: &event.session_id,
+                    child_event_id: &event.event_id,
+                    primary_parent_event_id: event.parent_event_id.as_deref(),
+                    parent_event_ids: &event.parent_event_ids,
+                });
             }
         }
-
-        for (user_id, session_id) in inserted_session_end_sessions {
-            sqlx::query(
-                "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
-                 WHERE session_id = ? AND user_id = ? \
-                   AND status NOT IN ('ended', 'deleting')",
-            )
-            .bind(&session_id)
-            .bind(&user_id)
-            .execute(&mut *tx)
+        crate::storage::insert_agent_event_edges_batch(&mut *tx, &edges)
             .await
-            .map_err(|e| format!("session close for {session_id}: {e}"))?;
-        }
+            .map_err(|error| format!("ingestion edge insert: {error}"))?;
+        crate::storage::apply_ingestion_session_effects(&mut tx, &deltas)
+            .await
+            .map_err(|error| format!("ingestion session effects: {error}"))?;
 
         for observation in events.iter().filter_map(delivery_observation) {
             observation.commit_started();
@@ -2827,6 +2869,7 @@ impl EventIngestionWorker {
             events_resolved: session_event_count,
             events_dropped_permanent: collision_events,
             delivery_outcomes,
+            rejected_session: None,
         })
     }
 }
@@ -3502,37 +3545,6 @@ mod tests {
         for (input, expect) in cases {
             assert_eq!(iso8601_to_mysql_datetime(input), expect);
         }
-    }
-
-    #[test]
-    fn add_inserted_rows_accumulates_without_saturating() {
-        let mut total = 40;
-        add_inserted_rows(&mut total, 2, "event_ingestion.test").unwrap();
-        assert_eq!(total, 42);
-    }
-
-    #[test]
-    fn add_inserted_rows_fails_loudly_on_conversion_overflow() {
-        let mut total = 0;
-        let err = add_inserted_rows(&mut total, i64::MAX as u64 + 1, "event_ingestion.test")
-            .expect_err("rows_affected overflow must fail");
-        assert!(
-            err.contains("event_ingestion.test") && err.contains("exceeds i64::MAX"),
-            "error should identify conversion overflow: {err}"
-        );
-        assert_eq!(total, 0, "failed conversion must not mutate total");
-    }
-
-    #[test]
-    fn add_inserted_rows_fails_loudly_on_total_overflow() {
-        let mut total = i64::MAX;
-        let err = add_inserted_rows(&mut total, 1, "event_ingestion.test")
-            .expect_err("total overflow must fail");
-        assert!(
-            err.contains("event_ingestion.test") && err.contains("total overflow"),
-            "error should identify total overflow: {err}"
-        );
-        assert_eq!(total, i64::MAX, "failed add must not mutate total");
     }
 
     #[test]

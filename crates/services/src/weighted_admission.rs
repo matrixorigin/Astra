@@ -168,8 +168,10 @@ pub struct DatabaseWeightedAdmissionController {
     pool: SharedPool,
     limits: WeightedAdmissionLimits,
     /// Queue before checking out SQL connections. Unrelated owner partitions
-    /// proceed independently; cold credit transfers acquire these in order.
+    /// proceed independently without holding a checkout while queued.
     reservation_gates: Arc<[Arc<Semaphore>; DISTRIBUTED_ADMISSION_PARTITIONS]>,
+    /// Coalesce refills before probing, without holding owner gates or SQL.
+    refill_gate: Arc<Semaphore>,
     /// One deadline covers both the in-process gate queue and the subsequent
     /// pool acquire. A request that cannot reach the durable gate in this
     /// budget fails explicitly instead of occupying an unbounded waiter.
@@ -190,6 +192,7 @@ impl DatabaseWeightedAdmissionController {
             pool,
             limits,
             reservation_gates: Arc::new(std::array::from_fn(|_| Arc::new(Semaphore::new(1)))),
+            refill_gate: Arc::new(Semaphore::new(1)),
             admission_wait_timeout,
         })
     }
@@ -263,30 +266,46 @@ impl DatabaseWeightedAdmissionController {
         let idempotency_hash = distributed_idempotency_hash(idempotency_key);
         let partition = distributed_admission_partition(&key.owner_user_id);
         let requested_hash = admission_capacity_hash(self.limits);
-        let mut refill_partitions: Option<Vec<usize>> = None;
-        let mut local_permits = Vec::new();
-        // End each SQL transaction before broadening. Retain localALL only
-        // across a configuration point recheck; partial plans are released.
-        for (exclusive_local, force_all) in [(false, false), (true, false), (true, true)] {
-            let local_partitions: Vec<_> =
-                if force_all || exclusive_local && refill_partitions.is_none() {
-                    (0..DISTRIBUTED_ADMISSION_PARTITIONS).collect()
-                } else if exclusive_local {
-                    refill_partitions.as_ref().expect("planned refill").clone()
-                } else {
-                    vec![partition]
-                };
-            if local_permits.len() != local_partitions.len() {
-                local_permits.clear();
-                for &index in &local_partitions {
-                    local_permits.push(self.acquire_reservation_gate(index, deadline).await?);
-                }
+        let initial = {
+            let _owner = self
+                .acquire_reservation_gate(&self.reservation_gates[partition], deadline)
+                .await?;
+            self.attempt_reservation(
+                key,
+                work,
+                ttl,
+                &idempotency_hash,
+                &requested_hash,
+                &[partition],
+                deadline,
+            )
+            .await?
+        };
+        let needs_credit = match initial {
+            ReservationAttempt::Granted(reservation) => {
+                return Ok(DistributedAdmissionPermit::new(self.clone(), reservation));
             }
-            let partitions = if force_all || exclusive_local && refill_partitions.is_some() {
-                local_partitions
-            } else {
-                vec![partition]
-            };
+            ReservationAttempt::ConfigurationNeeded => false,
+            ReservationAttempt::CreditNeeded => true,
+        };
+        let _refill = self
+            .acquire_reservation_gate(&self.refill_gate, deadline)
+            .await?;
+        let plan = if needs_credit {
+            match self
+                .probe_partition_capacity(key, work, &idempotency_hash, &requested_hash, deadline)
+                .await?
+            {
+                CapacityProbe::Exhausted => {
+                    return Err(WeightedAdmissionError::GlobalExhausted.into());
+                }
+                CapacityProbe::Donors(partitions) => partitions,
+                CapacityProbe::Uncertain => vec![partition],
+            }
+        } else {
+            vec![partition]
+        };
+        for partitions in [plan, (0..DISTRIBUTED_ADMISSION_PARTITIONS).collect()] {
             match self
                 .attempt_reservation(
                     key,
@@ -302,29 +321,7 @@ impl DatabaseWeightedAdmissionController {
                 ReservationAttempt::Granted(reservation) => {
                     return Ok(DistributedAdmissionPermit::new(self.clone(), reservation));
                 }
-                ReservationAttempt::ConfigurationNeeded => refill_partitions = None,
-                ReservationAttempt::CreditNeeded if !exclusive_local => {
-                    local_permits.clear();
-                    match self
-                        .probe_partition_capacity(
-                            key,
-                            work,
-                            &idempotency_hash,
-                            &requested_hash,
-                            deadline,
-                        )
-                        .await?
-                    {
-                        CapacityProbe::Exhausted => {
-                            return Err(WeightedAdmissionError::GlobalExhausted.into());
-                        }
-                        CapacityProbe::Donors(partitions) => refill_partitions = Some(partitions),
-                        CapacityProbe::Uncertain => {}
-                    }
-                }
-                ReservationAttempt::CreditNeeded => {
-                    tracing::debug!(target: "astra_services::weighted_admission", partition, "stale donor plan requires full capacity authority");
-                }
+                ReservationAttempt::ConfigurationNeeded | ReservationAttempt::CreditNeeded => {}
             }
         }
         unreachable!("full-inventory admission returns a terminal decision")
@@ -569,7 +566,9 @@ impl DatabaseWeightedAdmissionController {
         deadline: std::time::Instant,
     ) -> Result<DistributedAdmissionReservation, DistributedAdmissionError> {
         let partition = distributed_admission_partition(&reservation.key.owner_user_id);
-        let _reservation_gate = self.acquire_reservation_gate(partition, deadline).await?;
+        let _reservation_gate = self
+            .acquire_reservation_gate(&self.reservation_gates[partition], deadline)
+            .await?;
         let mut tx = self.begin_transaction(deadline, "begin_renewal").await?;
         let gate = self
             .lock_admission_gate(&mut tx, partition, deadline)
@@ -642,7 +641,9 @@ impl DatabaseWeightedAdmissionController {
         deadline: std::time::Instant,
     ) -> Result<(), DistributedAdmissionError> {
         let partition = distributed_admission_partition(&reservation.key.owner_user_id);
-        let _reservation_gate = self.acquire_reservation_gate(partition, deadline).await?;
+        let _reservation_gate = self
+            .acquire_reservation_gate(&self.reservation_gates[partition], deadline)
+            .await?;
         let mut tx = self.begin_transaction(deadline, "begin_release").await?;
         let gate = self
             .lock_admission_gate(&mut tx, partition, deadline)
@@ -689,19 +690,16 @@ impl DatabaseWeightedAdmissionController {
 
     async fn acquire_reservation_gate(
         &self,
-        partition: usize,
+        gate: &Arc<Semaphore>,
         deadline: std::time::Instant,
     ) -> Result<OwnedSemaphorePermit, DistributedAdmissionError> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        tokio::time::timeout(
-            remaining,
-            self.reservation_gates[partition].clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| self.admission_timeout())?
-        .map_err(|_| {
-            DistributedAdmissionError::Invalid("distributed admission gate was closed".into())
-        })
+        tokio::time::timeout(remaining, gate.clone().acquire_owned())
+            .await
+            .map_err(|_| self.admission_timeout())?
+            .map_err(|_| {
+                DistributedAdmissionError::Invalid("distributed admission gate was closed".into())
+            })
     }
 
     async fn begin_transaction(
@@ -2075,6 +2073,158 @@ mod tests {
             "admission fixture must have no retained reservations"
         );
         pool
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    #[serial_test::file_serial(admission_scope)]
+    async fn refill_probe_observes_post_queue_credit_and_recovers_after_timeout() {
+        let pool = admission_test_pool().await;
+        let mut settings = pool.settings().clone();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 0;
+        let one_pool = SharedPool::new(&settings).await.unwrap();
+        let unit = AdmissionWork {
+            provider_slots: 1,
+            ..AdmissionWork::default()
+        };
+        let global = AdmissionWork {
+            provider_slots: 16,
+            ..unit
+        };
+        let limits = WeightedAdmissionLimits {
+            global,
+            per_owner: global,
+        };
+        let controller =
+            DatabaseWeightedAdmissionController::new(one_pool.clone(), limits).unwrap();
+        let key_for = |partition| {
+            let owner = (0..10000)
+                .map(|n| format!("coalesced-owner-{n}"))
+                .find(|owner| distributed_admission_partition(owner) == partition)
+                .unwrap();
+            SessionKeyV1::owner_session("server", &owner, "coalesced-preflight", "main")
+        };
+        let key = key_for(15);
+        controller
+            .try_reserve(&key, unit, Duration::from_secs(30), "warm")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(one_pool.get())
+            .await
+            .unwrap();
+        let refill = controller
+            .refill_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut holder = CancellationSafeTransaction::begin(pool.get())
+            .await
+            .unwrap();
+        lock_distributed_admission_gate(&mut holder, 15)
+            .await
+            .unwrap();
+        let pending = tokio::spawn({
+            let controller = controller.clone();
+            let key = key.clone();
+            async move {
+                controller
+                    .try_reserve(
+                        &key,
+                        AdmissionWork {
+                            provider_slots: 2,
+                            ..unit
+                        },
+                        Duration::from_secs(30),
+                        "queued",
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info LIKE '%canonical_turn_v2_15%' AND info NOT LIKE '%information_schema.processlist%'")
+                .bind(&settings.database).bind(connection).fetch_one(pool.get()).await.unwrap();
+            if waiting == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("public initial attempt must own its local queue before donor changes");
+        holder.rollback().await.unwrap();
+        let owner = tokio::time::timeout(
+            Duration::from_secs(3),
+            controller.reservation_gates[15].clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(owner);
+        assert!(!pending.is_finished());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(one_pool.get()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let other = DatabaseWeightedAdmissionController::new(pool.clone(), limits).unwrap();
+        let donor = other
+            .try_reserve(&key_for(0), unit, Duration::from_secs(30), "occupy-donor")
+            .await
+            .unwrap();
+        let mut donor_lock = CancellationSafeTransaction::begin(pool.get())
+            .await
+            .unwrap();
+        lock_distributed_admission_gate(&mut donor_lock, 0)
+            .await
+            .unwrap();
+        drop(refill);
+        let granted = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("post-queue snapshot must skip the now-occupied/locked donor")
+            .unwrap();
+        granted.release().await.unwrap();
+        donor_lock.rollback().await.unwrap();
+        donor.release().await.unwrap();
+        let refill = controller
+            .refill_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut short = controller.clone();
+        short.with_admission_wait_timeout(Duration::from_millis(50));
+        assert!(matches!(
+            short
+                .try_reserve(&key, global, Duration::from_secs(30), "queue-timeout")
+                .await,
+            Err(DistributedAdmissionError::AdmissionTimeout { .. })
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(one_pool.get()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(refill);
+        controller
+            .try_reserve(&key, global, Duration::from_secs(30), "queue-timeout")
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let state: (String, String) = sqlx::query_as("SELECT CAST(SUM(allocated_provider_slots) AS CHAR), CAST(SUM(used_provider_slots) AS CHAR) FROM session_weighted_admission_gates")
+        .fetch_one(pool.get()).await.unwrap();
+        assert_eq!(state, ("16".into(), "0".into()));
+        one_pool.close().await;
+        pool.close().await;
     }
 
     #[test]

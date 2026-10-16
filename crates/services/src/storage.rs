@@ -993,6 +993,8 @@ where
 /// admission transaction is what makes the snapshot safe to reuse.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionWriteAdmissionFacts {
+    pub(crate) user_id: String,
+    pub(crate) session_id: String,
     session_status: String,
 }
 
@@ -1076,19 +1078,21 @@ where
         }
         Err(error) => return Err(error),
     }
-    let status: Option<String> = query_scalar(
-        "SELECT status FROM agent_sessions
+    let stored: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id, status FROM agent_sessions
          WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(status) = status {
+    if let Some((user_id, session_id, status)) = stored {
         if status == "deleting" {
             return Err(sqlx::Error::RowNotFound);
         }
         return Ok(SessionWriteAdmissionFacts {
+            user_id,
+            session_id,
             session_status: status,
         });
     }
@@ -1099,8 +1103,8 @@ where
         Ok(()) | Err(sqlx::Error::RowNotFound) => {}
         Err(error) => return Err(error),
     }
-    let created: Option<String> = query_scalar(
-        "SELECT status FROM agent_sessions
+    let created: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id, status FROM agent_sessions
          WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
          LIMIT 1 FOR UPDATE",
     )
@@ -1108,8 +1112,12 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(session_status) = created {
-        Ok(SessionWriteAdmissionFacts { session_status })
+    if let Some((user_id, session_id, session_status)) = created {
+        Ok(SessionWriteAdmissionFacts {
+            user_id,
+            session_id,
+            session_status,
+        })
     } else {
         Err(sqlx::Error::RowNotFound)
     }
@@ -1271,6 +1279,63 @@ where
     };
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+/// Apply only newly captured ingestion effects to already admitted session rows.
+/// Keys must be the stored identities returned by session admission, with one
+/// entry per row. The surrounding transaction owns their lifecycle fences.
+pub(crate) async fn apply_ingestion_session_effects(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    deltas: &std::collections::BTreeMap<(String, String), (i64, bool)>,
+) -> Result<(), sqlx::Error> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+    if let Some(((user_id, session_id), (delta, false))) = deltas.first_key_value()
+        && deltas.len() == 1
+    {
+        return bump_agent_session_event_count(&mut **tx, session_id, user_id, *delta, None).await;
+    }
+    let mut builder = QueryBuilder::<MySql>::new("UPDATE agent_sessions AS s JOIN (");
+    for (index, ((user_id, session_id), (delta, ended))) in deltas.iter().enumerate() {
+        if index > 0 {
+            builder.push(" UNION ALL ");
+        }
+        builder
+            .push("SELECT ")
+            .push_bind(user_id)
+            .push(" AS user_id, ")
+            .push_bind(session_id)
+            .push(" AS session_id, ")
+            .push_bind(*delta)
+            .push(" AS delta, ")
+            .push_bind(*ended)
+            .push(" AS ended");
+    }
+    builder.push(
+        ") AS d ON s.user_id = d.user_id AND s.session_id = d.session_id \
+         SET s.event_count = s.event_count + d.delta, \
+         s.updated_at = IF(s.last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), s.updated_at), \
+         s.last_active_at = IF(s.last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), s.last_active_at), \
+         s.ended_at = IF(d.ended AND s.status NOT IN ('ended', 'deleting'), NOW(), s.ended_at), \
+         s.status = IF(d.ended AND s.status NOT IN ('ended', 'deleting'), 'ended', s.status) WHERE ",
+    );
+    let mut candidates = builder.separated(" OR ");
+    for (user_id, session_id) in deltas.keys() {
+        candidates
+            .push("(s.user_id = ")
+            .push_bind_unseparated(user_id)
+            .push_unseparated(" AND s.session_id = ")
+            .push_bind_unseparated(session_id)
+            .push_unseparated(")");
+    }
+    let result = builder.build().execute(&mut **tx).await?;
+    if usize::try_from(result.rows_affected()).ok() != Some(deltas.len()) {
+        return Err(sqlx::Error::Protocol(
+            "ingestion effects did not update every admitted session".into(),
+        ));
     }
     Ok(())
 }

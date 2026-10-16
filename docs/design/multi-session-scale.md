@@ -250,12 +250,14 @@ does not destroy or reissue them.
 Ordinary reserve, renewal and release acquire only their owner partition gate.
 A local semaphore per partition queues requests before pool checkout. A missing
 configuration or allocation miss releases that transaction and local permit.
-A validated fresh snapshot may suggest the target and donors sufficient for
-the deficit. The controller locks these local permits and database gates in
-ascending order, then revalidates their real credit. Stale suggestions release
-the partial locks before one full-inventory attempt. Missing configuration
-instead takes all local permits and rechecks the owner before locking all
-database gates, coalescing concurrent initialization. Every attempt uses the
+One local refill semaphore then coalesces credit/configuration work before any
+checkout. A credit miss reads its fresh snapshot only after this queue; a
+configuration miss instead rechecks the owner without a probe. A valid snapshot
+may suggest the target and donors sufficient for the deficit. The controller
+locks only these database gates in ascending order and revalidates real credit.
+A stale suggestion ends its transaction before one full-inventory attempt,
+retaining only the refill semaphore. Refills do not acquire owner-local permits
+or spend capacity from local state. Every attempt uses the
 same transaction implementation, repairs due/dirty partitions and checks exact
 replay and owner/global limits.
 It transfers only unused donor credit and grants atomically. Per deficient
