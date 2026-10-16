@@ -795,13 +795,13 @@ fn model_request_accepted_event(
             provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
             provider_wire_bytes: attempt.wire.provider_wire_bytes,
         },
-        route: Some(ModelRequestRoute {
+        route: ModelRequestRoute {
             route_id: attempt.route_id.clone(),
             invocation_id: attempt.invocation_id.clone(),
             upstream_model: input.upstream_model_name.clone(),
             execution_placement: input.execution_placement,
             access_kind: input.access_kind,
-        }),
+        },
         lineage: attempt.request_context.lineage.clone(),
         budget: attempt.request_context.budget.clone(),
         usage: None,
@@ -9013,7 +9013,7 @@ mod tests {
                 .expect("terminal event");
 
         assert_ne!(accepted_id, terminal_id);
-        let route = accepted.route.as_ref().expect("admitted route attribution");
+        let route = &accepted.route;
         assert_eq!(route.route_id, invocation.route_id());
         assert_eq!(route.invocation_id, invocation.invocation_id());
         assert_eq!(route.upstream_model, "provider-model-1");
@@ -9138,7 +9138,7 @@ mod tests {
     }
 
     #[test]
-    fn model_request_event_preserves_missing_legacy_route_as_unknown() {
+    fn model_request_event_requires_admitted_route() {
         let invocation = plan_inference_invocation(input()).unwrap();
         let attempt = plan_inference_provider_attempt(
             &invocation,
@@ -9152,12 +9152,11 @@ mod tests {
         );
         let (_, encoded, _) =
             model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
-        let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        legacy.as_object_mut().unwrap().remove("route");
-        let decoded: ModelRequestContextEvent = serde_json::from_value(legacy).unwrap();
-        assert!(decoded.route.is_none());
-        assert_eq!(decoded.identity.offering_id, "offer-1");
-        assert_eq!(decoded.schema, MODEL_REQUEST_CONTEXT_SCHEMA);
+        let mut invalid: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        invalid.as_object_mut().unwrap().remove("route");
+        assert!(serde_json::from_value::<ModelRequestContextEvent>(invalid.clone()).is_err());
+        invalid["route"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ModelRequestContextEvent>(invalid).is_err());
     }
 
     #[test]

@@ -70,7 +70,7 @@ async fn default_request_context_storage_cost() {
             for record in events {
                 assert_eq!(record.event.identity.owner_scope, user);
                 assert_eq!(record.event.identity.session_id.as_deref(), Some(session.as_str()));
-                assert!(record.event.route.is_some());
+                assert!(!record.event.route.route_id.is_empty());
                 if record.stage == astra_services::ModelRequestEventStage::Terminal {
                     let usage = record.event.usage.unwrap();
                     assert_eq!(usage.total_input_tokens(), 23);
@@ -5240,11 +5240,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         .count();
     assert_eq!((accepted, terminal), (2, 2));
     for context in &context_events {
-        let route = context
-            .event
-            .route
-            .as_ref()
-            .expect("admitted route projection");
+        let route = &context.event.route;
         assert_eq!(route.route_id, plan.route_id());
         assert_eq!(route.invocation_id, plan.invocation_id());
         assert_eq!(route.execution_placement, ModelExecutionPlacement::Server);

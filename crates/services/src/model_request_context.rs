@@ -706,10 +706,8 @@ pub struct ModelRequestContextEvent {
     pub stage: ModelRequestEventStage,
     pub identity: ModelRequestIdentity,
     /// Admitted route attribution, taken from the inference ledger rather
-    /// than caller-supplied diagnostic metadata. Older records have no route
-    /// projection; absence must not be interpreted as a default selection.
-    #[serde(default)]
-    pub route: Option<ModelRequestRoute>,
+    /// than caller-supplied diagnostic metadata.
+    pub route: ModelRequestRoute,
     pub lineage: ModelRequestLineage,
     pub budget: ModelRequestBudget,
     pub usage: Option<ModelRequestUsage>,
@@ -762,10 +760,7 @@ impl ModelRequestContextEvent {
             || self.identity.session_id.as_deref() != session_id
             || self.identity.run_id.as_deref() != run_id
             || self.identity.request_id != attempt_id
-            || self
-                .route
-                .as_ref()
-                .is_some_and(|route| route.invocation_id != invocation_id)
+            || self.route.invocation_id != invocation_id
         {
             return Err(ServiceError::conflict(
                 "model request payload disagrees with its stored identity",

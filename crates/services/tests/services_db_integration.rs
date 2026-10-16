@@ -158,7 +158,13 @@ fn model_request_fixture_accepted_event(
             provider_wire_hash: "fixture-wire-hash".into(),
             provider_wire_bytes: 100,
         },
-        route: None,
+        route: astra_services::ModelRequestRoute {
+            route_id: format!("route-{request_id}"),
+            invocation_id: format!("invocation-{request_id}"),
+            upstream_model: "glm-5.2".into(),
+            execution_placement: astra_services::ModelExecutionPlacement::Server,
+            access_kind: astra_services::ModelAccessKind::SelfHosted,
+        },
         lineage: Default::default(),
         budget: Default::default(),
         usage: None,
@@ -181,15 +187,29 @@ async fn insert_model_request_fixture(
     created_at: &str,
 ) {
     let usage = event.usage.as_ref();
+    // Consumer fixture for the current stored contract, not a writer simulation.
+    let payload = match event.stage {
+        astra_services::ModelRequestEventStage::Accepted => serde_json::to_value(event).unwrap(),
+        astra_services::ModelRequestEventStage::Terminal => serde_json::json!({
+            "schema": "model_request_terminal_v1",
+            "terminal_status": event.terminal_status,
+            "provider_response_id": event.identity.provider_response_id,
+            "usage_status": event.usage_status,
+            "usage": event.usage,
+            "error_kind": event.error_kind,
+            "usage_source": "provider_terminal",
+        }),
+    };
     sqlx::query(
         "INSERT INTO model_request_context_events \
-         (user_id, session_id, event_id, attempt_id, invocation_id, event_stage, \
+         (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, \
           terminal_status, topology, provider, model_family, purpose, input_tokens, \
           output_tokens, cache_read_tokens, cache_creation_tokens, event_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(user_id)
     .bind(session_id)
+    .bind(&event.identity.run_id)
     .bind(Uuid::new_v4().to_string())
     .bind(attempt_id)
     .bind(format!("invocation-{attempt_id}"))
@@ -203,7 +223,7 @@ async fn insert_model_request_fixture(
     .bind(usage.map(|usage| usage.output_tokens as i64))
     .bind(usage.map(|usage| usage.input.cache_read_tokens as i64))
     .bind(usage.map(|usage| usage.input.cache_creation_tokens as i64))
-    .bind(serde_json::to_string(event).expect("serialize model request fixture"))
+    .bind(serde_json::to_string(&payload).expect("serialize model request fixture"))
     .bind(created_at)
     .execute(pool)
     .await
@@ -7050,24 +7070,13 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     .await
     .expect("insert owner session");
 
-    for (
-        user_id,
-        attempt_id,
-        run_id,
-        parent_run_id,
-        agent_id,
-        include_accepted,
-        status,
-        response_id,
-        created_at,
-    ) in [
+    for (user_id, attempt_id, run_id, parent_run_id, agent_id, status, response_id, created_at) in [
         (
             &owner_user_id,
             &owner_root_attempt,
             "root-run",
             None,
             "parent-agent",
-            false,
             Some("succeeded"),
             Some("root-provider-response"),
             "2026-06-01 10:00:10.000000",
@@ -7078,7 +7087,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             "child-run",
             Some("root-run"),
             "child-agent",
-            true,
             Some("delivery_unknown"),
             None,
             "2026-06-01 10:00:20.000000",
@@ -7089,7 +7097,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             "foreign-run",
             None,
             "foreign-agent",
-            false,
             Some("succeeded"),
             Some("foreign-provider-response"),
             "2026-06-01 10:00:30.000000",
@@ -7103,17 +7110,15 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             parent_run_id,
             agent_id,
         );
-        if include_accepted {
-            insert_model_request_fixture(
-                &pool,
-                user_id,
-                &session_id,
-                attempt_id,
-                &event,
-                "2026-06-01 10:00:19.000000",
-            )
-            .await;
-        }
+        insert_model_request_fixture(
+            &pool,
+            user_id,
+            &session_id,
+            attempt_id,
+            &event,
+            "2026-06-01 10:00:09.000000",
+        )
+        .await;
         if let Some(status) = status {
             event.stage = astra_services::ModelRequestEventStage::Terminal;
             event.terminal_status = Some(status.into());
@@ -7491,8 +7496,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .expect("owner reflect report");
     assert_eq!(report.data_coverage.events, 6);
     assert_eq!(report.data_coverage.decisions, 1);
-    assert_eq!(report.model_requests.records_observed, 3);
-    assert_eq!(report.model_requests.accepted_records_observed, 1);
+    assert_eq!(report.model_requests.records_observed, 4);
+    assert_eq!(report.model_requests.accepted_records_observed, 2);
     assert_eq!(
         report.model_requests.coverage,
         astra_services::reflect::ModelRequestCaptureCoverage::WindowObserved

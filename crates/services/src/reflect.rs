@@ -769,11 +769,7 @@ impl ModelRequestSummary {
                 identity.offering_id.clone(),
                 identity.provider.clone(),
                 identity.model.clone(),
-                record
-                    .event
-                    .route
-                    .as_ref()
-                    .map(|route| route.upstream_model.clone()),
+                Some(record.event.route.upstream_model.clone()),
                 identity.inference_purpose.clone(),
             );
             let group = groups
@@ -3428,7 +3424,13 @@ mod tests {
             schema: crate::model_request_context::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
             stage: ModelRequestEventStage::Terminal,
             identity,
-            route: None,
+            route: crate::ModelRequestRoute {
+                route_id: "route-1".into(),
+                invocation_id: "invocation-1".into(),
+                upstream_model: "deepseek-v4-flash".into(),
+                execution_placement: crate::ModelExecutionPlacement::Server,
+                access_kind: crate::ModelAccessKind::SelfHosted,
+            },
             lineage: ModelRequestLineage::default(),
             budget: Default::default(),
             usage: Some(ModelRequestUsage {

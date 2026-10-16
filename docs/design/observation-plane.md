@@ -284,15 +284,12 @@ access_kind
 The adjacent request identity owns the Offering, configured model, purpose,
 session/run/turn/round, and physical request ID. Accepted and terminal events
 must agree on route attribution, including recovery after process failure.
-Older records without this projection deserialize with an unknown route;
-readers must not infer selection policy from a model name or missing field.
+The admitted route is required; missing or null routes are invalid records.
 Credentials, owner/admission tokens, endpoint URLs, and raw prompt content do
 not belong in this projection.
 
-Request diagnostics use strict typed readers. Deployments adding route fields
-must upgrade readers and recovery workers before new producers, or drain old
-instances during a coordinated upgrade. Backward reading of stored records
-without route fields does not imply older binaries can read the new projection.
+Request diagnostics use one strict current encoding, without historical
+decoders, migration or mixed-version support.
 
 Usage coverage is independent of request outcome:
 
@@ -300,8 +297,8 @@ Usage coverage is independent of request outcome:
   Full-input budget errors and cache-read share may be computed.
 - `provider_partial`: retain observed token lanes, but do not report them as
   a complete input measurement, budget estimate error, or cache-read share.
-- `unavailable`: usage and measured diagnostic fields are absent. Placeholder
-  zeroes in legacy records are not evidence of zero-token billing.
+- `unavailable`: usage and measured diagnostic fields are absent, not measured
+  zero-token billing.
 
 Session Audit request usage reads retained physical provider attempts for the
 authenticated owner and session. It counts failures, cancellation and unknown
