@@ -5,10 +5,12 @@ import json
 from itertools import product
 import os
 import re
+import shlex
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 from test_release_build_shells import workflow_run_script
@@ -27,6 +29,50 @@ class CliSharedTests(unittest.TestCase):
         self.workflow = (ROOT / ".github/workflows/test.yml").read_text()
         self.producer = self.workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
         self.consumer = self.workflow.split("\n  shard-a:\n", 1)[1].split("\n  shard-b:\n", 1)[0]
+
+    def test_native_smokes_build_once_and_propagate_failures(self):
+        script = workflow_run_script(
+            ".github/workflows/test.yml",
+            "Verify native delivery through the production supervisor",
+        )
+        expected_tests = [
+            "cli::edge_lifecycle::native_delivery::tests::authenticated_shared_ws_executes_native_provider_through_cli_entrypoint",
+            "edge_tools::native_codex::tests::discovery_preserves_the_whole_budget_across_protocol_phases",
+            "cli::edge_lifecycle::native_delivery::tests::discovery_publishes_only_the_first_verified_path_client",
+        ]
+        for failed_command in ("", "build", "nextest"):
+            with self.subTest(failed_command=failed_command), tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory)
+                cargo = fixture / "cargo"
+                cargo.write_text('''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CALLS"], "a") as log:
+    log.write(json.dumps([sys.argv[1:], os.environ.get("ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN")]) + "\\n")
+sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
+''')
+                cargo.chmod(0o755)
+                calls = fixture / "calls.jsonl"
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script], cwd=fixture,
+                    env={**os.environ, "PATH": f"{fixture}{os.pathsep}{os.environ['PATH']}",
+                         "CALLS": str(calls), "FAIL_COMMAND": failed_command},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 17 if failed_command else 0, result.stderr)
+                recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+                self.assertEqual(recorded[0][0], shlex.split("build --locked -p astra-cli --bin astra"))
+                self.assertEqual(len(recorded), 1 if failed_command == "build" else 2)
+                if failed_command != "build":
+                    args, supervisor = recorded[1]
+                    self.assertEqual(args, shlex.split(
+                        "nextest run --locked -p astra-cli --lib --profile strict "
+                        "--run-ignored only --test-threads 1 --retries 0 -- --exact"
+                    ) + expected_tests)
+                    self.assertEqual(supervisor, str(fixture / "target/debug/astra"))
+        # The smoke profile must not overwrite the full inventory's CI JUnit file.
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
+        self.assertNotIn("junit", config["profile"]["default"])
+        self.assertNotIn("junit", config["profile"]["strict"])
 
     def test_required_labels_share_the_complete_inventory(self):
         matrix = self.consumer.split("      matrix:\n", 1)[1].split("    steps:\n", 1)[0]

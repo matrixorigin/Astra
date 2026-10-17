@@ -103,6 +103,10 @@ workflow. Trusting a fork also trusts its code writers; see the
 JUnit timings are retained on success and failure to assess total CI
 cost. Rerunning a failed CLI execution repeats the combined build/test job;
 there is no archived-test fallback or artifact-expiry dependency.
+The three ignored production-supervisor smokes use one additional nextest
+invocation, with exact names and separate serial test processes. They use the
+strict profile without retries, preserving the complete inventory's CI JUnit
+file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane also runs the CLI Bash regression
 using its existing default-feature test executable. Tools lint and serial
 workspace-coordination tests remain parallel; the protected coordination check
