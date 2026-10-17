@@ -7,6 +7,7 @@ pub mod attachments;
 pub mod cache_diagnostics;
 pub mod compact_prompt;
 pub mod grouping;
+pub mod history_summary;
 pub mod session_facts;
 pub mod session_memory_extract;
 pub mod summary;
