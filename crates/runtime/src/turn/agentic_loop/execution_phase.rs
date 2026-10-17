@@ -3726,22 +3726,22 @@ fn is_transport_success_empty_completion(details: &serde_json::Value) -> bool {
 fn record_repeated_transport_success_empty_completion(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
-) {
+) -> bool {
     if state.interruption.is_some()
         || !state.provider_adaptation.safe_recovery_attempted
         || error.kind != astra_core::ErrorKind::ProviderDeadline
     {
-        return;
+        return false;
     }
     let Some(details) = error
         .details_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
-        return;
+        return false;
     };
     if !is_transport_success_empty_completion(&details) {
-        return;
+        return false;
     }
 
     state.interruption = Some(InterruptionRecord::new(
@@ -3749,6 +3749,7 @@ fn record_repeated_transport_success_empty_completion(
         exhausted_provider_recovery_action(state),
         interruption_state_summary(state, Some(error.message.clone())),
     ));
+    true
 }
 
 /// Admit one logical recovery round after a provider attempt failed before it
@@ -5493,8 +5494,16 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
-            record_repeated_transport_success_empty_completion(state, &error);
+            let empty_completion =
+                record_repeated_transport_success_empty_completion(state, &error);
             state.hooks.completion_settlement.text_only = false;
+            if empty_completion {
+                // Affirmative clean non-delivery is an interrupted completion,
+                // not a provider failure. Use the ordinary terminal path so
+                // every surface preserves the producer's EmptyCompletion action.
+                state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
             record_direct_llm_error_state(state, &error);
             return Err(error);
         }
@@ -21399,19 +21408,25 @@ mod tests {
             ),
         );
 
-        assert!(
-            execute_turn_and_ingest_phase(
-                &mut host,
-                &mut state,
-                0,
-                TurnIterationPrep {
-                    quiet: true,
-                    turn_start_time: Instant::now(),
-                },
-            )
-            .await
-            .is_err()
-        );
+        let control = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .expect("clean empty exhaustion uses interrupted completion");
+        assert!(matches!(
+            control,
+            TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+        ));
+        assert!(matches!(
+            state.interruption.as_ref().unwrap().resume_action,
+            ResumeAction::RequiresIntervention { .. }
+        ));
 
         let interruption = state
             .interruption

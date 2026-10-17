@@ -38634,3 +38634,47 @@ async fn first_workspace_provisioning_race_selects_one_executor_without_loser_cl
         .await
         .unwrap();
 }
+
+// Exercise the real finalizer with the admitted host/loop fixture's outcome.
+pub(crate) fn assert_empty_recovery_run_finalization(
+    outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    state: &AgenticLoopState,
+) {
+    let (events, status, error) =
+        AgenticRunLifecycleService::finalize_run_events(outcome, vec![], state);
+    assert_eq!(status, RunStatus::Paused, "{events:?}");
+    assert_eq!(error.as_deref(), Some("user_intervention"));
+    let interrupted = events
+        .iter()
+        .find(|event| event["event_type"] == "run_interrupted")
+        .unwrap();
+    assert_eq!(interrupted["data"]["kind"], "empty_completion");
+    assert_eq!(interrupted["data"]["waiting_for"], "user_intervention");
+    assert!(
+        serde_json::to_string(interrupted)
+            .unwrap()
+            .contains("authorized model")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event_type"] != "run_error")
+    );
+    // A later real failure or cancellation must still override this interruption.
+    for (kind, expected) in [
+        (astra_core::ErrorKind::DatabaseError, RunStatus::Failed),
+        (astra_core::ErrorKind::Cancelled, RunStatus::Cancelled),
+    ] {
+        let (events, status, _) = AgenticRunLifecycleService::finalize_run_events(
+            Err(astra_core::ClassifiedError::new(kind, "later failure")),
+            vec![],
+            state,
+        );
+        assert_eq!(status, expected);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event_type"] != "run_interrupted")
+        );
+    }
+}

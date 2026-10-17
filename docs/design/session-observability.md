@@ -112,7 +112,10 @@ including pre-dispatch rejection, streaming interruption and cancellation. A
 known completed provider response stays completed if its durable receipt later
 fails; that separate settlement failure does not authorize its output. Failure
 traces retain safe kind/stage, actual dispatch facts, latency and qualified usage
-when available. Missing usage stays unknown. They do not store raw provider
+when available. Terminal trace usage is qualified from that invocation's canonical
+attempt facts before emission, including pending receipt settlement. Earlier
+logical continuations contribute to turn totals, not this invocation's trace.
+Missing usage stays unknown. They do not store raw provider
 errors, prompts or reasoning. Capture readers recognize failure events in both
 raw and persisted artifact envelopes. Normal `StepIncomplete` on a tool-round
 yield is not a failed task; final run errors close the actual current step.

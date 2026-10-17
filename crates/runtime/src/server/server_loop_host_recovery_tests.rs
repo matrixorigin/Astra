@@ -261,13 +261,24 @@ async fn recovery_effort_only_wire_can_deliver_after_the_suppressed_cap() {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
 async fn exhausted_provider_recovery_is_visible_and_closes_each_trace() {
+    for measured in [false, true] {
+        assert_exhausted_provider_recovery_trace(measured).await;
+    }
+}
+
+async fn assert_exhausted_provider_recovery_trace(measured: bool) {
     let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
     let response = || {
+        let mut chunk =
+            json!({"choices":[{"delta":{"reasoning_content":"fixture"},"finish_reason":null}]});
+        if measured {
+            chunk["usage"] = json!({"prompt_tokens":8,"completion_tokens":3});
+        }
         ProviderResponse::Stream {
-        content_type: "text/event-stream",
-        chunks: vec![b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"fixture\"},\"finish_reason\":null}]}\n\n".to_vec()],
-        release_before_chunk: None,
-    }
+            content_type: "text/event-stream",
+            chunks: vec![format!("data: {chunk}\n\n").into_bytes()],
+            release_before_chunk: None,
+        }
     };
     let provider = ProviderGateway::start(vec![ProviderScript::new(
         "failed inference and one recovery",
@@ -289,7 +300,11 @@ async fn exhausted_provider_recovery_is_visible_and_closes_each_trace() {
         .push(json!({"role":"user","content":"implement the supplied change"}));
     state.message = "implement the supplied change".into();
     state.user_intent = state.message.clone();
-    let _outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+    let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+    assert!(
+        outcome.is_err(),
+        "an incomplete stream must retain its error"
+    );
     let interruption = state.interruption.as_ref().expect("typed provider blocker");
     assert!(matches!(
         interruption.resume_action,
@@ -300,6 +315,9 @@ async fn exhausted_provider_recovery_is_visible_and_closes_each_trace() {
     assert!(!interruption.user_message.contains("Continue this session"));
     assert_eq!(interruption.tool_calls_completed, 0);
     assert!(!interruption.has_checkpoint);
+    let usage = state.qualified_usage.expect("two dispatched attempts");
+    assert_eq!(usage.input_tokens(), measured.then_some(16));
+    assert_eq!(usage.output_tokens(), measured.then_some(6));
     let events = host.take_emitted_events();
     let recovery = events
         .iter()
@@ -329,7 +347,19 @@ async fn exhausted_provider_recovery_is_visible_and_closes_each_trace() {
         assert_eq!(start.step_id, failure.step_id);
         assert!(failure.caused_by.contains(&start.event_id));
         assert!(start.payload.as_ref().unwrap()["invocation_id"].is_string());
-        assert!(failure.payload.as_ref().unwrap()["qualified_usage"].is_null());
+        let usage = &failure.payload.as_ref().unwrap()["qualified_usage"];
+        if measured {
+            assert_eq!(usage["input_tokens"], 8);
+            assert_eq!(usage["output_tokens"], 3);
+            assert!(usage["cached_input_tokens"].is_null());
+            assert!(usage["cache_creation_tokens"].is_null());
+        } else {
+            assert_eq!(
+                usage,
+                &json!({}),
+                "dispatched usage stays explicitly unknown"
+            );
+        }
     }
     assert!(
         traces
@@ -344,6 +374,61 @@ async fn exhausted_provider_recovery_is_visible_and_closes_each_trace() {
             )
     );
     assert_eq!(provider.requests.lock().await.len(), 2);
+    ledger.assert_quiescent();
+    provider.assert_complete();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
+    let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+    let responses = [(8, 3), (5, 2)].map(|(input, output)| ProviderResponse::Stream {
+        content_type: "text/event-stream",
+        chunks: vec![format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"fixture\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{input},\"completion_tokens\":{output}}}}}\n\ndata: [DONE]\n\n"
+        ).into_bytes()],
+        release_before_chunk: None,
+    });
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "two clean empty completions",
+        |request| request.path == "/v1/chat/completions",
+        responses.into(),
+    )])
+    .await;
+    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let mut host = test_host_builder("empty-user", "empty-recovery")
+        .with_test_inference_ledger(ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            format!("{}/v1/chat/completions", provider.base_url),
+            Some(2000),
+        )))
+        .build();
+    let mut state = create_durable_execution_test_state("empty-recovery");
+    state
+        .messages
+        .push(json!({"role":"user","content":"finish the supplied request"}));
+    state.message = "finish the supplied request".into();
+    state.user_intent = state.message.clone();
+    let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+    crate::server::run::lifecycle::tests::assert_empty_recovery_run_finalization(outcome, &state);
+    assert!(state.final_text.contains("unfinished"));
+    assert_eq!(provider.requests.lock().await.len(), 2);
+    assert_eq!(state.qualified_usage.unwrap().input_tokens(), Some(13));
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(5));
+    let completed: Vec<_> = state
+        .step_recorder
+        .events()
+        .iter()
+        .filter(|event| {
+            event.event_type == astra_pipeline::step_protocol::StepEventType::LlmRoundCompleted
+        })
+        .collect();
+    assert_eq!(completed.len(), 2);
+    for (event, (input, output)) in completed.iter().zip([(8, 3), (5, 2)]) {
+        let payload = event.payload.as_ref().unwrap();
+        assert_eq!(payload["input_tokens"], input);
+        assert_eq!(payload["output_tokens"], output);
+    }
     ledger.assert_quiescent();
     provider.assert_complete();
 }
@@ -401,6 +486,12 @@ async fn provider_completion_trace_survives_ledger_terminalization_deadline() {
     assert_eq!(payload["dispatch_started"], true);
     assert_eq!(payload["provider_completed"], true);
     assert_eq!(payload["error_kind"], "database_error");
+    let returned: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(returned["qualified_usage"]["input_tokens"], 8);
+    assert_eq!(returned["qualified_usage"]["output_tokens"], 3);
+    assert_eq!(payload["qualified_usage"], returned["qualified_usage"]);
+    assert!(payload["qualified_usage"]["cached_input_tokens"].is_null());
+    assert!(payload["qualified_usage"]["cache_creation_tokens"].is_null());
     assert_eq!(provider.requests.lock().await.len(), 1);
     // The foreground transfers settlement. The global coordinator waiter is
     // a no-op in lib tests; wait for this fixture's exact owner facts instead.

@@ -21611,18 +21611,43 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 provider_result
             };
+            let llm_round_latency_ms = llm_round_start.elapsed().as_millis() as u64;
+            let provider_attempts = durable_invocation.provider_attempt_facts().await;
+            let mut qualified_invocation_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
+            // The invocation's final facts are read once after its call has
+            // stopped. Each request key is unique in its existing owner map.
+            for usage in provider_attempts.iter().filter_map(|fact| fact.qualified_usage) {
+                qualified_invocation_usage = Some(match qualified_invocation_usage {
+                    None => usage,
+                    Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).expect("unknown usage is valid")
+                    }),
+                });
+            }
+            if let Some(usage) = qualified_invocation_usage {
+                qualified_attempt_usage = Some(match qualified_attempt_usage {
+                    None => usage,
+                    Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                            .expect("unknown usage is valid")
+                    }),
+                });
+            }
+            // A Step terminal describes this invocation only. The outer error
+            // projection may also include earlier logical continuations.
+            let r = r.map_err(|error| attach_qualified_error_usage(error, qualified_invocation_usage));
             match &r {
                 Ok(response) => {
                     let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&response.usage);
                     state.step_recorder.end_llm_round(
                         &llm_cfg.model_name, state.inference_purpose,
                         usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
-                        usage.cache_creation_tokens, llm_round_start.elapsed().as_millis() as u64,
+                        usage.cache_creation_tokens, llm_round_latency_ms,
                     );
                 }
                 Err(error) => state.step_recorder.fail_llm_round(
                     &llm_cfg.model_name, state.inference_purpose, error,
-                    llm_round_start.elapsed().as_millis() as u64,
+                    llm_round_latency_ms,
                     durable_invocation.provider_dispatch_started(),
                 ),
             }
@@ -21632,23 +21657,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "status": "llm_call_completed",
                     "turn": state.llm_rounds_completed,
                     "ttft_ms": attempt_first_stream_update_ms,
-                    "duration_ms": llm_round_start.elapsed().as_millis() as u64,
+                    "duration_ms": llm_round_latency_ms,
                 }));
             }
             self.publish_explain_analyze_provider_attempt_spans(
                 explain_provider_attempt_observer.drain_spans(),
             );
-            let provider_attempts = durable_invocation.provider_attempt_facts().await;
-            // The invocation's final facts are read once after its call has
-            // stopped. Each request key is unique in its existing owner map.
-            for usage in provider_attempts.iter().filter_map(|fact| fact.qualified_usage) {
-                qualified_attempt_usage = Some(match qualified_attempt_usage {
-                    None => usage,
-                    Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
-                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).expect("unknown usage is valid")
-                    }),
-                });
-            }
             match (
                 durable_invocation.admitted_canonical_transition_id(),
                 provider_canonical_planned_head,

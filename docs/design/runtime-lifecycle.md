@@ -36,7 +36,11 @@ provider wait. If that bounded recovery also fails, the interruption retains
 its provider cause and existing progress/checkpoint facts, and requires an
 explicit provider retry or authorized model selection. Its only remedy must not
 be another indistinguishable instruction to continue. This observation grants
-neither execution authority nor another retry. Final error exits close the
+neither execution authority nor another retry. A repeated clean provider terminal
+with no actionable delivery uses the existing interrupted-completion path with
+`EmptyCompletion`, preserving intervention guidance through run finalization.
+Actual provider and settlement errors retain their error outcome; stale
+interruptions cannot mask later failures or cancellation. Final error exits close the
 current inner step through the shared finalization owner, including admission
 and guidance failures; they do not create a step if none began.
 
