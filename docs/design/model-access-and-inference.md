@@ -820,6 +820,27 @@ Meaningful reasoning refreshes semantic activity but is not an actionable
 answer. Empty/whitespace reasoning does not refresh that deadline; idle,
 provider-work, cancellation and response-size limits remain authoritative.
 
+### Captured reasoning replay
+
+The canonical reasoning capability owner distinguishes required field backfill
+(DeepSeek and Kimi) from exact captured replay (the GLM 4.5, 4.6, 4.7 and 5
+interleaved-thinking families). Exact replay is selected by the admitted upstream model identity,
+including maintained vendor namespaces, rather than an offering display alias.
+Both shared wire assembly and its final send-time guard preserve every captured
+reasoning string, including empty and whitespace strings, along with signatures,
+tool identifiers and result order. They do not replace earlier blocks with a
+placeholder or invent missing historical reasoning. Current thinking controls
+and historical replay requirements are independent. The same contract applies
+to streaming, non-streaming and recovery calls; append-only cache projections
+retain their existing exact-prefix protection.
+
+This preserves originals that remain available. It cannot reconstruct history
+already discarded by earlier projections. Signed Anthropic and Bedrock replay
+continues to require its existing protocol and model authority. The upstream
+[GLM thinking contract](https://docs.z.ai/guides/capabilities/thinking-mode)
+requires complete original interleaved reasoning; this is not evidence that
+replay stripping caused a particular provider's latency or deadline.
+
 ## Provider request capability contract
 
 ### Problem and invariant
