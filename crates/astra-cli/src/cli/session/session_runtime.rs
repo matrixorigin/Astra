@@ -814,9 +814,18 @@ pub(crate) async fn resolve_server_model_selection(
     token: &str,
     model: &str,
     purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
-) -> Result<ServerModelSelection, String> {
-    let (catalog, _) = load_server_model_catalog(api, token, purpose).await?;
-    resolve_server_model_selection_from_catalog(model, &catalog)
+) -> Result<ServerModelSelection, astra_core::ClassifiedError> {
+    let (catalog, _) = fetch_server_model_catalog(api, Some(token), purpose)
+        .await
+        .map_err(|error| match error {
+            ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status, ..
+            }) => model_catalog_http_error(status),
+            other => astra_core::ClassifiedError::from(other.to_string()),
+        })?;
+    resolve_server_model_selection_from_catalog(model, &catalog).map_err(|error| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+    })
 }
 
 /// Resolve an explicit selector against the complete authoritative catalog.
@@ -2901,7 +2910,10 @@ mod tests {
         )
         .await
         .expect_err("a missing Offering must fail closed");
-        assert!(error.contains("authoritative catalog"), "{error}");
+        assert!(
+            error.to_string().contains("authoritative catalog"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

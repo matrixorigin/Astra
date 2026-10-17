@@ -1977,7 +1977,7 @@ impl<'a> CliSseStreamHost<'a> {
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
         if !self.resolve_edge_owner_bearer().await {
-            self.auth_failure = true;
+            self.mark_edge_auth_failure(&body.run_id);
             return Err(PostToolResultError::AuthRefreshFailed);
         }
         // Detach any inherited bearer provider so the explicitly admitted owner
@@ -2024,7 +2024,7 @@ impl<'a> CliSseStreamHost<'a> {
         body: &astra_thin_client::ApprovalRespondRequest,
     ) -> Result<(), PostApprovalError> {
         if !self.resolve_edge_owner_bearer().await {
-            self.auth_failure = true;
+            self.mark_edge_auth_failure(&body.run_id);
             return Err(PostApprovalError::AuthRefreshFailed);
         }
         // Detach any inherited bearer provider so the explicitly admitted owner
@@ -13870,7 +13870,13 @@ mod tests {
         edge_tool_result_401_refresh_acknowledges_once(Some("test"), "unchanged", false).await;
         edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", false).await;
         edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", true).await;
-        for transition in ["current_profile", "replacement", "account", "logout"] {
+        for transition in [
+            "current_profile",
+            "replacement",
+            "account",
+            "logout",
+            "proactive_refresh_failure",
+        ] {
             edge_tool_result_401_refresh_acknowledges_once(None, transition, false).await;
             edge_tool_result_401_refresh_acknowledges_once(None, transition, true).await;
         }
@@ -13889,6 +13895,11 @@ mod tests {
         )
         .unwrap();
 
+        let initial_token = if transition == "proactive_refresh_failure" {
+            "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature"
+        } else {
+            "expired-token"
+        };
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
             ..Default::default()
@@ -13897,7 +13908,7 @@ mod tests {
             "test".to_string(),
             Profile {
                 account_id: Some("user-id-1".to_string()),
-                access_token: Some("expired-token".to_string()),
+                access_token: Some(initial_token.to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
             },
@@ -13913,7 +13924,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(callback_path))
-            .and(header("authorization", "Bearer expired-token"))
+            .and(header("authorization", format!("Bearer {initial_token}")))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
                 "error": "expired"
             })))
@@ -13922,12 +13933,25 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path(astra_thin_client::paths::AUTH_REFRESH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "user_id": "user-id-1",
-                "access_token": "fresh-token",
-                "refresh_token": "fresh-refresh-token"
-            })))
-            .expect(if should_post { 1 } else { 0 })
+            .respond_with(
+                ResponseTemplate::new(if transition == "proactive_refresh_failure" {
+                    401
+                } else {
+                    200
+                })
+                .set_body_json(serde_json::json!({
+                    "user_id": "user-id-1",
+                    "access_token": "fresh-token",
+                    "refresh_token": "fresh-refresh-token"
+                })),
+            )
+            .expect(
+                if should_post || transition == "proactive_refresh_failure" {
+                    1
+                } else {
+                    0
+                },
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -13944,14 +13968,16 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
         let mut tool_cache = EdgeToolCache::new(10);
+        let parent_cancel = tokio_util::sync::CancellationToken::new();
+        let physical_cancel = parent_cancel.child_token();
         let ctx = EdgeSseContext {
             api: &api,
-            token: "expired-token",
+            token: initial_token,
             executor_id: "edge-test",
             executor,
             render_policy: RenderPolicy::Silent,
             perm_manager: None,
-            cancel_token: None,
+            cancel_token: Some(&physical_cancel),
             stream_event_tx: None,
             stream_event_sink: None,
             approval_request_tx: None,
@@ -13965,7 +13991,7 @@ mod tests {
         let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
             &api,
             auth_profile,
-            "expired-token",
+            initial_token,
         )
         .await;
         assert!(auth_owner.is_some());
@@ -14017,10 +14043,32 @@ mod tests {
         assert_eq!(posted, should_post);
         if !should_post {
             assert!(host.auth_failure);
-            assert!(server.received_requests().await.unwrap().is_empty());
+            let mut held_open_peer = futures_util::stream::pending::<Result<Vec<u8>, String>>();
+            let (_, abort) = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                super::consume_sse_stream_cancellable(
+                    &mut held_open_peer,
+                    &mut host,
+                    std::time::Duration::from_secs(300),
+                    Some(&physical_cancel),
+                    None,
+                ),
+            )
+            .await
+            .expect("owner rejection must wake the physical reader before idle timeout");
+            assert!(abort.is_some());
+            assert!(physical_cancel.is_cancelled());
+            assert!(!parent_cancel.is_cancelled());
+            assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                usize::from(transition == "proactive_refresh_failure")
+            );
             return;
         }
         assert!(!host.auth_failure);
+        assert!(!physical_cancel.is_cancelled());
+        assert!(!parent_cancel.is_cancelled());
         assert_eq!(host.token, "fresh-token");
         let posts: Vec<_> = server
             .received_requests()

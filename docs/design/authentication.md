@@ -284,6 +284,13 @@ re-execute a tool or resubmit an admitted turn. Only typed model-catalog
 preflight authentication failures without admitted-run or effect evidence may
 retry turn admission.
 
+Stdio captures that owner before Edge registration can refresh its bearer,
+then resolves the usable admission token through the same checked binding.
+Selected-model and default-model catalog failures both preserve typed HTTP
+evidence. Proactive callback-auth rejection retains the callback run id and
+wakes the physical SSE reader so exact-run cleanup can begin; it does not
+cancel the parent/user token.
+
 Confirmed refresh rotations within that binding remain usable. Changing the
 ambient default profile does not change an in-flight owner. Logout, account or
 native generation changes, and unrecognized credential replacement fail closed;

@@ -2140,3 +2140,53 @@ async fn stream_chat_sse_stdout_probe() {
     .unwrap();
     assert_eq!(result.full_text, "terminal publication marker");
 }
+
+#[tokio::test]
+async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    for status in [401, 403, 429] {
+        for selected in [None, Some("test-model")] {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "detail": "synthetic catalog denial"
+                    })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let registry = astra_runtime::skills::default_unified_registry();
+            let mut context = basic_chat_context(&api, &registry, "synthetic preflight");
+            context.model = selected;
+            let mut pm = PermissionManager::new(true);
+            let failure = execute_basic_cli_turn(
+                &context,
+                "synthetic-token",
+                None,
+                &mut pm,
+                BasicCliTurnOptions::default(),
+            )
+            .await
+            .expect_err("catalog rejected");
+            assert_eq!(
+                failure
+                    .partial
+                    .error_metadata
+                    .as_ref()
+                    .and_then(|v| v["http_status"].as_u64()),
+                Some(status as u64),
+                "{selected:?}: {failure:?}"
+            );
+            assert_eq!(
+                crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure),
+                status == 401
+            );
+            assert!(failure.partial.run_id.is_none());
+            assert!(failure.partial.tool_call_records.is_empty());
+            server.verify().await;
+        }
+    }
+}
