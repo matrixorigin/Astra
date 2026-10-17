@@ -820,6 +820,17 @@ Meaningful reasoning refreshes semantic activity but is not an actionable
 answer. Empty/whitespace reasoning does not refresh that deadline; idle,
 provider-work, cancellation and response-size limits remain authoritative.
 
+Primary recovery uses the same admitted thinking-control predicate as auxiliary
+selection: prefer supported suppression, then supported low effort, while
+preserving explicitly exact token budgets and requested thinking when capability
+is unknown or preservation is required. Low effort does not prove a fast
+response. An omitted or unsupported control does not prove thinking is disabled;
+therefore a short suppressed-response budget cannot be inferred from the fact
+that recovery was scheduled. Requested/effective controls and the actual work
+slice are diagnostic facts; the ordinary client and absolute execution budgets
+remain authoritative. Lifecycle reservation and exhaustion belong to
+[runtime lifecycle](runtime-lifecycle.md).
+
 ## Provider request capability contract
 
 ### Problem and invariant

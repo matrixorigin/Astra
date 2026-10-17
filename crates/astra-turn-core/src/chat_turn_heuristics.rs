@@ -12,9 +12,9 @@ const DEFAULT_EXPLORATION_ROUND_WINDOW: usize = 5;
 const EXPLORATORY_STALL_WINDOW: usize = 4;
 const EXPLORATORY_ROUND_WINDOW: usize = 8;
 
-/// Maximum provider slice reserved for synthesizing a final answer after
-/// exploratory execution is closed by a wall-clock deadline.
-pub const PROVIDER_ACTION_CONVERGENCE_BUDGET: Duration = astra_turn_types::FINAL_SYNTHESIS_TIME_CAP;
+/// Fast recovery cap only for requests whose admitted generation control
+/// positively supports suppressing thinking. Not final-answer authority.
+pub const SUPPRESSED_PROVIDER_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Receipt/cleanup space after an Edge action. Process-backed actions must
 /// allow reaping and publishing a terminal receipt; direct callbacks need a

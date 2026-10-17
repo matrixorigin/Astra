@@ -99,6 +99,24 @@ A run may appear stuck because of:
 
 The projection should expose the specific reason and next action.
 
+A safe provider recovery publishes its scheduled attempt before waiting again,
+without inventing task progress or adding an assistant-authored history message.
+When recovery is exhausted, live and replayed interruption projections carry the
+same provider cause, factual completed-call/checkpoint counts and explicit next
+action. A zero-tool recovery does not erase preceding tool evidence. Selecting a
+different model still requires ordinary authorization and admission.
+
+Each `LlmRoundStarted` retains the exact durable invocation identity and logical
+attempt index. It is closed by `LlmRoundCompleted` or typed `LlmRoundFailed`,
+including pre-dispatch rejection, streaming interruption and cancellation. A
+known completed provider response stays completed if its durable receipt later
+fails; that separate settlement failure does not authorize its output. Failure
+traces retain safe kind/stage, actual dispatch facts, latency and qualified usage
+when available. Missing usage stays unknown. They do not store raw provider
+errors, prompts or reasoning. Capture readers recognize failure events in both
+raw and persisted artifact envelopes. Normal `StepIncomplete` on a tool-round
+yield is not a failed task; final run errors close the actual current step.
+
 ## Stream events
 
 Stream events are transport projections of durable or near-durable facts. They should carry enough information to repair UI state after reconnect.

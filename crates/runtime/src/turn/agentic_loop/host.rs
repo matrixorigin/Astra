@@ -774,6 +774,10 @@ pub trait AgenticLoopHost: Send {
     /// source of control state.
     fn on_turn_phase(&mut self, _receipt: TurnPhaseReceipt) {}
 
+    /// Observe a bounded recovery reserved by the shared owner, before the
+    /// next provider wait. This is progress evidence, never retry authority.
+    fn on_provider_recovery(&mut self, _state: &AgenticLoopState, _reason: astra_core::ErrorKind) {}
+
     /// Asynchronous hosts publish admission at the background task's boundary.
     fn owns_semantic_admission_timing(&self) -> bool {
         false
@@ -2412,7 +2416,7 @@ pub struct ErrorRecoveryState {
 /// Bounded, run-local adaptations learned from typed provider outcomes.
 ///
 /// These facts retain one-shot request adaptations and whether the loop has
-/// already consumed its bounded action-convergence recovery. Continuation must
+/// already consumed its bounded safe provider recovery. Continuation must
 /// preserve them: resetting the consumed flag would grant recovery again.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2424,10 +2428,10 @@ pub struct ProviderAdaptationState {
     pub output_cap_action_first_pending: bool,
     /// A provider attempt spent its action-progress window on provisional
     /// reasoning without producing visible text or choosing a tool. Exactly
-    /// one logical recovery round may suppress thinking and request action.
-    pub action_convergence_attempted: bool,
-    /// One-shot wire adaptation consumed by the next primary provider call.
-    pub force_next_thinking_off: bool,
+    /// one capability-aware logical recovery may request an actionable response.
+    pub safe_recovery_attempted: bool,
+    /// One-shot recovery reservation consumed at the next primary dispatch.
+    pub safe_recovery_pending: bool,
 }
 
 // ─── Loop state ──────────────────────────────────────────────────────────────

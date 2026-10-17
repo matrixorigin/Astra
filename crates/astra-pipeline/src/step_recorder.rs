@@ -796,12 +796,20 @@ impl StepRecorder {
 
     /// Transition to ACT phase (before LLM call).
     /// Record the start of an LLM API call. Pairs with [`Self::end_llm_round`].
-    pub fn begin_llm_round(&mut self, model: &str, purpose: InferencePurpose) {
+    pub fn begin_llm_round(
+        &mut self,
+        model: &str,
+        purpose: InferencePurpose,
+        invocation_id: &str,
+        attempt_index: u32,
+    ) {
         self.emit_with_payload(
             StepEventType::LlmRoundStarted,
             serde_json::json!({
                 "model": model,
                 "purpose": purpose,
+                "invocation_id": invocation_id,
+                "attempt_index": attempt_index,
             }),
         );
     }
@@ -817,6 +825,9 @@ impl StepRecorder {
         cache_creation: u64,
         latency_ms: u64,
     ) {
+        if !self.llm_round_is_open() {
+            return;
+        }
         self.emit_with_payload(
             StepEventType::LlmRoundCompleted,
             serde_json::json!({
@@ -829,6 +840,86 @@ impl StepRecorder {
                 "latency_ms": latency_ms,
             }),
         );
+    }
+
+    /// Close a failed provider call without inventing a zero-usage response or
+    /// persisting upstream prose. The preceding start owns invocation identity.
+    pub fn fail_llm_round(
+        &mut self,
+        model: &str,
+        purpose: InferencePurpose,
+        error: &astra_core::ClassifiedError,
+        latency_ms: u64,
+        dispatch_started: bool,
+    ) {
+        if !self.llm_round_is_open() {
+            return;
+        }
+        let details = error
+            .details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let phase = details
+            .as_ref()
+            .and_then(|value| value.pointer("/deadline/phase"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|phase| {
+                matches!(
+                    *phase,
+                    "semantic_progress"
+                        | "actionable_output"
+                        | "provider_work"
+                        | "consuming the provider stream"
+                        | "waiting for provider response"
+                        | "sending the non-stream provider request"
+                        | "provider_attempt_admission"
+                        | "provider_attempt_terminalization"
+                        | "provider_attempt_persistence"
+                )
+            });
+        let usage = details
+            .as_ref()
+            .and_then(|value| value.get("qualified_usage"))
+            .and_then(|value| astra_turn_types::CanonicalTokenUsage::from_json(value).ok());
+        // The client can return a ledger error after the provider has already
+        // completed. Retain that physical truth without granting its response
+        // action authority or treating unknown usage as measured zero.
+        let provider_succeeded = details
+            .as_ref()
+            .and_then(|value| value.pointer("/provider_terminal/status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("succeeded");
+        self.emit_with_payload(
+            if provider_succeeded { StepEventType::LlmRoundCompleted } else { StepEventType::LlmRoundFailed },
+            serde_json::json!({
+                "model": model,
+                "purpose": purpose,
+                "error_kind": error.kind.as_str(),
+                "failure_stage": if details.as_ref().is_some_and(|value| value.get("provider_terminal").is_some()) { "settlement" } else if dispatch_started { "provider" } else { "admission" },
+                "dispatch_started": dispatch_started,
+                "provider_completed": provider_succeeded,
+                "deadline_phase": phase,
+                "qualified_usage": usage,
+                "latency_ms": latency_ms,
+            }),
+        );
+    }
+
+    fn llm_round_is_open(&self) -> bool {
+        let step_id = self.current_step.as_ref().map(|step| step.step_id());
+        self.events
+            .iter()
+            .rev()
+            .filter(|event| step_id.is_none_or(|id| event.step_id == id))
+            .find(|event| {
+                matches!(
+                    event.event_type,
+                    StepEventType::LlmRoundStarted
+                        | StepEventType::LlmRoundCompleted
+                        | StepEventType::LlmRoundFailed
+                )
+            })
+            .is_some_and(|event| event.event_type == StepEventType::LlmRoundStarted)
     }
 
     pub fn begin_act(&mut self, tool_count: usize) {
@@ -1981,7 +2072,7 @@ mod tests {
     #[test]
     fn llm_round_events_preserve_inference_purpose() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-purpose", "task-1");
-        rec.begin_llm_round("model-a", InferencePurpose::SubAgent);
+        rec.begin_llm_round("model-a", InferencePurpose::SubAgent, "invocation-a", 0);
         rec.end_llm_round("model-a", InferencePurpose::SubAgent, 10, 4, 3, 2, 25);
 
         let round_events = rec
@@ -2002,6 +2093,83 @@ mod tests {
             .expect("typed inference purpose");
             assert_eq!(purpose, InferencePurpose::SubAgent);
         }
+    }
+
+    #[test]
+    fn failed_llm_round_closes_exact_invocation_without_inventing_usage() {
+        let mut recorder = StepRecorder::new(TEST_USER_ID, "failed-provider", "task");
+        recorder.begin_turn(0);
+        recorder.begin_llm_round("fixture", InferencePurpose::PrimaryAgent, "invocation-2", 2);
+        let start = recorder.events().last().unwrap().event_id.clone();
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "SECRET upstream prose",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "deadline": {"phase": "semantic_progress"},
+                "partial_reasoning": "SECRET reasoning",
+            })
+            .to_string(),
+        );
+        recorder.fail_llm_round("fixture", InferencePurpose::PrimaryAgent, &error, 41, true);
+        recorder.fail_llm_round("fixture", InferencePurpose::PrimaryAgent, &error, 42, true);
+        let failures: Vec<_> = recorder
+            .events()
+            .iter()
+            .filter(|event| event.event_type == StepEventType::LlmRoundFailed)
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].caused_by.contains(&start));
+        let payload = failures[0].payload.as_ref().unwrap();
+        assert_eq!(payload["error_kind"], "provider_deadline");
+        assert_eq!(payload["deadline_phase"], "semantic_progress");
+        assert_eq!(payload["latency_ms"], 41);
+        assert!(payload["qualified_usage"].is_null());
+        assert!(payload.get("input_tokens").is_none());
+        assert!(!serde_json::to_string(payload).unwrap().contains("SECRET"));
+        recorder.end_turn(false);
+        recorder.end_turn(false);
+        assert_eq!(
+            recorder
+                .events()
+                .iter()
+                .filter(|event| event.event_type == StepEventType::StepIncomplete)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn settled_provider_response_is_not_relabelled_by_a_later_ledger_error() {
+        let mut recorder = StepRecorder::new(TEST_USER_ID, "completed-provider", "task");
+        recorder.begin_turn(0);
+        recorder.begin_llm_round("fixture", InferencePurpose::PrimaryAgent, "invocation", 0);
+        recorder.end_llm_round("fixture", InferencePurpose::PrimaryAgent, 10, 2, 0, 0, 7);
+        recorder.fail_llm_round(
+            "fixture",
+            InferencePurpose::PrimaryAgent,
+            &astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::DatabaseError,
+                "ledger failed",
+            ),
+            9,
+            true,
+        );
+        assert_eq!(
+            recorder
+                .events()
+                .iter()
+                .filter(|event| event.event_type == StepEventType::LlmRoundCompleted)
+                .count(),
+            1
+        );
+        assert!(
+            !recorder
+                .events()
+                .iter()
+                .any(|event| event.event_type == StepEventType::LlmRoundFailed)
+        );
     }
 
     #[test]

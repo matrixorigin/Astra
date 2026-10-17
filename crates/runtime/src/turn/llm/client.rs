@@ -1235,7 +1235,7 @@ impl ControlledProviderAttemptObserver<'_> {
             "terminalization" => "provider_attempt_terminalization",
             _ => "provider_attempt_persistence",
         };
-        let mut details = json!({
+        let details = json!({
             "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
             "deadline": {
                 "scope": "inference_ledger",
@@ -1244,18 +1244,15 @@ impl ControlledProviderAttemptObserver<'_> {
                 "retry_safety": "none"
             }
         });
-        if let Some(terminal) = terminal {
-            details["provider_terminal"] = json!({
-                "status": terminal.status.as_str(),
-                "usage_status": terminal.usage_status.as_str(),
-                "error_kind": terminal.error_kind,
-            });
-        }
-        astra_core::ClassifiedError::new(
+        let error = astra_core::ClassifiedError::new(
             astra_core::ErrorKind::DatabaseError,
             format!("durable inference ledger timed out during provider attempt {stage}"),
         )
-        .with_details_json(details.to_string())
+        .with_details_json(details.to_string());
+        match terminal {
+            Some(terminal) => attach_provider_terminal_evidence(error, terminal),
+            None => error,
+        }
     }
 }
 
@@ -1449,6 +1446,26 @@ pub(crate) fn classify_provider_send_error(
     )
 }
 
+/// A settlement error cannot erase the physical terminal already supplied by
+/// the adapter. Preserve only typed terminal facts, never provider error prose.
+fn attach_provider_terminal_evidence(
+    error: astra_core::ClassifiedError,
+    terminal: &astra_services::InferenceInvocationTerminal,
+) -> astra_core::ClassifiedError {
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    details["provider_terminal"] = json!({
+        "status": terminal.status.as_str(),
+        "usage_status": terminal.usage_status.as_str(),
+        "error_kind": terminal.error_kind,
+    });
+    error.with_details_json(details.to_string())
+}
+
 pub(crate) async fn finish_observed_provider_attempt(
     observer: Option<&dyn ProviderAttemptObserver>,
     attempt_index: Option<u32>,
@@ -1457,7 +1474,10 @@ pub(crate) async fn finish_observed_provider_attempt(
     let (Some(observer), Some(attempt_index)) = (observer, attempt_index) else {
         return Ok(());
     };
-    observer.finish_attempt(attempt_index, terminal).await
+    observer
+        .finish_attempt(attempt_index, terminal)
+        .await
+        .map_err(|error| attach_provider_terminal_evidence(error, terminal))
 }
 
 fn note_observed_provider_usage_presence(
@@ -12142,6 +12162,62 @@ mod tests {
 
         fn note_dispatch_started(&self, _attempt_index: u32) {
             self.dispatched.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct FailingFinishAttemptObserver(astra_core::ErrorKind);
+
+    #[async_trait]
+    impl ProviderAttemptObserver for FailingFinishAttemptObserver {
+        async fn begin_attempt(
+            &self,
+            _: &ProviderWireRequestIdentity,
+            _: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            Ok(ProviderAttemptAdmission::Admitted(0))
+        }
+        async fn finish_attempt(
+            &self,
+            _: u32,
+            _: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            Err(
+                astra_core::ClassifiedError::new(self.0, "fixture settlement failure")
+                    .with_details_json(
+                        json!({"source":"inference_execution_ledger", "existing":"retained"})
+                            .to_string(),
+                    ),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_error_retains_actual_provider_terminal_for_all_error_shapes() {
+        for kind in [
+            astra_core::ErrorKind::DatabaseError,
+            astra_core::ErrorKind::Cancelled,
+        ] {
+            let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+                astra_services::InferenceUsage::default(),
+                Some("provider-response".into()),
+            );
+            let error = finish_observed_provider_attempt(
+                Some(&FailingFinishAttemptObserver(kind)),
+                Some(0),
+                &terminal,
+            )
+            .await
+            .expect_err("runtime must still reject unsettled delivery");
+            assert_eq!(error.kind, kind);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["existing"], "retained");
+            assert_eq!(details["provider_terminal"]["status"], "succeeded");
+            assert_eq!(
+                details["provider_terminal"]["usage_status"],
+                "provider_exact"
+            );
+            assert!(details["provider_terminal"].get("error_message").is_none());
         }
     }
 

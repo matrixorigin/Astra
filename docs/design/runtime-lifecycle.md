@@ -22,6 +22,24 @@ run-work deadline with no visible text or selected tool enters the existing
 final settlement boundary. Ordinary provider timeouts and uncertain delivery
 do not grant that transition or another tool-execution attempt.
 
+A provider attempt that ends with affirmative no-delivery evidence may reserve
+one safe recovery per executed-tool progress epoch. Preparation and reconnect
+do not consume or replenish that reservation; dispatch consumes its pending
+request. The selected route's admitted thinking capability controls the recovery
+request. Only positively supported thinking suppression uses the short recovery
+slice; low effort, mandatory thinking and preserved exact controls retain the
+ordinary provider budget, always clamped by the run's original deadline. A
+recovery cannot start host continuations or silently switch models.
+
+Scheduling the recovery publishes a lifecycle observation before the next
+provider wait. If that bounded recovery also fails, the interruption retains
+its provider cause and existing progress/checkpoint facts, and requires an
+explicit provider retry or authorized model selection. Its only remedy must not
+be another indistinguishable instruction to continue. This observation grants
+neither execution authority nor another retry. Final error exits close the
+current inner step through the shared finalization owner, including admission
+and guidance failures; they do not create a step if none began.
+
 ## Source API retirement
 
 The unused `LoopDispatcher` source API is retired; production hosts invoke the

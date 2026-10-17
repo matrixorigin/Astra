@@ -1506,6 +1506,7 @@ fn is_step_event_type(value: &serde_json::Value) -> bool {
                     | "StepRetried"
                     | "LlmRoundStarted"
                     | "LlmRoundCompleted"
+                    | "LlmRoundFailed"
                     | "ToolCallStarted"
                     | "ToolCallCompleted"
                     | "ToolCallFailed"
@@ -3473,6 +3474,29 @@ mod tests {
         assert_eq!(stats.turn_rounds, 1);
         assert_eq!(stats.total_tool_calls, 1);
         assert_eq!(stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn provider_failure_trace_survives_raw_and_artifact_capture() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step_events.jsonl");
+        let failure = serde_json::json!({
+            "event_id": "round-failed", "run_id": "run-1",
+            "event_type": "LlmRoundFailed", "step_id": "step-1",
+            "caused_by": ["round-started"], "created_at": 3,
+            "payload": {"error_kind": "provider_deadline", "qualified_usage": null}
+        });
+        for record in [
+            failure.clone(),
+            serde_json::json!({
+                "schema_version":2, "artifact_kind":"step_event", "payload":failure,
+            }),
+        ] {
+            std::fs::write(&path, format!("{record}\n")).unwrap();
+            let capture = load_session_from_path("current", &path).unwrap();
+            assert_eq!(capture.count_events("LlmRoundFailed"), 1);
+            assert_eq!(capture.skipped_lines, 0);
+        }
     }
 
     #[test]

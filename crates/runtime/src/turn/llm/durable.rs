@@ -2222,6 +2222,8 @@ struct TestInferenceLedgerState {
     owner_lease_lost: bool,
     owner_renewals: u32,
     #[cfg(test)]
+    provider_terminal_delay: Option<std::time::Duration>,
+    #[cfg(test)]
     scope_rejection: Option<astra_services::InferenceScopeRejection>,
     #[cfg(test)]
     admission_plans: Vec<astra_services::InferenceInvocationPlan>,
@@ -2256,6 +2258,19 @@ impl TestInferenceLedgerPersistence {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_next_provider_terminalization(&self, delay: std::time::Duration) {
+        self.lock().provider_terminal_delay = Some(delay);
+    }
+
+    #[cfg(test)]
+    async fn apply_provider_terminal_delay(&self) {
+        let delay = self.lock().provider_terminal_delay.take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     pub(crate) fn assert_quiescent(&self) {
@@ -2303,7 +2318,7 @@ impl TestInferenceLedgerPersistence {
     }
 
     #[cfg(test)]
-    fn is_quiescent(&self) -> bool {
+    pub(crate) fn is_quiescent(&self) -> bool {
         let state = self.lock();
         state
             .invocations
@@ -2720,6 +2735,8 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
         attempt: &astra_services::InferenceProviderAttemptPlan,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> astra_services::ServiceResult<()> {
+        #[cfg(test)]
+        self.apply_provider_terminal_delay().await;
         let mut state = self.lock();
         let attempt_state = state
             .attempts
@@ -2754,6 +2771,8 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
                 "combined test inference settlement requires a successful terminal",
             ));
         }
+        #[cfg(test)]
+        self.apply_provider_terminal_delay().await;
         let mut state = self.lock();
         let provider_attempt = state
             .attempts

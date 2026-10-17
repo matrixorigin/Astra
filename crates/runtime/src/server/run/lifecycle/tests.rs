@@ -29720,11 +29720,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         .original
         .provider_adaptation
         .output_cap_action_first_pending = true;
-    facts
-        .original
-        .provider_adaptation
-        .action_convergence_attempted = true;
-    facts.original.provider_adaptation.force_next_thinking_off = true;
+    facts.original.provider_adaptation.safe_recovery_attempted = true;
+    facts.original.provider_adaptation.safe_recovery_pending = true;
     facts.original.skill_produced_output = true;
     facts.original.skill_execution.effort = Some(crate::skills::manifest::EffortLevel::High);
     facts.original.skill_execution.sandbox_policy = Some(
@@ -29860,8 +29857,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert!(state.hooks.completion_settlement.text_only);
     assert_eq!(state.error_recovery.consecutive_same_error, 2);
     assert!(state.provider_adaptation.output_cap_action_first_pending);
-    assert!(state.provider_adaptation.action_convergence_attempted);
-    assert!(state.provider_adaptation.force_next_thinking_off);
+    assert!(state.provider_adaptation.safe_recovery_attempted);
+    assert!(state.provider_adaptation.safe_recovery_pending);
     assert!(state.skill_produced_output);
     assert_eq!(
         serde_json::to_value(&state.skills.execution).unwrap(),
@@ -29889,7 +29886,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(restored.total_cache_read, 101);
     assert_eq!(restored.session_turn, 7);
     assert_eq!(restored.message, "original task");
-    assert!(restored.provider_adaptation.action_convergence_attempted);
+    assert!(restored.provider_adaptation.safe_recovery_attempted);
     assert!(restored.skill_produced_output);
     assert_eq!(serde_json::to_value(restored).unwrap(), wire);
     for field in wire.as_object().unwrap().keys() {

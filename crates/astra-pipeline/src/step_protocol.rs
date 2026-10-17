@@ -1357,6 +1357,8 @@ pub enum StepEventType {
 
     LlmRoundStarted,
     LlmRoundCompleted,
+    /// A provider call ended without a usable response. Usage may be unknown.
+    LlmRoundFailed,
 
     ToolCallStarted,
     ToolCallCompleted,

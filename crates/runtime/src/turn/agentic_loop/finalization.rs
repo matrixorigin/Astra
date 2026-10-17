@@ -518,6 +518,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Keep the shared loop's large suspended state out of every caller's
     // future. This remains the same task and cancellation/drop boundary.
     let result = Box::pin(run_agentic_loop_impl(host, state)).await;
+    // Every terminal error closes the actual inner step, including early
+    // admission/guidance exits. Recovery/continuation keeps its own boundary.
+    if result.is_err() && state.step_recorder.current_step().is_some() {
+        state.step_recorder.end_turn(false);
+    }
     let input_wait_continuation = matches!(result, Ok(AgenticLoopOutcome::Waiting(_)))
         && matches!(state.loop_entry, super::host::LoopEntry::InputWait { .. });
     let cancellation_exit = matches!(result, Ok(AgenticLoopOutcome::Cancelled))
