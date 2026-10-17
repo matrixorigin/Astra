@@ -577,8 +577,10 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn binding_cleanup_failure_preserves_cumulative_stream_telemetry() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let first = format!("telemetry-bind-first-{}", uuid::Uuid::new_v4());
         let second = format!("telemetry-bind-second-{}", uuid::Uuid::new_v4());
@@ -867,8 +869,10 @@ mod tests {
         assert!(!is_settled_stdout_closure(&concurrent_hard_error));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn binding_failure_cancels_the_exact_run_and_reports_settled_failure() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -917,8 +921,10 @@ mod tests {
         assert_eq!(settled.partial.remote_cancel_run_id, None);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn cancel_transport_failure_preserves_unsettled_remote_owner_and_session_lease() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -970,36 +976,46 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn exact_cancel_retries_transient_failure_until_settled_while_lease_is_held() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         #[derive(Clone)]
-        struct SettleOnSecondCall(std::sync::Arc<AtomicUsize>);
+        struct SettleWhenAllowed {
+            calls: std::sync::Arc<AtomicUsize>,
+            allow_settlement: std::sync::Arc<AtomicBool>,
+        }
 
-        impl Respond for SettleOnSecondCall {
+        impl Respond for SettleWhenAllowed {
             fn respond(&self, _request: &Request) -> ResponseTemplate {
-                let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if call == 1 {
                     return ResponseTemplate::new(503);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "run_id": "run-session-binding",
-                    "execution_settled": true,
+                    "execution_settled": self.allow_settlement.load(Ordering::SeqCst),
                 }))
             }
         }
 
         let server = MockServer::start().await;
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        // Hold the execution-settlement fact until the assertion, rather than
+        // relying on a 100ms scheduling window under parallel test load.
+        let allow_settlement = std::sync::Arc::new(AtomicBool::new(false));
         Mock::given(method("DELETE"))
             .and(path("/chat/runs/run-session-binding"))
             .and(header("authorization", "Bearer token"))
-            .respond_with(SettleOnSecondCall(calls.clone()))
-            .expect(2)
+            .respond_with(SettleWhenAllowed {
+                calls: calls.clone(),
+                allow_settlement: allow_settlement.clone(),
+            })
+            .expect(2..)
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -1022,6 +1038,7 @@ mod tests {
                 .is_err(),
             "the session lease must remain held throughout cancel-and-settle"
         );
+        allow_settlement.store(true, Ordering::SeqCst);
         task.await.unwrap().unwrap();
         astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
             .expect("settled request releases its lease");
