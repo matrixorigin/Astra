@@ -7046,12 +7046,19 @@ pub(crate) mod tests {
         let mut host = MockHost::new(Vec::new());
         host.hydration_error = true;
         let mut state = make_test_loop_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(hub.clone());
         let error = run_agentic_loop_with_host(&mut host, &mut state)
             .await
             .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert_eq!(state.charged_iterations, 0);
         assert_eq!(host.turn_count(), 0);
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert!(
+            matches!(&signals[0].signal_type, astra_core::feedback::SignalType::TaskFailure { reason } if reason.contains("WAL unavailable"))
+        );
     }
 
     #[tokio::test]
@@ -10121,10 +10128,18 @@ pub(crate) mod tests {
     async fn cancel_flag_none_does_not_cancel() {
         let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
         let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(hub.clone());
         state.cancellation.flag = None; // default
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
         assert_eq!(state.final_text, "ok");
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert_eq!(
+            signals[0].signal_type,
+            astra_core::feedback::SignalType::TaskSuccess
+        );
     }
 
     #[tokio::test]
@@ -10143,12 +10158,20 @@ pub(crate) mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         let mut host = MockHost::new(vec![text_result("should not run", 10, 5, Some(42))]);
         let mut state = make_state();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(hub.clone());
         state.cancellation.flag = Some(flag);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
         // No turns executed — host never called
         assert_eq!(host.current_turn, 0);
         assert!(state.final_text.is_empty());
+        let signals = hub.recent_feedback_signals();
+        assert_eq!(signals.len(), 1, "{signals:?}");
+        assert_eq!(
+            signals[0].signal_type,
+            astra_core::feedback::SignalType::Interruption
+        );
     }
 
     #[tokio::test]

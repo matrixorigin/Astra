@@ -404,6 +404,9 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
         )))
         .build();
     let mut state = create_durable_execution_test_state("empty-recovery");
+    let hub = Arc::new(crate::observability::ObservabilityHub::new());
+    state.telemetry.observability_session = Some(hub.start_session("empty-user", "empty-recovery"));
+    state.telemetry.observability_hub = Some(hub.clone());
     state
         .messages
         .push(json!({"role":"user","content":"finish the supplied request"}));
@@ -431,6 +434,18 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
     }
     ledger.assert_quiescent();
     provider.assert_complete();
+    let signals: Vec<_> = hub
+        .recent_feedback_signals()
+        .into_iter()
+        .filter(|signal| signal.turn_id == state.current_run_id)
+        .collect();
+    assert_eq!(signals.len(), 1, "{signals:?}");
+    assert_eq!(
+        signals[0].signal_type,
+        astra_core::feedback::SignalType::Interruption
+    );
+    assert_eq!(signals[0].turn_id, state.current_run_id);
+    assert_eq!(signals[0].context["session_id"], "empty-recovery");
 }
 
 #[tokio::test(flavor = "current_thread")]

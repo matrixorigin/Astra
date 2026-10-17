@@ -17,6 +17,11 @@ execution path; shared turn-evaluation thresholds and telemetry remain intact.
 - Improvement proposals must pass evaluation before activation.
 - Feedback must respect privacy, consent, and deletion.
 
+Run-outcome feedback projects the producer-owned terminal interruption record.
+A graceful `Completed` loop return with an interruption records `Interruption`;
+only uninterrupted completion records `TaskSuccess`. Failure and cancellation
+retain their distinct typed outcome signals and existing attribution.
+
 The retired public learning routes retain no request/response projections or
 trigger defaults. Their absence remains an HTTP contract; real evaluation,
 lesson storage, and feedback admission keep their existing owners.

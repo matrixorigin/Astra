@@ -109,8 +109,14 @@ pub(crate) fn record_loop_completion_feedback(
     // ── 1. Outcome signal ──
     match result {
         Ok(AgenticLoopOutcome::Completed) => {
+            // Graceful loop termination retains the producer's interruption truth.
+            let signal_type = if state.interruption.is_some() {
+                SignalType::Interruption
+            } else {
+                SignalType::TaskSuccess
+            };
             hub.record_feedback(enrich_signal(
-                FeedbackSignal::new(SignalType::TaskSuccess).with_turn(&turn_id),
+                FeedbackSignal::new(signal_type).with_turn(&turn_id),
             ));
         }
         Ok(AgenticLoopOutcome::Delegated) => {
