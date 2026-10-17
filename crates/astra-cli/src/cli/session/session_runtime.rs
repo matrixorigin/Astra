@@ -1313,9 +1313,7 @@ pub(crate) async fn capture_admitted_auth_owner(
         }
     } else {
         let profile_name = owner.profile_name.as_deref()?;
-        if owner.legacy_binding.is_none() {
-            return None;
-        }
+        owner.legacy_binding.as_ref()?;
         // Verify the supplied admitted bearer actually belongs to this
         // captured owner's binding; never infer ownership from the profile
         // name alone.
