@@ -44,6 +44,7 @@ vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
 import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { WorkTurnComposer } from "@/components/app/work-turn-composer";
+import { ToastProvider } from "@/components/ui/toast";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -73,6 +74,25 @@ test("keeps continuation unavailable without a durable attachment", () => {
   expect(screen.getByRole("button", { name: "Send guidance" })).toBeDisabled();
   expect(screen.getByPlaceholderText(/Reconnect to continue/i)).toBeInTheDocument();
   expect(streamHarness.instances).toHaveLength(0);
+});
+
+test("shows hook configuration warnings and continues the same Work turn", async () => {
+  render(<ToastProvider><WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" /></ToastProvider>);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Continue" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const client = streamHarness.instances[0]!;
+  const message = "Hook configuration .astra/hooks.json at hooks[0].event: invalid event";
+  act(() => {
+    client.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "run-1" });
+    client.options.onEvent({ type: "warning", code: "hook_configuration", message });
+    client.options.onEvent({ type: "text_delta", content: "answer" });
+  });
+  expect(screen.getByRole("alert")).toHaveTextContent(message);
+  expect(client.close).not.toHaveBeenCalled();
+  expect(screen.getByText("answer")).toBeInTheDocument();
+  act(() => client.options.onEvent({ type: "turn_complete", run_id: "run-1", assistant_text: "answer" }));
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled();
+  expect(refresh).toHaveBeenCalledOnce();
 });
 
 test("Memoria takeover requests fresh verification and submits no password", async () => {
