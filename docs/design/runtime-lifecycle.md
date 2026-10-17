@@ -552,6 +552,27 @@ process termination. Missing execution evidence retains the existing cleanup
 deadline and workspace quarantine. Complete cooperative cleanup convergence
 requires a provider-owned settlement contract beyond the one-way notification.
 
+Agent Binding HTTP admits a result or provider error only from a JSON-RPC 2.0
+response with the exact, typed protocol request ID of that exchange. SSE
+notifications and other request IDs cannot settle it. A missing/mismatched ID,
+malformed envelope or disconnected transport retains unknown-outcome handling;
+even a response carrying `astra.workspace_effect.settled` cannot discharge a
+different invocation. A correlated completion still requires the existing
+workspace-effect marker and valid workspace receipt authority before releasing
+a workspace-mutating call. Correlation does not independently prove provider
+cleanup or make a cancellation acknowledgement into a completion receipt.
+
+The MOI receiving boundary is outside Astra. Matrixflow
+[PR #18920](https://github.com/matrixorigin/matrixflow/pull/18920) adds protocol-ID
+propagation and authenticated, process-local cooperative cancellation; it does
+not establish remote execution settlement. The remaining gateway/provider
+contract must reach the exact invocation owner across replica and
+ownership-generation changes. That owner must cancel and
+settle its execution boundary, expose idempotent owner-scoped readback, and
+verify subprocess termination/reaping and absence of later writes. Astra's
+sender and response validation do not supply those receiving/provider facts;
+unknown outcomes keep the current cleanup deadline and quarantine protection.
+
 ### Session cancellation convergence
 
 `POST /sessions/{id}/cancel` accepts cancellation through the canonical Run
