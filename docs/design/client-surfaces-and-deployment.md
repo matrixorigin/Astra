@@ -96,6 +96,16 @@ display cells. Native MOI login uses a short `MOI` display label, not its intern
 credential profile identifier. Narrow or short terminals use a static presentation;
 animated frames must not wrap and invalidate cursor-up row accounting.
 
+Mutable assistant replies use a bounded Markdown tail in both the main viewport
+and the Ctrl+O transcript. When the byte window or rendered-row budget omits earlier
+text, a preview-only notice occupies one row within that same budget; its wording
+shortens to fit narrow terminals. The complete received source remains unchanged.
+Once output settles, the complete reply becomes available in the transcript and
+is queued for native scrollback through the existing background layout and bounded
+drain, independently of the statistics footer. A still-live tool prevents premature
+settlement. The notice does not imply a model context limit, and Ctrl+O does not
+provide the complete reply while it is still streaming.
+
 Inline terminal resize reconciles the viewport with the terminal's cursor
 position before clearing and repainting. The existing crossterm input owner
 pauses its reusable event stream with an acknowledged worker handoff for a

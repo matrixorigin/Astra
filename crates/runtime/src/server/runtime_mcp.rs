@@ -979,6 +979,10 @@ async fn post_agent_binding_mcp_rpc_with_risk(
     timeout: Duration,
     risk: AgentBindingMcpRpcRisk,
 ) -> Result<Value, AgentBindingMcpRpcError> {
+    let request_id = payload
+        .get("id")
+        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+        .ok_or_else(|| agent_binding_mcp_rpc_error("Agent Binding MCP request missing valid id"))?;
     let _permit = crate::capability_endpoint_pool::try_acquire_endpoint_permit(endpoint_url)
         .map_err(agent_binding_mcp_rpc_error)?;
 
@@ -1019,7 +1023,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
     })??;
 
     if !status.is_success() {
-        if let Err(error) = decode_agent_binding_mcp_rpc_response(&body)
+        if let Err(error) = decode_agent_binding_mcp_rpc_response(&body, request_id)
             && error.provider_acknowledged
         {
             return Err(error);
@@ -1030,7 +1034,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
         .after_send(risk));
     }
 
-    decode_agent_binding_mcp_rpc_response(&body).map_err(|error| error.after_send(risk))
+    decode_agent_binding_mcp_rpc_response(&body, request_id).map_err(|error| error.after_send(risk))
 }
 
 async fn notify_agent_binding_mcp_cancelled(
@@ -1066,21 +1070,24 @@ async fn notify_agent_binding_mcp_cancelled(
     Ok(())
 }
 
-fn decode_agent_binding_mcp_rpc_response(body: &str) -> Result<Value, AgentBindingMcpRpcError> {
+fn decode_agent_binding_mcp_rpc_response(
+    body: &str,
+    request_id: &Value,
+) -> Result<Value, AgentBindingMcpRpcError> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
-        return json_rpc_result(value);
+        return json_rpc_result(value, request_id);
     }
 
     for value in sse_json_values(body) {
-        match json_rpc_result(value) {
-            Ok(result) => return Ok(result),
-            Err(error) if error.detail.contains("JSON-RPC error") => return Err(error),
-            Err(_) => continue,
+        // A stream may include notifications, server requests and responses
+        // for other exchanges. Only a response can settle this exchange.
+        if value.get("method").is_none() && value.get("id") == Some(request_id) {
+            return json_rpc_result(value, request_id);
         }
     }
 
     Err(agent_binding_mcp_rpc_error(
-        "Agent Binding MCP response was neither JSON-RPC JSON nor SSE JSON-RPC data",
+        "Agent Binding MCP response did not contain a matching JSON-RPC response",
     ))
 }
 
@@ -1093,8 +1100,27 @@ fn sse_json_values(body: &str) -> Vec<Value> {
         .collect()
 }
 
-fn json_rpc_result(value: Value) -> Result<Value, AgentBindingMcpRpcError> {
+fn json_rpc_result(value: Value, request_id: &Value) -> Result<Value, AgentBindingMcpRpcError> {
+    // An authenticated HTTP response alone does not establish which invocation
+    // completed. Validate correlation before admitting provider acknowledgement
+    // or workspace-effect settlement metadata from the result.
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || value.get("id") != Some(request_id)
+        || value.get("method").is_some()
+        || value.get("result").is_some() == value.get("error").is_some()
+    {
+        return Err(agent_binding_mcp_rpc_error(
+            "Agent Binding MCP response has an invalid envelope or mismatched request id",
+        ));
+    }
     if let Some(error) = value.get("error") {
+        if error.get("code").and_then(Value::as_i64).is_none()
+            || error.get("message").and_then(Value::as_str).is_none()
+        {
+            return Err(agent_binding_mcp_rpc_error(
+                "Agent Binding MCP response has an invalid JSON-RPC error",
+            ));
+        }
         let code = error
             .get("code")
             .map(Value::to_string)
@@ -1854,6 +1880,214 @@ fn build_agent_binding_mcp_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_binding_response_correlation_precedes_acknowledgement() {
+        let id = json!("current-exchange");
+        for value in [
+            json!({"jsonrpc":"2.0", "id":"old-exchange", "result":{"_meta":{"astra.workspace_effect":{"settled":true}}}}),
+            json!({"jsonrpc":"2.0", "id":"old-exchange", "error":{"code":-32000,"message":"cancelled"}}),
+            json!({"jsonrpc":"2.0", "result":{}}),
+            json!({"jsonrpc":"2.0", "id":null, "result":{}}),
+            json!({"jsonrpc":"1.0", "id":id, "result":{}}),
+            json!({"jsonrpc":"2.0", "id":id, "result":{}, "error":{"code":-32000,"message":"cancelled"}}),
+            json!({"jsonrpc":"2.0", "id":id, "error":"cancelled"}),
+            json!({"jsonrpc":"2.0", "id":id, "method":"ping", "result":{}}),
+        ] {
+            let error = decode_agent_binding_mcp_rpc_response(&value.to_string(), &id)
+                .expect_err("foreign or malformed response cannot settle this exchange")
+                .after_send(AgentBindingMcpRpcRisk::ToolInvocation);
+            assert!(!error.provider_acknowledged);
+            assert!(error.side_effects_maybe());
+        }
+        let stream = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"current-exchange\",\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"old-exchange\",\"error\":{\"code\":-32000,\"message\":\"old error\"}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"current-exchange\",\"result\":{\"current\":true}}\n\n",
+        );
+        assert_eq!(
+            decode_agent_binding_mcp_rpc_response(stream, &id).unwrap(),
+            json!({"current":true})
+        );
+        let matching_error =
+            json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32000,"message":"rejected"}});
+        assert!(
+            decode_agent_binding_mcp_rpc_response(&matching_error.to_string(), &id)
+                .unwrap_err()
+                .provider_acknowledged
+        );
+        // JSON-RPC identity is typed; numeric 1 and string "1" differ.
+        assert!(
+            decode_agent_binding_mcp_rpc_response(
+                r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                &json!("1"),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_binding_http_errors_and_disconnect_preserve_unknown_effects() {
+        use axum::{Router, routing::post};
+        use tokio::io::AsyncReadExt;
+        for status in [StatusCode::OK, StatusCode::BAD_GATEWAY] {
+            for matching in [false, true] {
+                let app = Router::new().route("/mcp", post(move |Json(body): Json<Value>| async move {
+                    (status, Json(json!({"jsonrpc":"2.0", "id":if matching {body["id"].clone()} else {json!("old-request")}, "error":{"code":-32000,"message":"fixture rejection"}})))
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let error = post_agent_binding_mcp_rpc_with_risk(
+                    &endpoint,
+                    "Bearer fixture",
+                    json!({"jsonrpc":"2.0","id":"current-request","method":"tools/call"}),
+                    Duration::from_secs(2),
+                    AgentBindingMcpRpcRisk::ToolInvocation,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.provider_acknowledged, matching);
+                assert_eq!(error.side_effects_maybe(), !matching);
+                server.abort();
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let disconnected = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).await.unwrap() > 0);
+            // The request reached the receiver, which then disappears without
+            // any terminal response. Do not infer stopped effects from EOF.
+        });
+        let error = post_agent_binding_mcp_rpc_with_risk(
+            &endpoint,
+            "Bearer fixture",
+            json!({"jsonrpc":"2.0","id":"disconnect-request","method":"tools/call"}),
+            Duration::from_secs(2),
+            AgentBindingMcpRpcRisk::ToolInvocation,
+        )
+        .await
+        .unwrap_err();
+        disconnected.await.unwrap();
+        assert!(error.side_effects_maybe());
+        assert!(!error.provider_acknowledged);
+    }
+
+    #[tokio::test]
+    async fn agent_binding_cancel_ack_waits_for_correlated_completion_or_unknown_outcome() {
+        use axum::{Router, routing::post};
+        use tokio::sync::Notify;
+        use tokio_util::sync::CancellationToken;
+
+        for (notification_status, matching_response) in [
+            (Some(StatusCode::ACCEPTED), true),
+            (Some(StatusCode::NOT_IMPLEMENTED), true),
+            (None, true),
+            (Some(StatusCode::ACCEPTED), false),
+        ] {
+            let started = Arc::new(Notify::new());
+            let notified = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let request_id = Arc::new(std::sync::Mutex::new(Value::Null));
+            let cancel_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("fake-provider-write");
+            let app = Router::new().route("/mcp", post({
+                let (started, notified, release, request_id, cancel_count, marker) = (
+                    started.clone(), notified.clone(), release.clone(), request_id.clone(), cancel_count.clone(), marker.clone(),
+                );
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let (started, notified, release, request_id, cancel_count, marker) = (
+                        started.clone(), notified.clone(), release.clone(), request_id.clone(), cancel_count.clone(), marker.clone(),
+                    );
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer local-fixture");
+                        match body["method"].as_str().unwrap() {
+                            "tools/call" => {
+                                *request_id.lock().unwrap() = body["id"].clone();
+                                started.notify_one();
+                                release.notified().await;
+                                // A fake provider can still write after accepting
+                                // cancellation. Only its later matching completion
+                                // can carry settlement evidence for this request.
+                                tokio::fs::write(marker, "late fake effect").await.unwrap();
+                                (StatusCode::OK, Json(json!({
+                                    "jsonrpc":"2.0",
+                                    "id":if matching_response { body["id"].clone() } else { json!("stale-exchange") },
+                                    "result":{"content":[{"type":"text","text":"complete"}],"_meta":{"astra.workspace_effect":{"settled":true}}},
+                                })))
+                            }
+                            "notifications/cancelled" => {
+                                assert_eq!(body["params"]["requestId"], *request_id.lock().unwrap());
+                                cancel_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                notified.notify_one();
+                                let status = match notification_status {
+                                    Some(status) => status,
+                                    None => std::future::pending().await,
+                                };
+                                (status, Json(Value::Null))
+                            }
+                            other => panic!("unexpected method: {other}"),
+                        }
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+                "fixture", &endpoint, "Bearer local-fixture", None,
+                &[json!({"name":"write", "inputSchema":{"type":"object"}, "side_effect_class":"write"})],
+            ).unwrap();
+            let runtime = bundle.agent_binding_mcp.as_ref().unwrap();
+            let token = CancellationToken::new();
+            let args = json!({});
+            let call = runtime.call_tool_by_mcp_name(
+                "mcp__fixture__write",
+                &args,
+                "business-call",
+                None,
+                None,
+                Some(&token),
+            );
+            tokio::pin!(call);
+            tokio::select! {
+                result = &mut call => panic!("returned before dispatch: {result:?}"),
+                () = started.notified() => {},
+                () = tokio::time::sleep(Duration::from_secs(2)) => panic!("dispatch timed out"),
+            }
+            token.cancel();
+            token.cancel();
+            tokio::select! {
+                result = &mut call => panic!("notification settled execution: {result:?}"),
+                () = notified.notified() => {},
+                () = tokio::time::sleep(Duration::from_secs(2)) => panic!("notification timed out"),
+            }
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            assert!(!marker.exists());
+            release.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut call)
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::fs::read_to_string(marker).await.unwrap(),
+                "late fake effect"
+            );
+            if matching_response {
+                assert!(result.unwrap().workspace_effect_is_settled());
+            } else {
+                let error =
+                    result.expect_err("stale settlement cannot discharge current execution");
+                assert!(error.side_effects_maybe());
+                assert!(!error.provider_acknowledged);
+            }
+            assert_eq!(cancel_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
 
     #[test]
     fn prepares_agent_binding_mcp_bundle_from_frozen_snapshot() {

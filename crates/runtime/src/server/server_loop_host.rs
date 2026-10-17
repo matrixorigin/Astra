@@ -1216,10 +1216,9 @@ fn apply_pre_turn_summary(
     let candidate = crate::turn::cloud::compaction::prepare_prefix_summary(
         &state.messages,
         spill_count,
-        serde_json::json!({
-            "role": "system",
-            "content": format!("[Conversation compacted — {} messages summarized]\n\n{}", spill_count, summary_text),
-        }),
+        astra_turn_core::cloud::history_summary::history_summary_message(format!(
+            "[Conversation compacted — {spill_count} messages summarized]\n\n{summary_text}"
+        )),
         state.pinned_tool_schema_tokens as usize,
         max_tokens,
         crate::prompts::measured_prompt_tokens_from_manifest(
@@ -3943,6 +3942,10 @@ pub struct ServerAgenticLoopHost {
     test_judgment_clients:
         std::collections::VecDeque<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
 
+    /// Inject only the inference boundary in offline compaction regressions.
+    #[cfg(test)]
+    test_compaction_client: Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>>,
+
     // ── Fork-prefix parent capture (G2) ──
     /// Optional fork-prefix store. When wired, `on_turn_completed`
     /// captures the parent turn's
@@ -6280,6 +6283,8 @@ impl ServerAgenticLoopHostBuilder {
             memoria_client: self.memoria_client,
             #[cfg(test)]
             test_judgment_clients: self.test_judgment_clients,
+            #[cfg(test)]
+            test_compaction_client: None,
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
             disabled_tool_offers: self
@@ -11818,6 +11823,23 @@ impl ServerAgenticLoopHost {
         self.remember_resolved_llm_config(&llm_cfg);
         self.durable_summary_client(&llm_cfg, max_output_tokens, state, operation_id)
             .map(|client| Box::new(client) as Box<_>)
+    }
+
+    fn pre_turn_summary_client(
+        &mut self,
+        config: &ResolvedTurnLlmConfig,
+        state: &AgenticLoopState,
+        tools: Vec<Value>,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        #[cfg(test)]
+        if let Some(client) = self.test_compaction_client.take() {
+            return Some(client);
+        }
+        Some(Box::new(
+            self.durable_summary_client(config, 4096, state, "pre_turn_compaction")?
+                .with_prompt_cache_context(tools, cache_capability),
+        ))
     }
 
     fn durable_summary_client(
@@ -22812,9 +22834,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // select a different schema prefix and defeat inline reuse.
             state.sticky_tool_schemas.clone()
         };
-        let client = self
-            .durable_summary_client(&config, 4096, state, "pre_turn_compaction")?
-            .with_prompt_cache_context(summary_tools, cache_capability);
+        let client =
+            self.pre_turn_summary_client(&config, state, summary_tools, cache_capability)?;
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         if spill_count == 0 {
             state.compaction_effectiveness.record_futile();
@@ -22837,7 +22858,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::Semantic
             },
-            &client,
+            client.as_ref(),
         )
         .await
         {
@@ -37775,6 +37796,198 @@ mod tests {
         );
     }
 
+    struct ContinuitySummaryClient {
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    const CONTINUITY_FACT: &str = "HISTORICAL_CONSTRAINT_SENTINEL_42";
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for ContinuitySummaryClient {
+        async fn summarize(
+            &self,
+            purpose: astra_turn_types::InferencePurpose,
+            messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            assert_eq!(
+                purpose,
+                astra_turn_types::InferencePurpose::RequiredCompaction
+            );
+            self.requests.lock().unwrap().push(messages.to_vec());
+            // A replacement can retain the fact only when the actual request
+            // supplied it. Structural validity alone must not make this pass.
+            let fact = if serde_json::to_string(messages)
+                .unwrap()
+                .contains(CONTINUITY_FACT)
+            {
+                CONTINUITY_FACT
+            } else {
+                "historical constraint was unavailable"
+            };
+            Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                text: format!(
+                    "### Primary Request\n{fact}\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress"
+                ),
+                is_ptl_error: false,
+                model_used: "recording-fixture".into(),
+                finish_reason: Some("stop".into()),
+                usage: Map::new(),
+                qualified_usage: None,
+                judgment_provenance: None,
+                execution: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn pre_turn_summary_continuity_survives_three_generations_and_resume() {
+        use crate::turn::agentic_loop::host::AgenticLoopHost;
+        use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+        use astra_turn_core::cloud::history_summary::{
+            HISTORY_SUMMARY_FIELD, history_summary_text,
+        };
+
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+        for append_only in [false, true] {
+            let mut host = test_host_builder("summary-owner", "summary-session")
+                .with_admitted_model_execution(Some(test_gateway_execution(
+                    "http://127.0.0.1:1/unused",
+                    Some(1_000),
+                )))
+                .build();
+            let mut config = summary_test_config("http://127.0.0.1:1/unused".into());
+            config.model_name = "gpt-5-mini".into();
+            config.cache_capability = Some(CacheCapability {
+                volatile_placement: if append_only {
+                    VolatilePlacement::AppendOnlyUserTail
+                } else {
+                    VolatilePlacement::TailSuffix
+                },
+                ..CacheCapability::for_provider("openai")
+            });
+            host.remember_resolved_llm_config(&config);
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut state = create_test_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages = vec![
+                json!({"role":"system", "content":"HISTORY_STABLE_INSTRUCTION_MUST_NOT_BE_SUMMARIZED"}),
+                json!({"role":"user", "content":CONTINUITY_FACT}),
+                json!({"role":"assistant", "content":"Acknowledged"}),
+            ];
+
+            for generation in 0..3 {
+                state.compact_tier_applied = CompactionTier::Normal;
+                for round in 0..6 {
+                    let id = format!("summary-{generation}-{round}");
+                    state.messages.extend([
+                        json!({"role":"user", "content":format!("Continue {generation}/{round}: {}", "task context ".repeat(120))}),
+                        json!({"role":"assistant", "content":"Inspect evidence", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+                        json!({"role":"tool", "tool_call_id":id, "content":"observed evidence ".repeat(180)}),
+                        json!({"role":"assistant", "content":"Decision based on evidence"}),
+                    ]);
+                }
+                let active_control = format!("ACTIVE_RUNTIME_AUTHORITY_SENTINEL_{generation}");
+                let authority =
+                    crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                        &active_control,
+                        crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                        astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                    )
+                    .unwrap()
+                    .unwrap();
+                state.messages.push(authority.clone());
+                let before = state.messages.clone();
+                state.initialize_canonical_rewrite_proof(
+                    &before,
+                    &astra_turn_types::canonical_conversation_root(&before),
+                    generation,
+                );
+                let spill = pre_turn_summary_spill_count(&before);
+                assert!(spill > 0);
+                let suffix = before[spill..].to_vec();
+                host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                    requests: requests.clone(),
+                }));
+                let event = host
+                    .maybe_pre_turn_compact(&mut state, 0.95)
+                    .await
+                    .unwrap_or_else(|| panic!(
+                        "pre-turn compaction not accepted: append_only={append_only}, generation={generation}, spill={spill}, summary_requests={}",
+                        requests.lock().unwrap().len(),
+                    ));
+                assert!(event.tokens_freed > 0);
+                assert_eq!(event.tokens_before - event.tokens_after, event.tokens_freed);
+                assert_eq!(&state.messages[1..], suffix.as_slice());
+                assert_eq!(state.messages.last(), Some(&authority));
+                assert!(
+                    history_summary_text(&state.messages[0])
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                astra_turn_types::validate_canonical_tool_pairing(&state.messages).unwrap();
+
+                let request = requests.lock().unwrap().last().unwrap().clone();
+                let serialized = serde_json::to_string(&request).unwrap();
+                assert!(
+                    serialized.contains(CONTINUITY_FACT),
+                    "generation {generation}"
+                );
+                assert!(!serialized.contains("HISTORY_STABLE_INSTRUCTION_MUST_NOT_BE_SUMMARIZED"));
+                assert!(!serialized.contains(&active_control));
+                if !append_only {
+                    assert!(!serialized.contains("ACTIVE_RUNTIME_AUTHORITY_SENTINEL"));
+                }
+                if generation > 0 {
+                    let evidence = request
+                        .iter()
+                        .find(|m| {
+                            m["content"]
+                                .as_str()
+                                .is_some_and(|s| s.contains(CONTINUITY_FACT))
+                        })
+                        .unwrap();
+                    assert_eq!(evidence["role"], "assistant");
+                }
+                astra_turn_types::validate_canonical_tool_pairing(&request).unwrap();
+
+                // Exercise the canonical replacement and continuation owners,
+                // not a JSON-only round trip. Resume the second generation
+                // from the exact unmarked envelope persisted by older builds.
+                let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &before,
+                    true,
+                    &state.messages,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+                let mut committed: Vec<Value> = packs.into_iter().flatten().collect();
+                assert_eq!(committed[0][HISTORY_SUMMARY_FIELD], 1);
+                if generation == 0 {
+                    committed[0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(HISTORY_SUMMARY_FIELD);
+                }
+                let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+                assert!(
+                    history_summary_text(&restored[0])
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                assert_eq!(restored.last(), Some(&authority));
+                state = create_test_state();
+                state.max_turn_input_tokens = 100_000;
+                state.messages = restored;
+            }
+            assert_eq!(requests.lock().unwrap().len(), 3);
+        }
+    }
+
     #[test]
     fn pre_turn_summary_event_matches_the_applied_state_mutation() {
         let mut state = create_test_state();
@@ -37875,6 +38088,11 @@ mod tests {
     fn pre_turn_summary_rejects_a_summary_that_does_not_reduce_tokens() {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 20_000;
+        state.messages.push(
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "ONLY_PRIOR_SUMMARY_FACT".into(),
+            ),
+        );
         for index in 0..12 {
             state.messages.push(json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },

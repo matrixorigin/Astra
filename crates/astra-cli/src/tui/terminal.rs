@@ -815,7 +815,7 @@ mod tests {
                 .join("\n\n"),
         ));
         let mut pending = VecDeque::from([PendingHistory::Assistant(QueuedAssistantHistory {
-            cell,
+            cell: Arc::clone(&cell),
             width: 80,
             next_line: 0,
             layout_preparing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -828,5 +828,18 @@ mod tests {
         assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
         assert!(!pending.is_empty(), "long reply tail remains queued");
         assert!(first.iter().all(|line| line.spans[0].content == "█ "));
+
+        let mut emitted = first;
+        while !pending.is_empty() {
+            let (batch, _) = take_pending_history_batch(&mut pending);
+            assert!(batch.len() <= MAX_HISTORY_LINES_PER_DRAW);
+            assert!(!batch.is_empty() || pending.is_empty());
+            emitted.extend(batch);
+        }
+        assert_eq!(
+            emitted,
+            cell.display_lines(80),
+            "bounded drains preserve every row exactly once"
+        );
     }
 }

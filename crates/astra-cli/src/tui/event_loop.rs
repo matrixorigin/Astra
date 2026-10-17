@@ -15381,6 +15381,106 @@ mod tests {
     }
 
     #[test]
+    fn output_settlement_hands_full_reply_to_scrollback_before_turn_footer() {
+        use history_cell::{HistoryCell, assistant::AssistantCell};
+
+        let source = (0..120)
+            .map(|i| format!("answer-{i:03} 中文🦀  \n"))
+            .collect::<String>();
+        let mut widget = chat_widget::ChatWidget::new("");
+        for delta in source.split_inclusive('\n') {
+            widget.handle_event(
+                chat_widget::translate(
+                    TuiAppEvent::Token {
+                        model_item_id: None,
+                        text: delta.into(),
+                    },
+                    chat_widget::TurnContext::default(),
+                )
+                .unwrap(),
+            );
+        }
+        assert!(widget.drain_new_committed().is_empty());
+        let live = rendered_transcript_overlay(&widget, 80);
+        assert!(!live.contains("answer-000"));
+        assert!(live.contains("answer-119"));
+
+        let mut settled_at = None;
+        let mut pane = BottomPane::new();
+        let mut indicator = status_indicator::StatusIndicator::new();
+        let now = std::time::Instant::now();
+        // AssistantOutputSettled and TurnStreamClosed use this one-shot
+        // transition, then flush_chat_widget drains the committed cells.
+        // No TurnComplete/statistics event has arrived yet.
+        assert!(settle_visible_reply(
+            &mut settled_at,
+            &mut widget,
+            &mut pane,
+            &mut indicator,
+            now,
+        ));
+        assert!(widget.active_cell().is_none());
+        let committed = widget.drain_new_committed();
+        assert_eq!(committed.len(), 1, "no statistics footer yet");
+        let assistant = committed[0]
+            .as_any_ref()
+            .downcast_ref::<AssistantCell>()
+            .unwrap();
+        assert_eq!(assistant.source(), source);
+        assert!(!assistant.is_live());
+        let expected = AssistantCell::from_markdown(source).display_lines(80);
+        assistant.prepare_scrollback_layout(80);
+        let mut emitted = Vec::new();
+        let mut start = 0;
+        loop {
+            let (chunk, next, complete) = assistant.scrollback_lines_chunk(80, start, 8);
+            assert!(chunk.len() <= 8);
+            emitted.extend(chunk);
+            if complete {
+                break;
+            }
+            assert!(next > start);
+            start = next;
+        }
+        assert_eq!(
+            emitted, expected,
+            "the complete answer reaches scrollback exactly once"
+        );
+        let text = emitted
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("answer-000") && text.contains("answer-119"));
+
+        assert!(!settle_visible_reply(
+            &mut settled_at,
+            &mut widget,
+            &mut pane,
+            &mut indicator,
+            now,
+        ));
+        assert!(widget.drain_new_committed().is_empty());
+        widget.handle_event(
+            chat_widget::translate(
+                TuiAppEvent::TurnComplete,
+                chat_widget::TurnContext::default(),
+            )
+            .unwrap(),
+        );
+        let footer = widget.drain_new_committed();
+        assert_eq!(
+            footer.len(),
+            1,
+            "late statistics cannot duplicate the answer"
+        );
+        assert!(matches!(
+            footer[0].to_persist(),
+            Some(crate::tui::turn_event::TurnEvent::TurnSummary { .. })
+        ));
+    }
+
+    #[test]
     fn stream_close_while_tool_runs_does_not_release_turn_ownership() {
         let now = std::time::Instant::now();
         let mut output_settled_at = None;
@@ -22994,6 +23094,47 @@ mod tests {
             !rendered.contains("live-line-0\n"),
             "the transcript live suffix must not materialize the full reply: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn transcript_live_tail_notice_is_replaced_by_complete_text_on_settlement() {
+        use bottom_pane::transcript_view::TranscriptView;
+        use bottom_pane::view::BottomPaneView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut widget = chat_widget::ChatWidget::new("");
+        let source = (0..100)
+            .map(|i| format!("reply-{i:03}  \n"))
+            .collect::<String>();
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::AnswerDelta {
+                model_item_id: None,
+                text: source,
+            },
+        ));
+        let mut view =
+            TranscriptView::from_snapshot(transcript_snapshot(&widget, 80, vec![]), 24, 80);
+        let live = view.export_plain_lines();
+        assert!(live.len() <= 48);
+        assert!(live[0].contains("hidden"));
+        assert!(!live.join("\n").contains("reply-000"));
+        assert!(live.join("\n").contains("reply-099"));
+
+        widget.finish_stream_projection();
+        view.replace_with(transcript_snapshot(&widget, 80, vec![]), 80);
+        let complete = view.export_plain_lines().join("\n");
+        assert!(complete.contains("reply-000") && complete.contains("reply-099"));
+        assert!(!complete.contains("hidden"));
+        // The existing navigation keys can now reach either end of the
+        // complete settled reply without changing transcript semantics.
+        for (key, expected) in [(KeyCode::Home, "reply-000"), (KeyCode::End, "reply-099")] {
+            view.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+            let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            view.render(area, &mut buffer);
+            let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+            assert!(rendered.contains(expected), "{rendered}");
+        }
     }
 
     #[test]

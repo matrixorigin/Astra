@@ -142,6 +142,7 @@ pub(crate) fn adjust_spill_boundary_for_tool_pairs(
 }
 
 pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
+    let mut historical_summaries = Vec::new();
     let mut user_messages = Vec::new();
     let mut tools_used = Vec::new();
     let mut files_modified = Vec::new();
@@ -206,6 +207,10 @@ pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
     };
 
     for msg in messages {
+        if let Some(summary) = astra_turn_core::cloud::history_summary::history_summary_text(msg) {
+            historical_summaries.push(summary);
+            continue;
+        }
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
             "user" => {
@@ -274,6 +279,10 @@ pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
     }
 
     let mut summary = String::new();
+    for previous in historical_summaries {
+        summary.push_str(previous);
+        summary.push_str("\n\n");
+    }
 
     if !user_messages.is_empty() {
         summary.push_str("**User requests:**\n");
