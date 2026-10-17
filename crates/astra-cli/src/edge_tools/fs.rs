@@ -949,12 +949,9 @@ impl ToolExecutor {
     }
 
     fn str_replace_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
-        let path_arg = match args.get("path").and_then(Value::as_str) {
-            Some(p) => p,
-            None => return Err("Error: missing 'path'".to_string().into()),
-        };
-        let path = self.resolve_checked_result(path_arg)?;
         astra_tools::fs_ops::validate_str_replace_args(args).map_err(FsLeafError::Shared)?;
+        let path_arg = args["path"].as_str().expect("validated single-edit path");
+        let path = self.resolve_checked_result(path_arg)?;
         let dry_run = args
             .get("dry_run")
             .and_then(Value::as_bool)

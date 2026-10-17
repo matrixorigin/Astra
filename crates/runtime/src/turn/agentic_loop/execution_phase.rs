@@ -27136,3 +27136,7 @@ Use introspect(artifact=\"{handle}\") for earlier details."
     state.messages = candidate.messages;
     Some((freed, removed))
 }
+
+#[cfg(test)]
+#[path = "argument_rejection_tests.rs"]
+mod argument_rejection_tests;
