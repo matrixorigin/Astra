@@ -130,7 +130,7 @@ pub struct IngestionConfig {
     pub max_session_resident_bytes: u64,
     /// Max retries per batch on transient errors.
     pub max_retries: u32,
-    /// Maximum owner/session transactions this worker may execute at once.
+    /// Maximum batch transactions this worker may execute at once.
     /// The worker also leaves a small reserve in the shared SQL pool.
     pub max_concurrent_session_flushes: usize,
     /// Whole-attempt deadline, including connection acquisition and cleanup.
@@ -2142,8 +2142,8 @@ impl EventIngestionWorker {
             .saturating_sub(MIN_SHARED_POOL_CONNECTION_RESERVE)
             .max(1);
         // Keep at least half the pool outside ingestion's automatic budget.
-        // Independent session commits need enough parallelism to amortize
-        // sparse-session round trips without coupling their transaction locks.
+        // Batches amortize sparse writes but retain their session locks until
+        // commit; leave connection capacity for foreground/control requests.
         let automatic_budget = (pool_max / 2).max(1);
         config
             .max_concurrent_session_flushes
