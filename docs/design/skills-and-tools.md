@@ -57,9 +57,24 @@ warning. Definitions remain intact for existing programmatic consumers; no
 additional event dispatch is enabled. Unknown/invalid event names produce a
 field diagnostic and retain the whole-file parse-failure behavior.
 
-This diagnostic slice does not change the shared skill-lifecycle `HookAction`
-schema, unknown-field acceptance, action support, enforcement/circuit-breaker
-policy, configuration scopes, or ServerSandbox/ServerLocal selection rules.
+Unknown fields are rejected in the event-hook file wrapper (`hooks`,
+`session_hooks`, `default_timeout_secs`), each tool/session definition, and each
+`HookAction` variant. For example, `matchr` is a schema error; it no longer
+silently supplies the empty default matcher and activates on every tool. Like
+other schema errors, a typo rejects the entire first readable file, including
+otherwise valid definitions, and emits the existing redacted diagnostic without
+falling back. Diagnostics identify the nearest safe schema location and do not
+echo the unknown key. Correct or remove unrecognized fields when upgrading.
+Omitting `matcher` or explicitly using an empty string or `"*"` still intentionally
+matches all tools; existing timeout and execution defaults remain unchanged.
+
+`HookAction` is shared with skill lifecycle hooks, so unknown action fields also
+reject a skill manifest/frontmatter through its existing parser error path.
+Arbitrary keys and nested values inside `Custom.config`, and arbitrary HTTP
+`headers` keys, remain supported. This does not close unrelated skill frontmatter
+or the `SkillHooks` phase wrapper, change accepted event names or action support,
+introduce additional configuration scopes, or change admission,
+enforcement/circuit-breaker, or ServerSandbox/ServerLocal selection rules.
 
 ## Tools
 
