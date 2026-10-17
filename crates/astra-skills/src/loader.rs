@@ -1030,6 +1030,32 @@ Body."#;
     }
 
     #[test]
+    fn parse_hook_actions_reject_unknown_fields_but_keep_extension_maps() {
+        for phase in ["pre_invoke", "post_invoke", "on_error"] {
+            for action in [
+                "type: shell\n      command: echo safe\n      timout: 3",
+                "type: set_env\n      key: UNUSED\n      value: unused\n      vaule: typo",
+                "type: http\n      url: https://invalid.example\n      header: typo",
+                "type: custom\n      id: extension\n      confg: typo",
+            ] {
+                let content = format!(
+                    "---\nname: strict-hooks\nhooks:\n  {phase}:\n    - {action}\n---\nBody."
+                );
+                assert!(parse_skill_md(&content).is_err(), "{phase}: {action}");
+            }
+        }
+        let content = "---\nname: extensions\nfuture_frontmatter: allowed\nhooks:\n  pre_invoke:\n    - type: custom\n      id: extension\n      config:\n        future: {matchr: extension-owned}\n  post_invoke:\n    - type: http\n      url: https://invalid.example\n      headers:\n        X-Extension: allowed\n---\nBody.";
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        let hooks = manifest.hooks.unwrap();
+        assert!(
+            matches!(&hooks.pre_invoke[0], super::super::hooks::HookAction::Custom { config: Some(config), .. } if config["future"]["matchr"] == "extension-owned")
+        );
+        assert!(
+            matches!(&hooks.post_invoke[0], super::super::hooks::HookAction::Http { headers, .. } if headers["X-Extension"] == "allowed")
+        );
+    }
+
+    #[test]
     fn parse_hooks_from_frontmatter() {
         let content = r#"---
 name: hooked

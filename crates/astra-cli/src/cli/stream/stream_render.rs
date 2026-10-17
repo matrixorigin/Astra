@@ -8897,7 +8897,7 @@ mod tests {
         std::fs::create_dir(root.path().join(".astra")).unwrap();
         std::fs::write(
             root.path().join(".astra/hooks.json"),
-            r#"{"hooks":[{"event":"SECRET_EVENT"}]}"#,
+            r#"{"hooks":[{"event":"pre_tool_use","matchr":"SECRET_MATCHER","action":{"type":"shell","command":"echo SECRET_COMMAND"}}]}"#,
         )
         .unwrap();
         let (tools, _) = astra_runtime::skills::hooks::load_all_hooks(root.path());
