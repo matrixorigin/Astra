@@ -20,6 +20,12 @@ pub(crate) struct CanonicalRewritePermit {
     valid: bool,
 }
 
+impl CanonicalRewritePermit {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProviderWalReplacementAuthorization {
     pub(crate) generation: u64,

@@ -17798,16 +17798,20 @@ impl ServerAgenticLoopHost {
             session_facts: None,
         };
         let mut result = ctx.compact(messages, system_messages, visible_tools).await;
+        // Admission owns canonical rewrite authority. Without a valid permit,
+        // retain the request-local result and the existing WAL predecessor.
         if let Some(candidate) = crate::turn::cloud::compaction::prepare_request_summary(
             &state.messages,
             messages,
             &result,
-        ) {
+        ) && let Some(rewrite_permit) = state
+            .begin_canonical_rewrite()
+            .filter(|permit| permit.is_valid())
+        {
             // Install only after all summary I/O and validation finish. Dropping
             // the future cannot install a partially generated representation.
             // The canonical WAL/terminal commit already persists this rewrite;
             // no extra memory write or checkpoint table belongs here.
-            let rewrite_permit = state.begin_canonical_rewrite();
             result.messages.retain(|message| {
                 astra_turn_core::cloud::history_summary::history_summary_text(message).is_none()
             });
@@ -17821,7 +17825,7 @@ impl ServerAgenticLoopHost {
             // request preparation. Rebase its microcompact protection count
             // onto the accepted history, leaving later tool results eligible.
             state.last_request_message_count = Some(state.messages.len());
-            state.finish_canonical_rewrite(rewrite_permit);
+            state.finish_canonical_rewrite(Some(rewrite_permit));
         }
         result
     }
@@ -38306,6 +38310,147 @@ mod tests {
                 astra_core::ErrorKind::Network,
                 "isolated summary failure",
             ))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_compaction_without_rewrite_authority_preserves_provider_wal() {
+        for stale_proof in [false, true] {
+            for prior_wal in [true, false] {
+                let memory = Arc::new(CompactionMemoryFixture::default());
+                let mut host = test_host_builder("first-turn-owner", "first-turn-session")
+                    .with_memoria_client(Some(memory))
+                    .build();
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                    requests: requests.clone(),
+                }));
+                let mut state = create_test_state();
+                state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+                // A first canonical admission can contain populated request
+                // history, without a previously persisted summary or head.
+                state.messages.remove(0);
+                state.messages[1]["content"] = json!(CONTINUITY_FACT);
+                let original = state.messages.clone();
+                let durable = if stale_proof {
+                    original[..2].to_vec()
+                } else {
+                    Vec::new()
+                };
+                state.initialize_provider_canonical_wal_base(&durable);
+                if stale_proof {
+                    let mut foreign = durable.clone();
+                    foreign[0]["content"] = json!("different admitted prefix");
+                    state.initialize_canonical_rewrite_proof(
+                        &foreign,
+                        &astra_turn_types::canonical_conversation_root(&foreign),
+                        0,
+                    );
+                    assert!(state.begin_canonical_rewrite().is_some());
+                } else {
+                    assert!(state.begin_canonical_rewrite().is_none());
+                    assert_eq!(
+                        state
+                            .provider_canonical_wal_base
+                            .as_ref()
+                            .unwrap()
+                            .canonical
+                            .message_count,
+                        0,
+                    );
+                }
+                let durable_base = state.provider_canonical_wal_base.clone().unwrap();
+                if prior_wal {
+                    // An earlier provider attempt has already admitted this
+                    // prefix during the first canonical turn. New history
+                    // follows it, before request preparation compacts again.
+                    let first = plan_provider_canonical_wal_transition(
+                        &durable_base,
+                        None,
+                        &original[..original.len() - 2],
+                        Vec::new(),
+                        None,
+                        ProviderCanonicalWalLimits::PRODUCTION,
+                    )
+                    .unwrap();
+                    state.provider_canonical_wal_head = Some(first.head);
+                }
+                let original_head = state.provider_canonical_wal_head.clone();
+                state.last_request_message_count = Some(original.len());
+                let config = compaction_reuse_config(true);
+                let result = host
+                    .compact_messages_via_memoria(
+                        &mut state,
+                        &original,
+                        &[],
+                        &[],
+                        CompactionTier::AggressivePrune,
+                        &config,
+                    )
+                    .await;
+
+                // This is the planner used by execute_turn before provider
+                // dispatch. Installing an unauthorized shorter history used
+                // to fail here with MissingLinkedPredecessor.
+                let next = plan_provider_canonical_wal_transition(
+                    &durable_base,
+                    state.provider_canonical_wal_head.as_ref(),
+                    &state.messages,
+                    Vec::new(),
+                    None,
+                    ProviderCanonicalWalLimits::PRODUCTION,
+                )
+                .expect("request-local fallback must preserve the linked provider predecessor");
+                assert!(next.transition.replacement_compaction_generation.is_none());
+                assert_eq!(state.messages, original);
+                assert_eq!(state.last_request_message_count, Some(original.len()));
+                assert_eq!(
+                    state
+                        .provider_canonical_wal_head
+                        .as_ref()
+                        .map(|head| &head.transition_id),
+                    original_head.as_ref().map(|head| &head.transition_id),
+                );
+                assert_eq!(
+                    state
+                        .provider_canonical_wal_head
+                        .as_ref()
+                        .map(|head| &head.result),
+                    original_head.as_ref().map(|head| &head.result),
+                );
+                assert_eq!(requests.lock().unwrap().len(), 1);
+                assert!(result.boundary.is_some());
+                assert!(result.messages.len() < original.len());
+                assert!(
+                    result
+                        .history_summary
+                        .as_deref()
+                        .unwrap()
+                        .contains(CONTINUITY_FACT)
+                );
+                assert!(
+                    crate::turn::cloud::compaction::prepare_request_summary(
+                        &original, &original, &result,
+                    )
+                    .is_some(),
+                    "the fixture must offer a useful candidate that lacks rewrite authority",
+                );
+                let mut terminal = state.messages.clone();
+                terminal.push(
+                    json!({"role":"assistant", "content":"completed with request-local context"}),
+                );
+                let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &durable,
+                    stale_proof,
+                    &terminal,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+                astra_turn_types::validate_canonical_tool_pairing(&terminal).unwrap();
+            }
         }
     }
 
