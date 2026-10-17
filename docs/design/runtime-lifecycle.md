@@ -811,3 +811,16 @@ adaptive renewal and settlement retain their existing owners. Runtime config
 and handoff facts reject the retired `budget_policy` field, and pending context
 rejects the retired `self_status` kind. Provider output ending with `length`
 still receives the terminal truncation marker outside exploratory tasks.
+
+### Isolated process cleanup
+
+Timeout, cancellation and startup failure retain the existing process owner
+through cleanup. Leader reaping polls the actual exit status with a fixed
+cleanup deadline; it cannot depend solely on a process-exit signal waking an
+asynchronous wait. Failure to reap or settle descendants cannot certify a
+settled scope. Supervised invocations receive owner cancellation and the
+existing settlement grace before any forced helper kill; a forced helper kill
+never authorizes a receipt. Abort guards retain supervised provenance while
+an owner is handed to a worker, and output pumps use the existing bounded
+drain on error as well as timeout. Operation timeouts and sandbox authority
+are unchanged.
