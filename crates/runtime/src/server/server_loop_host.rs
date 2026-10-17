@@ -36913,7 +36913,7 @@ mod tests {
         std::fs::create_dir(root.path().join(".astra")).unwrap();
         std::fs::write(
             root.path().join(".astra/hooks.json"),
-            r#"{"hooks":[{"event":"SECRET_UNKNOWN_EVENT"}]}"#,
+            r#"{"hooks":[{"event":"pre_tool_use","matchr":"SECRET_MATCHER","action":{"type":"http","url":"https://invalid.example/SECRET","headers":{"Authorization":"SECRET_HEADER"}}}]}"#,
         )
         .unwrap();
         let (tools, _) = crate::skills::hooks::load_all_hooks(root.path());

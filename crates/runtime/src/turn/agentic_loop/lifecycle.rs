@@ -4421,13 +4421,37 @@ mod tests {
 
     #[tokio::test]
     async fn hook_config_diagnostics_reach_loop_output_once_without_execution() {
-        for content in [
-            r#"{"hooks":[{"event":"unknown-secret","action":{"type":"shell","command":"never execute this"}}]}"#,
-            r#"{"session_hooks":[{"event":"turn_end","action":{"type":"set_env","key":"UNUSED","value":"env-secret"}}]}"#,
+        for (filename, content, field) in [
+            (
+                "hooks.json",
+                r#"{"hooks":[{"event":"unknown-secret","action":{"type":"shell","command":"never execute this"}}]}"#,
+                "hooks[0].event",
+            ),
+            (
+                "hooks.json",
+                r#"{"hooks":[{"event":"pre_tool_use","matchr":"secret","action":{"type":"set_env","key":"UNUSED","value":"env-secret"}}]}"#,
+                "hooks[0]",
+            ),
+            (
+                "hooks.json",
+                r#"{"session_hooks":[{"event":"session_start","action":{"type":"set_env","key":"UNUSED","value":"env-secret","vaule":"secret"}}]}"#,
+                "session_hooks[0].action",
+            ),
+            (
+                "hooks.json",
+                r#"{"session_hooks":[{"event":"turn_end","action":{"type":"set_env","key":"UNUSED","value":"env-secret"}}]}"#,
+                "session_hooks[0].event",
+            ),
+            ("hooks.yaml", "hooks: []\nunknown-secret: secret\n", "($)"),
+            (
+                "hooks.yaml",
+                "session_hooks:\n  - event: session_start\n    action:\n      type: set_env\n      key: UNUSED\n      value: env-secret\n      vaule: secret\n",
+                "session_hooks[0].action",
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join(".astra")).unwrap();
-            std::fs::write(dir.path().join(".astra/hooks.json"), content).unwrap();
+            std::fs::write(dir.path().join(".astra").join(filename), content).unwrap();
             let mut state = make_state();
             (
                 state.skills.tool_event_hooks,
@@ -4444,8 +4468,8 @@ mod tests {
                 .filter(|line| line.starts_with("Hook configuration"))
                 .collect::<Vec<_>>();
             assert_eq!(diagnostics.len(), 1);
-            assert!(diagnostics[0].contains(".astra/hooks.json"));
-            assert!(diagnostics[0].contains("[0].event"));
+            assert!(diagnostics[0].contains(&format!(".astra/{filename}")));
+            assert!(diagnostics[0].contains(field), "{}", diagnostics[0]);
             assert!(!diagnostics[0].contains("secret"));
             configure_loop_host(&mut host, &state);
             assert_eq!(
