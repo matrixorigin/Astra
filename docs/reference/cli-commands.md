@@ -143,6 +143,61 @@ identity. The provider deadline accepts 1–120 seconds. Evaluation sessions are
 closed after definite results; uncertain delivery retains a session for
 inspection. See [quality judgment behavior](../guides/testing.md).
 
+## MCP configuration
+
+Standalone MCP configuration commands run locally without connecting to a server:
+
+```bash
+astra mcp list                        # project scope, with a hint to inspect the effective view
+astra mcp list -s user                # user scope
+astra mcp list --effective            # the configurations selected at chat startup
+astra mcp get example                 # winning definition's type, scope and source
+astra mcp add -s project example /path/to/mcp-server -- --server-argument
+astra mcp add-json -s user remote '{"type":"streamable_http","url":"https://example.com/mcp"}'
+astra mcp remove -s user remote
+```
+
+Project configuration is `$CWD/.astra/mcp.json`; user configuration defaults to
+`~/.astra/mcp.json`. When `ASTRA_LOCAL_STATE_ROOT` is set, its `mcp.json` is the
+user configuration instead. Both files use a top-level `mcpServers` object:
+
+```json
+{
+  "mcpServers": {
+    "example": {"command": "/path/to/mcp-server", "args": ["--server-argument"]},
+    "remote": {"type": "streamable_http", "url": "https://example.com/mcp"}
+  }
+}
+```
+
+`add-json` accepts **one server entry**, such as the `remote` object above,
+without the `mcpServers` wrapper. It supports `stdio` (the default, using
+`command`, `args`, and optional `env`), `sse`, `streamable_http`, and `ws`
+(using `url`, optional `headers`, and optional `auth_token`). Use the exact
+`streamable_http` spelling in configuration; `http` is not a chat-loader alias.
+`add` writes a stdio entry. Both commands default to project scope and reject
+an existing name in that file; remove the existing entry or edit the file to
+replace it. Adding configuration does not install an executable or test access.
+
+Chat discovery selects the **first enabled definition of each name**:
+project config, then skill `manifest.yaml` files in the existing skill search
+path priority, then user config. Manifest files within each skill root are
+sorted by path. A standalone entry with `disabled: true` or a skill entry with
+`enabled: false` does not reserve its name; a lower priority enabled definition
+can still win. Unsupported or incomplete standalone entries are skipped with
+a warning. A malformed file produces a warning and contributes no entries;
+a missing optional file is normal. Configuration changes apply to the next
+chat startup.
+
+`list` and `get` show enabled configurations eligible for discovery, including
+the winning source path. They hide connection settings, including commands,
+arguments, URLs, environment values, headers, and tokens. The effective view
+uses the same loader as chat; it describes configuration, without proving a
+connection or tool availability. In an active chat, `/mcp` shows connected
+servers and tools. The standalone `astra mcp test NAME -s project|user` and
+`astra mcp ping NAME -s project|user` explicitly connect to the selected server;
+for stdio this launches its configured command.
+
 ## astra admin
 
 Global options:

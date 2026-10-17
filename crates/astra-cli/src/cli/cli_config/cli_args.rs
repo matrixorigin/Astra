@@ -1166,6 +1166,9 @@ pub(crate) struct JournalDigestArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(
+    after_long_help = "MCP configuration: project $CWD/.astra/mcp.json; user ~/.astra/mcp.json (or $ASTRA_LOCAL_STATE_ROOT/mcp.json).\nChat loads the first enabled definition by name: project > skill manifests > user.\nUse `astra mcp list --effective` to inspect that configuration without connecting.\nUse `astra mcp add-json NAME JSON [-s project|user]` for one server entry (not a mcpServers wrapper).\nSupported JSON types: stdio (command, args, env), sse, streamable_http, ws (url, headers, auth_token).\nConfiguration changes apply on the next chat startup. Adding configuration does not install a server."
+)]
 pub(crate) enum McpCmd {
     /// List configured MCP servers
     List(McpListArgs),
@@ -1176,7 +1179,7 @@ pub(crate) enum McpCmd {
     AddJson(McpAddJsonArgs),
     /// Remove an MCP server
     Remove(McpRemoveArgs),
-    /// Show details of a configured MCP server
+    /// Show the effective MCP server and its source (connection settings hidden)
     Get(McpGetArgs),
     /// Test connection to an MCP server and list its tools
     Test(McpTestArgs),
@@ -1186,9 +1189,12 @@ pub(crate) enum McpCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct McpListArgs {
-    /// Config scope: project or user
-    #[arg(short = 's', long, default_value = "project")]
+    /// Config scope: project or user (use --effective for chat's merged config)
+    #[arg(short = 's', long, default_value = "project", value_parser = ["project", "user"])]
     pub scope: String,
+    /// Show chat's effective project + skills + user configuration without connecting
+    #[arg(long, conflicts_with = "scope")]
+    pub effective: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1337,6 +1343,53 @@ pub(crate) struct ConfigShowPolicyArgs {
 mod tests {
     use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn mcp_effective_view_is_explicit_and_conflicts_with_a_selected_scope() {
+        let cli = Cli::try_parse_from(["astra", "mcp", "list", "--effective"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mcp(super::McpCmd::List(args))) if args.effective)
+        );
+        let cli = Cli::try_parse_from(["astra", "mcp", "list"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mcp(super::McpCmd::List(args))) if !args.effective && args.scope == "project")
+        );
+        for scope in ["project", "user"] {
+            let cli = Cli::try_parse_from(["astra", "mcp", "list", "-s", scope]).unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Mcp(super::McpCmd::List(args))) if args.scope == scope)
+            );
+            assert!(
+                Cli::try_parse_from(["astra", "mcp", "list", "--effective", "-s", scope]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["astra", "mcp", "list", "-s", "unknown"]).is_err());
+        let cli = Cli::try_parse_from([
+            "astra",
+            "mcp",
+            "add",
+            "-s",
+            "project",
+            "example",
+            "/path/to/mcp-server",
+            "--",
+            "--server-argument",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mcp(super::McpCmd::Add(args))) if args.args == ["--server-argument"])
+        );
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("mcp")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(".astra/mcp.json"));
+        assert!(help.contains("streamable_http"));
+        assert!(help.contains("add-json"));
+        assert!(help.contains("does not install"));
+    }
 
     #[test]
     fn cli_has_no_unbacked_messaging_or_session_replay_commands() {
