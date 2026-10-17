@@ -1260,7 +1260,7 @@ struct CliSseStreamHost<'a> {
     last_permission_selection: Option<astra_turn_types::RunPermissionModeSelection>,
     api: &'a astra_thin_client::ThinClient,
     token: String,
-    auth_profile: Option<&'a str>,
+    owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     executor_id: &'a str,
     edge_agent_id: String,
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
@@ -1766,7 +1766,7 @@ impl<'a> CliSseStreamHost<'a> {
         ctx: EdgeSseContext<'a>,
         term_width: usize,
         render_md: bool,
-        auth_profile: Option<&'a str>,
+        owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     ) -> Self {
         let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
         let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
@@ -1784,7 +1784,7 @@ impl<'a> CliSseStreamHost<'a> {
             last_permission_selection: None,
             api: ctx.api,
             token: ctx.token.to_string(),
-            auth_profile,
+            owner_auth_snapshot,
             executor_id: ctx.executor_id,
             edge_agent_id: ctx.executor_id.to_string(),
             executor: ctx.executor,
@@ -1916,19 +1916,47 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
+    async fn resolve_edge_owner_bearer(&mut self) -> bool {
+        let Some(owner) = self.owner_auth_snapshot.as_ref() else {
+            return true; // A static bearer has no profile refresh authority.
+        };
+        if !owner.is_current() {
+            return false;
+        }
+        let api = self.api.clone().without_bearer_provider();
+        let Some(token) = session_runtime::owner_access_token(&api, owner, None).await else {
+            return false;
+        };
+        if !owner.is_current() {
+            return false;
+        }
+        self.token = token;
+        true
+    }
+
     async fn refresh_edge_token_after_401(&mut self) -> bool {
-        let Some(profile) = self.auth_profile else {
+        // Fail closed unless a captured owner was admitted at construction and is
+        // still the current login; never reselect current_profile or borrow another.
+        let Some(owner) = self.owner_auth_snapshot.as_ref() else {
             return false;
         };
         if !self.render_policy.is_silent() {
             eprintln!("{}", "  Token expired, attempting refresh…".yellow());
         }
-        if !session_runtime::attempt_token_refresh(self.api, Some(profile)).await {
+        if !owner.is_current() {
             return false;
         }
-        let Some(new_token) = session_runtime::current_access_token(Some(profile)) else {
+        // Detach any inherited bearer provider so it cannot override the
+        // explicitly admitted owner token.
+        let api = self.api.clone().without_bearer_provider();
+        let Some(new_token) =
+            session_runtime::owner_access_token(&api, owner, Some(self.token.as_str())).await
+        else {
             return false;
         };
+        if !owner.is_current() {
+            return false;
+        }
         self.token = new_token;
         if !self.render_policy.is_silent() {
             eprintln!(
@@ -1948,15 +1976,20 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
-        let result = self
-            .api
+        if !self.resolve_edge_owner_bearer().await {
+            self.auth_failure = true;
+            return Err(PostToolResultError::AuthRefreshFailed);
+        }
+        // Detach any inherited bearer provider so the explicitly admitted owner
+        // token is the only credential source for owned callback posts.
+        let api = self.api.clone().without_bearer_provider();
+        let result = api
             .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
             .await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
-                let retry = self
-                    .api
+                let retry = api
                     .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
                     .await;
                 match retry {
@@ -1990,10 +2023,14 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         body: &astra_thin_client::ApprovalRespondRequest,
     ) -> Result<(), PostApprovalError> {
-        let result = self
-            .api
-            .post_approval(Some(self.token.as_str()), body)
-            .await;
+        if !self.resolve_edge_owner_bearer().await {
+            self.auth_failure = true;
+            return Err(PostApprovalError::AuthRefreshFailed);
+        }
+        // Detach any inherited bearer provider so the explicitly admitted owner
+        // token is the only credential source for owned callback posts.
+        let api = self.api.clone().without_bearer_provider();
+        let result = api.post_approval(Some(self.token.as_str()), body).await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if recorded_approval_decision(&e).is_some() => {
@@ -2002,10 +2039,7 @@ impl<'a> CliSseStreamHost<'a> {
                 ))
             }
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
-                let retry = self
-                    .api
-                    .post_approval(Some(self.token.as_str()), body)
-                    .await;
+                let retry = api.post_approval(Some(self.token.as_str()), body).await;
                 if let Err(ref retry_err) = retry {
                     if let Some(decision) = recorded_approval_decision(retry_err) {
                         Err(PostApprovalError::AlreadyRecorded(decision))
@@ -8504,7 +8538,7 @@ pub(crate) async fn consume_turn_sse(
     explain_analyze_enabled: bool,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
-    auth_profile: Option<&str>,
+    auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
     stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
 ) -> TurnResult {
@@ -8549,7 +8583,7 @@ pub(crate) async fn consume_turn_sse(
             ctx,
             term_width,
             render_md && !render_policy.suppress_text(),
-            auth_profile,
+            auth_owner,
         );
         host.explain_analyze_enabled = explain_analyze_enabled;
         host.stream_json_exchange = stream_json_exchange;
@@ -13830,7 +13864,30 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
+        // 401 recovery is owned by the authenticated credential owner in both
+        // admission shapes: an explicit --profile and the raw omitted-profile
+        // value that still resolved the stored default profile at admission.
+        edge_tool_result_401_refresh_acknowledges_once(Some("test"), "unchanged", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", true).await;
+        for transition in ["current_profile", "replacement", "account", "logout"] {
+            edge_tool_result_401_refresh_acknowledges_once(None, transition, false).await;
+            edge_tool_result_401_refresh_acknowledges_once(None, transition, true).await;
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn edge_tool_result_401_refresh_acknowledges_once(
+        auth_profile: Option<&str>,
+        transition: &str,
+        approval: bool,
+    ) {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "test",
+            Some("user-id-1"),
+        )
+        .unwrap();
 
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
@@ -13847,14 +13904,20 @@ mod tests {
         );
         save_credentials(&creds).expect("save credentials");
 
+        let callback_path = if approval {
+            astra_thin_client::paths::APPROVAL_RESPOND
+        } else {
+            astra_thin_client::paths::TOOLS_RESULT
+        };
+        let should_post = matches!(transition, "unchanged" | "current_profile");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .and(path(callback_path))
             .and(header("authorization", "Bearer expired-token"))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
                 "error": "expired"
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -13864,16 +13927,16 @@ mod tests {
                 "access_token": "fresh-token",
                 "refresh_token": "fresh-refresh-token"
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .and(path(callback_path))
             .and(header("authorization", "Bearer fresh-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
 
@@ -13899,7 +13962,28 @@ mod tests {
             incremental_state: None,
             request_session_execution_lease: None,
         };
-        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api,
+            auth_profile,
+            "expired-token",
+        )
+        .await;
+        assert!(auth_owner.is_some());
+        match transition {
+            "current_profile" => creds.current_profile = Some("unrelated-profile".into()),
+            "replacement" => {
+                creds.profiles.get_mut("test").unwrap().access_token = Some("unknown-login".into())
+            }
+            "account" => {
+                creds.profiles.get_mut("test").unwrap().account_id = Some("other-account".into())
+            }
+            "logout" => {
+                creds.profiles.remove("test");
+            }
+            _ => (),
+        }
+        save_credentials(&creds).unwrap();
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, auth_owner);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "test-session".to_string(),
@@ -13914,11 +13998,42 @@ mod tests {
             },
         );
 
-        let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
+        let posted = if approval {
+            host.post_approval_with_auth_retry(&astra_thin_client::ApprovalRespondRequest {
+                request_id: "approval-1".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "test-session".into(),
+                run_id: "test-run".into(),
+                tool_name: Some("read_file".into()),
+                approval_kind: None,
+            })
+            .await
+            .is_ok()
+        } else {
+            host.post_tool_result_with_auth_retry(&body).await.is_ok()
+        };
 
-        assert!(posted);
+        assert_eq!(posted, should_post);
+        if !should_post {
+            assert!(host.auth_failure);
+            assert!(server.received_requests().await.unwrap().is_empty());
+            return;
+        }
         assert!(!host.auth_failure);
         assert_eq!(host.token, "fresh-token");
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == callback_path)
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[0].body, posts[1].body,
+            "refresh only reposts the identical result and hash"
+        );
     }
 
     #[serial_test::serial]
@@ -13986,7 +14101,13 @@ mod tests {
             incremental_state: None,
             request_session_execution_lease: None,
         };
-        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api,
+            Some("test"),
+            "expired-token",
+        )
+        .await;
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, auth_owner);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "test-session".to_string(),

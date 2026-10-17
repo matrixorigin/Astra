@@ -526,7 +526,7 @@ pub(crate) async fn stream_chat_sse(
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
-        auth_profile: p.auth_profile,
+        auth_owner: p.auth_owner.clone(),
         model: p.model,
         offering_id: p.offering_id.clone(),
         cli_context: p.cli_context,

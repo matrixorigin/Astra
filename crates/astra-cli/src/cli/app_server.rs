@@ -608,10 +608,13 @@ async fn run_turn(
 
     let explain_mode = explain_mode_from_params(&params)?;
     let unified_skill_registry = astra_runtime::skills::default_unified_registry();
+    let auth_owner =
+        session_runtime::capture_admitted_auth_owner(&ctx.api, ctx.auth_profile.as_deref(), &token)
+            .await;
     let chat_ctx = BasicCliChatContext {
         mcp_manager: None,
         api: &ctx.api,
-        auth_profile: ctx.auth_profile.as_deref(),
+        auth_owner,
         message: &message,
         offering_id: None,
         model: model.as_deref(),

@@ -3,7 +3,21 @@
 use crate::cli::session::session_runtime;
 
 pub(crate) fn should_retry_after_auth_refresh(failure: &crate::TurnFailure) -> bool {
-    failure.partial.error_code.as_deref() == Some(astra_core::ErrorKind::Auth.as_str())
+    // A catalog preflight rejection carries no admitted run or tool effects.
+    // An authentication-looking error after admission must never replay input.
+    let partial = &failure.partial;
+    partial.run_id.is_none()
+        && !partial.remote_cancel_required
+        && partial.remote_cancel_run_id.is_none()
+        && !partial.callback_client_detached
+        && partial.tool_calls_count == 0
+        && partial.tool_call_records.is_empty()
+        && partial.tools_used.is_empty()
+        && partial.tool_outcomes.is_none()
+        && partial.interruption.is_none()
+        && partial.run_transcript_messages.is_empty()
+        && partial.partial_text.is_empty()
+        && failure.partial.error_code.as_deref() == Some(astra_core::ErrorKind::Auth.as_str())
         && failure
             .partial
             .error_metadata
@@ -65,6 +79,37 @@ mod tests {
                 expected,
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn preflight_auth_retry_never_replays_an_admitted_or_uncertain_turn() {
+        let preflight = || crate::TurnFailure {
+            error: "translated preflight failure".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some(astra_core::ErrorKind::Auth.as_str().into()),
+                error_metadata: Some(
+                    serde_json::json!({"source":"model_access", "http_status":401}),
+                ),
+                ..Default::default()
+            },
+        };
+        assert!(should_retry_after_auth_refresh(&preflight()));
+        for change in [
+            |p: &mut crate::PartialTurnData| p.run_id = Some("accepted-run".into()),
+            |p: &mut crate::PartialTurnData| p.remote_cancel_required = true,
+            |p: &mut crate::PartialTurnData| p.remote_cancel_run_id = Some("child".into()),
+            |p: &mut crate::PartialTurnData| p.tool_calls_count = 1,
+            |p: &mut crate::PartialTurnData| p.tools_used.push("bash".into()),
+            |p: &mut crate::PartialTurnData| p.callback_client_detached = true,
+            |p: &mut crate::PartialTurnData| {
+                p.interruption = Some(serde_json::json!({"kind":"stream_transport"}))
+            },
+            |p: &mut crate::PartialTurnData| p.partial_text = "partial response".into(),
+        ] {
+            let mut failure = preflight();
+            change(&mut failure.partial);
+            assert!(!should_retry_after_auth_refresh(&failure));
         }
     }
 
