@@ -2845,7 +2845,7 @@ impl EventIngestionWorker {
                 });
             }
         }
-        crate::storage::insert_agent_event_edges_batch(&mut *tx, &edges)
+        crate::storage::insert_agent_event_edges_batch(&mut tx, &edges)
             .await
             .map_err(|error| format!("ingestion edge insert: {error}"))?;
         crate::storage::apply_ingestion_session_effects(&mut tx, &deltas)

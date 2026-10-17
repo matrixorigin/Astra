@@ -156,6 +156,8 @@ Retention is a product contract:
   headroom. It inserts event rows together and applies inserted-only counter,
   session-end and causal-edge effects through set-based writes. Session admission
   returns stored row identities; input spelling is not a second equality rule.
+  The shared causal-edge writer bounds each statement to 10,922 six-parameter
+  rows, preserving parent order across chunks within the caller's transaction.
   All facts and effects commit before durable delivery is acknowledged.
 - Cross-session batching couples locks for one bounded database attempt. A
   failed/uncertain batch retains each session's exact retry head; retries use the

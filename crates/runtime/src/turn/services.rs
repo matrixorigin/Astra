@@ -559,7 +559,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             .ok_or_else(|| "missing auxiliary event capture outcome".to_string())?;
             if outcome == DurableCaptureOutcome::Inserted {
                 crate::data_layer::storage::insert_agent_event_edges(
-                    &mut *tx,
+                    &mut tx,
                     &event.user_id,
                     &event.session_id,
                     &event.event_id,

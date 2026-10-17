@@ -440,7 +440,7 @@ pub(crate) async fn insert_trace_events(
             parent_event_ids: event.parent_event_id.as_slice(),
         })
         .collect::<Vec<_>>();
-    astra_services::storage::insert_agent_event_edges_batch(&mut **tx, &edge_inputs).await?;
+    astra_services::storage::insert_agent_event_edges_batch(tx, &edge_inputs).await?;
 
     Ok(AgentEventInsertBatchOutcome {
         inserted,

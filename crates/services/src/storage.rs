@@ -1582,12 +1582,12 @@ pub struct AgentEventEdgeInsert<'a> {
     pub parent_event_ids: &'a [String],
 }
 
-pub async fn insert_agent_event_edges_batch<'e, E>(
-    executor: E,
+pub async fn insert_agent_event_edges_batch<T>(
+    tx: &mut T,
     edges: &[AgentEventEdgeInsert<'_>],
 ) -> Result<(), sqlx::Error>
 where
-    E: sqlx::Executor<'e, Database = MySql>,
+    T: TransactionConnection,
 {
     let normalized = edges
         .iter()
@@ -1602,29 +1602,35 @@ where
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<MySql>::new(
-        "INSERT INTO agent_event_edges \
+    // Event/byte limits do not bound the number of normalized parent edges.
+    // MySQL allows 65,535 parameters; every edge binds six columns.
+    const BINDS_PER_EDGE: usize = 6;
+    const EDGES_PER_STATEMENT: usize = 65_535 / BINDS_PER_EDGE;
+    for chunk in normalized.chunks(EDGES_PER_STATEMENT) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_event_edges \
          (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) ",
-    );
-    builder.push_values(normalized, |mut row, (edge, index, parent_event_id)| {
-        row.push_bind(edge.user_id)
-            .push_bind(edge.session_id)
-            .push_bind(edge.child_event_id)
-            .push_bind(parent_event_id)
-            .push_bind(CAUSAL_EDGE_KIND)
-            .push_bind(i32::try_from(index).unwrap_or(i32::MAX));
-    });
-    builder.push(
-        " ON DUPLICATE KEY UPDATE \
+        );
+        builder.push_values(chunk, |mut row, (edge, index, parent_event_id)| {
+            row.push_bind(edge.user_id)
+                .push_bind(edge.session_id)
+                .push_bind(edge.child_event_id)
+                .push_bind(parent_event_id)
+                .push_bind(CAUSAL_EDGE_KIND)
+                .push_bind(i32::try_from(*index).unwrap_or(i32::MAX));
+        });
+        builder.push(
+            " ON DUPLICATE KEY UPDATE \
          session_id = VALUES(session_id), \
          parent_order = VALUES(parent_order)",
-    );
-    builder.build().execute(executor).await?;
+        );
+        builder.build().execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
-pub async fn insert_agent_event_edges<'e, E>(
-    executor: E,
+pub async fn insert_agent_event_edges<T>(
+    tx: &mut T,
     user_id: &str,
     session_id: &str,
     child_event_id: &str,
@@ -1632,10 +1638,10 @@ pub async fn insert_agent_event_edges<'e, E>(
     parent_event_ids: &[String],
 ) -> Result<(), sqlx::Error>
 where
-    E: sqlx::Executor<'e, Database = MySql>,
+    T: TransactionConnection,
 {
     insert_agent_event_edges_batch(
-        executor,
+        tx,
         &[AgentEventEdgeInsert {
             user_id,
             session_id,

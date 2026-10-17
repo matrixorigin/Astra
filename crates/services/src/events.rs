@@ -836,7 +836,7 @@ impl EventService for DatabaseEventService {
         };
 
         crate::storage::insert_agent_event_edges(
-            &mut *tx,
+            &mut tx,
             &user_id,
             &session_id,
             &event_id,
