@@ -5185,22 +5185,15 @@ impl ToolExecutor {
                 "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_session_state" => self.rollback_session_state(args).await,
                 "str_replace" => {
-                    let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
-                        Ok(args) => args,
-                        Err(error) => {
-                            let result = astra_tools::ToolResult::error(error)
-                                .with_failure_evidence(
-                                    astra_core::ToolFailureEvidence::from_error_kind(
-                                        astra_core::ErrorKind::ToolInvalidArgs,
-                                    ),
-                                )
-                                .with_workspace_mutation_not_applied()
-                                .with_execution_not_started();
-                            *source_is_error = Some(result.is_error);
-                            *tool_result_fields = result.metadata;
-                            return result.output;
-                        }
-                    };
+                    let args =
+                        match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
+                            Ok(args) => args,
+                            Err(result) => {
+                                *source_is_error = Some(result.is_error);
+                                *tool_result_fields = result.metadata;
+                                return result.output;
+                            }
+                        };
                     // edits array routes through the str_replace batch
                     // wrapper so both same-file and per-edit path batches
                     // share one contract.

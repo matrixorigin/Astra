@@ -125,12 +125,13 @@ distinctions. A shortened preview is not an authoritative receipt; control
 identities remain exact or are explicitly omitted, never shortened into a
 different identity.
 
-Pure single-edit argument validation authors its own no-execution fact before
-target binding or content reads. Invalid and identical replacements retain
-the original error/recovery evidence, with `execution_started=false`,
-`execution_fact=not_executed` and `disposition=rejected` through CLI callbacks
-and canonical journal recording. Such rejection does not replenish provider
-recovery. A missing target, failed content match, unchanged workspace or
+Pure single-edit argument validation and invocation normalization author their
+own no-execution fact before target binding or content reads. Invalid, mixed
+single/batch, and identical replacements retain the original error/recovery
+evidence, with `execution_started=false`, `execution_fact=not_executed` and
+`disposition=rejected` through CLI and server execution, durable terminal
+replay, and canonical callback journal recording. Such rejection does not
+replenish provider recovery. A missing target, failed content match, unchanged workspace or
 `ToolInvalidArgs` kind alone cannot establish that execution never began;
 later failures retain their source-owned facts.
 

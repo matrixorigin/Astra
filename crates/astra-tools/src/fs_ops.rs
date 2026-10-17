@@ -1331,21 +1331,31 @@ fn validated_single_edit_args(args: &Value) -> Result<Value, ToolResult> {
             replacement_arguments(&args)?;
             Ok(args)
         })
-        .map_err(|mut error| {
-            if error
-                .metadata
-                .as_ref()
-                .is_none_or(|fields| !fields.contains_key("recovery_evidence"))
-            {
-                error =
-                    error.with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
-                        astra_core::ErrorKind::ToolInvalidArgs,
-                    ));
-            }
-            error
-                .with_workspace_mutation_not_applied()
-                .with_execution_not_started()
-        })
+        .map_err(str_replace_argument_rejection)
+}
+
+fn str_replace_argument_rejection(mut error: ToolResult) -> ToolResult {
+    if error
+        .metadata
+        .as_ref()
+        .is_none_or(|fields| !fields.contains_key("recovery_evidence"))
+    {
+        error = error.with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+            astra_core::ErrorKind::ToolInvalidArgs,
+        ));
+    }
+    error
+        .with_workspace_mutation_not_applied()
+        .with_execution_not_started()
+}
+
+/// Normalize a new invocation before target binding or content reads.
+/// Preserve pure normalization rejection as a source-authored execution fact.
+/// Callers already holding a preimage use `normalize_str_replace_args` instead.
+pub fn normalize_str_replace_invocation_args(args: &Value) -> Result<Value, ToolResult> {
+    normalize_str_replace_args(args)
+        .map_err(ToolResult::error)
+        .map_err(str_replace_argument_rejection)
 }
 
 fn replacement_no_effect(message: String) -> ToolResult {
@@ -1490,16 +1500,9 @@ impl PreparedStrReplace {
     }
 }
 pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
-    let args = match normalize_str_replace_args(args) {
+    let args = match normalize_str_replace_invocation_args(args) {
         Ok(args) => args,
-        Err(error) => {
-            return ToolResult::error(error)
-                .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
-                    astra_core::ErrorKind::ToolInvalidArgs,
-                ))
-                .with_workspace_mutation_not_applied()
-                .with_execution_not_started();
-        }
+        Err(error) => return error,
     };
     if args.get("edits").and_then(Value::as_array).is_some() {
         return multi_path_edit(workspace_root, &args);
