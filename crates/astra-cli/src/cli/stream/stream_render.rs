@@ -11020,6 +11020,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn responsive_bash_uses_real_detach_slot_for_ctrl_b_handoff() {
         let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
         let (slot, listener) = astra_tools::detach::new_slot_with_handle();
         let executor = std::sync::Arc::new(
             crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
@@ -11033,6 +11035,7 @@ mod tests {
                 // compound shell command stays foreground so the edge
                 // executor can emit its post-workspace receipt.
                 "command": "sleep 5",
+                "workdir": "nested",
                 "timeout": 30.0,
             }),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
@@ -11056,6 +11059,31 @@ mod tests {
             .expect("edge bash should hand off promptly after Ctrl+B")
             .expect("payload");
         assert_eq!(payload.command, "sleep 5");
+        #[cfg(target_os = "linux")]
+        {
+            let pid = payload.child.id().expect("live detached child");
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).expect("child cwd");
+            assert_eq!(cwd.canonicalize().unwrap(), nested.canonicalize().unwrap());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let pid = payload.child.id().expect("live detached child").to_string();
+            let probe = std::process::Command::new("/usr/sbin/lsof")
+                .args(["-a", "-p", &pid, "-d", "cwd", "-Fn"])
+                .output()
+                .expect("system lsof child-cwd probe");
+            assert!(probe.status.success(), "child cwd must remain observable");
+            let text = String::from_utf8(probe.stdout).unwrap();
+            let cwd = text
+                .lines()
+                .find_map(|line| line.strip_prefix('n'))
+                .expect("child cwd path");
+            assert_eq!(
+                std::path::Path::new(cwd).canonicalize().unwrap(),
+                nested.canonicalize().unwrap()
+            );
+        }
+
         payload
             .adoption_tx
             .send(Ok("bg-shell-edge".to_string()))
@@ -11066,6 +11094,10 @@ mod tests {
             .expect("detached edge bash should finish the tool call")
             .expect("join");
         assert!(!outcome.is_error, "{outcome:?}");
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["bash_workdir"]["resolved_workspace_relative"],
+            "nested"
+        );
         assert!(
             outcome.output.contains("bash_detached"),
             "{}",

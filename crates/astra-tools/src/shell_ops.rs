@@ -831,8 +831,17 @@ impl PreparedBashWorkdir {
         }
     }
 
-    #[cfg(unix)]
     fn install_on_tokio_command(&self, command: &mut Command) -> Result<(), String> {
+        self.install_on_std_command(command.as_std_mut())
+    }
+
+    /// Install the pinned working directory after environment/sandbox setup.
+    /// Existing pre-exec ownership hooks remain composed with this hook.
+    #[cfg(unix)]
+    pub fn install_on_std_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<(), String> {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 
@@ -841,7 +850,7 @@ impl PreparedBashWorkdir {
             .try_clone()
             .map_err(|error| format!("Error: cannot clone bash workdir handle: {error}"))?;
         unsafe {
-            command.as_std_mut().pre_exec(move || {
+            command.pre_exec(move || {
                 if libc::fchdir(directory.as_raw_fd()) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -852,7 +861,10 @@ impl PreparedBashWorkdir {
     }
 
     #[cfg(not(unix))]
-    fn install_on_tokio_command(&self, command: &mut Command) -> Result<(), String> {
+    pub fn install_on_std_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<(), String> {
         command.current_dir(&self.path);
         Ok(())
     }
