@@ -299,65 +299,67 @@ fn shell_hook_risks(command: &str) -> Vec<String> {
     risks
 }
 
-fn log_blocked_shell_hook(
-    scope: &'static str,
-    command: &str,
-    error: &str,
-    path: Option<&std::path::Path>,
-) {
-    match path {
-        Some(path) => tracing::warn!(
-            target: "hook",
-            "Skipping unsafe {scope} shell hook '{}' from {}: {}",
-            command,
-            path.display(),
-            error
-        ),
-        None => tracing::warn!(
-            target: "hook",
-            "Blocking unsafe {scope} shell hook '{}': {}",
-            command,
-            error
-        ),
-    }
+fn log_blocked_shell_hook(scope: &'static str, error: &str) {
+    // Commands can contain credentials. Policy reasons contain only fixed labels.
+    tracing::warn!(target: "hook", "Blocking unsafe {scope} shell hook: {error}");
 }
 
 fn sanitize_tool_hooks(
     hooks: Vec<ToolEventHook>,
-    path: Option<&std::path::Path>,
+    source: &'static str,
+    diagnostics: &mut Vec<HookConfigDiagnostic>,
 ) -> Vec<ToolEventHook> {
     hooks
         .into_iter()
-        .filter_map(|hook| match &hook.action {
-            HookAction::Shell { command } => {
-                if let Some(error) = shell_hook_policy_error(command) {
-                    log_blocked_shell_hook("tool", command, &error, path);
-                    None
-                } else {
-                    Some(hook)
-                }
+        .enumerate()
+        .filter_map(|(index, hook)| {
+            if let HookAction::Shell { command } = &hook.action
+                && shell_hook_policy_error(command).is_some()
+            {
+                diagnostics.push(HookConfigDiagnostic::new(
+                    source,
+                    format!("hooks[{index}].action.command"),
+                    HookConfigDiagnosticKind::RejectedShell,
+                ));
+                None
+            } else {
+                Some(hook)
             }
-            _ => Some(hook),
         })
         .collect()
 }
 
 fn sanitize_session_hooks(
     hooks: Vec<SessionEventHook>,
-    path: Option<&std::path::Path>,
+    source: &'static str,
+    diagnostics: &mut Vec<HookConfigDiagnostic>,
 ) -> Vec<SessionEventHook> {
     hooks
         .into_iter()
-        .filter_map(|hook| match &hook.action {
-            HookAction::Shell { command } => {
-                if let Some(error) = shell_hook_policy_error(command) {
-                    log_blocked_shell_hook("session", command, &error, path);
-                    None
-                } else {
-                    Some(hook)
-                }
+        .enumerate()
+        .filter_map(|(index, hook)| {
+            if !matches!(
+                hook.event,
+                SessionEvent::SessionStart | SessionEvent::SessionEnd
+            ) {
+                diagnostics.push(HookConfigDiagnostic::new(
+                    source,
+                    format!("session_hooks[{index}].event"),
+                    HookConfigDiagnosticKind::UnsupportedEvent,
+                ));
             }
-            _ => Some(hook),
+            if let HookAction::Shell { command } = &hook.action
+                && shell_hook_policy_error(command).is_some()
+            {
+                diagnostics.push(HookConfigDiagnostic::new(
+                    source,
+                    format!("session_hooks[{index}].action.command"),
+                    HookConfigDiagnosticKind::RejectedShell,
+                ));
+                None
+            } else {
+                Some(hook)
+            }
         })
         .collect()
 }
@@ -408,6 +410,7 @@ pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
     execution: Arc<Mutex<ToolHookExecution>>,
     execution_disabled: bool,
+    config_diagnostics: Arc<Mutex<Vec<HookConfigDiagnostic>>>,
 }
 
 #[derive(Debug, Default)]
@@ -480,7 +483,16 @@ impl ToolEventHookRegistry {
             hooks,
             execution: Arc::default(),
             execution_disabled: false,
+            config_diagnostics: Arc::default(),
         }
+    }
+
+    /// Drain configuration diagnostics once per load, shared by the tool/session pair.
+    /// These are display-only facts, never hook authority or continuation state.
+    pub fn take_config_diagnostics(&self) -> Vec<HookConfigDiagnostic> {
+        std::mem::take(&mut *astra_core::sync_poison::recover_mutex_lock(
+            &self.config_diagnostics,
+        ))
     }
 
     pub fn disable_execution(&mut self) {
@@ -641,128 +653,258 @@ impl ToolEventHookRegistry {
 /// File names to search for in `.astra/` directory.
 const HOOK_CONFIG_CANDIDATES: &[&str] = &["hooks.json", "hooks.yaml", "hooks.yml"];
 
+/// A redacted configuration failure or compatibility warning.
+/// Only fixed candidate names, schema fields and numeric locations are retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookConfigDiagnostic {
+    pub source: &'static str,
+    pub field: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub kind: HookConfigDiagnosticKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HookConfigDiagnosticKind {
+    Read(std::io::ErrorKind),
+    InvalidConfiguration,
+    InvalidEvent,
+    UnsupportedEvent,
+    RejectedShell,
+}
+
+impl HookConfigDiagnostic {
+    fn new(source: &'static str, field: String, kind: HookConfigDiagnosticKind) -> Self {
+        Self {
+            source,
+            field,
+            line: None,
+            column: None,
+            kind,
+        }
+    }
+
+    fn parse_error(
+        source: &'static str,
+        path: &serde_path_to_error::Path,
+        location: Option<(usize, usize)>,
+    ) -> Self {
+        let field = safe_config_field(path);
+        let kind = if field.ends_with(".event") {
+            HookConfigDiagnosticKind::InvalidEvent
+        } else {
+            HookConfigDiagnosticKind::InvalidConfiguration
+        };
+        let mut diagnostic = Self::new(source, field, kind);
+        if let Some((line, column)) = location {
+            diagnostic.line = Some(line);
+            diagnostic.column = Some(column);
+        }
+        diagnostic
+    }
+}
+
+impl std::fmt::Display for HookConfigDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hook configuration .astra/{}", self.source)?;
+        if let (Some(line), Some(column)) = (self.line, self.column) {
+            write!(f, ":{line}:{column}")?;
+        }
+        write!(f, " ({}): ", self.field)?;
+        match self.kind {
+            HookConfigDiagnosticKind::Read(kind) => write!(f,
+                "cannot read file ({kind:?}); check that this is a readable UTF-8 regular file. Trying the next candidate."),
+            HookConfigDiagnosticKind::InvalidConfiguration => f.write_str(
+                "invalid syntax or field type; check the configuration at this location. No hooks loaded from this file; lower-priority files are not used."),
+            HookConfigDiagnosticKind::InvalidEvent => {
+                let events = if self.field.starts_with("session_hooks[") {
+                    "session_start or session_end"
+                } else {
+                    "pre_tool_use or post_tool_use"
+                };
+                write!(f, "invalid or unknown event; use {events} for standard runtime dispatch. No hooks loaded from this file; lower-priority files are not used.")
+            }
+            HookConfigDiagnosticKind::UnsupportedEvent => f.write_str(
+                "event is not dispatched by the standard runtime; use session_start or session_end. The definition is retained for compatibility; no new dispatch is enabled."),
+            HookConfigDiagnosticKind::RejectedShell => f.write_str(
+                "shell command rejected by the existing hook safety policy; review the command. This hook was skipped; other valid hooks are retained."),
+        }
+    }
+}
+
+// Parser messages and arbitrary map keys may contain secrets. Preserve only
+// known schema fields; never format the underlying serde error or input value.
+fn safe_config_field(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+    let mut field = String::new();
+    for segment in path {
+        match segment {
+            Segment::Map { key }
+                if matches!(
+                    key.as_str(),
+                    "hooks"
+                        | "session_hooks"
+                        | "default_timeout_secs"
+                        | "event"
+                        | "matcher"
+                        | "action"
+                        | "timeout_secs"
+                        | "is_async"
+                        | "priority"
+                        | "once"
+                        | "condition"
+                        | "type"
+                        | "command"
+                        | "key"
+                        | "value"
+                        | "id"
+                        | "config"
+                        | "url"
+                        | "headers"
+                ) =>
+            {
+                if !field.is_empty() {
+                    field.push('.');
+                }
+                field.push_str(key);
+                if matches!(key.as_str(), "headers" | "config") {
+                    break;
+                }
+            }
+            Segment::Seq { index } => field.push_str(&format!("[{index}]")),
+            _ => break,
+        }
+    }
+    if field.is_empty() {
+        "$".to_string()
+    } else {
+        field
+    }
+}
+
 /// Load tool event hooks from the project's `.astra/` directory.
-///
-/// Searches for `hooks.json`, `hooks.yaml`, or `hooks.yml` under
-/// `<project_root>/.astra/`. Returns an empty registry if no file is found
-/// or if parsing fails (with a warning log).
+/// See [`load_all_hooks`] for precedence and diagnostic behavior.
 pub fn load_tool_event_hooks(project_root: &std::path::Path) -> ToolEventHookRegistry {
     let (tool_hooks, _) = load_all_hooks(project_root);
     tool_hooks
 }
 
 /// Load session event hooks from the project's `.astra/` directory.
+/// See [`load_all_hooks`] for precedence and diagnostic behavior.
 pub fn load_session_event_hooks(project_root: &std::path::Path) -> SessionEventHookRegistry {
     let (_, session_hooks) = load_all_hooks(project_root);
     session_hooks
 }
 
-/// Load both tool and session event hooks from a single config file.
+/// Load both registries once from the first readable `.astra/hooks.json`,
+/// `hooks.yaml`, or `hooks.yml`. Missing files are optional. Read failures fall
+/// through; a readable but invalid file returns empty registries without fallback.
+/// Callers drain `take_config_diagnostics` from either registry for user display;
+/// the returned pair shares a queue so a diagnostic is only delivered once.
 pub fn load_all_hooks(
     project_root: &std::path::Path,
 ) -> (ToolEventHookRegistry, SessionEventHookRegistry) {
-    let astra_dir = project_root.join(".astra");
-    if !astra_dir.is_dir() {
-        return (
-            ToolEventHookRegistry::default(),
-            SessionEventHookRegistry::default(),
-        );
-    }
-
-    for candidate in HOOK_CONFIG_CANDIDATES {
-        let path = astra_dir.join(candidate);
-        if path.is_file() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let (tool_hooks, session_hooks) = if candidate.ends_with(".json") {
-                        parse_all_hooks_json(&content, &path)
-                    } else {
-                        parse_all_hooks_yaml(&content, &path)
-                    };
-                    let tool_hooks = sanitize_tool_hooks(tool_hooks, Some(path.as_path()));
-                    let session_hooks = sanitize_session_hooks(session_hooks, Some(path.as_path()));
-                    if !tool_hooks.is_empty() || !session_hooks.is_empty() {
-                        tracing::info!(
-                            target: "hook",
-                            "Loaded {} tool + {} session hooks from {}",
-                            tool_hooks.len(),
-                            session_hooks.len(),
-                            path.display()
+    let mut diagnostics = Vec::new();
+    let mut tools = Vec::new();
+    let mut sessions = Vec::new();
+    for &candidate in HOOK_CONFIG_CANDIDATES {
+        let path = project_root.join(".astra").join(candidate);
+        // Preserve the regular-file boundary: never read a directory, device or FIFO.
+        let content = std::fs::metadata(&path).and_then(|metadata| {
+            if !metadata.is_file() {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+            }
+            std::fs::read_to_string(&path)
+        });
+        match content {
+            Ok(content) => {
+                match parse_all_hooks(&content, candidate) {
+                    Ok(config) => {
+                        tools = sanitize_tool_hooks(
+                            apply_default_timeout(config.hooks, config.default_timeout_secs),
+                            candidate,
+                            &mut diagnostics,
+                        );
+                        sessions = sanitize_session_hooks(
+                            apply_default_timeout_session(
+                                config.session_hooks,
+                                config.default_timeout_secs,
+                            ),
+                            candidate,
+                            &mut diagnostics,
                         );
                     }
-                    return (
-                        ToolEventHookRegistry::new(tool_hooks),
-                        SessionEventHookRegistry::new(session_hooks),
-                    );
+                    Err(diagnostic) => diagnostics.push(diagnostic),
                 }
-                Err(e) => {
-                    tracing::warn!(target: "hook", "Failed to read {}: {}", path.display(), e);
+                if !tools.is_empty() || !sessions.is_empty() {
+                    tracing::info!(target: "hook", "Loaded {} tool + {} session hooks from .astra/{}", tools.len(), sessions.len(), candidate);
                 }
+                break;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => diagnostics.push(HookConfigDiagnostic::new(
+                candidate,
+                "$".to_string(),
+                HookConfigDiagnosticKind::Read(error.kind()),
+            )),
         }
     }
-
-    (
-        ToolEventHookRegistry::default(),
-        SessionEventHookRegistry::default(),
-    )
+    let diagnostics = Arc::new(Mutex::new(diagnostics));
+    let mut tools = ToolEventHookRegistry::new(tools);
+    let mut sessions = SessionEventHookRegistry::new(sessions);
+    tools.config_diagnostics = Arc::clone(&diagnostics);
+    sessions.config_diagnostics = diagnostics;
+    (tools, sessions)
 }
 
-/// JSON format: object with a `hooks` key and optional `default_timeout_secs`.
-/// Session hooks live under `session_hooks`.
-fn parse_all_hooks_json(
-    content: &str,
-    path: &std::path::Path,
-) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
-    #[derive(serde::Deserialize)]
-    struct Wrapper {
-        #[serde(default)]
-        hooks: Vec<ToolEventHook>,
-        #[serde(default)]
-        session_hooks: Vec<SessionEventHook>,
-        default_timeout_secs: Option<u32>,
-    }
-    if let Ok(w) = serde_json::from_str::<Wrapper>(content) {
-        return (
-            apply_default_timeout(w.hooks, w.default_timeout_secs),
-            apply_default_timeout_session(w.session_hooks, w.default_timeout_secs),
-        );
-    }
-
-    tracing::warn!(
-        target: "hook",
-        "Failed to parse {}: expected {{\"hooks\": [...], \"session_hooks\": [...]}}",
-        path.display()
-    );
-    (Vec::new(), Vec::new())
+#[derive(Deserialize)]
+struct HookConfig {
+    #[serde(default)]
+    hooks: Vec<ToolEventHook>,
+    #[serde(default)]
+    session_hooks: Vec<SessionEventHook>,
+    default_timeout_secs: Option<u32>,
 }
 
-/// YAML format: same as JSON — object with `hooks:` and optional `session_hooks:`.
-fn parse_all_hooks_yaml(
+fn parse_all_hooks(
     content: &str,
-    path: &std::path::Path,
-) -> (Vec<ToolEventHook>, Vec<SessionEventHook>) {
-    #[derive(serde::Deserialize)]
-    struct Wrapper {
-        #[serde(default)]
-        hooks: Vec<ToolEventHook>,
-        #[serde(default)]
-        session_hooks: Vec<SessionEventHook>,
-        default_timeout_secs: Option<u32>,
+    source: &'static str,
+) -> Result<HookConfig, HookConfigDiagnostic> {
+    if source.ends_with(".json") {
+        let mut deserializer = serde_json::Deserializer::from_str(content);
+        let config = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+            HookConfigDiagnostic::parse_error(
+                source,
+                error.path(),
+                Some((error.inner().line(), error.inner().column())),
+            )
+        })?;
+        // Keep from_str's rejection of trailing input when using the streaming deserializer.
+        deserializer.end().map_err(|error| {
+            let mut diagnostic = HookConfigDiagnostic::new(
+                source,
+                "$".to_string(),
+                HookConfigDiagnosticKind::InvalidConfiguration,
+            );
+            diagnostic.line = Some(error.line());
+            diagnostic.column = Some(error.column());
+            diagnostic
+        })?;
+        Ok(config)
+    } else {
+        serde_path_to_error::deserialize(serde_yaml_ng::Deserializer::from_str(content)).map_err(
+            |error| {
+                HookConfigDiagnostic::parse_error(
+                    source,
+                    error.path(),
+                    error
+                        .inner()
+                        .location()
+                        .map(|location| (location.line(), location.column())),
+                )
+            },
+        )
     }
-    if let Ok(w) = serde_yaml_ng::from_str::<Wrapper>(content) {
-        return (
-            apply_default_timeout(w.hooks, w.default_timeout_secs),
-            apply_default_timeout_session(w.session_hooks, w.default_timeout_secs),
-        );
-    }
-
-    tracing::warn!(
-        target: "hook",
-        "Failed to parse {}: expected YAML mapping with `hooks:` / `session_hooks:`",
-        path.display()
-    );
-    (Vec::new(), Vec::new())
 }
 
 /// Apply `default_timeout_secs` to hooks that still have the built-in default (10).
@@ -1157,7 +1299,7 @@ async fn run_shell_pre_hook(
     use tokio::process::Command;
 
     if let Some(error) = shell_hook_policy_error(command) {
-        log_blocked_shell_hook("pre-tool", command, &error, None);
+        log_blocked_shell_hook("pre-tool", &error);
         return PreToolHookOutcome::Decision(PreToolDecision::Block(error));
     }
 
@@ -1239,7 +1381,7 @@ async fn run_shell_post_hook(
     use tokio::process::Command;
 
     if let Some(error) = shell_hook_policy_error(command) {
-        log_blocked_shell_hook("post-tool", command, &error, None);
+        log_blocked_shell_hook("post-tool", &error);
         return PostToolHookOutcome::OperationalFailure(error);
     }
 
@@ -1571,6 +1713,7 @@ pub struct SessionEventHookRegistry {
     hooks: Vec<SessionEventHook>,
     execution: Mutex<SessionHookExecution>,
     execution_disabled: bool,
+    config_diagnostics: Arc<Mutex<Vec<HookConfigDiagnostic>>>,
 }
 
 #[derive(Debug, Default)]
@@ -1641,7 +1784,16 @@ impl SessionEventHookRegistry {
             hooks,
             execution: Mutex::default(),
             execution_disabled: false,
+            config_diagnostics: Arc::default(),
         }
+    }
+
+    /// Drain configuration diagnostics once per load, shared by the tool/session pair.
+    /// These are display-only facts, never hook authority or continuation state.
+    pub fn take_config_diagnostics(&self) -> Vec<HookConfigDiagnostic> {
+        std::mem::take(&mut *astra_core::sync_poison::recover_mutex_lock(
+            &self.config_diagnostics,
+        ))
     }
 
     pub fn disable_execution(&mut self) {
@@ -1849,7 +2001,7 @@ async fn run_shell_session_hook(
     use tokio::process::Command;
 
     if let Some(error) = shell_hook_policy_error(command) {
-        log_blocked_shell_hook("session", command, &error, None);
+        log_blocked_shell_hook("session", &error);
         return None;
     }
 
@@ -3177,6 +3329,335 @@ mod tests {
     }
 
     // ── Config loading tests ────────────────────────────────────────
+
+    #[test]
+    fn hook_config_diagnostics_distinguish_missing_empty_and_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, sessions) = load_all_hooks(dir.path());
+        assert!(tools.is_empty() && sessions.is_empty());
+        assert!(tools.take_config_diagnostics().is_empty());
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir(&astra).unwrap();
+        assert!(
+            load_session_event_hooks(dir.path())
+                .take_config_diagnostics()
+                .is_empty()
+        );
+
+        for (name, valid, malformed) in [
+            (
+                "hooks.json",
+                r#"{"hooks":[],"session_hooks":[]}"#,
+                "{\n\"hooks\": [",
+            ),
+            ("hooks.yaml", "hooks: []\nsession_hooks: []\n", "hooks: [\n"),
+            ("hooks.yml", "hooks: []\n", "hooks: [\n"),
+        ] {
+            let path = astra.join(name);
+            std::fs::write(&path, valid).unwrap();
+            assert!(
+                load_tool_event_hooks(dir.path())
+                    .take_config_diagnostics()
+                    .is_empty()
+            );
+            std::fs::write(&path, malformed).unwrap();
+            let (tools, sessions) = load_all_hooks(dir.path());
+            assert!(tools.is_empty() && sessions.is_empty());
+            let diagnostics = sessions.take_config_diagnostics();
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].source, name);
+            assert_eq!(
+                diagnostics[0].kind,
+                HookConfigDiagnosticKind::InvalidConfiguration
+            );
+            assert!(diagnostics[0].line.is_some_and(|line| line > 0));
+            assert!(diagnostics[0].column.is_some());
+            assert!(diagnostics[0].to_string().contains("No hooks loaded"));
+            assert!(
+                tools.take_config_diagnostics().is_empty(),
+                "shared diagnostics must not duplicate"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn hook_config_diagnostics_preserve_precedence_and_atomic_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir(&astra).unwrap();
+        let valid = serde_json::json!({"hooks": [{
+            "event": "pre_tool_use", "action": {"type": "set_env", "key": "UNUSED", "value": "unused"}
+        }]});
+        std::fs::write(
+            astra.join("hooks.yaml"),
+            serde_yaml_ng::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(astra.join("hooks.yml"), "invalid: [").unwrap();
+        let mut invalid = valid.clone();
+        invalid["session_hooks"] = serde_json::json!([{
+            "event": "unknown-event-secret", "action": {"type": "set_env", "key": "UNUSED", "value": "unused"}
+        }]);
+        std::fs::write(astra.join("hooks.json"), invalid.to_string()).unwrap();
+        let (tools, sessions) = load_all_hooks(dir.path());
+        assert!(
+            tools.is_empty() && sessions.is_empty(),
+            "do not load a partial config or fall back after a parse error"
+        );
+        let diagnostics = tools.take_config_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source, "hooks.json");
+        assert_eq!(diagnostics[0].field, "session_hooks[0].event");
+        assert_eq!(diagnostics[0].kind, HookConfigDiagnosticKind::InvalidEvent);
+        assert!(!format!("{diagnostics:?}").contains("unknown-event-secret"));
+
+        std::fs::write(astra.join("hooks.json"), "{}").unwrap();
+        let (tools, sessions) = load_all_hooks(dir.path());
+        assert!(
+            tools.is_empty() && sessions.is_empty(),
+            "valid empty JSON still shadows YAML"
+        );
+        assert!(tools.take_config_diagnostics().is_empty());
+        std::fs::remove_file(astra.join("hooks.json")).unwrap();
+        let tools = load_tool_event_hooks(dir.path());
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools.take_config_diagnostics().is_empty(),
+            "lower-priority files are not parsed"
+        );
+    }
+
+    #[test]
+    fn hook_config_diagnostics_read_errors_fall_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir(&astra).unwrap();
+        // Invalid UTF-8 is a deterministic read failure, including when tests run as root.
+        std::fs::write(astra.join("hooks.json"), [0xff]).unwrap();
+        std::fs::create_dir(astra.join("hooks.yaml")).unwrap();
+        std::fs::write(astra.join("hooks.yml"), "session_hooks:\n  - event: session_end\n    action:\n      type: set_env\n      key: UNUSED\n      value: unused\n").unwrap();
+        let (tools, sessions) = load_all_hooks(dir.path());
+        assert!(tools.is_empty());
+        assert_eq!(sessions.len(), 1);
+        let diagnostics = tools.take_config_diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].source, "hooks.json");
+        assert_eq!(
+            diagnostics[0].kind,
+            HookConfigDiagnosticKind::Read(std::io::ErrorKind::InvalidData)
+        );
+        assert_eq!(diagnostics[1].source, "hooks.yaml");
+        assert!(matches!(
+            diagnostics[1].kind,
+            HookConfigDiagnosticKind::Read(_)
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.to_string().contains("Trying the next candidate"))
+        );
+        assert!(sessions.take_config_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn hook_config_diagnostics_unknown_events_are_located_and_redacted() {
+        for name in ["hooks.json", "hooks.yaml"] {
+            for collection in ["hooks", "session_hooks"] {
+                let dir = tempfile::tempdir().unwrap();
+                let astra = dir.path().join(".astra");
+                std::fs::create_dir(&astra).unwrap();
+                let value = serde_json::json!({collection: [{
+                    "event": "event-secret\nforged warning",
+                    "action": {"type":"http", "url":"https://invalid.example/secret", "headers":{"Authorization":"header-secret"}}
+                }]});
+                let content = if name.ends_with("json") {
+                    value.to_string()
+                } else {
+                    serde_yaml_ng::to_string(&value).unwrap()
+                };
+                std::fs::write(astra.join(name), content).unwrap();
+                let (tools, sessions) = load_all_hooks(dir.path());
+                assert!(tools.is_empty() && sessions.is_empty());
+                let diagnostics = tools.take_config_diagnostics();
+                assert_eq!(diagnostics.len(), 1);
+                let diagnostic = &diagnostics[0];
+                assert_eq!(diagnostic.kind, HookConfigDiagnosticKind::InvalidEvent);
+                assert_eq!(diagnostic.field, format!("{collection}[0].event"));
+                assert!(diagnostic.line.is_some());
+                let output = format!("{diagnostic} {diagnostic:?}");
+                for secret in [
+                    "event-secret",
+                    "forged warning",
+                    "header-secret",
+                    "invalid.example",
+                ] {
+                    assert!(!output.contains(secret));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hook_config_diagnostics_do_not_enable_or_remove_dormant_events() {
+        let events = [
+            "session_start",
+            "session_end",
+            "user_prompt_submit",
+            "pre_compact",
+            "post_compact",
+            "file_changed",
+            "cwd_changed",
+            "turn_start",
+            "turn_end",
+        ];
+        for name in ["hooks.json", "hooks.yaml"] {
+            let dir = tempfile::tempdir().unwrap();
+            let astra = dir.path().join(".astra");
+            std::fs::create_dir(&astra).unwrap();
+            let value = serde_json::json!({"default_timeout_secs": 23, "session_hooks": events.iter().map(|event| serde_json::json!({
+                "event":event, "action":{"type":"set_env","key":"UNUSED","value":"env-secret"}
+            })).collect::<Vec<_>>()});
+            let content = if name.ends_with("json") {
+                value.to_string()
+            } else {
+                serde_yaml_ng::to_string(&value).unwrap()
+            };
+            std::fs::write(astra.join(name), content).unwrap();
+            let mut sessions = load_session_event_hooks(dir.path());
+            assert_eq!(sessions.len(), events.len());
+            assert!(sessions.hooks.iter().all(|hook| hook.timeout_secs == 23));
+            let continuation = sessions.capture_continuation().unwrap();
+            sessions.disable_execution();
+            let diagnostics = sessions.take_config_diagnostics();
+            assert_eq!(diagnostics.len(), 7);
+            for (index, diagnostic) in diagnostics.iter().enumerate() {
+                assert_eq!(diagnostic.kind, HookConfigDiagnosticKind::UnsupportedEvent);
+                assert_eq!(
+                    diagnostic.field,
+                    format!("session_hooks[{}].event", index + 2)
+                );
+                assert!(!format!("{diagnostic:?} {diagnostic}").contains("env-secret"));
+            }
+            assert_eq!(sessions.capture_continuation().unwrap(), continuation);
+            assert!(sessions.take_config_diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn hook_config_diagnostics_schema_errors_never_echo_payloads() {
+        let cases = [
+            (
+                serde_json::json!({"hooks":[{"event":"pre_tool_use", "timeout_secs":"timeout-secret", "action":{"type":"shell","command":"command-secret"}}]}),
+                "hooks[0].timeout_secs",
+            ),
+            (
+                serde_json::json!({"hooks":[{"event":"pre_tool_use", "action":{"type":"shell","command":{"secret-key":"command-secret"}}}]}),
+                "hooks[0].action",
+            ),
+            (
+                serde_json::json!({"session_hooks":[{"event":"session_start", "action":{"type":"http","url":"url-secret","headers":{"header-secret":{"secret-key":"secret-value"}}}}]}),
+                "session_hooks[0].action",
+            ),
+            (
+                serde_json::json!({"session_hooks":[{"event":"session_start", "action":{"type":"set_env","key":"env-secret","value":[]}}]}),
+                "session_hooks[0].action",
+            ),
+        ];
+        for name in ["hooks.json", "hooks.yaml"] {
+            for (value, field_prefix) in &cases {
+                let dir = tempfile::tempdir().unwrap();
+                let astra = dir.path().join(".astra");
+                std::fs::create_dir(&astra).unwrap();
+                let content = if name.ends_with("json") {
+                    value.to_string()
+                } else {
+                    serde_yaml_ng::to_string(value).unwrap()
+                };
+                std::fs::write(astra.join(name), content).unwrap();
+                let (tools, sessions) = load_all_hooks(dir.path());
+                assert!(tools.is_empty() && sessions.is_empty());
+                let diagnostics = sessions.take_config_diagnostics();
+                assert_eq!(diagnostics.len(), 1);
+                assert!(
+                    diagnostics[0].field.starts_with(field_prefix),
+                    "{:?}",
+                    diagnostics[0]
+                );
+                assert!(!format!("{:?} {}", diagnostics[0], diagnostics[0]).contains("secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn hook_config_diagnostics_rejected_commands_preserve_partial_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra = dir.path().join(".astra");
+        std::fs::create_dir(&astra).unwrap();
+        std::fs::write(astra.join("hooks.json"), r#"{
+            "hooks":[
+                {"event":"pre_tool_use","action":{"type":"set_env","key":"UNUSED","value":"unused"}},
+                {"event":"post_tool_use","action":{"type":"shell","command":"sudo command-secret"}}
+            ],
+            "session_hooks":[
+                {"event":"session_start","action":{"type":"shell","command":"sudo other-secret"}},
+                {"event":"session_end","action":{"type":"set_env","key":"UNUSED","value":"unused"}}
+            ]
+        }"#).unwrap();
+        let (tools, sessions) = load_all_hooks(dir.path());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(sessions.len(), 1);
+        let diagnostics = sessions.take_config_diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].field, "hooks[1].action.command");
+        assert_eq!(diagnostics[1].field, "session_hooks[0].action.command");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.kind == HookConfigDiagnosticKind::RejectedShell)
+        );
+        assert!(!format!("{diagnostics:?}").contains("secret"));
+    }
+
+    #[test]
+    fn hook_config_diagnostics_report_exact_parser_locations() {
+        for (name, content, line, column) in [
+            (
+                "hooks.json",
+                "{\n\"hooks\": [\n{\"event\":\"unknown\"}\n]\n}",
+                3,
+                18,
+            ),
+            ("hooks.yaml", "hooks:\n  - event: unknown\n", 2, 12),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".astra")).unwrap();
+            std::fs::write(dir.path().join(".astra").join(name), content).unwrap();
+            let diagnostics = load_tool_event_hooks(dir.path()).take_config_diagnostics();
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].field, "hooks[0].event");
+            assert_eq!(diagnostics[0].line, Some(line));
+            assert_eq!(diagnostics[0].column, Some(column));
+            assert!(
+                diagnostics[0]
+                    .to_string()
+                    .contains(&format!(".astra/{name}:{line}:{column}"))
+            );
+        }
+    }
+
+    #[test]
+    fn hook_config_diagnostics_reject_trailing_documents() {
+        for (name, content) in [("hooks.json", "{} {}"), ("hooks.yaml", "{}\n---\n{}\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let astra = dir.path().join(".astra");
+            std::fs::create_dir(&astra).unwrap();
+            std::fs::write(astra.join(name), content).unwrap();
+            let (tools, sessions) = load_all_hooks(dir.path());
+            assert!(tools.is_empty() && sessions.is_empty());
+            assert_eq!(tools.take_config_diagnostics().len(), 1);
+        }
+    }
 
     #[test]
     fn load_hooks_from_formats() {

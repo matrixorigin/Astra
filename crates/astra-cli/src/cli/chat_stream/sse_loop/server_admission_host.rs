@@ -1302,7 +1302,7 @@ impl CliServerAdmissionHost<'_> {
         Ok(turn_result)
     }
 
-    fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
+    pub(super) fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
         let permission_event =
             astra_turn_core::permission::notice::parse_auto_approved_permission(&line);
         if self.render_policy.suppress_headless() {

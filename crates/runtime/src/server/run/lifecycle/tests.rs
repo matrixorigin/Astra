@@ -31418,6 +31418,7 @@ fn build_initial_state_uses_remote_declarations_without_reading_edge_files() {
     let mo = dir.path().join(".astra");
     std::fs::create_dir_all(&mo).unwrap();
     std::fs::write(mo.join("stop-hooks.yaml"), "hooks: [").unwrap();
+    std::fs::write(mo.join("hooks.json"), "{invalid hook config").unwrap();
 
     let svc = test_service();
     let mut req = test_request("implement a fix");
@@ -31480,6 +31481,20 @@ fn build_initial_state_uses_remote_declarations_without_reading_edge_files() {
         assert_eq!(state.hooks.declarations, checks);
         assert!(state.skills.tool_event_hooks.is_empty());
         assert!(state.skills.session_event_hooks.is_empty());
+        assert!(
+            state
+                .skills
+                .tool_event_hooks
+                .take_config_diagnostics()
+                .is_empty()
+        );
+        assert!(
+            state
+                .skills
+                .session_event_hooks
+                .take_config_diagnostics()
+                .is_empty()
+        );
         assert_eq!(
             state.hooks.workspace_root_hint.as_deref(),
             Some(dir.path().to_str().unwrap())
@@ -31498,6 +31513,8 @@ fn build_initial_state_uses_workspace_override_when_no_edge_cwd() {
     )
     .unwrap();
 
+    std::fs::write(mo.join("hooks.json"), "{invalid hook config").unwrap();
+
     let svc = test_service();
     // Request with NO edge_profile.cwd — simulates web-agent mode.
     let req = test_request("fix a bug");
@@ -31514,6 +31531,15 @@ fn build_initial_state_uses_workspace_override_when_no_edge_cwd() {
         Some(&bindings),
         None,
     );
+    let diagnostics = state.skills.session_event_hooks.take_config_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].source, "hooks.json");
+    assert_eq!(
+        diagnostics[0].kind,
+        astra_skills::hooks::HookConfigDiagnosticKind::InvalidConfiguration
+    );
+    assert!(state.skills.tool_event_hooks.is_empty());
+    assert!(state.skills.session_event_hooks.is_empty());
     assert_eq!(state.hooks.stop_hooks.len(), 1);
     assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
     assert_eq!(

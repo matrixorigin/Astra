@@ -289,6 +289,11 @@ async fn prepare_remote_request(
     host: &mut CliServerAdmissionHost<'_>,
     state: &mut RemoteTurnState,
 ) -> Result<(), astra_core::ClassifiedError> {
+    use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
+
+    for diagnostic in state.skills.session_event_hooks.take_config_diagnostics() {
+        host.emit_headless_line(HeadlessStderrStyle::Yellow, diagnostic.to_string());
+    }
     let read_only = if let Some(context) = state.permission_context.as_ref() {
         context.read().await.inherited.read_only_execution
     } else {
