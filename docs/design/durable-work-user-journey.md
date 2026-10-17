@@ -181,6 +181,27 @@ The user-visible states are:
 | Provider binding | `Session/workspace + binding generation` | Canonical selection authorizes provider use at Run admission and invocation dispatch |
 | Workspace materialization | persisted `materialization_id` plus authenticated canonical checkout root and repo identity/ref/tree hash | The local Edge state identity survives reconnects and Edge-label changes; independent Sessions may bind it, while the executor's workspace coordination lease serializes physical operations. A matching hash proves committed tree identity, not environment or external effects |
 
+The shared CLI/Edge runtime-env owner persists the canonical checkout identity
+under the default device-state directory, keyed by the canonical checkout path.
+Isolated cache roots mirror that identity and reject conflicting values; they
+cannot create a second identity owner. Unix mount device/inode metadata may seed
+a first registration, but a changed mount number must not invalidate an already
+published identity. A bounded `.checkout` sidecar records a device/path/inode
+fingerprint without the volatile mount number. On Unix, a later inode change
+rejects directory replacement at the same path instead of reusing the old ID;
+it requires explicit identity recovery/re-registration. Legacy `.id` files have
+no inode witness: their first upgraded start binds the current directory, so a
+replacement before that migration cannot be detected. Non-Unix binding checks
+cover device identity and canonical path only, as before.
+Existing default-state identity values, including an older path-alias file,
+are retained during canonical-path registration. Identity
+files remain bounded regular files with atomic no-replace publication; malformed
+or symlinked state is rejected. A conflicting legacy identity present only in an
+isolated cache is not adopted when the default-state owner is absent; the cache
+is left unchanged and requires explicit recovery. This does not change
+authenticated provider binding, repository attestation, or executor-local
+workspace coordination.
+
 Client URLs and normal user-facing controls identify Work and branch. Session
 and Run ids remain available in diagnostics and repair surfaces, not as the
 primary navigation model.

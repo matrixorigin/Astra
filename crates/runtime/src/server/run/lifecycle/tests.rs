@@ -18317,6 +18317,87 @@ fn native_edge_execution_request(executor_id: &str, root: &str) -> ChatRequestDa
 }
 
 #[tokio::test]
+async fn native_edge_execution_reports_capability_schema_errors() {
+    let binding = astra_runtime_env::RunBinding::edge_developer(
+        "/workspace/schema-test",
+        &astra_runtime_env::ToolRegistry::builtins(),
+    );
+    let current = serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+        binding,
+    ))
+    .unwrap();
+    for version in [1, 99, 2] {
+        let mut capabilities = current.clone();
+        capabilities["schema_version"] = json!(version);
+        capabilities
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_discovery");
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        pool.register_with_capabilities_registry_and_materialization_id(
+            "owner-1",
+            "edge-agent",
+            None,
+            Some("/workspace/schema-test".into()),
+            Some(capabilities),
+            None,
+            Some("registry-schema-test".into()),
+            Some("materialization-schema-test".into()),
+            sender,
+        );
+        let service = test_service().with_edge_connection_pool(pool);
+        let request = native_edge_execution_request("edge-agent", "/workspace/schema-test");
+        let mut discovery = Vec::new();
+        let (status, Json(error)) = service
+            .authorize_native_edge_execution("owner-1", &request, &mut discovery)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(discovery.is_empty());
+        if version != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION {
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("edge_capability_schema_unsupported")
+            );
+            assert!(error.detail.contains(&format!("schema v{version}")));
+            assert!(error.detail.contains("expects v2"));
+            assert!(error.detail.contains("upgrade"));
+            let response = crate::server::http_helpers::sse_error_response_from_error_with_context(
+                status,
+                error,
+                crate::server::http_helpers::SseErrorContext::default(),
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            let data = text.strip_prefix("data: ").unwrap().trim();
+            let event =
+                astra_thin_client::classify_stream_event(serde_json::from_str(data).unwrap())
+                    .unwrap();
+            let astra_thin_client::StreamEvent::Error {
+                message,
+                retryable,
+                raw,
+                ..
+            } = event
+            else {
+                panic!("schema rejection must remain a client-visible SSE error");
+            };
+            assert!(message.contains(&format!("schema v{version}")));
+            assert!(message.contains("upgrade"));
+            assert!(!retryable);
+            assert_eq!(raw["error_code"], "edge_capability_schema_unsupported");
+            assert_eq!(raw["error_kind"], "invalid_request");
+        } else {
+            assert_eq!(error.detail, "selected Edge discovery is invalid");
+            assert!(error.error_code.is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let physical =

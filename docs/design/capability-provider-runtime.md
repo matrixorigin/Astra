@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-10-09.
+> Last updated: 2026-10-18.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -242,6 +242,17 @@ Runtime advertisements use schema version 2 and carry an explicit
 declared. Missing discovery is not inferred from public tool schemas. Local
 snapshots use the `cli-local` discovery protocol, the authenticated executor as
 provider identity, and the materialization/root physical identity as binding.
+
+WebSocket and chat admission decode the advertisement through the shared
+runtime-env version-first decoder. An unsupported integer `schema_version` is
+reported before decoding version-specific required fields. Chat admission
+returns HTTP 409 with `edge_capability_schema_unsupported` and a version-aware
+message directing users to install a matching CLI/Edge version and upgrade
+outdated clients; WebSocket admission reports the same version mismatch.
+Current-schema payloads still require all fields, including `provider_discovery`.
+This does not admit older schemas, default missing discovery, or add validation
+to REST registration. A compatible client release remains necessary to use a
+server that requires a newer schema.
 
 Server admission resolves the selected authenticated registration through the
 same conservative resolver as other providers and installs one combined policy

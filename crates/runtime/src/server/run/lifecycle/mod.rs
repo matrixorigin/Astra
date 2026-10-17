@@ -46,6 +46,7 @@ use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
     error_response_coded_with_metadata,
 };
+use astra_runtime_env::RuntimeEnvironmentAdvertisementDecodeError;
 use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
@@ -10880,13 +10881,22 @@ impl AgenticRunLifecycleService {
                 let Some(capabilities) = capabilities else {
                     return Ok(Vec::new());
                 };
-                let advert: astra_runtime_env::RuntimeEnvironmentAdvertisement =
-                    serde_json::from_value(capabilities.clone()).map_err(|_| {
+                let advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::decode(
+                    capabilities.clone(),
+                )
+                .map_err(|error| match error {
+                    error @ RuntimeEnvironmentAdvertisementDecodeError::UnsupportedSchema {
+                        ..
+                    } => error_response_coded(
+                        StatusCode::CONFLICT,
+                        error.to_string(),
+                        astra_thin_client::EDGE_CAPABILITY_SCHEMA_UNSUPPORTED_CODE,
+                    ),
+                    RuntimeEnvironmentAdvertisementDecodeError::Invalid(_) => {
                         error_response(StatusCode::CONFLICT, "selected Edge discovery is invalid")
-                    })?;
-                if advert.schema_version
-                    != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
-                    || advert.binding.executor.executor_id != executor_id
+                    }
+                })?;
+                if advert.binding.executor.executor_id != executor_id
                     || !advert.binding.executor.is_edge_agent()
                     || advert.binding.workspace.kind
                         != astra_runtime_env::WorkspaceBindingKind::EdgeWorkspace

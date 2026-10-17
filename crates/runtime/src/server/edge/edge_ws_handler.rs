@@ -1729,22 +1729,8 @@ fn validate_edge_capabilities(
             &capabilities,
         ));
 
-    let mut advert = match serde_json::from_value::<
-        astra_runtime_env::RuntimeEnvironmentAdvertisement,
-    >(capabilities.clone())
-    {
-        Ok(a) => a,
-        Err(error) => return Err(format!("invalid edge capabilities: {error}")),
-    };
-
-    // Reject schema versions we don't understand.
-    if advert.schema_version != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported edge capability schema version {}; expected {}",
-            advert.schema_version,
-            astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION,
-        ));
-    }
+    let mut advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::decode(capabilities)
+        .map_err(|error| error.to_string())?;
 
     // Ensure the executor is actually an edge agent (not a cloud executor
     // or local CLI masquerading as edge).
@@ -2236,11 +2222,29 @@ mod tests {
     }
 
     #[test]
+    fn validate_edge_capabilities_reports_unsupported_capability_schema_before_body() {
+        for version in [1, u64::from(u32::MAX)] {
+            let error = validate_edge_capabilities(
+                Some(serde_json::json!({"schema_version": version})),
+                "edge-agent",
+                "user-1",
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("schema v{version}")), "{error}");
+            assert!(error.contains("expects v2"), "{error}");
+            assert!(error.contains("upgrade"), "{error}");
+            assert!(!error.contains("missing field"), "{error}");
+        }
+    }
+
+    #[test]
     fn validate_edge_capabilities_rejects_absent_malformed_and_unknown_schema() {
         assert!(validate_edge_capabilities(None, "edge-agent", "user-1").is_err());
         assert!(
             validate_edge_capabilities(
-                Some(serde_json::json!({"schema_version": 1})),
+                Some(serde_json::json!({
+                    "schema_version": RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+                })),
                 "edge-agent",
                 "user-1"
             )
