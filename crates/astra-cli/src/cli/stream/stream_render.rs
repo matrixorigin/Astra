@@ -4826,7 +4826,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if !policy.is_silent() {
             for effect in &effects {
                 if let SseRenderEffect::SystemWarning(message) = effect {
-                    eprintln!("{}", message.yellow());
+                    eprintln!("{}", message.as_str().yellow());
                 }
             }
         }

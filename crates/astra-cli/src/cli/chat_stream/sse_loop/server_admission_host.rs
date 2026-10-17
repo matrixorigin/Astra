@@ -1305,7 +1305,7 @@ impl CliServerAdmissionHost<'_> {
 
     pub(super) fn emit_system_warning(&mut self, message: String) {
         if !self.render_policy.suppress_headless() {
-            eprintln!("{}", message.yellow());
+            eprintln!("{}", message.as_str().yellow());
             self.pending_clear_lines += 1;
         }
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SystemWarning(message));
