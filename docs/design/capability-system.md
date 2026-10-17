@@ -177,6 +177,15 @@ MCP is a provider type, not a separate tool universe.
 - Lock contention or transient discovery should not silently look like permanent tool absence.
 - MCP write tools obey plan and permission policy.
 
+The standalone CLI's `astra mcp list --effective` and `astra mcp get` consume
+`manifest_loader` discovery, the same owner as chat startup. The first enabled
+configuration by name wins in project → ordered skill manifests → user order.
+Display projects only server name, transport and file provenance; connection
+values remain available to the runtime and are omitted from display and parse
+diagnostics. Missing optional config files are normal; unreadable or malformed
+files produce sanitized diagnostics. This is configuration inspection, not a
+connection or tool-admission result. See the [CLI reference](../reference/cli-commands.md#mcp-configuration).
+
 ## Diagnostics
 
 Diagnostics must distinguish:

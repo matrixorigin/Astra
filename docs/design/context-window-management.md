@@ -86,6 +86,23 @@ Preserve:
 
 ## Compaction output
 
+Accepted history summaries carry a versioned `_astra_history_summary` marker
+through canonical replacement and continuation restore. They retain their
+existing system storage role, but the shared summary input projection passes
+them as historical evidence: assistant context for inline summaries and an
+explicit prior-summary section for rendered summaries. Inline requests precede
+that assistant evidence with an auxiliary user task preamble, preserving the
+user-first conversation shape required by providers such as Bedrock Nova,
+including after resume and PTL retries. The preamble is never persisted as
+human conversation history. Stable instructions and
+runtime-owned controls never qualify as historical summaries. Resume also
+recognizes the exact pre-marker compaction envelopes already persisted by Astra.
+Both summary paths retain this evidence across PTL retries without applying
+ordinary message excerpt caps. Artifact spills also carry forward prior summary
+evidence and recovery handles; the existing net token reduction check still
+decides whether the candidate can replace history. This is an input continuity
+contract, not a guarantee of a model's semantic fidelity.
+
 Exact-output deduplication is distinct from deciding that an observation is
 obsolete. A repeated path, tool name or read argument does not prove equal
 content: files can change, ranges can differ and providers can change ownership.

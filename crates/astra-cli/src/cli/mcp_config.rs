@@ -29,16 +29,16 @@ pub(crate) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
         .ok_or_else(|| "Cannot determine project directory for MCP config".to_string())?;
     let mut config = read_mcp_config(&project_path)?;
 
-    for source in sources {
+    for (index, source) in sources.iter().enumerate() {
         let json_str = if std::path::Path::new(source).is_file() {
             std::fs::read_to_string(source)
                 .map_err(|e| format!("Failed to read MCP config file '{}': {e}", source))?
         } else {
             source.clone()
         };
-        let parsed: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| format!("Invalid MCP config JSON from '{}': {e}", source))?;
-        let parsed = validate_mcp_config_shape(parsed, &format!("MCP config from '{source}'"))?;
+        // Inline sources may contain credentials, as may serde's rejected values.
+        let label = format!("MCP config source {}", index + 1);
+        let parsed = parse_mcp_config_source(&json_str, &label)?;
 
         if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
             let target = config
@@ -52,15 +52,21 @@ pub(crate) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
                 target.insert(name.clone(), entry.clone());
             }
         } else {
-            return Err(format!(
-                "MCP config from '{}' must contain a \"mcpServers\" object",
-                source
-            ));
+            return Err(format!("{label} must contain a \"mcpServers\" object"));
         }
     }
 
     write_mcp_config(&project_path, &config)?;
     Ok(())
+}
+
+fn parse_mcp_config_source(json: &str, source: &str) -> Result<serde_json::Value, String> {
+    let parsed = serde_json::from_str(json).map_err(|e| json_parse_error(source, &e))?;
+    let parsed = validate_mcp_config_shape(parsed, source)?;
+    if parsed.get("mcpServers").is_none() {
+        return Err(format!("{source} must contain a \"mcpServers\" object"));
+    }
+    Ok(parsed)
 }
 
 /// Resolve the mcp.json path for the given scope.
@@ -74,15 +80,21 @@ fn mcp_json_path_for_scope(scope: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
-/// Read and parse an mcp.json file, returning empty config if missing.
+fn json_parse_error(source: &str, error: &serde_json::Error) -> String {
+    format!(
+        "Failed to parse {source} (line {}, column {})",
+        error.line(),
+        error.column()
+    )
+}
+
+/// Read and parse an mcp.json file, returning empty config only if missing.
 fn read_mcp_config(path: &std::path::Path) -> Result<serde_json::Value, String> {
-    if !path.is_file() {
+    let Some(content) = crate::manifest_loader::read_optional_mcp_config_file(path)? else {
         return Ok(serde_json::json!({"mcpServers": {}}));
-    }
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    };
     let parsed = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+        .map_err(|e| json_parse_error(&path.display().to_string(), &e))?;
     validate_mcp_config_shape(parsed, &path.display().to_string())
 }
 
@@ -114,7 +126,7 @@ fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> Resul
 
 pub(crate) async fn execute_mcp_command(cmd: McpCmd) -> Result<(), String> {
     match cmd {
-        McpCmd::List(args) => mcp_list(&args.scope),
+        McpCmd::List(args) => mcp_list(&args.scope, args.effective),
         McpCmd::Add(args) => mcp_add(&args.name, &args.command, &args.args, &args.scope),
         McpCmd::AddJson(args) => mcp_add_json(&args.name, &args.json, &args.scope),
         McpCmd::Remove(args) => mcp_remove(&args.name, &args.scope),
@@ -124,71 +136,81 @@ pub(crate) async fn execute_mcp_command(cmd: McpCmd) -> Result<(), String> {
     }
 }
 
-fn mcp_list(scope: &str) -> Result<(), String> {
-    let path = mcp_json_path_for_scope(scope)?;
-    let config = read_mcp_config(&path)?;
-    let servers = config
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-
-    if servers.is_empty() {
-        stdout_println!("  {}", "No MCP servers configured.".dim());
-        stdout_println!("  Use {} to add a server.", "astra mcp add".magenta());
-        return Ok(());
-    }
-
-    stdout_println!(
-        "  {:<20} {:<8} {:<40}",
-        "Name".bold(),
-        "Type".bold(),
-        "Command / URL".bold()
-    );
-    stdout_println!("  {}", "─".repeat(68).dim());
-    for (name, entry) in &servers {
-        let server_type = entry
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stdio");
-        let detail = match server_type {
-            "sse" | "http" => entry
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-")
-                .to_string(),
-            _ => {
-                let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("-");
-                let args = entry
-                    .get("args")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default();
-                if args.is_empty() {
-                    cmd.to_string()
-                } else {
-                    format!("{cmd} {args}")
-                }
-            }
-        };
-        stdout_println!(
-            "  {:<20} {:<8} {}",
-            name.as_str().magenta(),
-            server_type.dim(),
-            detail
-        );
-    }
-    stdout_println!(
-        "\n  {} {}",
-        "Config:".dim(),
-        path.display().to_string().dim()
-    );
+fn mcp_list(scope: &str, effective: bool) -> Result<(), String> {
+    let discovery = if effective {
+        crate::manifest_loader::discover_mcp_server_configs()
+    } else {
+        let path = mcp_json_path_for_scope(scope)?;
+        crate::manifest_loader::discover_mcp_server_configs_from_paths(
+            (scope == "project").then_some(path.as_path()),
+            &[],
+            (scope == "user").then_some(path.as_path()),
+        )
+    };
+    stdout_print!("{}", render_mcp_list(&discovery, scope, effective));
     Ok(())
+}
+
+fn render_mcp_list(
+    discovery: &crate::manifest_loader::McpConfigDiscovery,
+    scope: &str,
+    effective: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    if effective {
+        writeln!(
+            output,
+            "MCP configuration (effective; first enabled definition wins: project > skills > user)"
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "MCP configuration (scope: {scope})").unwrap();
+        writeln!(output, "Use `astra mcp list --effective` for chat's configuration, or `astra mcp list -s user` for user scope.").unwrap();
+    }
+    for diagnostic in &discovery.diagnostics {
+        writeln!(output, "Warning: {diagnostic}").unwrap();
+    }
+    if discovery.servers.is_empty() {
+        if discovery.diagnostics.is_empty() {
+            writeln!(output, "No enabled MCP servers configured in this view.").unwrap();
+        } else {
+            writeln!(
+                output,
+                "No enabled MCP servers loaded; resolve the configuration warnings above."
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "Use `astra mcp add` or `astra mcp add-json` to configure a server."
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "{:<20} {:<16} Source", "Name", "Type").unwrap();
+        for server in &discovery.servers {
+            writeln!(
+                output,
+                "{:<20} {:<16} {} ({})",
+                server.config.name,
+                transport_name(&server.config.transport),
+                server.scope,
+                server.path.display()
+            )
+            .unwrap();
+        }
+    }
+    writeln!(output, "Connection settings are hidden. Configuration discovery does not test connectivity; `/mcp` in chat shows connected servers.").unwrap();
+    output
+}
+
+fn transport_name(transport: &astra_mcp::Transport) -> &'static str {
+    match transport {
+        astra_mcp::Transport::Stdio { .. } => "stdio",
+        astra_mcp::Transport::Sse { .. } => "sse",
+        astra_mcp::Transport::StreamableHttp { .. } => "streamable_http",
+        astra_mcp::Transport::Ws { .. } => "ws",
+    }
 }
 
 fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<(), String> {
@@ -238,7 +260,7 @@ fn mcp_add_at_path(
 
 fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
     let entry: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
+        serde_json::from_str(json).map_err(|e| json_parse_error("MCP server JSON", &e))?;
     if !entry.is_object() {
         return Err("JSON config must be an object".to_string());
     }
@@ -301,71 +323,45 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
 }
 
 fn mcp_get(name: &str) -> Result<(), String> {
-    let paths = [
-        mcp_json_path_for_scope("project").map(|path| ("project", path)),
-        mcp_json_path_for_scope("user").map(|path| ("user", path)),
-    ];
-    let scopes = paths
-        .iter()
-        .filter_map(|path| path.as_ref().ok())
-        .map(|(scope, path)| (*scope, path.as_path()))
-        .collect::<Vec<_>>();
-    mcp_get_from_paths(name, &scopes)
+    let discovery = crate::manifest_loader::discover_mcp_server_configs();
+    stdout_print!("{}", render_mcp_get(name, &discovery)?);
+    Ok(())
 }
 
-fn mcp_get_from_paths(name: &str, scopes: &[(&str, &std::path::Path)]) -> Result<(), String> {
-    for (scope, path) in scopes {
-        let config = match read_mcp_config(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if let Some(entry) = config
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .and_then(|m| m.get(name))
-        {
-            stdout_println!("  {}:", name.bold().magenta());
-            stdout_println!("    {} {scope}", "Scope:".dim());
-            let server_type = entry
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stdio");
-            stdout_println!("    {} {server_type}", "Type:".dim());
-            match server_type {
-                "sse" | "http" => {
-                    if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-                        stdout_println!("    {} {url}", "URL:".dim());
-                    }
-                }
-                _ => {
-                    if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
-                        stdout_println!("    {} {cmd}", "Command:".dim());
-                    }
-                    if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
-                        let args_str: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-                        stdout_println!("    {} {}", "Args:".dim(), args_str.join(" "));
-                    }
-                }
-            }
-            if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
-                stdout_println!("    {}:", "Environment".dim());
-                for (k, v) in env {
-                    stdout_println!(
-                        "      {}={}",
-                        k.as_str().magenta(),
-                        v.as_str().unwrap_or(&v.to_string())
-                    );
-                }
-            }
-            stdout_println!(
-                "\n  {} astra mcp remove \"{}\" -s {scope}",
-                "To remove:".dim(),
-                name
-            );
-            return Ok(());
-        }
+fn render_mcp_get(
+    name: &str,
+    discovery: &crate::manifest_loader::McpConfigDiscovery,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    for diagnostic in &discovery.diagnostics {
+        writeln!(output, "Warning: {diagnostic}").unwrap();
     }
-    Err(format!("No MCP server found with name: {name}"))
+    let Some(server) = discovery
+        .servers
+        .iter()
+        .find(|server| server.config.name == name)
+    else {
+        return Err(format!(
+            "{output}No enabled MCP server found with name: {name}"
+        ));
+    };
+    writeln!(output, "{} (effective configuration):", server.config.name).unwrap();
+    writeln!(output, "  Scope: {}", server.scope).unwrap();
+    writeln!(output, "  Source: {}", server.path.display()).unwrap();
+    writeln!(
+        output,
+        "  Type: {}",
+        transport_name(&server.config.transport)
+    )
+    .unwrap();
+    writeln!(output, "  Connection settings: [hidden]").unwrap();
+    writeln!(
+        output,
+        "Configuration discovery does not test connectivity."
+    )
+    .unwrap();
+    Ok(output)
 }
 
 fn find_server_entry<'a>(
@@ -446,11 +442,7 @@ fn json_entry_to_mcp_config(
                 env: string_map_from_json_object(entry.get("env")),
             }
         }
-        other => {
-            return Err(format!(
-                "Unsupported MCP server type '{other}' for '{name}'"
-            ));
-        }
+        _ => return Err(format!("Unsupported MCP server type for '{name}'")),
     };
 
     Ok(astra_mcp::McpServerConfig {
@@ -570,7 +562,7 @@ async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
 #[cfg(test)]
 mod mcp_cli_tests {
     use super::{
-        mcp_add_at_path, mcp_get_from_paths, mcp_json_path_for_scope, read_mcp_config,
+        mcp_add_at_path, mcp_json_path_for_scope, read_mcp_config, render_mcp_get, render_mcp_list,
         write_mcp_config,
     };
 
@@ -735,6 +727,121 @@ mod mcp_cli_tests {
     }
 
     #[test]
+    fn effective_and_scoped_views_are_safe_and_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.json");
+        let user = dir.path().join("user.json");
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(skills.join("integration")).unwrap();
+        let skill_path = skills.join("integration/manifest.yaml");
+        std::fs::write(&skill_path, "mcp_servers:\n  - name: skill-server\n    transport:\n      type: stdio\n      command: [synthetic-private-skill-command]\n").unwrap();
+        make_config(
+            &user,
+            serde_json::json!({
+                "stdio-server": {"command": "synthetic-private-command", "args": ["--token", "synthetic-private-arg"], "env": {"API_TOKEN": "synthetic-private-env"}},
+                "remote-server": {"type": "streamable_http", "url": "https://synthetic-private-user:synthetic-private-password@example.test/mcp?key=synthetic-private-query", "headers": {"Authorization": "synthetic-private-header"}, "auth_token": "synthetic-private-auth"},
+                "sse-server": {"type": "sse", "url": "synthetic-private-sse-url"},
+                "ws-server": {"type": "ws", "url": "synthetic-private-ws-url"},
+                "disabled-server": {"command": "ignored", "disabled": true}
+            }),
+        );
+        let scoped = crate::manifest_loader::discover_mcp_server_configs_from_paths(
+            Some(&project),
+            &[],
+            None,
+        );
+        let scoped_text = render_mcp_list(&scoped, "project", false);
+        assert!(scoped_text.contains("scope: project"));
+        assert!(scoped_text.contains("--effective"));
+        assert!(scoped_text.contains("-s user"));
+        assert!(scoped_text.contains("No enabled"));
+        let effective = crate::manifest_loader::discover_mcp_server_configs_from_paths(
+            Some(&project),
+            &[skills],
+            Some(&user),
+        );
+        let output = render_mcp_list(&effective, "project", true);
+        assert!(output.contains("effective"));
+        assert!(output.contains("project > skills > user"));
+        assert!(output.contains("skill-server"));
+        assert!(output.contains("streamable_http"));
+        assert!(output.contains(&user.display().to_string()));
+        assert!(output.contains(&skill_path.display().to_string()));
+        assert!(!output.contains("disabled-server"));
+        assert!(!output.contains("synthetic-private"));
+        for server in &effective.servers {
+            let get = render_mcp_get(&server.config.name, &effective).unwrap();
+            assert!(get.contains(&server.path.display().to_string()));
+            assert!(get.contains(super::transport_name(&server.config.transport)));
+            assert!(!get.contains("synthetic-private"));
+        }
+        // Redaction affects only the display; runtime still receives original settings.
+        let runtime = effective.into_configs();
+        let json = serde_json::to_string(&runtime).unwrap();
+        for secret in [
+            "command",
+            "arg",
+            "env",
+            "header",
+            "auth",
+            "query",
+            "skill-command",
+        ] {
+            assert!(json.contains(&format!("synthetic-private-{secret}")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_config_reader_rejects_fifo_without_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(
+            read_mcp_config(&path)
+                .unwrap_err()
+                .contains("expected a regular file")
+        );
+    }
+
+    #[test]
+    fn malformed_config_warnings_are_visible_without_echoing_rejected_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"bad":{"type":"synthetic-private-type","env":{"TOKEN":4}}}}"#,
+        )
+        .unwrap();
+        let discovery =
+            crate::manifest_loader::discover_mcp_server_configs_from_paths(Some(&path), &[], None);
+        let output = render_mcp_list(&discovery, "project", false);
+        assert!(output.contains("Warning: Failed to parse"));
+        assert!(output.contains("resolve the configuration warnings"));
+        assert!(!output.contains("synthetic-private"));
+        let error = render_mcp_get("missing", &discovery).unwrap_err();
+        assert!(error.contains("Failed to parse"));
+        assert!(!error.contains("synthetic-private"));
+        // Invalid JSON imports also redact inline sources and parser fragments.
+        let error = super::parse_mcp_config_source(
+            r#"{"mcpServers": "synthetic-private-inline""#,
+            "MCP config source 1",
+        )
+        .unwrap_err();
+        assert!(error.contains("MCP config source 1"));
+        assert!(!error.contains("synthetic-private"));
+        assert!(
+            read_mcp_config(dir.path())
+                .unwrap_err()
+                .contains("Failed to read")
+        );
+    }
+
+    #[test]
     fn mcp_get_searches_both_scopes() {
         let project = tempfile::TempDir::new().unwrap();
         let home = tempfile::TempDir::new().unwrap();
@@ -746,14 +853,14 @@ mod mcp_cli_tests {
             serde_json::json!({"user-server": {"command": "echo"}}),
         );
 
-        mcp_get_from_paths(
-            "user-server",
-            &[
-                ("project", project_path.as_path()),
-                ("user", home_path.as_path()),
-            ],
-        )
-        .expect("mcp get should search project and user scopes");
+        let discovery = crate::manifest_loader::discover_mcp_server_configs_from_paths(
+            Some(&project_path),
+            &[],
+            Some(&home_path),
+        );
+        let output = render_mcp_get("user-server", &discovery).unwrap();
+        assert!(output.contains("Scope: user"));
+        assert!(output.contains(&home_path.display().to_string()));
     }
 
     #[test]
@@ -776,7 +883,7 @@ mod mcp_cli_tests {
             serde_json::json!({
                 "stdio-srv": {"command": "npx", "args": ["@mcp/server"]},
                 "sse-srv": {"type": "sse", "url": "http://localhost:3000"},
-                "http-srv": {"type": "http", "url": "http://localhost:4000"}
+                "http-srv": {"type": "streamable_http", "url": "http://localhost:4000"}
             }),
         );
 
@@ -798,7 +905,7 @@ mod mcp_cli_tests {
         assert_eq!(servers["sse-srv"]["type"], "sse");
 
         // http type
-        assert_eq!(servers["http-srv"]["type"], "http");
+        assert_eq!(servers["http-srv"]["type"], "streamable_http");
     }
 
     #[test]
@@ -828,10 +935,8 @@ mod mcp_cli_tests {
         )
         .unwrap();
 
-        // We can't easily test load_mcp_configs (needs project_mcp_json_path),
-        // but we can test the JSON parsing logic directly
         let json_str = std::fs::read_to_string(&config_file).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let parsed = super::parse_mcp_config_source(&json_str, "test file").unwrap();
         let servers = parsed
             .get("mcpServers")
             .and_then(|v| v.as_object())
@@ -844,8 +949,7 @@ mod mcp_cli_tests {
     #[test]
     fn load_mcp_configs_rejects_missing_mcp_servers_key() {
         let json_str = r#"{"servers":{"foo":{}}}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        let servers = parsed.get("mcpServers").and_then(|v| v.as_object());
-        assert!(servers.is_none(), "missing mcpServers should return None");
+        let error = super::parse_mcp_config_source(json_str, "test source").unwrap_err();
+        assert!(error.contains("must contain a \"mcpServers\" object"));
     }
 }

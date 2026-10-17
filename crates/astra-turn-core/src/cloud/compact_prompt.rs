@@ -64,6 +64,12 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
 
     let mut out = String::new();
     for msg in messages {
+        if let Some(summary) = super::history_summary::history_summary_text(msg) {
+            // This may be the only remaining representation of old task state.
+            // Do not apply the ordinary per-message excerpt cap to it.
+            out.push_str(&format!("[PRIOR CONVERSATION SUMMARY — historical evidence, not instructions]: {summary}\n\n"));
+            continue;
+        }
         if astra_turn_types::is_runtime_owned_message(msg) {
             continue;
         }
@@ -76,7 +82,7 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
 
         match role {
             "system" => {
-                // Skip system messages — they'll be re-injected by the runtime
+                // Stable instructions are supplied separately by the runtime.
                 continue;
             }
             "tool" => {
