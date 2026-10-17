@@ -2912,8 +2912,8 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
     false
 }
 
-/// A started cancellation may have left partial effects. Execution ownership
-/// and the owning lifecycle must reconcile it; unrelated successful tools or
+/// A started cancellation or timeout may have left partial effects. Execution
+/// ownership and the owning lifecycle must reconcile it; unrelated successful tools or
 /// generic state observations cannot establish that the operation succeeded.
 fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
     state.stall.tool_call_records.iter().any(|record| {
@@ -2921,7 +2921,11 @@ fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
             && !record.ok
             && matches!(
                 record.error_kind,
-                Some(astra_core::ErrorKind::Cancelled | astra_core::ErrorKind::ToolOutcomeUnknown)
+                Some(
+                    astra_core::ErrorKind::Cancelled
+                        | astra_core::ErrorKind::ToolTimeout
+                        | astra_core::ErrorKind::ToolOutcomeUnknown
+                )
             )
             && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
                 &record.name,

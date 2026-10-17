@@ -189,3 +189,63 @@ async fn callback_outcome_facts_survive_journaling_and_control_completion() {
         }
     }
 }
+
+#[tokio::test]
+async fn timeout_callback_requires_reconciliation_only_for_started_side_effects() {
+    // The callback and journal must preserve the executor's timeout and startup
+    // facts. A later successful observation cannot settle the earlier operation.
+    for (command, started, incomplete) in [
+        ("perform-external-operation", true, true),
+        ("perform-external-operation", false, false),
+        ("pwd", true, false),
+    ] {
+        let mut result = make_edge_tool_with_args("bash", json!({"command": command}), "");
+        let fields = result.tool_result_fields.as_mut().unwrap();
+        fields.insert("error_kind".into(), json!("tool_timeout"));
+        if started {
+            astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        } else {
+            astra_tools::execution_outcome::insert_not_executed_fact(fields);
+        }
+        result.status = "failed".into();
+        result.output = "Error: command timed out".into();
+        let mut observed =
+            make_edge_tool_with_args("bash", json!({"command": "pwd"}), "/workspace");
+        observed.request_id = "req-bash-probe".into();
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![result], 10, 2, None),
+            edge_tool_result(vec![observed], 10, 2, None),
+            text_result("Preserved partial report.", 10, 2, None),
+        ])
+        .with_valid_tools(&["bash"]);
+        let mut state = external_request();
+        let budget = state.max_turns;
+        let _ = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        let record = &state.stall.tool_call_records[0];
+        assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
+        assert_eq!(record.was_executed(), started);
+        assert!(!record.ok);
+        assert!(
+            state.stall.tool_call_records[1].ok,
+            "the unrelated probe succeeded"
+        );
+        assert_eq!(state.interruption.is_some(), incomplete, "{record:?}");
+        if incomplete {
+            assert_eq!(
+                state.interruption.as_ref().unwrap().kind,
+                InterruptionKind::ExecutionIncomplete
+            );
+        }
+        assert_eq!(
+            host.turn_count(),
+            3,
+            "no automatic replay or recovery round"
+        );
+        assert_eq!(state.max_turns, budget);
+        assert_eq!(state.stall.tool_call_records.len(), 2);
+        assert_eq!(state.final_text, "Preserved partial report.");
+        assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
+    }
+}

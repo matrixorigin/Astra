@@ -360,6 +360,11 @@ typed workspace completion evidence, unsettled execution ownership, and child
 completion/reply obligations. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
+An executed, failed side-effect-capable invocation with cancellation, timeout or
+unknown-outcome evidence remains execution-incomplete until its owning lifecycle
+reconciles it. Settled process ownership does not prove success of the operation.
+A pre-start rejection or proven read-only timeout does not create this side-effect
+obligation or grant an automatic recovery write.
 
 Durable Edge completion references bind the authenticated invocation identity,
 selected executor and accepted result hash. Local-only delivery grants no such
