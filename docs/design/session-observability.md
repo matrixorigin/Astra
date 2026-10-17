@@ -69,6 +69,13 @@ checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
 
+Legacy `llm_round` records without `session_id` can inherit a file's session
+only when that same authorized source contains an explicit matching session ID
+in the inspected records.
+Every explicit event ID and conversation cursor must still match the requested
+session. A primary file cannot bind an unattributed supplemental source; missing
+IDs on other event types and unanchored round-only fragments remain invalid.
+
 ## Stuck detection
 
 A run may appear stuck because of:

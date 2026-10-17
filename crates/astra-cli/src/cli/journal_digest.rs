@@ -932,8 +932,16 @@ fn validate_session_events(
     events: &[session_journal::JournalEvent],
     session_id: &str,
 ) -> Result<(), String> {
+    // Legacy round telemetry omitted session_id. Bind it only within an
+    // authorized source that also explicitly identifies the requested session.
+    let anchored = events
+        .iter()
+        .any(|event| event.session_id.as_deref() == Some(session_id));
     for event in events {
-        if event.session_id.as_deref() != Some(session_id)
+        let implicit_round = anchored
+            && event.event_type == JournalEventType::LlmRound
+            && event.session_id.is_none();
+        if (!implicit_round && event.session_id.as_deref() != Some(session_id))
             || event
                 .conversation_commit
                 .as_ref()
@@ -1986,7 +1994,7 @@ mod tests {
         DigestFocus, ErrorCategory, SCHEMA_VERSION, build_digest, build_digest_with_owners,
         result_body_signals_failure,
     };
-    use astra_services::session_journal::JournalDirGuard;
+    use astra_services::session_journal::{self, JournalDirGuard};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2002,8 +2010,8 @@ mod tests {
         path
     }
 
-    /// Normalize old fixture IDs to the session under test. Production never
-    /// infers event identity from the filename.
+    /// Normalize synthetic fixture IDs to the session under test. Reader
+    /// regressions write their original bytes directly instead.
     fn write_test_journal(path: PathBuf, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
         let sid = path
             .file_stem()
@@ -2079,8 +2087,7 @@ mod tests {
         let _g = JournalDirGuard::new(tmp.path());
 
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        write_test_journal(journal_path_for_test(sid), REAL_SESSION_0AC769_FIXTURE)
-            .expect("write journal");
+        fs::write(journal_path_for_test(sid), REAL_SESSION_0AC769_FIXTURE).expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(d.journal_lines_non_empty, 14);
@@ -2452,6 +2459,102 @@ mod tests {
             .err()
             .expect("unattributed event must fail");
         assert!(error.contains("another session"));
+    }
+
+    #[test]
+    fn digest_legacy_round_binding_is_per_source_and_preserves_session_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "legacy-round-session";
+        let local = astra_services::OwnerScope::user("legacy-local").unwrap();
+        let account = astra_services::OwnerScope::user("legacy-account").unwrap();
+        let path = |owner: &astra_services::OwnerScope| {
+            let path = session_journal::journal_file_path_for_owner(owner, sid).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        };
+        let anchor = serde_json::json!({"type":"session_start", "ts":"t0", "session_id":sid});
+        let round = serde_json::json!({"type":"llm_round", "ts":"t1", "turn":1, "round":0,
+            "producer_scope":{"run_id":"child", "agent_id":"child"}, "tokens_in":7});
+        let encode = |events: &[serde_json::Value]| {
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>()
+        };
+        fs::write(path(&local), encode(std::slice::from_ref(&anchor))).unwrap();
+        // An anchor in the primary file does not bind an unattributed account file.
+        fs::write(path(&account), encode(std::slice::from_ref(&round))).unwrap();
+        assert!(build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account)).is_err());
+
+        fs::write(
+            path(&account),
+            encode(&[anchor.clone(), round.clone(), round.clone()]) + "not json\n",
+        )
+        .unwrap();
+        let digest =
+            build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account)).unwrap();
+        assert_eq!(digest.aggregates.subrun_total_tokens_in, 7);
+        assert_eq!(digest.subruns[0].llm_round_details.len(), 1);
+        assert_eq!(digest.journal_lines_malformed, 1);
+        let window =
+            super::read_attached_observation_window_with_owners(sid, &local, Some(account.clone()))
+                .unwrap();
+        assert_eq!(
+            window
+                .events
+                .iter()
+                .filter(|event| event.event_type == session_journal::JournalEventType::LlmRound)
+                .count(),
+            1
+        );
+
+        let mut foreign_round = round.clone();
+        foreign_round["session_id"] = serde_json::json!("foreign-session");
+        let mut empty_id = round.clone();
+        empty_id["session_id"] = serde_json::json!("");
+        let mut foreign_anchor = anchor.clone();
+        foreign_anchor["session_id"] = serde_json::json!("foreign-session");
+        let mut missing_turn = round.clone();
+        missing_turn["type"] = serde_json::json!("turn");
+        let mut foreign_cursor = round.clone();
+        foreign_cursor["conversation_commit"] = serde_json::json!({
+            "schema_version":1, "base_root_hash":"base",
+            "cursor":{"schema_version":1, "owner_id":account.id(), "session_id":"foreign-session",
+                "branch_id":"main", "completed_turn":1, "journal_event_seq":1,
+                "conversation_seq":1, "canonical_root_hash":"root", "projection_schema":1,
+                "compaction_generation":0},
+            "delta":{"kind":"append", "messages":[]}
+        });
+        for rejected in [
+            foreign_round,
+            empty_id,
+            foreign_anchor,
+            missing_turn,
+            foreign_cursor,
+        ] {
+            for owner in [&local, &account] {
+                fs::write(path(&local), encode(std::slice::from_ref(&anchor))).unwrap();
+                fs::write(path(&account), encode(std::slice::from_ref(&anchor))).unwrap();
+                fs::write(
+                    path(owner),
+                    encode(&[anchor.clone(), round.clone(), rejected.clone()]),
+                )
+                .unwrap();
+                let error = build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account))
+                    .err()
+                    .expect("foreign or unattributed event must fail");
+                assert!(error.contains("another session"), "{error}");
+                assert!(
+                    super::read_attached_observation_window_with_owners(
+                        sid,
+                        &local,
+                        Some(account.clone())
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
