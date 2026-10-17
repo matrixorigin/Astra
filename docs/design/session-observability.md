@@ -59,7 +59,14 @@ Progress should be derived from durable events:
 
 The explicit CLI `journal digest` reads the complete authorized profile and
 attached account journals. Terminal turn usage is the qualified accounting
-source; `LlmRound` tokens are a separate diagnostic observation. The JSON
+source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
+and tree's root self totals share the same root `Turn`/`TurnError` accounting;
+neither round replays nor child terminals add to those buckets. Tree still
+rolls separately attributed child completions into its inclusive root total.
+Diff's `prompt` and `completion` are fresh input and output; its `total` is
+their sum, excluding prompt-cache buckets. Known terminal totals do not
+reconstruct missing usage or upgrade a historical last-round snapshot into
+a complete attempt total. The JSON
 `usage_coverage` and round-conflict fields identify unknown buckets and
 excluded contradictions. Root-plus-child observed totals mix sources and are
 never a bill or proof of complete session cost. No journal cursor grants

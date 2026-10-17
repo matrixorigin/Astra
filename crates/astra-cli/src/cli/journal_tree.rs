@@ -75,10 +75,10 @@ pub struct DelegationNode {
     /// Aggregated completion tokens on the sub-run (includes children for root).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub completion_tokens: u64,
-    /// Root's own prompt tokens (Turn/LlmRound only, excludes children).
+    /// Root's own known terminal prompt tokens (excludes children).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub self_prompt_tokens: u64,
-    /// Root's own completion tokens (Turn/LlmRound only, excludes children).
+    /// Root's own known terminal completion tokens (excludes children).
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub self_completion_tokens: u64,
     /// Tool invocations on this sub-run.
@@ -111,6 +111,7 @@ pub(crate) fn fold_events_into_tree(
     session_id: &str,
     events: &[JournalEvent],
 ) -> (DelegationNode, u32, u32) {
+    let usage = journal_digest::root_terminal_usage(events);
     let mut root = DelegationNode {
         id: session_id.to_string(),
         label: "root".to_string(),
@@ -119,8 +120,8 @@ pub(crate) fn fold_events_into_tree(
         model: None,
         agent_type: None,
         task: None,
-        prompt_tokens: 0,
-        completion_tokens: 0,
+        prompt_tokens: usage.prompt,
+        completion_tokens: usage.completion,
         self_prompt_tokens: 0,
         self_completion_tokens: 0,
         tool_calls: 0,
@@ -133,14 +134,6 @@ pub(crate) fn fold_events_into_tree(
     for ev in events {
         match ev.event_type {
             JournalEventType::Turn | JournalEventType::LlmRound => {
-                // Root-level token accumulation. Use prompt_tokens +
-                // completion_tokens when present.
-                if let Some(p) = ev.tokens_in {
-                    root.prompt_tokens = root.prompt_tokens.saturating_add(p);
-                }
-                if let Some(c) = ev.tokens_out {
-                    root.completion_tokens = root.completion_tokens.saturating_add(c);
-                }
                 if root.started_at.is_none() && !ev.ts.is_empty() {
                     root.started_at = Some(ev.ts.clone());
                 }

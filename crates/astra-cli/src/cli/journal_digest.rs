@@ -2,6 +2,7 @@
 
 use crate::cli::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
+use astra_turn_core::token_accounting::TokenAccounting;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -640,32 +641,29 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
     }
 }
 
-fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
-    if let Some(scope) = ev.producer_scope.as_ref() {
-        let typed_child_purpose = ev
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("purpose"))
-            .and_then(serde_json::Value::as_str)
-            == Some("sub_agent");
-        let child_source = ev
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("source"))
-            .and_then(serde_json::Value::as_str)
-            == Some("child_agent");
-        if scope.agent_id.is_none() && !typed_child_purpose && !child_source {
-            return None;
-        }
-        return Some(SubrunIdentity {
-            run_id: scope.run_id.clone(),
-            parent_run_id: scope.parent_run_id.clone(),
-            agent_id: scope.agent_id.clone(),
-            local_turn: scope.local_turn,
-        });
-    }
+fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
+    ev.producer_scope.as_ref().is_some_and(|scope| {
+        scope.parent_run_id.is_some()
+            || scope
+                .agent_id
+                .as_deref()
+                .is_some_and(|agent| agent != "root")
+            || ev.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("purpose").and_then(serde_json::Value::as_str) == Some("sub_agent")
+                    || metadata.get("source").and_then(serde_json::Value::as_str)
+                        == Some("child_agent")
+            })
+    })
+}
 
-    None
+fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
+    let scope = ev.producer_scope.as_ref()?;
+    is_child_producer(ev).then(|| SubrunIdentity {
+        run_id: scope.run_id.clone(),
+        parent_run_id: scope.parent_run_id.clone(),
+        agent_id: scope.agent_id.clone(),
+        local_turn: scope.local_turn,
+    })
 }
 
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
@@ -766,6 +764,30 @@ fn observed_runtime_round_usage(
         }),
         tokens_out: sum(|round| round.tokens_out)?,
     })
+}
+
+fn is_root_terminal(event: &session_journal::JournalEvent) -> bool {
+    matches!(
+        event.event_type,
+        JournalEventType::Turn | JournalEventType::TurnError
+    ) && !is_child_producer(event)
+}
+
+/// Known root terminal buckets, shared by the offline journal projections.
+/// Round observations never replace or add to qualified terminal accounting.
+pub(crate) fn root_terminal_usage(events: &[session_journal::JournalEvent]) -> TokenAccounting {
+    events.iter().filter(|event| is_root_terminal(event)).fold(
+        TokenAccounting::default(),
+        |mut total, event| {
+            total.accumulate(&TokenAccounting::from_fields(
+                event.tokens_in.unwrap_or(0),
+                event.cache_read_tokens.unwrap_or(0),
+                event.cache_creation_tokens.unwrap_or(0),
+                event.tokens_out.unwrap_or(0),
+            ));
+            total
+        },
+    )
 }
 
 fn usage_source(event: &session_journal::JournalEvent) -> &'static str {
@@ -1146,10 +1168,12 @@ fn build_digest_with_owners(
     let mut turn_errors = Vec::new();
     let mut other_errors = Vec::new();
 
-    let mut total_tokens_in: u64 = 0;
-    let mut total_cache_read_tokens: u64 = 0;
-    let mut total_cache_creation_tokens: u64 = 0;
-    let mut total_tokens_out: u64 = 0;
+    let TokenAccounting {
+        prompt: total_tokens_in,
+        cache_read: total_cache_read_tokens,
+        cache_creation: total_cache_creation_tokens,
+        completion: total_tokens_out,
+    } = root_terminal_usage(&events);
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
     let mut total_fresh_tool_calls: u64 = 0;
@@ -1197,7 +1221,7 @@ fn build_digest_with_owners(
     let mut seq: u32 = 0;
     for ev in &events {
         match ev.event_type {
-            JournalEventType::Turn => {
+            JournalEventType::Turn if is_root_terminal(ev) => {
                 root_terminal_buckets_complete &= ev.tokens_in.is_some()
                     && ev.cache_read_tokens.is_some()
                     && ev.cache_creation_tokens.is_some()
@@ -1262,14 +1286,6 @@ fn build_digest_with_owners(
                             });
                         }
                     }
-                }
-                if let Some(ti) = tokens_in {
-                    total_tokens_in += ti;
-                }
-                total_cache_read_tokens += cache_read_tokens.unwrap_or(0);
-                total_cache_creation_tokens += cache_creation_tokens.unwrap_or(0);
-                if let Some(to) = tokens_out {
-                    total_tokens_out += to;
                 }
                 if let Some(d) = ev.duration_ms {
                     total_duration_ms += d;
@@ -1369,7 +1385,7 @@ fn build_digest_with_owners(
                 };
                 turns_out.push(row);
             }
-            JournalEventType::TurnError => {
+            JournalEventType::TurnError if is_root_terminal(ev) => {
                 root_terminal_buckets_complete &= ev.tokens_in.is_some()
                     && ev.cache_read_tokens.is_some()
                     && ev.cache_creation_tokens.is_some()
@@ -1422,10 +1438,6 @@ fn build_digest_with_owners(
                         }
                     }
                 }
-                total_tokens_in += tokens_in.unwrap_or(0);
-                total_cache_read_tokens += cache_read_tokens.unwrap_or(0);
-                total_cache_creation_tokens += cache_creation_tokens.unwrap_or(0);
-                total_tokens_out += tokens_out.unwrap_or(0);
                 total_duration_ms += ev.duration_ms.unwrap_or(0);
                 turn_errors.push(TurnErrRow {
                     seq,
@@ -2071,6 +2083,45 @@ mod tests {
         assert_eq!(d.turns[0].tool_groups[0].call_count, 2);
         assert_eq!(d.turns[0].tool_groups[1].round, Some(1));
         assert_eq!(d.turns[0].tool_groups[1].fail_count, 1);
+    }
+
+    #[test]
+    fn digest_terminal_buckets_share_root_scope_with_diff_and_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "terminal-bucket-scope";
+        write_test_journal(journal_path_for_test(sid), concat!(
+            r#"{"type":"turn","ts":"t1","turn":1,"tokens_in":20,"cache_read_tokens":4,"cache_creation_tokens":1,"tokens_out":3}"#, "\n",
+            r#"{"type":"turn_error","ts":"t2","turn":2,"producer_scope":{"run_id":"root","agent_id":"root"},"tokens_in":60,"cache_read_tokens":6,"cache_creation_tokens":2,"tokens_out":7}"#, "\n",
+            r#"{"type":"turn_error","ts":"t3","producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"child"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"turn","ts":"t4","turn":3}"#, "\n",
+            r#"{"type":"llm_round","ts":"t5","turn":3,"producer_scope":{"run_id":"root-observation","agent_id":"root"},"tokens_in":500,"tokens_out":50}"#, "\n",
+            r#"{"type":"turn_error","ts":"t6","producer_scope":{"run_id":"child-parent-only","parent_run_id":"root"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"turn_error","ts":"t7","producer_scope":{"run_id":"child-purpose-only"},"metadata":{"purpose":"sub_agent"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"turn_error","ts":"t8","producer_scope":{"run_id":"child-source-only"},"metadata":{"source":"child_agent"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"llm_round","ts":"t9","producer_scope":{"run_id":"child-parent-only","parent_run_id":"root"},"tokens_in":5,"tokens_out":1}"#, "\n",
+        )).unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        assert_eq!(digest.aggregates.attempt_count, 3);
+        assert_eq!(digest.aggregates.turn_error_count, 1);
+        assert_eq!(digest.aggregates.total_tokens_in, 80);
+        assert_eq!(digest.aggregates.total_cache_read_tokens, 10);
+        assert_eq!(digest.aggregates.total_cache_creation_tokens, 3);
+        assert_eq!(digest.aggregates.total_provider_input_tokens, 93);
+        assert_eq!(digest.aggregates.total_tokens_out, 10);
+        assert_eq!(digest.aggregates.subrun_count, 1);
+        assert_eq!(digest.aggregates.subrun_total_tokens_in, 5);
+        assert!(!digest.usage_coverage.root_terminal_buckets_complete);
+        let events = astra_services::session_journal::read_journal(sid).unwrap();
+        let diff = crate::cli::journal_diff::diff_events(sid, sid, &events, &events);
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree(sid, &events);
+        assert_eq!(diff.a_tokens.prompt, digest.aggregates.total_tokens_in);
+        assert_eq!(tree.self_prompt_tokens, digest.aggregates.total_tokens_in);
+        assert_eq!(diff.a_tokens.completion, digest.aggregates.total_tokens_out);
+        assert_eq!(
+            tree.self_completion_tokens,
+            digest.aggregates.total_tokens_out
+        );
     }
 
     #[test]

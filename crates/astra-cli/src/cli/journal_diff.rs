@@ -46,7 +46,7 @@ pub struct JournalDiff {
     /// level diff: "A called [Read, Grep, Read]; B called [Read, Read]".
     pub a_tool_sequence: Vec<String>,
     pub b_tool_sequence: Vec<String>,
-    /// Aggregate token totals.
+    /// Known root terminal tokens; excludes round observations and child work.
     pub a_tokens: TokenTotals,
     pub b_tokens: TokenTotals,
     /// b - a, signed. Negative = B used fewer tokens (usually good).
@@ -157,17 +157,12 @@ fn event_counts(events: &[JournalEvent]) -> BTreeMap<String, u32> {
 }
 
 fn token_totals(events: &[JournalEvent]) -> TokenTotals {
-    let mut t = TokenTotals::default();
-    for e in events {
-        if let Some(p) = e.tokens_in {
-            t.prompt = t.prompt.saturating_add(p);
-        }
-        if let Some(c) = e.tokens_out {
-            t.completion = t.completion.saturating_add(c);
-        }
+    let usage = journal_digest::root_terminal_usage(events);
+    TokenTotals {
+        prompt: usage.prompt,
+        completion: usage.completion,
+        total: usage.prompt.saturating_add(usage.completion),
     }
-    t.total = t.prompt.saturating_add(t.completion);
-    t
 }
 
 fn tool_sequence(events: &[JournalEvent]) -> Vec<String> {
@@ -332,6 +327,56 @@ mod tests {
         assert!(d.only_in_b.is_empty());
         assert!(d.a_has_final_text);
         assert!(d.b_has_final_text);
+    }
+
+    #[test]
+    fn token_totals_use_terminals_once_instead_of_rounds_plus_terminals() {
+        for terminal_input in [100, 150] {
+            let round = evt(json!({"type":"llm_round", "ts":"t1", "session_id":"a",
+                "turn":1, "round":0, "tokens_in":50, "tokens_out":5}));
+            let events = vec![
+                round.clone(),
+                round,
+                evt(json!({"type":"llm_round", "ts":"t2", "session_id":"a",
+                    "turn":1, "round":1, "tokens_in":100, "tokens_out":10})),
+                evt(json!({"type":"turn", "ts":"t3", "session_id":"a",
+                    "turn":1, "tokens_in":terminal_input, "tokens_out":10})),
+                evt(json!({"type":"turn_error", "ts":"t4", "session_id":"a",
+                    "producer_scope":{"run_id":"root", "agent_id":"root"},
+                    "tokens_in":20, "tokens_out":2})),
+                evt(json!({"type":"turn_error", "ts":"t5", "session_id":"a",
+                    "producer_scope":{"run_id":"child", "parent_run_id":"root", "agent_id":"child"},
+                    "tokens_in":999, "tokens_out":999})),
+                // Observations without a terminal are not qualified accounting.
+                evt(json!({"type":"llm_round", "ts":"t6", "session_id":"a",
+                    "turn":2, "tokens_in":500, "tokens_out":50})),
+                evt(
+                    json!({"type":"tool_call_error", "ts":"t7", "session_id":"a",
+                    "tokens_in":700, "tokens_out":70}),
+                ),
+            ];
+            let diff = diff_events("a", "b", &events, &[]);
+            assert_eq!(diff.a_tokens.prompt, terminal_input + 20);
+            assert_eq!(diff.a_tokens.completion, 12);
+            let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &events);
+            assert_eq!(tree.self_prompt_tokens, diff.a_tokens.prompt);
+            assert_eq!(tree.self_completion_tokens, diff.a_tokens.completion);
+        }
+    }
+
+    #[test]
+    fn real_fixture_token_total_matches_digest_terminal_accounting() {
+        let events: Vec<JournalEvent> =
+            include_str!("../../../services/fixtures/real_session_0ac769_min.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let diff = diff_events("a", "b", &events, &events);
+        assert_eq!(diff.a_tokens.prompt, 33659);
+        assert_eq!(diff.a_tokens.completion, 2855);
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree("a", &events);
+        assert_eq!(tree.self_prompt_tokens, diff.a_tokens.prompt);
+        assert_eq!(tree.self_completion_tokens, diff.a_tokens.completion);
     }
 
     #[test]
