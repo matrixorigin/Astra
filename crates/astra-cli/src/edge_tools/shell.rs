@@ -28,8 +28,7 @@ fn bash_preparation_rejection(message: String) -> super::ToolExecutionOutcome {
     let mut outcome = super::tool_execution_outcome_from_output(message);
     outcome.is_error = true;
     let fields = outcome.tool_result_fields.get_or_insert_default();
-    fields.insert("disposition".into(), Value::String("rejected".into()));
-    fields.insert("execution_started".into(), Value::Bool(false));
+    astra_tools::execution_outcome::insert_not_executed_fact(fields);
     fields.insert("side_effects_maybe".into(), Value::Bool(false));
     outcome
 }
@@ -158,9 +157,8 @@ fn annotate_environment_background_termination(
     let fields = outcome
         .tool_result_fields
         .get_or_insert_with(serde_json::Map::new);
+    astra_tools::execution_outcome::insert_started_execution_fact(fields);
     fields.extend([
-        ("execution_started".to_string(), Value::Bool(true)),
-        ("side_effects_maybe".to_string(), Value::Bool(true)),
         ("retryable".to_string(), Value::Bool(false)),
         (
             "background_task_id".to_string(),
@@ -4286,6 +4284,7 @@ impl ToolExecutor {
         let fields = outcome
             .tool_result_fields
             .get_or_insert_with(serde_json::Map::new);
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
         fields.insert(
             "exit_code".to_string(),
             Value::Number(serde_json::Number::from(exit_code)),
@@ -4333,49 +4332,6 @@ impl ToolExecutor {
         .await
         .ok()
         .flatten()
-    }
-
-    async fn capture_external_effect_before_async(
-        &self,
-        args: &Value,
-    ) -> Result<Option<astra_tools::workspace_observation::ExternalEffectFingerprint>, String> {
-        let args = args.clone();
-        let root = self.effective_project_root();
-        tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::ExternalEffectFingerprint::capture_from_args(
-                &args, &root,
-            )
-        })
-        .await
-        .map_err(|error| format!("external state preimage worker failed: {error}"))?
-    }
-
-    async fn attach_external_effect_observation_async(
-        &self,
-        mut outcome: super::ToolExecutionOutcome,
-        before: Option<&astra_tools::workspace_observation::ExternalEffectFingerprint>,
-        scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-        lease: Option<&astra_tools::workspace_observation::ExternalEffectObservationLease>,
-    ) -> super::ToolExecutionOutcome {
-        if lease.is_some_and(|lease| !lease.receipt_authority_valid()) {
-            return outcome;
-        }
-        if let Some(receipt) = match before {
-            Some(before) => {
-                before
-                    .changed_receipt_async(
-                        scope_ownership.map(astra_sandbox::ScopeOwnership::as_str),
-                    )
-                    .await
-            }
-            None => None,
-        } {
-            outcome
-                .tool_result_fields
-                .get_or_insert_with(serde_json::Map::new)
-                .extend(receipt);
-        }
-        outcome
     }
 
     fn quarantine_after_weak_bash_scope(
@@ -4542,7 +4498,7 @@ impl ToolExecutor {
             return read_only_shell_rejection();
         }
         if std::env::var(ENVIRONMENT_BACKGROUND_TASK_AUTH).as_deref() != Ok("1") {
-            return super::ToolExecutionOutcome::error(
+            return bash_preparation_rejection(
                 "Error: environment-lifetime background tasks are not authorized by this execution environment; no process was started".to_string(),
             );
         }
@@ -4552,13 +4508,13 @@ impl ToolExecutor {
                 Err(error) => return bash_preparation_rejection(error),
             };
         if args.get("source_artifacts").is_some() {
-            return super::ToolExecutionOutcome::error(
+            return bash_preparation_rejection(
                 "Error: source_artifacts cannot be combined with run_in_background; prepare immutable inputs in a foreground call first".to_string(),
             );
         }
         let ready_check = match args.get("ready_check").and_then(Value::as_str) {
             Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-            _ => return super::ToolExecutionOutcome::error(
+            _ => return bash_preparation_rejection(
                 "Error: run_in_background requires a non-empty, side-effect-free ready_check; no process was started".to_string(),
             ),
         };
@@ -4589,14 +4545,14 @@ impl ToolExecutor {
         let task_id = format!("env-bg-{:016x}", hasher.finish());
         let output_dir = match environment_background_output_dir() {
             Ok(path) => path,
-            Err(error) => return super::ToolExecutionOutcome::error(format!("Error: {error}")),
+            Err(error) => return bash_preparation_rejection(format!("Error: {error}")),
         };
         let stdout_path = output_dir.join(format!("{task_id}.stdout"));
         let stderr_path = output_dir.join(format!("{task_id}.stderr"));
         let stdout = match std::fs::File::create(&stdout_path) {
             Ok(file) => file,
             Err(error) => {
-                return super::ToolExecutionOutcome::error(format!(
+                return bash_preparation_rejection(format!(
                     "Error: cannot create background stdout: {error}"
                 ));
             }
@@ -4604,7 +4560,7 @@ impl ToolExecutor {
         let stderr = match std::fs::File::create(&stderr_path) {
             Ok(file) => file,
             Err(error) => {
-                return super::ToolExecutionOutcome::error(format!(
+                return bash_preparation_rejection(format!(
                     "Error: cannot create background stderr: {error}"
                 ));
             }
@@ -4645,7 +4601,7 @@ impl ToolExecutor {
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return super::ToolExecutionOutcome::error(format!(
+                return bash_preparation_rejection(format!(
                     "Error: background task could not start: {error}"
                 ));
             }
@@ -4803,14 +4759,10 @@ impl ToolExecutor {
             astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                 "bash", args,
             );
-        let external_effect_requested = args
-            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-            .is_some();
-        if (explicit_verification || external_effect_requested)
-            && environment_background_requested(args)
-        {
-            return super::ToolExecutionOutcome::error(
-                "Error: bash verification and external_state_paths require a foreground executor-owned observation window".to_string(),
+        if explicit_verification && environment_background_requested(args) {
+            return bash_preparation_rejection(
+                "Error: bash verification requires a foreground executor-owned observation window"
+                    .to_string(),
             );
         }
         if environment_background_requested(args) {
@@ -4826,7 +4778,7 @@ impl ToolExecutor {
         let source_preimages = match prepare_source_preimages(self, args, invocation, true) {
             Ok(plan) => plan,
             Err(message) => {
-                return super::ToolExecutionOutcome::error(format!("Error: {message}"));
+                return bash_preparation_rejection(format!("Error: {message}"));
             }
         };
         // The outer run_script process holds the exclusive writer generation
@@ -4862,27 +4814,6 @@ impl ToolExecutor {
         } else {
             self.capture_bash_workspace_before_async(&command).await
         };
-        let external_lease = match astra_tools::workspace_observation::acquire_external_effect_observation_lease_with_options(
-            args,
-            &self.effective_project_root(),
-            cancel_token,
-            std::time::Duration::from_secs_f64(timeout_secs.max(0.1)),
-        ).await {
-            Ok(lease) => lease,
-            Err(astra_tools::workspace_observation::ExternalEffectLeaseFailure::Admission(failure)) => return super::workspace_lease_failure_tool_execution_outcome("bash", failure),
-            Err(message) => return super::ToolExecutionOutcome::error(format!("Error: external state observation was not admitted: {message}")),
-        };
-        if external_effect_requested && external_lease.is_none() {
-            return super::ToolExecutionOutcome::error("Error: external state observation lease is contended or unavailable; no command was run.".to_string());
-        }
-        let external_before = match self.capture_external_effect_before_async(args).await {
-            Ok(before) => before,
-            Err(message) => {
-                return super::ToolExecutionOutcome::error(format!(
-                    "Error: external state observation was not admitted: {message}"
-                ));
-            }
-        };
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return super::cancelled_tool_execution_outcome("bash", false);
         }
@@ -4912,14 +4843,12 @@ impl ToolExecutor {
                 &command_for_settlement,
                 &quarantine_root,
             );
-            (result, _observation_lease, external_lease)
+            (result, _observation_lease)
         })
         .await;
-        let (shell_result, _observation_lease, external_lease) = match shell_result {
-            Ok((result, observation_lease, external_lease)) => {
-                (Ok(result), observation_lease, external_lease)
-            }
-            Err(error) => (Err(error), None, None),
+        let (shell_result, _observation_lease) = match shell_result {
+            Ok((result, observation_lease)) => (Ok(result), observation_lease),
+            Err(error) => (Err(error), None),
         };
         let coordination_unsettled = _observation_lease
             .as_ref()
@@ -4946,14 +4875,6 @@ impl ToolExecutor {
                         _observation_lease.as_ref(),
                     )
                     .await;
-                let outcome = self
-                    .attach_external_effect_observation_async(
-                        outcome,
-                        external_before.as_ref(),
-                        scope_ownership,
-                        external_lease.as_ref(),
-                    )
-                    .await;
                 self.quarantine_after_weak_bash_scope(scope_ownership);
                 outcome
             }
@@ -4968,6 +4889,10 @@ impl ToolExecutor {
                 } else {
                     super::ToolExecutionOutcome::error(error.message)
                 };
+                let mut outcome = outcome;
+                astra_tools::execution_outcome::insert_started_execution_fact(
+                    outcome.tool_result_fields.get_or_insert_default(),
+                );
                 let outcome = self
                     .attach_bash_workspace_observation_async(
                         outcome,
@@ -4978,38 +4903,38 @@ impl ToolExecutor {
                         _observation_lease.as_ref(),
                     )
                     .await;
-                let outcome = self
-                    .attach_external_effect_observation_async(
-                        outcome,
-                        external_before.as_ref(),
-                        error.scope_ownership,
-                        external_lease.as_ref(),
-                    )
-                    .await;
                 self.quarantine_after_weak_bash_scope(error.scope_ownership);
                 outcome
             }
             Err(error) => {
-                let outcome = self
-                    .attach_bash_workspace_observation_async(
-                        super::ToolExecutionOutcome::error(format!(
-                            "Error: bash worker failed: {error}"
-                        )),
-                        workspace_before,
-                        coordination_unsettled
-                            || !astra_tools::workspace_observation::bash_command_is_detachable_safe(
-                                &command,
-                            ),
-                        None,
-                        explicit_verification,
-                        _observation_lease.as_ref(),
-                    )
-                    .await;
-                self.attach_external_effect_observation_async(
+                let mut outcome = super::ToolExecutionOutcome::error(format!(
+                    "Error: bash worker failed: {error}"
+                ));
+                let fields = outcome.tool_result_fields.get_or_insert_default();
+                let evidence = astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolOutcomeUnknown,
+                );
+                fields.insert(
+                    "error_kind".into(),
+                    Value::String(evidence.kind.as_str().into()),
+                );
+                fields.insert(
+                    "recovery_evidence".into(),
+                    serde_json::to_value(evidence).expect("tool outcome evidence must serialize"),
+                );
+                fields.insert("execution_fact".into(), Value::String("unknown".into()));
+                fields.insert("side_effects_maybe".into(), Value::Bool(true));
+                fields.insert("retryable".into(), Value::Bool(false));
+                self.attach_bash_workspace_observation_async(
                     outcome,
-                    external_before.as_ref(),
+                    workspace_before,
+                    coordination_unsettled
+                        || !astra_tools::workspace_observation::bash_command_is_detachable_safe(
+                            &command,
+                        ),
                     None,
-                    external_lease.as_ref(),
+                    explicit_verification,
+                    _observation_lease.as_ref(),
                 )
                 .await
             }
@@ -5050,10 +4975,7 @@ impl ToolExecutor {
             };
         if astra_tools::workspace_observation::is_explicit_workspace_verification_request(
             "bash", args,
-        ) || args
-            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-            .is_some()
-        {
+        ) {
             // Verify mode requires the foreground lease/fingerprint fence;
             // never let TUI detach handling turn it into a best-effort shell
             // call or an adoptable background task.
@@ -5074,14 +4996,12 @@ impl ToolExecutor {
             Ok(plan) => plan,
             Err(message) => {
                 self.restore_bash_detach_handle(slot, handle).await;
-                return Some(super::ToolExecutionOutcome::error(format!(
-                    "Error: {message}"
-                )));
+                return Some(bash_preparation_rejection(format!("Error: {message}")));
             }
         };
         if source_preimages.is_some() {
             self.restore_bash_detach_handle(slot, handle).await;
-            return Some(super::ToolExecutionOutcome::error(
+            return Some(bash_preparation_rejection(
                 "Error: source_artifacts cannot be combined with detached bash until terminal receipt tracking is available".to_string(),
             ));
         }
@@ -5700,6 +5620,7 @@ mod tests {
         assert_eq!(fields["error_kind"], "contract_violation");
         assert_eq!(fields["retryable"], false);
         assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["disposition"], "executed");
         assert_eq!(fields["side_effects_maybe"], true);
         assert!(
             fields["background_task_id"]
@@ -5781,6 +5702,7 @@ mod tests {
         assert_eq!(fields["error_kind"], "tool_timeout");
         assert_eq!(fields["retryable"], false);
         assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["disposition"], "executed");
         assert_eq!(fields["side_effects_maybe"], true);
         assert_eq!(fields["background_task_state"], "stopped");
         assert_eq!(fields["background_task_ownership"], "reclaimed");
@@ -5860,6 +5782,7 @@ mod tests {
         assert_eq!(fields["error_kind"], "cancelled");
         assert_eq!(fields["retryable"], false);
         assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["disposition"], "executed");
         assert_eq!(fields["side_effects_maybe"], true);
         assert_eq!(fields["background_task_state"], "cancelled");
         assert_eq!(fields["background_task_ownership"], "reclaimed");

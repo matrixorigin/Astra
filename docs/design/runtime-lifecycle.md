@@ -273,7 +273,10 @@ changes on the corresponding side of the bound-workspace effect boundary;
 mixed requires changes on both sides, and an unclear target/boundary remains
 unknown. Effect-owner domain is independent of this scope. Read-only references
 create no mutation obligation. All judgment carriers share this semantic
-contract; the existing typed receipt checks still own completion evidence.
+contract. External-only scope does not create a generic delta-receipt completion
+obligation or authorize a recovery write. Current desired state may be established
+without a new mutation. Mixed scope retains its bound-workspace obligation; Work,
+explicit verification and typed workspace owners retain their existing checks.
 
 The same distinction applies to delegated agents and fanout children: inferred
 read-only task intent does not create an execution permission ceiling. Children
@@ -353,7 +356,7 @@ trace and usage accounting even when another approach answers the question.
 
 Concrete execution obligations keep their existing owners: permissions and
 provider admission, canonical Work settlement, explicit verification hooks,
-workspace/external-effect receipts, unsettled execution ownership, and child
+typed workspace completion evidence, unsettled execution ownership, and child
 completion/reply obligations. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
