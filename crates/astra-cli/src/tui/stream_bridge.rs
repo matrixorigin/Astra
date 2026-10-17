@@ -432,6 +432,7 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         StreamEvent::RunInterrupted { user_message } => {
             TuiAppEvent::RunInterrupted { user_message }
         }
+        StreamEvent::SystemWarning(text) => TuiAppEvent::SystemWarning(text),
         StreamEvent::StatusLine(text) => TuiAppEvent::StatusLine(text),
         StreamEvent::UserIntentApplied {
             intent_id,
@@ -496,6 +497,15 @@ mod tests {
     use astra_turn_core::agent_live_event::{
         AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
     };
+
+    #[test]
+    fn hook_config_diagnostics_map_to_visible_system_warnings() {
+        let message = "Hook configuration .astra/hooks.json: invalid configuration";
+        assert!(
+            matches!(map_stream_event(StreamEvent::SystemWarning(message.into())),
+            Some(TuiAppEvent::SystemWarning(text)) if text == message)
+        );
+    }
 
     fn output_event(agent_id: &str, text: &str) -> AgentLiveEvent {
         AgentLiveEvent {

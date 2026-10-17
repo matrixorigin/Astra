@@ -59,7 +59,14 @@ Progress should be derived from durable events:
 
 The explicit CLI `journal digest` reads the complete authorized profile and
 attached account journals. Terminal turn usage is the qualified accounting
-source; `LlmRound` tokens are a separate diagnostic observation. The JSON
+source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
+and tree's root self totals share the same root `Turn`/`TurnError` accounting;
+neither round replays nor child terminals add to those buckets. Tree still
+rolls separately attributed child completions into its inclusive root total.
+Diff's `prompt` and `completion` are fresh input and output; its `total` is
+their sum, excluding prompt-cache buckets. Known terminal totals do not
+reconstruct missing usage or upgrade a historical last-round snapshot into
+a complete attempt total. The JSON
 `usage_coverage` and round-conflict fields identify unknown buckets and
 excluded contradictions. Root-plus-child observed totals mix sources and are
 never a bill or proof of complete session cost. No journal cursor grants
@@ -68,6 +75,13 @@ attached profile/account source authorization. Each source retains its own turns
 checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
+
+Legacy `llm_round` records without `session_id` can inherit a file's session
+only when that same authorized source contains an explicit matching session ID
+in the inspected records.
+Every explicit event ID and conversation cursor must still match the requested
+session. A primary file cannot bind an unattributed supplemental source; missing
+IDs on other event types and unanchored round-only fragments remain invalid.
 
 ## Stuck detection
 

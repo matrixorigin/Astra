@@ -22769,6 +22769,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         result
     }
 
+    fn emit_hook_config_diagnostic(
+        &mut self,
+        diagnostic: &crate::skills::hooks::HookConfigDiagnostic,
+    ) {
+        self.emit_progress_event(json!({
+            "type": "warning",
+            "code": "hook_configuration",
+            "message": diagnostic.to_string(),
+        }));
+    }
+
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
         self.emit_progress_event(json!({
             "type": "headless_line",
@@ -36927,6 +36938,33 @@ mod tests {
         assert_eq!(host.emitted_events.len(), 1);
         assert_eq!(host.emitted_events[0]["type"], "headless_line");
         assert_eq!(host.emitted_events[0]["content"], "test line");
+    }
+
+    #[test]
+    fn hook_config_diagnostics_emit_a_safe_client_warning() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".astra")).unwrap();
+        std::fs::write(
+            root.path().join(".astra/hooks.json"),
+            r#"{"hooks":[{"event":"SECRET_UNKNOWN_EVENT"}]}"#,
+        )
+        .unwrap();
+        let (tools, _) = crate::skills::hooks::load_all_hooks(root.path());
+        let diagnostic = tools.take_config_diagnostics().pop().unwrap();
+        let mut host = test_host_builder("u", "s").build();
+        host.emit_hook_config_diagnostic(&diagnostic);
+        assert_eq!(host.emitted_events.len(), 1);
+        let projected =
+            astra_services::runs::transform_run_event_for_client(host.emitted_events[0].clone());
+        assert_eq!(projected["type"], "warning");
+        assert_eq!(projected["code"], "hook_configuration");
+        assert_eq!(projected["message"], diagnostic.to_string());
+        assert!(!projected.to_string().contains("SECRET"));
+        assert!(
+            !projected
+                .to_string()
+                .contains(root.path().to_str().unwrap())
+        );
     }
 
     #[test]

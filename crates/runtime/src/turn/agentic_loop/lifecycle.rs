@@ -3455,6 +3455,16 @@ pub(crate) async fn run_loop_preamble(state: &mut AgenticLoopState) {
 /// Host-local schema installation is needed for a new executor even when its
 /// logical turn has already completed the side-effecting preamble.
 pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &AgenticLoopState) {
+    for diagnostic in state
+        .skills
+        .tool_event_hooks
+        .take_config_diagnostics()
+        .into_iter()
+        .chain(state.skills.session_event_hooks.take_config_diagnostics())
+    {
+        host.emit_hook_config_diagnostic(&diagnostic);
+    }
+
     if let Some(resolver) = &state.skills.resolver {
         // Phase-9: `skill_tool_schema_v2` is a byte-stable constant — it
         // takes no skill list and advertises `skill_name` as an open
@@ -4408,6 +4418,45 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn hook_config_diagnostics_reach_loop_output_once_without_execution() {
+        for content in [
+            r#"{"hooks":[{"event":"unknown-secret","action":{"type":"shell","command":"never execute this"}}]}"#,
+            r#"{"session_hooks":[{"event":"turn_end","action":{"type":"set_env","key":"UNUSED","value":"env-secret"}}]}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".astra")).unwrap();
+            std::fs::write(dir.path().join(".astra/hooks.json"), content).unwrap();
+            let mut state = make_state();
+            (
+                state.skills.tool_event_hooks,
+                state.skills.session_event_hooks,
+            ) = crate::skills::hooks::load_all_hooks(dir.path());
+            state.skills.tool_event_hooks.disable_execution();
+            state.skills.session_event_hooks.disable_execution();
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            let diagnostics = host
+                .emitted_lines
+                .iter()
+                .filter(|line| line.starts_with("Hook configuration"))
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0].contains(".astra/hooks.json"));
+            assert!(diagnostics[0].contains("[0].event"));
+            assert!(!diagnostics[0].contains("secret"));
+            configure_loop_host(&mut host, &state);
+            assert_eq!(
+                host.emitted_lines
+                    .iter()
+                    .filter(|line| line.starts_with("Hook configuration"))
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[tokio::test]
     async fn restored_workspace_observation_unavailable_stops_before_provider_with_remaining_budget()

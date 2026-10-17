@@ -914,6 +914,14 @@ pub trait AgenticLoopHost: Send {
     /// Headless round terminal output.
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String);
 
+    /// Display-only configuration diagnostics; they never alter hook authority.
+    fn emit_hook_config_diagnostic(
+        &mut self,
+        diagnostic: &crate::skills::hooks::HookConfigDiagnostic,
+    ) {
+        self.emit_headless_line(HeadlessStderrStyle::Yellow, diagnostic.to_string());
+    }
+
     /// Whether output is suppressed (quiet mode).
     fn is_quiet(&self) -> bool;
 

@@ -321,6 +321,9 @@ fn event_to_json(event: &StreamEvent, owner: &StreamEventOwner) -> String {
                 "user_message": user_message,
             })
         }
+        StreamEvent::SystemWarning(message) => {
+            serde_json::json!({"type": "warning", "message": message})
+        }
         StreamEvent::StatusLine(text) => {
             serde_json::json!({"type": "status", "text": text})
         }
@@ -449,6 +452,16 @@ mod tests {
 
     fn event_to_json(event: &StreamEvent) -> String {
         super::event_to_json(event, &test_owner())
+    }
+
+    #[test]
+    fn hook_config_diagnostics_have_a_machine_warning_event() {
+        let message = "Hook configuration .astra/hooks.json: invalid configuration";
+        let wire: serde_json::Value =
+            serde_json::from_str(&event_to_json(&StreamEvent::SystemWarning(message.into())))
+                .unwrap();
+        assert_eq!(wire["type"], "warning");
+        assert_eq!(wire["message"], message);
     }
 
     #[test]

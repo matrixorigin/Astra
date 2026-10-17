@@ -664,6 +664,8 @@ pub enum ChatTurnEdgePending {
 /// Hints for the CLI live renderer (no-op when the consumer sets `quiet`).
 #[derive(Debug)]
 pub enum SseRenderEffect {
+    /// A visible advisory, independent of assistant output and terminal status.
+    SystemWarning(String),
     StopThinkingSpinner,
     StartThinkingSpinner,
     /// Incremental reasoning chunk for a compact terminal preview (CLI).
@@ -907,6 +909,19 @@ fn apply_one_event(
         }
     }
     match etype {
+        "warning" => {
+            if let Some(message) = event
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| {
+                    !message.is_empty()
+                        && message.len() <= 1024
+                        && !message.chars().any(char::is_control)
+                })
+            {
+                effects.push(SseRenderEffect::SystemWarning(message.to_string()));
+            }
+        }
         "text_delta" => {
             if let Some(id) = event.get("model_item_id").and_then(Value::as_str) {
                 if accum
@@ -2159,6 +2174,43 @@ pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_config_diagnostics_are_advisory_render_effects() {
+        let mut accum = ChatTurnSseAccum {
+            full_text: "answer".into(),
+            ..Default::default()
+        };
+        let mut pending = Vec::new();
+        let wire = serde_json::json!({
+            "type": "warning", "code": "hook_configuration",
+            "message": "Hook configuration .astra/hooks.json at hooks[0].event: invalid event",
+        });
+        let projected = astra_services::runs::transform_run_event_for_client(wire.clone());
+        let effects = dispatch_chat_turn_sse_event_block(
+            &format!("data: {projected}\n\n"),
+            &mut accum,
+            &mut pending,
+        );
+        assert!(
+            matches!(effects.as_slice(), [SseRenderEffect::SystemWarning(message)] if message == wire["message"].as_str().unwrap())
+        );
+        assert_eq!(accum.full_text, "answer");
+        assert!(accum.error_message.is_none());
+        assert!(!accum.stream_complete);
+        assert!(pending.is_empty());
+        for message in ["", "bad\ncontrol", "\u{1b}[31m"] {
+            let event = serde_json::json!({"type": "warning", "message": message});
+            assert!(
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut pending
+                )
+                .is_empty()
+            );
+        }
+    }
 
     fn server_feedback_frame() -> crate::context_feedback::RuntimeFeedbackFrame {
         serde_json::from_value(serde_json::json!({

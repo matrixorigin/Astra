@@ -636,6 +636,7 @@ export function useStreamLifecycle(
         {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onWarning: (message) => addToast(message, "warning"),
           onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
           onExplainAnalyzeEvent: (event) =>
             applyExplainAnalyzeEvent(assistantMessageId, event),
@@ -758,6 +759,7 @@ export function useStreamLifecycle(
         });
     },
     [
+      addToast,
       applyWorkSurfaceStreamEvent,
       applyArtifactPublication,
     applyExplainAnalyzeEvent,
@@ -883,6 +885,7 @@ export function useStreamLifecycle(
         await streamChatMessage(detail.chat.id, streamPayload, {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onWarning: (message) => addToast(message, "warning"),
           onArtifactPublication: (event) => applyArtifactPublication(currentAssistantId, event),
           onExplainAnalyzeEvent: (event) =>
             applyExplainAnalyzeEvent(currentAssistantId, event),
@@ -1118,6 +1121,7 @@ export function useStreamLifecycle(
       }
     },
     [
+      addToast,
       applyWorkSurfaceStreamEvent,
       applyArtifactPublication,
     applyExplainAnalyzeEvent,
@@ -1192,6 +1196,7 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onWarning: (message) => addToast(message, "warning"),
             onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
             onExplainAnalyzeEvent: (event) =>
               applyExplainAnalyzeEvent(assistantMessageId, event),
@@ -1588,6 +1593,7 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onWarning: (message) => addToast(message, "warning"),
             onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
             onExplainAnalyzeEvent: (event) =>
               applyExplainAnalyzeEvent(assistantMessageId, event),

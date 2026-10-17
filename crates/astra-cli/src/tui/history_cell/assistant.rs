@@ -74,6 +74,9 @@ struct LiveMarkdownLayoutCache {
     revision: u64,
     width: usize,
     refreshed_at: Instant,
+    /// Keep the omission fact with the frame it describes, even when token
+    /// bursts advance the source past the byte limit before the next refresh.
+    source_truncated: bool,
     lines: Vec<Line<'static>>,
 }
 
@@ -439,18 +442,19 @@ impl AssistantCell {
         let (tail, truncated) = utf8_tail_window(source, MAX_LIVE_SOURCE_BYTES);
         // A tail can begin in the middle of a line. Discard that fragment so
         // partial Markdown syntax at the boundary cannot corrupt the visible
-        // projection; the leading ellipsis remains the honest continuity cue.
+        // projection; the preview notice remains the honest continuity cue.
         let markdown_tail = if truncated {
             tail.split_once('\n').map(|(_, rest)| rest).unwrap_or(tail)
         } else {
             tail
         };
+        let notice_width = width;
         let width = width.max(20);
         let now = Instant::now();
         let mut cache = astra_core::sync_poison::recover_mutex_lock(&self.live_render_cache);
-        let lines = match cache.as_ref() {
+        let (lines, truncated) = match cache.as_ref() {
             Some(cache) if cache.width == width && cache.revision == self.render_revision => {
-                cache.lines.clone()
+                (cache.lines.clone(), cache.source_truncated)
             }
             Some(cache)
                 if cache.width == width
@@ -458,7 +462,7 @@ impl AssistantCell {
             {
                 // A formatted frame that is a few tokens behind is preferable
                 // to a raw Markdown frame or an input-loop reparse storm.
-                cache.lines.clone()
+                (cache.lines.clone(), cache.source_truncated)
             }
             _ => {
                 let lines = render_markdown_text_with_width(markdown_tail, Some(width))
@@ -470,23 +474,40 @@ impl AssistantCell {
                     revision: self.render_revision,
                     width,
                     refreshed_at: now,
+                    source_truncated: truncated,
                     lines: lines.clone(),
                 });
-                lines
+                (lines, truncated)
             }
         };
         drop(cache);
 
-        let visible_start = lines.len().saturating_sub(maximum);
-        let mut out = lines.into_iter().skip(visible_start).collect::<Vec<_>>();
+        let omitted = truncated || lines.len() > maximum;
+        // The notice consumes a row from the same budget. Prefixing an
+        // already-full body row could wrap and hide the newest output.
+        let body_budget = maximum.saturating_sub(usize::from(omitted));
+        let visible_start = lines.len().saturating_sub(body_budget);
+        let mut out = Vec::new();
+        if omitted {
+            use unicode_width::UnicodeWidthStr;
+
+            let notice = [
+                "… earlier text hidden (live preview)",
+                "… earlier text hidden",
+                "… hidden",
+                "…",
+            ]
+            .into_iter()
+            .find(|notice| notice.width() <= notice_width)
+            .unwrap_or("");
+            out.push(Line::from(Span::styled(
+                notice,
+                Style::default().fg(crate::tui::theme::current().dim),
+            )));
+        }
+        out.extend(lines.into_iter().skip(visible_start));
         if out.is_empty() {
             out.push(Line::default());
-        }
-        if truncated && let Some(first) = out.first_mut() {
-            first.spans.insert(
-                0,
-                Span::styled("… ", Style::default().fg(crate::tui::theme::current().dim)),
-            );
         }
         out
     }
@@ -856,6 +877,205 @@ mod tests {
             !text.contains("line-0\n"),
             "old text stays out of the live frame"
         );
+    }
+
+    fn line_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn live_tail_notice_snapshot() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta("BEGIN\n\nmiddle\n\nEND");
+        assert_eq!(
+            line_text(&c.live_viewport_lines(80, 3)),
+            "… earlier text hidden (live preview)\n\nEND"
+        );
+    }
+
+    #[test]
+    fn live_tail_notice_covers_line_clipping_and_wrapped_paragraphs() {
+        for source in [
+            (0..100)
+                .map(|i| format!("line-{i}  \n"))
+                .collect::<String>(),
+            format!("{}LATEST", "wrapped words ".repeat(100)),
+            format!("# Result\n\n```rust\n{}\n```", "let x = 1;\n".repeat(30)),
+        ] {
+            assert!(source.len() < 16 * 1024, "exercise line-only clipping");
+            let mut c = AssistantCell::new_streaming();
+            c.push_delta(&source);
+            for width in [20, 80] {
+                let full = render_markdown_text_with_width(&source, Some(width)).lines;
+                assert!(full.len() > 4);
+                let live = c.live_viewport_lines(width as u16, 4);
+                assert_eq!(live.len(), 4, "the notice consumes one of the four rows");
+                assert!(line_text(&live[..1]).contains("hidden"), "{live:?}");
+                assert_eq!(&live[1..], &full[full.len() - 3..]);
+                assert_eq!(c.source(), source, "preview clipping cannot edit source");
+            }
+        }
+    }
+
+    #[test]
+    fn live_tail_notice_covers_byte_clipping_with_few_rendered_lines() {
+        for prefix in ["a", "中文🦀e\u{301}"] {
+            for padding in 0..4 {
+                let source = format!(
+                    "{}{}\n\n**LATEST中文🦀**",
+                    prefix.repeat(16 * 1024),
+                    "x".repeat(padding),
+                );
+                let mut c = AssistantCell::new_streaming();
+                c.push_delta(&source);
+                let live = c.live_viewport_lines(80, 8);
+                assert!(live.len() < 8, "only the byte window clipped this source");
+                assert!(line_text(&live[..1]).contains("hidden"), "{live:?}");
+                assert!(line_text(&live).contains("LATEST中文🦀"));
+                assert!(!line_text(&live).contains('�'));
+                assert!(!line_text(&live).contains("**"));
+                assert_eq!(c.source(), source);
+            }
+        }
+    }
+
+    #[test]
+    fn live_tail_notice_respects_tiny_budgets_and_narrow_widths() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta(&"a line\n".repeat(100));
+        for width in [0, 1, 2, 8, 20, 21, 40, 80] {
+            assert!(c.live_viewport_lines(width, 0).is_empty());
+            for maximum in [1, 2, 3] {
+                let live = c.live_viewport_lines(width, maximum);
+                assert_eq!(live.len(), maximum);
+                assert!(live[0].width() <= usize::from(width));
+                if width > 0 {
+                    assert!(line_text(&live[..1]).starts_with('…'), "{live:?}");
+                    // The notice must occupy exactly one physical row even
+                    // when the surrounding Paragraph wraps at a narrow width.
+                    let rendered = buffer_to_string(&draw_widget(
+                        ratatui::widgets::Paragraph::new(vec![live[0].clone(), Line::raw("Z")])
+                            .wrap(ratatui::widgets::Wrap { trim: false }),
+                        width,
+                        2,
+                    ));
+                    assert_eq!(rendered.lines().nth(1).unwrap().trim(), "Z");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_tail_notice_shares_the_budget_with_closed_thinking() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta(&format!(
+            "<think>reasoning</think>\n{}END",
+            "body  \n".repeat(20)
+        ));
+        let live = c.live_viewport_lines(80, 3);
+        assert_eq!(live.len(), 3);
+        assert!(line_text(&live[..1]).contains("Thought"));
+        assert!(line_text(&live[1..2]).contains("hidden"));
+        assert_eq!(line_text(&live[2..]), "END");
+    }
+
+    #[test]
+    fn live_tail_notice_is_absent_when_all_rendered_text_fits() {
+        for source in [
+            "",
+            "short 中文🦀",
+            "# Heading\n\n**bold** and `code`",
+            "```rust\nlet x = 1;\n```",
+        ] {
+            let mut c = AssistantCell::new_streaming();
+            c.push_delta(source);
+            let full = render_markdown_text_with_width(source, Some(80)).lines;
+            for maximum in [full.len(), full.len() + 1] {
+                assert_eq!(c.live_viewport_lines(80, maximum), full);
+            }
+        }
+
+        // Exactly the byte budget, with one visible Markdown row. The next
+        // byte must cross the limit without relying on rendered-line clipping.
+        let mut c = AssistantCell::new_streaming();
+        let source = "a".repeat(16 * 1024);
+        c.push_delta(&source);
+        assert!(!line_text(&c.live_viewport_lines(u16::MAX, 8)).contains("hidden"));
+        c.push_delta("!");
+        // A width change forces a fresh frame rather than the throttled cache.
+        assert!(line_text(&c.live_viewport_lines(u16::MAX - 1, 8)).contains("hidden"));
+    }
+
+    #[test]
+    fn live_tail_notice_tracks_the_cached_frame_across_stream_updates() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta("short reply");
+        let initial = c.live_viewport_lines(80, 3);
+        // Keep this test deterministic without sleeps or depending on host
+        // speed: the retained frame is fresh until we explicitly age it.
+        astra_core::sync_poison::recover_mutex_lock(&c.live_render_cache)
+            .as_mut()
+            .unwrap()
+            .refreshed_at = Instant::now() + std::time::Duration::from_secs(60);
+        c.push_delta(&format!("\n{}\nLATEST", "中文🦀 row\n".repeat(2_000)));
+        assert_eq!(c.live_viewport_lines(80, 3), initial);
+        astra_core::sync_poison::recover_mutex_lock(&c.live_render_cache)
+            .as_mut()
+            .unwrap()
+            .refreshed_at = Instant::now() - std::time::Duration::from_secs(1);
+        let updated = c.live_viewport_lines(80, 3);
+        assert_eq!(updated.len(), 3);
+        assert!(line_text(&updated[..1]).contains("hidden"));
+        assert!(line_text(&updated).contains("LATEST"));
+        // A viewport-height change uses the same rich layout, with its own
+        // row budget. It must not put the preview notice into that cache.
+        let resized = c.live_viewport_lines(80, 2);
+        assert_eq!(resized.len(), 2);
+        assert!(line_text(&resized).contains("LATEST"));
+        assert!(astra_core::sync_poison::recover_mutex_lock(&c.render_cache).is_none());
+    }
+
+    #[test]
+    fn live_tail_notice_never_enters_final_markdown_or_persisted_source() {
+        let source = format!(
+            "# BEGIN\n\n```text\n{}END中文🦀\n```",
+            "row\n".repeat(5_000)
+        );
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta(&source);
+        assert!(line_text(&c.live_viewport_lines(80, 3)).contains("hidden"));
+        assert!(
+            matches!(c.to_persist(), Some(TurnEvent::Assistant { markdown, .. }) if markdown == source)
+        );
+        c.finalize();
+        c.prepare_scrollback_layout(80);
+        let expected = AssistantCell::from_markdown(source.clone()).display_lines(80);
+        let mut actual = Vec::new();
+        let mut start = 0;
+        loop {
+            let (chunk, next, complete) = c.scrollback_lines_chunk(80, start, 8);
+            assert!(chunk.len() <= 8);
+            actual.extend(chunk);
+            if complete {
+                break;
+            }
+            assert!(next > start);
+            start = next;
+        }
+        assert_eq!(actual, expected, "every final row is emitted exactly once");
+        assert!(line_text(&actual).contains("BEGIN"));
+        assert!(line_text(&actual).contains("END中文🦀"));
+        assert!(!line_text(&actual).contains("hidden"));
+        assert_eq!(c.source(), source);
     }
 
     #[test]

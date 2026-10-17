@@ -4789,6 +4789,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             use crate::cli::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
+                    SseRenderEffect::SystemWarning(message) => {
+                        Some(StreamEvent::SystemWarning(message.clone()))
+                    }
                     SseRenderEffect::StreamText {
                         model_item_id,
                         text: s,
@@ -4808,12 +4811,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    self.emit_stream_observation(ev).await;
+                    if matches!(ev, StreamEvent::SystemWarning(_)) {
+                        // Configuration diagnostics are rare control messages;
+                        // preserve each one when the interactive queue is full.
+                        self.emit_stream_event(ev).await;
+                    } else {
+                        self.emit_stream_observation(ev).await;
+                    }
                 }
             }
         }
 
         let policy = self.render_policy;
+        if !policy.is_silent() {
+            for effect in &effects {
+                if let SseRenderEffect::SystemWarning(message) = effect {
+                    eprintln!("{}", message.as_str().yellow());
+                }
+            }
+        }
         match policy {
             RenderPolicy::Silent => return,
             RenderPolicy::FinalOnly => {
@@ -4826,7 +4842,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText { .. } => {} // suppressed
+                        SseRenderEffect::StreamText { .. } | SseRenderEffect::SystemWarning(_) => {} // suppressed or already rendered
                     }
                 }
                 return;
@@ -4837,6 +4853,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
+                SseRenderEffect::SystemWarning(_) => {
+                    i += 1;
+                }
                 SseRenderEffect::StopThinkingSpinner => {
                     // `text_delta` emits Stop then StreamText; in plan-only mode we stream the
                     // assistant body into the reasoning viewport — skipping Stop avoids clearing
@@ -8445,6 +8464,7 @@ fn apply_sse_render_effects(
     }
     for effect in effects {
         match effect {
+            SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
@@ -8869,6 +8889,76 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn hook_config_diagnostics_reach_silent_tui_under_backpressure() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".astra")).unwrap();
+        std::fs::write(
+            root.path().join(".astra/hooks.json"),
+            r#"{"hooks":[{"event":"SECRET_EVENT"}]}"#,
+        )
+        .unwrap();
+        let (tools, _) = astra_runtime::skills::hooks::load_all_hooks(root.path());
+        let message = tools.take_config_diagnostics().pop().unwrap().to_string();
+        let event = astra_services::runs::transform_run_event_for_client(serde_json::json!({
+            "type": "warning", "code": "hook_configuration", "message": message,
+        }));
+        let mut accum = ChatTurnSseAccum::default();
+        let effects = astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &format!("data: {event}\n\n"),
+            &mut accum,
+            &mut Vec::new(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+            .await
+            .unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "unused",
+                executor_id: "unused",
+                executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path())),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let delivery = host.on_render_effects(effects);
+        tokio::pin!(delivery);
+        // A full channel retains this diagnostic instead of sampling it away.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::StatusLine(_))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+            .await
+            .unwrap();
+        let warning = rx.recv().await.unwrap();
+        assert!(matches!(warning,
+            chat_stream::StreamEvent::SystemWarning(text) if text == message && !text.contains("SECRET")));
+        assert!(accum.full_text.is_empty());
+        assert!(accum.error_message.is_none());
+    }
 
     #[test]
     fn unavailable_approval_explains_denial_without_exposing_credentials() {

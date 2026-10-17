@@ -2,6 +2,7 @@
 
 use crate::cli::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
+use astra_turn_core::token_accounting::TokenAccounting;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -640,32 +641,29 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
     }
 }
 
-fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
-    if let Some(scope) = ev.producer_scope.as_ref() {
-        let typed_child_purpose = ev
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("purpose"))
-            .and_then(serde_json::Value::as_str)
-            == Some("sub_agent");
-        let child_source = ev
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("source"))
-            .and_then(serde_json::Value::as_str)
-            == Some("child_agent");
-        if scope.agent_id.is_none() && !typed_child_purpose && !child_source {
-            return None;
-        }
-        return Some(SubrunIdentity {
-            run_id: scope.run_id.clone(),
-            parent_run_id: scope.parent_run_id.clone(),
-            agent_id: scope.agent_id.clone(),
-            local_turn: scope.local_turn,
-        });
-    }
+fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
+    ev.producer_scope.as_ref().is_some_and(|scope| {
+        scope.parent_run_id.is_some()
+            || scope
+                .agent_id
+                .as_deref()
+                .is_some_and(|agent| agent != "root")
+            || ev.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("purpose").and_then(serde_json::Value::as_str) == Some("sub_agent")
+                    || metadata.get("source").and_then(serde_json::Value::as_str)
+                        == Some("child_agent")
+            })
+    })
+}
 
-    None
+fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
+    let scope = ev.producer_scope.as_ref()?;
+    is_child_producer(ev).then(|| SubrunIdentity {
+        run_id: scope.run_id.clone(),
+        parent_run_id: scope.parent_run_id.clone(),
+        agent_id: scope.agent_id.clone(),
+        local_turn: scope.local_turn,
+    })
 }
 
 fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
@@ -766,6 +764,30 @@ fn observed_runtime_round_usage(
         }),
         tokens_out: sum(|round| round.tokens_out)?,
     })
+}
+
+fn is_root_terminal(event: &session_journal::JournalEvent) -> bool {
+    matches!(
+        event.event_type,
+        JournalEventType::Turn | JournalEventType::TurnError
+    ) && !is_child_producer(event)
+}
+
+/// Known root terminal buckets, shared by the offline journal projections.
+/// Round observations never replace or add to qualified terminal accounting.
+pub(crate) fn root_terminal_usage(events: &[session_journal::JournalEvent]) -> TokenAccounting {
+    events.iter().filter(|event| is_root_terminal(event)).fold(
+        TokenAccounting::default(),
+        |mut total, event| {
+            total.accumulate(&TokenAccounting::from_fields(
+                event.tokens_in.unwrap_or(0),
+                event.cache_read_tokens.unwrap_or(0),
+                event.cache_creation_tokens.unwrap_or(0),
+                event.tokens_out.unwrap_or(0),
+            ));
+            total
+        },
+    )
 }
 
 fn usage_source(event: &session_journal::JournalEvent) -> &'static str {
@@ -932,8 +954,16 @@ fn validate_session_events(
     events: &[session_journal::JournalEvent],
     session_id: &str,
 ) -> Result<(), String> {
+    // Legacy round telemetry omitted session_id. Bind it only within an
+    // authorized source that also explicitly identifies the requested session.
+    let anchored = events
+        .iter()
+        .any(|event| event.session_id.as_deref() == Some(session_id));
     for event in events {
-        if event.session_id.as_deref() != Some(session_id)
+        let implicit_round = anchored
+            && event.event_type == JournalEventType::LlmRound
+            && event.session_id.is_none();
+        if (!implicit_round && event.session_id.as_deref() != Some(session_id))
             || event
                 .conversation_commit
                 .as_ref()
@@ -1146,10 +1176,12 @@ fn build_digest_with_owners(
     let mut turn_errors = Vec::new();
     let mut other_errors = Vec::new();
 
-    let mut total_tokens_in: u64 = 0;
-    let mut total_cache_read_tokens: u64 = 0;
-    let mut total_cache_creation_tokens: u64 = 0;
-    let mut total_tokens_out: u64 = 0;
+    let TokenAccounting {
+        prompt: total_tokens_in,
+        cache_read: total_cache_read_tokens,
+        cache_creation: total_cache_creation_tokens,
+        completion: total_tokens_out,
+    } = root_terminal_usage(&events);
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
     let mut total_fresh_tool_calls: u64 = 0;
@@ -1197,7 +1229,7 @@ fn build_digest_with_owners(
     let mut seq: u32 = 0;
     for ev in &events {
         match ev.event_type {
-            JournalEventType::Turn => {
+            JournalEventType::Turn if is_root_terminal(ev) => {
                 root_terminal_buckets_complete &= ev.tokens_in.is_some()
                     && ev.cache_read_tokens.is_some()
                     && ev.cache_creation_tokens.is_some()
@@ -1262,14 +1294,6 @@ fn build_digest_with_owners(
                             });
                         }
                     }
-                }
-                if let Some(ti) = tokens_in {
-                    total_tokens_in += ti;
-                }
-                total_cache_read_tokens += cache_read_tokens.unwrap_or(0);
-                total_cache_creation_tokens += cache_creation_tokens.unwrap_or(0);
-                if let Some(to) = tokens_out {
-                    total_tokens_out += to;
                 }
                 if let Some(d) = ev.duration_ms {
                     total_duration_ms += d;
@@ -1369,7 +1393,7 @@ fn build_digest_with_owners(
                 };
                 turns_out.push(row);
             }
-            JournalEventType::TurnError => {
+            JournalEventType::TurnError if is_root_terminal(ev) => {
                 root_terminal_buckets_complete &= ev.tokens_in.is_some()
                     && ev.cache_read_tokens.is_some()
                     && ev.cache_creation_tokens.is_some()
@@ -1422,10 +1446,6 @@ fn build_digest_with_owners(
                         }
                     }
                 }
-                total_tokens_in += tokens_in.unwrap_or(0);
-                total_cache_read_tokens += cache_read_tokens.unwrap_or(0);
-                total_cache_creation_tokens += cache_creation_tokens.unwrap_or(0);
-                total_tokens_out += tokens_out.unwrap_or(0);
                 total_duration_ms += ev.duration_ms.unwrap_or(0);
                 turn_errors.push(TurnErrRow {
                     seq,
@@ -1986,7 +2006,7 @@ mod tests {
         DigestFocus, ErrorCategory, SCHEMA_VERSION, build_digest, build_digest_with_owners,
         result_body_signals_failure,
     };
-    use astra_services::session_journal::JournalDirGuard;
+    use astra_services::session_journal::{self, JournalDirGuard};
     use std::fs;
     use std::path::PathBuf;
 
@@ -2002,8 +2022,8 @@ mod tests {
         path
     }
 
-    /// Normalize old fixture IDs to the session under test. Production never
-    /// infers event identity from the filename.
+    /// Normalize synthetic fixture IDs to the session under test. Reader
+    /// regressions write their original bytes directly instead.
     fn write_test_journal(path: PathBuf, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
         let sid = path
             .file_stem()
@@ -2074,13 +2094,51 @@ mod tests {
     }
 
     #[test]
+    fn digest_terminal_buckets_share_root_scope_with_diff_and_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "terminal-bucket-scope";
+        write_test_journal(journal_path_for_test(sid), concat!(
+            r#"{"type":"turn","ts":"t1","turn":1,"tokens_in":20,"cache_read_tokens":4,"cache_creation_tokens":1,"tokens_out":3}"#, "\n",
+            r#"{"type":"turn_error","ts":"t2","turn":2,"producer_scope":{"run_id":"root","agent_id":"root"},"tokens_in":60,"cache_read_tokens":6,"cache_creation_tokens":2,"tokens_out":7}"#, "\n",
+            r#"{"type":"turn_error","ts":"t3","producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"child"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"turn","ts":"t4","turn":3}"#, "\n",
+            r#"{"type":"llm_round","ts":"t5","turn":3,"producer_scope":{"run_id":"root-observation","agent_id":"root"},"tokens_in":500,"tokens_out":50}"#, "\n",
+            r#"{"type":"turn_error","ts":"t6","producer_scope":{"run_id":"child-parent-only","parent_run_id":"root"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"turn_error","ts":"t7","producer_scope":{"run_id":"child-purpose-only"},"metadata":{"purpose":"sub_agent"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"turn_error","ts":"t8","producer_scope":{"run_id":"child-source-only"},"metadata":{"source":"child_agent"},"tokens_in":999,"tokens_out":999}"#, "\n",
+            r#"{"type":"llm_round","ts":"t9","producer_scope":{"run_id":"child-parent-only","parent_run_id":"root"},"tokens_in":5,"tokens_out":1}"#, "\n",
+        )).unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        assert_eq!(digest.aggregates.attempt_count, 3);
+        assert_eq!(digest.aggregates.turn_error_count, 1);
+        assert_eq!(digest.aggregates.total_tokens_in, 80);
+        assert_eq!(digest.aggregates.total_cache_read_tokens, 10);
+        assert_eq!(digest.aggregates.total_cache_creation_tokens, 3);
+        assert_eq!(digest.aggregates.total_provider_input_tokens, 93);
+        assert_eq!(digest.aggregates.total_tokens_out, 10);
+        assert_eq!(digest.aggregates.subrun_count, 1);
+        assert_eq!(digest.aggregates.subrun_total_tokens_in, 5);
+        assert!(!digest.usage_coverage.root_terminal_buckets_complete);
+        let events = astra_services::session_journal::read_journal(sid).unwrap();
+        let diff = crate::cli::journal_diff::diff_events(sid, sid, &events, &events);
+        let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree(sid, &events);
+        assert_eq!(diff.a_tokens.prompt, digest.aggregates.total_tokens_in);
+        assert_eq!(tree.self_prompt_tokens, digest.aggregates.total_tokens_in);
+        assert_eq!(diff.a_tokens.completion, digest.aggregates.total_tokens_out);
+        assert_eq!(
+            tree.self_completion_tokens,
+            digest.aggregates.total_tokens_out
+        );
+    }
+
+    #[test]
     fn digest_surfaces_real_session_fixture_rounds_and_grouped_tools() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
 
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        write_test_journal(journal_path_for_test(sid), REAL_SESSION_0AC769_FIXTURE)
-            .expect("write journal");
+        fs::write(journal_path_for_test(sid), REAL_SESSION_0AC769_FIXTURE).expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(d.journal_lines_non_empty, 14);
@@ -2452,6 +2510,102 @@ mod tests {
             .err()
             .expect("unattributed event must fail");
         assert!(error.contains("another session"));
+    }
+
+    #[test]
+    fn digest_legacy_round_binding_is_per_source_and_preserves_session_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "legacy-round-session";
+        let local = astra_services::OwnerScope::user("legacy-local").unwrap();
+        let account = astra_services::OwnerScope::user("legacy-account").unwrap();
+        let path = |owner: &astra_services::OwnerScope| {
+            let path = session_journal::journal_file_path_for_owner(owner, sid).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        };
+        let anchor = serde_json::json!({"type":"session_start", "ts":"t0", "session_id":sid});
+        let round = serde_json::json!({"type":"llm_round", "ts":"t1", "turn":1, "round":0,
+            "producer_scope":{"run_id":"child", "agent_id":"child"}, "tokens_in":7});
+        let encode = |events: &[serde_json::Value]| {
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>()
+        };
+        fs::write(path(&local), encode(std::slice::from_ref(&anchor))).unwrap();
+        // An anchor in the primary file does not bind an unattributed account file.
+        fs::write(path(&account), encode(std::slice::from_ref(&round))).unwrap();
+        assert!(build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account)).is_err());
+
+        fs::write(
+            path(&account),
+            encode(&[anchor.clone(), round.clone(), round.clone()]) + "not json\n",
+        )
+        .unwrap();
+        let digest =
+            build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account)).unwrap();
+        assert_eq!(digest.aggregates.subrun_total_tokens_in, 7);
+        assert_eq!(digest.subruns[0].llm_round_details.len(), 1);
+        assert_eq!(digest.journal_lines_malformed, 1);
+        let window =
+            super::read_attached_observation_window_with_owners(sid, &local, Some(account.clone()))
+                .unwrap();
+        assert_eq!(
+            window
+                .events
+                .iter()
+                .filter(|event| event.event_type == session_journal::JournalEventType::LlmRound)
+                .count(),
+            1
+        );
+
+        let mut foreign_round = round.clone();
+        foreign_round["session_id"] = serde_json::json!("foreign-session");
+        let mut empty_id = round.clone();
+        empty_id["session_id"] = serde_json::json!("");
+        let mut foreign_anchor = anchor.clone();
+        foreign_anchor["session_id"] = serde_json::json!("foreign-session");
+        let mut missing_turn = round.clone();
+        missing_turn["type"] = serde_json::json!("turn");
+        let mut foreign_cursor = round.clone();
+        foreign_cursor["conversation_commit"] = serde_json::json!({
+            "schema_version":1, "base_root_hash":"base",
+            "cursor":{"schema_version":1, "owner_id":account.id(), "session_id":"foreign-session",
+                "branch_id":"main", "completed_turn":1, "journal_event_seq":1,
+                "conversation_seq":1, "canonical_root_hash":"root", "projection_schema":1,
+                "compaction_generation":0},
+            "delta":{"kind":"append", "messages":[]}
+        });
+        for rejected in [
+            foreign_round,
+            empty_id,
+            foreign_anchor,
+            missing_turn,
+            foreign_cursor,
+        ] {
+            for owner in [&local, &account] {
+                fs::write(path(&local), encode(std::slice::from_ref(&anchor))).unwrap();
+                fs::write(path(&account), encode(std::slice::from_ref(&anchor))).unwrap();
+                fs::write(
+                    path(owner),
+                    encode(&[anchor.clone(), round.clone(), rejected.clone()]),
+                )
+                .unwrap();
+                let error = build_digest_with_owners(sid, DigestFocus::All, &local, Some(&account))
+                    .err()
+                    .expect("foreign or unattributed event must fail");
+                assert!(error.contains("another session"), "{error}");
+                assert!(
+                    super::read_attached_observation_window_with_owners(
+                        sid,
+                        &local,
+                        Some(account.clone())
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
