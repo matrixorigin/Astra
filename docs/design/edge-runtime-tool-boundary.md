@@ -114,8 +114,10 @@ Ordinary shell execution uses the selected provider's permission, sandbox and
 process-coordination boundaries. Optional bounded observation is evidence, not
 an execution prerequisite. The executor records pre-start rejection separately
 from started success, failure or cancellation; unavailable observation cannot
-turn either into a permission denial. An interrupted operation can leave partial
-effects and must not be replayed merely to obtain evidence.
+turn either into a permission denial. A started command deadline carries typed
+`tool_timeout` evidence even after its process scope is settled. Cancellation,
+timeout and lost outcomes can leave partial effects and must not be replayed
+merely to obtain evidence.
 
 Command output can establish a current state, including an already-satisfied
 request or an absent directory, without claiming this invocation changed it.

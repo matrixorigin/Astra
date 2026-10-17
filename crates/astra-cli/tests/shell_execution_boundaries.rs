@@ -151,3 +151,40 @@ async fn cancellation_before_dispatch_is_not_an_executed_failure() {
     assert_eq!(fields["side_effects_maybe"], false);
     assert_eq!(fields["error_kind"], "cancelled");
 }
+
+#[tokio::test]
+async fn foreground_timeout_preserves_external_effect_and_typed_failure() {
+    let workspace = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let marker = external.path().join("marker");
+    let executor = executor(workspace.path());
+    let failed = executor
+        .execute_with_metadata(
+            "bash",
+            &json!({
+                "command": format!("printf partial >> '{}'; sleep 1; printf late >> '{}'; sleep 5", marker.display(), marker.display()),
+                "timeout": 0.2,
+            }),
+        )
+        .await;
+    assert!(failed.is_error, "{failed:?}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "partial");
+    let fields = failed.tool_result_fields.unwrap();
+    assert_eq!(fields["error_kind"], "tool_timeout");
+    assert_eq!(fields["execution_started"], true);
+    assert_eq!(fields["disposition"], "executed");
+    assert_eq!(fields["side_effects_maybe"], true);
+    assert_eq!(fields["retryable"], false);
+    assert_eq!(fields["recovery_evidence"]["kind"], "tool_timeout");
+    assert_eq!(fields["recovery_evidence"]["retryable"], false);
+    assert_eq!(
+        fields["recovery_evidence"]["recovery_actions"],
+        json!(["reconcile_outcome"])
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "partial",
+        "timed-out process must not resume its effects"
+    );
+}

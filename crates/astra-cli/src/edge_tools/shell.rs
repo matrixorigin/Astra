@@ -3171,6 +3171,7 @@ struct ScopedShellOutput {
 #[derive(Debug)]
 struct ShellRunError {
     message: String,
+    kind: astra_core::ErrorKind,
     execution_started: bool,
     /// A child was started and its complete descendant set could not be
     /// proven empty. Pre-spawn failures deliberately leave this false.
@@ -3218,6 +3219,7 @@ impl ShellRunError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: astra_core::ErrorKind::ToolUnavailable,
             execution_started: false,
             ownership_unsettled: false,
             scope_ownership: None,
@@ -3226,10 +3228,12 @@ impl ShellRunError {
 
     fn after_process_started(
         message: impl Into<String>,
+        kind: astra_core::ErrorKind,
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
     ) -> Self {
         Self {
             message: message.into(),
+            kind,
             execution_started: true,
             ownership_unsettled: scope_ownership.is_none(),
             scope_ownership,
@@ -3330,6 +3334,7 @@ fn run_shell_output_with_config(
         let ownership = settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
         return Err(ShellRunError::after_process_started(
             format!("Error: Bash invocation owner handshake failed: {error}"),
+            astra_core::ErrorKind::ToolOutcomeUnknown,
             ownership,
         ));
     }
@@ -3380,6 +3385,7 @@ fn run_shell_output_with_config(
                         settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
                     return Err(ShellRunError::after_process_started(
                         "Error: command cancelled by user",
+                        astra_core::ErrorKind::Cancelled,
                         scope_ownership,
                     ));
                 }
@@ -3388,6 +3394,7 @@ fn run_shell_output_with_config(
                         settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
                     return Err(ShellRunError::after_process_started(
                         format!("Error: command timed out after {}s", config.timeout_secs),
+                        astra_core::ErrorKind::ToolTimeout,
                         scope_ownership,
                     ));
                 }
@@ -3398,6 +3405,7 @@ fn run_shell_output_with_config(
                     settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
                 return Err(ShellRunError::after_process_started(
                     format!("Error: {e}"),
+                    astra_core::ErrorKind::ToolOutcomeUnknown,
                     scope_ownership,
                 ));
             }
@@ -5001,17 +5009,24 @@ impl ToolExecutor {
                 if !error.execution_started {
                     return bash_preparation_rejection(error.message);
                 }
-                let outcome = if cancel_token
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                {
+                // Preserve the worker's cause; a cancellation arriving after
+                // settlement must not relabel a timeout or lost process result.
+                let mut outcome = if error.kind == astra_core::ErrorKind::Cancelled {
                     super::cancelled_tool_execution_outcome("bash", true)
                 } else {
-                    super::ToolExecutionOutcome::error(error.message)
+                    super::ToolExecutionOutcome::error_with_evidence(
+                        error.message,
+                        astra_core::ToolFailureEvidence::new(
+                            error.kind,
+                            astra_core::ToolFailureCause::OutcomeUnknown,
+                            false,
+                            vec![astra_core::ToolRecoveryAction::ReconcileOutcome],
+                        ),
+                    )
                 };
-                let mut outcome = outcome;
-                astra_tools::execution_outcome::insert_started_execution_fact(
-                    outcome.tool_result_fields.get_or_insert_default(),
-                );
+                let fields = outcome.tool_result_fields.get_or_insert_default();
+                fields.insert("retryable".into(), Value::Bool(false));
+                astra_tools::execution_outcome::insert_started_execution_fact(fields);
                 let outcome = self
                     .attach_bash_workspace_observation_async(
                         outcome,
@@ -5464,6 +5479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = Err(super::ShellRunError::after_process_started(
             "descendants not settled",
+            astra_core::ErrorKind::ToolOutcomeUnknown,
             None,
         ));
         super::finalize_shell_scope_before_lease_transfer(&result, "touch marker", dir.path());
