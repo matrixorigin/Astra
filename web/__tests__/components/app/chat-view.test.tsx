@@ -369,6 +369,25 @@ describe("ChatView deferred-input unhappy paths", () => {
     ).not.toBeDisabled();
   });
 
+  it("shows hook configuration warnings while preserving the streamed reply", async () => {
+    const user = userEvent.setup();
+    const message = "Hook configuration .astra/hooks.json at hooks[0].event: invalid event";
+    let handlers: Parameters<typeof streamChatMessage>[2] | undefined;
+    mockStreamChatMessage.mockImplementation((_chatId, _payload, nextHandlers) => {
+      handlers = nextHandlers;
+      return new Promise(() => {});
+    });
+    render(<ToastProvider><ChatView initial={makeDetail(null)} /></ToastProvider>);
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+    act(() => {
+      handlers?.onWarning?.(message);
+      handlers?.onText?.("answer after warning");
+    });
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(message));
+    expect(await screen.findByText("answer after warning")).toBeInTheDocument();
+    expect(mockStreamChatMessage).toHaveBeenCalledOnce();
+  });
+
   it("shows workspace selection errors directly in the assistant message", async () => {
     const user = userEvent.setup();
     const message =
