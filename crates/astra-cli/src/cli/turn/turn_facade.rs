@@ -455,12 +455,20 @@ mod tests {
             // Credential resolution and HTTP share one absolute deadline.
             (200, true, 240, 400, 400),
         ] {
+            // The slow case must refresh before the first DELETE. A 401
+            // refresh followed by a new loop iteration would recompute the
+            // budget and miss the stale-duration regression.
+            let admitted_token = if refresh_delay > 0 {
+                "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature"
+            } else {
+                "old-cancel"
+            };
             let mut creds = CredentialsFile::default();
             creds.profiles.insert(
                 "default".into(),
                 Profile {
                     account_id: Some("cancel-owner".into()),
-                    access_token: Some("old-cancel".into()),
+                    access_token: Some(admitted_token.into()),
                     refresh_token: Some("old-refresh".into()),
                     ..Default::default()
                 },
@@ -469,9 +477,9 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("DELETE"))
                 .and(path("/chat/runs/exact-owner-run"))
-                .and(header("authorization", "Bearer old-cancel"))
+                .and(header("authorization", format!("Bearer {admitted_token}")))
                 .respond_with(ResponseTemplate::new(401))
-                .expect(1)
+                .expect(if refresh_delay > 0 { 0 } else { 1 })
                 .mount(&server)
                 .await;
             Mock::given(method("POST")).and(path("/auth/refresh"))
@@ -491,13 +499,13 @@ mod tests {
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-            let owner = capture_admitted_auth_owner(&api, None, "old-cancel")
+            let owner = capture_admitted_auth_owner(&api, None, admitted_token)
                 .await
                 .unwrap();
             let start = tokio::time::Instant::now();
             let result = super::cancel_exact_run_until_settled_with_deadline(
                 &api,
-                "old-cancel",
+                admitted_token,
                 "exact-owner-run",
                 Some(&owner),
                 start + std::time::Duration::from_millis(budget),
