@@ -118,6 +118,15 @@ fn sanitize_prompt_facing_messages_impl(
             "role": role,
             "content": content,
         });
+        if preserve_turn_semantics
+            && msg
+                .get(crate::cloud::history_summary::HISTORY_SUMMARY_FIELD)
+                .and_then(Value::as_u64)
+                == Some(1)
+            && crate::cloud::history_summary::history_summary_text(&msg).is_some()
+        {
+            projected[crate::cloud::history_summary::HISTORY_SUMMARY_FIELD] = json!(1);
+        }
         if preserve_turn_semantics && role == "user" {
             match astra_turn_types::user_turn_semantics(&msg) {
                 Ok(Some(semantics)) => {
@@ -322,6 +331,14 @@ fn canonical_text_message(
         "role": role,
         "content": content,
     });
+    if message
+        .get(crate::cloud::history_summary::HISTORY_SUMMARY_FIELD)
+        .and_then(Value::as_u64)
+        == Some(1)
+        && crate::cloud::history_summary::history_summary_text(message).is_some()
+    {
+        projected[crate::cloud::history_summary::HISTORY_SUMMARY_FIELD] = json!(1);
+    }
     if preserve_turn_semantics
         && let Ok(Some(semantics)) = astra_turn_types::user_turn_semantics(message)
     {

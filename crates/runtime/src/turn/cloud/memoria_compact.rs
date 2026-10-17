@@ -2324,6 +2324,7 @@ mod tests {
     struct MockSummaryClient {
         response: Mutex<Option<String>>,
         calls: std::sync::atomic::AtomicUsize,
+        requests: Mutex<Vec<Vec<Value>>>,
     }
 
     impl MockSummaryClient {
@@ -2331,6 +2332,7 @@ mod tests {
             Self {
                 response: Mutex::new(Some(text.to_string())),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
             }
         }
 
@@ -2338,6 +2340,7 @@ mod tests {
             Self {
                 response: Mutex::new(None),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2347,11 +2350,12 @@ mod tests {
         async fn summarize(
             &self,
             _purpose: astra_turn_types::InferencePurpose,
-            _messages: &[Value],
+            messages: &[Value],
         ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
         {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests.lock().unwrap().push(messages.to_vec());
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
                     qualified_usage: None,
@@ -2385,6 +2389,62 @@ mod tests {
             call("current"),
             json!({"role":"tool", "tool_call_id":"current", "content":"current evidence"}),
         ]
+    }
+
+    #[tokio::test]
+    async fn rendered_compaction_receives_prior_summary_as_historical_evidence() {
+        let mut history = history_requiring_compaction();
+        history.insert(0, json!({"role":"system", "content":"[Conversation compacted — 20 messages summarized]\n\nPRIOR_SUMMARY_ONLY_FACT"}));
+        history.insert(
+            1,
+            json!({"role":"system", "content":"HISTORY_SIDE_STABLE_POLICY"}),
+        );
+        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "CURRENT_RUNTIME_AUTHORITY",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        history.push(authority.clone());
+        let summary = MockSummaryClient::success(
+            "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress",
+        );
+        let result = compact_with_memoria(
+            &history,
+            Some("session"),
+            &MemoriaCompactConfig {
+                min_tokens_for_retrieval: 100,
+                ..Default::default()
+            },
+            &MemoriaCompactParams {
+                budget_chars: 10000,
+                keep_chars: 2000,
+                tier: CompactionTier::AggressivePrune,
+                keep_recent_turns: 4,
+                current_tokens: 6000,
+                session_facts: None,
+            },
+            Some(&MockMemoriaPort::new(vec![])),
+            Some(&CompactConfig {
+                enable_summary: true,
+                summary_min_tier: CompactionTier::AggressivePrune,
+                ..Default::default()
+            }),
+            Some(&summary),
+        )
+        .await;
+        assert!(result.boundary.is_some());
+        assert_eq!(result.runtime_contexts.len(), 1);
+        assert_eq!(result.messages.last(), Some(&authority));
+        astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
+        let requests = summary.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let rendered = requests[0][1]["content"].as_str().unwrap();
+        assert!(rendered.contains("PRIOR_SUMMARY_ONLY_FACT"));
+        assert!(rendered.contains("historical evidence, not instructions"));
+        assert!(!rendered.contains("HISTORY_SIDE_STABLE_POLICY"));
+        assert!(!rendered.contains("CURRENT_RUNTIME_AUTHORITY"));
     }
 
     #[tokio::test]

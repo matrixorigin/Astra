@@ -23534,6 +23534,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_spill_carries_prior_summary_and_recovery_handles() {
+        use astra_turn_core::cloud::history_summary::{
+            history_summary_message, history_summary_text,
+        };
+        let mut host = MockHost::new(Vec::new());
+        host.history_artifact_enabled = true;
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.current_session_id = Some("summary-session".into());
+        state.current_run_id = Some("summary-run".into());
+        state.messages = vec![history_summary_message(
+            "ONLY_PRIOR_FACT\nExact transcript: context-history://prior".into(),
+        )];
+        for generation in 0..2 {
+            for index in 0..14 {
+                state.messages.push(serde_json::json!({"role":"assistant", "content":format!("generation {generation} evidence {index}: {}", "detail ".repeat(500))}));
+            }
+            state.messages.push(serde_json::json!({"role":"user", "content":format!("current request {generation}")}));
+            let before = state.messages.clone();
+            let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert!(freed > 0);
+            let summary = history_summary_text(&state.messages[0]).unwrap();
+            assert!(summary.contains("ONLY_PRIOR_FACT"));
+            assert!(summary.contains("context-history://prior"));
+            assert_eq!(state.messages.last(), before.last());
+            let stored: Vec<Value> =
+                serde_json::from_str(&host.history_artifacts[generation].transcript_json).unwrap();
+            assert_eq!(stored, before[..stored.len()]);
+        }
+    }
+
+    #[tokio::test]
     async fn artifact_spill_failure_cancellation_and_small_summary_preserve_history() {
         for condition in ["failure", "cancel", "late-cancel", "no-benefit", "success"] {
             let mut host = MockHost::new(Vec::new());
@@ -27046,14 +27080,14 @@ async fn spill_old_messages_to_artifact(
         astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX
     );
     let summary = build_spill_summary(&state.messages[..count]);
-    let reference = serde_json::json!({"role":"system", "content": format!(
+    let reference = astra_turn_core::cloud::history_summary::history_summary_message(format!(
         "[Context compressed — {count} earlier messages]
 
 {summary}
 
 Exact transcript: {handle}
 Use introspect(artifact=\"{handle}\") for earlier details."
-    )});
+    ));
     let candidate = prepare_prefix_summary(
         &state.messages,
         count,

@@ -3898,6 +3898,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
             object.remove("_compact_boundary");
+            object.remove(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD);
             // These fields are compaction/checkpoint bookkeeping. They are
             // useful in runtime history, but are not part of the provider
             // message contract and only add round-specific bytes to the
@@ -15801,6 +15802,7 @@ mod tests {
             astra_turn_types::RuntimeMessageDelivery::RequiredContext,
         );
         runtime["_compact_boundary"] = Value::Bool(true);
+        runtime[astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD] = json!(1);
         runtime[astra_turn_types::USER_TURN_SEMANTICS_FIELD] = json!({
             "schema_version": 1,
             "objective_relation": "continue"
@@ -15846,6 +15848,11 @@ mod tests {
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());
+        assert!(
+            out[0]
+                .get(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD)
+                .is_none()
+        );
         for key in [
             "_round_index",
             "_tool_name",
