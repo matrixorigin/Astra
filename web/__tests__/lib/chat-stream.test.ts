@@ -72,6 +72,33 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it('surfaces hook configuration warnings without changing the answer or run status', async () => {
+    const onWarning = vi.fn();
+    const onRunFinished = vi.fn();
+    const onStreamGap = vi.fn();
+    const message = 'Hook configuration .astra/hooks.json at hooks[0].event: invalid event';
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      `data: ${JSON.stringify({ type: 'warning', code: 'hook_configuration', message, index: 7 })}\n\n`,
+      'data: {"type":"stream_gap","run_id":"run-1","repair":"refresh_run_snapshot"}\n\n',
+      'data: {"type":"text_delta","content":"answer"}\n\n',
+      'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
+    ]) });
+    await expect(streamChatMessage('chat', defaultPayload, { onWarning, onRunFinished, onStreamGap })).resolves.toBe('answer');
+    expect(onWarning).toHaveBeenCalledExactlyOnceWith(message);
+    expect(onRunFinished).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
+    expect(onStreamGap).toHaveBeenCalledWith(expect.objectContaining({ nextEventIndex: 8 }));
+  });
+
+  it('does not replay hook warnings as new notifications', async () => {
+    const onWarning = vi.fn();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      'data: {"type":"warning","code":"hook_configuration","message":"historical diagnostic","index":7}\n\n',
+      'data: [DONE]\n\n',
+    ]) });
+    await streamExistingChatRun('chat', 'run', { onWarning }, { replayOnly: true });
+    expect(onWarning).not.toHaveBeenCalled();
+  });
+
   it.each(["failed", "cancelled", "completed"])("repairs observations for a %s run without replaying its lifecycle", async (status) => {
     const onRunUpdated = vi.fn();
     const onText = vi.fn();

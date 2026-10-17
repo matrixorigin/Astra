@@ -199,6 +199,7 @@ export type ChatStreamHandlers = {
   onReasoning?: (reasoning: string) => void;
   onReasoningDone?: (reasoning: string) => void;
   onText?: (text: string) => void;
+  onWarning?: (message: string) => void;
   onSessionBound?: (session: { chatId?: string; sessionId: string }) => void;
   onRunStarted?: (runId: string) => void;
   onRunUpdated?: (run: {
@@ -335,6 +336,13 @@ function applyStreamEvent(
   const eventIndex = normalizeEventIndex(event.index);
   if (eventIndex !== null) {
     state.nextEventIndex = Math.max(state.nextEventIndex ?? 0, eventIndex + 1);
+  }
+
+  if (type === "warning") {
+    if (typeof event.message === "string" && event.message.trim()) {
+      handlers.onWarning?.(event.message);
+    }
+    return;
   }
 
   if (

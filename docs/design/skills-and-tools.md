@@ -40,8 +40,10 @@ remain individually filtered while other valid definitions remain loaded.
 
 Both returned registries share redacted diagnostics, drained once per load via
 `take_config_diagnostics`. The shared loop and remote CLI publish them through
-the existing status/headless-line channel, including when hook execution is
-disabled. Source names are project-relative; diagnostics include schema fields,
+the existing warning/message wire contract and visible TUI warning/Web toast
+channels, including when hook execution is disabled. Only explicitly marked hook
+configuration warnings pass the external Server projection; extra payload fields
+are discarded. Source names are project-relative; diagnostics include schema fields,
 array indices and parser line/column when available, never raw parser messages,
 config values, arbitrary map keys, commands, HTTP headers or environment values.
 A new load can report the same unresolved problem again. Diagnostics are not

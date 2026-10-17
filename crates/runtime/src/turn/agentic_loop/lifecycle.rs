@@ -3462,7 +3462,7 @@ pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &Agen
         .into_iter()
         .chain(state.skills.session_event_hooks.take_config_diagnostics())
     {
-        host.emit_headless_line(HeadlessStderrStyle::Yellow, diagnostic.to_string());
+        host.emit_hook_config_diagnostic(&diagnostic);
     }
 
     if let Some(resolver) = &state.skills.resolver {

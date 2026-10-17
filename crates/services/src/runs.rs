@@ -28032,6 +28032,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     // server-authored frame instead of reconstructing it from progress,
     // usage, or terminal events.
     "runtime_feedback",
+    // Only the explicitly projected, redacted hook-configuration advisory below.
+    "warning",
     // Work-surface execution binding and transport lifecycle.
     "workspace_bound",
     "executor_bound",
@@ -28061,6 +28063,33 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     // live task board in every interactive client.
     "work_task_board_update",
 ];
+
+fn project_hook_configuration_warning(event: serde_json::Value) -> serde_json::Value {
+    // Do not expose arbitrary internal warnings or adjacent config/provider payloads.
+    // This message is authored by the typed, redacted hook diagnostic producer.
+    if event.get("code").and_then(serde_json::Value::as_str) != Some("hook_configuration") {
+        return serde_json::Value::Null;
+    }
+    let Some(message) = event
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|message| {
+            !message.is_empty()
+                && message.len() <= 1024
+                && message.is_ascii()
+                && !message.bytes().any(|byte| byte.is_ascii_control())
+        })
+    else {
+        return serde_json::Value::Null;
+    };
+    let mut projected = serde_json::json!({
+        "type": "warning", "code": "hook_configuration", "message": message,
+    });
+    if let Some(index) = event.get("index").and_then(serde_json::Value::as_u64) {
+        projected["index"] = index.into();
+    }
+    projected
+}
 
 fn project_runtime_feedback(event: serde_json::Value) -> serde_json::Value {
     let Some(frame) = event
@@ -28246,7 +28275,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_stream_gap = client_type == "stream_gap";
         let is_execution_binding = matches!(client_type, "workspace_bound" | "executor_bound");
         if is_external {
-            return if client_type == "artifact_publication" {
+            return if client_type == "warning" {
+                project_hook_configuration_warning(event)
+            } else if client_type == "artifact_publication" {
                 project_artifact_publication(event)
             } else if is_tool_call_end {
                 project_external_tool_call_end(event)
@@ -28291,6 +28322,13 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             | "reasoning_done"
     );
     let mut projected = match event_type {
+        "warning" => {
+            let mut wire = serde_json::Value::Object(data);
+            if let Some(index) = event.get("index") {
+                wire["index"] = index.clone();
+            }
+            project_hook_configuration_warning(wire)
+        }
         "workspace_bound" | "executor_bound" => {
             let mut wire = serde_json::Value::Object(data);
             wire["type"] = event_type.into();
@@ -29547,6 +29585,53 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hook_config_diagnostics_project_only_marked_redacted_warnings() {
+        let message = "Hook configuration .astra/hooks.json at hooks[0].event: invalid event";
+        let data = serde_json::json!({
+            "code": "hook_configuration", "message": message,
+            "command": "SECRET", "headers": {"Authorization": "SECRET"},
+        });
+        let expected = serde_json::json!({
+            "type": "warning", "code": "hook_configuration", "message": message,
+            "index": 7,
+        });
+        let mut live = data.clone();
+        live["type"] = "warning".into();
+        live["index"] = 7.into();
+        let replay = serde_json::json!({"event_type": "warning", "data": data, "index": 7});
+        for event in [live, replay] {
+            let projected = super::transform_run_event_for_client(event);
+            assert_eq!(projected, expected);
+            assert_eq!(
+                super::transform_run_event_for_client(projected.clone()),
+                projected
+            );
+            assert!(!projected.to_string().contains("SECRET"));
+        }
+        for event in [
+            serde_json::json!({"type": "warning", "message": "internal SECRET"}),
+            serde_json::json!({"type": "warning", "code": "other", "message": "SECRET"}),
+            serde_json::json!({"type": "headless_line", "content": "SECRET"}),
+            serde_json::json!({"event_type": "warning", "data": {"message": "SECRET"}}),
+        ] {
+            assert!(super::transform_run_event_for_client(event).is_null());
+        }
+        for message in [
+            String::new(),
+            "line\ncontrol".into(),
+            "\u{1b}[31m".into(),
+            "x".repeat(1025),
+        ] {
+            assert!(
+                super::transform_run_event_for_client(serde_json::json!({
+                    "type": "warning", "code": "hook_configuration", "message": message,
+                }))
+                .is_null()
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn execution_deadline_checkpoint_does_not_renew_expired_work_or_total_time() {
         let admitted = super::ExecutionDeadlineAuthority::from_budget_at(
