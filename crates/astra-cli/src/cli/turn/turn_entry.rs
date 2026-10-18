@@ -959,6 +959,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn background_completion_preserves_context_until_user_submission_carries_it() {
+        let _home = crate::test_utils::HomeGuard::temp();
         use crate::cli::mock_llm::{MockLlmServer, MockScenario};
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let _credentials_guard = crate::tests::isolate_credentials();

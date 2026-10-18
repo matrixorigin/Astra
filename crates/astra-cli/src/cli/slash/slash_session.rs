@@ -1005,6 +1005,13 @@ async fn apply_restored_session(
     state: &mut SessionState,
     mut restored: RestoredSession,
 ) -> Result<(), String> {
+    let local_resume_allowed = session_continuation::local_journal_privacy_allows_resume(
+        &restored.session_id,
+    )
+    .map_err(|error| format!("cannot verify local continuation privacy boundary: {error}"))?;
+    if !local_resume_allowed {
+        return Err("TUI restore is unavailable because local conversation content was omitted by privacy policy. Use one-shot chat with an explicit --session-id to request an authorized Server canonical resume.".into());
+    }
     let resume_bundle = restored.resume_bundle.take();
     if restored.restored_from_cloud && resume_bundle.is_none() {
         return Err("cloud restore omitted required versioned ResumeBundle".to_string());
@@ -1908,6 +1915,50 @@ mod resume_tests {
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
         assert!(guidance.contains("15000 tokens freed"), "{guidance}");
         assert!(guidance.contains("insufficient"), "{guidance}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn privacy_tui_restore_rejects_before_admission_and_preserves_current_state() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let sid = "privacy-tui-restore";
+        let writer = session_journal::JournalWriter::new(sid).unwrap();
+        let mut event = session_journal::JournalEvent::turn(Some(sid), 1, None, "", "", 0, 0, 0, 0);
+        event.metadata = Some(serde_json::json!({"local_continuation": "omitted_by_policy"}));
+        writer.append(&event).unwrap();
+        let mut bundle = typed_resume_bundle(
+            sid,
+            1,
+            vec![
+                serde_json::json!({"role": "user", "content": "Server question"}),
+                serde_json::json!({"role": "assistant", "content": "Server answer"}),
+            ],
+        );
+        bundle.source = astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        let restored = RestoredSession {
+            session_id: sid.into(),
+            restored_from_cloud: true,
+            resume_bundle: Some(bundle),
+            ..Default::default()
+        };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id("current-session");
+        state.history = vec![("current question".into(), "current answer".into())];
+        let error = apply_restored_session(None, &api, &mut state, restored.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("TUI restore is unavailable"));
+        assert!(error.contains("one-shot chat with an explicit --session-id"));
+        assert_eq!(state.session_id.as_deref(), Some("current-session"));
+        assert_eq!(state.history[0].1, "current answer");
+        std::fs::write(writer.path(), [0xff]).unwrap();
+        let error = apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cannot verify local continuation privacy boundary"));
+        assert_eq!(state.session_id.as_deref(), Some("current-session"));
     }
 
     #[serial_test::serial]

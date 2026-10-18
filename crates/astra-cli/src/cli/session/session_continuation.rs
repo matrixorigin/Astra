@@ -205,10 +205,53 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
     load_session_continuation_for_recovery(session_id).map(|continuation| continuation.messages)
 }
 
+fn journal_privacy_allows_resume(
+    session_id: &str,
+    events: &[astra_services::session_journal::JournalEvent],
+) -> Result<bool, String> {
+    if astra_services::session_journal::has_content_omitted_turn(events) {
+        return Ok(false);
+    }
+    // A structurally present successor is not proof that it superseded the
+    // omission. Only the existing canonical replay may establish that fact.
+    if events.iter().any(|event| {
+        astra_services::session_journal::has_content_omitted_turn(std::slice::from_ref(event))
+    }) {
+        active_conversation_from_append_order_events(session_id, events)?;
+    }
+    Ok(true)
+}
+
+pub(crate) fn local_journal_privacy_allows_resume(session_id: &str) -> Result<bool, String> {
+    let events = astra_services::session_journal::read_complete_journal_append_order(session_id)
+        .map_err(|error| error.to_string())?;
+    journal_privacy_allows_resume(session_id, &events)
+}
+
 pub(crate) fn load_session_continuation_for_recovery(
     session_id: &str,
 ) -> Option<SessionContinuation> {
-    match load_journal_canonical_conversation(session_id) {
+    // Privacy omission is terminal for every local recovery source, including
+    // old CSL/checkpoint projections. It must not fall back to stale content.
+    let canonical = match astra_services::session_journal::read_complete_journal_append_order(
+        session_id,
+    ) {
+        Ok(events) => {
+            if !journal_privacy_allows_resume(session_id, &events).unwrap_or(false) {
+                return None;
+            }
+            if astra_services::session_journal::journal_file_path(session_id).is_file() {
+                active_conversation_from_append_order_events(session_id, &events)
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "cannot verify local continuation privacy boundary");
+            return None;
+        }
+    };
+    match canonical {
         Ok(Some(active_conversation)) => {
             let messages = active_conversation.materialize();
             record_session_restore_hydration(&messages);
@@ -403,7 +446,7 @@ pub(crate) fn recover_or_initialize_active_conversation_from_append_order_events
 fn load_journal_canonical_conversation(
     session_id: &str,
 ) -> Result<Option<astra_turn_core::active_conversation::ActiveConversation>, String> {
-    let events = astra_services::session_journal::read_journal_append_order(session_id)
+    let events = astra_services::session_journal::read_complete_journal_append_order(session_id)
         .map_err(|error| error.to_string())?;
     let journal_exists = astra_services::session_journal::journal_file_path(session_id).is_file();
     if !journal_exists {
@@ -416,6 +459,9 @@ fn active_conversation_from_append_order_events(
     session_id: &str,
     events: &[astra_services::session_journal::JournalEvent],
 ) -> Result<Option<astra_turn_core::active_conversation::ActiveConversation>, String> {
+    if astra_services::session_journal::has_content_omitted_turn(events) {
+        return Err("local continuation was omitted by privacy policy".into());
+    }
     let commits = events
         .iter()
         .filter_map(|event| event.conversation_commit.clone())

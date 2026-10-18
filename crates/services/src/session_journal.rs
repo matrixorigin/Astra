@@ -2071,7 +2071,13 @@ fn execution_lease_path(journal_path: &Path, session_id: &str) -> PathBuf {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CanonicalCommitCasOutcome {
-    Committed { persistence_warning: Option<String> },
+    Committed {
+        persistence_warning: Option<String>,
+    },
+    /// A durable terminal record exists, but content policy omitted continuation.
+    ContentOmitted {
+        persistence_warning: Option<String>,
+    },
     NotCommitted(String),
     Conflict(String),
     Unknown(String),
@@ -2146,6 +2152,70 @@ fn classify_canonical_commit_presence(
         ))
     } else {
         CanonicalCommitPresence::Absent
+    }
+}
+
+/// An explicit local privacy boundary. No local snapshot can recover a turn
+/// after its canonical content was intentionally omitted, until a later
+/// complete canonical settlement restores local continuation.
+pub fn has_content_omitted_turn(events: &[JournalEvent]) -> bool {
+    for event in events.iter().rev() {
+        if event.conversation_commit.is_some() {
+            return false;
+        }
+        if event.event_type == JournalEventType::Turn
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("local_continuation"))
+                .and_then(serde_json::Value::as_str)
+                == Some("omitted_by_policy")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn classify_content_omitted_turn_presence(
+    events: &[JournalEvent],
+    malformed_lines: usize,
+    turn: u32,
+    intended: &JournalEvent,
+) -> CanonicalCommitPresence {
+    if malformed_lines > 0 {
+        return CanonicalCommitPresence::Unknown(
+            "privacy settlement journal contains malformed records".into(),
+        );
+    }
+    let matches = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                JournalEventType::Turn | JournalEventType::TurnError
+            ) && event.turn == Some(turn)
+        })
+        .collect::<Vec<_>>();
+    let intended = match serde_json::to_value(intended) {
+        Ok(value) => value,
+        Err(error) => {
+            return CanonicalCommitPresence::Unknown(format!(
+                "cannot verify privacy settlement: {error}"
+            ));
+        }
+    };
+    match matches.as_slice() {
+        [] => CanonicalCommitPresence::Absent,
+        [event] if serde_json::to_value(event).is_ok_and(|value| value == intended) => {
+            CanonicalCommitPresence::Exact
+        }
+        [_] => CanonicalCommitPresence::Conflict(
+            "privacy settlement turn identity already exists".into(),
+        ),
+        _ => CanonicalCommitPresence::Unknown(
+            "privacy settlement has duplicate terminal records".into(),
+        ),
     }
 }
 
@@ -2350,9 +2420,63 @@ impl JournalWriter {
             intended,
             events,
             &lease.created_parent_dirs,
+            None,
         )
     }
 
+    /// Settle a content-redacted terminal turn through the same lease, base,
+    /// generation and durability fences as canonical commits. The intended
+    /// canonical commit is used only for validation and is never serialized.
+    pub fn append_content_omitted_turn_cas(
+        &self,
+        lease: &SessionExecutionLease,
+        expected_base_cursor: Option<&SessionCursorV1>,
+        turn: u32,
+        intended: &ConversationCommitV1,
+        event: &JournalEvent,
+    ) -> CanonicalCommitCasOutcome {
+        if lease.session_id != self.session_id
+            || lease.lock_path != execution_lease_path(&self.path, &self.session_id)
+        {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "privacy settlement requires the matching active session execution lease".into(),
+            );
+        }
+        if !journal_content_redact_enabled()
+            || event.conversation_commit.is_some()
+            || !has_content_omitted_turn(std::slice::from_ref(event))
+            || !event
+                .user_input
+                .as_deref()
+                .is_some_and(is_journal_content_marker)
+            || !event
+                .assistant_output
+                .as_deref()
+                .is_some_and(is_journal_content_marker)
+            || event.session_id.as_deref() != Some(self.session_id.as_str())
+        {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "privacy settlement requires an explicitly content-redacted turn".into(),
+            );
+        }
+        match self.append_canonical_commit_cas_locked(
+            expected_base_cursor,
+            turn,
+            intended,
+            std::slice::from_ref(event),
+            &lease.created_parent_dirs,
+            Some(event),
+        ) {
+            CanonicalCommitCasOutcome::Committed {
+                persistence_warning,
+            } => CanonicalCommitCasOutcome::ContentOmitted {
+                persistence_warning,
+            },
+            outcome => outcome,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn append_canonical_commit_cas_locked(
         &self,
         expected_base_cursor: Option<&SessionCursorV1>,
@@ -2360,6 +2484,7 @@ impl JournalWriter {
         intended: &ConversationCommitV1,
         events: &[JournalEvent],
         lease_created_dirs: &[PathBuf],
+        content_omitted: Option<&JournalEvent>,
     ) -> CanonicalCommitCasOutcome {
         use fs2::FileExt;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -2374,7 +2499,8 @@ impl JournalWriter {
             .filter(|event| {
                 event.event_type == JournalEventType::Turn
                     && event.turn == Some(turn)
-                    && event.conversation_commit.as_ref() == Some(intended)
+                    && (event.conversation_commit.as_ref() == Some(intended)
+                        || content_omitted.is_some())
             })
             .count();
         let terminal_turn_events = events
@@ -2449,7 +2575,13 @@ impl JournalWriter {
                     ));
                 }
             };
-        match classify_canonical_commit_presence(&current_events, malformed_lines, turn, intended) {
+        let classify = |events: &[JournalEvent], malformed_lines| match content_omitted {
+            Some(event) => {
+                classify_content_omitted_turn_presence(events, malformed_lines, turn, event)
+            }
+            None => classify_canonical_commit_presence(events, malformed_lines, turn, intended),
+        };
+        match classify(&current_events, malformed_lines) {
             CanonicalCommitPresence::Exact => {
                 if let Err(error) = file.sync_data() {
                     return CanonicalCommitCasOutcome::Unknown(format!(
@@ -2460,7 +2592,7 @@ impl JournalWriter {
                     Ok(true) => {
                         if let Err(error) = self.sync_creation_metadata_if_needed(
                             journal_created,
-                            false,
+                            content_omitted.is_some() && expected_base_cursor.is_none(),
                             lease_created_dirs,
                         ) {
                             CanonicalCommitCasOutcome::Unknown(format!(
@@ -2553,12 +2685,7 @@ impl JournalWriter {
                     ));
                 }
             };
-        match classify_canonical_commit_presence(
-            &verified_events,
-            verified_malformed_lines,
-            turn,
-            intended,
-        ) {
+        match classify(&verified_events, verified_malformed_lines) {
             CanonicalCommitPresence::Exact => {
                 match open_journal_file_is_current(&file, &self.path) {
                     Ok(true) => {}
@@ -3323,6 +3450,21 @@ fn read_journal_from_path(path: &Path) -> std::io::Result<Vec<JournalEvent>> {
         events.len(),
     );
     Ok(events)
+}
+
+/// Read a complete current-generation local journal without creating files or
+/// directories. Recovery/policy decisions must not silently skip malformed or
+/// unterminated records that may contain a privacy boundary.
+pub fn read_complete_journal_append_order(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
+    let owner_scope = OwnerScope::local_user();
+    let path = journal_file_path_for_owner(&owner_scope, session_id)?;
+    JournalWriter {
+        path,
+        owner_scope,
+        session_id: session_id.to_string(),
+        created_parent_dirs: Vec::new(),
+    }
+    .complete_append_order_snapshot()
 }
 
 /// Read a session journal in physical append order.
@@ -11978,6 +12120,73 @@ mod turn_event_buffer_tests {
     }
 
     #[test]
+    fn content_omitted_cas_preserves_base_conflict_and_directory_durability() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "privacy-cas-fences";
+        let writer = JournalWriter::new(sid).unwrap();
+        let commit = canonical_cas_test_commit(sid, "private-message");
+        let mut event = JournalEvent::turn(Some(sid), 1, None, "", "", 0, 0, 0, 0);
+        event.user_input = Some(journal_content_marker("private-input"));
+        event.assistant_output = Some(journal_content_marker("private-output"));
+        event.metadata = Some(serde_json::json!({"local_continuation": "omitted_by_policy"}));
+        // A stale base fails before writing even though no canonical content
+        // is being retained. The privacy path shares the canonical CAS fence.
+        assert!(matches!(
+            writer.append_canonical_commit_cas_locked(
+                Some(&commit.cursor),
+                1,
+                &commit,
+                std::slice::from_ref(&event),
+                &[],
+                Some(&event),
+            ),
+            CanonicalCommitCasOutcome::Conflict(_)
+        ));
+        assert!(writer.complete_append_order_snapshot().unwrap().is_empty());
+        fail_next_journal_directory_sync();
+        assert!(matches!(writer.append_canonical_commit_cas_locked(
+            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event),
+        ), CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("creation metadata")));
+        // Exact retry must repeat the creation fence after uncertainty, even
+        // when reopening an existing file and retaining no created-dir list.
+        fail_next_journal_directory_sync();
+        assert!(matches!(writer.append_canonical_commit_cas_locked(
+            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event),
+        ), CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("creation metadata")));
+        // A successful fence establishes authority without duplicating the turn.
+        assert!(matches!(
+            writer.append_canonical_commit_cas_locked(
+                None,
+                1,
+                &commit,
+                std::slice::from_ref(&event),
+                &[],
+                Some(&event),
+            ),
+            CanonicalCommitCasOutcome::Committed { .. }
+        ));
+        let events = writer.complete_append_order_snapshot().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::Turn)
+                .count(),
+            1
+        );
+        assert!(has_content_omitted_turn(&events));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.conversation_commit.is_none())
+        );
+        let bytes = std::fs::read_to_string(writer.path()).unwrap();
+        for content in ["private-message", "private-input", "private-output"] {
+            assert!(!bytes.contains(content));
+        }
+    }
+
+    #[test]
     fn first_canonical_commit_requires_parent_directory_durability() {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -12123,6 +12332,7 @@ mod turn_event_buffer_tests {
                     &first_commit,
                     &[first_event],
                     &[],
+                    None,
                 )
             });
             let second_barrier = barrier.clone();
@@ -12137,6 +12347,7 @@ mod turn_event_buffer_tests {
                     &second_commit,
                     &[second_event],
                     &[],
+                    None,
                 )
             });
             vec![first.join().unwrap(), second.join().unwrap()]
@@ -12204,7 +12415,7 @@ mod turn_event_buffer_tests {
             let _guard = JournalDirGuard::new(&thread_dir);
             JournalWriter::new(session_id)
                 .unwrap()
-                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[])
+                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[], None)
         });
 
         opened_rx.recv().unwrap();

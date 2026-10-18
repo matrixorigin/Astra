@@ -117,7 +117,8 @@ pub(crate) struct Cli {
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     pub no_instructions: bool,
-    /// Redact journal user/assistant content on disk (maps to ASTRA_JOURNAL_CONTENT_REDACT=1)
+    /// Redact local journal content (ASTRA_JOURNAL_CONTENT_REDACT=1).
+    /// One-shot results remain usable, but cannot be recovered or auto-resumed locally.
     #[arg(long = "no-journal-content")]
     pub no_journal_content: bool,
     /// Print startup timing for each initialization phase

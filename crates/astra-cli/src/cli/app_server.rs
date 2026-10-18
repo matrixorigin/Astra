@@ -115,7 +115,8 @@ impl AppServerFailure {
             code: match settlement.commit_status {
                 HeadlessCanonicalCommitStatus::Committed => SESSION_PROJECTION_FAILED_CODE,
                 HeadlessCanonicalCommitStatus::Unknown => SESSION_COMMIT_UNKNOWN_CODE,
-                HeadlessCanonicalCommitStatus::NotRequested
+                HeadlessCanonicalCommitStatus::ContentOmitted
+                | HeadlessCanonicalCommitStatus::NotRequested
                 | HeadlessCanonicalCommitStatus::NotCommitted => SESSION_PERSISTENCE_FAILED_CODE,
             },
             message: settlement
@@ -170,6 +171,9 @@ pub(crate) async fn run_stdio_app_server(
     system_prompt: Option<&str>,
     auto_approve: bool,
 ) -> Result<(), String> {
+    if astra_services::session_journal::journal_content_redact_enabled() {
+        return Err("app-server requires durable local continuation; journal content redaction is supported for one-shot chat".into());
+    }
     if listen != "stdio://" {
         return Err(format!("unsupported app-server listener `{listen}`"));
     }
@@ -1450,6 +1454,20 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn privacy_app_server_rejects_before_any_server_request() {
+        let _env = ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::run_stdio_app_server("stdio://", &api, None, None, None, false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("requires durable local continuation"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     fn runtime_feedback_frame() -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
         serde_json::from_value(serde_json::json!({
             "schema_version": 4,
@@ -2182,6 +2200,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn stalled_edge_registration_interrupt_releases_turn_and_session_lease() {
+        let _home = crate::test_utils::HomeGuard::temp();
         let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let _credentials_guard = crate::tests::isolate_credentials();
@@ -2279,6 +2298,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn stalled_edge_registration_has_a_finite_deadline() {
+        let _home = crate::test_utils::HomeGuard::temp();
         let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
         let server = MockServer::start().await;
         Mock::given(method("POST"))

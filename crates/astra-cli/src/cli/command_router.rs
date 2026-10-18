@@ -401,6 +401,7 @@ fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<Stri
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HeadlessCanonicalCommitStatus {
     NotRequested,
+    ContentOmitted,
     Committed,
     NotCommitted,
     Unknown,
@@ -431,11 +432,20 @@ pub(crate) fn persist_headless_session_state(
         turn_start,
         execution_lease,
     ) {
-        Ok(Some(turn)) => {
+        Ok(Some(session_side_effects::OneShotJournalSettlement::Canonical(turn))) => {
             if let Some(error) = turn.persistence_error.as_ref() {
                 record_stream_persistence_error(sr, error.clone());
             }
             (HeadlessCanonicalCommitStatus::Committed, Some(turn))
+        }
+        Ok(Some(session_side_effects::OneShotJournalSettlement::ContentOmitted {
+            persistence_error,
+        })) => {
+            sr.local_continuation_omitted = true;
+            if let Some(error) = persistence_error {
+                record_stream_persistence_error(sr, error);
+            }
+            (HeadlessCanonicalCommitStatus::ContentOmitted, None)
         }
         Ok(None) => (HeadlessCanonicalCommitStatus::NotRequested, None),
         Err(session_side_effects::OneShotJournalCommitError::NotCommitted(error)) => {
@@ -905,6 +915,8 @@ fn effective_one_shot_permission_mode(
 fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option<String> {
     if let Some(error) = sr.session_persistence_error.as_deref() {
         Some(format!("Session persistence degraded: {error}"))
+    } else if sr.local_continuation_omitted {
+        Some("Local conversation content omitted by privacy policy; this turn cannot be recovered or automatically resumed locally.".into())
     } else if exit_code == ExitCode::Partial {
         Some(match sr.interruption_kind.as_deref() {
             Some(kind) => format!(
@@ -3466,6 +3478,7 @@ fn final_json_output_with_context(
         "llm_rounds": sr.llm_rounds,
         "tool_calls_count": sr.tool_calls_count,
         "tools_used": sr.tools_used,
+        "local_continuation": if sr.local_continuation_omitted { Some("omitted_by_policy") } else { None },
         "persistence_error": sr.session_persistence_error,
         "exit_code": i32::from(exit_code),
         "success": exit_code == ExitCode::Success && disposition == "completed",
@@ -4788,6 +4801,334 @@ mod one_shot_persistence_tests {
         astra_services::session_journal::SessionExecutionLease::try_acquire(session_id).unwrap()
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn privacy_one_shot_settles_success_without_content_or_local_resume() {
+        let (sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::test_utils::isolate_credentials();
+        let credential_path = crate::cli::cli_config::cli_utils::credentials_path();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        let sid = "privacy-one-shot-success";
+        let lease = execution_lease(sid);
+        let mut result = crate::tests::stub_stream_result("private-answer-sentinel");
+        result.session_id = Some(sid.into());
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "private-input-sentinel"}),
+            serde_json::json!({"role": "assistant", "content": result.full_text}),
+        ];
+        result.tool_call_records = vec![astra_services::session_journal::ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            args_full: Some("private-tool-args-sentinel".into()),
+            result_preview: Some("private-tool-result-sentinel".into()),
+            ..Default::default()
+        }];
+        result.run_transcript_messages = result.final_messages.clone();
+        result.pending_context_assembly_trace =
+            Some((1, serde_json::json!({"secret": "private-trace-sentinel"})));
+        let settlement = persist_headless_session_state(
+            None,
+            Some("test-model"),
+            "private-input-sentinel",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::ContentOmitted
+        );
+        assert_eq!(settlement.canonical_session_id, None);
+        assert!(!settlement.projection_repair_required);
+        assert_eq!(settlement.persistence_error, None);
+        assert!(
+            !credential_path.exists(),
+            "privacy settlement must not create a last-session pointer"
+        );
+        assert!(!crate::cli::session::session_recovery::io::csl_log_path_for(sid).exists());
+        let exit = super::compute_exit_code(&result);
+        assert_eq!(exit, ExitCode::Success);
+        let output = super::final_json_output(&result, exit);
+        assert_eq!(output["success"], true);
+        assert_eq!(output["local_continuation"], "omitted_by_policy");
+        assert!(
+            super::one_shot_completion_warning(&result, exit)
+                .unwrap()
+                .contains("cannot be recovered")
+        );
+        let events = astra_services::session_journal::read_journal_append_order(sid).unwrap();
+        assert!(astra_services::session_journal::has_content_omitted_turn(
+            &events
+        ));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.conversation_commit.is_none())
+        );
+        assert!(!crate::cli::cli_config::cli_utils::local_session_is_resumable(sid));
+        assert!(
+            crate::cli::session::session_continuation::load_session_continuation_for_recovery(sid)
+                .is_none()
+        );
+        fn persisted_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flat_map(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        persisted_files(&path)
+                    } else {
+                        vec![path]
+                    }
+                })
+                .collect()
+        }
+        for path in persisted_files(sessions.path()) {
+            let bytes = std::fs::read(&path).unwrap();
+            let bytes = String::from_utf8_lossy(&bytes);
+            for secret in [
+                "private-input-sentinel",
+                "private-answer-sentinel",
+                "private-trace-sentinel",
+                "private-tool-args-sentinel",
+                "private-tool-result-sentinel",
+            ] {
+                assert!(
+                    !bytes.contains(secret),
+                    "content leaked into {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn privacy_one_shot_invalidates_old_csl_and_can_settle_after_server_restore() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::test_utils::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        let sid = uuid::Uuid::new_v4().to_string();
+        let lease = execution_lease(&sid);
+        let mut result = crate::tests::stub_stream_result("original answer");
+        result.session_id = Some(sid.clone());
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "original question"}),
+            serde_json::json!({"role": "assistant", "content": "original answer"}),
+        ];
+        let settlement = persist_headless_session_state(
+            None,
+            None,
+            "original question",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Committed
+        );
+        assert!(
+            crate::cli::session::session_continuation::load_session_continuation_for_recovery(&sid)
+                .is_some()
+        );
+        let credential_path = crate::cli::cli_config::cli_utils::credentials_path();
+        let credentials_before = std::fs::read(&credential_path).unwrap();
+        let csl_path = crate::cli::session::session_recovery::io::csl_log_path_for(&sid);
+        let csl_before = std::fs::read(&csl_path).unwrap();
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        result.full_text = "private answer".into();
+        result.final_messages.extend([
+            serde_json::json!({"role": "user", "content": "private question"}),
+            serde_json::json!({"role": "assistant", "content": "private answer"}),
+        ]);
+        let settlement = persist_headless_session_state(
+            None,
+            None,
+            "private question",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::ContentOmitted
+        );
+        assert_eq!(std::fs::read(&credential_path).unwrap(), credentials_before);
+        assert_eq!(
+            std::fs::read(&csl_path).unwrap(),
+            csl_before,
+            "privacy settlement must not update old CSL"
+        );
+        assert!(
+            crate::cli::session::session_continuation::load_session_continuation_for_recovery(&sid)
+                .is_none(),
+            "old canonical journal and CSL must not mask the omitted turn"
+        );
+        assert!(!crate::cli::cli_config::cli_utils::local_session_is_resumable(&sid));
+        let journal_path = astra_services::session_journal::journal_file_path(&sid);
+        let journal_before_corruption = std::fs::read(&journal_path).unwrap();
+        let tail_start = journal_before_corruption[..journal_before_corruption.len() - 1]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        for suffix in [vec![0xff], b"not-json\n".to_vec(), b"{\"type\":".to_vec()] {
+            let mut corrupt = journal_before_corruption[..tail_start].to_vec();
+            corrupt.extend(suffix);
+            std::fs::write(&journal_path, corrupt).unwrap();
+            assert!(
+                crate::cli::session::session_continuation::load_session_continuation_for_recovery(
+                    &sid
+                )
+                .is_none(),
+                "an unreadable privacy boundary must not restore old CSL"
+            );
+            assert!(!crate::cli::cli_config::cli_utils::local_session_is_resumable(&sid));
+        }
+        std::fs::write(&journal_path, &journal_before_corruption).unwrap();
+        let mut invalid_commit =
+            astra_services::session_journal::read_complete_journal_append_order(&sid)
+                .unwrap()
+                .into_iter()
+                .find_map(|event| event.conversation_commit)
+                .unwrap();
+        invalid_commit.base_root_hash = invalid_commit.cursor.canonical_root_hash.clone();
+        invalid_commit.cursor.completed_turn = 3;
+        invalid_commit.cursor.conversation_seq += 1;
+        invalid_commit.cursor.journal_event_seq += 1;
+        invalid_commit.cursor.canonical_root_hash = "invalid-successor-root".into();
+        let mut invalid_successor = astra_services::session_journal::JournalEvent::turn(
+            Some(&sid),
+            3,
+            None,
+            "",
+            "",
+            0,
+            0,
+            0,
+            0,
+        );
+        invalid_successor.conversation_commit = Some(invalid_commit);
+        astra_services::session_journal::JournalWriter::new(&sid)
+            .unwrap()
+            .append(&invalid_successor)
+            .unwrap();
+        assert!(
+            crate::cli::session::session_continuation::local_journal_privacy_allows_resume(&sid)
+                .is_err(),
+            "invalid core commit cannot clear an earlier omission"
+        );
+        assert!(
+            crate::cli::session::session_continuation::load_session_continuation_for_recovery(&sid)
+                .is_none(),
+            "invalid successor must not restore old CSL"
+        );
+        assert!(!crate::cli::cli_config::cli_utils::local_session_is_resumable(&sid));
+        std::fs::write(&journal_path, &journal_before_corruption).unwrap();
+        // Model the final messages of a later explicitly authorized Server
+        // restoration. No local loader is allowed to invent these messages.
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "0") };
+        result.local_continuation_omitted = false;
+        result.full_text = "restored answer".into();
+        result.final_messages.extend([
+            serde_json::json!({"role": "user", "content": "restored question"}),
+            serde_json::json!({"role": "assistant", "content": "restored answer"}),
+        ]);
+        let settlement = persist_headless_session_state(
+            None,
+            None,
+            "restored question",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Committed
+        );
+        let continuation =
+            crate::cli::session::session_continuation::load_session_continuation_for_recovery(&sid)
+                .unwrap();
+        assert_eq!(continuation.messages, result.final_messages);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn privacy_one_shot_does_not_hide_missing_lease_or_invalid_continuation() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::test_utils::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        let sid = "privacy-one-shot-invalid";
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.session_id = Some(sid.into());
+        let settlement = persist_headless_session_state(
+            None,
+            None,
+            "hello",
+            &mut result,
+            std::time::Instant::now(),
+            None,
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::NotCommitted
+        );
+        assert!(
+            result
+                .session_persistence_error
+                .as_deref()
+                .unwrap()
+                .contains("execution lease")
+        );
+        assert!(!result.local_continuation_omitted);
+        assert_eq!(
+            super::compute_exit_code(&result),
+            ExitCode::PersistenceError
+        );
+        let lease = execution_lease(sid);
+        result.session_persistence_error = None;
+        let settlement = persist_headless_session_state(
+            None,
+            None,
+            "hello",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::NotCommitted
+        );
+        assert!(
+            result
+                .session_persistence_error
+                .as_deref()
+                .unwrap()
+                .contains("canonical messages are empty")
+        );
+        assert!(!result.local_continuation_omitted);
+        result.session_persistence_error = None;
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "unsafe", "_astra_user_turn_semantics": {"schema_version": "invalid"}}),
+        ];
+        let settlement = persist_headless_session_state(
+            None,
+            None,
+            "hello",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::NotCommitted
+        );
+        assert!(!result.local_continuation_omitted);
+        assert!(result.session_persistence_error.is_some());
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn one_shot_csl_resume_matches_committed_messages_with_turn_provenance() {
@@ -5187,6 +5528,7 @@ mod one_shot_persistence_tests {
             session_id: Some(sid.clone()),
             run_id: None,
             session_persistence_error: None,
+            local_continuation_omitted: false,
             full_text: "answer".into(),
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -5321,6 +5663,7 @@ mod one_shot_persistence_tests {
             session_id: Some(sid.clone()),
             run_id: None,
             session_persistence_error: None,
+            local_continuation_omitted: false,
             full_text: "answer".into(),
             prompt_tokens: 0,
             completion_tokens: 0,

@@ -718,6 +718,8 @@ pub(crate) struct StreamResult {
     /// Durable local persistence failure recorded after the runtime finished
     /// successfully (for example one-shot journal append failure).
     pub(crate) session_persistence_error: Option<String>,
+    /// Content policy intentionally omitted durable local continuation.
+    pub(crate) local_continuation_omitted: bool,
     pub(crate) full_text: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
@@ -1563,6 +1565,7 @@ impl Default for StreamResult {
             session_id: None,
             run_id: None,
             session_persistence_error: None,
+            local_continuation_omitted: false,
             full_text: String::new(),
             prompt_tokens: 0,
             completion_tokens: 0,

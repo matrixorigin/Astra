@@ -602,6 +602,11 @@ pub(crate) fn local_session_is_resumable(session_id: &str) -> bool {
     if session_journal::validate_session_id(session_id).is_err() {
         return false;
     }
+    if !crate::cli::session::session_continuation::local_journal_privacy_allows_resume(session_id)
+        .unwrap_or(false)
+    {
+        return false;
+    }
     let user_id = cli_user_id();
     let journal_exists = session_journal::journal_file_path(session_id).exists();
     let has_heavy_checkpoint =

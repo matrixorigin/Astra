@@ -231,6 +231,40 @@ Physical page counts, page high watermarks, and page lag are not exposed.
 The committed projection may honestly lag canonical context until its evidence
 has been materialized and the contiguous cursor promoted.
 
+## One-shot local content privacy
+
+`astra --no-journal-content chat ...` (or `ASTRA_JOURNAL_CONTENT_REDACT=1`)
+intentionally omits the local canonical conversation commit. A successfully
+completed turn remains successful if its content-redacted terminal record is
+durably settled. The record and final JSON report
+`local_continuation: "omitted_by_policy"`; plain output warns that this turn
+cannot be recovered or automatically resumed locally. This is distinct from a
+canonical commit and does not grant a canonical cursor or claim recoverability.
+
+The local terminal record retains redaction markers and operational counts,
+without model/tool content or raw diagnostic sidecars. No CSL snapshot is
+written and no profile last-session pointer is advanced. Local recovery and
+automatic resume reject older journal/CSL/checkpoint state after that boundary.
+Automatic cloud-list selection also skips locally marked sessions. A local
+journal read failure cannot prove the absence of this boundary, so local
+recovery and automatic selection fail closed rather than using an older
+snapshot. A successor commit must also pass canonical replay before clearing
+an earlier omission; a JSON-shaped record alone is insufficient. A legitimately
+missing journal still permits existing recovery sources.
+In one-shot chat, an explicitly selected, authorized Server canonical
+ResumeBundle remains the Server's authority; a later complete canonical local
+settlement can restore local recoverability. TUI restore of a locally marked
+session is rejected before turn admission with guidance to use an explicit
+one-shot Server resume. Ordinary unmarked TUI restores retain their existing
+behavior. This switch controls local persistence, not Server
+retention or the stdout/event output explicitly requested by the caller.
+
+Privacy settlement uses the existing journal execution lease, owner checks,
+base-cursor comparison, file-generation checks, fsync and exact-record readback.
+Actual append/durability failures, uncertain settlement and invalid continuation
+still fail closed. The stdio app-server requires durable local thread
+continuation and rejects this policy before admitting a turn.
+
 ## User-facing diagnostics
 
 A user should be able to answer:
