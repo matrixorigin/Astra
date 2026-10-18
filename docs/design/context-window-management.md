@@ -103,6 +103,30 @@ evidence and recovery handles; the existing net token reduction check still
 decides whether the candidate can replace history. This is an input continuity
 contract, not a guarantee of a model's semantic fidelity.
 
+Successful request-time summaries also become the loop's canonical working set
+when the summary plus bounded history saves estimated tokens. The existing
+rewrite proof and canonical WAL/terminal commit own this transition; no separate
+summary cache, memory write or checkpoint table is involved. Later pipeline and
+pre-turn pressure measurements therefore see the accepted representation plus
+newly appended history, rather than repeatedly summarizing the original input.
+An unchanged or still-fitting working set performs no further summary inference;
+new history that requires actual compaction can produce the next generation.
+Summary space is reserved only when history exceeds the concrete budget after
+memory costs; reserving a hypothetical next summary cannot create that pressure.
+
+Acceptance requires a valid admitted canonical rewrite permit and input matching
+either the exact canonical source or the shared pipeline's validated
+provider-placement projection. If that projection re-homed append-only
+authority, its active human-anchored suffix must survive unchanged and is restored
+in canonical history. A stale/unrecognized projection, invalid tool pairing,
+non-reducing candidate, failed summary or cancelled in-flight operation cannot
+install a replacement. Request-local mechanical fallback and final wire budget
+enforcement remain available. On the first canonical turn without an admitted
+rewrite proof, a successful summary stays request-local and preserves the
+existing provider WAL prefix. Prior summary generations are consumed as evidence
+and replaced by the accepted summary, not accumulated. Resume uses the ordinary
+canonical continuation path and retains that summary without another inference.
+
 Exact-output deduplication is distinct from deciding that an observation is
 obsolete. A repeated path, tool name or read argument does not prove equal
 content: files can change, ranges can differ and providers can change ownership.

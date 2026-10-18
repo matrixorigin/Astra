@@ -372,7 +372,7 @@ fn serialized_value_chars(value: &Value) -> usize {
     serialized_value_size(value).0
 }
 
-fn serialized_message_chars(messages: &[Value]) -> usize {
+pub(crate) fn serialized_message_chars(messages: &[Value]) -> usize {
     messages.iter().map(serialized_value_chars).sum()
 }
 
@@ -1182,9 +1182,81 @@ pub struct CompactResult {
     /// Memory binder and preserve identity, ranking, budgeting, and
     /// `CacheScope::None` placement.
     pub retrieved_memory_entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
-    /// Required per-compaction runtime context routed through the volatile
-    /// system lane, never persisted as user/assistant/tool history.
-    pub runtime_contexts: Vec<String>,
+    /// Successful summary of this operation's input history. The loop owner
+    /// may accept it with the bounded history through its canonical rewrite
+    /// proof; until then it is only a request-local candidate.
+    pub history_summary: Option<String>,
+}
+
+/// Accept a successful request summary as the next canonical working set.
+/// The caller still owns the rewrite proof and durable commit. No cache or
+/// second transcript is needed: future pressure estimates use this history.
+pub(crate) fn prepare_request_summary(
+    canonical: &[Value],
+    source: &[Value],
+    result: &CompactResult,
+) -> Option<Vec<Value>> {
+    use astra_turn_core::cloud::history_summary::{history_summary_message, history_summary_text};
+
+    result.boundary.as_ref()?;
+    let summary = astra_turn_core::cloud::compact_prompt::validated_structured_summary(
+        result.history_summary.as_deref()?,
+    )?;
+    let is_frame = |message: &&Value| {
+        astra_turn_types::runtime_message_delivery(message)
+            == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+    };
+    let mut candidate = result.messages.clone();
+    // Each new summary consumed the previous summaries as evidence (#1024).
+    // Replace those generations instead of accumulating another summary lane.
+    candidate.retain(|message| history_summary_text(message).is_none());
+    candidate.insert(
+        0,
+        history_summary_message(format!(
+            "[Conversation compacted — {} messages summarized]\n\n{summary}",
+            source.len(),
+        )),
+    );
+    if crate::prompts::estimate_tokens(&candidate, 0, 0)
+        >= crate::prompts::estimate_tokens(source, 0, 0)
+    {
+        return None;
+    }
+    if source != canonical {
+        // The shared pipeline delegates history optimization to Memoria. Its
+        // only history projection is removal of validated append-only frames
+        // when switching provider placement. Never promote any other view to
+        // canonical history, or guess message identity from content/role.
+        if !canonical.iter().filter(|m| !is_frame(m)).eq(source.iter()) {
+            return None;
+        }
+        if let Some(start) =
+            astra_turn_types::active_append_only_authority_protected_suffix_start(canonical)
+        {
+            let suffix = &canonical[start..];
+            let projected_len = suffix.iter().filter(|m| !is_frame(m)).count();
+            let retained_start = candidate.len().checked_sub(projected_len)?;
+            if !candidate[retained_start..]
+                .iter()
+                .eq(suffix.iter().filter(|m| !is_frame(m)))
+            {
+                return None;
+            }
+            candidate.truncate(retained_start);
+            candidate.extend_from_slice(suffix);
+        }
+    }
+    if let Some(start) =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(canonical)
+        && !candidate.ends_with(&canonical[start..])
+    {
+        return None;
+    }
+    astra_turn_types::validate_canonical_tool_pairing(&candidate).ok()?;
+    (source == canonical
+        || crate::prompts::estimate_tokens(&candidate, 0, 0)
+            < crate::prompts::estimate_tokens(canonical, 0, 0))
+    .then_some(candidate)
 }
 
 /// Test entrypoint for the same tier-aware budget pass used by Memoria.
@@ -1219,7 +1291,7 @@ pub(crate) fn compact_tiered_impl(
             tier,
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
-            runtime_contexts: Vec::new(),
+            history_summary: None,
         };
     }
 
@@ -1242,7 +1314,7 @@ pub(crate) fn compact_tiered_impl(
             tier,
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
-            runtime_contexts: Vec::new(),
+            history_summary: None,
         };
     }
 
@@ -1382,7 +1454,7 @@ pub(crate) fn compact_tiered_impl(
         tier,
         session_memory_context: None,
         retrieved_memory_entries: Vec::new(),
-        runtime_contexts: Vec::new(),
+        history_summary: None,
     }
 }
 
@@ -1414,6 +1486,59 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn request_summary_acceptance_rejects_unproven_or_unprofitable_rewrites() {
+        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "keep the current work read-only",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let canonical = vec![
+            json!({"role":"user", "content":"old task"}),
+            json!({"role":"assistant", "content":"old evidence ".repeat(2000)}),
+            json!({"role":"user", "content":"current task"}),
+            authority.clone(),
+        ];
+        let mut source = canonical.clone();
+        crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut source).unwrap();
+        let mut result =
+            compact_tiered_impl(&source, 2000, 100, CompactionTier::AggressivePrune, 1);
+        let summary = "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress";
+        result.history_summary = Some(summary.into());
+        let accepted = prepare_request_summary(&canonical, &source, &result).unwrap();
+        assert!(accepted.ends_with(&canonical[2..]));
+
+        let mut stale_source = source.clone();
+        stale_source[0]["content"] = json!("different task");
+        assert!(prepare_request_summary(&canonical, &stale_source, &result).is_none());
+        let mut lost_anchor = result.clone();
+        lost_anchor.messages.pop();
+        assert!(prepare_request_summary(&canonical, &source, &lost_anchor).is_none());
+        let mut no_summary = result.clone();
+        no_summary.history_summary = None;
+        assert!(prepare_request_summary(&canonical, &source, &no_summary).is_none());
+        no_summary.history_summary = Some("summary truncated before the required sections".into());
+        assert!(prepare_request_summary(&canonical, &source, &no_summary).is_none());
+        let mut no_op = result.clone();
+        no_op.boundary = None;
+        assert!(prepare_request_summary(&canonical, &source, &no_op).is_none());
+        let mut no_savings = result.clone();
+        no_savings.history_summary = Some(format!("{summary}{}", "summary overhead ".repeat(3000)));
+        assert!(prepare_request_summary(&canonical, &source, &no_savings).is_none());
+        let mut orphan = result.clone();
+        orphan.messages.insert(
+            0,
+            json!({"role":"tool","tool_call_id":"missing","content":"orphan"}),
+        );
+        assert!(prepare_request_summary(&canonical, &source, &orphan).is_none());
+        let mut lost_control = result;
+        lost_control.messages.push(authority);
+        lost_control.messages.last_mut().unwrap()["content"] = json!("changed control");
+        assert!(prepare_request_summary(&canonical, &canonical, &lost_control).is_none());
+    }
 
     fn tool(content: &str) -> Value {
         json!({"role": "tool", "content": content})

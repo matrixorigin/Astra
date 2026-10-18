@@ -3402,7 +3402,7 @@ mod tests {
             tier: CompactionTier::CompactHistory,
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
-            runtime_contexts: Vec::new(),
+            history_summary: None,
         };
 
         let observation = observe_context_compaction(
@@ -3452,7 +3452,7 @@ mod tests {
             tier: CompactionTier::CompactHistory,
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
-            runtime_contexts: Vec::new(),
+            history_summary: None,
         };
         assert!(
             observe_context_compaction(

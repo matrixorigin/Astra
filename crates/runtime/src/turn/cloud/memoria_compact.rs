@@ -1,14 +1,14 @@
 //! Memoria-based message compaction.
 //!
 //! Retrieves typed current-session memory for the context pipeline and may
-//! persist a typed compaction episode after a successful summary.
+//! prepare a semantic summary for canonical acceptance by the loop owner.
 //!
 //! Architecture:
 //! ```text
 //! 1. Messages exceed budget threshold
 //! 2. Retrieve typed current-session memory as separate runtime context
 //! 3. Truncate old messages (keep recent turns)
-//! 4. Optionally store a semantic compaction episode after summary succeeds
+//! 4. Return a validated summary candidate; the existing canonical owner commits it
 //! ```
 
 use serde_json::{Value, json};
@@ -1575,13 +1575,7 @@ pub async fn compact_with_memoria(
         }
     };
 
-    let will_summarize = compact_config
-        .zip(summary_client.as_ref())
-        .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier));
     let summary_token_budget = compact_config.map(|c| c.summary_token_budget).unwrap_or(0);
-
-    let summary_reserve_chars =
-        plan_summary_reservation(params.budget_chars, will_summarize, summary_token_budget);
 
     let session_memory_context =
         build_session_memory_context(&memories, sid, params.tier, params.session_facts.as_ref());
@@ -1600,11 +1594,21 @@ pub async fn compact_with_memoria(
         })
         .fold(0_usize, usize::saturating_add);
 
-    let adjusted_budget_chars = adjusted_message_budget_chars(
-        params.budget_chars,
-        session_memory_chars.saturating_add(retrieved_memory_chars),
-        summary_reserve_chars,
-    );
+    let memory_chars = session_memory_chars.saturating_add(retrieved_memory_chars);
+    let unreserved_budget_chars =
+        adjusted_message_budget_chars(params.budget_chars, memory_chars, 0);
+    // Reserving space for a hypothetical next summary must not manufacture
+    // history loss in an already-fitting working set. This matters after an
+    // accepted summary has become part of that history, even at a high tier.
+    let will_summarize = compact_config
+        .zip(summary_client.as_ref())
+        .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier))
+        && super::compaction::serialized_message_chars(messages) > unreserved_budget_chars;
+    let summary_reserve_chars =
+        plan_summary_reservation(params.budget_chars, will_summarize, summary_token_budget);
+
+    let adjusted_budget_chars =
+        adjusted_message_budget_chars(params.budget_chars, memory_chars, summary_reserve_chars);
 
     // Apply truncation against a budget that leaves room for typed runtime
     // context. Retrieval results are never inserted into history messages.
@@ -1626,15 +1630,13 @@ pub async fn compact_with_memoria(
     // protected working set merely because its tier is elevated.
     if let Some(cfg) = compact_config
         && let Some(s_client) = summary_client
-        && cfg.should_summarize(params.tier)
+        && will_summarize
         && result.boundary.is_some()
     {
         match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
             Some(summary) => {
                 let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);
-                result
-                    .runtime_contexts
-                    .push(format!("## Compacted Conversation Summary\n{summary}"));
+                result.history_summary = Some(summary.clone());
 
                 if let Some(ref mut boundary) = result.boundary {
                     boundary.summary = Some(format!(
@@ -2435,7 +2437,7 @@ mod tests {
         )
         .await;
         assert!(result.boundary.is_some());
-        assert_eq!(result.runtime_contexts.len(), 1);
+        assert!(result.history_summary.is_some());
         assert_eq!(result.messages.last(), Some(&authority));
         astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
         let requests = summary.requests.lock().unwrap();
@@ -2607,9 +2609,18 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Relaxed),
                 expected_calls
             );
-            assert_eq!(result.runtime_contexts.len(), expected_calls);
+            assert_eq!(
+                usize::from(result.history_summary.is_some()),
+                expected_calls
+            );
             if summarized {
-                assert!(result.runtime_contexts[0].contains("Switched from OAuth to JWT auth"));
+                assert!(
+                    result
+                        .history_summary
+                        .as_ref()
+                        .unwrap()
+                        .contains("Switched from OAuth to JWT auth")
+                );
                 assert!(
                     result.messages.iter().all(|message| !message
                         .get("content")
@@ -2624,6 +2635,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn summary_reservation_cannot_create_pressure_in_fitting_history() {
+        let mut messages = history_requiring_compaction();
+        messages.insert(
+            0,
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "previously accepted summary".into(),
+            ),
+        );
+        let summary = MockSummaryClient::success(
+            "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress",
+        );
+        let params = MemoriaCompactParams {
+            budget_chars: super::super::compaction::serialized_message_chars(&messages) + 1,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+            session_facts: None,
+        };
+        let result = compact_with_memoria(
+            &messages,
+            Some("session"),
+            &MemoriaCompactConfig::default(),
+            &params,
+            Some(&MockMemoriaPort::new(vec![])),
+            Some(&CompactConfig::default()),
+            Some(&summary),
+        )
+        .await;
+        assert_eq!(result.messages, messages);
+        assert!(result.boundary.is_none());
+        assert!(result.history_summary.is_none());
+        assert_eq!(summary.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -2668,7 +2715,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert!(result.runtime_contexts.is_empty());
+        assert!(result.history_summary.is_none());
         assert_eq!(
             result.messages.last(),
             msgs.last(),
