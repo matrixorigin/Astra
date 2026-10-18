@@ -1906,7 +1906,35 @@ impl ToolExecutor {
         ) = ToolSurfaceNames::default();
     }
 
-    /// Snapshot of the names that the model's `<deferred-tools>` manifest
+    /// Inspect the current admitted surface and discovered provider policies.
+    /// This reads existing snapshots; it does not discover or invoke providers.
+    pub(crate) async fn current_surface_requires_workspace_coordination(&self) -> bool {
+        let registry = runtime_env_builtin_registry();
+        let visible = self.current_visible_tool_schemas_snapshot();
+        let deferred = self.current_activatable_tool_names_snapshot();
+        for name in visible
+            .iter()
+            .filter_map(astra_turn_core::tool::schema::tool_schema_name)
+            .chain(deferred.iter().map(String::as_str))
+        {
+            if registry
+                .get(name)
+                .is_some_and(|spec| spec.effect.writes_workspace || spec.required.shell)
+                || astra_tools::executor::may_require_workspace_serialization(name)
+            {
+                return true;
+            }
+            if astra_runtime_env::is_mcp_namespaced_tool_name(name)
+                && let Ok((_, prepared)) = self.prepare_mcp_tool_call(name).await
+                && prepared.policy().effect == astra_turn_types::ResolvedToolEffect::Mutating
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Snapshot the exact names of deferred tools that the current prompt
     /// currently advertises. Used by the host to keep its validator-side
     /// `deferred_tool_names` set in lockstep with what the prompt rendered.
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
@@ -10228,6 +10256,49 @@ pub(crate) mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolBinding.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn discovered_mcp_host_preflight_follows_existing_mutation_policy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = crate::mcp_client::ensure_mock_mcp_server_binary();
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "host_preflight".into(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    args: vec![],
+                    env: Default::default(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: Default::default(),
+            })
+            .await
+            .unwrap();
+        let schemas = manager.all_tool_schemas();
+        let mut executor = ToolExecutor::new(workspace.path());
+        executor.install_mcp_bundle(Arc::new(tokio::sync::RwLock::new(manager)), schemas.clone());
+        for (suffix, requires_coordination) in [("echo", false), ("write_marker", true)] {
+            let surface: Vec<_> = schemas
+                .iter()
+                .filter(|schema| {
+                    astra_turn_core::tool::schema::tool_schema_name(schema)
+                        .is_some_and(|name| name.ends_with(suffix))
+                })
+                .cloned()
+                .collect();
+            assert_eq!(surface.len(), 1);
+            executor.set_current_visible_tool_schemas(&surface);
+            assert_eq!(
+                executor
+                    .current_surface_requires_workspace_coordination()
+                    .await,
+                requires_coordination
+            );
+        }
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

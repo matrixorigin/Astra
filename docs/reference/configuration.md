@@ -165,6 +165,16 @@ window metadata and tool verification contracts retain their existing owners.
 
 Unknown top-level runtime fields are rejected by the configuration parser.
 User and project files, environment values and CLI settings apply in that order.
+Local cache and credential-directory overrides do not relocate the canonical
+physical-device identity. Local CLI/Edge execution requires
+`~/.astra/edge-materializations/device.id` and its canonical checkout identity
+files under the default home state root. Initialize Astra on the same device
+with that directory writable before running in a restricted home environment;
+retain the canonical identity files alongside any isolated cache. A writable
+`ASTRA_LOCAL_STATE_ROOT` or credential directory alone is insufficient. The
+existing identity preflight reports this prerequisite before turn admission;
+do not delete identity files or login credentials as a repair step.
+
 The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
 when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
 live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings

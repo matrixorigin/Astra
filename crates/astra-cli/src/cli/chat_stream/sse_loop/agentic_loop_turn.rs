@@ -1403,6 +1403,34 @@ struct ChatTurnPostPayloadRequest<'a> {
     prepare: PrepareChatTurnRequest<'a>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static WORKSPACE_HOST_VALIDATION_FOR_TEST: Result<(), astra_tools::workspace_observation::WorkspaceLeaseFailure>;
+}
+
+fn validate_workspace_coordination_host()
+-> Result<(), astra_tools::workspace_observation::WorkspaceLeaseFailure> {
+    #[cfg(test)]
+    if let Ok(result) = WORKSPACE_HOST_VALIDATION_FOR_TEST.try_with(|result| *result) {
+        return result;
+    }
+    astra_tools::workspace_observation::validate_workspace_coordination_host()
+}
+
+// Use the resolved, locally bound surface, including activatable tools. A
+// text-only turn or a surface with only read-only tools needs no writer host.
+async fn validate_local_workspace_host_for_tool_surface(
+    executor: &ToolExecutor,
+) -> Result<(), String> {
+    if executor
+        .current_surface_requires_workspace_coordination()
+        .await
+    {
+        validate_workspace_coordination_host().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 async fn chat_turn_post_payload_after_prepare(
     request: ChatTurnPostPayloadRequest<'_>,
 ) -> Result<
@@ -1431,7 +1459,9 @@ async fn chat_turn_post_payload_after_prepare(
     let (current_session_id, session_turn) = (prepare.current_session_id, prepare.session_turn);
     let server_message = prepare.message.to_string();
     let server_explain = prepare.explain.explain_on || prepare.explain.explain_verbose;
+    let executor = Arc::clone(&prepare.executor);
     let prepared = prepare_chat_turn_payload(prepare).await;
+    validate_local_workspace_host_for_tool_surface(&executor).await?;
     let execution_time_budget = execution_time_budget_clock.map(|budget| budget.remaining());
     let server_payload = server_loop_admission_payload_with_execution_time_budget(
         prepared.payload,
@@ -1746,6 +1776,65 @@ mod tests {
         EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
         EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
+
+    #[tokio::test]
+    async fn host_preflight_uses_only_the_resolved_writer_surface() {
+        use super::{
+            WORKSPACE_HOST_VALIDATION_FOR_TEST, validate_local_workspace_host_for_tool_surface,
+        };
+        use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+        use std::collections::HashSet;
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        let schema = |name| json!({"type": "function", "function": {"name": name}});
+        WORKSPACE_HOST_VALIDATION_FOR_TEST
+            .scope(
+                Err(WorkspaceLeaseFailure::CoordinationHostUnsupported),
+                async {
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_ok()
+                    );
+                    executor.set_current_visible_tool_schemas(&[schema("read_file")]);
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_ok()
+                    );
+                    executor.set_current_visible_tool_schemas(&[schema("write_file")]);
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_err()
+                    );
+                    executor.set_current_visible_tool_schemas(&[schema("lsp")]);
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_err()
+                    );
+                    executor.set_current_visible_tool_schemas(&[]);
+                    executor
+                        .set_current_activatable_tool_names(HashSet::from(["bash".to_string()]));
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_err()
+                    );
+                },
+            )
+            .await;
+        WORKSPACE_HOST_VALIDATION_FOR_TEST
+            .scope(Ok(()), async {
+                assert!(
+                    validate_local_workspace_host_for_tool_surface(&executor)
+                        .await
+                        .is_ok()
+                );
+            })
+            .await;
+    }
 
     #[test]
     fn typed_edge_skill_catalog_crosses_without_raw_listing_content() {

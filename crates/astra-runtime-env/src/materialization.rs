@@ -191,12 +191,23 @@ fn sync_identity_directory(directory: &Path, description: &str) -> Result<(), St
 }
 
 fn load_or_create_device_identity(state_root: &Path) -> Result<String, String> {
+    let path = device_identity_path(state_root);
     load_or_create_identity_file(
-        &device_identity_path(state_root),
+        &path,
         None,
         || format!("device-{}", uuid::Uuid::new_v4()),
         "Edge device identity",
     )
+    .map_err(|error| {
+        format!(
+            "{error}. Canonical device identity '{}' is required before local Edge execution. \
+             Initialize Astra on this device with its canonical ~/.astra/edge-materializations \
+             directory writable, then retain the device.id and canonical checkout identity files. \
+             ASTRA_LOCAL_STATE_ROOT and credential-directory overrides do not relocate this identity. \
+             Do not delete identity files or login credentials to repair this prerequisite.",
+            path.display()
+        )
+    })
 }
 
 #[cfg(unix)]

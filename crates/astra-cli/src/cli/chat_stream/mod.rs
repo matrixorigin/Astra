@@ -31,3 +31,6 @@ pub(crate) use params::{
 #[cfg(test)]
 pub(crate) use sse_loop::is_pre_admission_rejection;
 pub(crate) use sse_loop::stream_chat_sse;
+
+#[cfg(test)]
+pub(crate) use sse_loop::WORKSPACE_HOST_VALIDATION_FOR_TEST;

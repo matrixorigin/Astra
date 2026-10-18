@@ -215,6 +215,16 @@ Local shell and typed workspace writers must serialize each executor-owned
 pre/execute/post observation window across Astra processes without placing the
 coordination authority inside the tool-writable workspace.
 
+The CLI checks this host prerequisite before submitting a turn that advertises
+locally bound workspace writers or shell tools (including deferred tools).
+Text-only and read-only surfaces do not require it. Unsupported hosts fail with
+an actionable local setup error before model execution; admission also rechecks
+the same trust boundary. Tool-level refusals use the non-retryable
+`workspace_host_unsupported` kind, distinct from a missing workspace binding.
+Rebinding a workspace or changing cache roots cannot repair a host whose
+coordination directory is not trusted; use a supported host or have its
+administrator provision the required root-owned sticky directory.
+
 - Linux uses a root-owned sticky temporary root, a kernel-owned abstract Unix
   socket name for each workspace generation, a per-UID integrity witness, and
   inotify-backed sticky tamper evidence.

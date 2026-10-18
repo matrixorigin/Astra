@@ -786,6 +786,17 @@ impl DefaultToolExecutor {
 /// contract). Keeping the predicate shared prevents edge and server routes
 /// from acquiring different workspace observation windows.
 pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
+    workspace_mutation_tool_with_args(name, Some(args))
+}
+
+/// Whether a tool surface can admit a typed workspace writer. With no
+/// invocation arguments yet, argument-dependent writers retain their potential
+/// write effect; this does not authorize or classify an actual invocation.
+pub fn may_require_workspace_serialization(name: &str) -> bool {
+    workspace_mutation_tool_with_args(name, None)
+}
+
+fn workspace_mutation_tool_with_args(name: &str, args: Option<&Value>) -> bool {
     match name {
         "write_file"
         | "str_replace"
@@ -799,7 +810,9 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
         | "rollback_git_worktrees"
         | "worktree"
         | "rename_symbol" => true,
-        "lsp" => args.get("dry_run").and_then(Value::as_bool) == Some(false),
+        "lsp" => {
+            args.is_none_or(|args| args.get("dry_run").and_then(Value::as_bool) == Some(false))
+        }
 
         _ => false,
     }
@@ -818,6 +831,25 @@ pub fn requires_workspace_serialization(name: &str, args: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn potential_writer_surface_keeps_argument_dependent_writers() {
+        assert!(super::may_require_workspace_serialization("lsp"));
+        assert!(super::requires_workspace_serialization(
+            "lsp",
+            &serde_json::json!({"dry_run": false})
+        ));
+        assert!(!super::requires_workspace_serialization(
+            "lsp",
+            &serde_json::json!({"dry_run": true})
+        ));
+        assert!(!super::requires_workspace_serialization(
+            "lsp",
+            &serde_json::json!({})
+        ));
+        assert!(super::may_require_workspace_serialization("write_file"));
+        assert!(!super::may_require_workspace_serialization("read_file"));
+    }
+
     struct AdmissionWaitProgress(tokio::sync::Notify);
 
     #[async_trait]

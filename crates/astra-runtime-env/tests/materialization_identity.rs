@@ -642,3 +642,32 @@ mod compatibility {
         );
     }
 }
+
+#[test]
+fn unavailable_canonical_device_directory_has_actionable_setup_error() {
+    let device = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // A file at the required directory deterministically models an unavailable
+    // canonical identity store even when the test process has elevated rights.
+    fs::write(device.path().join("edge-materializations"), "blocked").unwrap();
+    let error =
+        load_or_create_materialization_id_in_roots(workspace.path(), cache.path(), device.path())
+            .unwrap_err();
+    assert!(
+        error.contains(
+            &device
+                .path()
+                .join("edge-materializations/device.id")
+                .display()
+                .to_string()
+        )
+    );
+    assert!(error.contains("Canonical device identity"));
+    assert!(
+        error.contains("ASTRA_LOCAL_STATE_ROOT and credential-directory overrides do not relocate")
+    );
+    assert!(error.contains("directory writable"));
+    assert!(error.contains("Do not delete identity files or login credentials"));
+    assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+}

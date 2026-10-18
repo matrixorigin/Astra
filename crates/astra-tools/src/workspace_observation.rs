@@ -521,6 +521,7 @@ pub fn workspace_ownership_is_unsettled(workspace_root: &Path) -> Option<bool> {
 pub enum WorkspaceLeaseFailure {
     OwnershipUnsettled,
     BindingUnavailable,
+    CoordinationHostUnsupported,
     Contended,
     Cancelled,
     WatcherUnavailable,
@@ -534,6 +535,9 @@ pub enum WorkspaceLeaseFailure {
 impl std::fmt::Display for WorkspaceLeaseFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CoordinationHostUnsupported => formatter.write_str(
+                "Local workspace execution requires a root-owned, sticky, world-writable temporary directory (/tmp on Linux, /private/tmp on macOS). This host does not provide the trusted coordination root; use a supported host or ask its administrator to provision it. Workspace rebinding and cache overrides cannot repair this host prerequisite.",
+            ),
             Self::WatcherCapacity {
                 active,
                 requested,
@@ -572,6 +576,8 @@ pub fn classify_workspace_lease_failure(workspace_root: &Path) -> WorkspaceLease
         WorkspaceLeaseFailure::OwnershipUnsettled
     } else if !workspace_root.exists() {
         WorkspaceLeaseFailure::BindingUnavailable
+    } else if validate_workspace_coordination_host().is_err() {
+        WorkspaceLeaseFailure::CoordinationHostUnsupported
     } else {
         WorkspaceLeaseFailure::Contended
     }
@@ -1819,6 +1825,15 @@ fn trusted_sticky_coordination_root(metadata: &fs::Metadata) -> bool {
         && metadata.mode() & 0o002 != 0
 }
 
+/// Check the host prerequisite for local workspace execution without acquiring
+/// authority or creating state. Admission still validates the root again, so
+/// this early diagnostic never replaces the execution-time trust boundary.
+pub fn validate_workspace_coordination_host() -> Result<(), WorkspaceLeaseFailure> {
+    stable_coordination_root()
+        .map(|_| ())
+        .ok_or(WorkspaceLeaseFailure::CoordinationHostUnsupported)
+}
+
 fn stable_coordination_root() -> Option<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -2377,6 +2392,7 @@ async fn acquire_workspace_lease_attempt(
     cancel_token: Option<&CancellationToken>,
     deadline: tokio::time::Instant,
 ) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
+    validate_workspace_coordination_host()?;
     let writer_state =
         writer_epoch_state(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     if writer_state
@@ -2389,7 +2405,7 @@ async fn acquire_workspace_lease_attempt(
         workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)
             .ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     let trusted_coordination_root =
-        stable_coordination_root().ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
+        stable_coordination_root().ok_or(WorkspaceLeaseFailure::CoordinationHostUnsupported)?;
     let gate = observation_gate(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     loop {
         if cancel_token.is_some_and(CancellationToken::is_cancelled)
@@ -6635,6 +6651,54 @@ mod tests {
         .await
         .expect("UID B must proceed after UID A releases the global generation");
         assert!(second.path_identity_is_unchanged());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn coordination_host_keeps_the_root_owned_sticky_directory_requirement() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // Even a root-owned directory must provide sticky world-writable
+        // semantics. Never modify the real host namespace for this test.
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!trusted_sticky_coordination_root(
+            &fs::symlink_metadata(root.path()).unwrap()
+        ));
+        let link = root.path().join("tmp-link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        assert!(!trusted_sticky_coordination_root(
+            &fs::symlink_metadata(link).unwrap()
+        ));
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(root.path()).unwrap();
+        assert_eq!(
+            trusted_sticky_coordination_root(&metadata),
+            metadata.uid() == 0
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_coordination_host_is_not_a_missing_workspace_binding() {
+        if validate_workspace_coordination_host().is_ok() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            acquire_workspace_mutation_lease_with_options(
+                root.path(),
+                None,
+                Duration::from_millis(20)
+            )
+            .await
+            .err(),
+            Some(WorkspaceLeaseFailure::CoordinationHostUnsupported)
+        );
+        assert_eq!(
+            classify_workspace_lease_failure(root.path()),
+            WorkspaceLeaseFailure::CoordinationHostUnsupported
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

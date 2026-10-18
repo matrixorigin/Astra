@@ -1883,3 +1883,6 @@ hooks:
         assert_eq!(s[0].label, "audit");
     }
 }
+
+#[cfg(test)]
+pub(crate) use agentic_loop_turn::WORKSPACE_HOST_VALIDATION_FOR_TEST;

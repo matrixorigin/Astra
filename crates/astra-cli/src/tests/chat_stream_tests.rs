@@ -2190,3 +2190,53 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
         }
     }
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unsupported_workspace_host_rejects_public_turn_before_admission_http() {
+    use crate::cli::chat_stream::WORKSPACE_HOST_VALIDATION_FOR_TEST;
+    use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/models"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(crate::test_utils::mock_model_catalog_json(&["test-model"])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "write a file in this workspace");
+    let mut pm = PermissionManager::new(true);
+    let failure = WORKSPACE_HOST_VALIDATION_FOR_TEST
+        .scope(
+            Err(WorkspaceLeaseFailure::CoordinationHostUnsupported),
+            async {
+                stream_chat_sse(ChatTurnParams::basic_cli(
+                    &context,
+                    "synthetic-token",
+                    None,
+                    &mut pm,
+                ))
+                .await
+            },
+        )
+        .await
+        .expect_err("unsupported local host must reject before Server admission");
+    assert!(failure.error.contains("root-owned"), "{failure:?}");
+    assert!(failure.error.contains("administrator"), "{failure:?}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the read-only model catalog may be requested"
+    );
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert_eq!(requests[0].url.path(), "/models");
+    assert!(failure.partial.run_id.is_none());
+    assert!(failure.partial.tool_call_records.is_empty());
+}
