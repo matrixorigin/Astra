@@ -2564,14 +2564,11 @@ async fn execute_cli_command_impl(
                                 .map(|state| state.snapshot())
                                 .unwrap_or_default();
                             async {
-                                let interrupted_failure = |reason: &str| {
-                                    crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
-                                        reason,
-                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
-                                    )
-                                };
                                 let Some(run_id) = snapshot.run_id.clone() else {
-                                    return interrupted_failure("request interrupted before an authoritative run id was observed; remote execution settlement is unverified");
+                                    return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        "request interrupted before an authoritative run id was observed; remote execution settlement is unverified",
+                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    );
                                 };
                                 let terminal = terminal_deadline.expect("interrupt establishes terminal deadline");
                                 let terminal_settle_deadline = terminal
@@ -2585,7 +2582,10 @@ async fn execute_cli_command_impl(
                                     result = cancel => result,
                                     _ = tokio::signal::ctrl_c() => Err("user_interrupted (second Ctrl+C); remote execution settlement is unverified".to_string()),
                                 } {
-                                    return interrupted_failure(&error);
+                                    return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        &error,
+                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    );
                                 }
                                 request_session_execution_lease.mark_remote_execution_settled();
                                 wall_deadline_server_terminal_settled = true;
@@ -2610,7 +2610,10 @@ async fn execute_cli_command_impl(
                                             Err(failure) => Err(failure),
                                         }
                                     }
-                                    None => interrupted_failure(&format!("request interruption root drain did not settle for run {run_id}")),
+                                    None => crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        &format!("request interruption root drain did not settle for run {run_id}"),
+                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    ),
                                 }
                             }.await
                         }
@@ -4547,27 +4550,18 @@ mod exit_code_tests {
         }
     }
 
-    fn one_shot_cleanup_test_input(
-        kind: Option<astra_core::ErrorKind>,
-    ) -> Result<StreamResult, crate::TurnFailure> {
-        match kind {
-            None => Ok(StreamResult {
-                full_text: "observed result prefix".into(),
-                prompt_tokens: 7,
+    fn one_shot_cleanup_test_failure(kind: astra_core::ErrorKind) -> crate::TurnFailure {
+        crate::TurnFailure {
+            error: "original turn failure".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(kind),
+                error_code: (kind == astra_core::ErrorKind::ContractViolation)
+                    .then(|| "original_code".into()),
+                error_metadata: Some(serde_json::json!({"source": "original failure"})),
+                partial_text: "original failure prefix".into(),
+                prompt_tokens: 11,
                 ..Default::default()
-            }),
-            Some(kind) => Err(crate::TurnFailure {
-                error: "original turn failure".into(),
-                partial: crate::PartialTurnData {
-                    failure_kind: Some(kind),
-                    error_code: (kind == astra_core::ErrorKind::ContractViolation)
-                        .then(|| "original_code".into()),
-                    error_metadata: Some(serde_json::json!({"source": "original failure"})),
-                    partial_text: "original failure prefix".into(),
-                    prompt_tokens: 11,
-                    ..Default::default()
-                },
-            }),
+            },
         }
     }
 
@@ -4631,7 +4625,14 @@ mod exit_code_tests {
         ] {
             let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
             state.replace_text("incremental prefix cannot replace existing text");
-            let input = one_shot_cleanup_test_input(kind);
+            let input = match kind {
+                None => Ok(StreamResult {
+                    full_text: "observed result prefix".into(),
+                    prompt_tokens: 7,
+                    ..Default::default()
+                }),
+                Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+            };
             if kind == Some(astra_core::ErrorKind::Cancelled) {
                 assert!(input.as_ref().unwrap_err().is_clean_local_cancel());
             }
@@ -4684,8 +4685,16 @@ mod exit_code_tests {
             let writer_result =
                 super::settle_one_shot_stream_event_writer(Some(writer), None).await;
             let mut cleanup_settled = true;
+            let input = match kind {
+                None => Ok(StreamResult {
+                    full_text: "observed result prefix".into(),
+                    prompt_tokens: 7,
+                    ..Default::default()
+                }),
+                Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+            };
             let result = super::apply_one_shot_cleanup_result(
-                one_shot_cleanup_test_input(kind),
+                input,
                 writer_result,
                 &state,
                 &mut cleanup_settled,
@@ -4749,7 +4758,7 @@ mod exit_code_tests {
         let interruption = serde_json::json!({
             "kind": "execution_incomplete", "resumable": true, "reason": "original reason",
         });
-        let mut prior = one_shot_cleanup_test_input(kind).unwrap_err();
+        let mut prior = one_shot_cleanup_test_failure(astra_core::ErrorKind::ContractViolation);
         prior.partial.interruption = Some(interruption.clone());
         assert!(super::one_shot_resumable_turn_failure(&prior, false, true).is_some());
         let mut cleanup_settled = true;
