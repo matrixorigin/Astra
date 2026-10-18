@@ -2365,7 +2365,8 @@ impl ToolExecutor {
 
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
-        let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
+        let previous_session_id = self.active_session_id();
+        let session_changed = previous_session_id.as_deref() != Some(session_id.as_str());
         // File-edit checkpoint persistence: on session-id set, rebind the
         // journal to an auto-persist directory keyed by session.
         //
@@ -2381,7 +2382,15 @@ impl ToolExecutor {
         // - (empty, has): merge loads disk entries → memory reflects disk
         // - (has, empty): merge is no-op, flush writes memory to disk
         // - (has, has): both preserved, resequenced, flushed together
-        if let Some(dir) = file_checkpoint_dir_for(&session_id)
+        if astra_services::session_journal::journal_content_redact_enabled() {
+            let mut journal = self.file_journal.lock_recover();
+            if session_changed && previous_session_id.is_some() {
+                // The in-memory undo history still belongs to one session.
+                *journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
+            } else {
+                journal.disable_persistence();
+            }
+        } else if let Some(dir) = file_checkpoint_dir_for(&session_id)
             && let Ok(mut journal) = self.file_journal.lock()
         {
             // Three cases:
@@ -2589,7 +2598,9 @@ impl ToolExecutor {
         // Re-apply persistence to the new journal if a session is already active.
         // Guarded by session_id presence so pure in-memory callers (no session
         // set) keep the original zero-side-effect behavior.
-        if let Some(sid) = self.active_session_id()
+        if astra_services::session_journal::journal_content_redact_enabled() {
+            self.file_journal.lock_recover().disable_persistence();
+        } else if let Some(sid) = self.active_session_id()
             && let Some(dir) = file_checkpoint_dir_for(&sid)
             && let Ok(mut j) = self.file_journal.lock()
             && j.persist_dir().is_none()
@@ -11006,6 +11017,124 @@ pub(crate) mod tests {
         );
         let expected = tmp.path().join("session-a").join("file_checkpoints");
         assert_eq!(journal.persist_dir(), Some(expected.as_path()));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn privacy_file_edits_keep_in_memory_undo_without_checkpoints() {
+        let checkpoints = tempfile::tempdir().unwrap();
+        let _root = CheckpointRootGuard::set(checkpoints.path());
+        let _policy = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        assert!(astra_services::session_journal::journal_content_redact_enabled());
+        let (work, executor) = temp_executor();
+        let executor = executor.with_active_session_id("private-file-edits");
+        let path = work.path().join("result.txt");
+        let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+            "path": "result.txt", "content": "18\n"
+        }));
+        assert!(applied);
+        assert_eq!(std::fs::read(&path).unwrap(), b"18\n");
+        {
+            let journal = executor.file_journal.lock_recover();
+            assert!(journal.persist_dir().is_none());
+            let entry = journal.entries().next().unwrap();
+            assert!(entry.before_content.is_none());
+            assert_eq!(entry.after_content, b"18\n");
+            journal.undo_file(&path).unwrap().unwrap();
+        }
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"private preimage\n").unwrap();
+        executor.read_file(&serde_json::json!({"path": "result.txt"}));
+        let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+            "path": "result.txt", "content": "private replacement\n"
+        }));
+        assert!(applied);
+        executor
+            .file_journal
+            .lock_recover()
+            .undo_file(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"private preimage\n");
+        assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
+
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "0") };
+        let executor = ToolExecutor::new(work.path()).with_active_session_id("normal-file-edits");
+        let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+            "path": "normal.txt", "content": "normal content\n"
+        }));
+        assert!(applied);
+        let stored = checkpoints
+            .path()
+            .join("normal-file-edits/file_checkpoints/000000.json");
+        let entry: astra_turn_core::file_edit_journal::FileEditEntry =
+            serde_json::from_slice(&std::fs::read(stored).unwrap()).unwrap();
+        assert_eq!(entry.after_content, b"normal content\n");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn privacy_shared_file_journal_disables_existing_persistence_in_both_builder_orders() {
+        let checkpoints = tempfile::tempdir().unwrap();
+        let _root = CheckpointRootGuard::set(checkpoints.path());
+        let _policy = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        assert!(astra_services::session_journal::journal_content_redact_enabled());
+        for shared_first in [false, true] {
+            for prebound in [false, true] {
+                let work = tempfile::tempdir().unwrap();
+                let mut journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
+                let prior = work.path().join("prior-checkpoints");
+                if prebound {
+                    journal.enable_persistence(prior.clone());
+                    journal.record_committed(
+                        &work.path().join("prior.txt"),
+                        "prior",
+                        0,
+                        None,
+                        b"old content",
+                        astra_turn_core::file_edit_journal::EditType::Create,
+                    );
+                }
+                let original = prebound.then(|| std::fs::read(prior.join("000000.json")).unwrap());
+                let shared = Arc::new(std::sync::Mutex::new(journal));
+                let executor = ToolExecutor::new(work.path());
+                let executor = if shared_first {
+                    executor
+                        .with_shared_file_journal(shared.clone())
+                        .with_active_session_id("private-shared")
+                } else {
+                    executor
+                        .with_active_session_id("private-shared")
+                        .with_shared_file_journal(shared.clone())
+                };
+                assert!(shared.lock_recover().persist_dir().is_none());
+                let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+                    "path": "private.txt", "content": "private content\n"
+                }));
+                assert!(applied);
+                let journal = shared.lock_recover();
+                assert_eq!(journal.len(), usize::from(prebound) + 1);
+                journal
+                    .undo_file(&work.path().join("private.txt"))
+                    .unwrap()
+                    .unwrap();
+                assert!(!work.path().join("private.txt").exists());
+                assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
+                if let Some(original) = original {
+                    assert_eq!(std::fs::read(prior.join("000000.json")).unwrap(), original);
+                    assert_eq!(std::fs::read_dir(&prior).unwrap().count(), 1);
+                } else {
+                    assert!(!prior.exists());
+                }
+                drop(journal);
+                executor.set_active_session_id("another-private-session");
+                assert!(shared.lock_recover().is_empty());
+                assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
+            }
+        }
     }
 
     /// REGRESSION: the production wiring order is

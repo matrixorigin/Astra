@@ -245,6 +245,9 @@ The local terminal record retains redaction markers and operational counts,
 without model/tool content or raw diagnostic sidecars. No CSL snapshot is
 written and no profile last-session pointer is advanced. Local recovery and
 automatic resume reject older journal/CSL/checkpoint state after that boundary.
+File-edit undo entries remain in memory for the running process, but their
+before/after content is not persisted to file checkpoints under this policy.
+Previously written checkpoints are left unchanged.
 Automatic cloud-list selection also skips locally marked sessions. A local
 journal read failure cannot prove the absence of this boundary, so local
 recovery and automatic selection fail closed rather than using an older

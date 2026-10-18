@@ -162,6 +162,12 @@ impl FileEditJournal {
         self.persist_dir.as_deref()
     }
 
+    /// Keep undo entries in memory without persisting subsequent mutations.
+    /// Previously written checkpoints are left untouched.
+    pub fn disable_persistence(&mut self) {
+        self.persist_dir = None;
+    }
+
     /// Record one successfully committed file mutation.
     ///
     /// The caller supplies the preimage captured during preparation and the
