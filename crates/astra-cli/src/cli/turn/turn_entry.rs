@@ -719,7 +719,6 @@ pub(crate) const INTERACTIVE_SERVER_RESUME_TIMEOUT: std::time::Duration =
 pub(crate) struct AdmittedServerTurn {
     pub(crate) attachment_owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
-    pub(crate) turn_index: u32,
     pub(crate) bearer: String,
     pub(crate) api: astra_thin_client::ThinClient,
     pub(crate) continuation: crate::cli::session::session_continuation::SessionContinuation,
@@ -768,18 +767,10 @@ pub(super) async fn acquire_interactive_turn_admission(
         let refresh = tokio::time::timeout(INTERACTIVE_SERVER_RESUME_TIMEOUT, async {
             let auth_owner =
                 session_runtime::capture_admitted_auth_owner(&request_api, profile, token).await;
-            let bearer = match auth_owner.as_ref() {
-                Some(owner) => session_runtime::owner_access_token(&request_api, owner, None)
-                    .await
-                    .ok_or_else(|| {
-                        "Server resume authentication could not be refreshed for the admitted owner"
-                            .to_string()
-                    })?,
-                None => token.to_string(),
-            };
-            let restored = crate::cli::session::session_restore_client::fetch_cloud_session_snapshot_with_bearer(
-                &request_api, &session_id, &bearer,
-            ).await?.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
+            let (restored, bearer) = crate::cli::session::session_restore_client::fetch_cloud_session_snapshot_with_bearer(
+                &request_api, &session_id, token, auth_owner.as_ref(),
+            ).await?;
+            let restored = restored.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
             Ok::<_, String>((restored, bearer, auth_owner))
         });
         let cancelled = async {
@@ -809,7 +800,6 @@ pub(super) async fn acquire_interactive_turn_admission(
         Some(AdmittedServerTurn {
             attachment_owner,
             auth_owner,
-            turn_index: restored.turn_count.saturating_add(1),
             bearer,
             api: request_api,
             continuation,
@@ -833,7 +823,6 @@ pub(super) async fn acquire_interactive_turn_admission(
             &session_id,
             &events,
         )?;
-        let messages = active.materialize();
         let restored =
             session_runtime::restored_journal_state_from_append_order_events(true, &events);
         state.history = restored.session.history;
@@ -846,7 +835,7 @@ pub(super) async fn acquire_interactive_turn_admission(
         state.last_turn_event = restored.last_turn_event;
         state.deferred_tool_activations =
             astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-                &messages,
+                active.messages(),
                 std::mem::take(&mut state.deferred_tool_activations),
             );
         state.active_conversation = Some(active);

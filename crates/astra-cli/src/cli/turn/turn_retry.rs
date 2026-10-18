@@ -265,7 +265,6 @@ mod tests {
             let admitted = AdmittedServerTurn {
                 attachment_owner: cli_utils::cli_owner_auth_snapshot(),
                 auth_owner,
-                turn_index: 4,
                 bearer: bearer.into(),
                 api: api.clone().without_bearer_provider(),
                 continuation,
@@ -323,7 +322,7 @@ mod tests {
             assert_eq!(outcome, super::TurnSettlementOutcome::NotStarted);
             assert_eq!(
                 *observed.lock().unwrap(),
-                bound_owner.then(|| ("owner-rotated-access".to_string(), 4, messages))
+                bound_owner.then(|| ("owner-rotated-access".to_string(), 21, messages))
             );
             assert_eq!(
                 state.turn, 20,

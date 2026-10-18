@@ -59,7 +59,15 @@ fn basic_chat_context<'a>(
 /// to sibling test modules (e.g. `resume_tests`) so they don't have to
 /// duplicate the payload literal.
 pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
-    sse_text_response_with_execution_summary(text, session_id, 0, 0, &[], 1)
+    sse_text_response_with_execution_summary(
+        text,
+        session_id,
+        0,
+        0,
+        &[],
+        1,
+        (&format!("run-{session_id}"), 1),
+    )
 }
 
 fn with_root_communication(body: String, session_id: &str) -> String {
@@ -92,16 +100,18 @@ fn with_root_communication(body: String, session_id: &str) -> String {
     stream + &body
 }
 
-fn sse_text_response_with_execution_summary(
+pub(super) fn sse_text_response_with_execution_summary(
     text: &str,
     session_id: &str,
     tool_calls_count: u32,
     observation_tool_calls_count: u32,
     tools_used: &[&str],
     llm_rounds: u32,
+    server_turn: (&str, u32),
 ) -> String {
+    let (run_id, session_turn) = server_turn;
     let tool_ledger_receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
-        format!("run-{session_id}"),
+        run_id,
         1,
         tool_calls_count,
         tool_calls_count,
@@ -115,11 +125,11 @@ fn sse_text_response_with_execution_summary(
         true,
     );
     format!(
-        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"run-{session_id}\"}}\n\n\
+        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"{run_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
              data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
-             data: {{\"type\":\"run_finished\",\"run_id\":\"run-{session_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
+             data: {{\"type\":\"run_finished\",\"run_id\":\"{run_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
              data: {}\n\n\
              data: [DONE]\n\n",
         serde_json::json!({
@@ -135,13 +145,13 @@ fn sse_text_response_with_execution_summary(
                 "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
                 "identity": {
                     "session_id": session_id,
-                    "run_id": format!("run-{session_id}"),
+                    "run_id": run_id,
                     "agent_id": "root",
                     "model_id": "mock-model",
                     "topology": "cli_server"
                 },
                 "progress": {
-                    "session_turn": 1,
+                    "session_turn": session_turn,
                     "agentic_round_index": llm_rounds.saturating_sub(1),
                     "llm_rounds_completed": llm_rounds,
                     "slice_round_limit": 60,
@@ -782,6 +792,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
                         2,
                         &["agent", "tool_search"],
                         4,
+                        ("run-sess-server-loop", 1),
                     ),
                 )
             }
@@ -1173,7 +1184,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                     }
                                 }),
                                 sse_text_response_with_execution_summary(
-                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1,
+                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1, ("run-sess-tx-e2e", 1),
                                 ),
                             );
                         (TEST_SSE_HEADERS, body)
@@ -1695,7 +1706,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                     format!(
                         "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\ndata: {request}\n\n{}",
                         sse_text_response_with_execution_summary(
-                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1,
+                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1, ("run-sess-mcp", 1),
                         ),
                     )
                 } else { format!(

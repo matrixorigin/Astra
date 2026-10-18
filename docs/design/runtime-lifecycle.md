@@ -176,12 +176,19 @@ request per turn for those attachments. Its 30-second deadline and the current
 TUI cancellation token bound the wait while the local lease is held. The
 resume and model requests use the same admitted owner bearer, refreshed only
 through that captured owner's existing binding. An environment bearer remains
-an explicit bearer and cannot borrow profile refresh authority.
-A failed or degraded refresh stops before execution; it cannot fall back to the local replica. The returned
-Server session turn count and canonical messages supply that request's inputs.
-The local snapshot independently supplies the local journal turn allocation and
-canonical commit base. The local workspace's sidecar ordering counter is also
-seeded from that local journal during explicit Server canonical restore,
+an explicit bearer and cannot borrow profile refresh authority. A typed resume
+401 permits one refresh and retry through the captured owner within the same
+deadline; a repeated rejection, 403 or unowned bearer never retries.
+A failed or degraded refresh stops before execution; it cannot fall back to the
+local replica. The returned canonical messages refresh the client continuation
+mirror. Server admission independently restores its conversation and allocates
+its turn; no client message list or predicted Server turn crosses that boundary.
+Server feedback is validated against the accepted session, run, model and
+terminal receipt, never a local counter or a pre-admission prediction.
+The local snapshot supplies one turn allocation for the local journal, tool
+mutation/rollback scopes, checkpoints and traces, plus the canonical commit
+base. Session state and the workspace's sidecar ordering counter are seeded from
+that local journal during explicit Server canonical restore,
 starting at zero for a replica with no local turns. After remote reads, restore
 holds the captured owner's execution lease while reading the current local
 head and merging metadata under that owner's workspace lock. Already committed

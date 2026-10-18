@@ -237,9 +237,9 @@ fn build_turn_stream_params<'a>(
         bg_task_commands: Some(state.bg_task_commands.clone()),
         bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
-        turn_index: input
-            .admitted_server_turn
-            .map_or_else(|| state.turn.saturating_add(1), |turn| turn.turn_index),
+        // This clock scopes every local tool mutation, checkpoint and journal
+        // event. Server admission allocates its own turn independently.
+        turn_index: state.turn.saturating_add(1),
         pipeline_state: state.runtime_pipeline_state.clone(),
         compaction_state: state.runtime_compaction_state.clone(),
         consecutive_context_window_errors: state.runtime_consecutive_context_window_errors,

@@ -720,7 +720,7 @@ fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &Prepare
 
 fn persist_resumed_workspace_metadata(
     restored: &RestoredSession,
-    workspace_turn_count: u32,
+    local_turn_count: u32,
     local_projection_owner: Option<&astra_services::OwnerScope>,
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
@@ -734,7 +734,7 @@ fn persist_resumed_workspace_metadata(
             session_workspace::WorkspaceMetadata::new(&restored.session_id, model_for_new)
         });
     let update = |ws: &mut session_workspace::WorkspaceMetadata| {
-        ws.turn_count = workspace_turn_count;
+        ws.turn_count = local_turn_count;
         if local_projection_owner.is_some() {
             // The current workspace may have advanced while optional remote
             // reads were pending. Keep its local evidence and cumulative facts.
@@ -1313,7 +1313,7 @@ async fn apply_restored_session(
             })
         })
         .transpose()?;
-    let workspace_turn_count = if workspace_lease.is_some() {
+    let local_turn_count = if workspace_lease.is_some() {
         let writer = session_journal::JournalWriter::for_owner(
             &restored_owner.owner_scope,
             &restored.session_id,
@@ -1340,7 +1340,7 @@ async fn apply_restored_session(
     }
     persist_resumed_workspace_metadata(
         &restored,
-        workspace_turn_count,
+        local_turn_count,
         use_server_canonical.then_some(&restored_owner.owner_scope),
         total_cache_read_tokens,
         total_cache_creation_tokens,
@@ -1351,7 +1351,7 @@ async fn apply_restored_session(
     state.prepare_for_session_rebind().await;
     state.reset_for_session_restore();
     state.set_session_id(restored.session_id.clone());
-    state.turn = restored.turn_count;
+    state.turn = local_turn_count;
     state.total_prompt_tokens = restored.total_tokens_in;
     state.total_completion_tokens = restored.total_tokens_out;
     state.total_cache_read_tokens = total_cache_read_tokens;
@@ -2132,7 +2132,7 @@ mod resume_tests {
         apply_restored_session(None, &api, &mut state, server_restored)
             .await
             .expect("Server journal authority must not compare replica clocks");
-        assert_eq!(state.turn, 3);
+        assert_eq!(state.turn, 20);
         assert_eq!(
             state.active_conversation.as_ref().unwrap().messages(),
             messages
@@ -3379,7 +3379,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn explicit_server_restore_keeps_two_request_and_local_commit_clocks_independent() {
+    async fn explicit_server_restore_preserves_canonical_messages_and_local_commit_clock() {
         use astra_turn_core::active_conversation::ActiveConversation;
         use std::sync::{
             Arc,
@@ -3482,8 +3482,8 @@ mod resume_tests {
                 .await
                 .unwrap();
             assert_eq!(
-                state.turn, server_turn,
-                "the restored UI retains the official Server head"
+                state.turn, local_turn,
+                "restore must keep the local journal clock independent of the Server head"
             );
             assert_eq!(
                 session_workspace::read_workspace(&sid).unwrap().turn_count,
@@ -3503,7 +3503,7 @@ mod resume_tests {
             let api = api.with_bearer_provider(Arc::new(ConflictingAdmissionTestBearer));
             assert!(state.server_resume_attachment.is_some());
             // This retained source cursor is only an attachment identity; its
-            // turn cannot override the freshly returned official session head.
+            // turn cannot override the local journal's turn allocation.
             state
                 .server_resume_attachment
                 .as_mut()
@@ -3546,7 +3546,7 @@ mod resume_tests {
             assert_eq!(
                 first,
                 (
-                    server_turn + 1,
+                    admitted_local_turn + 1,
                     server_messages,
                     admitted_local_turn + u32::from(!failed_primary_append)
                 )
@@ -3560,7 +3560,7 @@ mod resume_tests {
             assert_eq!(
                 second,
                 (
-                    server_turn + 2,
+                    admitted_local_turn + 1 + u32::from(!failed_primary_append),
                     next_messages,
                     admitted_local_turn + 1 + u32::from(!failed_primary_append)
                 )
@@ -3781,8 +3781,8 @@ mod resume_tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            state.turn, 20,
-            "Server UI head cannot become the local allocation"
+            state.turn, 4,
+            "restore must use the local head read under the publication lease"
         );
         assert_eq!(
             state.active_conversation.as_ref().unwrap().cursor(),
@@ -3846,6 +3846,8 @@ mod resume_tests {
             ResponseTemplate::new(200).set_body_json(wrong_owner),
             ResponseTemplate::new(200).set_body_json(wrong_session),
             ResponseTemplate::new(404),
+            ResponseTemplate::new(401),
+            ResponseTemplate::new(403),
             ResponseTemplate::new(503),
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"session_id":sid,"turn_count":3})),
@@ -3872,8 +3874,8 @@ mod resume_tests {
                 .is_err()
             );
             assert_eq!(
-                state.turn, 3,
-                "failed official refresh must not install local turn20"
+                state.turn, 20,
+                "failed official refresh must preserve the restored local clock"
             );
             assert_eq!(
                 state.active_conversation.as_ref().unwrap().cursor(),
@@ -3933,7 +3935,7 @@ mod resume_tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
-        for expires_in in [-10, 30] {
+        for expires_in in [-10, 30, 3600] {
             let sid = format!("resume-bound-owner-{expires_in}-{}", uuid::Uuid::new_v4());
             let owner = "resume-admitted-owner";
             let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
@@ -4021,6 +4023,16 @@ mod resume_tests {
                 .and(path(format!("/sessions/{sid}/resume")))
                 .and(wiremock::matchers::header(
                     "authorization",
+                    format!("Bearer {old_bearer}"),
+                ))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(u64::from(expires_in == 3600))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(format!("/sessions/{sid}/resume")))
+                .and(wiremock::matchers::header(
+                    "authorization",
                     "Bearer rotated-owner-access",
                 ))
                 .respond_with(ResponseTemplate::new(200).set_body_json(&restored))
@@ -4040,7 +4052,7 @@ mod resume_tests {
             let observed = crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_with_token_for_test(
                 &mut state, &api, true, &old_bearer, false,
             ).await.unwrap();
-            assert_eq!(observed, (4, server_messages, 21));
+            assert_eq!(observed, (21, server_messages, 21));
             let saved = cli_utils::load_credentials();
             assert_eq!(saved.current_profile.as_deref(), Some("ambient-other"));
             assert_eq!(
@@ -4123,7 +4135,7 @@ mod resume_tests {
             } else {
                 "timed out"
             }));
-            assert_eq!(state.turn, 3, "no local or model turn was admitted");
+            assert_eq!(state.turn, 20, "no local or model turn was admitted");
             assert!(
                 session_journal::SessionExecutionLease::try_acquire(&sid).is_ok(),
                 "failed refresh must release the lease"
@@ -4154,7 +4166,7 @@ mod resume_tests {
             .unwrap();
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(state.turn, 3);
+        assert_eq!(state.turn, 2);
         assert!(
             state
                 .history

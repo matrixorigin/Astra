@@ -666,8 +666,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
-    /// 1-based session turn currently in progress; used to tag journal entries
-    /// and rollback scopes.
+    /// 1-based local journal turn currently in progress. Every local tool
+    /// mutation, checkpoint, trace and rollback scope uses this clock. Server
+    /// admission and Server feedback own an independent turn sequence.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
