@@ -3429,6 +3429,12 @@ pub(crate) fn settle_one_shot_user_interrupt_result(
                 }
             }
         };
+        // A cancelled physical stream can return before terminal ingestion
+        // populates final_text. Retain its already-observed request prefix as
+        // evidence only; the local fence still requires a hard failure.
+        if failure.partial.partial_text.is_empty() {
+            failure.partial.partial_text = incremental_state.snapshot().partial_text;
+        }
         failure
             .error
             .push_str("; workspace_ownership_unsettled; local execution settlement is unverified");
@@ -4269,6 +4275,94 @@ mod exit_code_tests {
             assert_eq!(failure.partial.partial_text, "retained partial");
             assert_eq!(failure.partial.prompt_tokens, 23);
         }
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_recovers_observed_prefix_without_promoting_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("observed prefix before text_done");
+        let failure = crate::TurnFailure {
+            error: "original cancellation".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                prompt_tokens: 9,
+                ..Default::default()
+            },
+        };
+        let failure = super::settle_one_shot_user_interrupt_result(
+            Err(failure),
+            Some(&executor),
+            None,
+            true,
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::Cancelled)
+        );
+        assert_eq!(failure.partial.prompt_tokens, 9);
+        assert!(
+            failure
+                .error
+                .starts_with("original cancellation; workspace_ownership_unsettled")
+        );
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["text"], "observed prefix before text_done");
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["success"], false);
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_keeps_existing_hard_error_prefix_and_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("incremental prefix must not replace retained text");
+        let metadata = serde_json::json!({"source": "synthetic binding failure"});
+        let failure = crate::TurnFailure {
+            error: "original contract violation".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                error_code: Some("original_code".into()),
+                error_metadata: Some(metadata.clone()),
+                partial_text: "original canonical partial".into(),
+                ..Default::default()
+            },
+        };
+        let failure = super::settle_one_shot_user_interrupt_result(
+            Err(failure),
+            Some(&executor),
+            None,
+            true,
+            &state,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(
+            failure
+                .error
+                .starts_with("original contract violation; workspace_ownership_unsettled")
+        );
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["text"], "original canonical partial");
+        assert_eq!(json["error_code"], "original_code");
+        assert_eq!(json["error_metadata"], metadata);
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["server_terminal_unverified"], true);
     }
 
     #[test]
