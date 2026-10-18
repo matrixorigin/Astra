@@ -133,16 +133,6 @@ pub(crate) async fn execute_server_bash(
     // must neither reacquire that exclusive generation nor mint its own
     // fingerprint receipt.
     let nested_run_script_callback = astra_tools::rpc_bridge::is_run_script_rpc_dispatch();
-    if nested_run_script_callback
-        && args
-            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-            .is_some()
-    {
-        return pre_dispatch_rejection_tool_result(
-            "Error: external_state_paths requires a top-level foreground executor-owned observation window"
-                .to_string(),
-        );
-    }
     let observation_lease = if !command.trim().is_empty() && !nested_run_script_callback {
         match astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
             workspace_root,
@@ -179,45 +169,6 @@ pub(crate) async fn execute_server_bash(
     } else {
         None
     };
-    let external_lease = match astra_tools::workspace_observation::acquire_external_effect_observation_lease_with_options(
-        args, workspace_root, cancel_token, Duration::from_secs_f64(timeout_secs.max(0.1)),
-    ).await {
-        Ok(lease) => lease,
-        Err(astra_tools::workspace_observation::ExternalEffectLeaseFailure::Admission(failure)) => return astra_tools::workspace_lease_failure_tool_result("bash", failure),
-        Err(reason) => return pre_dispatch_rejection_tool_result(format!("Error: external state observation was not admitted: {reason}")),
-    };
-    if args
-        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-        .is_some()
-        && external_lease.is_none()
-    {
-        return pre_dispatch_rejection_tool_result(
-            "Error: external state observation lease is contended or unavailable; no command was run.",
-        );
-    }
-    let external_before = {
-        let root = workspace_root.to_path_buf();
-        let args = args.clone();
-        match tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::ExternalEffectFingerprint::capture_from_args(
-                &args, &root,
-            )
-        })
-        .await
-        {
-            Ok(Ok(before)) => before,
-            Ok(Err(reason)) => {
-                return pre_dispatch_rejection_tool_result(format!(
-                    "Error: external state observation was not admitted: {reason}"
-                ));
-            }
-            Err(error) => {
-                return pre_dispatch_rejection_tool_result(format!(
-                    "Error: external state preimage worker failed: {error}"
-                ));
-            }
-        }
-    };
     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return astra_tools::cancelled_tool_result("bash", false);
     }
@@ -240,7 +191,7 @@ pub(crate) async fn execute_server_bash(
             let execution_started = output.execution_started;
             let scope_ownership = output.scope_ownership;
             if output.cancelled {
-                astra_tools::cancelled_tool_result("bash", true)
+                astra_tools::cancelled_tool_result("bash", execution_started)
                     .with_metadata_scope_settled(scope_ownership, execution_started)
             } else {
                 tool_result_from_server_bash_output(command, output, timeout_secs)
@@ -262,7 +213,7 @@ pub(crate) async fn execute_server_bash(
             let execution_started = output.execution_started;
             let scope_ownership = output.scope_ownership;
             if output.cancelled {
-                astra_tools::cancelled_tool_result("bash", true)
+                astra_tools::cancelled_tool_result("bash", execution_started)
                     .with_metadata_scope_settled(scope_ownership, execution_started)
             } else {
                 tool_result_from_server_bash_output(command, output, timeout_secs)
@@ -341,23 +292,6 @@ pub(crate) async fn execute_server_bash(
         quarantine_weak_after_current,
         explicit_verification,
     );
-    if let Some(receipt) = match external_before.as_ref() {
-        Some(before)
-            if external_lease
-                .as_ref()
-                .is_none_or(|lease| lease.integrity_valid()) =>
-        {
-            before
-                .changed_receipt_async(scope_ownership.map(astra_sandbox::ScopeOwnership::as_str))
-                .await
-        }
-        _ => None,
-    } {
-        result
-            .metadata
-            .get_or_insert_with(Default::default)
-            .extend(receipt);
-    }
     astra_tools::shell_ops::attach_bash_workdir_evidence(
         &mut result,
         workspace_root,
@@ -382,6 +316,12 @@ impl ScopeSettledResult for astra_tools::ToolResult {
         execution_started: bool,
     ) -> Self {
         let fields = self.metadata.get_or_insert_with(Default::default);
+        if execution_started {
+            astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        } else {
+            astra_tools::execution_outcome::insert_not_executed_fact(fields);
+            fields.insert("side_effects_maybe".into(), Value::Bool(false));
+        }
         fields.insert(
             "_astra_execution_started".to_string(),
             Value::Bool(execution_started),
@@ -830,6 +770,43 @@ mod tests {
                 .unwrap()
                 .display()
                 .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_optional_observation_preserves_server_execution_facts() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::File::create(workspace.path().join("large-output.bin"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        for (command, failed, code) in [
+            ("printf ready", false, 0),
+            ("printf partial > marker; exit 7", true, 7),
+        ] {
+            let result = execute_server_bash(
+                &policy,
+                workspace.path(),
+                &binding,
+                None,
+                &serde_json::json!({"command": command}),
+                None,
+            )
+            .await;
+            assert_eq!(result.is_error, failed, "{result:?}");
+            let fields = result.metadata.as_ref().unwrap();
+            assert_eq!(fields["disposition"], "executed");
+            assert_eq!(fields["execution_started"], true);
+            assert_eq!(fields["exit_code"], code);
+            if !failed {
+                assert_eq!(result.output.trim(), "ready");
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("marker")).unwrap(),
+            "partial"
         );
     }
 

@@ -59,10 +59,19 @@ pub(crate) enum TurnAttempt {
 
 pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
+    // Capture the admitted owner after admission/validation but before the
+    // stream is built; only this snapshot may drive in-flight refresh.
+    let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+        input.api,
+        input.profile,
+        input.token,
+    )
+    .await;
     let prepared = prepare_turn_stream_state(state).await;
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
         Some(prepared.run_control.clone());
-    let params = build_turn_stream_params(state, input, &prepared);
+    let mut params = build_turn_stream_params(state, input, &prepared);
+    params.auth_owner = auth_owner;
     let (result, was_user_cancel) =
         await_stream_with_interrupts(params, &prepared, input.api, input.token).await;
     // Release the TUI's sender at transport close, before post-stream
@@ -131,7 +140,7 @@ fn build_turn_stream_params<'a>(
     ChatTurnParams {
         api: input.api,
         token: input.token,
-        auth_profile: input.profile,
+        auth_owner: None,
         message: input.message,
         user_intent: input.user_intent,
         input_runtime_required_texts: input.input_runtime_required_texts,
@@ -225,6 +234,7 @@ async fn await_stream_with_interrupts<'a>(
     let cancel_token_for_signal = prepared.cancel_token.clone();
     let incremental_state = prepared.incremental_state.clone();
     let tui_cancel_token = prepared.tui_cancel_token.clone();
+    let auth_owner = params.auth_owner.clone();
     let stream_fut = stream_chat_sse(params);
     tokio::pin!(stream_fut);
 
@@ -258,7 +268,7 @@ async fn await_stream_with_interrupts<'a>(
         _ = tokio::signal::ctrl_c() => {
             prepared.run_control.request_cancel_for_user();
             cancel_token_for_signal.cancel();
-            notify_server_to_cancel_run(api, bearer, &incremental_state, "Ctrl+C");
+            notify_server_to_cancel_run(api, bearer, auth_owner.as_ref(), &incremental_state, "Ctrl+C");
             if tui_cancel_token.is_none() {
                 eprintln!("\n{}", "  Interrupted. (press Ctrl+C again to force-exit, or wait up to 10s for graceful drain)".dim());
             }
@@ -278,7 +288,7 @@ async fn await_stream_with_interrupts<'a>(
         } => {
             prepared.run_control.request_cancel_for_user();
             cancel_token_for_signal.cancel();
-            notify_server_to_cancel_run(api, bearer, &incremental_state, "TUI cancel");
+            notify_server_to_cancel_run(api, bearer, auth_owner.as_ref(), &incremental_state, "TUI cancel");
             let drained = drain_after_cancel(
                 &mut stream_fut,
                 drain_timeout,
@@ -361,6 +371,7 @@ pub(crate) fn report_server_run_detach_after_internal_failure(
 fn notify_server_to_cancel_run(
     api: &astra_thin_client::ThinClient,
     bearer: &str,
+    auth_owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     incremental_state: &Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
     source: &'static str,
 ) {
@@ -375,13 +386,23 @@ fn notify_server_to_cancel_run(
     };
     let api = api.clone();
     let bearer = bearer.to_string();
+    let auth_owner = auth_owner.cloned();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     tokio::spawn(async move {
-        match api.cancel_run(Some(&bearer), &run_id).await {
+        match super::turn_facade::cancel_exact_run_until_settled_with_deadline(
+            &api,
+            &bearer,
+            &run_id,
+            auth_owner.as_ref(),
+            deadline,
+        )
+        .await
+        {
             Ok(_) => tracing::info!(
                 target: "astra::cli::cancel",
                 run_id = %run_id,
                 source,
-                "server-side run cancellation requested"
+                "server-side run cancellation settled"
             ),
             Err(e) => tracing::warn!(
                 target: "astra::cli::cancel",

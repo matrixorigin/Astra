@@ -162,13 +162,10 @@ pub(crate) async fn stream_chat_sse(
                     error = %error,
                     "turn failed before SSE stream because model context_window metadata was unavailable"
                 );
-                return Err(crate::TurnFailure {
+                return Err(session_runtime::model_catalog_turn_failure(
                     error,
-                    partial: crate::PartialTurnData {
-                        session_id: p.session_id.map(str::to_string),
-                        ..Default::default()
-                    },
-                });
+                    p.session_id,
+                ));
             }
         }
     }
@@ -526,7 +523,7 @@ pub(crate) async fn stream_chat_sse(
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
-        auth_profile: p.auth_profile,
+        auth_owner: p.auth_owner.clone(),
         model: p.model,
         offering_id: p.offering_id.clone(),
         cli_context: p.cli_context,

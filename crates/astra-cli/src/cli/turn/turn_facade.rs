@@ -10,6 +10,7 @@ use crate::cli::stream::streaming_types::{StreamResult, TurnFailure};
 
 const SESSION_BINDING_CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg(test)]
 async fn cancel_exact_run_until_settled(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -19,19 +20,54 @@ async fn cancel_exact_run_until_settled(
         api,
         token,
         run_id,
-        SESSION_BINDING_CANCEL_DEADLINE,
+        None,
+        tokio::time::Instant::now() + SESSION_BINDING_CANCEL_DEADLINE,
     )
     .await
 }
 
-async fn cancel_exact_run_until_settled_with_deadline(
+/// Resolve the cancellation bearer for one captured owner. `rejected` is
+/// `Some` only for the single reactive refresh after a 401 so the checked
+/// refresh persistence cannot loop. Every wait uses the same absolute deadline.
+/// Owner drift or an unrefreshable source fails closed: never fall back to
+/// another binding, profile, or environment bearer.
+async fn owner_cancel_bearer(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    rejected: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<String, String> {
+    if !owner.is_current() {
+        return Err("captured owner is no longer current".to_string());
+    }
+    let resolved = tokio::time::timeout_at(
+        deadline,
+        crate::cli::session::session_runtime::owner_access_token(api, owner, rejected),
+    )
+    .await
+    .map_err(|_| "bearer resolution timed out".to_string())?;
+    if !owner.is_current() {
+        return Err("captured owner changed during bearer resolution".to_string());
+    }
+    resolved
+        .ok_or_else(|| "captured owner credentials are unavailable or unrefreshable".to_string())
+}
+
+pub(crate) async fn cancel_exact_run_until_settled_with_deadline(
     api: &astra_thin_client::ThinClient,
     token: &str,
     run_id: &str,
-    budget: std::time::Duration,
+    owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + budget;
+    // The captured owner, when present, supplies every bearer for the exact
+    // cancellation request; an inherited transport provider must not replace
+    // it with another binding at dispatch. A `None` owner keeps the original
+    // explicit token and cannot borrow a profile.
+    let api = api.clone().without_bearer_provider();
     let mut last_error = None;
+    // At most one reactive refresh/repost after a 401 across the whole loop.
+    let mut reactive_refresh_used = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -39,10 +75,25 @@ async fn cancel_exact_run_until_settled_with_deadline(
                 .map(|error: String| format!("; last cancellation error: {error}"))
                 .unwrap_or_default();
             return Err(format!(
-                "session identity failure cancellation did not settle run {run_id}{suffix}"
+                "exact-run cancellation did not settle run {run_id}{suffix}"
             ));
         }
-        match tokio::time::timeout(remaining, api.cancel_run(Some(token), run_id)).await {
+        let attempt_token = match owner {
+            Some(owner) => match owner_cancel_bearer(&api, owner, None, deadline).await {
+                Ok(resolved) => resolved,
+                Err(reason) => {
+                    return Err(format!(
+                        "exact-run cancellation for run {run_id} failed closed: {reason}"
+                    ));
+                }
+            },
+            None => token.to_owned(),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("cancellation timed out for run {run_id}"));
+        }
+        match tokio::time::timeout_at(deadline, api.cancel_run(Some(&attempt_token), run_id)).await
+        {
             Ok(Ok(response))
                 if response
                     .get("execution_settled")
@@ -52,19 +103,59 @@ async fn cancel_exact_run_until_settled_with_deadline(
                 return Ok(());
             }
             Ok(Ok(_)) => {
+                // The server accepted the cancellation but execution is not
+                // settled yet; keep polling within the same deadline.
                 last_error = None;
             }
-            Ok(Err(error)) => {
-                // DELETE is the idempotent cancellation operation for one
-                // exact durable run. A transport/5xx failure is not proof that
-                // execution is settled, so keep the lease and retry within the
-                // bounded request settlement window.
-                last_error = Some(error.to_string());
-            }
+            Ok(Err(error)) => match &error {
+                astra_thin_client::ThinClientError::Api { status, .. }
+                    if *status == reqwest::StatusCode::UNAUTHORIZED =>
+                {
+                    let Some(owner) = owner else {
+                        return Err(format!(
+                            "exact-run cancellation for run {run_id} was rejected with 401 and remains unsettled; last error: {error}"
+                        ));
+                    };
+                    if reactive_refresh_used {
+                        return Err(format!(
+                            "exact-run cancellation for run {run_id} was rejected with 401 again after its one refresh and remains unsettled; last error: {error}"
+                        ));
+                    }
+                    reactive_refresh_used = true;
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(format!(
+                            "exact-run cancellation did not settle run {run_id}; last cancellation error: {error}"
+                        ));
+                    }
+                    match owner_cancel_bearer(&api, owner, Some(&attempt_token), deadline).await {
+                        // One repost of the same exact cancellation, within
+                        // the same deadline and run id; nothing else replays.
+                        Ok(_) => {}
+                        Err(reason) => {
+                            return Err(format!(
+                                "exact-run cancellation for run {run_id} failed closed after its one refresh attempt ({reason}); last error: {error}"
+                            ));
+                        }
+                    }
+                }
+                astra_thin_client::ThinClientError::Api { status, .. }
+                    if *status == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    return Err(format!(
+                        "exact-run cancellation for run {run_id} was rejected with 403 and remains unsettled; last error: {error}"
+                    ));
+                }
+                _ => {
+                    // DELETE is the idempotent cancellation operation for one
+                    // exact durable run. A transport/5xx failure is not proof
+                    // that execution is settled, so keep the lease and retry
+                    // within the bounded request settlement window.
+                    last_error = Some(error.to_string());
+                }
+            },
             Err(_) => {
-                return Err(format!(
-                    "session identity failure cancellation timed out for run {run_id}"
-                ));
+                return Err(format!("exact-run cancellation timed out for run {run_id}"));
             }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -92,6 +183,7 @@ fn exact_run_id_from_turn_result(
 async fn settle_request_session_binding_failure(
     api: &astra_thin_client::ThinClient,
     token: &str,
+    auth_owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     request_lease: Option<
         &crate::cli::session::session_execution_lease::RequestSessionExecutionLease,
     >,
@@ -101,6 +193,7 @@ async fn settle_request_session_binding_failure(
     settle_request_session_binding_failure_with_cancel_deadline(
         api,
         token,
+        auth_owner,
         request_lease,
         incremental_state,
         result,
@@ -112,6 +205,7 @@ async fn settle_request_session_binding_failure(
 async fn settle_request_session_binding_failure_with_cancel_deadline(
     api: &astra_thin_client::ThinClient,
     token: &str,
+    auth_owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     request_lease: Option<
         &crate::cli::session::session_execution_lease::RequestSessionExecutionLease,
     >,
@@ -142,9 +236,16 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
     let exact_run_id = exact_run_id_from_turn_result(&result, incremental_state);
     let cancellation_error = match exact_run_id.as_deref() {
         Some(run_id) => {
-            cancel_exact_run_until_settled_with_deadline(api, token, run_id, cancel_deadline)
-                .await
-                .err()
+            let deadline = tokio::time::Instant::now() + cancel_deadline;
+            cancel_exact_run_until_settled_with_deadline(
+                api,
+                token,
+                run_id,
+                auth_owner,
+                deadline,
+            )
+            .await
+            .err()
         }
         None => Some(
             "remote owner cleanup could not cancel the exact run because no authoritative run id was observed"
@@ -296,6 +397,11 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
     mut options: BasicCliTurnOptions,
 ) -> Result<StreamResult, TurnFailure> {
     let mut params = ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager);
+    // Use the single owner snapshot captured when the BasicCliChatContext was
+    // built; every retry and cancellation re-entry of this submitted turn
+    // shares that one immutable captured owner. Never recapture a later login.
+    let auth_owner = ctx.auth_owner.clone();
+    params.auth_owner = auth_owner.clone();
     params.pre_loaded_messages = options.pre_loaded_messages;
     params.deferred_tool_activations = Some(&mut options.deferred_tool_activations);
     params.append_system_prompt = options.append_system_prompt;
@@ -310,6 +416,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
     settle_request_session_binding_failure(
         ctx.api,
         token,
+        auth_owner.as_ref(),
         options.request_session_execution_lease.as_deref(),
         options.incremental_state.as_deref(),
         stream_chat_sse(params).await,
@@ -325,8 +432,155 @@ mod tests {
         settle_request_session_binding_failure_with_cancel_deadline,
     };
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn captured_owner_cancel_refreshes_once_and_requires_execution_settlement() {
+        use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+        use crate::cli::session::session_runtime::capture_admitted_auth_owner;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("cancel-owner"),
+        )
+        .unwrap();
+        for (second_status, settles, refresh_delay, cancel_delay, budget) in [
+            (200, true, 0, 0, 1000),
+            (401, false, 0, 0, 1000),
+            (403, false, 0, 0, 1000),
+            // A terminal status alone does not release execution ownership.
+            (200, false, 0, 0, 80),
+            // Credential resolution and HTTP share one absolute deadline.
+            (200, true, 240, 400, 400),
+        ] {
+            // The slow case must refresh before the first DELETE. A 401
+            // refresh followed by a new loop iteration would recompute the
+            // budget and miss the stale-duration regression.
+            let admitted_token = if refresh_delay > 0 {
+                "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature"
+            } else {
+                "old-cancel"
+            };
+            let mut creds = CredentialsFile::default();
+            creds.profiles.insert(
+                "default".into(),
+                Profile {
+                    account_id: Some("cancel-owner".into()),
+                    access_token: Some(admitted_token.into()),
+                    refresh_token: Some("old-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            save_credentials(&creds).unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/exact-owner-run"))
+                .and(header("authorization", format!("Bearer {admitted_token}")))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(if refresh_delay > 0 { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            Mock::given(method("POST")).and(path("/auth/refresh"))
+                .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(refresh_delay))
+                    .set_body_json(serde_json::json!({"user_id":"cancel-owner", "access_token":"new-cancel", "refresh_token":"new-refresh"})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/exact-owner-run"))
+                .and(header("authorization", "Bearer new-cancel"))
+                .respond_with(
+                    ResponseTemplate::new(second_status)
+                        .set_delay(std::time::Duration::from_millis(cancel_delay))
+                        .set_body_json(
+                            serde_json::json!({"status":"cancelled", "execution_settled":settles}),
+                        ),
+                )
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let owner = capture_admitted_auth_owner(&api, None, admitted_token)
+                .await
+                .unwrap();
+            let start = tokio::time::Instant::now();
+            let result = super::cancel_exact_run_until_settled_with_deadline(
+                &api,
+                admitted_token,
+                "exact-owner-run",
+                Some(&owner),
+                start + std::time::Duration::from_millis(budget),
+            )
+            .await;
+            assert_eq!(result.is_ok(), settles && cancel_delay == 0);
+            if cancel_delay > 0 {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_millis(550),
+                    "refresh must not restart the cancellation deadline"
+                );
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                requests.iter().all(|r| r.url.path() == "/auth/refresh"
+                    || r.url.path() == "/chat/runs/exact-owner-run")
+            );
+            if second_status == 401 || second_status == 403 {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| r.method.as_str() == "DELETE")
+                        .count(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn captured_owner_cannot_adopt_an_unknown_same_account_login_for_cancel() {
+        use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("cancel-owner"),
+        )
+        .unwrap();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("cancel-owner".into()),
+                access_token: Some("original".into()),
+                refresh_token: Some("original-refresh".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api, None, "original",
+        )
+        .await
+        .unwrap();
+        creds.profiles.get_mut("default").unwrap().access_token = Some("replacement".into());
+        save_credentials(&creds).unwrap();
+        let result = super::cancel_exact_run_until_settled_with_deadline(
+            &api,
+            "original",
+            "never-rebind",
+            Some(&owner),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
     #[tokio::test]
     async fn binding_cleanup_failure_preserves_cumulative_stream_telemetry() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let first = format!("telemetry-bind-first-{}", uuid::Uuid::new_v4());
         let second = format!("telemetry-bind-second-{}", uuid::Uuid::new_v4());
@@ -350,6 +604,7 @@ mod tests {
         let failure = settle_request_session_binding_failure(
             &api,
             "token",
+            None,
             Some(holder.as_ref()),
             None,
             Ok(result),
@@ -386,6 +641,7 @@ mod tests {
         let settled = settle_request_session_binding_failure(
             &api,
             "token",
+            None,
             None,
             None,
             Err(crate::cli::stream::streaming_types::TurnFailure {
@@ -435,6 +691,7 @@ mod tests {
         let unsettled = settle_request_session_binding_failure_with_cancel_deadline(
             &api,
             "token",
+            None,
             None,
             None,
             Err(crate::cli::stream::streaming_types::TurnFailure {
@@ -495,6 +752,7 @@ mod tests {
         let failure = settle_request_session_binding_failure(
             &api,
             "token",
+            None,
             Some(holder.as_ref()),
             None,
             Err(crate::cli::stream::streaming_types::TurnFailure {
@@ -554,6 +812,7 @@ mod tests {
             "token",
             None,
             None,
+            None,
             Err(crate::cli::stream::streaming_types::TurnFailure {
                 error: "stdout output transport closed by its consumer".to_string(),
                 partial: crate::PartialTurnData {
@@ -610,8 +869,10 @@ mod tests {
         assert!(!is_settled_stdout_closure(&concurrent_hard_error));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn binding_failure_cancels_the_exact_run_and_reports_settled_failure() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -639,6 +900,7 @@ mod tests {
         let settled = settle_request_session_binding_failure(
             &api,
             "token",
+            None,
             Some(holder.as_ref()),
             None,
             Err(crate::cli::stream::streaming_types::TurnFailure {
@@ -659,8 +921,10 @@ mod tests {
         assert_eq!(settled.partial.remote_cancel_run_id, None);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn cancel_transport_failure_preserves_unsettled_remote_owner_and_session_lease() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -684,6 +948,7 @@ mod tests {
         let unsettled = settle_request_session_binding_failure_with_cancel_deadline(
             &api,
             "token",
+            None,
             Some(holder.as_ref()),
             None,
             Err(crate::cli::stream::streaming_types::TurnFailure {
@@ -711,36 +976,46 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn exact_cancel_retries_transient_failure_until_settled_while_lease_is_held() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         #[derive(Clone)]
-        struct SettleOnSecondCall(std::sync::Arc<AtomicUsize>);
+        struct SettleWhenAllowed {
+            calls: std::sync::Arc<AtomicUsize>,
+            allow_settlement: std::sync::Arc<AtomicBool>,
+        }
 
-        impl Respond for SettleOnSecondCall {
+        impl Respond for SettleWhenAllowed {
             fn respond(&self, _request: &Request) -> ResponseTemplate {
-                let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if call == 1 {
                     return ResponseTemplate::new(503);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "run_id": "run-session-binding",
-                    "execution_settled": true,
+                    "execution_settled": self.allow_settlement.load(Ordering::SeqCst),
                 }))
             }
         }
 
         let server = MockServer::start().await;
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        // Hold the execution-settlement fact until the assertion, rather than
+        // relying on a 100ms scheduling window under parallel test load.
+        let allow_settlement = std::sync::Arc::new(AtomicBool::new(false));
         Mock::given(method("DELETE"))
             .and(path("/chat/runs/run-session-binding"))
             .and(header("authorization", "Bearer token"))
-            .respond_with(SettleOnSecondCall(calls.clone()))
-            .expect(2)
+            .respond_with(SettleWhenAllowed {
+                calls: calls.clone(),
+                allow_settlement: allow_settlement.clone(),
+            })
+            .expect(2..)
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -763,6 +1038,7 @@ mod tests {
                 .is_err(),
             "the session lease must remain held throughout cancel-and-settle"
         );
+        allow_settlement.store(true, Ordering::SeqCst);
         task.await.unwrap().unwrap();
         astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
             .expect("settled request releases its lease");

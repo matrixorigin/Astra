@@ -228,7 +228,6 @@ async fn callback_through_pipeline(
         progress_emitter: None,
         pre_resolved_results: &[],
         runtime_tool_executor: None,
-        external_effect_recovery_paths: None,
         turn_start: None,
         llm_round: 0,
         plan_mode_active: false,

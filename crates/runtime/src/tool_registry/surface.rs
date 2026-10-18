@@ -385,13 +385,6 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "mode",
                 "timeout",
                 "force",
-                // This optional observation contract is part of Bash's
-                // stable resident shape. Adding it only while a terminal
-                // obligation is pending changes the provider tool prefix
-                // when that obligation settles and breaks prompt-cache
-                // continuity. Runtime admission still validates the field
-                // independently of this presentation contract.
-                "external_state_paths",
                 // These fields are present only on the CLI edge projection.
                 // The shared/server Bash schema does not declare them, so
                 // retaining them here cannot widen a foreground executor.
@@ -399,7 +392,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "ready_check",
                 "background_ttl",
             ][..],
-            "Omit mode for inspection. External mutations only: external_state_paths=minimal absolute roots; evidence needs owned foreground delta.",
+            "Omit mode for inspection; verify adds an explicit unchanged-workspace proof.",
         ),
         "str_replace" => (
             &[
@@ -640,7 +633,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         "description".to_string(),
         Value::String(if managed_background {
             format!(
-                "{description} For services that must survive this call, set run_in_background with an independent ready_check; neither supplies the foreground delta. Select the full contract with tool_search for artifact preservation."
+                "{description} For services that must survive this call, set run_in_background with an independent ready_check; readiness is independent of command completion. Select the full contract with tool_search for artifact preservation."
             )
         } else {
             description

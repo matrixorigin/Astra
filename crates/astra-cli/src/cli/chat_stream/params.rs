@@ -511,8 +511,8 @@ use crate::cli::cli_config::cli_context::CliContext;
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
-    /// Credential profile used for in-turn auth refresh when edge result posts hit 401.
-    pub(crate) auth_profile: Option<&'a str>,
+    /// Optional CLI owner snapshot used for in-turn auth refresh owner identity.
+    pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub(crate) message: &'a str,
     /// Raw user intent captured before CLI prompt wrapping/runtime scaffolding.
     /// Runtime decision judges read this, not the prompt-facing `message`.
@@ -706,7 +706,10 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Connected CLI MCP providers must survive the basic-turn adapter.
     pub mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     pub api: &'a astra_thin_client::ThinClient,
-    pub auth_profile: Option<&'a str>,
+    /// Frozen owner captured once per basic CLI invocation. All retries and
+    /// cancellation re-entries of the submitted turn share this single
+    /// immutable snapshot; never recapture a later login mid-turn.
+    pub auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub message: &'a str,
     pub offering_id: Option<&'a str>,
     pub model: Option<&'a str>,
@@ -761,7 +764,7 @@ impl<'a> ChatTurnParams<'a> {
         ChatTurnParams {
             api: ctx.api,
             token,
-            auth_profile: ctx.auth_profile,
+            auth_owner: ctx.auth_owner.clone(),
             message: ctx.message,
             user_intent: ctx.message,
             input_runtime_required_texts: &[],

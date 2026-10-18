@@ -814,9 +814,18 @@ pub(crate) async fn resolve_server_model_selection(
     token: &str,
     model: &str,
     purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
-) -> Result<ServerModelSelection, String> {
-    let (catalog, _) = load_server_model_catalog(api, token, purpose).await?;
-    resolve_server_model_selection_from_catalog(model, &catalog)
+) -> Result<ServerModelSelection, astra_core::ClassifiedError> {
+    let (catalog, _) = fetch_server_model_catalog(api, Some(token), purpose)
+        .await
+        .map_err(|error| match error {
+            ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status, ..
+            }) => model_catalog_http_error(status),
+            other => astra_core::ClassifiedError::from(other.to_string()),
+        })?;
+    resolve_server_model_selection_from_catalog(model, &catalog).map_err(|error| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+    })
 }
 
 /// Resolve an explicit selector against the complete authoritative catalog.
@@ -1264,7 +1273,68 @@ fn active_env_access_token(now_epoch: i64) -> Option<String> {
 /// reimplement expiry or precedence rules and accidentally replace it with a
 /// profile credential.
 pub(crate) fn uses_environment_access_token(token: &str) -> bool {
-    active_env_access_token(chrono::Utc::now().timestamp()).as_deref() == Some(token)
+    // Provenance only: a bearer selected from ASTRA_ACCESS_TOKEN keeps that
+    // classification even after it expires. Compare the raw nonempty
+    // environment bearer instead of re-deriving expiry/precedence; never log
+    // or expose the compared token.
+    match std::env::var("ASTRA_ACCESS_TOKEN") {
+        Ok(env_token) if !env_token.is_empty() => env_token == token,
+        _ => false,
+    }
+}
+
+/// Pre-admission capture of the owner that admitted a bearer. Environment
+/// bearers carry no legacy refresh authority; an explicit profile must match
+/// the installed owner; the owner must be account/source-bound; and the
+/// supplied token must actually belong to the captured owner's binding. A
+/// changed or unbound source yields `None` rather than borrowing another
+/// login, and a matching account label alone never confers ownership.
+/// Ownership is rechecked with `is_current` after the async validation.
+/// Refresh itself remains `owner_access_token`, unchanged.
+pub(crate) async fn capture_admitted_auth_owner(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+) -> Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot> {
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    if uses_environment_access_token(token) {
+        return None;
+    }
+    if let Some(profile) = profile
+        && owner.profile_name.as_deref() != Some(profile)
+    {
+        return None;
+    }
+    let _account = owner
+        .server_account_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())?;
+    if !owner.is_current() {
+        return None;
+    }
+    if let Some(binding) = &owner.native_binding {
+        if binding.endpoint().trim_end_matches('/') != api.api_origin().trim_end_matches('/') {
+            return None;
+        }
+        let snapshot = binding.snapshot_off_runtime().await.ok()?;
+        if snapshot.refresh_pending || snapshot.access_token != token {
+            return None;
+        }
+    } else {
+        let profile_name = owner.profile_name.as_deref()?;
+        owner.legacy_binding.as_ref()?;
+        // Verify the supplied admitted bearer actually belongs to this
+        // captured owner's binding; never infer ownership from the profile
+        // name alone.
+        let bound_token = owner.access_token().await?;
+        if profile_name.is_empty() || bound_token != token {
+            return None;
+        }
+    }
+    if !owner.is_current() {
+        return None;
+    }
+    Some(owner)
 }
 
 pub(crate) async fn fresh_access_token(
@@ -2840,7 +2910,10 @@ mod tests {
         )
         .await
         .expect_err("a missing Offering must fail closed");
-        assert!(error.contains("authoritative catalog"), "{error}");
+        assert!(
+            error.to_string().contains("authoritative catalog"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -4818,5 +4891,121 @@ mod tests {
         // TMPDIR may be inside the checkout: stop Git's ancestor discovery.
         std::fs::write(dir.path().join(".git"), "gitdir: absent-repository\n").unwrap();
         assert!(git_root_from(dir.path()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod admitted_owner_tests {
+    use super::capture_admitted_auth_owner;
+    use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile, save_credentials};
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn admitted_owner_requires_the_selected_bearer_and_never_borrows_for_env() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("selected".into()),
+                refresh_token: Some("refresh".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        assert!(
+            capture_admitted_auth_owner(&api, None, "selected")
+                .await
+                .is_some()
+        );
+        assert!(
+            capture_admitted_auth_owner(&api, Some("default"), "selected")
+                .await
+                .is_some()
+        );
+        assert!(
+            capture_admitted_auth_owner(&api, Some("other"), "selected")
+                .await
+                .is_none()
+        );
+        assert!(
+            capture_admitted_auth_owner(&api, None, "unknown")
+                .await
+                .is_none()
+        );
+        // Even an expired environment bearer equal to a saved token must not
+        // acquire refresh authority from the saved profile.
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("ASTRA_ACCESS_TOKEN", value),
+                        None => std::env::remove_var("ASTRA_ACCESS_TOKEN"),
+                    }
+                }
+            }
+        }
+        let _env = RestoreEnv(std::env::var_os("ASTRA_ACCESS_TOKEN"));
+        let expired = "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature";
+        creds.profiles.get_mut("default").unwrap().access_token = Some(expired.into());
+        save_credentials(&creds).unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", expired);
+        }
+        assert!(
+            capture_admitted_auth_owner(&api, None, expired)
+                .await
+                .is_none()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn native_admission_capture_is_read_only_even_inside_refresh_skew() {
+        let _credentials = crate::tests::isolate_credentials();
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("native"));
+        let server = wiremock::MockServer::start().await;
+        let mut session = crate::cli::native_auth::test_session();
+        session.environment.astra_url = server.uri();
+        session.expires_at = astra_credentials::native::unix_now().unwrap() + 10;
+        let (session, _) = store.publish(session).unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, session.clone());
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        let _identity = cli_utils::install_cli_profile_identity_for_test(
+            &binding.profile_name(),
+            Some(&session.astra_user_id),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        assert!(
+            capture_admitted_auth_owner(&api, None, &session.access_token)
+                .await
+                .is_some()
+        );
+        assert!(
+            capture_admitted_auth_owner(&api, None, "unknown")
+                .await
+                .is_none()
+        );
+        let wrong_endpoint =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        assert!(
+            capture_admitted_auth_owner(&wrong_endpoint, None, &session.access_token)
+                .await
+                .is_none()
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "capture cannot rotate a token or probe another identity"
+        );
     }
 }

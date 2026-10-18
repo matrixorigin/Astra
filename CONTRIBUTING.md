@@ -90,6 +90,10 @@ contract and its tests live in [`scripts/ci/`](scripts/ci/).
 The frozen MOI consumer compatibility test runs independently of this routing
 on every Test Suite run. The required online core aggregate also requires that
 fresh-database journey to pass; see the testing guide for its exact scope.
+The Terminal-Bench fresh-database contract derives admission gate names and
+cardinality from the source-owned partition count and scope formatter. It
+requires the exact ordered gate inventory; missing, duplicate, legacy or
+unknown rows and unsupported source declarations fail closed.
 
 CLI tests build and run their complete inventory once, after building the
 standalone mock MCP server. Five protected check labels require that same
@@ -103,6 +107,10 @@ workflow. Trusting a fork also trusts its code writers; see the
 JUnit timings are retained on success and failure to assess total CI
 cost. Rerunning a failed CLI execution repeats the combined build/test job;
 there is no archived-test fallback or artifact-expiry dependency.
+The three ignored production-supervisor smokes use one additional nextest
+invocation, with exact names and separate serial test processes. They use the
+strict profile without retries, preserving the complete inventory's CI JUnit
+file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane also runs the CLI Bash regression
 using its existing default-feature test executable. Tools lint and serial
 workspace-coordination tests remain parallel; the protected coordination check

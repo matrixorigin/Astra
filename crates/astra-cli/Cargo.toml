@@ -108,6 +108,7 @@ fs2 = "0.4"
 shell-words = "1.1.1"
 
 [dev-dependencies]
+rsa = "0.9"
 globset = "0.4"
 astra-runtime = { workspace = true, features = ["e2e-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }

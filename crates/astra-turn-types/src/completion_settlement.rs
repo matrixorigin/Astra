@@ -30,15 +30,6 @@ pub struct CompletionSettlementState {
     /// the latter guides exploration while this field protects the terminal
     /// completion boundary.
     pub workspace_mutation_retries: u32,
-    /// Number of bounded retries after an external or mixed mutation contract
-    /// attempted to finish without an executor-owned external delta receipt.
-    pub external_effect_retries: u32,
-    /// Structured external observation scope carried across the bounded
-    /// recovery boundary.  A model may split observation and mutation across
-    /// two calls; the executor-owned scope is the only authority allowed to
-    /// bridge those calls, never command text or assistant prose.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub external_effect_recovery_paths: Option<Vec<String>>,
     /// Number of bounded same-turn retries after the final successful
     /// workspace mutation had no later successful observation.  A mutation is
     /// progress, but it is not evidence that the resulting workspace is
@@ -150,8 +141,6 @@ pub struct ForegroundFanoutPagination {
 pub enum CompletionAction {
     #[serde(rename = "required_workspace_mutation")]
     RequiredWorkspaceMutation,
-    #[serde(rename = "required_external_effect")]
-    RequiredExternalEffect,
     /// Spend one terminal boundary on a task-facing tool action when the
     /// structured workspace intent is unknown or merely permits mutation.
     /// Ordinary admission and safety policy still own executable authority;
@@ -227,8 +216,6 @@ mod tests {
             output_cap_continuations: 1,
             textless_response_retries: 1,
             workspace_mutation_retries: 3,
-            external_effect_retries: 4,
-            external_effect_recovery_paths: Some(vec!["artifact".into()]),
             post_mutation_observation_retries: 5,
             post_mutation_observation_failed_action_retries: 6,
             post_mutation_repair_retries: 7,
