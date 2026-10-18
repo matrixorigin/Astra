@@ -757,6 +757,11 @@ async fn assert_one_shot_sigint(
     let model_counter = models.clone();
     let app = axum::Router::new()
         .route("/agents/edge", post(|| async { axum::Json(serde_json::json!({"ok": true})) }))
+        // Hosts with native capacity create the same provisional session
+        // before model admission; hosts without it bind from session_info.
+        .route("/sessions", post(|| async { axum::Json(serde_json::json!({
+            "session_id": "sigint-session"
+        })) }))
         .route("/skills", get(|| async { axum::Json(serde_json::json!({
             "skills": [], "total": 0, "limit": 100, "next_cursor": null
         })) }))
@@ -774,7 +779,7 @@ async fn assert_one_shot_sigint(
                 chats.fetch_add(1, Ordering::SeqCst);
                 let stream = futures_util::stream::once(async move {
                     Ok::<Bytes, Infallible>(Bytes::from(if identity {
-                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\n"
+                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\ndata: {\"type\":\"warning\",\"message\":\"sigint-partial-ready\"}\n\n"
                     } else {
                         ": held before authoritative admission identity\n\n"
                     }))
@@ -835,16 +840,18 @@ async fn assert_one_shot_sigint(
     if wall {
         command.args(["--max-wall-time-seconds", "120"]);
     }
-    let child = command.spawn().unwrap();
+    let mut child = command.spawn().unwrap();
     let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let readiness = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             let ready = if setup {
                 models.load(Ordering::SeqCst) > 0
             } else if identity {
+                // Quiet mode defers token projection. The ordered warning
+                // receipt proves the preceding partial text was consumed.
                 std::fs::read_to_string(&events)
                     .unwrap_or_default()
-                    .contains("observed partial")
+                    .contains("sigint-partial-ready")
             } else {
                 chats.load(Ordering::SeqCst) > 0
             };
@@ -854,8 +861,23 @@ async fn assert_one_shot_sigint(
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("CLI must reach held stream");
+    .await;
+    if readiness.is_err() {
+        let _ = child.kill().await;
+        let output = child.wait_with_output().await.unwrap();
+        let excerpt = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+        };
+        panic!(
+            "CLI did not reach held stream; status={}; stdout={}; stderr={}",
+            output.status,
+            excerpt(&output.stdout),
+            excerpt(&output.stderr)
+        );
+    }
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
     if second {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
