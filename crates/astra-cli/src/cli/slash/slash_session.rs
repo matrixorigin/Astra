@@ -2333,7 +2333,11 @@ mod resume_tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-journal-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-        std::fs::create_dir_all(session_journal::journal_file_path(&session_id)).unwrap();
+        let journal_path = session_journal::journal_file_path(&session_id);
+        std::fs::create_dir_all(&journal_path).unwrap();
+        let read_error = std::fs::read(&journal_path)
+            .expect_err("a directory is not a readable journal")
+            .to_string();
 
         let restored = RestoredSession {
             session_id: session_id.clone(),
@@ -2344,12 +2348,32 @@ mod resume_tests {
             ..Default::default()
         };
         let mut state = SessionState::default();
+        state.set_session_id("existing-session");
+        state.turn = 7;
+        state.history = vec![("old".into(), "state".into())];
+        let active = astra_turn_core::active_conversation::ActiveConversation::empty(
+            "existing-owner",
+            "existing-session",
+        )
+        .unwrap();
+        let cursor = active.cursor().clone();
+        state.active_conversation = Some(active);
         let error = apply_restored_session(None, &api, &mut state, restored)
             .await
             .expect_err("unreadable local journal should abort restore");
 
-        assert!(error.contains("failed to read session journal"), "{error}");
+        assert_eq!(
+            error,
+            format!("cannot verify local continuation privacy boundary: {read_error}")
+        );
         assert!(!error.contains("not found or not owned"), "{error}");
+        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
+        assert_eq!(state.turn, 7);
+        assert_eq!(state.history, vec![("old".into(), "state".into())]);
+        assert_eq!(
+            state.active_conversation.as_ref().unwrap().cursor(),
+            &cursor
+        );
     }
     #[tokio::test]
     async fn apply_restored_session_keeps_local_canonical_generation_when_step_checkpoint_is_invalid()
