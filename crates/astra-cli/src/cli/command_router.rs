@@ -65,6 +65,15 @@ const WALL_DEADLINE_TERMINAL_RESERVE: std::time::Duration = std::time::Duration:
 /// the Server never receives a rounded-up execution slice.
 const WALL_BUDGET_REQUEST_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+async fn settle_one_shot_native_delivery(
+    shutdown: impl std::future::Future<Output = ()>,
+    terminal_deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    tokio::time::timeout_at(terminal_deadline, shutdown)
+        .await
+        .map_err(|_| "user_interrupted; native delivery shutdown did not settle".to_string())
+}
+
 async fn settle_one_shot_stream_event_writer(
     writer: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     terminal_deadline: Option<tokio::time::Instant>,
@@ -2555,10 +2564,15 @@ async fn execute_cli_command_impl(
                                 .map(|state| state.snapshot())
                                 .unwrap_or_default();
                             async {
-                                let run_id = snapshot.run_id.clone().ok_or_else(|| crate::TurnFailure {
-                                    error: "request interrupted before an authoritative run id was observed; remote execution settlement is unverified".to_string(),
-                                    partial: Default::default(),
-                                })?;
+                                let interrupted_failure = |reason: &str| {
+                                    crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        reason,
+                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    )
+                                };
+                                let Some(run_id) = snapshot.run_id.clone() else {
+                                    return interrupted_failure("request interrupted before an authoritative run id was observed; remote execution settlement is unverified");
+                                };
                                 let terminal = terminal_deadline.expect("interrupt establishes terminal deadline");
                                 let terminal_settle_deadline = terminal
                                     .checked_sub(WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN)
@@ -2567,13 +2581,12 @@ async fn execute_cli_command_impl(
                                 let cancel = crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
                                     api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
                                 );
-                                tokio::select! {
+                                if let Err(error) = tokio::select! {
                                     result = cancel => result,
                                     _ = tokio::signal::ctrl_c() => Err("user_interrupted (second Ctrl+C); remote execution settlement is unverified".to_string()),
-                                }.map_err(|error| crate::TurnFailure {
-                                    error,
-                                    partial: Default::default(),
-                                })?;
+                                } {
+                                    return interrupted_failure(&error);
+                                }
                                 request_session_execution_lease.mark_remote_execution_settled();
                                 wall_deadline_server_terminal_settled = true;
                                 let drain_budget = terminal
@@ -2597,56 +2610,51 @@ async fn execute_cli_command_impl(
                                             Err(failure) => Err(failure),
                                         }
                                     }
-                                    None => Err(crate::TurnFailure {
-                                        error: format!("request interruption root drain did not settle for run {run_id}"),
-                                        partial: Default::default(),
-                                    }),
+                                    None => interrupted_failure(&format!("request interruption root drain did not settle for run {run_id}")),
                                 }
                             }.await
                         }
                         result = &mut turn_future => result,
                 }
             };
-            let mut turn_result = if (user_interrupted || wall_deadline_reached)
-                && !wall_deadline_root_settled
-            {
-                if !wall_deadline_server_terminal_settled {
-                    request_session_execution_lease.retain_unsettled_owner_until_process_exit();
-                }
-                let reason = turn_result
-                    .err()
-                    .map(|failure| failure.error)
-                    .unwrap_or_else(|| "request interrupted without root settlement".to_string());
-                crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
-                    &reason,
-                    wall_deadline_incremental_state
-                        .as_ref()
-                        .expect("one-shot state")
-                        .clone(),
-                )
-            } else {
-                turn_result
-            };
+            // An additional cleanup failure is a negative veto, independent
+            // of the original error class and exact Server cancellation proof.
+            let mut interruption_cleanup_settled = true;
+            let mut turn_result =
+                if (user_interrupted || wall_deadline_reached) && !wall_deadline_root_settled {
+                    if !wall_deadline_server_terminal_settled {
+                        request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                    }
+                    apply_one_shot_cleanup_result(
+                        turn_result,
+                        Err("request interrupted without root execution settlement".to_string()),
+                        wall_deadline_incremental_state
+                            .as_ref()
+                            .expect("one-shot state"),
+                        &mut interruption_cleanup_settled,
+                    )
+                } else {
+                    turn_result
+                };
 
             if let Some(handle) = native_delivery.take() {
                 if user_interrupted {
-                    if tokio::time::timeout_at(
-                        terminal_deadline.expect("interrupt establishes terminal deadline"),
+                    let shutdown = settle_one_shot_native_delivery(
                         handle.shutdown(),
+                        terminal_deadline.expect("interrupt establishes terminal deadline"),
                     )
-                    .await
-                    .is_err()
-                    {
+                    .await;
+                    if shutdown.is_err() {
                         request_session_execution_lease.retain_unsettled_owner_until_process_exit();
-                        turn_result =
-                            crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
-                                "user_interrupted; native delivery shutdown did not settle",
-                                wall_deadline_incremental_state
-                                    .as_ref()
-                                    .expect("one-shot state")
-                                    .clone(),
-                            );
                     }
+                    turn_result = apply_one_shot_cleanup_result(
+                        turn_result,
+                        shutdown,
+                        wall_deadline_incremental_state
+                            .as_ref()
+                            .expect("one-shot state"),
+                        &mut interruption_cleanup_settled,
+                    );
                 } else {
                     handle.shutdown().await;
                 }
@@ -2654,18 +2662,18 @@ async fn execute_cli_command_impl(
 
             // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);
-            if let Err(error) =
-                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await
-            {
-                if !user_interrupted {
-                    return Err(error);
-                }
-                turn_result = crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
-                    &error,
+            let writer_settlement =
+                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await;
+            if !user_interrupted {
+                writer_settlement?;
+            } else {
+                turn_result = apply_one_shot_cleanup_result(
+                    turn_result,
+                    writer_settlement,
                     wall_deadline_incremental_state
                         .as_ref()
-                        .expect("one-shot state")
-                        .clone(),
+                        .expect("one-shot state"),
+                    &mut interruption_cleanup_settled,
                 );
             }
 
@@ -2676,7 +2684,8 @@ async fn execute_cli_command_impl(
                     turn_result,
                     executor_observer.get().map(|executor| executor.as_ref()),
                     native_executor.as_deref(),
-                    wall_deadline_root_settled
+                    interruption_cleanup_settled
+                        && wall_deadline_root_settled
                         && wall_deadline_server_terminal_settled
                         && request_session_execution_lease.failure().is_none(),
                     wall_deadline_incremental_state
@@ -2691,6 +2700,7 @@ async fn execute_cli_command_impl(
                     if one_shot_stdout_closure_is_settled(
                         &e,
                         user_interrupted,
+                        interruption_cleanup_settled,
                         executor_observer.get().map(|executor| executor.as_ref()),
                         native_executor.as_deref(),
                     ) =>
@@ -2698,9 +2708,11 @@ async fn execute_cli_command_impl(
                     return Ok(ExitCode::Success);
                 }
                 Err(e) => {
-                    if !user_interrupted
-                        && let Some(mut sr) = stream_result_from_resumable_turn_failure(&e)
-                    {
+                    if let Some(mut sr) = one_shot_resumable_turn_failure(
+                        &e,
+                        user_interrupted,
+                        interruption_cleanup_settled,
+                    ) {
                         let exit_code = finalize_one_shot_stream_result_with_request_lease(
                             profile.as_deref(),
                             effective_model.as_deref(),
@@ -3374,14 +3386,100 @@ fn one_shot_local_ownership_unsettled(
     })
 }
 
+fn one_shot_resumable_turn_failure(
+    failure: &crate::TurnFailure,
+    user_interrupted: bool,
+    cleanup_settled: bool,
+) -> Option<StreamResult> {
+    if user_interrupted || !cleanup_settled {
+        return None;
+    }
+    stream_result_from_resumable_turn_failure(failure)
+}
+
 pub(crate) fn one_shot_stdout_closure_is_settled(
     failure: &crate::TurnFailure,
     user_interrupted: bool,
+    cleanup_settled: bool,
     executor: Option<&crate::edge_tools::ToolExecutor>,
     native_executor: Option<&crate::edge_tools::ToolExecutor>,
 ) -> bool {
-    crate::cli::turn::turn_facade::is_settled_stdout_closure(failure)
+    cleanup_settled
+        && crate::cli::turn::turn_facade::is_settled_stdout_closure(failure)
         && (!user_interrupted || !one_shot_local_ownership_unsettled(executor, native_executor))
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_one_shot_cleanup_result(
+    result: Result<StreamResult, crate::TurnFailure>,
+    cleanup: Result<(), String>,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+    cleanup_settled: &mut bool,
+) -> Result<StreamResult, crate::TurnFailure> {
+    match cleanup {
+        Ok(()) => result,
+        Err(reason) => {
+            *cleanup_settled = false;
+            retain_one_shot_interruption_failure(result, &reason, incremental_state)
+        }
+    }
+}
+
+/// Preserve an existing failure and all of its typed evidence. Cleanup causes
+/// are additive; only a result without a failure needs a new failure envelope.
+#[allow(clippy::result_large_err)]
+fn retain_one_shot_interruption_failure(
+    result: Result<StreamResult, crate::TurnFailure>,
+    reason: &str,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) -> Result<StreamResult, crate::TurnFailure> {
+    let had_failure = result.is_err();
+    let mut failure = match result {
+        Err(failure) => failure,
+        Ok(sr) => {
+            let tool_outcomes = sr.canonical_tool_outcomes();
+            crate::TurnFailure {
+                error: reason.to_string(),
+                partial: crate::PartialTurnData {
+                    qualified_usage: sr.qualified_usage,
+                    session_id: sr.session_id,
+                    run_id: sr.run_id,
+                    partial_text: sr.full_text,
+                    prompt_tokens: sr.prompt_tokens,
+                    completion_tokens: sr.completion_tokens,
+                    cache_read_tokens: sr.cache_read_tokens,
+                    cache_creation_tokens: sr.cache_creation_tokens,
+                    usage_attribution: sr.usage_attribution,
+                    tool_calls_count: sr.tool_calls_count,
+                    tool_call_records: sr.tool_call_records,
+                    tools_used: sr.tools_used,
+                    stall_events: sr.stall_events,
+                    verdict_events: sr.verdict_events,
+                    last_heavy_checkpoint: sr.last_heavy_checkpoint,
+                    llm_rounds: sr.llm_rounds,
+                    token_usage_coverage: sr.token_usage_coverage,
+                    tool_outcomes,
+                    applied_user_intents: sr.applied_user_intents,
+                    run_transcript_messages: sr.run_transcript_messages,
+                    interruption: sr.interruption,
+                    ..Default::default()
+                },
+            }
+        }
+    };
+    // A cancelled physical stream can return before terminal ingestion
+    // populates final_text. Retain its already-observed request prefix as
+    // evidence only; the interruption still requires a hard failure.
+    if failure.partial.partial_text.is_empty() {
+        failure.partial.partial_text = incremental_state.snapshot().partial_text;
+    }
+    if had_failure {
+        if !failure.error.is_empty() {
+            failure.error.push_str("; ");
+        }
+        failure.error.push_str(reason);
+    }
+    Err(failure)
 }
 
 /// Called only after native delivery shutdown; a settled Server run cannot
@@ -3396,49 +3494,11 @@ pub(crate) fn settle_one_shot_user_interrupt_result(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let local_unsettled = one_shot_local_ownership_unsettled(executor, native_executor);
     if local_unsettled {
-        let mut failure = match result {
-            Err(failure) => failure,
-            Ok(sr) => {
-                let tool_outcomes = sr.canonical_tool_outcomes();
-                crate::TurnFailure {
-                    error: "user_interrupted".to_string(),
-                    partial: crate::PartialTurnData {
-                        qualified_usage: sr.qualified_usage,
-                        session_id: sr.session_id,
-                        run_id: sr.run_id,
-                        partial_text: sr.full_text,
-                        prompt_tokens: sr.prompt_tokens,
-                        completion_tokens: sr.completion_tokens,
-                        cache_read_tokens: sr.cache_read_tokens,
-                        cache_creation_tokens: sr.cache_creation_tokens,
-                        usage_attribution: sr.usage_attribution,
-                        tool_calls_count: sr.tool_calls_count,
-                        tool_call_records: sr.tool_call_records,
-                        tools_used: sr.tools_used,
-                        stall_events: sr.stall_events,
-                        verdict_events: sr.verdict_events,
-                        last_heavy_checkpoint: sr.last_heavy_checkpoint,
-                        llm_rounds: sr.llm_rounds,
-                        token_usage_coverage: sr.token_usage_coverage,
-                        tool_outcomes,
-                        applied_user_intents: sr.applied_user_intents,
-                        run_transcript_messages: sr.run_transcript_messages,
-                        interruption: sr.interruption,
-                        ..Default::default()
-                    },
-                }
-            }
-        };
-        // A cancelled physical stream can return before terminal ingestion
-        // populates final_text. Retain its already-observed request prefix as
-        // evidence only; the local fence still requires a hard failure.
-        if failure.partial.partial_text.is_empty() {
-            failure.partial.partial_text = incremental_state.snapshot().partial_text;
-        }
-        failure
-            .error
-            .push_str("; workspace_ownership_unsettled; local execution settlement is unverified");
-        return Err(failure);
+        return retain_one_shot_interruption_failure(
+            result,
+            "workspace_ownership_unsettled; local execution settlement is unverified",
+            incremental_state,
+        );
     }
     match result {
         Err(failure) if recover_clean_cancel && failure.is_clean_local_cancel() => Ok(
@@ -4424,6 +4484,231 @@ mod exit_code_tests {
                 );
             }
         }
+    }
+
+    fn one_shot_cleanup_test_input(
+        kind: Option<astra_core::ErrorKind>,
+    ) -> Result<StreamResult, crate::TurnFailure> {
+        match kind {
+            None => Ok(StreamResult {
+                full_text: "observed result prefix".into(),
+                prompt_tokens: 7,
+                ..Default::default()
+            }),
+            Some(kind) => Err(crate::TurnFailure {
+                error: "original turn failure".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(kind),
+                    error_code: (kind == astra_core::ErrorKind::ContractViolation)
+                        .then(|| "original_code".into()),
+                    error_metadata: Some(serde_json::json!({"source": "original failure"})),
+                    partial_text: "original failure prefix".into(),
+                    prompt_tokens: 11,
+                    ..Default::default()
+                },
+            }),
+        }
+    }
+
+    fn assert_one_shot_cleanup_stays_failed(
+        result: Result<StreamResult, crate::TurnFailure>,
+        cleanup_settled: bool,
+        kind: Option<astra_core::ErrorKind>,
+        state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+        causes: &[&str],
+    ) {
+        assert!(!cleanup_settled);
+        // This is the same recovery gate used after the production cleanup
+        // boundaries, even when the prior kind was a clean cancellation.
+        let failure = super::settle_one_shot_user_interrupt_result(
+            result,
+            None,
+            None,
+            cleanup_settled,
+            state,
+        )
+        .unwrap_err();
+        assert_eq!(failure.partial.failure_kind, kind);
+        for cause in causes {
+            assert!(failure.error.contains(cause), "{}", failure.error);
+        }
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["success"], false);
+        if kind.is_some() {
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("original turn failure;")
+            );
+            assert_eq!(json["text"], "original failure prefix");
+            assert_eq!(json["prompt_tokens"], 11);
+            assert_eq!(
+                json["error_metadata"],
+                serde_json::json!({"source": "original failure"})
+            );
+            if kind == Some(astra_core::ErrorKind::ContractViolation) {
+                assert_eq!(json["error_code"], "original_code");
+            } else {
+                assert!(json["error_code"].is_null());
+            }
+        } else {
+            assert_eq!(json["text"], "observed result prefix");
+            assert_eq!(json["prompt_tokens"], 7);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_shot_native_shutdown_timeout_preserves_prior_failure_and_cleanup_veto() {
+        for kind in [
+            None,
+            Some(astra_core::ErrorKind::Cancelled),
+            Some(astra_core::ErrorKind::ContractViolation),
+        ] {
+            let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+            state.replace_text("incremental prefix cannot replace existing text");
+            let input = one_shot_cleanup_test_input(kind);
+            if kind == Some(astra_core::ErrorKind::Cancelled) {
+                assert!(input.as_ref().unwrap_err().is_clean_local_cancel());
+            }
+            let shutdown = super::settle_one_shot_native_delivery(
+                std::future::pending(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await;
+            let mut cleanup_settled = true;
+            let result =
+                super::apply_one_shot_cleanup_result(input, shutdown, &state, &mut cleanup_settled);
+            // A later successful cleanup cannot erase the earlier timeout veto.
+            let result =
+                super::apply_one_shot_cleanup_result(result, Ok(()), &state, &mut cleanup_settled);
+            let writer = tokio::spawn(async {
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            let writer_result =
+                super::settle_one_shot_stream_event_writer(Some(writer), None).await;
+            let result = super::apply_one_shot_cleanup_result(
+                result,
+                writer_result,
+                &state,
+                &mut cleanup_settled,
+            );
+            assert_one_shot_cleanup_stays_failed(
+                result,
+                cleanup_settled,
+                kind,
+                &state,
+                &[
+                    "native delivery shutdown did not settle",
+                    "stream-event file write failed",
+                ],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_event_writer_failure_preserves_prior_failure_and_cleanup_veto() {
+        for kind in [
+            None,
+            Some(astra_core::ErrorKind::Cancelled),
+            Some(astra_core::ErrorKind::ContractViolation),
+        ] {
+            let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+            let writer = tokio::spawn(async {
+                Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            let writer_result =
+                super::settle_one_shot_stream_event_writer(Some(writer), None).await;
+            let mut cleanup_settled = true;
+            let result = super::apply_one_shot_cleanup_result(
+                one_shot_cleanup_test_input(kind),
+                writer_result,
+                &state,
+                &mut cleanup_settled,
+            );
+            assert_one_shot_cleanup_stays_failed(
+                result,
+                cleanup_settled,
+                kind,
+                &state,
+                &["stream-event file write failed"],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_cleanup_failure_prevents_settled_stdout_success() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("observed prefix");
+        let failure = crate::TurnFailure {
+            error: "stdout closed".into(),
+            partial: crate::PartialTurnData {
+                output_transport_failure: Some(
+                    crate::cli::stream::streaming_types::OutputTransportFailure::Closed,
+                ),
+                ..Default::default()
+            },
+        };
+        assert!(super::one_shot_stdout_closure_is_settled(
+            &failure, true, true, None, None
+        ));
+        let writer =
+            tokio::spawn(async { Err::<(), _>(std::io::Error::from_raw_os_error(libc::ENOSPC)) });
+        let writer_result = super::settle_one_shot_stream_event_writer(Some(writer), None).await;
+        let mut cleanup_settled = true;
+        let failure = super::apply_one_shot_cleanup_result(
+            Err(failure),
+            writer_result,
+            &state,
+            &mut cleanup_settled,
+        )
+        .unwrap_err();
+        assert!(!super::one_shot_stdout_closure_is_settled(
+            &failure,
+            true,
+            cleanup_settled,
+            None,
+            None
+        ));
+        assert_eq!(failure.partial.partial_text, "observed prefix");
+        assert!(
+            failure
+                .error
+                .starts_with("stdout closed; stream-event file write failed")
+        );
+    }
+
+    #[test]
+    fn one_shot_root_drain_failure_preserves_original_partial_classification() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        let kind = Some(astra_core::ErrorKind::ContractViolation);
+        let interruption = serde_json::json!({
+            "kind": "execution_incomplete", "resumable": true, "reason": "original reason",
+        });
+        let mut prior = one_shot_cleanup_test_input(kind).unwrap_err();
+        prior.partial.interruption = Some(interruption.clone());
+        assert!(super::one_shot_resumable_turn_failure(&prior, false, true).is_some());
+        let mut cleanup_settled = true;
+        let result = super::apply_one_shot_cleanup_result(
+            Err(prior),
+            Err("request interrupted without root execution settlement".into()),
+            &state,
+            &mut cleanup_settled,
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.partial.interruption, Some(interruption));
+        assert!(super::one_shot_resumable_turn_failure(&failure, false, cleanup_settled).is_none());
+        assert!(super::one_shot_resumable_turn_failure(&failure, true, true).is_none());
+        assert_one_shot_cleanup_stays_failed(
+            Err(failure),
+            cleanup_settled,
+            kind,
+            &state,
+            &["request interrupted without root execution settlement"],
+        );
     }
 
     #[test]

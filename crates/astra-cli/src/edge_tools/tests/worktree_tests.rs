@@ -218,6 +218,7 @@ fn user_interrupt_local_fence_follows_actual_sse_executor_not_native_executor() 
         !crate::cli::command_router::one_shot_stdout_closure_is_settled(
             &closed,
             true,
+            true,
             Some(observed),
             Some(&native),
         )
@@ -237,6 +238,7 @@ fn user_interrupt_local_fence_follows_actual_sse_executor_not_native_executor() 
     assert!(
         crate::cli::command_router::one_shot_stdout_closure_is_settled(
             &closed,
+            true,
             true,
             Some(observed),
             Some(&native),
@@ -259,6 +261,7 @@ fn user_interrupt_local_fence_follows_actual_sse_executor_not_native_executor() 
     assert!(
         !crate::cli::command_router::one_shot_stdout_closure_is_settled(
             &closed,
+            true,
             true,
             None,
             Some(&native),

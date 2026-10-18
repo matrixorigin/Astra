@@ -140,6 +140,10 @@ the native delivery executor is checked independently. Neither can substitute
 for the other. Observed partial data remains available as an explicit failure,
 and a closed stdout pipe cannot turn a positively unsettled local owner into a
 successful exit. Absent local evidence does not create settlement authority.
+Secondary root-drain, native-shutdown or event-output cleanup failures append
+their causes to an existing failure without replacing its typed evidence or
+observed partial text. Any such failure vetoes resumable partial and closed-pipe
+success, even when the original failure class is cancellation.
 
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and

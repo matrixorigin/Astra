@@ -1009,3 +1009,180 @@ async fn one_shot_sigint_exits_while_stdin_writer_remains_open() {
     assert_eq!(json["server_terminal_unverified"], true);
     assert!(json["run_id"].is_null());
 }
+
+/// Reproduce identity failure followed by event-file ENOSPC through the real
+/// process entrypoint. Native shutdown timeouts have a separate production-
+/// boundary test; this fixture does not claim to stall a real native owner.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_keeps_identity_failure_when_event_writer_also_fails() {
+    use axum::body::{Body, Bytes};
+    use axum::extract::Path;
+    use axum::http::{Response, header};
+    use axum::routing::{delete, get, post};
+    use futures_util::StreamExt as _;
+    use std::convert::Infallible;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::Stdio;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let fixture = tempfile::tempdir().unwrap();
+    let fault = fixture.path().join("stream_event_enospc.so");
+    let compiler = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-O2", "-o"])
+        .arg(&fault)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/stream_event_enospc.c"
+        ))
+        .arg("-ldl")
+        .output()
+        .expect("compile the isolated event-file fault fixture");
+    assert!(
+        compiler.status.success(),
+        "fault fixture: {}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    for inject_enospc in [false, true] {
+        let chats = Arc::new(AtomicUsize::new(0));
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let first_cancel = Arc::new(tokio::sync::Notify::new());
+        let release_cancel = Arc::new(tokio::sync::Notify::new());
+        let chat_count = chats.clone();
+        let cancel_count = cancels.clone();
+        let observed_cancel = first_cancel.clone();
+        let cancel_release = release_cancel.clone();
+        let app = axum::Router::new()
+            .route("/agents/edge", post(|| async { axum::Json(serde_json::json!({"ok": true})) }))
+            .route("/sessions", post(|| async { axum::Json(serde_json::json!({"session_id": "sigint-session"})) }))
+            .route("/skills", get(|| async { axum::Json(serde_json::json!({"skills": [], "total": 0, "limit": 100, "next_cursor": null})) }))
+            .route("/models", get(|| async { pipe_model_catalog() }))
+            .route("/chat/stream", post(move || {
+                chat_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let stream = futures_util::stream::once(async {
+                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\ndata: {\"type\":\"warning\",\"message\":\"force-writer-enospc\"}\n\ndata: {\"type\":\"session_info\",\"session_id\":\"changed-session\",\"run_id\":\"sigint-run\"}\n\n"))
+                    }).chain(futures_util::stream::pending());
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR)
+                        .body(Body::from_stream(stream)).unwrap()
+                }
+            }))
+            .route("/chat/runs/{run_id}", delete(move |Path(run): Path<String>| {
+                let cancels = cancel_count.clone();
+                let started = observed_cancel.clone();
+                let release = cancel_release.clone();
+                async move {
+                    assert_eq!(run, "sigint-run", "cleanup stays on the captured exact run");
+                    if cancels.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    axum::Json(serde_json::json!({"execution_settled": true}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let events = home.path().join("events.jsonl");
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+        command
+            .args([
+                "--api-url",
+                &base,
+                "--profile",
+                "synthetic-double-failure",
+                "--model",
+                "mock-model",
+                "--bare",
+                "--no-instructions",
+                "chat",
+                "--json",
+                "--no-resume",
+                "--permission-mode",
+                "bypass",
+                "--stream-events",
+            ])
+            .arg(&events)
+            .args(["-m", "synthetic double failure"])
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("XDG_DATA_HOME", home.path().join(".local/share"))
+            .env("ASTRA_ACCESS_TOKEN", "synthetic-offline-signal-test")
+            .env("ASTRA_API_URL", &base)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if inject_enospc {
+            let mut preload = fault.as_os_str().to_os_string();
+            if let Some(inherited) = std::env::var_os("LD_PRELOAD") {
+                preload.push(":");
+                preload.push(inherited);
+            }
+            command.env("LD_PRELOAD", preload);
+        }
+        let child = command.spawn().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), first_cancel.notified())
+            .await
+            .expect("identity failure must reach exact-run cleanup before SIGINT");
+        let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        release_cancel.notify_one();
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
+                .await
+                .expect("bounded double-failure exit")
+                .unwrap();
+        server.abort();
+        assert_eq!(output.status.signal(), None);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("terminal failure JSON");
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["run_id"], "sigint-run");
+        assert_eq!(json["text"], "observed partial");
+        let error = json["error"].as_str().unwrap();
+        assert!(
+            error.contains("server session identity changed within one request"),
+            "{json}"
+        );
+        assert_eq!(
+            error.contains("stream-event file write failed"),
+            inject_enospc,
+            "{json}"
+        );
+        if inject_enospc {
+            assert!(
+                error.contains(&std::io::Error::from_raw_os_error(libc::ENOSPC).to_string()),
+                "{json}"
+            );
+        }
+        assert_eq!(
+            chats.load(Ordering::SeqCst),
+            1,
+            "never replay the submitted turn"
+        );
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            2,
+            "facade and interrupt settle the same exact owner"
+        );
+    }
+}
