@@ -720,33 +720,59 @@ fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &Prepare
 
 fn persist_resumed_workspace_metadata(
     restored: &RestoredSession,
+    workspace_turn_count: u32,
+    local_projection_owner: Option<&astra_services::OwnerScope>,
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
     existing_workspace: Option<&session_workspace::WorkspaceMetadata>,
 ) -> Result<(), String> {
     let model_for_new = restored.model.as_deref().unwrap_or("default");
-    let mut ws = existing_workspace
+    let mut initial = existing_workspace
         .cloned()
         .or_else(|| restored.workspace.clone())
         .unwrap_or_else(|| {
             session_workspace::WorkspaceMetadata::new(&restored.session_id, model_for_new)
         });
-    ws.turn_count = restored.turn_count;
-    ws.total_tokens_in = restored.total_tokens_in;
-    ws.total_tokens_out = restored.total_tokens_out;
-    ws.total_cache_read_tokens = total_cache_read_tokens;
-    ws.total_cache_creation_tokens = total_cache_creation_tokens;
-    ws.status = restored.last_status.clone();
-    if let Some(ref branch) = restored.git_branch {
-        ws.git_branch = Some(branch.clone());
-    }
-    ws.model = astra_core::model_override::normalize_model_override_owned(restored.model.clone());
-    if restored.permission_mode.is_some() {
-        ws.permission_mode = restored.permission_mode.clone();
-    }
-    ws.last_context_trace = restored.last_context_trace.clone();
-    astra_services::session_workspace::write_workspace(&ws)
-        .map_err(|e| format!("write workspace during resume: {e}"))
+    let update = |ws: &mut session_workspace::WorkspaceMetadata| {
+        ws.turn_count = workspace_turn_count;
+        if local_projection_owner.is_some() {
+            // The current workspace may have advanced while optional remote
+            // reads were pending. Keep its local evidence and cumulative facts.
+            ws.total_tokens_in = ws.total_tokens_in.max(restored.total_tokens_in);
+            ws.total_tokens_out = ws.total_tokens_out.max(restored.total_tokens_out);
+            ws.total_cache_read_tokens = ws.total_cache_read_tokens.max(total_cache_read_tokens);
+            ws.total_cache_creation_tokens = ws
+                .total_cache_creation_tokens
+                .max(total_cache_creation_tokens);
+        } else {
+            ws.total_tokens_in = restored.total_tokens_in;
+            ws.total_tokens_out = restored.total_tokens_out;
+            ws.total_cache_read_tokens = total_cache_read_tokens;
+            ws.total_cache_creation_tokens = total_cache_creation_tokens;
+            ws.last_context_trace = restored.last_context_trace.clone();
+        }
+        ws.status = restored.last_status.clone();
+        if let Some(ref branch) = restored.git_branch {
+            ws.git_branch = Some(branch.clone());
+        }
+        ws.model =
+            astra_core::model_override::normalize_model_override_owned(restored.model.clone());
+        if restored.permission_mode.is_some() {
+            ws.permission_mode = restored.permission_mode.clone();
+        }
+    };
+    let result = if let Some(owner) = local_projection_owner {
+        session_workspace::update_workspace_for_owner(
+            owner,
+            &restored.session_id,
+            || initial,
+            update,
+        )
+    } else {
+        update(&mut initial);
+        session_workspace::write_workspace(&initial)
+    };
+    result.map_err(|error| format!("write workspace during resume: {error}"))
 }
 
 fn parse_restored_permission_mode(
@@ -1022,6 +1048,7 @@ async fn apply_restored_session(
     if had_resume_bundle && typed_continuation.is_none() {
         return Err("restored ResumeBundle failed causal validation".to_string());
     }
+    let restored_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     let local_journal = session_runtime::restored_journal_state(&restored.session_id)?;
     if !restored.restored_from_cloud && !local_journal.exists {
         return Err(format!(
@@ -1060,6 +1087,11 @@ async fn apply_restored_session(
             })? == 1
         }
     };
+    let use_server_canonical = use_typed_continuation
+        && restored.restored_from_cloud
+        && typed_continuation.as_ref().is_some_and(|continuation| {
+            continuation.resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+        });
     let selected_cursor = if use_typed_continuation {
         typed_continuation
             .as_ref()
@@ -1264,12 +1296,57 @@ async fn apply_restored_session(
         &restored.session_id,
     )
     .await;
+    // Workspace sidecars order their local projections by this counter. Read
+    // the local head again after all network awaits, and fence it through the
+    // metadata write so another surface cannot advance behind this snapshot.
+    if use_server_canonical && !restored_owner.is_current() {
+        return Err("Server restore owner changed before local workspace publication".into());
+    }
+    let workspace_lease = use_server_canonical
+        .then(|| {
+            session_journal::SessionExecutionLease::try_acquire_for_owner(
+                &restored_owner.owner_scope,
+                &restored.session_id,
+            )
+            .map_err(|error| {
+                format!("cannot project Server restore into the local workspace: {error}")
+            })
+        })
+        .transpose()?;
+    let workspace_turn_count = if workspace_lease.is_some() {
+        let writer = session_journal::JournalWriter::for_owner(
+            &restored_owner.owner_scope,
+            &restored.session_id,
+        )
+        .map_err(|error| format!("open local journal during Server restore: {error}"))?;
+        let events = writer
+            .complete_append_order_snapshot()
+            .map_err(|error| format!("read local journal during Server restore: {error}"))?;
+        session_continuation::recover_or_initialize_active_conversation_from_append_order_events(
+            &restored.session_id,
+            &events,
+        )?;
+        session_runtime::restored_journal_state_from_append_order_events(
+            writer.path().is_file(),
+            &events,
+        )
+        .session
+        .turn
+    } else {
+        restored.turn_count
+    };
+    if use_server_canonical && !restored_owner.is_current() {
+        return Err("Server restore owner changed before local workspace publication".into());
+    }
     persist_resumed_workspace_metadata(
         &restored,
+        workspace_turn_count,
+        use_server_canonical.then_some(&restored_owner.owner_scope),
         total_cache_read_tokens,
         total_cache_creation_tokens,
         prepared_workspace.workspace.as_ref(),
     )?;
+    drop(workspace_lease);
 
     state.prepare_for_session_rebind().await;
     state.reset_for_session_restore();
@@ -1358,11 +1435,7 @@ async fn apply_restored_session(
     };
     state.server_resume_attachment = typed_continuation
         .as_ref()
-        .filter(|continuation| {
-            use_typed_continuation
-                && restored.restored_from_cloud
-                && continuation.resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
-        })
+        .filter(|_| use_server_canonical)
         .map(|continuation| {
             (
                 continuation.resume.cursor.clone(),
@@ -3317,6 +3390,7 @@ mod resume_tests {
         for (local_turn, server_turn, concurrent_local_turn, failed_primary_append) in [
             (20, 3, false, false),
             (3, 20, false, false),
+            (0, 20, false, false),
             (20, 3, true, false),
             (20, 3, false, true),
         ] {
@@ -3332,22 +3406,24 @@ mod resume_tests {
                 .prepare_commit(local_turn, None, local_messages)
                 .unwrap();
             let writer = session_journal::JournalWriter::new(&sid).unwrap();
-            writer
-                .append(
-                    &session_journal::JournalEvent::turn(
-                        Some(&sid),
-                        local_turn,
-                        None,
-                        "local question",
-                        "local answer",
-                        0,
-                        0,
-                        0,
-                        0,
+            if local_turn > 0 {
+                writer
+                    .append(
+                        &session_journal::JournalEvent::turn(
+                            Some(&sid),
+                            local_turn,
+                            None,
+                            "local question",
+                            "local answer",
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                        .with_conversation_commit(local.commit),
                     )
-                    .with_conversation_commit(local.commit),
-                )
-                .unwrap();
+                    .unwrap();
+            }
             let server_messages = vec![
                 serde_json::json!({"role":"user", "content":"Server question"}),
                 serde_json::json!({"role":"assistant", "content":"Server answer"}),
@@ -3367,7 +3443,11 @@ mod resume_tests {
                 .unwrap()
                 .next;
             // The conversation cursor may lag the official Server session head.
-            let first_restore = canonical_server_test_restore(&sid, server_turn, &server_active);
+            let mut first_restore =
+                canonical_server_test_restore(&sid, server_turn, &server_active);
+            let mut remote_workspace = session_workspace::WorkspaceMetadata::new(&sid, "default");
+            remote_workspace.turn_count = server_turn;
+            first_restore.workspace = Some(remote_workspace);
             let next_restore = canonical_server_test_restore(&sid, server_turn + 1, &next_server);
             let responses = Arc::new(vec![first_restore.clone(), first_restore, next_restore]);
             let count = Arc::new(AtomicUsize::new(0));
@@ -3401,6 +3481,15 @@ mod resume_tests {
             restore_session_into_state(&sid, None, &api, &mut state)
                 .await
                 .unwrap();
+            assert_eq!(
+                state.turn, server_turn,
+                "the restored UI retains the official Server head"
+            );
+            assert_eq!(
+                session_workspace::read_workspace(&sid).unwrap().turn_count,
+                local_turn,
+                "workspace sidecar ordering must start from the local journal, including an empty replica",
+            );
             Mock::given(method("POST"))
                 .and(path("/admission-token-probe"))
                 .and(wiremock::matchers::header(
@@ -3485,7 +3574,11 @@ mod resume_tests {
                 .filter(|event| event.event_type == session_journal::JournalEventType::Turn)
                 .filter_map(|event| event.turn)
                 .collect::<Vec<_>>();
-            let mut expected_turns = vec![local_turn];
+            let mut expected_turns = if local_turn == 0 {
+                Vec::new()
+            } else {
+                vec![local_turn]
+            };
             if concurrent_local_turn {
                 expected_turns.push(admitted_local_turn);
             }
@@ -3496,6 +3589,230 @@ mod resume_tests {
             assert_eq!(turns, expected_turns);
             assert_eq!(count.load(Ordering::SeqCst), 3);
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn server_restore_fences_fresh_local_workspace_head_after_memory_await() {
+        use crate::cli::turn::{
+            turn_commit::commit_primary_turn, turn_learning::consume_chat_turn_learning,
+        };
+        use astra_turn_core::{
+            active_conversation::ActiveConversation, context_assembly_trace::ContextAssemblyTrace,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let sid = format!("resume-workspace-race-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&sid);
+        let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+        let mut local = SessionState::default();
+        local.set_session_id(&sid);
+        local.turn = 3;
+        local.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
+        local.active_conversation = Some(ActiveConversation::empty(&owner, &sid).unwrap());
+        let mut third_result = crate::tests::stub_stream_result("local answer 3");
+        third_result.final_messages = vec![
+            serde_json::json!({"role":"user", "content":"local question 3"}),
+            serde_json::json!({"role":"assistant", "content":"local answer 3"}),
+        ];
+        let third_trace = ContextAssemblyTrace {
+            turn_id: "local-trace-3".into(),
+            session_id: sid.clone(),
+            ..Default::default()
+        };
+        third_result.pending_context_assembly_trace = Some((3, third_trace.to_json_value()));
+        let learning = consume_chat_turn_learning(&third_result);
+        let third = commit_primary_turn(
+            &mut local,
+            "local question 3",
+            &mut third_result,
+            &learning,
+            std::time::Instant::now(),
+        );
+        assert!(third.outcome.turn_persisted);
+        let third_sidecar = third.deferred_sidecars.unwrap();
+        third_sidecar.execute(false).unwrap();
+        let local_third = local.active_conversation.as_ref().unwrap().clone();
+        let remote = ActiveConversation::empty(&owner, &sid)
+            .unwrap()
+            .prepare_commit(
+                20,
+                None,
+                vec![
+                    serde_json::json!({"role":"user", "content":"Server question"}),
+                    serde_json::json!({"role":"assistant", "content":"Server answer"}),
+                ],
+            )
+            .unwrap()
+            .next;
+        let restored = canonical_server_test_restore(&sid, 20, &remote);
+
+        // Hold the actual optional memory response until another admitted local
+        // surface has committed turn4 and its real workspace/context sidecar.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (memory_seen_tx, memory_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let body = serde_json::json!({"memories":[{
+            "memory_id":"synthetic-session-memory", "session_id":sid,
+            "content":astra_runtime::session_memory::runner::encode_session_memory_entry(&sid, "## Active Goals\n- Continue\n"),
+            "memory_type":"working",
+        }]}).to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            assert!(request.starts_with(b"POST /memory/retrieve "));
+            memory_seen_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        });
+        let api = astra_thin_client::ThinClient::new(&origin, None).unwrap();
+        let mut state = SessionState::default();
+        let rebind_cache = state.bg_task_list_cache.clone();
+        let rebind_gate = rebind_cache.read().await;
+        let restore = apply_restored_session(None, &api, &mut state, restored.clone());
+        let advance = async {
+            memory_seen_rx.await.unwrap();
+            let lease = session_journal::SessionExecutionLease::try_acquire(&sid).unwrap();
+            let mut fourth = SessionState::default();
+            fourth.set_session_id(&sid);
+            fourth.turn = 4;
+            fourth.journal = Some(session_journal::JournalWriter::new(&sid).unwrap());
+            fourth.active_conversation = Some(local_third.clone());
+            let mut result = crate::tests::stub_stream_result("local answer 4");
+            result.final_messages = local_third.materialize();
+            result.final_messages.extend([
+                serde_json::json!({"role":"user", "content":"local question 4"}),
+                serde_json::json!({"role":"assistant", "content":"local answer 4"}),
+            ]);
+            let trace = ContextAssemblyTrace {
+                turn_id: "local-trace-4".into(),
+                session_id: sid.clone(),
+                ..Default::default()
+            };
+            result.pending_context_assembly_trace = Some((4, trace.to_json_value()));
+            let learning = consume_chat_turn_learning(&result);
+            let primary = commit_primary_turn(
+                &mut fourth,
+                "local question 4",
+                &mut result,
+                &learning,
+                std::time::Instant::now(),
+            );
+            assert!(primary.outcome.turn_persisted);
+            primary.deferred_sidecars.unwrap().execute(false).unwrap();
+            let workspace = session_workspace::read_workspace(&sid).unwrap();
+            assert_eq!(workspace.turn_count, 4);
+            assert_eq!(
+                workspace.last_context_trace.unwrap().turn_id,
+                "local-trace-4"
+            );
+            session_workspace::update_workspace(
+                &sid,
+                || unreachable!(),
+                |workspace| {
+                    workspace
+                        .discovered_skills
+                        .push("concurrent-local-skill".into());
+                    workspace.summary = Some("local turn4 workspace evidence".into());
+                    workspace.checkpoints.push(4);
+                },
+            )
+            .unwrap();
+            let revision = session_workspace::read_workspace(&sid)
+                .unwrap()
+                .projection_revision;
+            drop(lease);
+            release_tx.send(()).unwrap();
+            // prepare_for_session_rebind is gated, so this observation is after
+            // restore publication but before startup can repair a lost trace.
+            loop {
+                let workspace = session_workspace::read_workspace(&sid).unwrap();
+                if workspace.projection_revision > revision {
+                    assert_eq!(workspace.turn_count, 4);
+                    assert_eq!(
+                        workspace.last_context_trace.unwrap().turn_id,
+                        "local-trace-4"
+                    );
+                    assert_eq!(
+                        workspace.discovered_skills,
+                        vec!["concurrent-local-skill".to_string()]
+                    );
+                    assert_eq!(
+                        workspace.summary.as_deref(),
+                        Some("local turn4 workspace evidence")
+                    );
+                    assert_eq!(workspace.checkpoints, vec![4]);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(rebind_gate);
+        };
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(restore, advance)
+        })
+        .await
+        .expect("memory/publication/rebind gates must all complete");
+        outcome.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.turn, 20,
+            "Server UI head cannot become the local allocation"
+        );
+        assert_eq!(
+            state.active_conversation.as_ref().unwrap().cursor(),
+            remote.cursor(),
+            "fresh local workspace metadata cannot replace the selected Server cursor"
+        );
+        third_sidecar.execute(false).unwrap();
+        let workspace = session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(
+            workspace.turn_count, 4,
+            "the old restore snapshot and stale sidecar must not regress the local head"
+        );
+        assert_eq!(
+            workspace.last_context_trace.unwrap().turn_id,
+            "local-trace-4"
+        );
+        let _busy = session_journal::SessionExecutionLease::try_acquire(&sid).unwrap();
+        let mut contender = SessionState::default();
+        let error = apply_restored_session(None, &api, &mut contender, restored)
+            .await
+            .unwrap_err();
+        assert!(error.contains("active execution"), "{error}");
+        assert!(
+            contender.session_id.is_none(),
+            "busy restore must fail before live attachment replacement"
+        );
+        assert_eq!(
+            session_workspace::read_workspace(&sid).unwrap().turn_count,
+            4
+        );
     }
 
     #[serial_test::serial]

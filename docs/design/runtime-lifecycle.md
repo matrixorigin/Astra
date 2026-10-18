@@ -180,7 +180,13 @@ an explicit bearer and cannot borrow profile refresh authority.
 A failed or degraded refresh stops before execution; it cannot fall back to the local replica. The returned
 Server session turn count and canonical messages supply that request's inputs.
 The local snapshot independently supplies the local journal turn allocation and
-canonical commit base. Server cursors are never advanced as local cursors.
+canonical commit base. The local workspace's sidecar ordering counter is also
+seeded from that local journal during explicit Server canonical restore,
+starting at zero for a replica with no local turns. After remote reads, restore
+holds the captured owner's execution lease while reading the current local
+head and merging metadata under that owner's workspace lock. Already committed
+local trace and workspace fields are retained. The Server head must not suppress
+subsequent local workspace or context-trace projections. Server cursors are never advanced as local cursors.
 Ordinary local and fresh attachments do not perform this additional request.
 
 

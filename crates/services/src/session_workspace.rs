@@ -613,8 +613,11 @@ pub async fn persist_remote_workspace(
 }
 
 pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
-    let path = workspace_file_path(session_id)?;
-    let metadata = std::fs::metadata(&path)?;
+    read_workspace_at_path(session_id, &workspace_file_path(session_id)?)
+}
+
+fn read_workspace_at_path(session_id: &str, path: &Path) -> std::io::Result<WorkspaceMetadata> {
+    let metadata = std::fs::metadata(path)?;
     const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024; // 1 MB
     if metadata.len() > MAX_WORKSPACE_YAML_SIZE {
         return Err(std::io::Error::new(
@@ -626,7 +629,7 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
             ),
         ));
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     let metadata: WorkspaceMetadata = serde_yaml_ng::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     validate_workspace_identity(session_id, &metadata)?;
@@ -659,21 +662,40 @@ pub fn update_workspace(
     initialize: impl FnOnce() -> WorkspaceMetadata,
     update: impl FnOnce(&mut WorkspaceMetadata),
 ) -> std::io::Result<()> {
-    let dir = validated_workspace_dir(session_id)?;
+    update_workspace_for_owner(
+        &crate::OwnerScope::local_user(),
+        session_id,
+        initialize,
+        update,
+    )
+}
+
+/// Apply the same atomic workspace update in an explicitly captured owner scope.
+pub fn update_workspace_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+    initialize: impl FnOnce() -> WorkspaceMetadata,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<()> {
+    let dir = crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
     let _lock = lock_workspace(&dir)?;
-    let (mut metadata, existing_config) = match read_workspace_optional(session_id)? {
-        Some(metadata) => {
-            let config = (
-                metadata.tuned_config_json.clone(),
-                metadata.config_mutation_revision,
-                metadata.projection_revision,
-            );
-            (metadata, Some(config))
-        }
-        None => (initialize(), None),
-    };
+    let (mut metadata, existing_config) =
+        match read_workspace_at_path(session_id, &dir.join("workspace.yaml")) {
+            Ok(metadata) => {
+                let config = (
+                    metadata.tuned_config_json.clone(),
+                    metadata.config_mutation_revision,
+                    metadata.projection_revision,
+                );
+                (metadata, Some(config))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (initialize(), None),
+            Err(error) => return Err(error),
+        };
     validate_workspace_identity(session_id, &metadata)?;
     update(&mut metadata);
     if let Some((tuned_config_json, revision, projection_revision)) = existing_config {
@@ -1308,6 +1330,56 @@ fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn explicit_owner_workspace_update_reads_and_writes_only_the_captured_namespace() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::session_journal::JournalDirGuard::new(root.path());
+        let sid = "workspace-explicit-owner-update";
+        let owner = crate::OwnerScope::user("captured-workspace-owner").unwrap();
+        assert_ne!(owner, crate::OwnerScope::local_user());
+        update_workspace_for_owner(
+            &owner,
+            sid,
+            || WorkspaceMetadata::new(sid, "default"),
+            |workspace| {
+                workspace.turn_count = 3;
+                workspace.summary = Some("captured owner evidence".into());
+            },
+        )
+        .unwrap();
+        update_workspace(
+            sid,
+            || WorkspaceMetadata::new(sid, "default"),
+            |workspace| workspace.turn_count = 20,
+        )
+        .unwrap();
+        update_workspace_for_owner(
+            &owner,
+            sid,
+            || panic!("existing captured workspace must be read"),
+            |workspace| {
+                assert_eq!(workspace.turn_count, 3);
+                workspace.turn_count = 4;
+                workspace.discovered_skills.push("captured-skill".into());
+            },
+        )
+        .unwrap();
+        assert_eq!(read_workspace(sid).unwrap().turn_count, 20);
+        let path = crate::local_session_artifact_store()
+            .session_dir_for_owner(&owner, sid)
+            .unwrap()
+            .join("workspace.yaml");
+        let captured = read_workspace_at_path(sid, &path).unwrap();
+        assert_eq!(captured.turn_count, 4);
+        assert_eq!(captured.summary.as_deref(), Some("captured owner evidence"));
+        assert_eq!(
+            captured.discovered_skills,
+            vec!["captured-skill".to_string()]
+        );
+    }
+
     use super::*;
     use crate::session_journal::{JournalDirGuard, ProcessJournalDirGuard};
     use async_trait::async_trait;

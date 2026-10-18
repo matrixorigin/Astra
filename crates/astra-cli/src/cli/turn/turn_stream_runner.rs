@@ -554,6 +554,13 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
             serde_json::json!({"role":"assistant", "content":"continued"}),
         ]);
         result.session_id = Some(session_id.clone());
+        let trace_id = format!("admitted-local-turn-{}", state.turn.saturating_add(1));
+        let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+            turn_id: trace_id.clone(),
+            session_id: session_id.clone(),
+            ..Default::default()
+        };
+        result.pending_context_assembly_trace = Some((turn_index, trace.to_json_value()));
         let expected_messages = result.final_messages.clone();
         let previous_turn = state.turn;
         let journal_path = state.journal.as_ref().unwrap().path().to_path_buf();
@@ -612,11 +619,15 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
             &session_id, &events,
         ).unwrap();
         assert_eq!(replay.messages(), expected_messages);
+        let workspace = astra_services::session_workspace::read_workspace(&session_id).unwrap();
+        assert_eq!(workspace.turn_count, state.turn);
         assert_eq!(
-            astra_services::session_workspace::read_workspace(&session_id)
-                .unwrap()
-                .turn_count,
-            state.turn
+            workspace
+                .last_context_trace
+                .as_ref()
+                .map(|trace| trace.turn_id.as_str()),
+            Some(trace_id.as_str()),
+            "a Server restore must not make a current local sidecar look stale",
         );
     }
     Ok((turn_index, messages, state.turn))
