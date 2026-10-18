@@ -1218,9 +1218,9 @@ impl ToolHandler<RuntimeToolExecutor> for StrReplaceToolHandler {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return astra_tools::cancelled_tool_result("str_replace", false);
         }
-        let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
+        let args = match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
             Ok(args) => args,
-            Err(error) => return tool_result_from_output(error),
+            Err(error) => return error,
         };
         let turn_index = context.journal_turn_index.load(Ordering::Relaxed);
         if args

@@ -5185,13 +5185,15 @@ impl ToolExecutor {
                 "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_session_state" => self.rollback_session_state(args).await,
                 "str_replace" => {
-                    let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
-                        Ok(args) => args,
-                        Err(error) => {
-                            *source_is_error = Some(true);
-                            return error;
-                        }
-                    };
+                    let args =
+                        match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
+                            Ok(args) => args,
+                            Err(result) => {
+                                *source_is_error = Some(result.is_error);
+                                *tool_result_fields = result.metadata;
+                                return result.output;
+                            }
+                        };
                     // edits array routes through the str_replace batch
                     // wrapper so both same-file and per-edit path batches
                     // share one contract.
@@ -6832,6 +6834,73 @@ pub(crate) mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })
+    }
+
+    #[tokio::test]
+    async fn cli_pure_edit_rejection_preserves_source_execution_facts() {
+        let (directory, executor) = temp_executor();
+        executor.set_current_visible_tool_schemas(&all_tool_schemas());
+        *executor.sandbox_policy.write().unwrap() =
+            Some(super::SandboxPolicy::permissive(directory.path()));
+        let path = directory.path().join("f.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        for args in [
+            serde_json::json!({"old_str":"before", "new_str":"after"}),
+            serde_json::json!({"path":"f.txt", "old_str":"same", "new_str":"same"}),
+            serde_json::json!({"path":"f.txt", "old_str":"before", "new_str":"after", "edits":[]}),
+        ] {
+            let outcome = executor.execute_with_metadata("str_replace", &args).await;
+            assert!(outcome.is_error, "{outcome:?}");
+            let fields = outcome.tool_result_fields.unwrap();
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["execution_fact"], "not_executed");
+            assert_eq!(fields["disposition"], "rejected");
+            assert_eq!(
+                fields["error_kind"],
+                astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+        }
+        let unreadable = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({"path":"missing.txt", "old_str":"before", "new_str":"after"}),
+            )
+            .await;
+        assert!(unreadable.is_error);
+        assert_ne!(
+            unreadable
+                .tool_result_fields
+                .as_ref()
+                .and_then(|m| m.get("execution_fact")),
+            Some(&serde_json::json!("not_executed"))
+        );
+        let read = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path":"f.txt"}))
+            .await;
+        assert!(!read.is_error, "{read:?}");
+        let missing = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({"path":"f.txt", "old_str":"absent", "new_str":"after"}),
+            )
+            .await;
+        assert!(missing.is_error);
+        assert_ne!(
+            missing
+                .tool_result_fields
+                .as_ref()
+                .and_then(|m| m.get("execution_fact")),
+            Some(&serde_json::json!("not_executed"))
+        );
+        let changed = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({"path":"f.txt", "old_str":"before", "new_str":"after"}),
+            )
+            .await;
+        assert!(!changed.is_error, "{changed:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
     }
 
     #[tokio::test]

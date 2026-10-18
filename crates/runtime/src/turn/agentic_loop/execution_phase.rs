@@ -24767,5 +24767,9 @@ Use introspect(artifact=\"{handle}\") for earlier details."
 }
 
 #[cfg(test)]
+#[path = "argument_rejection_tests.rs"]
+mod argument_rejection_tests;
+
+#[cfg(test)]
 #[path = "execution_evidence_tests.rs"]
 mod execution_evidence_tests;
