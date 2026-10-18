@@ -11,6 +11,8 @@
 //!
 //! - [`ReasoningReplayMode::AlwaysReplay`] — the provider requires the field on
 //!   every assistant message, even when reasoning was empty (DeepSeek, Moonshot/Kimi).
+//! - [`ReasoningReplayMode::CapturedExact`] — preserve every captured block
+//!   unchanged without backfilling missing history (GLM interleaved thinking).
 //! - [`ReasoningReplayMode::OnDemand`] — the field is only needed when thinking
 //!   was explicitly enabled or the history already contains reasoning (standard
 //!   OpenAI, Anthropic, etc.).
@@ -31,6 +33,10 @@ pub enum ReasoningReplayMode {
     ///
     /// Examples: DeepSeek, Moonshot/Kimi.
     AlwaysReplay,
+
+    /// Replay original captured blocks byte-for-byte, without inventing a
+    /// field for messages whose reasoning was not captured (GLM interleaved thinking).
+    CapturedExact,
 
     /// Provider only needs `reasoning_content` when thinking was explicitly
     /// enabled for the request or the history already contains reasoning
@@ -58,7 +64,7 @@ impl ReasoningCapabilities {
     /// Whether reasoning replay is required for this provider/model.
     #[inline]
     pub fn requires_replay(&self) -> bool {
-        self.replay_mode == ReasoningReplayMode::AlwaysReplay
+        self.replay_mode != ReasoningReplayMode::OnDemand
     }
 }
 
@@ -104,6 +110,23 @@ pub fn reasoning_capabilities(provider: &str, model: &str) -> ReasoningCapabilit
     if is_deepseek {
         return ReasoningCapabilities {
             replay_mode: ReasoningReplayMode::AlwaysReplay,
+            reasoning_placeholder: "",
+        };
+    }
+
+    // GLM interleaved thinking requires complete original reasoning history.
+    // Match the upstream model identity, including published namespaces, rather
+    // than a display alias or an arbitrary substring in a provider URL.
+    let glm_model = model_lower
+        .strip_prefix("z-ai/")
+        .or_else(|| model_lower.strip_prefix("zai-org/"))
+        .unwrap_or(&model_lower);
+    if ["glm-4.5", "glm-4.6", "glm-4.7", "glm-5"]
+        .iter()
+        .any(|family| matches_provider_token(glm_model, family))
+    {
+        return ReasoningCapabilities {
+            replay_mode: ReasoningReplayMode::CapturedExact,
             reasoning_placeholder: "",
         };
     }
@@ -180,6 +203,43 @@ fn is_model_id_token_boundary(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glm_upstream_identity_requires_exact_captured_replay() {
+        for model in [
+            "glm-4.5",
+            "GLM-4.6",
+            "glm-4.7-flash",
+            "glm-5",
+            "glm-5.3",
+            "z-ai/glm-5.3",
+            "zai-org/GLM-4.7",
+            "zai-org/GLM-4.5-Air",
+        ] {
+            let caps = reasoning_capabilities("openai", model);
+            assert_eq!(
+                caps.replay_mode,
+                ReasoningReplayMode::CapturedExact,
+                "{model}"
+            );
+            assert!(caps.requires_replay());
+        }
+        for (provider, model) in [
+            ("zhipu", "display-alias"),
+            ("https://host/glm-5.3", "custom"),
+            ("openai", "my-glm-5.3"),
+            ("openai", "glm-5ish"),
+            ("openai", "other/glm-5.3"),
+            ("openai", "THUDM/GLM-4.5-Air"),
+            ("openai", "glm-4-9b"),
+        ] {
+            assert_eq!(
+                reasoning_capabilities(provider, model).replay_mode,
+                ReasoningReplayMode::OnDemand,
+                "{provider}/{model}"
+            );
+        }
+    }
 
     // ── AlwaysReplay providers ────────────────────────────────────────────
 
