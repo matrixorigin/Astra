@@ -76,7 +76,7 @@ hmac = "0.12.1"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 nix = { version = "0.31.2", features = ["fs", "signal", "term"] }
 regex = "1.12.2"
-reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream", "socks"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_path_to_error = "0.1.20"

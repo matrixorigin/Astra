@@ -68,6 +68,20 @@ available through a ready bound Edge provider. Capability availability does
 not enable either tool for a user turn; Web and SDK clients must explicitly
 select optional tools separately.
 
+### Outbound HTTPS trust
+
+Astra HTTP clients using the workspace reqwest transport trust both bundled
+public CA roots and the process platform trust store. This supports managed
+private CAs, including certificates used by an HTTPS inspection proxy, while
+retaining certificate-chain and hostname verification and existing proxy routing.
+
+For a process-specific CA configuration, set `SSL_CERT_FILE` to a PEM CA bundle
+and/or `SSL_CERT_DIR` to a directory of PEM CA files before starting Astra. These
+variables select the native-root source instead of platform discovery; bundled
+public roots remain available. Configure them only in the selected CLI, User
+Runner, or Server process environment. They do not transfer a user machine’s
+trust store to the Server. Restart the process after changing its trust settings.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`
