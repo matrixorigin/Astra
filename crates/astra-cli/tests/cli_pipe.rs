@@ -1153,25 +1153,26 @@ async fn one_shot_sigint_keeps_identity_failure_when_event_writer_also_fails() {
         );
         let json: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("terminal failure JSON");
-        assert_eq!(json["final_state"], "failed");
-        assert_eq!(json["server_terminal_unverified"], true);
-        assert_eq!(json["success"], false);
-        assert_eq!(json["run_id"], "sigint-run");
-        assert_eq!(json["text"], "observed partial");
+        let diagnostic = format!("inject_enospc={inject_enospc}; terminal={json}");
+        assert_eq!(json["final_state"], "failed", "{diagnostic}");
+        assert_eq!(json["server_terminal_unverified"], true, "{diagnostic}");
+        assert_eq!(json["success"], false, "{diagnostic}");
+        assert_eq!(json["run_id"], "sigint-run", "{diagnostic}");
+        assert_eq!(json["text"], "observed partial", "{diagnostic}");
         let error = json["error"].as_str().unwrap();
         assert!(
             error.contains("server session identity changed within one request"),
-            "{json}"
+            "{diagnostic}"
         );
         assert_eq!(
             error.contains("stream-event file write failed"),
             inject_enospc,
-            "{json}"
+            "{diagnostic}"
         );
         if inject_enospc {
             assert!(
                 error.contains(&std::io::Error::from_raw_os_error(libc::ENOSPC).to_string()),
-                "{json}"
+                "{diagnostic}"
             );
         }
         assert_eq!(

@@ -3425,6 +3425,17 @@ fn apply_one_shot_cleanup_result(
     }
 }
 
+fn retain_one_shot_observed_partial(
+    failure: &mut crate::TurnFailure,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) {
+    // Physical-stream failure may precede terminal text ingestion. Keep only
+    // already-observed request evidence, without changing failure authority.
+    if failure.partial.partial_text.is_empty() {
+        failure.partial.partial_text = incremental_state.snapshot().partial_text;
+    }
+}
+
 /// Preserve an existing failure and all of its typed evidence. Cleanup causes
 /// are additive; only a result without a failure needs a new failure envelope.
 #[allow(clippy::result_large_err)]
@@ -3467,12 +3478,7 @@ fn retain_one_shot_interruption_failure(
             }
         }
     };
-    // A cancelled physical stream can return before terminal ingestion
-    // populates final_text. Retain its already-observed request prefix as
-    // evidence only; the interruption still requires a hard failure.
-    if failure.partial.partial_text.is_empty() {
-        failure.partial.partial_text = incremental_state.snapshot().partial_text;
-    }
+    retain_one_shot_observed_partial(&mut failure, incremental_state);
     if had_failure {
         if !failure.error.is_empty() {
             failure.error.push_str("; ");
@@ -3492,6 +3498,10 @@ pub(crate) fn settle_one_shot_user_interrupt_result(
     recover_clean_cancel: bool,
     incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
 ) -> Result<StreamResult, crate::TurnFailure> {
+    let result = result.map_err(|mut failure| {
+        retain_one_shot_observed_partial(&mut failure, incremental_state);
+        failure
+    });
     let local_unsettled = one_shot_local_ownership_unsettled(executor, native_executor);
     if local_unsettled {
         return retain_one_shot_interruption_failure(
@@ -4483,6 +4493,57 @@ mod exit_code_tests {
                     .is_err()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn user_interrupt_unfenced_hard_failure_retains_observed_prefix_without_promotion() {
+        let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+        state.replace_text("observed partial");
+        let metadata = serde_json::json!({"source": "original contract failure"});
+        for original_text in ["", "original retained partial"] {
+            let failure = crate::TurnFailure {
+                error: "original contract violation".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                    error_code: Some("original_code".into()),
+                    error_metadata: Some(metadata.clone()),
+                    partial_text: original_text.into(),
+                    prompt_tokens: 11,
+                    ..Default::default()
+                },
+            };
+            // No local fence or secondary cleanup error: the hard failure
+            // still owns the terminal while its visible prefix survives.
+            let failure = super::settle_one_shot_user_interrupt_result(
+                Err(failure),
+                None,
+                None,
+                true,
+                &state,
+            )
+            .unwrap_err();
+            assert_eq!(failure.error, "original contract violation");
+            assert_eq!(
+                failure.partial.failure_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+            let json = super::hard_failure_json_output(failure);
+            assert_eq!(
+                json["text"],
+                if original_text.is_empty() {
+                    "observed partial"
+                } else {
+                    original_text
+                }
+            );
+            assert_eq!(json["error_code"], "original_code");
+            assert_eq!(json["error_metadata"], metadata);
+            assert_eq!(json["prompt_tokens"], 11);
+            assert_eq!(json["exit_code"], 3);
+            assert_eq!(json["final_state"], "failed");
+            assert_eq!(json["server_terminal_unverified"], true);
+            assert_eq!(json["success"], false);
         }
     }
 
