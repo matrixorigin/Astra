@@ -22933,7 +22933,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         let model_id = self.model_override.clone().unwrap_or_default();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
-        let raw_provider = provider.raw_provider_name().to_owned();
+        // Replay capability follows admitted upstream identity. The display
+        // alias remains the existing fork/cache identity and grants no wire capability.
+        let (replay_provider, replay_model) = self
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| (execution.provider.as_str(), execution.upstream_model_name()))
+            .unwrap_or(("", ""));
         let canonical_prefix_bytes = match serde_json::to_vec(&state.messages) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -22968,8 +22974,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             model_id: model_id.clone(),
             thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
                 &state.thinking,
-                &raw_provider,
-                &model_id,
+                replay_provider,
+                replay_model,
             ),
             system_blocks: vec![],
             tool_schemas,
@@ -23876,6 +23882,8 @@ mod tests {
         assert_eq!(texts[0], "existing runtime fact");
         assert!(texts[1].contains("No provider-owned collaborator is currently advertised"));
     }
+
+    include!("server_loop_host_replay_tests.rs");
 
     fn test_host_builder(
         user_id: impl Into<String>,
