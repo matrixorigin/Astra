@@ -99,6 +99,27 @@ async fn refresh_root_permission_context(
     }
 }
 
+/// Arc-wrap the fully configured canonical executor and publish that same
+/// instance before admission. A reused observation slot must never hide a
+/// different executor behind an earlier reference.
+#[allow(clippy::result_large_err)]
+pub(crate) fn retain_cli_executor(
+    executor: edge_tools::ToolExecutor,
+    observer: Option<&crate::cli::chat_stream::CliExecutorObserver>,
+) -> Result<Arc<edge_tools::ToolExecutor>, crate::TurnFailure> {
+    let executor = Arc::new(executor);
+    if observer.is_some_and(|observer| observer.set(executor.clone()).is_err()) {
+        return Err(crate::TurnFailure {
+            error: "ordinary SSE executor observer was reused for another executor".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                ..Default::default()
+            },
+        });
+    }
+    Ok(executor)
+}
+
 /// Keep stream state on the heap at the shared entrypoint. Embedding it in
 /// callers compounds their poll stack before a local tool callback can run.
 pub(crate) fn stream_chat_sse<'a>(
@@ -548,7 +569,7 @@ async fn stream_chat_sse_inner(
         history: p.history,
         recent_tools: p.recent_tools,
         project_root: project_root.clone(),
-        executor: std::sync::Arc::new(executor),
+        executor: retain_cli_executor(executor, p.executor_observer.as_ref())?,
         registry,
         all_schemas,
         perm_manager: p.perm_manager,
@@ -588,6 +609,16 @@ async fn stream_chat_sse_inner(
         last_error_metadata: None,
         output_transport_failure: None,
     };
+
+    #[cfg(test)]
+    if let Some(observer) = p.executor_observer.as_ref() {
+        // Public-entry loopback tests verify the actual admission host too,
+        // rather than only the reference returned by the isolated factory.
+        assert!(Arc::ptr_eq(
+            &host.executor,
+            observer.get().expect("published executor")
+        ));
+    }
 
     let completion_checks =
         load_completion_check_declarations(&project_root).map_err(|error| crate::TurnFailure {
@@ -1127,6 +1158,30 @@ fn load_turn_messages(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_executor_observer_rejects_a_second_factory_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+        let first = super::retain_cli_executor(
+            crate::edge_tools::ToolExecutor::new(root.path()),
+            Some(&observer),
+        )
+        .unwrap();
+        let failure = super::retain_cli_executor(
+            crate::edge_tools::ToolExecutor::new(root.path()),
+            Some(&observer),
+        )
+        .err()
+        .expect("a different executor cannot replace the observed owner");
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, observer.get().unwrap()));
+        assert!(failure.partial.run_id.is_none());
+        assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+    }
+
     use super::{
         TurnMessageLoadError, load_turn_messages, missing_model_selection_journal_event,
         missing_model_selection_turn_failure, non_tty_output_failure, normalize_turn_model,

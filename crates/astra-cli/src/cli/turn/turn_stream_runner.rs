@@ -214,6 +214,7 @@ fn build_turn_stream_params<'a>(
         execution_time_budget: None,
         run_control: Some(prepared.run_control.clone()),
         incremental_state: Some(prepared.incremental_state.clone()),
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: state.tui_stream_event_tx.clone(),

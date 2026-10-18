@@ -388,6 +388,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: Some(request_lease.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: Some(event_tx),
@@ -572,6 +573,7 @@ async fn stream_chat_sse_simple_text_response() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -698,6 +700,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: Some(event_tx),
@@ -849,6 +852,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
@@ -955,6 +959,7 @@ async fn stream_chat_sse_api_error_propagated() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1074,6 +1079,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
@@ -1247,6 +1253,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1416,6 +1423,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1583,6 +1591,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -2178,12 +2187,16 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
             let mut context = basic_chat_context(&api, &registry, "synthetic preflight");
             context.model = selected;
             let mut pm = PermissionManager::new(true);
+            let observer = crate::cli::chat_stream::CliExecutorObserver::default();
             let failure = execute_basic_cli_turn(
                 &context,
                 "synthetic-token",
                 None,
                 &mut pm,
-                BasicCliTurnOptions::default(),
+                BasicCliTurnOptions {
+                    executor_observer: Some(observer.clone()),
+                    ..Default::default()
+                },
             )
             .await
             .expect_err("catalog rejected");
@@ -2199,6 +2212,10 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
             assert_eq!(
                 crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure),
                 status == 401
+            );
+            assert!(
+                observer.get().is_none(),
+                "catalog denial is before the executor factory"
             );
             assert!(failure.partial.run_id.is_none());
             assert!(failure.partial.tool_call_records.is_empty());
@@ -2255,4 +2272,123 @@ async fn unsupported_workspace_host_rejects_public_turn_before_admission_http() 
     assert_eq!(requests[0].url.path(), "/models");
     assert!(failure.partial.run_id.is_none());
     assert!(failure.partial.tool_call_records.is_empty());
+}
+
+#[tokio::test]
+async fn basic_cli_catalog_auth_retry_observes_only_the_successful_factory() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    use axum::response::IntoResponse as _;
+    use axum::routing::get;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let catalogs = Arc::new(AtomicUsize::new(0));
+    let catalog_count = catalogs.clone();
+    let chats = Arc::new(AtomicUsize::new(0));
+    let chat_count = chats.clone();
+    let app = Router::new()
+        .route(
+            "/models",
+            get(move || {
+                let count = catalog_count.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            "synthetic expired token",
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(crate::test_utils::mock_model_catalog_json(&["test-model"]))
+                            .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/chat/stream",
+            post(move || {
+                let count = chat_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        TEST_SSE_HEADERS,
+                        sse_text_response("retry result", "sess-observer-retry"),
+                    )
+                }
+            }),
+        );
+    let base = super::spawn_mock_app(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "synthetic retry");
+    let mut pm = PermissionManager::new(true);
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    let options = BasicCliTurnOptions {
+        executor_observer: Some(observer.clone()),
+        ..Default::default()
+    };
+    // Utility/child constructors have no observer unless the outer request explicitly supplies it.
+    assert!(
+        ChatTurnParams::basic_cli(&context, "synthetic", None, &mut pm)
+            .executor_observer
+            .is_none()
+    );
+    let failure = execute_basic_cli_turn(
+        &context,
+        "synthetic-expired",
+        None,
+        &mut pm,
+        options.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+    assert!(observer.get().is_none());
+    // The same cloned options used by auth refresh must still publish the real successful factory.
+    let result = execute_basic_cli_turn(&context, "synthetic-refreshed", None, &mut pm, options)
+        .await
+        .unwrap();
+    assert_eq!(result.full_text, "retry result");
+    assert!(observer.get().is_some());
+    assert_eq!(chats.load(Ordering::SeqCst), 1);
+    assert_eq!(catalogs.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn basic_cli_post_catalog_auth_failure_never_authorizes_replay() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    let app = Router::new().route(
+        "/chat/stream",
+        post(|| async {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "synthetic post-catalog auth denial",
+            )
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "no replay");
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    let mut pm = PermissionManager::new(true);
+    let failure = execute_basic_cli_turn(
+        &context,
+        "synthetic",
+        None,
+        &mut pm,
+        BasicCliTurnOptions {
+            executor_observer: Some(observer.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        observer.get().is_some(),
+        "this failure occurs after executor creation"
+    );
+    assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
 }

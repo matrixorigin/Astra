@@ -425,6 +425,7 @@ pub(crate) async fn handle_review_command(
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,

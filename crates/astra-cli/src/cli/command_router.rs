@@ -2388,6 +2388,7 @@ async fn execute_cli_command_impl(
                     &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                 )
             };
+            let mut native_executor = None;
             let mut native_delivery = if let (Some(session_id), Some(account_id)) =
                 (session_id.as_deref(), cli_utils::cli_account_id())
             {
@@ -2398,16 +2399,19 @@ async fn execute_cli_command_impl(
                 // being reused by this process.
                 pm.bind_permission_attachment(session_id, 1);
                 let project_root = std::env::current_dir().unwrap_or_default();
-                let executor = crate::edge_tools::ToolExecutor::new(project_root)
-                    .with_active_session_id(session_id.to_owned())
-                    .with_cloud(api.api_origin(), token.to_owned());
+                let executor = std::sync::Arc::new(
+                    crate::edge_tools::ToolExecutor::new(project_root)
+                        .with_active_session_id(session_id.to_owned())
+                        .with_cloud(api.api_origin(), token.to_owned()),
+                );
+                native_executor = Some(executor.clone());
                 setup_await!(
                     crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
                         api,
                         &token,
                         account_id,
                         session_id,
-                        std::sync::Arc::new(executor),
+                        executor,
                         pm.subscribe_permission_policy(),
                         one_shot_terminal_deadline,
                     )
@@ -2491,6 +2495,7 @@ async fn execute_cli_command_impl(
             let wall_deadline_incremental_state = Some(std::sync::Arc::new(
                 astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
             ));
+            let executor_observer = crate::cli::chat_stream::CliExecutorObserver::default();
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 deferred_tool_activations,
@@ -2499,6 +2504,7 @@ async fn execute_cli_command_impl(
                 turn_index: Some(session_routing.next_server_turn_index()),
                 cancel_token: wall_deadline_cancel_token.clone(),
                 incremental_state: wall_deadline_incremental_state.clone(),
+                executor_observer: Some(executor_observer.clone()),
                 request_session_execution_lease: Some(request_session_execution_lease.clone()),
                 ..Default::default()
             };
@@ -2582,10 +2588,7 @@ async fn execute_cli_command_impl(
                                         wall_deadline_root_settled = true;
                                         match result {
                                             Ok(result) => Ok(result),
-                                            Err(failure) if !user_interrupted || (
-                                                failure.is_clean_local_cancel()
-                                                && request_session_execution_lease.failure().is_none()
-                                            ) => Ok(stream_result_from_incremental_snapshot(
+                                            Err(_) if !user_interrupted => Ok(stream_result_from_incremental_snapshot(
                                                 wall_deadline_incremental_state
                                                     .as_ref()
                                                     .map(|state| state.snapshot())
@@ -2666,9 +2669,32 @@ async fn execute_cli_command_impl(
                 );
             }
 
+            if user_interrupted {
+                // Native shutdown joins callbacks and their local scope cleanup.
+                // Only now can its sticky ownership barrier veto partial recovery.
+                turn_result = settle_one_shot_user_interrupt_result(
+                    turn_result,
+                    executor_observer.get().map(|executor| executor.as_ref()),
+                    native_executor.as_deref(),
+                    wall_deadline_root_settled
+                        && wall_deadline_server_terminal_settled
+                        && request_session_execution_lease.failure().is_none(),
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state"),
+                );
+            }
+
             let mut sr = match turn_result {
                 Ok(sr) => sr,
-                Err(e) if crate::cli::turn::turn_facade::is_settled_stdout_closure(&e) => {
+                Err(e)
+                    if one_shot_stdout_closure_is_settled(
+                        &e,
+                        user_interrupted,
+                        executor_observer.get().map(|executor| executor.as_ref()),
+                        native_executor.as_deref(),
+                    ) =>
+                {
                     return Ok(ExitCode::Success);
                 }
                 Err(e) => {
@@ -3335,6 +3361,85 @@ fn interrupted_before_chat_admission(json: bool) -> Result<ExitCode, String> {
         )?;
     }
     Ok(ExitCode::ApiError)
+}
+
+fn one_shot_local_ownership_unsettled(
+    executor: Option<&crate::edge_tools::ToolExecutor>,
+    native_executor: Option<&crate::edge_tools::ToolExecutor>,
+) -> bool {
+    executor.into_iter().chain(native_executor).any(|executor| {
+        astra_tools::workspace_observation::workspace_ownership_is_unsettled(
+            &executor.effective_project_root(),
+        ) == Some(true)
+    })
+}
+
+pub(crate) fn one_shot_stdout_closure_is_settled(
+    failure: &crate::TurnFailure,
+    user_interrupted: bool,
+    executor: Option<&crate::edge_tools::ToolExecutor>,
+    native_executor: Option<&crate::edge_tools::ToolExecutor>,
+) -> bool {
+    crate::cli::turn::turn_facade::is_settled_stdout_closure(failure)
+        && (!user_interrupted || !one_shot_local_ownership_unsettled(executor, native_executor))
+}
+
+/// Called only after native delivery shutdown; a settled Server run cannot
+/// discharge the executor's independent, canonical local ownership barrier.
+#[allow(clippy::result_large_err)]
+pub(crate) fn settle_one_shot_user_interrupt_result(
+    result: Result<StreamResult, crate::TurnFailure>,
+    executor: Option<&crate::edge_tools::ToolExecutor>,
+    native_executor: Option<&crate::edge_tools::ToolExecutor>,
+    recover_clean_cancel: bool,
+    incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
+) -> Result<StreamResult, crate::TurnFailure> {
+    let local_unsettled = one_shot_local_ownership_unsettled(executor, native_executor);
+    if local_unsettled {
+        let mut failure = match result {
+            Err(failure) => failure,
+            Ok(sr) => {
+                let tool_outcomes = sr.canonical_tool_outcomes();
+                crate::TurnFailure {
+                    error: "user_interrupted".to_string(),
+                    partial: crate::PartialTurnData {
+                        qualified_usage: sr.qualified_usage,
+                        session_id: sr.session_id,
+                        run_id: sr.run_id,
+                        partial_text: sr.full_text,
+                        prompt_tokens: sr.prompt_tokens,
+                        completion_tokens: sr.completion_tokens,
+                        cache_read_tokens: sr.cache_read_tokens,
+                        cache_creation_tokens: sr.cache_creation_tokens,
+                        usage_attribution: sr.usage_attribution,
+                        tool_calls_count: sr.tool_calls_count,
+                        tool_call_records: sr.tool_call_records,
+                        tools_used: sr.tools_used,
+                        stall_events: sr.stall_events,
+                        verdict_events: sr.verdict_events,
+                        last_heavy_checkpoint: sr.last_heavy_checkpoint,
+                        llm_rounds: sr.llm_rounds,
+                        token_usage_coverage: sr.token_usage_coverage,
+                        tool_outcomes,
+                        applied_user_intents: sr.applied_user_intents,
+                        run_transcript_messages: sr.run_transcript_messages,
+                        interruption: sr.interruption,
+                        ..Default::default()
+                    },
+                }
+            }
+        };
+        failure
+            .error
+            .push_str("; workspace_ownership_unsettled; local execution settlement is unverified");
+        return Err(failure);
+    }
+    match result {
+        Err(failure) if recover_clean_cancel && failure.is_clean_local_cancel() => Ok(
+            stream_result_from_incremental_snapshot(incremental_state.snapshot()),
+        ),
+        result => result,
+    }
 }
 
 fn apply_wall_deadline_interruption(sr: &mut StreamResult, server_terminal_verified: bool) {
@@ -4080,6 +4185,151 @@ mod exit_code_tests {
 
     fn empty_stream_result() -> StreamResult {
         StreamResult::default()
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_rejects_drained_ok_and_preserves_partial_json() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        let result = StreamResult {
+            session_id: Some("session".into()),
+            run_id: Some("run".into()),
+            full_text: "observed prefix".into(),
+            prompt_tokens: 17,
+            llm_rounds: Some(2),
+            server_terminal_authoritative: true,
+            run_transcript_messages: vec![
+                serde_json::json!({"role": "assistant", "content": "observed prefix"}),
+            ],
+            ..Default::default()
+        };
+        let failure = super::settle_one_shot_user_interrupt_result(
+            Ok(result),
+            Some(&executor),
+            None,
+            true,
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.partial.llm_rounds, Some(2));
+        assert_eq!(failure.partial.run_transcript_messages.len(), 1);
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["session_id"], "session");
+        assert_eq!(json["run_id"], "run");
+        assert_eq!(json["text"], "observed prefix");
+        assert_eq!(json["prompt_tokens"], 17);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["server_terminal_unverified"], true);
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("workspace_ownership_unsettled"));
+        assert!(error.contains("local execution settlement is unverified"));
+    }
+
+    #[test]
+    fn user_interrupt_local_fence_preserves_clean_cancel_and_hard_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(root.path())
+        );
+        for kind in [
+            astra_core::ErrorKind::Cancelled,
+            astra_core::ErrorKind::ContractViolation,
+        ] {
+            let failure = crate::TurnFailure {
+                error: "original failure".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(kind),
+                    partial_text: "retained partial".into(),
+                    error_code: (kind != astra_core::ErrorKind::Cancelled)
+                        .then(|| "original_code".into()),
+                    prompt_tokens: 23,
+                    ..Default::default()
+                },
+            };
+            let expected_code = failure.partial.error_code.clone();
+            let failure = super::settle_one_shot_user_interrupt_result(
+                Err(failure),
+                Some(&executor),
+                None,
+                true,
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(
+                failure
+                    .error
+                    .starts_with("original failure; workspace_ownership_unsettled")
+            );
+            assert_eq!(failure.partial.failure_kind, Some(kind));
+            assert_eq!(failure.partial.error_code, expected_code);
+            assert_eq!(failure.partial.partial_text, "retained partial");
+            assert_eq!(failure.partial.prompt_tokens, 23);
+        }
+    }
+
+    #[test]
+    fn user_interrupt_without_local_fence_retains_existing_partial_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        for executor in [None, Some(&executor)] {
+            let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+            let failure = crate::TurnFailure {
+                error: "cancelled".into(),
+                partial: crate::PartialTurnData {
+                    failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                    ..Default::default()
+                },
+            };
+            let mut recovered = super::settle_one_shot_user_interrupt_result(
+                Err(failure),
+                executor,
+                None,
+                true,
+                &state,
+            )
+            .unwrap();
+            super::apply_wall_deadline_interruption(&mut recovered, true);
+            assert_eq!(super::compute_exit_code(&recovered), ExitCode::Partial);
+            assert!(!recovered.server_terminal_unverified);
+            let unchanged = super::settle_one_shot_user_interrupt_result(
+                Ok(StreamResult {
+                    full_text: "unchanged".into(),
+                    ..Default::default()
+                }),
+                executor,
+                None,
+                true,
+                &state,
+            )
+            .unwrap();
+            assert_eq!(unchanged.full_text, "unchanged");
+            for kind in [
+                astra_core::ErrorKind::Cancelled,
+                astra_core::ErrorKind::ContractViolation,
+            ] {
+                let failure = crate::TurnFailure {
+                    error: "unsettled or hard failure".into(),
+                    partial: crate::PartialTurnData {
+                        failure_kind: Some(kind),
+                        ..Default::default()
+                    },
+                };
+                assert!(
+                    super::settle_one_shot_user_interrupt_result(
+                        Err(failure),
+                        executor,
+                        None,
+                        kind != astra_core::ErrorKind::Cancelled,
+                        &state,
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]

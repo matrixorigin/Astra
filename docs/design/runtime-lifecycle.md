@@ -132,7 +132,14 @@ observed partial text. Cancellation acceptance alone does not
 prove execution settlement. Missing run identity, failed settlement, a drain
 failure or a second interrupt produces an unverified failure instead of a
 successful terminal result or automatic replay. A setup interrupt before stream
-admission sends no run cancellation.
+admission sends no run cancellation. After native callback shutdown, a positively
+unsettled local workspace owner blocks resumable partial publication, even when
+the exact Server run has settled. A request-scoped reference published by the
+ordinary SSE executor factory follows that same executor's active worktree;
+the native delivery executor is checked independently. Neither can substitute
+for the other. Observed partial data remains available as an explicit failure,
+and a closed stdout pipe cannot turn a positively unsettled local owner into a
+successful exit. Absent local evidence does not create settlement authority.
 
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and

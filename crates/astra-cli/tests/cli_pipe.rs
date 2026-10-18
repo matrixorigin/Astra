@@ -696,37 +696,37 @@ fn assert_no_completed_turn(directory: std::path::PathBuf, session_id: &str) {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_settles_exact_run_without_wall_deadline() {
-    assert_one_shot_sigint(true, true, false, false, false).await;
+    assert_one_shot_sigint(true, true, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_preserves_wall_deadline_contract() {
-    assert_one_shot_sigint(true, true, true, false, false).await;
+    assert_one_shot_sigint(true, true, true, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_unsettled_cancel_is_not_success() {
-    assert_one_shot_sigint(false, true, false, false, false).await;
+    assert_one_shot_sigint(false, true, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_without_run_identity_never_cancels_session() {
-    assert_one_shot_sigint(false, false, false, false, false).await;
+    assert_one_shot_sigint(false, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_second_sigint_returns_unverified_json() {
-    assert_one_shot_sigint(false, true, false, true, false).await;
+    assert_one_shot_sigint(false, true, false, true, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_interrupts_setup_before_stream_admission() {
-    assert_one_shot_sigint(false, false, false, false, true).await;
+    assert_one_shot_sigint(false, false, false, false, true, false).await;
 }
 
 /// Exercise the real command router and process signal policy with a held
@@ -738,6 +738,7 @@ async fn assert_one_shot_sigint(
     wall: bool,
     second: bool,
     setup: bool,
+    local_fenced: bool,
 ) {
     use axum::body::{Body, Bytes};
     use axum::extract::Path;
@@ -804,6 +805,12 @@ async fn assert_one_shot_sigint(
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let home = tempfile::tempdir().unwrap();
+    if local_fenced {
+        // Synthetic pre-existing canonical fence; never clear any real workspace guard.
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(home.path())
+        );
+    }
     let events = home.path().join("events.jsonl");
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
     command
@@ -917,7 +924,7 @@ async fn assert_one_shot_sigint(
     } else {
         assert_eq!(cancels.load(Ordering::SeqCst), 0);
     }
-    if settled {
+    if settled && !local_fenced {
         assert_eq!(output.status.code(), Some(5));
         assert_eq!(json["final_state"], "interrupted");
         assert_eq!(json["interruption_kind"], "execution_incomplete");
@@ -929,7 +936,29 @@ async fn assert_one_shot_sigint(
         assert_eq!(json["final_state"], "failed");
         assert_eq!(json["server_terminal_unverified"], true);
         assert_eq!(json["success"], false);
+        if local_fenced {
+            assert_eq!(json["text"], "observed partial");
+            assert_eq!(json["persistence_error"], serde_json::Value::Null);
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("workspace_ownership_unsettled")
+            );
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("local execution settlement is unverified")
+            );
+        }
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_server_settled_cannot_hide_local_ownership_fence() {
+    assert_one_shot_sigint(true, true, false, false, false, true).await;
 }
 
 #[cfg(unix)]

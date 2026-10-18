@@ -504,10 +504,14 @@ pub struct PlanReviewRequest {
 
 pub type PlanReviewRequestTx = mpsc::Sender<PlanReviewRequest>;
 
-/// Parameters for a single agentic chat turn — groups the many arguments
-/// to `stream_chat_sse` into a named struct to reduce cognitive load.
 use crate::cli::cli_config::cli_context::CliContext;
 
+/// Request-local reference to the canonical ordinary executor, published once.
+pub(crate) type CliExecutorObserver =
+    Arc<std::sync::OnceLock<Arc<crate::edge_tools::ToolExecutor>>>;
+
+/// Parameters for a single agentic chat turn — groups the many arguments
+/// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
@@ -582,6 +586,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
+    /// Observe the exact ordinary SSE executor through request settlement.
+    /// This carries a reference only, never a copied workspace or authority.
+    pub(crate) executor_observer: Option<CliExecutorObserver>,
     /// Request-scoped execution authority. Headless fresh-session calls bind
     /// this from the first accepted Server session identity before any edge
     /// tool can execute, then retain it through canonical local persistence.
@@ -800,6 +807,7 @@ impl<'a> ChatTurnParams<'a> {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
