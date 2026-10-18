@@ -301,7 +301,14 @@ pub(crate) fn turn_policy_from_payload_edge_tools(
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
     let schemas = final_visible_tool_schemas_from_payload(payload);
-    TurnInteractionPolicy::from_tool_schemas(interaction_mode, &schemas)
+    let mut policy = TurnInteractionPolicy::from_tool_schemas(interaction_mode, &schemas);
+    // Pause capability can come from the approval transport even when the
+    // caller has no ask_user channel and has restricted that tool.
+    policy.allow_ask_user &= policy
+        .visible_tool_names
+        .iter()
+        .any(|name| name == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME);
+    policy
 }
 
 pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Value> {
@@ -908,10 +915,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         .filter_map(tool_schema_name)
         .map(|name| (name.to_string(), name.to_string()))
         .collect();
+    let mut restricted_tool_names = ctx.restricted_tools.iter().collect::<Vec<_>>();
+    restricted_tool_names.sort();
     merge_edge_profile_extensions(
         &mut payload,
         &json!({
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS: native_ids,
+            // Server also owns builtin schemas. Carry the deny set so it
+            // cannot reintroduce a tool whose client channel is unavailable.
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES: restricted_tool_names,
         }),
     );
     attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
@@ -2716,6 +2728,16 @@ mod tests {
         );
         assert_eq!(policy.observation_tool_names, vec!["mo_query".to_string()]);
         assert!(policy.allow_ask_user);
+    }
+
+    #[test]
+    fn approval_pause_does_not_enable_an_unavailable_question_tool() {
+        let policy = super::turn_policy_from_payload_edge_tools(
+            &json!({"edge_tools": [schema("write_file")]}),
+            TurnInteractionMode::Prompt,
+        );
+        assert!(policy.can_pause_for_user);
+        assert!(!policy.allow_ask_user);
     }
 
     #[test]

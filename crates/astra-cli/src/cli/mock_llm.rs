@@ -1065,6 +1065,17 @@ async fn handle_cancel_run(
     State(state): State<ServerState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<axum::Json<Value>, StatusCode> {
+    // A pending local tool approval can interrupt the fixture's root stream.
+    if state.scenario == MockScenario::ToolThenComplete && run_id == "mock-run-tool" {
+        state
+            .cancelled_runs
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .push(run_id.clone());
+        return Ok(axum::Json(serde_json::json!({
+            "run_id": run_id, "status": "cancelled", "execution_settled": true
+        })));
+    }
     let snapshot = orchestration_snapshot(&state)?;
     let run = snapshot
         .runs
@@ -1232,6 +1243,11 @@ impl MockLlmServer {
     /// Start the mock server on a random free port. Returns immediately.
     pub async fn start(scenario: MockScenario) -> Result<Self, String> {
         Self::start_inner(scenario, false, Router::new()).await
+    }
+
+    /// Add boundary-specific protocol fixtures alongside the scripted chat.
+    pub async fn start_with_routes(scenario: MockScenario, routes: Router) -> Result<Self, String> {
+        Self::start_inner(scenario, false, routes).await
     }
 
     /// Hold a Server orchestration stream until the test releases its terminal

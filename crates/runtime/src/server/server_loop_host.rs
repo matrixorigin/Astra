@@ -34215,6 +34215,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_approval_transport_can_restrict_server_owned_question_tool() {
+        let build = |profile| {
+            test_host_builder("user1", "sess1")
+                .with_edge_tools(sample_edge_tools_full())
+                .with_execution_binding_snapshot(edge_runtime_snapshot())
+                .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+                .with_edge_profile(profile)
+                .build()
+        };
+        let unrestricted = build(serde_json::Map::new());
+        assert!(schema_names(&unrestricted.tool_schemas).contains("ask_user"));
+        let profile = serde_json::Map::from_iter([(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES
+                .to_string(),
+            json!(["ask_user"]),
+        )]);
+        let host = build(profile);
+        assert_eq!(host.turn_interaction_mode(), TurnInteractionMode::Prompt);
+        assert!(!schema_names(&host.tool_schemas).contains("ask_user"));
+        assert!(!schema_names(&host.deferred_tool_schemas).contains("ask_user"));
+        assert!(!host.valid_tool_names().contains("ask_user"));
+        assert!(!host.always_load_tool_names.contains("ask_user"));
+    }
+
+    #[test]
     fn sync_valid_tools_uses_final_wire_surface_not_candidate_edge_tools() {
         let mut host = test_host_builder("user1", "sess1")
             .with_server_service_tool_catalog_enabled(false)

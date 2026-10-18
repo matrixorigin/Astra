@@ -2,6 +2,18 @@
 
 Current Rust CLI reference for the single `astra` CLI, including `astra admin`.
 
+## Stdio app server
+
+`astra serve stdio` accepts JSON-RPC requests over piped stdin/stdout. A
+`turn/start` request with `permissionMode: "prompt"` (or `"accept_edits"`)
+uses the same permission manager as the terminal. When a tool needs approval,
+`approval/requested` carries its approval ID; answer with `approval/respond`
+using `approvalId` and `decision` (`allow_once`, `always`, or `deny`).
+`turn/interrupt` closes pending approvals without authorizing execution.
+The approval transport does not provide the `ask_user` question interface.
+Prompt execution without an approval transport or terminal prompt sink fails
+before a model request is admitted.
+
 ## Turn summary
 
 The completion line shows elapsed time, time to first token (`ttft`), primary
