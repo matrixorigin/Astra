@@ -334,20 +334,21 @@ fn an_existing_default_state_alias_is_preserved_during_registration() {
     symlink(workspace.path(), &alias).unwrap();
     let previous_path = materialization_id_path_in_state(&alias, device.path());
     fs::create_dir_all(previous_path.parent().unwrap()).unwrap();
-    fs::write(&previous_path, "materialization-persisted-alias").unwrap();
+    let device_id = "device-legacy-alias-fixture";
+    fs::write(previous_path.parent().unwrap().join("device.id"), device_id).unwrap();
+    let legacy = compatibility::legacy_id(workspace.path(), device_id, None);
+    let original_bytes = format!("{legacy}\n").into_bytes();
+    fs::write(&previous_path, &original_bytes).unwrap();
     assert_eq!(
         load_or_create_materialization_id_in_roots(&alias, cache.path(), device.path()).unwrap(),
-        "materialization-persisted-alias"
+        legacy
     );
     assert_eq!(
         load_or_create_materialization_id_in_roots(workspace.path(), cache.path(), device.path())
             .unwrap(),
-        "materialization-persisted-alias"
+        legacy
     );
-    assert_eq!(
-        fs::read_to_string(previous_path).unwrap(),
-        "materialization-persisted-alias"
-    );
+    assert_eq!(fs::read(previous_path).unwrap(), original_bytes);
 }
 
 #[test]
@@ -469,4 +470,175 @@ fn a_dangling_default_state_alias_is_not_ignored() {
     );
     assert_eq!(fs::read_link(previous_path).unwrap(), missing);
     assert!(!missing.exists());
+}
+
+#[cfg(unix)]
+mod compatibility {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    // Exact pre-UUID seed: the previous client recomputes and compares this
+    // value on every start. A UUID belongs in the witness, not in this seed.
+    pub(super) fn legacy_id(
+        workspace: &std::path::Path,
+        device_id: &str,
+        device_number: Option<u64>,
+    ) -> String {
+        let workspace = workspace.canonicalize().unwrap();
+        let metadata = workspace.metadata().unwrap();
+        let mut bytes = device_id.as_bytes().to_vec();
+        bytes.push(0);
+        bytes.extend_from_slice(workspace.to_string_lossy().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&device_number.unwrap_or(metadata.dev()).to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+        format!("materialization-{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn new_registration_keeps_the_pre_uuid_seed_for_older_readers() {
+        let device = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let owner = materialization_id_path_in_state(&workspace, device.path());
+        fs::create_dir_all(owner.parent().unwrap()).unwrap();
+        let device_id = "device-backward-readability-fixture";
+        fs::write(owner.parent().unwrap().join("device.id"), device_id).unwrap();
+        let expected = legacy_id(&workspace, device_id, None);
+        let actual =
+            load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+                .unwrap();
+        assert_eq!(
+            actual, expected,
+            "a fresh ID must pass the old reader's strict comparison"
+        );
+        assert_eq!(fs::read_to_string(&owner).unwrap(), expected);
+        assert_eq!(
+            load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_existing_owner_with_a_different_seed_is_never_rewritten() {
+        let device = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+            .unwrap();
+        let owner = materialization_id_path_in_state(&workspace, device.path());
+        let witness = fs::read(owner.with_extension("checkout")).unwrap();
+        // Published IDs are opaque. Model an ID minted by the UUID-seeded
+        // implementation without coupling this test to the native UUID API.
+        let published = format!(
+            "materialization-{:x}",
+            Sha256::digest(b"previous-uuid-seed")
+        );
+        let original = format!("{published}\n").into_bytes();
+        fs::write(&owner, &original).unwrap();
+        assert_eq!(
+            load_or_create_materialization_id_in_roots(&workspace, device.path(), device.path())
+                .unwrap(),
+            published
+        );
+        assert_eq!(fs::read(&owner).unwrap(), original);
+        assert_eq!(fs::read(owner.with_extension("checkout")).unwrap(), witness);
+    }
+
+    #[test]
+    fn retargeted_default_state_alias_is_rejected_before_creating_a_new_owner() {
+        let device = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let alias = root.path().join("alias");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        symlink(&first, &alias).unwrap();
+        let original =
+            load_or_create_materialization_id_in_roots(&alias, device.path(), device.path())
+                .unwrap();
+        let alias_path = materialization_id_path_in_state(&alias, device.path());
+        let original_alias = fs::read(&alias_path).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        let error =
+            load_or_create_materialization_id_in_roots(&alias, device.path(), device.path())
+                .unwrap_err();
+        assert!(error.contains("alias cannot prove"), "{error}");
+        assert_eq!(fs::read(alias_path).unwrap(), original_alias);
+        assert_eq!(
+            fs::read_to_string(materialization_id_path_in_state(
+                &first.canonicalize().unwrap(),
+                device.path()
+            ))
+            .unwrap(),
+            original
+        );
+        let second_owner =
+            materialization_id_path_in_state(&second.canonicalize().unwrap(), device.path());
+        assert!(!second_owner.exists());
+        assert!(!second_owner.with_extension("checkout").exists());
+    }
+
+    #[test]
+    fn a_matching_canonical_owner_authorizes_an_alias_after_mount_number_drift() {
+        let device = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let canonical = workspace.path().canonicalize().unwrap();
+        let alias = aliases.path().join("alias");
+        symlink(&canonical, &alias).unwrap();
+        let owner = materialization_id_path_in_state(&canonical, device.path());
+        fs::create_dir_all(owner.parent().unwrap()).unwrap();
+        let device_id = "device-mount-drift-alias-fixture";
+        fs::write(owner.parent().unwrap().join("device.id"), device_id).unwrap();
+        let old_id = legacy_id(
+            &canonical,
+            device_id,
+            Some(canonical.metadata().unwrap().dev() ^ 1),
+        );
+        let original_bytes = format!("{old_id}\n").into_bytes();
+        fs::write(&owner, &original_bytes).unwrap();
+        let alias_path = materialization_id_path_in_state(&alias, device.path());
+        fs::write(&alias_path, &original_bytes).unwrap();
+        assert_eq!(
+            load_or_create_materialization_id_in_roots(&alias, device.path(), device.path())
+                .unwrap(),
+            old_id
+        );
+        assert_eq!(fs::read(owner).unwrap(), original_bytes);
+        assert_eq!(fs::read(alias_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn an_unprovable_legacy_alias_is_not_adopted_without_a_canonical_owner() {
+        let device = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let alias = aliases.path().join("alias");
+        symlink(workspace.path(), &alias).unwrap();
+        let alias_path = materialization_id_path_in_state(&alias, device.path());
+        fs::create_dir_all(alias_path.parent().unwrap()).unwrap();
+        let original = b"materialization-unverified-old-target\n";
+        fs::write(&alias_path, original).unwrap();
+        let error =
+            load_or_create_materialization_id_in_roots(&alias, device.path(), device.path())
+                .unwrap_err();
+        assert!(error.contains("alias cannot prove"), "{error}");
+        assert!(
+            error.contains("Keep device.id and login credentials"),
+            "{error}"
+        );
+        assert_eq!(fs::read(alias_path).unwrap(), original);
+        assert!(
+            !materialization_id_path_in_state(
+                &workspace.path().canonicalize().unwrap(),
+                device.path()
+            )
+            .exists()
+        );
+    }
 }

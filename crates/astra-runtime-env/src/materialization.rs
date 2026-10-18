@@ -211,7 +211,8 @@ fn checkout_binding(identity: &[u8], filesystem_uuid: &[u8], inode: u64) -> Stri
 }
 
 /// Seed a new checkout identity from the device and canonical directory.
-/// With a UUID, device/inode values only seed the ID and the separate binding
+/// Keep the pre-UUID seed readable by older clients. With a UUID, device/inode
+/// values only seed the ID and the separate binding
 /// excludes the volatile mount number. Without the Linux UUID API, the original
 /// device/inode seed remains the expected value on every start.
 struct CheckoutIdentity {
@@ -273,10 +274,6 @@ fn materialization_identity_for_workspace(
         identity.extend_from_slice(&metadata.dev().to_le_bytes());
         identity.push(0);
         identity.extend_from_slice(&metadata.ino().to_le_bytes());
-        if let Some(uuid) = volume {
-            identity.push(0);
-            identity.extend_from_slice(&uuid);
-        }
         binding
     };
     #[cfg(not(unix))]
@@ -347,8 +344,8 @@ fn load_or_create_materialization_id_with_resolver(
         None
     };
     // Older clients keyed their default-state file by the caller's path, even
-    // though the ID used its canonical root. Preserve that published value
-    // when first resolving an alias into the canonical default-state owner.
+    // though the ID used its canonical root. An alias is only a mirror once
+    // the canonical owner exists; without one, it must prove the old seed.
     let previous_exists = previous_path != canonical_path
         && match fs::symlink_metadata(&previous_path) {
             Ok(_) => true,
@@ -359,10 +356,42 @@ fn load_or_create_materialization_id_with_resolver(
                 ));
             }
         };
+    let alias_conflict_hint = "This path alias conflicts with the default-state owner. Stop its Astra/astra-edge \
+         processes and back up/remove only the conflicting alias .id file before retrying; \
+         keep the canonical .id/.checkout, device.id and login credentials.";
+    let existing_canonical_id = if previous_exists {
+        match fs::symlink_metadata(&canonical_path) {
+            Ok(_) => Some(load_or_create_identity_file(
+                &canonical_path,
+                legacy_validation,
+                || seed.clone(),
+                "workspace materialization identity",
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect canonical workspace identity: {error}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let previous_id = if previous_exists {
+        let expected = existing_canonical_id
+            .as_deref()
+            .map(|id| (id, alias_conflict_hint))
+            .unwrap_or((
+                seed.as_str(),
+                "This alias cannot prove that its saved identity belongs to the current checkout. \
+                 The link target, mount, or directory may have changed. Restore the original \
+                 checkout or stop its Astra/astra-edge processes and back up/remove only the \
+                 unverified alias .id before registering the current target again. \
+                 Keep device.id and login credentials; no saved identities were replaced.",
+            ));
         Some(load_or_create_identity_file(
             &previous_path,
-            legacy_validation,
+            Some(expected),
             || seed.clone(),
             "workspace materialization identity",
         )?)
@@ -390,21 +419,19 @@ fn load_or_create_materialization_id_with_resolver(
             "workspace checkout binding",
         )?;
     }
-    let canonical_id = load_or_create_identity_file(
-        &canonical_path,
-        legacy_validation,
-        || previous_id.as_ref().unwrap_or(&seed).clone(),
-        "workspace materialization identity",
-    )?;
+    let canonical_id = match existing_canonical_id {
+        Some(id) => id,
+        None => load_or_create_identity_file(
+            &canonical_path,
+            legacy_validation,
+            || previous_id.as_ref().unwrap_or(&seed).clone(),
+            "workspace materialization identity",
+        )?,
+    };
     if previous_id.is_some() {
         load_or_create_identity_file(
             &previous_path,
-            Some((
-                &canonical_id,
-                "This path alias conflicts with the default-state owner. Stop its Astra/astra-edge \
-                 processes and back up/remove only the conflicting alias .id file before retrying; \
-                 keep the canonical .id/.checkout, device.id and login credentials.",
-            )),
+            Some((&canonical_id, alias_conflict_hint)),
             || canonical_id.clone(),
             "workspace materialization identity",
         )?;

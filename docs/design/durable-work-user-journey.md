@@ -2,7 +2,7 @@
 
 > Status: target design contract; current support and verification limits are
 > described in the final section.
-> Last updated: 2026-09-16.
+> Last updated: 2026-10-18.
 
 This document owns the user-visible journey for finding, observing, continuing,
 and changing the execution provider for one durable Work across TUI, Web, and
@@ -186,7 +186,13 @@ under the default device-state directory, keyed by the canonical checkout path.
 Isolated cache roots mirror that identity and reject conflicting values; they
 cannot create a second identity owner. When a filesystem UUID is available,
 Unix mount device/inode metadata only seed a first registration: a changed mount
-number does not invalidate the published identity. A bounded `.checkout` sidecar records a
+number does not invalidate the published identity. New registrations keep the
+pre-UUID device/path/device-number/inode seed so an older client can read an
+unchanged checkout. The UUID belongs only in the independent witness, not the ID
+seed. Previously published IDs, including UUID-seeded IDs from an earlier
+implementation, remain byte-for-byte unchanged; this does not make those IDs
+readable by older clients. An older client still cannot handle mount-number
+drift because it does not consult the witness. A bounded `.checkout` sidecar records a
 device/path/filesystem-UUID/inode fingerprint without the volatile mount number.
 The filesystem UUID comes from macOS `ATTR_VOL_UUID` or Linux
 `FS_IOC_GETFSUUID`, read through the same open directory as its inode. A changed
@@ -212,8 +218,15 @@ it requires explicit identity recovery/re-registration. Legacy `.id` files have
 no inode witness: their first upgraded start binds the current directory, so a
 replacement before that migration cannot be detected. Non-Unix binding checks
 cover device identity and canonical path only, as before.
-Existing default-state identity values, including an older path-alias file,
-are retained during canonical-path registration. Identity
+Existing canonical default-state identity values are retained. A path-alias file
+is a mirror of an existing canonical owner and must match that owner's ID. If
+there is no canonical owner, alias migration must match the original strict
+device/path/device-number/inode seed before publishing any canonical owner or
+witness. An unchanged legacy alias retains its exact bytes; an alias whose target
+or unprovable mount binding changed fails closed instead of relabelling the old
+target's identity. Restore the original checkout or explicitly back up/remove
+only that unverified alias before registering the current target again. No
+extra alias mapping or state format is introduced. Identity
 files remain bounded regular files with atomic no-replace publication; malformed
 or symlinked state is rejected. A conflicting legacy identity present only in an
 isolated cache is not adopted when the default-state owner is absent; the cache
@@ -227,7 +240,10 @@ using that checkout. Back up and remove only its canonical
 under the default device-state root, together with that checkout's older path
 alias and isolated-cache `.id` mirrors. Removing `.id` alone does not reset the
 checkout guard. Register the replacement checkout again; do not treat this as
-permission to resume the previous checkout's Session/provider binding. Keep
+permission to resume the previous checkout's Session/provider binding. Deleting
+the owner and witness is an explicit loss of continuity
+evidence, not proof of a new identity: recycled device/inode values can reproduce
+the legacy seed. Do not use such a reset to authorize an old Session binding. Keep
 `device.id`, login credentials and unrelated checkout state. For a conflicting
 isolated cache/alias only, back up/remove only that conflicting mirror, retaining
 the canonical `.id` and `.checkout`. No automatic deletion or identity repair is
