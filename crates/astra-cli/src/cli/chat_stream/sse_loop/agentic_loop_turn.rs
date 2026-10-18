@@ -1786,6 +1786,9 @@ mod tests {
         use std::collections::HashSet;
         let root = tempfile::tempdir().unwrap();
         let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        // Test executors install the full default tool surface. Model an
+        // explicitly resolved no-tool turn before checking its host needs.
+        executor.set_current_tool_surface(&[], HashSet::new());
         let schema = |name| json!({"type": "function", "function": {"name": name}});
         WORKSPACE_HOST_VALIDATION_FOR_TEST
             .scope(
