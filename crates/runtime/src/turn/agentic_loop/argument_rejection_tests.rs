@@ -1,4 +1,3 @@
-use super::*;
 use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
 use crate::turn::agentic_loop::host::tests::{
     MockHost, edge_runtime_environment_fields, edge_tool_result, make_edge_tool_with_args,
@@ -37,6 +36,8 @@ async fn actual_pure_edit_rejection_survives_callback_journal_without_recovery_c
         ])
         .with_valid_tools(&["str_replace"]);
         let mut state = make_state();
+        // The earlier provider recovery was consumed before this tool turn.
+        state.provider_adaptation.safe_recovery_attempted = true;
         let _ = run_agentic_loop_with_host(&mut host, &mut state)
             .await
             .unwrap();
@@ -48,11 +49,9 @@ async fn actual_pure_edit_rejection_survives_callback_journal_without_recovery_c
             Some(astra_core::ErrorKind::ToolInvalidArgs)
         );
         assert!(!record.was_executed());
-        state.provider_adaptation.action_convergence_attempted = true;
-        assert!(!advance_provider_recovery_epoch_from_new_records(
-            &mut state, 0
-        ));
-        assert!(state.provider_adaptation.action_convergence_attempted);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
+        assert_eq!(host.turn_count(), 2, "rejection must not trigger recovery");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
     }
 }
@@ -222,6 +221,7 @@ async fn server_edit_normalization_rejection_survives_durable_replay_and_callbac
             ));
             let mut host = MockHost::new(turns).with_valid_tools(&["str_replace", "read_file"]);
             let mut state = make_state();
+            state.provider_adaptation.safe_recovery_attempted = true;
             let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
             assert!(
                 outcome.is_ok(),
@@ -254,15 +254,9 @@ async fn server_edit_normalization_rejection_survives_durable_replay_and_callbac
                 );
             }
             assert_eq!(record.was_executed(), !rejected);
-            state.provider_adaptation.action_convergence_attempted = true;
-            assert_eq!(
-                advance_provider_recovery_epoch_from_new_records(&mut state, 0),
-                !rejected
-            );
-            assert_eq!(
-                state.provider_adaptation.action_convergence_attempted,
-                rejected
-            );
+            assert_eq!(state.provider_adaptation.safe_recovery_attempted, rejected);
+            assert!(!state.provider_adaptation.safe_recovery_pending);
+            assert_eq!(host.turn_count(), if succeeds { 3 } else { 2 });
         }
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
