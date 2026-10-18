@@ -1027,16 +1027,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .cloned();
                 rec.workspace_writer_applied_bound =
                     projected_writer_applied_bound(&execution, rec, terminal_owner);
-                rec.external_effect_observed = fields
-                    .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD)
-                    .and_then(serde_json::Value::as_bool);
-                rec.external_effect_scope = fields
-                    .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD)
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string);
-                rec.external_effect_receipt = fields
-                    .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
-                    .cloned();
                 rec.workspace_mutation_partial = fields
                     .get("workspace_mutation_partial")
                     .and_then(serde_json::Value::as_bool);

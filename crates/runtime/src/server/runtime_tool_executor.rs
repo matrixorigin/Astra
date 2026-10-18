@@ -15261,7 +15261,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn bash_timeout_emits_tool_timeout_work_surface_metadata() {
-        let (mut exec, _dir) = test_executor();
+        let (mut exec, dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
 
@@ -15269,7 +15269,7 @@ for line in sys.stdin:
             .execute_with_metadata(
                 "bash",
                 &json!({
-                    "command": "printf start; sleep 1",
+                    "command": "printf partial > timeout-marker; printf start; sleep 1",
                     "timeout": 0.1,
                     "_tool_call_id": "call-tool-timeout"
                 }),
@@ -15279,7 +15279,14 @@ for line in sys.stdin:
         let metadata = result.metadata.as_ref().expect("tool timeout metadata");
         assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
         assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(metadata["execution_started"], true);
+        assert_eq!(metadata["disposition"], "executed");
+        assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("timeout-marker")).unwrap(),
+            "partial"
+        );
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {

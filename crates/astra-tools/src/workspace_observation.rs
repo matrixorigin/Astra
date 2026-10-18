@@ -78,19 +78,6 @@ static DESIRED_STATE_MARKER_REGISTRY: OnceLock<
 const MAX_LIVE_DESIRED_STATE_MARKERS: usize = 4096;
 pub const OBSERVATION_RECEIPT_FIELD: &str = "workspace_observation_receipt";
 pub const OBSERVATION_SCOPE_FIELD: &str = "workspace_observation_scope";
-/// Structured Bash argument naming the bounded external state roots whose
-/// exact pre/post state the executor must observe.
-pub const EXTERNAL_STATE_PATHS_FIELD: &str = "external_state_paths";
-pub const EXTERNAL_EFFECT_OBSERVED_FIELD: &str = "external_effect_observed";
-pub const EXTERNAL_EFFECT_SCOPE_FIELD: &str = "external_effect_scope";
-pub const EXTERNAL_EFFECT_RECEIPT_FIELD: &str = "external_effect_receipt";
-pub const DECLARED_EXTERNAL_STATE_SCOPE: &str = "declared_external_state";
-/// Ownership marker for non-filesystem tools that return an executor-owned
-/// external mutation receipt.  This is intentionally distinct from the
-/// invocation/fingerprint owners above: a typed service operation proves its
-/// own durable mutation and does not expose a filesystem observation window.
-pub const TYPED_EXTERNAL_TOOL_OWNERSHIP: &str = "typed_external_tool";
-const MAX_EXTERNAL_STATE_PATHS: usize = 16;
 /// Minimal path for the only external helper allowed in a detached command
 /// (`sleep`). Builtins do not consult PATH, and clearing the inherited
 /// environment removes BASH_ENV, exported functions, LD_PRELOAD, and user
@@ -166,10 +153,6 @@ static WRITER_EPOCHS: OnceLock<
 static QUARANTINED_WRITER_STATES: OnceLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<WriterEpochState>>>,
 > = OnceLock::new();
-
-// Fingerprinting can walk a bounded but still non-trivial tree.  Keep it off
-// runtime workers and bound concurrent postimages under multi-session load.
-static EXTERNAL_POSTIMAGE_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn recover_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
@@ -2625,438 +2608,6 @@ pub enum WorkspaceFingerprintComparison {
     Unknown,
 }
 
-/// Executor-owned preimage for an explicit, bounded set of external state
-/// roots.  This is intentionally opt-in: scanning arbitrary host state is
-/// neither attributable nor affordable, while inferring paths from shell text
-/// would make model wording a completion authority.
-#[derive(Debug, Clone)]
-pub struct ExternalEffectFingerprint {
-    targets: Vec<ExternalObservedTarget>,
-    target_set_digest: String,
-}
-
-#[derive(Debug, Clone)]
-struct ExternalObservedTarget {
-    declared_path: PathBuf,
-    observation_root: PathBuf,
-    root_before: WorkspaceFingerprint,
-    /// Files and not-yet-created paths use an exact-path conjunct so a
-    /// sibling change in their observation parent cannot manufacture proof.
-    /// Directories are already their own exact observation root.
-    leaf_before: Option<u64>,
-}
-
-/// Cross-process leases covering every canonical external observation root.
-/// They are held from preimage through postimage so another session cannot
-/// donate its mutation to this invocation's receipt.
-pub struct ExternalEffectObservationLease {
-    leases: Vec<WorkspaceObservationLease>,
-}
-
-impl ExternalEffectObservationLease {
-    pub fn coordination_integrity_valid(&self) -> bool {
-        self.leases
-            .iter()
-            .all(WorkspaceObservationLease::coordination_integrity_valid)
-    }
-
-    pub fn receipt_authority_valid(&self) -> bool {
-        self.leases
-            .iter()
-            .all(WorkspaceObservationLease::receipt_authority_valid)
-    }
-
-    pub fn integrity_valid(&self) -> bool {
-        self.receipt_authority_valid()
-    }
-}
-
-pub async fn acquire_external_effect_observation_lease_with_options(
-    args: &serde_json::Value,
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Result<Option<ExternalEffectObservationLease>, ExternalEffectLeaseFailure> {
-    let Some(roots) = external_effect_observation_roots(args, workspace_root)
-        .map_err(ExternalEffectLeaseFailure::InvalidDeclaration)?
-    else {
-        return Ok(None);
-    };
-    let deadline = tokio::time::Instant::now() + max_wait;
-    let mut leases = Vec::with_capacity(roots.len());
-    for root in roots {
-        let lease = acquire_workspace_observation_lease_with_options(
-            &root,
-            cancel_token,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
-        .await
-        .map_err(ExternalEffectLeaseFailure::Admission)?;
-        leases.push(lease);
-    }
-    Ok(Some(ExternalEffectObservationLease { leases }))
-}
-
-#[derive(Debug)]
-pub enum ExternalEffectLeaseFailure {
-    InvalidDeclaration(String),
-    Admission(WorkspaceLeaseFailure),
-}
-
-impl std::fmt::Display for ExternalEffectLeaseFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidDeclaration(message) => formatter.write_str(message),
-            Self::Admission(failure) => std::fmt::Display::fmt(failure, formatter),
-        }
-    }
-}
-
-fn external_effect_observation_roots(
-    args: &serde_json::Value,
-    workspace_root: &Path,
-) -> Result<Option<Vec<PathBuf>>, String> {
-    let Some(raw_paths) = args.get(EXTERNAL_STATE_PATHS_FIELD) else {
-        return Ok(None);
-    };
-    let paths = raw_paths.as_array().ok_or_else(|| {
-        format!("{EXTERNAL_STATE_PATHS_FIELD} must be an array of absolute paths")
-    })?;
-    if paths.is_empty() || paths.len() > MAX_EXTERNAL_STATE_PATHS {
-        return Err(format!(
-            "{EXTERNAL_STATE_PATHS_FIELD} must contain 1..={MAX_EXTERNAL_STATE_PATHS} paths"
-        ));
-    }
-    let workspace = workspace_root
-        .canonicalize()
-        .map_err(|e| format!("bound workspace cannot be resolved: {e}"))?;
-    let mut roots = Vec::with_capacity(paths.len());
-    for raw in paths {
-        let raw = raw
-            .as_str()
-            .ok_or_else(|| format!("{EXTERNAL_STATE_PATHS_FIELD} entries must be strings"))?;
-        let target = PathBuf::from(raw);
-        if !target.is_absolute()
-            || target
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(format!(
-                "external state path must be absolute and traversal-free: {raw}"
-            ));
-        }
-        let root = external_observation_root(&target)
-            .ok_or_else(|| format!("external state path has no observable existing root: {raw}"))?;
-        let root = root.canonicalize().map_err(|e| {
-            format!("external state observation root cannot be resolved for {raw}: {e}")
-        })?;
-        if root.starts_with(&workspace) || workspace.starts_with(&root) {
-            return Err(format!(
-                "external state path overlaps the bound workspace and cannot issue an external receipt: {raw}"
-            ));
-        }
-        roots.push(root);
-    }
-    roots.sort();
-    roots.dedup();
-    Ok(Some(roots))
-}
-
-impl ExternalEffectFingerprint {
-    /// Stable identity for the declared external target set. This contains no
-    /// host observation and is safe to retain as the correlation key between
-    /// a started cancellation and a later executor-owned receipt. The receipt
-    /// remains the authority for the observed mutation.
-    pub fn declared_target_set_digest_from_args(args: &serde_json::Value) -> Option<String> {
-        let raw_paths = args.get(EXTERNAL_STATE_PATHS_FIELD)?.as_array()?;
-        if raw_paths.is_empty() || raw_paths.len() > MAX_EXTERNAL_STATE_PATHS {
-            return None;
-        }
-        let mut paths = raw_paths
-            .iter()
-            .map(|raw| raw.as_str().map(PathBuf::from))
-            .collect::<Option<Vec<_>>>()?;
-        if paths.iter().any(|path| {
-            !path.is_absolute()
-                || path
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir))
-        }) {
-            return None;
-        }
-        paths.sort();
-        paths.dedup();
-        let mut hasher = Sha256::new();
-        for path in paths {
-            hasher.update(path.as_os_str().as_encoded_bytes());
-            hasher.update([0]);
-        }
-        Some(hex::encode(hasher.finalize()))
-    }
-
-    /// Validate and capture an explicit external-state observation contract.
-    ///
-    /// Every path must be absolute, traversal-free, outside the bound
-    /// workspace, and narrow enough for the existing bounded fingerprint. An
-    /// explicit but unobservable target is rejected before execution rather
-    /// than silently degrading into exit-status inference.
-    pub fn capture_from_args(
-        args: &serde_json::Value,
-        workspace_root: &Path,
-    ) -> Result<Option<Self>, String> {
-        let Some(raw_paths) = args.get(EXTERNAL_STATE_PATHS_FIELD) else {
-            return Ok(None);
-        };
-        let paths = raw_paths.as_array().ok_or_else(|| {
-            format!("{EXTERNAL_STATE_PATHS_FIELD} must be an array of absolute paths")
-        })?;
-        if paths.is_empty() || paths.len() > MAX_EXTERNAL_STATE_PATHS {
-            return Err(format!(
-                "{EXTERNAL_STATE_PATHS_FIELD} must contain 1..={MAX_EXTERNAL_STATE_PATHS} paths"
-            ));
-        }
-        let workspace = workspace_root
-            .canonicalize()
-            .map_err(|error| format!("bound workspace cannot be resolved: {error}"))?;
-        let mut targets = Vec::with_capacity(paths.len());
-        for raw in paths {
-            let raw = raw
-                .as_str()
-                .ok_or_else(|| format!("{EXTERNAL_STATE_PATHS_FIELD} entries must be strings"))?;
-            let target = PathBuf::from(raw);
-            if !target.is_absolute()
-                || target
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir))
-            {
-                return Err(format!(
-                    "external state path must be absolute and traversal-free: {raw}"
-                ));
-            }
-            let observation_root = external_observation_root(&target).ok_or_else(|| {
-                format!("external state path has no observable existing root: {raw}")
-            })?;
-            let canonical = observation_root.canonicalize().map_err(|error| {
-                format!("external state observation root cannot be resolved for {raw}: {error}")
-            })?;
-            if canonical.starts_with(&workspace) || workspace.starts_with(&canonical) {
-                return Err(format!(
-                    "external state path overlaps the bound workspace and cannot issue an external receipt: {raw}"
-                ));
-            }
-            targets.push((target, canonical));
-        }
-        targets.sort_by(|left, right| left.0.cmp(&right.0));
-        targets.dedup_by(|left, right| left.0 == right.0);
-        let mut target_hasher = Sha256::new();
-        let targets = targets
-            .iter()
-            .map(|(declared_path, observation_root)| {
-                target_hasher.update(declared_path.as_os_str().as_encoded_bytes());
-                target_hasher.update([0]);
-                let root_before = WorkspaceFingerprint::capture_with_reason(observation_root).map_err(|reason| {
-                    match reason {
-                        FingerprintUnavailable::Quarantined => {
-                            tracing::warn!(
-                                component = "workspace_observation",
-                                operation = "capture_external_preimage",
-                                error_code = "external_state_observation_quarantined",
-                                root_digest = observation_root_digest(observation_root),
-                                "external observation refused by persistent attribution quarantine"
-                            );
-                            "external_state_observation_quarantined: Changes to this path cannot be safely verified after earlier work. The command was not run. Before restarting Astra or astra-edge, verify that earlier background work has stopped. Starting a new conversation alone will not clear this condition.".to_string()
-                        }
-                        FingerprintUnavailable::Unavailable => format!(
-                        "external state root is unavailable, ambiguous, or exceeds observation bounds: {}",
-                        observation_root.display()
-                        ),
-                    }
-                })?;
-                let leaf_before = (!declared_path.is_dir())
-                    .then(|| external_leaf_fingerprint(declared_path))
-                    .transpose()?;
-                Ok::<_, String>(ExternalObservedTarget {
-                    declared_path: declared_path.clone(),
-                    observation_root: observation_root.clone(),
-                    root_before,
-                    leaf_before,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Self {
-            targets,
-            target_set_digest: hex::encode(target_hasher.finalize()),
-        }))
-    }
-
-    /// Produce a receipt only for an observed delta owned by an authoritative
-    /// invocation boundary. Failure to capture any postimage is unknown, not
-    /// unchanged and never success evidence.
-    pub fn changed_receipt(
-        &self,
-        ownership: Option<&str>,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        if !matches!(
-            ownership,
-            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
-        ) {
-            return None;
-        }
-        let mut changed = false;
-        for target in &self.targets {
-            let root_after = WorkspaceFingerprint::capture(&target.observation_root)?;
-            let root_changed = target.root_before.changed_from(Some(root_after));
-            let leaf_changed = match target.leaf_before {
-                Some(before) => external_leaf_fingerprint(&target.declared_path).ok()? != before,
-                None => true,
-            };
-            changed |= root_changed && leaf_changed;
-        }
-        changed.then(|| {
-            external_effect_changed_receipt(
-                ownership.expect("authoritative ownership matched"),
-                &self.target_set_digest,
-                self.targets.len(),
-            )
-        })
-    }
-
-    /// Async callers must use this path: no recursive fingerprint work runs
-    /// on a Tokio worker, and a shared cap prevents a burst of sessions from
-    /// saturating the blocking pool.
-    pub async fn changed_receipt_async(
-        &self,
-        ownership: Option<&str>,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let permit = EXTERNAL_POSTIMAGE_PERMITS
-            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
-            .clone()
-            .acquire_owned()
-            .await
-            .ok()?;
-        let fingerprint = self.clone();
-        let ownership = ownership.map(str::to_owned);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            fingerprint.changed_receipt(ownership.as_deref())
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-}
-
-fn external_leaf_fingerprint(path: &Path) -> Result<u64, String> {
-    let mut hasher = DefaultHasher::new();
-    let mut content_bytes = 0usize;
-    hash_path_state(path, &mut hasher, &mut content_bytes).ok_or_else(|| {
-        format!(
-            "external state path cannot be fingerprinted: {}",
-            path.display()
-        )
-    })?;
-    Ok(hasher.finish())
-}
-
-fn external_observation_root(target: &Path) -> Option<PathBuf> {
-    if target.is_dir() {
-        return Some(target.to_path_buf());
-    }
-    let mut candidate = target.parent()?.to_path_buf();
-    while !candidate.exists() {
-        candidate = candidate.parent()?.to_path_buf();
-    }
-    Some(candidate)
-}
-
-fn external_effect_changed_receipt(
-    ownership: &str,
-    target_set_digest: &str,
-    observed_roots: usize,
-) -> serde_json::Map<String, serde_json::Value> {
-    serde_json::Map::from_iter([
-        (
-            EXTERNAL_EFFECT_OBSERVED_FIELD.to_string(),
-            serde_json::Value::Bool(true),
-        ),
-        (
-            EXTERNAL_EFFECT_SCOPE_FIELD.to_string(),
-            serde_json::Value::String(DECLARED_EXTERNAL_STATE_SCOPE.to_string()),
-        ),
-        (
-            EXTERNAL_EFFECT_RECEIPT_FIELD.to_string(),
-            serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "post_execution_fingerprint",
-                "scope": DECLARED_EXTERNAL_STATE_SCOPE,
-                "changed": true,
-                "ownership": ownership,
-                "target_set_digest": target_set_digest,
-                "observed_roots": observed_roots,
-            }),
-        ),
-    ])
-}
-
-/// Validate the durable projection of an executor-owned external delta.
-pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> bool {
-    let common = receipt.get("schema").and_then(serde_json::Value::as_str)
-        == Some("external_effect_receipt.v1")
-        && receipt.get("scope").and_then(serde_json::Value::as_str)
-            == Some(DECLARED_EXTERNAL_STATE_SCOPE)
-        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(true);
-    if !common {
-        return false;
-    }
-
-    let fingerprint_receipt = receipt.get("source").and_then(serde_json::Value::as_str)
-        == Some("post_execution_fingerprint")
-        && matches!(
-            receipt.get("ownership").and_then(serde_json::Value::as_str),
-            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
-        )
-        && receipt
-            .get("target_set_digest")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|digest| {
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        && receipt
-            .get("observed_roots")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|count| (1..=MAX_EXTERNAL_STATE_PATHS as u64).contains(&count));
-    if fingerprint_receipt {
-        return true;
-    }
-
-    // Typed service mutations (for example Memoria remember/forget/update)
-    // have no filesystem target to fingerprint.  They are accepted only when
-    // the owning executor stamps the narrow typed-tool shape, including a
-    // bounded operation digest and a known mutation action.  The runtime also
-    // binds this receipt to the canonical tool record before using it as
-    // completion evidence.
-    receipt.get("source").and_then(serde_json::Value::as_str) == Some("typed_external_tool")
-        && receipt.get("ownership").and_then(serde_json::Value::as_str)
-            == Some(TYPED_EXTERNAL_TOOL_OWNERSHIP)
-        && receipt.get("tool").and_then(serde_json::Value::as_str) == Some("memory")
-        && matches!(
-            receipt.get("action").and_then(serde_json::Value::as_str),
-            Some("remember" | "forget" | "update" | "feedback")
-        )
-        && receipt
-            .get("operation_digest")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|digest| {
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum FingerprintUnavailable {
-    Quarantined,
-    Unavailable,
-}
-
 fn observation_root_digest(root: &Path) -> String {
     hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()))
 }
@@ -3067,16 +2618,10 @@ impl WorkspaceFingerprint {
     /// Git status is the fast path and reports tracked/untracked workspace
     /// changes without walking file contents.  Non-git workspaces use a
     /// bounded metadata manifest.  If the manifest exceeds its bound or any
-    /// required metadata cannot be read, return `None` so callers fail closed.
+    /// required metadata cannot be read, return `None`.
     pub fn capture(root: &Path) -> Option<Self> {
-        Self::capture_with_reason(root).ok()
-    }
-
-    fn capture_with_reason(root: &Path) -> Result<Self, FingerprintUnavailable> {
-        let root = root
-            .canonicalize()
-            .map_err(|_| FingerprintUnavailable::Unavailable)?;
-        let writer_state = writer_epoch_state(&root).ok_or(FingerprintUnavailable::Unavailable)?;
+        let root = root.canonicalize().ok()?;
+        let writer_state = writer_epoch_state(&root)?;
         let epoch_before = writer_state
             .epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -3090,10 +2635,10 @@ impl WorkspaceFingerprint {
         // ambiguous.  Do not sample a half-written tree and later attribute
         // it to the surrounding Bash call.
         if quarantined_before {
-            return Err(FingerprintUnavailable::Quarantined);
+            return None;
         }
         if active_before != 0 {
-            return Err(FingerprintUnavailable::Unavailable);
+            return None;
         }
         let digest = match git_status_fingerprint(&root) {
             GitFingerprint::Captured(digest) => Some(digest),
@@ -3102,8 +2647,7 @@ impl WorkspaceFingerprint {
             // still cannot produce trustworthy evidence.
             GitFingerprint::Unknown => None,
             GitFingerprint::UseManifest => manifest_fingerprint(&root),
-        }
-        .ok_or(FingerprintUnavailable::Unavailable)?;
+        }?;
         let epoch_after = writer_state
             .epoch
             .load(std::sync::atomic::Ordering::Acquire);
@@ -3117,12 +2661,12 @@ impl WorkspaceFingerprint {
         // was running.  An epoch or active-count change makes this sample
         // un-attributable; fail closed instead of producing a false receipt.
         if quarantined_after {
-            return Err(FingerprintUnavailable::Quarantined);
+            return None;
         }
         if epoch_before != epoch_after || active_before != active_after || active_after != 0 {
-            return Err(FingerprintUnavailable::Unavailable);
+            return None;
         }
-        Ok(Self {
+        Some(Self {
             digest,
             writer_state,
             writer_epoch: epoch_after,
@@ -5126,95 +4670,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn external_effect_receipt_requires_observed_delta_and_authoritative_ownership() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let external = tempfile::tempdir().expect("external state");
-        let target = external.path().join("managed.conf");
-        fs::write(&target, "before").expect("external fixture");
-        let args = serde_json::json!({
-            EXTERNAL_STATE_PATHS_FIELD: [target],
-        });
-
-        let unchanged = ExternalEffectFingerprint::capture_from_args(&args, workspace.path())
-            .expect("valid observation contract")
-            .expect("external preimage");
-        fs::write(external.path().join("unrelated.conf"), "sibling change")
-            .expect("external sibling fixture");
-        assert!(
-            unchanged
-                .changed_receipt(Some(INVOCATION_CGROUP_OWNERSHIP))
-                .is_none(),
-            "a sibling delta cannot satisfy the exact declared file target"
-        );
-
-        let before = ExternalEffectFingerprint::capture_from_args(&args, workspace.path())
-            .expect("valid observation contract")
-            .expect("external preimage");
-        fs::write(&target, "after").expect("external mutation");
-        assert!(before.changed_receipt(Some("model_claim")).is_none());
-        let fields = before
-            .changed_receipt(Some(INVOCATION_SUPERVISOR_OWNERSHIP))
-            .expect("authoritative observed delta");
-        assert_eq!(
-            fields.get(EXTERNAL_EFFECT_OBSERVED_FIELD),
-            Some(&serde_json::Value::Bool(true))
-        );
-        assert!(
-            fields
-                .get(EXTERNAL_EFFECT_RECEIPT_FIELD)
-                .is_some_and(is_authoritative_external_effect_receipt)
-        );
-    }
-
-    #[test]
-    fn external_effect_observation_rejects_workspace_overlap_and_bad_paths() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        for args in [
-            serde_json::json!({EXTERNAL_STATE_PATHS_FIELD: [workspace.path()]}),
-            serde_json::json!({EXTERNAL_STATE_PATHS_FIELD: ["relative/path"]}),
-            serde_json::json!({EXTERNAL_STATE_PATHS_FIELD: []}),
-        ] {
-            assert!(ExternalEffectFingerprint::capture_from_args(&args, workspace.path()).is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn external_effect_lease_excludes_competing_observation_window() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let external = tempfile::tempdir().expect("external state");
-        let target = external.path().join("managed.conf");
-        fs::write(&target, "before").expect("external fixture");
-        let args = serde_json::json!({ EXTERNAL_STATE_PATHS_FIELD: [target] });
-
-        let first = acquire_external_effect_observation_lease_with_options(
-            &args,
-            workspace.path(),
-            None,
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("valid external contract")
-        .expect("first external window admitted");
-        let second = acquire_external_effect_observation_lease_with_options(
-            &args,
-            workspace.path(),
-            None,
-            Duration::ZERO,
-        )
-        .await;
-        assert!(
-            matches!(
-                second,
-                Err(ExternalEffectLeaseFailure::Admission(
-                    WorkspaceLeaseFailure::Contended
-                ))
-            ),
-            "a competing session cannot observe the same external root"
-        );
-        assert!(first.integrity_valid());
-    }
-
     fn typed_workspace_tool_receipt_for(
         name: &str,
         args: &serde_json::Value,
@@ -6121,60 +5576,8 @@ mod tests {
     }
 
     #[test]
-    fn external_preimage_reports_sticky_quarantine_without_exposing_paths() {
-        let log = tempfile::NamedTempFile::new().unwrap();
-        let writer = log.reopen().unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.try_clone().unwrap())
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-        let workspace = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
-        let args = serde_json::json!({"external_state_paths": [external.path()]});
-        assert!(ExternalEffectFingerprint::capture_from_args(&args, workspace.path()).is_ok());
-        let handle = WorkspaceAttributionState::capture(external.path()).unwrap();
-        handle.quarantine();
-        drop(handle);
-        for _ in 0..2 {
-            let error = ExternalEffectFingerprint::capture_from_args(&args, workspace.path())
-                .err()
-                .unwrap();
-            assert!(error.starts_with("external_state_observation_quarantined:"));
-            // English recovery copy must not promise that a new session or restart is safe.
-            assert!(error.contains("verify that earlier background work has stopped"));
-            assert!(error.contains("Starting a new conversation alone will not clear"));
-            assert!(!error.contains(external.path().to_str().unwrap()));
-            assert!(matches!(
-                WorkspaceFingerprint::capture_with_reason(external.path()),
-                Err(FingerprintUnavailable::Quarantined)
-            ));
-        }
-        assert_eq!(
-            workspace_ownership_is_unsettled(external.path()),
-            Some(false)
-        );
-        // The formatter owns the cloned file handle. Drop the subscriber
-        // before reading the evidence so the assertion observes all buffered
-        // records deterministically instead of depending on scheduler timing.
-        drop(_subscriber);
-        let output = fs::read_to_string(log.path()).unwrap();
-        assert!(output.contains("attribution_uncertain"));
-        assert!(output.contains("external_state_observation_quarantined"));
-        assert!(output.contains(&observation_root_digest(
-            &external.path().canonicalize().unwrap()
-        )));
-        assert!(!output.contains(external.path().to_str().unwrap()));
-    }
-
-    #[test]
-    fn missing_root_is_not_reported_as_quarantine() {
+    fn missing_root_has_no_fingerprint() {
         let root = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            WorkspaceFingerprint::capture_with_reason(&root.path().join("missing")),
-            Err(FingerprintUnavailable::Unavailable)
-        ));
         assert!(WorkspaceFingerprint::capture(&root.path().join("missing")).is_none());
     }
 

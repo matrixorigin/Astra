@@ -109,37 +109,6 @@ fn without_descriptions(mut value: Value) -> Value {
     value
 }
 
-fn assert_resident_external_state_contract(resident_bash: &Value, canonical_bash: &Value) {
-    let description = resident_bash["function"]["description"]
-        .as_str()
-        .expect("resident Bash description");
-    for cue in [
-        "External mutations only",
-        "minimal absolute roots",
-        "owned foreground delta",
-    ] {
-        assert!(
-            description.contains(cue),
-            "resident Bash must retain external-state cue {cue:?}: {description}"
-        );
-    }
-    assert!(
-        !description.contains("tool_search for artifact preservation or external-effect evidence"),
-        "resident external_state_paths must not require deferred discovery: {description}"
-    );
-
-    let resident_external =
-        &resident_bash["function"]["parameters"]["properties"]["external_state_paths"];
-    let canonical_external =
-        &canonical_bash["function"]["parameters"]["properties"]["external_state_paths"];
-    assert_ne!(resident_external, &Value::Null);
-    assert_eq!(
-        without_descriptions(resident_external.clone()),
-        without_descriptions(canonical_external.clone()),
-        "resident Bash must preserve the complete executable external_state_paths schema"
-    );
-}
-
 // ── 1. Defaults ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -596,16 +565,9 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
-        [
-            "command",
-            "external_state_paths",
-            "force",
-            "mode",
-            "timeout",
-            "workdir"
-        ]
-        .into_iter()
-        .collect(),
+        ["command", "force", "mode", "timeout", "workdir"]
+            .into_iter()
+            .collect(),
         "ordinary resident Bash must retain its exact foreground call shape"
     );
 
@@ -740,7 +702,6 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     assert!(!question_properties.contains_key("multi_select"));
 
     let full_bash = find(&full, "bash");
-    assert_resident_external_state_contract(bash, full_bash);
     assert!(
         full_bash["function"]["parameters"]["properties"]
             .get("source_artifacts")
@@ -841,11 +802,6 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
 fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
     let mut edge_catalog = astra_tools::schemas::all_tool_schemas();
     astra_tools::schemas::enable_managed_background_bash_schema(&mut edge_catalog);
-    let canonical_bash = edge_catalog
-        .iter()
-        .find(|schema| tool_schema_name(schema) == Some("bash"))
-        .expect("canonical managed edge Bash")
-        .clone();
     let surface = ToolSurface::build(edge_catalog, &ToolSurfaceConfig::default(), &[]);
     let bash = surface
         .always_load_schemas()
@@ -869,7 +825,6 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
         [
             "background_ttl",
             "command",
-            "external_state_paths",
             "force",
             "mode",
             "ready_check",
@@ -881,7 +836,6 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
         .collect(),
         "managed resident Bash must retain its exact supported call shape"
     );
-    assert_resident_external_state_contract(&bash, &canonical_bash);
     assert!(
         bash["function"]["description"]
             .as_str()
@@ -892,7 +846,7 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
         bash["function"]["description"]
             .as_str()
             .expect("Bash description")
-            .contains("neither supplies the foreground delta")
+            .contains("readiness is independent of command completion")
     );
     assert!(properties["run_in_background"]["description"].is_string());
     assert!(properties["ready_check"]["description"].is_string());
