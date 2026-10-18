@@ -415,13 +415,12 @@ fn derive_turn_interaction_mode(
                 TurnInteractionMode::Deny
             }
         }
-        // Native prompt channels, not the stream renderer, establish TUI
-        // interaction capability. The TUI intentionally uses Silent while it
-        // renders approval/ask_user overlays itself. Headless callers and
-        // callers without a native prompt sink remain noninteractive.
+        // Approval delivery establishes pause capability independently of TTY
+        // rendering and ask_user. Both TUI and stdio use the canonical
+        // approval channel; terminal callers retain their native prompt sink.
         // Actual tool approvals still pass through the permission engine.
         PermissionMode::Prompt | PermissionMode::AcceptEdits => {
-            if stdin_is_terminal && has_ask_user_request_tx {
+            if has_approval_request_tx || (stdin_is_terminal && has_ask_user_request_tx) {
                 TurnInteractionMode::Prompt
             } else {
                 TurnInteractionMode::NonInteractive
@@ -969,14 +968,32 @@ impl CliServerAdmissionHost<'_> {
             .collect::<Vec<_>>();
 
         let interaction_mode = self.turn_interaction_mode_inherent();
+        if !self.is_plan_subtask
+            && matches!(
+                self.perm_manager.mode(),
+                PermissionMode::Prompt | PermissionMode::AcceptEdits
+            )
+            && !interaction_mode.can_pause_for_user()
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "prompt permission mode requires an approval channel or an interactive terminal prompt sink",
+            ));
+        }
         // The caller-owned token is an input-only cancellation source. Edge
         // callback failures must stop this physical stream and cancel its
         // durable run without being misreported as a user cancellation or
         // cancelling other work that shares the caller token.
         let stream_cancel_token = child_cancellation_scope(state.cancel_token.as_ref());
         let persistent_restricted_tools = state.restricted_tools.clone();
-        let interaction_scoped_restrictions =
+        let mut interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
+        // The stdio approval transport does not implement ask_user. Keep that
+        // capability tied to its own native request channel.
+        if self.ask_user_request_tx.is_none() {
+            interaction_scoped_restrictions
+                .insert(astra_turn_core::interaction_types::ASK_USER_TOOL_NAME.to_string());
+        }
         state
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
@@ -2588,13 +2605,13 @@ mod tests {
             );
             assert_eq!(
                 derive_turn_interaction_mode(mode, false, true, false, true, true),
-                TurnInteractionMode::NonInteractive,
-                "an approval channel alone cannot display ask_user",
+                TurnInteractionMode::Prompt,
+                "approval delivery does not require an ask_user channel",
             );
             assert_eq!(
                 derive_turn_interaction_mode(mode, false, true, true, true, false),
-                TurnInteractionMode::NonInteractive,
-                "headless execution must remain noninteractive",
+                TurnInteractionMode::Prompt,
+                "stdio approval delivery does not require a terminal",
             );
         }
         for mode in [PermissionMode::Deny, PermissionMode::Plan] {

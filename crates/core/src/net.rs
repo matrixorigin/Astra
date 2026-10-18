@@ -1,5 +1,12 @@
 //! Shared HTTP networking utilities.
 //!
+//! # TLS trust
+//!
+//! The workspace reqwest features combine bundled public roots with native
+//! platform roots, including `SSL_CERT_FILE` / `SSL_CERT_DIR` overrides. Keep
+//! this policy in the shared dependency rather than loading roots per client.
+//! Certificate-chain and hostname verification remain enabled.
+//!
 //! # Proxy policy
 //!
 //! Three tiers, by traffic destination — pick the matching helper instead of
