@@ -107,6 +107,18 @@ execution, and evidence. Executors that cannot consume that pinned subdirectory
 identity (including the current managed mount boundary and non-Unix process
 path) fail closed instead of falling back to path-based execution.
 
+The CLI carries this same prepared directory into foreground, detachable and
+explicit environment-background commands, including their readiness probes.
+Sandbox environment setup cannot reset it to the workspace root. Path checks
+resolve relative operands from that directory while retaining the existing
+workspace policy and explicitly allowed paths. Directory selection itself
+remains confined to the workspace root.
+Read-before-edit registration and inferred source capture follow the pinned
+execution directory. Declared `source_artifacts` keep workspace-root semantics.
+Outcomes carry the shared `bash_workdir` evidence for the requested and resolved
+workspace-relative directory, including started nonzero outcomes. An omitted
+`workdir` on a later call starts at the workspace root again.
+
 ## Routes
 
 | Route | Meaning |

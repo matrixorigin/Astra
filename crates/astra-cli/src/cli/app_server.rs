@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
-use crate::cli::cli_config::cli_utils::get_profile_and_token;
+use crate::cli::cli_config::cli_utils::{CliOwnerAuthSnapshot, get_profile_and_token};
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
 use crate::cli::session::session_continuation::{
     SessionContinuation, load_session_continuation_for_recovery,
@@ -493,6 +493,36 @@ async fn register_edge_before_chat(
     }
 }
 
+async fn prepare_turn_auth(
+    ctx: &ServerContext,
+    cancel: &CancellationToken,
+) -> Result<(String, Option<CliOwnerAuthSnapshot>), AppServerFailure> {
+    let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
+    // Registration's native bearer provider may rotate the selected token.
+    // Freeze its owner first; never recapture a later login from the old token.
+    let owner =
+        session_runtime::capture_admitted_auth_owner(&ctx.api, ctx.auth_profile.as_deref(), &token)
+            .await;
+    let unavailable =
+        || AppServerFailure::turn_failed("Sign-in changed or could not be refreshed before chat");
+    if owner.is_none() && crate::cli::native_auth::active().is_some() {
+        return Err(unavailable());
+    }
+    register_edge_before_chat(&ctx.api, &token, cancel, EDGE_REGISTRATION_TIMEOUT).await?;
+    let token = if let Some(owner) = owner.as_ref() {
+        if !owner.is_current() {
+            return Err(unavailable());
+        }
+        session_runtime::owner_access_token(&ctx.api.clone().without_bearer_provider(), owner, None)
+            .await
+            .filter(|_| owner.is_current())
+            .ok_or_else(unavailable)?
+    } else {
+        token
+    };
+    Ok((token, owner))
+}
+
 async fn run_turn(
     ctx: ServerContext,
     writer: JsonWriter,
@@ -531,12 +561,11 @@ async fn run_turn(
     )
     .await?;
 
-    let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
     // The stdio entrypoint bypasses interactive startup, but its turns still
     // advertise this checkout as an Edge executor. Register its stable
     // materialization before asking the Server to admit a turn, as one-shot
     // chat does.
-    register_edge_before_chat(&ctx.api, &token, &cancel, EDGE_REGISTRATION_TIMEOUT).await?;
+    let (token, auth_owner) = prepare_turn_auth(&ctx, &cancel).await?;
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(params.get("model").and_then(Value::as_str));
     let model = params
@@ -611,7 +640,7 @@ async fn run_turn(
     let chat_ctx = BasicCliChatContext {
         mcp_manager: None,
         api: &ctx.api,
-        auth_profile: ctx.auth_profile.as_deref(),
+        auth_owner,
         message: &message,
         offering_id: None,
         model: model.as_deref(),
@@ -2029,6 +2058,125 @@ mod tests {
         .unwrap();
         assert_eq!(matched.as_deref(), Some("turn-1"));
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stdio_registration_keeps_native_owner_across_refresh_and_rejects_replacement() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use rsa::{pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+        use wiremock::matchers::header;
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _registry = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _env_token = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        // A generated, test-only key signs the loopback refresh response. No
+        // operator credentials or external provider are involved.
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let der = key.to_pkcs1_der().unwrap();
+        let encoding = jsonwebtoken::EncodingKey::from_rsa_der(der.as_bytes());
+        for transition in ["rotation", "replacement", "refresh_failure"] {
+            let root = tempfile::tempdir().unwrap();
+            let store =
+                astra_credentials::native::NativeStore::with_directory(root.path().join("native"));
+            let server = MockServer::start().await;
+            let issuer = format!("{}/realms/moi", server.uri());
+            let mut session = crate::cli::native_auth::test_session();
+            session.environment.issuer = issuer.clone();
+            session.environment.astra_url = server.uri();
+            session.environment.moi_url = format!("{}/newmoi", server.uri());
+            session.environment.authorization_endpoint =
+                format!("{issuer}/protocol/openid-connect/auth");
+            session.environment.token_endpoint = format!("{issuer}/protocol/openid-connect/token");
+            session.environment.revocation_endpoint =
+                format!("{issuer}/protocol/openid-connect/revoke");
+            session.environment.jwks_uri = format!("{issuer}/protocol/openid-connect/certs");
+            session.expires_at = astra_credentials::native::unix_now().unwrap() + 10;
+            let (session, _) = store.publish(session).unwrap();
+            let binding = crate::cli::native_auth::binding_for_test(store.clone(), session.clone());
+            let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+            let _identity =
+                crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                    &binding.profile_name(),
+                    Some(&session.astra_user_id),
+                )
+                .unwrap();
+            let now = astra_credentials::native::unix_now().unwrap();
+            let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+            jwt_header.kid = Some("stdio-test".into());
+            let rotated = jsonwebtoken::encode(
+                &jwt_header,
+                &serde_json::json!({
+                    "iss": issuer, "sub": session.subject, "sid": session.session_id,
+                    "azp": "astra-cli", "aud": ["astra-api", "aistudio-api"],
+                    "iat": now, "exp": now + 900
+                }),
+                &encoding,
+            )
+            .unwrap();
+            Mock::given(method("GET")).and(path("/realms/moi/protocol/openid-connect/certs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": [{
+                    "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"stdio-test",
+                    "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()), "e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())
+                }]}))).expect(usize::from(transition != "refresh_failure") as u64).mount(&server).await;
+            Mock::given(method("POST")).and(path("/realms/moi/protocol/openid-connect/token"))
+                .respond_with(ResponseTemplate::new(if transition == "refresh_failure" {400} else {200})
+                    .set_body_json(serde_json::json!({"access_token":rotated,"refresh_token":"synthetic-rotated", "expires_in":900,"token_type":"Bearer"})))
+                .expect(1).mount(&server).await;
+            let replacement_store = store.clone();
+            let replacement_session = session.clone();
+            Mock::given(method("POST"))
+                .and(path("/agents/edge"))
+                .and(header("authorization", format!("Bearer {rotated}")))
+                .respond_with(move |_: &wiremock::Request| {
+                    if transition == "replacement" {
+                        replacement_store
+                            .publish(replacement_session.clone())
+                            .unwrap();
+                    }
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true}))
+                })
+                .expect(usize::from(transition != "refresh_failure") as u64)
+                .mount(&server)
+                .await;
+            let ctx = ServerContext {
+                api: astra_thin_client::ThinClient::new(&server.uri(), None)
+                    .unwrap()
+                    .with_bearer_provider(binding),
+                auth_profile: None,
+                default_model: None,
+                system_prompt: None,
+                auto_approve: false,
+            };
+            let prepared = super::prepare_turn_auth(&ctx, &CancellationToken::new()).await;
+            if transition == "rotation" {
+                let (token, owner) = prepared.expect("registration and confirmed rotation");
+                let owner =
+                    owner.expect("registration must not downgrade native owner to static bearer");
+                assert!(owner.is_current());
+                assert_eq!(store.current().unwrap().generation, session.generation);
+                assert_eq!(
+                    token, rotated,
+                    "turn admission uses the same owner's rotated bearer"
+                );
+                assert_eq!(
+                    crate::cli::session::session_runtime::owner_access_token(
+                        &ctx.api.clone().without_bearer_provider(),
+                        &owner,
+                        None
+                    )
+                    .await
+                    .as_deref(),
+                    Some(rotated.as_str())
+                );
+            } else {
+                assert!(
+                    prepared.is_err(),
+                    "{transition} cannot admit a downgraded/static turn"
+                );
+            }
+            server.verify().await;
+        }
     }
 
     #[tokio::test]

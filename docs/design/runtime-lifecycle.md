@@ -273,7 +273,10 @@ changes on the corresponding side of the bound-workspace effect boundary;
 mixed requires changes on both sides, and an unclear target/boundary remains
 unknown. Effect-owner domain is independent of this scope. Read-only references
 create no mutation obligation. All judgment carriers share this semantic
-contract; the existing typed receipt checks still own completion evidence.
+contract. External-only scope does not create a generic delta-receipt completion
+obligation or authorize a recovery write. Current desired state may be established
+without a new mutation. Mixed scope retains its bound-workspace obligation; Work,
+explicit verification and typed workspace owners retain their existing checks.
 
 The same distinction applies to delegated agents and fanout children: inferred
 read-only task intent does not create an execution permission ceiling. Children
@@ -353,10 +356,15 @@ trace and usage accounting even when another approach answers the question.
 
 Concrete execution obligations keep their existing owners: permissions and
 provider admission, canonical Work settlement, explicit verification hooks,
-workspace/external-effect receipts, unsettled execution ownership, and child
+typed workspace completion evidence, unsettled execution ownership, and child
 completion/reply obligations. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
+An executed, failed side-effect-capable invocation with cancellation, timeout or
+unknown-outcome evidence remains execution-incomplete until its owning lifecycle
+reconciles it. Settled process ownership does not prove success of the operation.
+A pre-start rejection or proven read-only timeout does not create this side-effect
+obligation or grant an automatic recovery write.
 
 Durable Edge completion references bind the authenticated invocation identity,
 selected executor and accepted result hash. Local-only delivery grants no such
@@ -803,3 +811,16 @@ adaptive renewal and settlement retain their existing owners. Runtime config
 and handoff facts reject the retired `budget_policy` field, and pending context
 rejects the retired `self_status` kind. Provider output ending with `length`
 still receives the terminal truncation marker outside exploratory tasks.
+
+### Isolated process cleanup
+
+Timeout, cancellation and startup failure retain the existing process owner
+through cleanup. Leader reaping polls the actual exit status with a fixed
+cleanup deadline; it cannot depend solely on a process-exit signal waking an
+asynchronous wait. Failure to reap or settle descendants cannot certify a
+settled scope. Supervised invocations receive owner cancellation and the
+existing settlement grace before any forced helper kill; a forced helper kill
+never authorizes a receipt. Abort guards retain supervised provenance while
+an owner is handed to a worker, and output pumps use the existing bounded
+drain on error as well as timeout. Operation timeouts and sandbox authority
+are unchanged.

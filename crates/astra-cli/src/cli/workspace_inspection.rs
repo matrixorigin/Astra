@@ -382,12 +382,16 @@ pub(crate) async fn handle_review_command(
     );
     let _pipeline_modules =
         crate::cli::session::session_runtime::create_pipeline_modules_quiet(api, None).await;
+    // Capture the admitted owner before stream admission; only this snapshot
+    // may drive in-flight refresh.
+    let auth_owner =
+        crate::cli::session::session_runtime::capture_admitted_auth_owner(api, profile, tok).await;
     let mut pm = PermissionManager::with_workspace_trust(false, &project_root);
     let turn_start = std::time::Instant::now();
     let sr = stream_chat_sse(ChatTurnParams {
         api,
         token: tok,
-        auth_profile: profile,
+        auth_owner,
         message: &prompt,
         user_intent: &prompt,
         input_runtime_required_texts: &[],

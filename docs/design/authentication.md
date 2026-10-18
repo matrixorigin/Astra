@@ -272,3 +272,31 @@ make test-memoria-auth-online-contract
 ```
 
 The test issues and revokes upstream keys; never point it at a production service.
+
+## CLI in-flight credential ownership
+
+A CLI turn captures its admitted credential owner once, including when
+`--profile` is omitted and the stored default is selected. Tool result and
+approval acknowledgements, exact-run cleanup, wall-deadline cancellation and
+user cancellation resolve credentials through that captured binding. One
+reactive 401 refresh may repost the same callback or cancellation; it does not
+re-execute a tool or resubmit an admitted turn. Only typed model-catalog
+preflight authentication failures without admitted-run or effect evidence may
+retry turn admission.
+
+Stdio captures that owner before Edge registration can refresh its bearer,
+then resolves the usable admission token through the same checked binding.
+Selected-model and default-model catalog failures both preserve typed HTTP
+evidence. Proactive callback-auth rejection retains the callback run id and
+wakes the physical SSE reader so exact-run cleanup can begin; it does not
+cancel the parent/user token.
+
+Confirmed refresh rotations within that binding remain usable. Changing the
+ambient default profile does not change an in-flight owner. Logout, account or
+native generation changes, and unrecognized credential replacement fail closed;
+an environment bearer cannot borrow a stored profile's refresh authority.
+Bearer resolution and exact cancellation share one absolute cleanup deadline.
+Only `execution_settled: true` confirms execution settlement; a terminal status
+alone does not release an uncertain local execution lease. Internal transport
+detach retains the existing server recovery semantics and is not user cancel
+authority.

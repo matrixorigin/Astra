@@ -167,10 +167,6 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// Optional server-side tool executor for web agent sessions.
     pub runtime_tool_executor:
         Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
-    /// Executor-owned external observation scope carried across the bounded
-    /// recovery boundary.  This is structured state, never inferred from a
-    /// Bash command or assistant prose.
-    pub external_effect_recovery_paths: Option<&'a [String]>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -324,7 +320,6 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         progress_emitter,
         pre_resolved_results,
         runtime_tool_executor,
-        external_effect_recovery_paths,
         turn_start,
         llm_round,
         plan_mode_active,
@@ -465,7 +460,6 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             progress_emitter,
             effective_permission_timeout,
             runtime_tool_executor,
-            external_effect_recovery_paths,
             turn_start,
             llm_round,
             plan_mode_active,

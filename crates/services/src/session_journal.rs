@@ -1072,17 +1072,6 @@ pub struct ToolCallRecord {
     /// completion may consume it; restoration retains it for audit alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_writer_applied_bound: Option<bool>,
-    /// Executor-owned observation that explicitly declared state outside the
-    /// bound workspace changed during this invocation. This is separate from
-    /// workspace evidence so neither scope can satisfy the other's contract.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_effect_observed: Option<bool>,
-    /// Scope bound into `external_effect_receipt`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_effect_scope: Option<String>,
-    /// Compact, validated executor receipt for the declared external targets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_effect_receipt: Option<serde_json::Value>,
     /// A multi-target writer committed a strict prefix before failing. This
     /// is a quarantine/barrier fact, never successful mutation evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]

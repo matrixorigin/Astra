@@ -2871,10 +2871,6 @@ pub enum VolatileKind {
     /// Bounded execution observations and requirements for the next Work
     /// decision. Observational only; settlement admission retains authority.
     WorkEvidenceContext,
-    /// External-effect rows rebuilt from the tool ledger at prompt assembly.
-    /// Compaction may drop the original tool messages; this snapshot is not
-    /// part of that history and is not a completion receipt.
-    ExternalEffectLedger,
     /// A provider response completed before newly applied runtime input.
     /// The stale response is not executable; the next request re-evaluates.
     RuntimeInputBoundary,
@@ -2970,7 +2966,6 @@ impl VolatileKind {
                 | Self::ActiveWorkSnapshot
                 | Self::CanonicalWorkState
                 | Self::WorkEvidenceContext
-                | Self::ExternalEffectLedger,
         )
     }
 
@@ -2989,7 +2984,6 @@ impl VolatileKind {
             | Self::ActiveWorkSnapshot
             | Self::CanonicalWorkState
             | Self::WorkEvidenceContext
-            | Self::ExternalEffectLedger
             | Self::RuntimeInputBoundary
             | Self::FinalAnswerSettlement
             | Self::CanonicalWorkEstablishmentRetry

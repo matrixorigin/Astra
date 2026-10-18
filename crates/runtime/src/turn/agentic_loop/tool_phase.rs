@@ -2121,11 +2121,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             .as_ref()
             .map(|b| b.current_round())
             .unwrap_or(0);
-        // Snapshot the executor-owned external observation scope before borrowing
-        // the rest of loop state mutably for the headless round.  The clone is
-        // bounded to the explicitly declared roots and carries no command text.
-        let external_effect_recovery_paths =
-            super::execution_phase::external_effect_recovery_scope(state);
         // Delegation interception records are created outside the normal
         // pre-resolved helper, so fill the same causal round metadata before
         // taking the immutable journal snapshot. This keeps every record in the
@@ -2275,7 +2270,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
             runtime_tool_executor: state.runtime_tool_executor.as_deref(),
-            external_effect_recovery_paths: external_effect_recovery_paths.as_deref(),
             turn_start: Some(tool_record_turn_start),
             llm_round: obs_llm_round,
             plan_mode_active,
@@ -2368,7 +2362,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             let snapshot = state.stall.tool_call_records[new_records_start..].to_vec();
             (snapshot, parallel_count_emit)
         };
-        super::execution_phase::remember_external_effect_recovery_scope(state, &round_tool_calls);
         let policy_history_error = state
             .stall
             .runtime_policy_evaluation

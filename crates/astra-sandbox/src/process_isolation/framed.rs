@@ -4,8 +4,8 @@
 
 use super::{
     BashInvocationOwner, InvocationSupervisor, IsolatedScopeAbortGuard, OUTPUT_DRAIN_TIMEOUT,
-    READ_CHUNK_SIZE, ScopeSettlement, apply_process_scope, settle_isolated_owner_after_exit,
-    terminate_isolated_child,
+    READ_CHUNK_SIZE, ScopeSettlement, apply_process_scope, reap_child_after_owner_loss,
+    settle_isolated_owner_after_exit, terminate_isolated_child,
 };
 use std::io;
 use std::process::{Command, ExitStatus, Stdio};
@@ -487,14 +487,7 @@ async fn drive(
             // Give the subreaper time to finish; leader-only SIGKILL first
             // could release its adopted descendants. No receipt survives this
             // failure, regardless of whether the helper exits successfully.
-            if !supervised
-                || tokio::time::timeout(Duration::from_secs(3), child.wait())
-                    .await
-                    .is_err()
-            {
-                let _ = child.kill().await;
-            }
-            let _ = child.wait().await;
+            reap_child_after_owner_loss(&mut child, supervised).await;
         }
         status = child.try_wait().ok().flatten();
         guard.disarm();

@@ -10182,7 +10182,6 @@ impl ServerAgenticLoopHost {
                 matches!(
                     window.action,
                     crate::turn::agentic_loop::host::CompletionAction::RequiredWorkspaceMutation
-                        | crate::turn::agentic_loop::host::CompletionAction::RequiredExternalEffect
                 )
             })
         {
@@ -43395,7 +43394,6 @@ mod tests {
         let properties = bash["function"]["parameters"]["properties"]
             .as_object()
             .expect("Bash properties");
-        assert!(properties.contains_key("external_state_paths"));
         assert_eq!(
             bash, &ordinary_bash,
             "Bash's provider schema must not change when the external-effect obligation is admitted or settled"
