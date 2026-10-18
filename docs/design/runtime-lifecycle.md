@@ -122,6 +122,18 @@ Each CLI SSE invocation publishes its server-verified session and run identity
 before terminal output, including resumed sessions. A previously installed
 session id does not bind a new stream observer or authorize timeout cleanup.
 
+One-shot CLI chat registers SIGINT before admission. The first interrupt stops
+local work and uses the captured owner to cancel only the observed exact run,
+within a bounded settlement window (also bounded by any request wall deadline).
+It drains the existing turn and commits the existing canonical partial before
+publishing an interrupted JSON result. Its nullable `interruption_reason` field
+preserves the typed reason, including `user_interrupted`, independently of any
+observed partial text. Cancellation acceptance alone does not
+prove execution settlement. Missing run identity, failed settlement, a drain
+failure or a second interrupt produces an unverified failure instead of a
+successful terminal result or automatic replay. A setup interrupt before stream
+admission sends no run cancellation.
+
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and
 retryable; an ambiguous sync result is retried against the journal rather than

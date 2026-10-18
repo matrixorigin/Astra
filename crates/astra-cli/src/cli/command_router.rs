@@ -2153,6 +2153,14 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Chat(args)) => {
+            // Poll before admission: Tokio installs the process signal handler on
+            // first poll, and the pending future retains an interrupt during setup.
+            let interrupt = tokio::signal::ctrl_c();
+            tokio::pin!(interrupt);
+            if let std::task::Poll::Ready(result) = futures_util::poll!(&mut interrupt) {
+                result.map_err(|error| error.to_string())?;
+                return interrupted_before_chat_admission(args.json);
+            }
             let mut chat_context = cli_context.clone();
             if let Some(model) = args.model.as_deref() {
                 chat_context.select_model(Some(model));
@@ -2185,13 +2193,40 @@ async fn execute_cli_command_impl(
                 }
             }
 
+            // Setup cannot admit a model run. Keep it interruptible as well,
+            // including authentication/catalog waits before the stream exists.
+            macro_rules! setup_await {
+                ($future:expr) => {
+                    tokio::select! {
+                        biased;
+                        signal = &mut interrupt => {
+                            signal.map_err(|error| error.to_string())?;
+                            return interrupted_before_chat_admission(args.json);
+                        }
+                        result = $future => result,
+                    }
+                };
+            }
+
             // Determine message source: --stdin, -m, or start REPL
             let message = if args.stdin {
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|e| format!("Could not read input from stdin: {e}"))?;
-                let msg = buf.trim().to_string();
+                // An ordinary detached reader lets cancellation terminate this
+                // process even while the pipe's writer stays open. Tokio stdin
+                // and spawn_blocking would keep runtime shutdown waiting on the
+                // uncancellable OS read after the signal branch returned.
+                let (input_tx, input_rx) = tokio::sync::oneshot::channel();
+                std::thread::Builder::new()
+                    .name("astra-chat-stdin".to_string())
+                    .spawn(move || {
+                        let mut input = String::new();
+                        let result = std::io::stdin().read_to_string(&mut input).map(|_| input);
+                        let _ = input_tx.send(result);
+                    })
+                    .map_err(|error| format!("Could not start stdin reader: {error}"))?;
+                let input = setup_await!(input_rx)
+                    .map_err(|error| format!("Could not receive input from stdin: {error}"))?
+                    .map_err(|error| format!("Could not read input from stdin: {error}"))?;
+                let msg = input.trim().to_string();
                 if msg.is_empty() {
                     return Err(
                         "message cannot be empty (stdin was empty or whitespace-only)".to_string(),
@@ -2227,16 +2262,19 @@ async fn execute_cli_command_impl(
             };
 
             let token = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(
+                setup_await!(tokio::time::timeout_at(
                     deadline,
                     fresh_access_token_or_error(api, profile.as_deref()),
-                )
-                .await
+                ))
                 .map_err(|_| "request wall deadline expired during authentication".to_string())??
             } else {
-                fresh_access_token_or_error(api, profile.as_deref()).await?
+                setup_await!(fresh_access_token_or_error(api, profile.as_deref()))?
             };
-            register_one_shot_edge(api, &token, one_shot_terminal_deadline).await?;
+            setup_await!(register_one_shot_edge(
+                api,
+                &token,
+                one_shot_terminal_deadline
+            ))?;
             let explicit_session_id = args.session_id.clone();
             let session_routing_future = resolve_one_shot_session_routing(
                 api,
@@ -2248,13 +2286,11 @@ async fn execute_cli_command_impl(
                 !args.no_resume,
             );
             let mut session_routing = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(deadline, session_routing_future)
-                    .await
-                    .map_err(|_| {
-                        "request wall deadline expired during session routing".to_string()
-                    })??
+                setup_await!(tokio::time::timeout_at(deadline, session_routing_future)).map_err(
+                    |_| "request wall deadline expired during session routing".to_string(),
+                )??
             } else {
-                session_routing_future.await?
+                setup_await!(session_routing_future)?
             };
             // A headless turn normally lets /chat/stream create its session
             // lazily. Native capacity must be advertised before the parent
@@ -2266,9 +2302,9 @@ async fn execute_cli_command_impl(
                 && !crate::edge_tools::native_codex::native_provider_executable_snapshot()
                     .is_empty()
             {
-                let session_id =
+                let session_id = setup_await!(
                     crate::cli::slash::slash_state::create_server_session_identity(api, &token)
-                        .await?;
+                )?;
                 session_routing.server_session_id = Some(session_id.clone());
                 session_routing.history_source_session_id = Some(session_id);
                 created_session_for_native = true;
@@ -2289,14 +2325,14 @@ async fn execute_cli_command_impl(
                     !args.no_resume,
                 );
                 session_routing = if let Some(deadline) = one_shot_terminal_deadline {
-                    tokio::time::timeout_at(deadline, refresh_future)
-                        .await
-                        .map_err(|_| {
+                    setup_await!(tokio::time::timeout_at(deadline, refresh_future)).map_err(
+                        |_| {
                             "request wall deadline expired while refreshing admitted session"
                                 .to_string()
-                        })??
+                        },
+                    )??
                 } else {
-                    refresh_future.await?
+                    setup_await!(refresh_future)?
                 };
                 if session_routing.server_session_id.as_deref() != Some(session_id) {
                     return Err("session routing changed after execution admission".to_string());
@@ -2318,13 +2354,11 @@ async fn execute_cli_command_impl(
                 global_model.as_deref(),
             );
             let resolved_model = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(deadline, model_future)
-                    .await
-                    .map_err(|_| {
-                        "request wall deadline expired during model resolution".to_string()
-                    })??
+                setup_await!(tokio::time::timeout_at(deadline, model_future)).map_err(|_| {
+                    "request wall deadline expired during model resolution".to_string()
+                })??
             } else {
-                model_future.await?
+                setup_await!(model_future)?
             };
             let effective_model = resolved_model.model;
             let effective_offering_id = resolved_model.offering_id;
@@ -2345,7 +2379,7 @@ async fn execute_cli_command_impl(
                     session_routing.continuation_turn_inputs()?
                 };
             let is_tty = terminal::size().is_ok();
-            let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
+            let _pipeline = setup_await!(create_pipeline_modules(api, profile.as_deref()));
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 PermissionManager::with_load_policy(
@@ -2367,16 +2401,17 @@ async fn execute_cli_command_impl(
                 let executor = crate::edge_tools::ToolExecutor::new(project_root)
                     .with_active_session_id(session_id.to_owned())
                     .with_cloud(api.api_origin(), token.to_owned());
-                crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
-                    api,
-                    &token,
-                    account_id,
-                    session_id,
-                    std::sync::Arc::new(executor),
-                    pm.subscribe_permission_policy(),
-                    one_shot_terminal_deadline,
+                setup_await!(
+                    crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
+                        api,
+                        &token,
+                        account_id,
+                        session_id,
+                        std::sync::Arc::new(executor),
+                        pm.subscribe_permission_policy(),
+                        one_shot_terminal_deadline,
+                    )
                 )
-                .await
             } else {
                 None
             };
@@ -2414,12 +2449,13 @@ async fn execute_cli_command_impl(
             #[cfg(feature = "harness")]
             let harness_sink = astra_harness::InMemorySnapshotSink::arc();
 
-            let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
-                api,
-                profile.as_deref(),
-                &token,
-            )
-            .await;
+            let auth_owner = setup_await!(
+                crate::cli::session::session_runtime::capture_admitted_auth_owner(
+                    api,
+                    profile.as_deref(),
+                    &token,
+                )
+            );
 
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 mcp_manager: Some(_pipeline.mcp_manager.clone()),
@@ -2449,14 +2485,12 @@ async fn execute_cli_command_impl(
                 #[cfg(feature = "harness")]
                 benchmark_profile: args.benchmark_profile,
             };
-            let wall_deadline_cancel_token = args
-                .max_wall_time_seconds
-                .map(|_| std::sync::Arc::new(tokio_util::sync::CancellationToken::new()));
-            let wall_deadline_incremental_state = args.max_wall_time_seconds.map(|_| {
-                std::sync::Arc::new(
-                    astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
-                )
-            });
+            let wall_deadline_cancel_token = Some(std::sync::Arc::new(
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let wall_deadline_incremental_state = Some(std::sync::Arc::new(
+                astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
+            ));
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 deferred_tool_activations,
@@ -2469,10 +2503,11 @@ async fn execute_cli_command_impl(
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
-            let terminal_deadline = one_shot_terminal_deadline;
+            let mut terminal_deadline = one_shot_terminal_deadline;
             let execution_deadline =
                 terminal_deadline.map(|deadline| deadline - WALL_DEADLINE_TERMINAL_RESERVE);
             let mut wall_deadline_reached = false;
+            let mut user_interrupted = false;
             let mut wall_deadline_root_settled = false;
             let mut wall_deadline_server_terminal_settled = false;
             let turn_result = {
@@ -2484,11 +2519,28 @@ async fn execute_cli_command_impl(
                     turn_options,
                 );
                 tokio::pin!(turn_future);
-                if let Some(deadline) = execution_deadline {
-                    tokio::select! {
-                        result = &mut turn_future => result,
-                        _ = tokio::time::sleep_until(deadline) => {
-                            wall_deadline_reached = true;
+                tokio::select! {
+                        biased;
+                        interrupted = async {
+                            tokio::select! {
+                                result = &mut interrupt => {
+                                    result.map_err(|error| error.to_string())?;
+                                    Ok::<_, String>(true)
+                                }
+                                _ = async {
+                                    match execution_deadline {
+                                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                        None => std::future::pending().await,
+                                    }
+                                } => Ok(false),
+                            }
+                        } => {
+                            user_interrupted = interrupted?;
+                            wall_deadline_reached = !user_interrupted;
+                            if user_interrupted {
+                                let signal_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                                terminal_deadline = Some(terminal_deadline.map_or(signal_deadline, |deadline| deadline.min(signal_deadline)));
+                            }
                             if let Some(cancel_token) = wall_deadline_cancel_token.as_ref() {
                                 cancel_token.cancel();
                             }
@@ -2498,62 +2550,121 @@ async fn execute_cli_command_impl(
                                 .unwrap_or_default();
                             async {
                                 let run_id = snapshot.run_id.clone().ok_or_else(|| crate::TurnFailure {
-                                    error: "request wall deadline reached before an authoritative run id was observed".to_string(),
+                                    error: "request interrupted before an authoritative run id was observed; remote execution settlement is unverified".to_string(),
                                     partial: Default::default(),
                                 })?;
-                                let terminal = terminal_deadline.expect("deadline pair is constructed together");
+                                let terminal = terminal_deadline.expect("interrupt establishes terminal deadline");
                                 let terminal_settle_deadline = terminal
                                     .checked_sub(WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN)
                                     .unwrap_or(terminal);
                                 let cancel_deadline = terminal_settle_deadline;
-                                crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
+                                let cancel = crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
                                     api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
-                                ).await.map_err(|error| crate::TurnFailure {
+                                );
+                                tokio::select! {
+                                    result = cancel => result,
+                                    _ = tokio::signal::ctrl_c() => Err("user_interrupted (second Ctrl+C); remote execution settlement is unverified".to_string()),
+                                }.map_err(|error| crate::TurnFailure {
                                     error,
                                     partial: Default::default(),
                                 })?;
+                                request_session_execution_lease.mark_remote_execution_settled();
                                 wall_deadline_server_terminal_settled = true;
                                 let drain_budget = terminal
                                     .saturating_duration_since(tokio::time::Instant::now())
                                     .min(std::time::Duration::from_secs(20));
-                                match tokio::time::timeout(
-                                    drain_budget,
-                                    &mut turn_future,
-                                )
-                                .await
-                                {
-                                    Ok(result) => {
+                                let drained = tokio::select! {
+                                    result = tokio::time::timeout(drain_budget, &mut turn_future) => result.ok(),
+                                    _ = tokio::signal::ctrl_c() => None,
+                                };
+                                match drained {
+                                    Some(result) => {
                                         wall_deadline_root_settled = true;
                                         match result {
                                             Ok(result) => Ok(result),
-                                            Err(_) => Ok(stream_result_from_incremental_snapshot(
+                                            Err(failure) if !user_interrupted || (
+                                                failure.is_clean_local_cancel()
+                                                && request_session_execution_lease.failure().is_none()
+                                            ) => Ok(stream_result_from_incremental_snapshot(
                                                 wall_deadline_incremental_state
                                                     .as_ref()
                                                     .map(|state| state.snapshot())
                                                     .unwrap_or(snapshot),
                                             )),
+                                            Err(failure) => Err(failure),
                                         }
                                     }
-                                    Err(_) => Err(crate::TurnFailure {
-                                        error: format!("request wall deadline root drain timed out for run {run_id}"),
+                                    None => Err(crate::TurnFailure {
+                                        error: format!("request interruption root drain did not settle for run {run_id}"),
                                         partial: Default::default(),
                                     }),
                                 }
                             }.await
                         }
-                    }
-                } else {
-                    turn_future.as_mut().await
+                        result = &mut turn_future => result,
                 }
+            };
+            let mut turn_result = if (user_interrupted || wall_deadline_reached)
+                && !wall_deadline_root_settled
+            {
+                if !wall_deadline_server_terminal_settled {
+                    request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                }
+                let reason = turn_result
+                    .err()
+                    .map(|failure| failure.error)
+                    .unwrap_or_else(|| "request interrupted without root settlement".to_string());
+                crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                    &reason,
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state")
+                        .clone(),
+                )
+            } else {
+                turn_result
             };
 
             if let Some(handle) = native_delivery.take() {
-                handle.shutdown().await;
+                if user_interrupted {
+                    if tokio::time::timeout_at(
+                        terminal_deadline.expect("interrupt establishes terminal deadline"),
+                        handle.shutdown(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                        turn_result =
+                            crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                "user_interrupted; native delivery shutdown did not settle",
+                                wall_deadline_incremental_state
+                                    .as_ref()
+                                    .expect("one-shot state")
+                                    .clone(),
+                            );
+                    }
+                } else {
+                    handle.shutdown().await;
+                }
             }
 
             // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);
-            settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await?;
+            if let Err(error) =
+                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await
+            {
+                if !user_interrupted {
+                    return Err(error);
+                }
+                turn_result = crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                    &error,
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state")
+                        .clone(),
+                );
+            }
 
             let mut sr = match turn_result {
                 Ok(sr) => sr,
@@ -2561,7 +2672,9 @@ async fn execute_cli_command_impl(
                     return Ok(ExitCode::Success);
                 }
                 Err(e) => {
-                    if let Some(mut sr) = stream_result_from_resumable_turn_failure(&e) {
+                    if !user_interrupted
+                        && let Some(mut sr) = stream_result_from_resumable_turn_failure(&e)
+                    {
                         let exit_code = finalize_one_shot_stream_result_with_request_lease(
                             profile.as_deref(),
                             effective_model.as_deref(),
@@ -2602,13 +2715,24 @@ async fn execute_cli_command_impl(
                     return Err(e.error);
                 }
             };
-            if wall_deadline_reached {
+            if wall_deadline_reached || user_interrupted {
                 if !wall_deadline_root_settled {
                     return Err(
                         "request wall deadline ended without root execution settlement".to_string(),
                     );
                 }
+                let had_partial_text = !sr.full_text.trim().is_empty();
                 apply_wall_deadline_interruption(&mut sr, wall_deadline_server_terminal_settled);
+                if user_interrupted {
+                    sr.interruption = Some(serde_json::json!({
+                        "kind": "execution_incomplete",
+                        "reason": "user_interrupted",
+                        "resumable": true,
+                    }));
+                    if !had_partial_text {
+                        sr.full_text = "Execution interrupted by the user.".to_string();
+                    }
+                }
                 retain_wall_deadline_partial_canonical_messages(&mut sr, &message);
             }
 
@@ -3200,6 +3324,19 @@ async fn execute_cli_command_impl(
 /// that field to avoid treating those as tool failures — a grep that
 /// finds nothing or a diff that reports differences is a successful tool
 /// execution, not an error the agent needs to recover from.
+fn interrupted_before_chat_admission(json: bool) -> Result<ExitCode, String> {
+    if json {
+        write_headless_stdout_line(
+            &hard_failure_json_output(crate::TurnFailure {
+                error: "user_interrupted before chat stream admission".to_string(),
+                partial: Default::default(),
+            })
+            .to_string(),
+        )?;
+    }
+    Ok(ExitCode::ApiError)
+}
+
 fn apply_wall_deadline_interruption(sr: &mut StreamResult, server_terminal_verified: bool) {
     sr.final_state = "interrupted".to_string();
     sr.interruption_kind = Some("execution_incomplete".to_string());
@@ -3452,6 +3589,9 @@ fn final_json_output_with_context(
         "text": sr.full_text,
         "final_state": sr.final_state,
         "interruption_kind": sr.interruption_kind,
+        "interruption_reason": sr.interruption.as_ref()
+            .and_then(|interruption| interruption.get("reason"))
+            .and_then(serde_json::Value::as_str),
         "server_terminal_unverified": sr.server_terminal_unverified,
         "server_terminal_authoritative": sr.server_terminal_authoritative,
         "tool_record_coverage": if sr.tool_record_coverage_partial {
@@ -4491,6 +4631,7 @@ mod final_json_output_tests {
         assert_eq!(output["text"], "hello");
         assert_eq!(output["final_state"], "completed");
         assert!(output["interruption_kind"].is_null());
+        assert!(output["interruption_reason"].is_null());
         assert_eq!(
             output["tool_result_class_counts"],
             serde_json::json!({
@@ -4533,6 +4674,7 @@ mod final_json_output_tests {
             "text",
             "final_state",
             "interruption_kind",
+            "interruption_reason",
             "tool_result_class_counts",
             "prompt_tokens",
             "fresh_prompt_tokens",
@@ -4617,6 +4759,10 @@ mod final_json_output_tests {
 
         assert_eq!(output["final_state"], "interrupted");
         assert_eq!(output["completion_disposition"], "interrupted");
+        assert_eq!(
+            output["interruption_reason"],
+            "remote_tool_receipt_unresolved"
+        );
         assert_eq!(output["success"], false);
         assert_eq!(output["exit_code"], 5);
     }

@@ -10,7 +10,7 @@ use crate::cli::session::session_state::SessionState;
 use crossterm::style::Stylize;
 
 #[allow(clippy::result_large_err)]
-fn fabricate_user_cancel_failure(
+pub(crate) fn fabricate_user_cancel_failure(
     reason: &str,
     incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
 ) -> Result<StreamResult, crate::TurnFailure> {

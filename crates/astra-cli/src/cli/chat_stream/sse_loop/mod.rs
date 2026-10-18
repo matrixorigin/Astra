@@ -749,6 +749,7 @@ async fn stream_chat_sse_inner(
         s.stop_clear();
     }
     let loop_result = consume_remote_turn(&mut host, &mut state).await;
+    let failure_kind = loop_result.as_ref().err().map(|error| error.kind);
     let loop_failure = match loop_result {
         Err(error) => Some(error.to_string()),
         Ok(_) => host
@@ -854,6 +855,7 @@ async fn stream_chat_sse_inner(
                 session_id: state.current_session_id.clone(),
                 // Only the verified physical Server owner crosses settlement.
                 run_id: host.last_physical_run_id.clone(),
+                failure_kind,
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
                 admission_rejected: is_pre_admission_rejection(

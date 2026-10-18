@@ -692,3 +692,269 @@ fn assert_no_completed_turn(directory: std::path::PathBuf, session_id: &str) {
         }
     }
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_settles_exact_run_without_wall_deadline() {
+    assert_one_shot_sigint(true, true, false, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_preserves_wall_deadline_contract() {
+    assert_one_shot_sigint(true, true, true, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_unsettled_cancel_is_not_success() {
+    assert_one_shot_sigint(false, true, false, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_without_run_identity_never_cancels_session() {
+    assert_one_shot_sigint(false, false, false, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_second_sigint_returns_unverified_json() {
+    assert_one_shot_sigint(false, true, false, true, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_interrupts_setup_before_stream_admission() {
+    assert_one_shot_sigint(false, false, false, false, true).await;
+}
+
+/// Exercise the real command router and process signal policy with a held
+/// response stream. No provider, credential store or model request is involved.
+#[cfg(unix)]
+async fn assert_one_shot_sigint(
+    settled: bool,
+    identity: bool,
+    wall: bool,
+    second: bool,
+    setup: bool,
+) {
+    use axum::body::{Body, Bytes};
+    use axum::extract::Path;
+    use axum::http::{Response, header};
+    use axum::routing::{delete, get, post};
+    use std::convert::Infallible;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let chats = Arc::new(AtomicUsize::new(0));
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let chat_counter = chats.clone();
+    let cancel_counter = cancels.clone();
+    let models = Arc::new(AtomicUsize::new(0));
+    let model_counter = models.clone();
+    let app = axum::Router::new()
+        .route("/agents/edge", post(|| async { axum::Json(serde_json::json!({"ok": true})) }))
+        .route("/skills", get(|| async { axum::Json(serde_json::json!({
+            "skills": [], "total": 0, "limit": 100, "next_cursor": null
+        })) }))
+        .route("/models", get(move || {
+            let models = model_counter.clone();
+            async move {
+                models.fetch_add(1, Ordering::SeqCst);
+                if setup { std::future::pending::<()>().await; }
+                pipe_model_catalog()
+            }
+        }))
+        .route("/chat/stream", post(move || {
+            let chats = chat_counter.clone();
+            async move {
+                chats.fetch_add(1, Ordering::SeqCst);
+                let stream = futures_util::stream::once(async move {
+                    Ok::<Bytes, Infallible>(Bytes::from(if identity {
+                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\n"
+                    } else {
+                        ": held before authoritative admission identity\n\n"
+                    }))
+                }).chain(futures_util::stream::pending());
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR)
+                    .body(Body::from_stream(stream)).unwrap()
+            }
+        }))
+        .route("/chat/runs/{run_id}", delete(move |Path(run): Path<String>| {
+            let cancels = cancel_counter.clone();
+            async move {
+                assert_eq!(run, "sigint-run", "cancel only the observed exact run");
+                cancels.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({"execution_settled": settled}))
+            }
+        }));
+    use futures_util::StreamExt as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let home = tempfile::tempdir().unwrap();
+    let events = home.path().join("events.jsonl");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+    command
+        .args([
+            "--api-url",
+            &base,
+            "--profile",
+            "sigint-test",
+            "--model",
+            "mock-model",
+            "--bare",
+            "--no-instructions",
+            "chat",
+            "--json",
+            "--no-resume",
+            "--permission-mode",
+            "bypass",
+            "--stream-events",
+        ])
+        .arg(&events)
+        .args(["-m", "held offline signal test"])
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("ASTRA_ACCESS_TOKEN", "synthetic-offline-signal-test")
+        .env("ASTRA_API_URL", &base)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if wall {
+        command.args(["--max-wall-time-seconds", "120"]);
+    }
+    let child = command.spawn().unwrap();
+    let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let ready = if setup {
+                models.load(Ordering::SeqCst) > 0
+            } else if identity {
+                std::fs::read_to_string(&events)
+                    .unwrap_or_default()
+                    .contains("observed partial")
+            } else {
+                chats.load(Ordering::SeqCst) > 0
+            };
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("CLI must reach held stream");
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    if second {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while cancels.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
+        .await
+        .expect("bounded graceful SIGINT exit")
+        .unwrap();
+    server.abort();
+    assert_eq!(
+        output.status.signal(),
+        None,
+        "SIGINT must produce a terminal JSON document"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "terminal JSON: {error}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert!(!output.status.success());
+    assert_eq!(
+        chats.load(Ordering::SeqCst),
+        usize::from(!setup),
+        "never replay admission"
+    );
+    if identity {
+        assert_eq!(json["run_id"], "sigint-run");
+        assert!(cancels.load(Ordering::SeqCst) > 0);
+    } else {
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+    }
+    if settled {
+        assert_eq!(output.status.code(), Some(5));
+        assert_eq!(json["final_state"], "interrupted");
+        assert_eq!(json["interruption_kind"], "execution_incomplete");
+        assert_eq!(json["interruption_reason"], "user_interrupted");
+        assert_eq!(json["text"], "observed partial");
+        assert_eq!(json["server_terminal_unverified"], false);
+    } else {
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["success"], false);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_exits_while_stdin_writer_remains_open() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"))
+        .args(["--bare", "--no-instructions", "chat", "--json", "--stdin"])
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut writer = child.stdin.take().unwrap();
+    // More than a pipe buffer proves the child is reading, which follows
+    // signal registration. Keep the writer open until after process exit.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        writer.write_all(&vec![b'x'; 2 * 1024 * 1024]),
+    )
+    .await
+    .expect("CLI must start reading stdin")
+    .unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().unwrap() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("held stdin must not block SIGINT or runtime shutdown")
+        .unwrap();
+    drop(writer);
+    assert_eq!(output.status.signal(), None);
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["final_state"], "failed");
+    assert_eq!(json["server_terminal_unverified"], true);
+    assert!(json["run_id"].is_null());
+}
