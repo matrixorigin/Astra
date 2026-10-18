@@ -36,6 +36,7 @@ pub(crate) struct TurnExecutionInput<'a> {
     /// from its first boundary and must never enter the agentic loop with a
     /// provisional or display-only identity.
     pub(crate) session_id: &'a str,
+    pub(crate) admitted_server_turn: Option<&'a super::turn_entry::AdmittedServerTurn>,
     pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
 }
@@ -61,12 +62,42 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
     let TurnExecutionRequest { state, input } = request;
     // Capture the admitted owner after admission/validation but before the
     // stream is built; only this snapshot may drive in-flight refresh.
-    let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
-        input.api,
-        input.profile,
-        input.token,
-    )
-    .await;
+    let auth_owner = match input.admitted_server_turn {
+        Some(turn) => turn.auth_owner.clone(),
+        None => {
+            crate::cli::session::session_runtime::capture_admitted_auth_owner(
+                input.api,
+                input.profile,
+                input.token,
+            )
+            .await
+        }
+    };
+    if let Some(server_turn) = input.admitted_server_turn
+        && (!server_turn.attachment_owner.is_current()
+            || server_turn
+                .auth_owner
+                .as_ref()
+                .is_some_and(|owner| !owner.is_current())
+            || state
+                .server_resume_attachment
+                .as_ref()
+                .is_none_or(|(cursor, epoch)| {
+                    cursor.session_id != input.session_id
+                        || cursor.owner_id != crate::cli::cli_config::cli_utils::cli_user_id()
+                        || *epoch != state.session_attachment_epoch
+                }))
+    {
+        return TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
+            error:
+                "Server resume authentication changed before execution; restore the session again"
+                    .into(),
+            partial: crate::PartialTurnData {
+                session_id: Some(input.session_id.to_string()),
+                ..Default::default()
+            },
+        }));
+    }
     let prepared = prepare_turn_stream_state(state).await;
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
         Some(prepared.run_control.clone());
@@ -138,7 +169,9 @@ fn build_turn_stream_params<'a>(
         }
     }
     ChatTurnParams {
-        api: input.api,
+        api: input
+            .admitted_server_turn
+            .map_or(input.api, |turn| &turn.api),
         token: input.token,
         auth_owner: None,
         message: input.message,
@@ -204,7 +237,9 @@ fn build_turn_stream_params<'a>(
         bg_task_commands: Some(state.bg_task_commands.clone()),
         bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
-        turn_index: state.turn.saturating_add(1),
+        turn_index: input
+            .admitted_server_turn
+            .map_or_else(|| state.turn.saturating_add(1), |turn| turn.turn_index),
         pipeline_state: state.runtime_pipeline_state.clone(),
         compaction_state: state.runtime_compaction_state.clone(),
         consecutive_context_window_errors: state.runtime_consecutive_context_window_errors,
@@ -212,10 +247,15 @@ fn build_turn_stream_params<'a>(
         // Headless read observations share a lifecycle with the turn-local
         // workspace epoch. They must not be imported from session state.
         idempotency_cache: None,
-        pre_loaded_messages: state
-            .active_conversation
-            .as_ref()
-            .map(|conversation| conversation.materialize()),
+        pre_loaded_messages: input
+            .admitted_server_turn
+            .map(|turn| turn.continuation.messages.clone())
+            .or_else(|| {
+                state
+                    .active_conversation
+                    .as_ref()
+                    .map(|conversation| conversation.materialize())
+            }),
         append_system_prompt: prepared.append_system_prompt.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
@@ -416,6 +456,192 @@ fn notify_server_to_cancel_run(
 }
 
 #[cfg(test)]
+pub(crate) async fn admitted_interactive_turn_inputs_for_test(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    settle: bool,
+) -> Result<(u32, Vec<serde_json::Value>, u32), String> {
+    admitted_interactive_turn_inputs_with_token_for_test(
+        state,
+        api,
+        settle,
+        "admitted-token",
+        false,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    settle: bool,
+    input_token: &str,
+    fail_primary_append: bool,
+) -> Result<(u32, Vec<serde_json::Value>, u32), String> {
+    let session_id = state.session_id.clone().expect("restored session");
+    let admission =
+        super::turn_entry::acquire_interactive_turn_admission(state, api, None, input_token)
+            .await?;
+    assert!(
+        matches!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),
+            Err(astra_services::session_journal::SessionExecutionLeaseError::Conflict { .. }),
+        ),
+        "the admitted local snapshot remains protected through settlement"
+    );
+    let token = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+        .map_or(input_token, |turn| turn.bearer.as_str());
+    let prepared = prepare_turn_stream_state(state).await;
+    let params = build_turn_stream_params(
+        state,
+        TurnExecutionInput {
+            api,
+            profile: None,
+            token,
+            message: "continue again",
+            user_intent: "continue again",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
+            session_id: &session_id,
+            admitted_server_turn: admission
+                .as_ref()
+                .and_then(|admission| admission.server_turn.as_ref()),
+            semantic_query_override: None,
+            explain_analyze_terminal_degraded: None,
+        },
+        &prepared,
+    );
+    if let Some(turn) = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+    {
+        assert_eq!(
+            params.token, turn.bearer,
+            "resume and runtime use the same resolved bearer"
+        );
+        if crate::cli::session::session_runtime::uses_environment_access_token(params.token) {
+            assert!(
+                turn.auth_owner.is_none(),
+                "environment bearers confer no profile refresh authority"
+            );
+        }
+    }
+    if settle {
+        params
+            .api
+            .post_bearer_path_empty_json::<serde_json::Value>(
+                params.token,
+                "/admission-token-probe",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let turn_index = params.turn_index;
+    let messages = params
+        .pre_loaded_messages
+        .expect("canonical prompt projection");
+    if settle {
+        // Use the real primary commit and sidecars, with deterministic runtime
+        // output, after the same local turn allocation as successful settlement.
+        let previous = state.active_conversation.as_ref().unwrap().cursor().clone();
+        let mut result = crate::tests::stub_stream_result("continued");
+        result.final_messages = messages.clone();
+        result.final_messages.extend([
+            serde_json::json!({"role":"user", "content":"continue again"}),
+            serde_json::json!({"role":"assistant", "content":"continued"}),
+        ]);
+        result.session_id = Some(session_id.clone());
+        let expected_messages = result.final_messages.clone();
+        let previous_turn = state.turn;
+        let journal_path = state.journal.as_ref().unwrap().path().to_path_buf();
+        let backup = journal_path.with_extension("before-failed-append");
+        if fail_primary_append {
+            std::fs::rename(&journal_path, &backup).unwrap();
+            std::fs::create_dir(&journal_path).unwrap();
+        }
+        super::turn_success::apply_turn_success(
+            state,
+            None,
+            "continue again",
+            result,
+            std::time::Instant::now(),
+        );
+        if fail_primary_append {
+            std::fs::remove_dir(&journal_path).unwrap();
+            std::fs::rename(&backup, &journal_path).unwrap();
+            assert!(
+                state
+                    .session_persistence_error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("append turn event"))
+            );
+            assert_eq!(
+                state.turn, previous_turn,
+                "failed primary settlement rolls back local allocation"
+            );
+            assert_eq!(
+                state.active_conversation.as_ref().unwrap().cursor(),
+                &previous
+            );
+            return Ok((turn_index, messages, state.turn));
+        }
+        assert!(
+            state.session_persistence_error.is_none(),
+            "{:?}",
+            state.session_persistence_error
+        );
+        let events = astra_services::session_journal::JournalWriter::new(&session_id)
+            .unwrap()
+            .complete_append_order_snapshot()
+            .unwrap();
+        let commit = events
+            .iter()
+            .rev()
+            .find_map(|event| event.conversation_commit.as_ref())
+            .unwrap();
+        assert_eq!(commit.base_root_hash, previous.canonical_root_hash);
+        assert_eq!(commit.cursor.completed_turn, state.turn);
+        assert_eq!(
+            commit.cursor.conversation_seq,
+            previous.conversation_seq + 1
+        );
+        let replay = crate::cli::session::session_continuation::recover_or_initialize_active_conversation_from_append_order_events(
+            &session_id, &events,
+        ).unwrap();
+        assert_eq!(replay.messages(), expected_messages);
+        assert_eq!(
+            astra_services::session_workspace::read_workspace(&session_id)
+                .unwrap()
+                .turn_count,
+            state.turn
+        );
+    }
+    Ok((turn_index, messages, state.turn))
+}
+
+#[cfg(test)]
+pub(crate) async fn probe_admitted_retry_request_for_test(
+    request: TurnExecutionRequest<'_>,
+) -> (String, u32, Vec<serde_json::Value>) {
+    assert!(request.input.admitted_server_turn.is_some());
+    let prepared = prepare_turn_stream_state(request.state).await;
+    let params = build_turn_stream_params(request.state, request.input, &prepared);
+    params
+        .api
+        .post_bearer_path_empty_json::<serde_json::Value>(params.token, "/admission-token-probe")
+        .await
+        .unwrap();
+    (
+        params.token.to_string(),
+        params.turn_index,
+        params.pre_loaded_messages.unwrap(),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         PreparedTurnStreamState, TurnExecutionInput, apply_stream_failure_local_cancellation,
@@ -558,6 +784,7 @@ mod tests {
                 input_runtime_required_texts: &[],
                 input_runtime_volatile_texts: &[],
                 session_id: &session_id,
+                admitted_server_turn: None,
                 semantic_query_override: None,
                 explain_analyze_terminal_degraded: None,
             },
@@ -667,6 +894,7 @@ mod tests {
                 input_runtime_required_texts: &[],
                 input_runtime_volatile_texts: &[],
                 session_id: "sess-1",
+                admitted_server_turn: None,
                 semantic_query_override: None,
                 explain_analyze_terminal_degraded: None,
             },

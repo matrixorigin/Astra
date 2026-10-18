@@ -1356,6 +1356,19 @@ async fn apply_restored_session(
     } else {
         prepared_history.active_conversation.clone()
     };
+    state.server_resume_attachment = typed_continuation
+        .as_ref()
+        .filter(|continuation| {
+            use_typed_continuation
+                && restored.restored_from_cloud
+                && continuation.resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+        })
+        .map(|continuation| {
+            (
+                continuation.resume.cursor.clone(),
+                state.session_attachment_epoch,
+            )
+        });
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.last_turn_event = last_turn_event;
     let fallback_resume_messages;
@@ -3254,6 +3267,555 @@ mod resume_tests {
             committed.discovered_skills,
             vec!["cloud-recovery".to_string()]
         );
+    }
+
+    #[derive(Debug)]
+    struct ConflictingAdmissionTestBearer;
+
+    impl astra_thin_client::client::BearerProvider for ConflictingAdmissionTestBearer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async { Ok("unrelated-provider-token".into()) })
+        }
+    }
+
+    fn canonical_server_test_restore(
+        session_id: &str,
+        head_turn: u32,
+        conversation: &astra_turn_core::active_conversation::ActiveConversation,
+    ) -> RestoredSession {
+        RestoredSession {
+            session_id: session_id.into(),
+            turn_count: head_turn,
+            restored_from_cloud: true,
+            resume_bundle: Some(astra_turn_types::ResumeBundleV1 {
+                schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                cursor: conversation.cursor().clone(),
+                conversation_messages: conversation.materialize(),
+                materialized_conversation_root_hash: None,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn explicit_server_restore_keeps_two_request_and_local_commit_clocks_independent() {
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        for (local_turn, server_turn, concurrent_local_turn, failed_primary_append) in [
+            (20, 3, false, false),
+            (3, 20, false, false),
+            (20, 3, true, false),
+            (20, 3, false, true),
+        ] {
+            let sid = format!("resume-independent-{local_turn}-{}", uuid::Uuid::new_v4());
+            write_profile_with_token(&sid);
+            let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+            let local_messages = vec![
+                serde_json::json!({"role":"user", "content":"local question"}),
+                serde_json::json!({"role":"assistant", "content":"local answer"}),
+            ];
+            let local = ActiveConversation::empty(&owner, &sid)
+                .unwrap()
+                .prepare_commit(local_turn, None, local_messages)
+                .unwrap();
+            let writer = session_journal::JournalWriter::new(&sid).unwrap();
+            writer
+                .append(
+                    &session_journal::JournalEvent::turn(
+                        Some(&sid),
+                        local_turn,
+                        None,
+                        "local question",
+                        "local answer",
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .with_conversation_commit(local.commit),
+                )
+                .unwrap();
+            let server_messages = vec![
+                serde_json::json!({"role":"user", "content":"Server question"}),
+                serde_json::json!({"role":"assistant", "content":"Server answer"}),
+            ];
+            let server_active = ActiveConversation::empty(&owner, &sid)
+                .unwrap()
+                .prepare_commit(server_turn - 1, None, server_messages.clone())
+                .unwrap()
+                .next;
+            let mut next_messages = server_messages.clone();
+            next_messages.extend([
+                serde_json::json!({"role":"user", "content":"continue again"}),
+                serde_json::json!({"role":"assistant", "content":"continued"}),
+            ]);
+            let next_server = server_active
+                .prepare_commit(server_turn + 1, None, next_messages.clone())
+                .unwrap()
+                .next;
+            // The conversation cursor may lag the official Server session head.
+            let first_restore = canonical_server_test_restore(&sid, server_turn, &server_active);
+            let next_restore = canonical_server_test_restore(&sid, server_turn + 1, &next_server);
+            let responses = Arc::new(vec![first_restore.clone(), first_restore, next_restore]);
+            let count = Arc::new(AtomicUsize::new(0));
+            let counter = count.clone();
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/sessions/{sid}/resume")))
+                .respond_with(move |request: &wiremock::Request| {
+                    let index = counter.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        if index == 0 {
+                            "Bearer test-token"
+                        } else {
+                            "Bearer admitted-token"
+                        },
+                        "admission must use its own bearer, not the ambient profile token"
+                    );
+                    ResponseTemplate::new(200).set_body_json(&responses[index.min(2)])
+                })
+                .expect(3)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            restore_session_into_state(&sid, None, &api, &mut state)
+                .await
+                .unwrap();
+            Mock::given(method("POST"))
+                .and(path("/admission-token-probe"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer admitted-token",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let api = api.with_bearer_provider(Arc::new(ConflictingAdmissionTestBearer));
+            assert!(state.server_resume_attachment.is_some());
+            // This retained source cursor is only an attachment identity; its
+            // turn cannot override the freshly returned official session head.
+            state
+                .server_resume_attachment
+                .as_mut()
+                .unwrap()
+                .0
+                .completed_turn = if local_turn > server_turn { 100 } else { 0 };
+            let _env_bearer = EnvGuard::set("ASTRA_ACCESS_TOKEN", "admitted-token");
+            let admitted_local_turn = local_turn + u32::from(concurrent_local_turn);
+            if concurrent_local_turn {
+                let mut messages = local.next.materialize();
+                messages.extend([
+                    serde_json::json!({"role":"user", "content":"headless question"}),
+                    serde_json::json!({"role":"assistant", "content":"headless answer"}),
+                ]);
+                let advanced = local
+                    .next
+                    .prepare_commit(admitted_local_turn, None, messages)
+                    .unwrap();
+                writer
+                    .append(
+                        &session_journal::JournalEvent::turn(
+                            Some(&sid),
+                            admitted_local_turn,
+                            None,
+                            "headless question",
+                            "headless answer",
+                            0,
+                            0,
+                            0,
+                            0,
+                        )
+                        .with_conversation_commit(advanced.commit),
+                    )
+                    .unwrap();
+            }
+            let first =
+                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_with_token_for_test(
+                    &mut state, &api, true, "admitted-token", failed_primary_append,
+                ).await.unwrap();
+            assert_eq!(
+                first,
+                (
+                    server_turn + 1,
+                    server_messages,
+                    admitted_local_turn + u32::from(!failed_primary_append)
+                )
+            );
+            let second =
+                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
+                    &mut state, &api, true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                second,
+                (
+                    server_turn + 2,
+                    next_messages,
+                    admitted_local_turn + 1 + u32::from(!failed_primary_append)
+                )
+            );
+            let events = session_journal::JournalWriter::new(&sid)
+                .unwrap()
+                .complete_append_order_snapshot()
+                .unwrap();
+            let turns = events
+                .iter()
+                .filter(|event| event.event_type == session_journal::JournalEventType::Turn)
+                .filter_map(|event| event.turn)
+                .collect::<Vec<_>>();
+            let mut expected_turns = vec![local_turn];
+            if concurrent_local_turn {
+                expected_turns.push(admitted_local_turn);
+            }
+            expected_turns.push(admitted_local_turn + 1);
+            if !failed_primary_append {
+                expected_turns.push(admitted_local_turn + 2);
+            }
+            assert_eq!(turns, expected_turns);
+            assert_eq!(count.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn explicit_server_admission_fails_closed_and_clears_attachment_on_rebind() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let sid = format!("resume-guards-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&sid);
+        write_local_resumable_session(&sid, 20);
+        let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+        let remote = astra_turn_core::active_conversation::ActiveConversation::empty(&owner, &sid)
+            .unwrap()
+            .prepare_commit(
+                3,
+                None,
+                vec![serde_json::json!({"role":"user", "content":"Server question"})],
+            )
+            .unwrap()
+            .next;
+        let restored = canonical_server_test_restore(&sid, 3, &remote);
+        let mut checkpoint = restored.clone();
+        checkpoint.resume_bundle.as_mut().unwrap().source =
+            astra_turn_types::ResumeSourceV1::Checkpoint;
+        let mut wrong_owner = restored.clone();
+        wrong_owner.resume_bundle.as_mut().unwrap().cursor.owner_id = "foreign-account".into();
+        let mut wrong_session = restored.clone();
+        wrong_session.session_id = "foreign-session".into();
+        for response in [
+            ResponseTemplate::new(200).set_body_json(checkpoint),
+            ResponseTemplate::new(200).set_body_json(wrong_owner),
+            ResponseTemplate::new(200).set_body_json(wrong_session),
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"session_id":sid,"turn_count":3})),
+        ] {
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            apply_restored_session(None, &api, &mut state, restored.clone())
+                .await
+                .unwrap();
+            let prior_requests = server.received_requests().await.unwrap().len();
+            Mock::given(method("POST"))
+                .and(path(format!("/sessions/{sid}/resume")))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let before = state.active_conversation.as_ref().unwrap().cursor().clone();
+            assert!(
+                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
+                    &mut state, &api, false,
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                state.turn, 3,
+                "failed official refresh must not install local turn20"
+            );
+            assert_eq!(
+                state.active_conversation.as_ref().unwrap().cursor(),
+                &before
+            );
+            let requests = server.received_requests().await.unwrap();
+            let requests = &requests[prior_requests..];
+            assert_eq!(
+                requests[0]
+                    .headers
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer admitted-token"
+            );
+            assert_eq!(requests.len(), 1, "no chat or fallback request");
+            assert_eq!(requests[0].url.path(), format!("/sessions/{sid}/resume"));
+            state.server_resume_attachment.as_mut().unwrap().1 += 1;
+            assert!(
+                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
+                    &mut state, &api, false,
+                )
+                .await
+                .unwrap_err()
+                .contains("current account/session")
+            );
+            state.server_resume_attachment.as_mut().unwrap().1 -= 1;
+            state.server_resume_attachment.as_mut().unwrap().0.owner_id = "foreign-account".into();
+            assert!(
+                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
+                    &mut state, &api, false,
+                )
+                .await
+                .unwrap_err()
+                .contains("current account/session")
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                prior_requests + 1
+            );
+            let binding = state.server_resume_attachment.clone();
+            state.set_session_id("another-session");
+            assert!(state.server_resume_attachment.is_none());
+            state.server_resume_attachment = binding;
+            state.reset_for_session_restore();
+            assert!(state.server_resume_attachment.is_none());
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn explicit_server_admission_refreshes_only_the_captured_owner_and_uses_rotated_bearer() {
+        use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile};
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use base64::Engine;
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _env = EnvGuard::set("ASTRA_ACCESS_TOKEN", "");
+        for expires_in in [-10, 30] {
+            let sid = format!("resume-bound-owner-{expires_in}-{}", uuid::Uuid::new_v4());
+            let owner = "resume-admitted-owner";
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(
+                    &serde_json::json!({"exp":chrono::Utc::now().timestamp() + expires_in}),
+                )
+                .unwrap(),
+            );
+            let old_bearer = format!("eyJhbGciOiJub25lIn0.{payload}.synthetic");
+            let mut credentials = CredentialsFile::default();
+            credentials.current_profile = Some("ambient-other".into());
+            credentials.profiles.insert(
+                "default".into(),
+                Profile {
+                    account_id: Some(owner.into()),
+                    access_token: Some(old_bearer.clone()),
+                    refresh_token: Some("admitted-owner-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            credentials.profiles.insert(
+                "ambient-other".into(),
+                Profile {
+                    account_id: Some("unrelated-account".into()),
+                    access_token: Some("unrelated-access".into()),
+                    refresh_token: Some("unrelated-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            cli_utils::save_credentials(&credentials).unwrap();
+            let _identity =
+                cli_utils::install_cli_profile_identity_for_test("default", Some(owner)).unwrap();
+            let local = ActiveConversation::empty(owner, &sid)
+                .unwrap()
+                .prepare_commit(
+                    20,
+                    None,
+                    vec![
+                        serde_json::json!({"role":"user", "content":"local question"}),
+                        serde_json::json!({"role":"assistant", "content":"local answer"}),
+                    ],
+                )
+                .unwrap();
+            session_journal::JournalWriter::new(&sid)
+                .unwrap()
+                .append(
+                    &session_journal::JournalEvent::turn(
+                        Some(&sid),
+                        20,
+                        None,
+                        "local question",
+                        "local answer",
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .with_conversation_commit(local.commit),
+                )
+                .unwrap();
+            let server_messages = vec![
+                serde_json::json!({"role":"user", "content":"Server question"}),
+                serde_json::json!({"role":"assistant", "content":"Server answer"}),
+            ];
+            let remote = ActiveConversation::empty(owner, &sid)
+                .unwrap()
+                .prepare_commit(3, None, server_messages.clone())
+                .unwrap()
+                .next;
+            let restored = canonical_server_test_restore(&sid, 3, &remote);
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+                .unwrap()
+                .with_bearer_provider(std::sync::Arc::new(ConflictingAdmissionTestBearer));
+            let mut state = SessionState::default();
+            apply_restored_session(None, &api, &mut state, restored.clone())
+                .await
+                .unwrap();
+            Mock::given(method("POST")).and(path("/auth/refresh"))
+                .and(wiremock::matchers::body_json(serde_json::json!({"refresh_token":"admitted-owner-refresh"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id":owner, "access_token":"rotated-owner-access", "refresh_token":"rotated-owner-refresh",
+                }))).expect(1).mount(&server).await;
+            Mock::given(method("POST"))
+                .and(path(format!("/sessions/{sid}/resume")))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer rotated-owner-access",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&restored))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/admission-token-probe"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    "Bearer rotated-owner-access",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let observed = crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_with_token_for_test(
+                &mut state, &api, true, &old_bearer, false,
+            ).await.unwrap();
+            assert_eq!(observed, (4, server_messages, 21));
+            let saved = cli_utils::load_credentials();
+            assert_eq!(saved.current_profile.as_deref(), Some("ambient-other"));
+            assert_eq!(
+                saved.profiles["ambient-other"].access_token.as_deref(),
+                Some("unrelated-access")
+            );
+            assert_eq!(
+                saved.profiles["default"].access_token.as_deref(),
+                Some("rotated-owner-access")
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn explicit_server_admission_refresh_cancels_and_times_out_before_execution() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let sid = format!("resume-bounded-{}", uuid::Uuid::new_v4());
+        write_profile_with_token(&sid);
+        write_local_resumable_session(&sid, 20);
+        let owner = crate::cli::cli_config::cli_utils::cli_user_id();
+        let remote = astra_turn_core::active_conversation::ActiveConversation::empty(&owner, &sid)
+            .unwrap()
+            .prepare_commit(
+                3,
+                None,
+                vec![serde_json::json!({"role":"user", "content":"Server question"})],
+            )
+            .unwrap()
+            .next;
+        let restored = canonical_server_test_restore(&sid, 3, &remote);
+        for user_cancel in [true, false] {
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            apply_restored_session(None, &api, &mut state, restored.clone())
+                .await
+                .unwrap();
+            let prior_requests = server.received_requests().await.unwrap().len();
+            Mock::given(method("POST"))
+                .and(path(format!("/sessions/{sid}/resume")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(&restored)
+                        .set_delay(
+                            crate::cli::turn::turn_entry::INTERACTIVE_SERVER_RESUME_TIMEOUT
+                                + std::time::Duration::from_secs(10),
+                        ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+            state.tui_cancel_token = Some(cancel.clone());
+            let attempt =
+                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
+                    &mut state, &api, false,
+                );
+            let interrupt = async {
+                while server.received_requests().await.unwrap().len() <= prior_requests {
+                    tokio::task::yield_now().await;
+                }
+                if user_cancel {
+                    cancel.cancel();
+                } else {
+                    tokio::time::pause();
+                    tokio::time::advance(
+                        crate::cli::turn::turn_entry::INTERACTIVE_SERVER_RESUME_TIMEOUT,
+                    )
+                    .await;
+                }
+            };
+            let (outcome, ()) = tokio::join!(attempt, interrupt);
+            if !user_cancel {
+                tokio::time::resume();
+            }
+            assert!(outcome.unwrap_err().contains(if user_cancel {
+                "cancelled"
+            } else {
+                "timed out"
+            }));
+            assert_eq!(state.turn, 3, "no local or model turn was admitted");
+            assert!(
+                session_journal::SessionExecutionLease::try_acquire(&sid).is_ok(),
+                "failed refresh must release the lease"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                prior_requests + 1
+            );
+        }
     }
 
     #[serial_test::serial]

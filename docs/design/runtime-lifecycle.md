@@ -169,6 +169,21 @@ bundle. A local replica cannot override Server ownership, deletion, or a failed
 restore request. Local-only continuation remains available without Server
 authentication; clearing a stale remote pointer does not delete the replica.
 
+An interactive attachment explicitly restored from a Server canonical bundle
+refreshes that bundle through the authenticated resume API before each actual
+model turn, while holding the local execution lease. This adds one resume
+request per turn for those attachments. Its 30-second deadline and the current
+TUI cancellation token bound the wait while the local lease is held. The
+resume and model requests use the same admitted owner bearer, refreshed only
+through that captured owner's existing binding. An environment bearer remains
+an explicit bearer and cannot borrow profile refresh authority.
+A failed or degraded refresh stops before execution; it cannot fall back to the local replica. The returned
+Server session turn count and canonical messages supply that request's inputs.
+The local snapshot independently supplies the local journal turn allocation and
+canonical commit base. Server cursors are never advanced as local cursors.
+Ordinary local and fresh attachments do not perform this additional request.
+
+
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution
 of the original run. Continuing a session in a new run consumes canonical

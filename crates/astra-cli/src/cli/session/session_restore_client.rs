@@ -144,9 +144,20 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_client(
         None if crate::cli::native_auth::active().is_some() => String::new(),
         None => return Ok(None),
     };
+    fetch_cloud_session_snapshot_with_bearer(api, session_id, &token).await
+}
+
+/// Read the official Server continuation with the bearer already admitted for
+/// this turn. Do not select an ambient profile while a turn owns that binding.
+pub(crate) async fn fetch_cloud_session_snapshot_with_bearer(
+    api: &astra_thin_client::ThinClient,
+    session_id: &str,
+    token: &str,
+) -> Result<Option<RestoredSession>, String> {
+    validate_remote_session_id(session_id)?;
     let path = astra_thin_client::paths::session_resume(session_id);
     match api
-        .post_bearer_path_empty_json::<RestoredSession>(&token, &path)
+        .post_bearer_path_empty_json::<RestoredSession>(token, &path)
         .await
     {
         Ok(restored) => Ok(Some(validate_restored_session(session_id, restored)?)),
