@@ -52,9 +52,9 @@ BOOT_METADATA_TABLES = frozenset(
         "astra_schema_table_contracts",
         "infra_llm_models",
         "maintenance_sweep_cursors",
-        # The distributed weighted-admission coordinator owns one durable
-        # scope gate. It is created during core-schema bootstrap and is not
-        # user/session/work state; its exact scope is validated below.
+        # The distributed weighted-admission coordinator owns partition gates.
+        # They are created during core-schema bootstrap and are not
+        # user/session/work state; their exact source scopes are validated below.
         "session_weighted_admission_gates",
         "sweeper_leases",
         # A fresh scored database is seeded through the production admin API.
@@ -279,6 +279,7 @@ def _validate_closed_schema_counts(
     counts: dict[str, int],
     *,
     optional_absent: set[str] | frozenset[str] = frozenset(),
+    repo: Path | None = None,
 ) -> None:
     _validate_closed_schema_presence(canonical, actual, optional_absent)
     if set(counts) != actual:
@@ -304,7 +305,11 @@ def _validate_closed_schema_counts(
         "astra_schema_contracts": 1,
         "infra_llm_models": 1,
         "maintenance_sweep_cursors": 1,
-        "session_weighted_admission_gates": 1,
+        "session_weighted_admission_gates": len(
+            _distributed_admission_scopes(
+                Path(__file__).resolve().parents[2] if repo is None else repo
+            )
+        ),
         "sweeper_leases": 1,
     }
     for table, expected in expected_boot_counts.items():
@@ -367,19 +372,38 @@ def _core_schema_contract_version(repo: Path) -> str:
     return match.group(1)
 
 
-def _distributed_admission_scope(repo: Path) -> str:
+def _distributed_admission_scopes(repo: Path) -> list[str]:
     source = (
         repo / "crates" / "services" / "src" / "weighted_admission.rs"
     ).read_text(encoding="utf-8")
-    match = re.search(
-        r'pub\(crate\) const DISTRIBUTED_ADMISSION_SCOPE: &str = "([^"]+)";',
+    partitions = re.findall(
+        r'^pub\(crate\) const DISTRIBUTED_ADMISSION_PARTITIONS: usize = ([1-9][0-9]*);$',
         source,
+        re.MULTILINE,
     )
-    if match is None:
+    # Recognize only the source-owned literal formatter. Unsupported changes
+    # must fail closed rather than accept a guessed scope or arbitrary rows.
+    formats = re.findall(
+        r'^pub\(crate\) fn distributed_admission_scope\(partition: usize\) -> String \{\s*'
+        r'format!\("([a-zA-Z0-9_]+)\{partition:02\}([a-zA-Z0-9_]*)"\)\s*^\}',
+        source,
+        re.MULTILINE,
+    )
+    if len(partitions) != 1 or len(formats) != 1:
         raise ContractError(
-            "cannot resolve the source-owned distributed admission scope"
+            "cannot resolve the source-owned distributed admission scopes"
         )
-    return match.group(1)
+    prefix, suffix = formats[0]
+    return sorted(
+        f"{prefix}{partition:02}{suffix}" for partition in range(int(partitions[0]))
+    )
+
+
+def _validate_admission_gates(rows: list[list[str]], repo: Path) -> None:
+    if rows != [[scope] for scope in _distributed_admission_scopes(repo)]:
+        raise ContractError(
+            "session_weighted_admission_gates does not match the exact source scopes"
+        )
 
 
 def _canonical_runtime_system_baseline(repo: Path) -> dict[str, object]:
@@ -578,10 +602,7 @@ def _validate_boot_metadata(database: str, repo: Path, counts: dict[str, int]) -
         "SELECT scope_name FROM session_weighted_admission_gates ORDER BY scope_name",
         database,
     )
-    if admission_gates != [[_distributed_admission_scope(repo)]]:
-        raise ContractError(
-            "session_weighted_admission_gates does not match the exact source scope"
-        )
+    _validate_admission_gates(admission_gates, repo)
     digest = hashlib.sha256(
         json.dumps(table_contracts, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -616,7 +637,7 @@ def _runtime_state(database: str, repo: Path | None = None) -> dict[str, object]
             "database count inventory returned a non-integer"
         ) from error
     _validate_closed_schema_counts(
-        canonical, actual, counts, optional_absent=conditional_tables
+        canonical, actual, counts, optional_absent=conditional_tables, repo=repo
     )
     boot_metadata = _validate_boot_metadata(database, repo, counts)
     return {

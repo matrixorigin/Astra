@@ -377,7 +377,7 @@ pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult 
     } else {
         format!("Tool '{name}' not executed: run was cancelled")
     };
-    ToolResult {
+    let mut result = ToolResult {
         output: json!({
             "status": "cancelled",
             "error_kind": TOOL_ERROR_KIND_CANCELLED,
@@ -404,7 +404,15 @@ pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult 
         ])),
         is_error: true,
         exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
+    };
+    let fields = result.metadata.get_or_insert_default();
+    if execution_started {
+        execution_outcome::insert_started_execution_fact(fields);
+    } else {
+        execution_outcome::insert_not_executed_fact(fields);
+        fields.insert("side_effects_maybe".into(), Value::Bool(false));
     }
+    result
 }
 
 /// A workspace lease admission failure is a fact about scheduling, not a

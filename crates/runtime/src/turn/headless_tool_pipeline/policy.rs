@@ -332,13 +332,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         &mut self,
         item: usize,
     ) -> HeadlessPipelineStage<ValidatedExecution> {
-        let mut slot = self.resolve_slot(item);
-        super::inherit_external_effect_recovery_scope(
-            &slot.name,
-            &mut slot.args,
-            self.ctx.external_effect_recovery_paths,
-        );
-
+        let slot = self.resolve_slot(item);
         if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
             return HeadlessPipelineStage::ShortCircuit;
         }

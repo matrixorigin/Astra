@@ -19644,6 +19644,74 @@ mod tests {
     }
 
     #[test]
+    fn glm_exact_captured_replay_is_shared_by_streaming_nonstreaming_and_cache_projection() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+        use astra_turn_core::thinking_config::ThinkingEffort;
+        let append_only = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let messages = vec![
+            json!({"role":"user", "content":"request"}),
+            json!({"role":"assistant", "content":"first", "reasoning_content":" original\n\t", "reasoning_signature":"original-signature"}),
+            json!({"role":"assistant", "content":"missing original"}),
+            json!({"role":"assistant", "content":"empty", "reasoning_content":""}),
+            json!({"role":"assistant", "content":"space", "reasoning_content":" \t"}),
+            json!({"role":"assistant", "content":"last", "reasoning_content":"last original"}),
+        ];
+        for streaming in [false, true] {
+            for thinking in [
+                ThinkingConfig::Off,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Low,
+                },
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Max,
+                },
+            ] {
+                for capability in [None, Some(append_only)] {
+                    let body = build_provider_request_body_with_cache_capability(
+                        &messages,
+                        &[],
+                        "glm-5.3",
+                        "openai",
+                        Some(128),
+                        None,
+                        streaming,
+                        &thinking,
+                        None,
+                        capability,
+                    );
+                    assert_eq!(body["messages"], json!(messages));
+                    assert_eq!(body["stream"], streaming);
+                    let mut extended = messages.clone();
+                    extended.push(json!({"role":"user", "content":"next"}));
+                    let next = build_provider_request_body_with_cache_capability(
+                        &extended,
+                        &[],
+                        "glm-5.3",
+                        "openai",
+                        Some(128),
+                        None,
+                        streaming,
+                        &thinking,
+                        None,
+                        capability,
+                    );
+                    assert_eq!(
+                        &next["messages"].as_array().unwrap()[..messages.len()],
+                        messages.as_slice()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn append_only_cache_shape_does_not_invent_reasoning_wire_fields() {
         use astra_turn_core::cache_placement::{
             CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,

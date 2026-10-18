@@ -26,7 +26,8 @@ pub(crate) async fn execute_for_model(
         model,
         astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
     )
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(execute(api, token, &selection.offering_id, message, timeout_seconds).await)
 }
 

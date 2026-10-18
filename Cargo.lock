@@ -183,6 +183,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rpassword",
+ "rsa",
  "rustyline",
  "schemars",
  "serde",

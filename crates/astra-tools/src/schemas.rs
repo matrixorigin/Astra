@@ -1898,13 +1898,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "maxItems": crate::source_preimage::MAX_SOURCE_ARTIFACTS,
                             "items": {"type": "string", "minLength": 1},
                             "description": "Optional hard evidence-preservation guarantee. List existing regular files relative to the workspace root before a command may open or transform irreplaceable inputs. Each file is copied and checksum-verified before the shell starts; any invalid path, capture failure, or race prevents execution. This is not a glob and a checksum alone is not a backup."
-                        },
-                        "external_state_paths": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 16,
-                            "items": {"type": "string", "minLength": 1},
-                            "description": "Required when this command may change state outside the bound workspace. List the smallest absolute external roots whose state must change. Astra captures bounded pre/post fingerprints and issues completion evidence only for an observed delta under authoritative process ownership. Paths inside or overlapping the workspace, relative/traversal paths, unobservable roots, background tasks, and unchanged state fail closed. Omit this only for workspace-confined work or an explicit read-only verification; do not use it for workspace files."
                         }
                     },
                     "required": ["command"]

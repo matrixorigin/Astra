@@ -110,8 +110,20 @@ must not extend the command budget. Missing or invalid command authority rejects
 a Bash request. Model arguments remain unchanged for approval, invocation identity
 and journal evidence; runtime controls are never injected into those arguments.
 
-Ordinary shell inspection and diagnostics use command output as evidence and
-omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
+Ordinary shell execution uses the selected provider's permission, sandbox and
+process-coordination boundaries. Optional bounded observation is evidence, not
+an execution prerequisite. The executor records pre-start rejection separately
+from started success, failure or cancellation; unavailable observation cannot
+turn either into a permission denial. A started command deadline carries typed
+`tool_timeout` evidence even after its process scope is settled. Cancellation,
+timeout and lost outcomes can leave partial effects and must not be replayed
+merely to obtain evidence.
+
+Command output can establish a current state, including an already-satisfied
+request or an absent directory, without claiming this invocation changed it.
+Neither a zero exit status nor a generic filesystem delta proves arbitrary task
+correctness. Domain tools and canonical Work retain their own result contracts.
+Inspection and diagnostics omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
 after edits. If bounded observation is unavailable, command output is retained
 but the requested verification fails closed; it must not mint a completion or
 no-change receipt. Command text does not select or weaken this contract.
@@ -250,8 +262,7 @@ coordination authority inside the tool-writable workspace.
 
 Workspace lease admission uses the asynchronous options APIs with explicit
 cancellation and wait budgets. Observation, mutation, and opaque writer APIs
-return `Result<_, WorkspaceLeaseFailure>`; external observation preserves that
-typed admission failure separately from invalid path declarations. The unused synchronous acquisition APIs and
+return `Result<_, WorkspaceLeaseFailure>` with typed admission failures. The unused synchronous acquisition APIs and
 no-options observation wrapper are retired from the Rust source API. Process
 coordination, generation watches, diagnostic paths, and guard cleanup remain
 shared; tests exercise the same acquisition paths as executors.
@@ -293,12 +304,11 @@ or prevent the next command. Unsettled execution ownership and a replaced or
 tampered binding still prevent admission. Every receipt-producing path must
 check receipt authority independently of the coordination check used to launch.
 
-Quarantine is retained per observation root for the executor process lifetime,
-not per conversation. Explicit external-state preimage capture reports
-`external_state_observation_quarantined` separately from ordinary unavailable,
-ambiguous or over-bound fingerprints. The command is not launched in this case.
-Quarantine establishment and later refusals log a root digest, not local paths
-or shell input. A new conversation does not clear quarantine; before restarting
+Receipt-attribution quarantine is retained per workspace observation root for
+the executor process lifetime, not per conversation. It prevents new attribution
+receipts, while healthy execution coordination remains independent. Explicit
+verification still fails when the required proof is unavailable. Quarantine
+diagnostics log a root digest, not local paths or shell input. A new conversation does not clear quarantine; before restarting
 the affected Astra or astra-edge process, verify that earlier background work
 has stopped. Restart alone does not stop escaped descendants or prove safety.
 

@@ -19,7 +19,7 @@ const SHELL_HOOK_POLICY_PREFIX: &str = "shell hook command blocked";
 
 /// An action to execute as part of a hook.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HookAction {
     /// Run a shell command.
     Shell { command: String },
@@ -152,6 +152,7 @@ pub enum HookDecisionContractError {
 ///
 /// Configured in project settings (`.astra/hooks.json`) or skill frontmatter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolEventHook {
     /// Which event triggers this hook.
     pub event: ToolEventKind,
@@ -715,7 +716,7 @@ impl std::fmt::Display for HookConfigDiagnostic {
             HookConfigDiagnosticKind::Read(kind) => write!(f,
                 "cannot read file ({kind:?}); check that this is a readable UTF-8 regular file. Trying the next candidate."),
             HookConfigDiagnosticKind::InvalidConfiguration => f.write_str(
-                "invalid syntax or field type; check the configuration at this location. No hooks loaded from this file; lower-priority files are not used."),
+                "invalid syntax, unknown field, or invalid field type; check the configuration at this location. No hooks loaded from this file; lower-priority files are not used."),
             HookConfigDiagnosticKind::InvalidEvent => {
                 let events = if self.field.starts_with("session_hooks[") {
                     "session_start or session_end"
@@ -858,6 +859,7 @@ pub fn load_all_hooks(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HookConfig {
     #[serde(default)]
     hooks: Vec<ToolEventHook>,
@@ -1676,6 +1678,7 @@ pub enum SessionEvent {
 ///
 /// Configured in `.astra/hooks.json` / `.astra/hooks.yaml` alongside tool event hooks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionEventHook {
     /// Which session event triggers this hook.
     pub event: SessionEvent,
@@ -3329,6 +3332,144 @@ mod tests {
     }
 
     // ── Config loading tests ────────────────────────────────────────
+
+    #[test]
+    fn hook_config_matcher_typo_never_broadens_to_all_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".astra")).unwrap();
+        std::fs::write(dir.path().join(".astra/hooks.json"), r#"{"hooks":[{"event":"pre_tool_use","matchr":"bash","action":{"type":"shell","command":"echo safe"}}]}"#).unwrap();
+        let (tools, sessions) = load_all_hooks(dir.path());
+        assert!(
+            tools
+                .matching(ToolEventKind::PreToolUse, "read_file")
+                .is_empty(),
+            "a misspelled matcher must not activate on unrelated tools"
+        );
+        assert!(tools.is_empty() && sessions.is_empty());
+        assert_eq!(tools.take_config_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn hook_config_unknown_fields_reject_the_whole_first_readable_file() {
+        let tool = serde_json::json!({"event":"pre_tool_use", "action":{"type":"shell", "command":"echo command-secret"}});
+        let session = serde_json::json!({"event":"session_start", "action":{"type":"set_env", "key":"UNUSED", "value":"env-secret"}});
+        let valid = serde_json::json!({"hooks":[tool.clone()], "session_hooks":[session.clone()]});
+        let mut cases = Vec::new();
+        let mut top = valid.clone();
+        top["unknown-secret\nforged warning"] = serde_json::json!("value-secret");
+        cases.push((top, "$"));
+        for (collection, definition) in [("hooks", &tool), ("session_hooks", &session)] {
+            let mut typo = valid.clone();
+            typo[collection][0][if collection == "hooks" {
+                "matchr"
+            } else {
+                "onec"
+            }] = serde_json::json!("field-secret");
+            cases.push((typo, collection));
+            for action in [
+                serde_json::json!({"type":"shell", "command":"echo command-secret", "commmand":"typo-secret"}),
+                serde_json::json!({"type":"set_env", "key":"UNUSED", "value":"env-secret", "vaule":"typo-secret"}),
+                serde_json::json!({"type":"http", "url":"https://invalid.example/url-secret", "headers":{}, "header":"typo-secret"}),
+                serde_json::json!({"type":"custom", "id":"id-secret", "config":{}, "confg":"typo-secret"}),
+            ] {
+                let mut invalid = valid.clone();
+                let mut hook = definition.clone();
+                hook["action"] = action;
+                invalid[collection].as_array_mut().unwrap().push(hook);
+                cases.push((invalid, collection));
+            }
+        }
+        for (index, name) in HOOK_CONFIG_CANDIDATES.iter().copied().enumerate() {
+            for (value, field_prefix) in &cases {
+                let dir = tempfile::tempdir().unwrap();
+                let astra = dir.path().join(".astra");
+                std::fs::create_dir(&astra).unwrap();
+                for candidate in &HOOK_CONFIG_CANDIDATES[index..] {
+                    let value = if *candidate == name { value } else { &valid };
+                    let content = if candidate.ends_with("json") {
+                        value.to_string()
+                    } else {
+                        serde_yaml_ng::to_string(value).unwrap()
+                    };
+                    std::fs::write(astra.join(candidate), content).unwrap();
+                }
+                let (tools, sessions) = load_all_hooks(dir.path());
+                assert!(tools.is_empty() && sessions.is_empty(), "{name}: {value}");
+                let diagnostics = sessions.take_config_diagnostics();
+                assert_eq!(diagnostics.len(), 1);
+                let diagnostic = &diagnostics[0];
+                assert_eq!(diagnostic.source, name);
+                assert_eq!(
+                    diagnostic.kind,
+                    HookConfigDiagnosticKind::InvalidConfiguration
+                );
+                assert!(diagnostic.field.starts_with(field_prefix), "{diagnostic:?}");
+                assert!(diagnostic.line.is_some_and(|line| line > 0));
+                assert!(diagnostic.column.is_some());
+                assert!(
+                    diagnostic
+                        .to_string()
+                        .contains("lower-priority files are not used")
+                );
+                let output = format!("{diagnostic} {diagnostic:?}");
+                for secret in [
+                    "secret",
+                    "forged warning",
+                    "invalid.example",
+                    "matchr",
+                    "onec",
+                ] {
+                    assert!(!output.contains(secret), "{output}");
+                }
+                assert!(tools.take_config_diagnostics().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn hook_config_strict_fields_preserve_defaults_and_extension_maps() {
+        for name in HOOK_CONFIG_CANDIDATES {
+            let dir = tempfile::tempdir().unwrap();
+            let astra = dir.path().join(".astra");
+            std::fs::create_dir(&astra).unwrap();
+            let value = serde_json::json!({"default_timeout_secs":27, "hooks":[
+                {"event":"pre_tool_use", "action":{"type":"custom", "id":"extension", "config":{"matchr":"extension-owned", "nested":{"future":true}}}},
+                {"event":"post_tool_use", "matcher":"read_*", "action":{"type":"http", "url":"https://invalid.example", "headers":{"X-Extension":"ok", "Authorization":"header-secret"}}}
+            ], "session_hooks":[{"event":"session_start", "action":{"type":"set_env", "key":"UNUSED", "value":"unused"}}]});
+            let content = if name.ends_with("json") {
+                value.to_string()
+            } else {
+                serde_yaml_ng::to_string(&value).unwrap()
+            };
+            std::fs::write(astra.join(name), content).unwrap();
+            let (tools, sessions) = load_all_hooks(dir.path());
+            assert_eq!(tools.len(), 2);
+            assert_eq!(sessions.len(), 1);
+            assert!(tools.take_config_diagnostics().is_empty());
+            let all = tools.matching(ToolEventKind::PreToolUse, "any_tool");
+            assert_eq!(
+                all.len(),
+                1,
+                "omitted matcher intentionally still matches all tools"
+            );
+            assert_eq!(all[0].timeout_secs, 27);
+            assert!(!all[0].is_async && !all[0].once);
+            assert_eq!(
+                serde_json::to_value(&all[0].action).unwrap(),
+                value["hooks"][0]["action"]
+            );
+            let http = tools.matching(ToolEventKind::PostToolUse, "read_file");
+            assert_eq!(
+                serde_json::to_value(&http[0].action).unwrap()["headers"],
+                value["hooks"][1]["action"]["headers"]
+            );
+            assert!(
+                tools
+                    .matching(ToolEventKind::PostToolUse, "bash")
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn hook_config_diagnostics_distinguish_missing_empty_and_malformed() {

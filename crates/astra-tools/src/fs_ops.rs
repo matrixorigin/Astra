@@ -1319,10 +1319,43 @@ fn replacement_arguments(args: &Value) -> Result<ReplacementArguments<'_>, ToolR
 
 /// Validate single-edit parameters without resolving or reading a target.
 pub fn validate_str_replace_args(args: &Value) -> Result<(), ToolResult> {
-    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
-    replacement_arguments(&args)
-        .map(|_| ())
-        .map_err(ToolResult::with_workspace_mutation_not_applied)
+    validated_single_edit_args(args).map(|_| ())
+}
+
+/// This boundary runs before target resolution or content reads. Later
+/// preimage/match/publication failures must retain their own execution facts.
+fn validated_single_edit_args(args: &Value) -> Result<Value, ToolResult> {
+    normalize_str_replace_args(args)
+        .map_err(ToolResult::error)
+        .and_then(|args| {
+            replacement_arguments(&args)?;
+            Ok(args)
+        })
+        .map_err(str_replace_argument_rejection)
+}
+
+fn str_replace_argument_rejection(mut error: ToolResult) -> ToolResult {
+    if error
+        .metadata
+        .as_ref()
+        .is_none_or(|fields| !fields.contains_key("recovery_evidence"))
+    {
+        error = error.with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+            astra_core::ErrorKind::ToolInvalidArgs,
+        ));
+    }
+    error
+        .with_workspace_mutation_not_applied()
+        .with_execution_not_started()
+}
+
+/// Normalize a new invocation before target binding or content reads.
+/// Preserve pure normalization rejection as a source-authored execution fact.
+/// Callers already holding a preimage use `normalize_str_replace_args` instead.
+pub fn normalize_str_replace_invocation_args(args: &Value) -> Result<Value, ToolResult> {
+    normalize_str_replace_args(args)
+        .map_err(ToolResult::error)
+        .map_err(str_replace_argument_rejection)
 }
 
 fn replacement_no_effect(message: String) -> ToolResult {
@@ -1342,8 +1375,8 @@ fn prepare_str_replace_inner(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedStrReplace, ToolResult> {
-    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
-    let path_str = replacement_arguments(&args)?.path_str;
+    let args = validated_single_edit_args(args)?;
+    let path_str = args["path"].as_str().expect("validated single-edit path");
     let path = resolve_existing_path_for_tool(workspace_root, path_str, "str_replace")?;
     let content = std::fs::read_to_string(&path)
         .map_err(|error| ToolResult::error(format!("Error: Cannot read file: {error}")))?;
@@ -1467,9 +1500,9 @@ impl PreparedStrReplace {
     }
 }
 pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
-    let args = match normalize_str_replace_args(args) {
+    let args = match normalize_str_replace_invocation_args(args) {
         Ok(args) => args,
-        Err(error) => return ToolResult::error(error),
+        Err(error) => return error,
     };
     if args.get("edits").and_then(Value::as_array).is_some() {
         return multi_path_edit(workspace_root, &args);
@@ -2715,6 +2748,82 @@ pub fn unified_diff_raw(old_content: &str, new_content: &str, path: &Path) -> St
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn pure_single_edit_rejections_report_no_execution_before_target_access() {
+        let directory = TempDir::new().unwrap();
+        // A nonexistent target proves rejection does not depend on preimage I/O.
+        for args in [
+            serde_json::json!({"path":"missing.txt", "old_str":"same", "new_str":"same"}),
+            serde_json::json!({"path":"missing.txt", "old_str":"", "new_str":"after"}),
+            serde_json::json!({"path":"missing.txt", "old_str":"before"}),
+            serde_json::json!({"path":"missing.txt", "old_str":"before", "new_str":"after", "edits":[]}),
+        ] {
+            let result = str_replace(directory.path(), &args);
+            if args.get("old_str") == args.get("new_str") {
+                let original = replacement_arguments(&args).err().unwrap();
+                assert_eq!(result.output, original.output);
+                assert_eq!(
+                    result.metadata.as_ref().unwrap()["recovery_evidence"],
+                    original.metadata.as_ref().unwrap()["recovery_evidence"]
+                );
+            }
+            assert!(result.is_error, "{result:?}");
+            let fields = result.metadata.unwrap();
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["execution_fact"], "not_executed");
+            assert_eq!(fields["disposition"], "rejected");
+            assert_eq!(
+                fields["error_kind"],
+                astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            );
+            assert!(!directory.path().join("missing.txt").exists());
+        }
+    }
+
+    #[test]
+    fn post_read_edit_failure_does_not_claim_execution_never_started() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("f.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        let unreadable = str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"missing.txt", "old_str":"before", "new_str":"after"
+            }),
+        );
+        assert!(unreadable.is_error);
+        assert_ne!(
+            unreadable
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("execution_fact")),
+            Some(&serde_json::json!("not_executed"))
+        );
+        let result = str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"f.txt", "old_str":"absent", "new_str":"after"
+            }),
+        );
+        assert!(result.is_error);
+        assert_ne!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("execution_fact")),
+            Some(&serde_json::json!("not_executed"))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+        let result = str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"f.txt", "old_str":"before", "new_str":"after"
+            }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
+    }
 
     #[test]
     fn prepared_existing_publications_do_not_recreate_removed_parent_directories() {

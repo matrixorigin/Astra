@@ -136,3 +136,12 @@ pub fn insert_not_executed_fact(metadata: &mut serde_json::Map<String, Value>) {
         Value::String("not_executed".to_string()),
     );
 }
+
+/// Record process startup at the executor that owns it. Later validation or
+/// observation failure cannot turn an executed command into a preflight refusal.
+pub fn insert_started_execution_fact(metadata: &mut serde_json::Map<String, Value>) {
+    metadata.insert("execution_started".into(), Value::Bool(true));
+    metadata.insert("disposition".into(), Value::String("executed".into()));
+    metadata.insert("execution_fact".into(), Value::String("executed".into()));
+    metadata.insert("side_effects_maybe".into(), Value::Bool(true));
+}

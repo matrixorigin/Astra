@@ -955,7 +955,7 @@ async fn handle_edge_connection(
                                     output,
                                     is_error,
                                     duration_ms,
-                                    mut tool_result_fields,
+                                    tool_result_fields,
                                 }) => {
                                     if request_id != identity.storage_key() {
                                         tracing::warn!(
@@ -967,13 +967,6 @@ async fn handle_edge_connection(
                                         );
                                         continue;
                                     }
-                                    // Edge result fields are client input.  In particular an
-                                    // external-state postimage receipt cannot become durable
-                                    // completion evidence until the protocol carries a
-                                    // server-issued, single-use executor attestation.  Failing
-                                    // closed here prevents forged or replayed JSON from crossing
-                                    // the transport boundary as trusted metadata.
-                                    strip_untrusted_external_effect_fields(&mut tool_result_fields);
                                     let inflight = read_inflight.get(&request_id).await;
                                     let direct_result = EdgeToolResult {
                                         output: output.clone(),
@@ -1561,16 +1554,6 @@ async fn fail_inflight_edge_dispatches(
     failed
 }
 
-fn strip_untrusted_external_effect_fields(
-    fields: &mut Option<serde_json::Map<String, serde_json::Value>>,
-) {
-    if let Some(fields) = fields.as_mut() {
-        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD);
-        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD);
-        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD);
-    }
-}
-
 #[cfg(test)]
 mod inflight_dispatch_tracker_tests {
     use super::*;
@@ -1634,26 +1617,6 @@ mod inflight_dispatch_tracker_tests {
             "rejecting an invalid result must leave the real invocation live"
         );
         assert!(tracker.remove("req-1").await.is_some());
-    }
-
-    #[test]
-    fn edge_client_cannot_inject_external_completion_receipt() {
-        let mut fields = Some(serde_json::json!({
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD: true,
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD: "declared_external_state",
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD: {"schema": "external_effect_receipt.v1"},
-            "exit_code": 0,
-        }).as_object().expect("object").clone());
-        strip_untrusted_external_effect_fields(&mut fields);
-        let fields = fields.expect("preserve unrelated fields");
-        assert_eq!(fields.get("exit_code"), Some(&serde_json::json!(0)));
-        assert!(
-            !fields.contains_key(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
-        );
-        assert!(
-            !fields
-                .contains_key(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD)
-        );
     }
 }
 
