@@ -1371,6 +1371,16 @@ mod tests {
 
 #[cfg(test)]
 mod fork_capture_thinking_slice_tests {
+    #[test]
+    fn glm_captured_reasoning_survives_fork_with_current_thinking_off() {
+        let capture =
+            super::fork_capture_thinking_slice(&super::ThinkingConfig::Off, "openai", "glm-5.3")
+                .unwrap();
+        assert!(capture.enabled);
+        assert_eq!(capture.kind, "native");
+        assert_eq!(capture.budget_tokens, 0);
+    }
+
     use super::*;
 
     #[test]

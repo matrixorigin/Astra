@@ -1040,6 +1040,15 @@ impl ReasoningReplayPolicy {
         model: &str,
     ) -> Self {
         let caps = crate::reasoning_capabilities::reasoning_capabilities(provider, model);
+        if caps.replay_mode == crate::reasoning_capabilities::ReasoningReplayMode::CapturedExact {
+            // Captured history is already the only valid projection. Do not
+            // normalize whitespace, insert placeholders, or strip old blocks.
+            return Self {
+                enforce_reasoning_field: false,
+                placeholder: String::new(),
+                can_strip_unsigned_reasoning: false,
+            };
+        }
         let enforce_reasoning_field =
             !matches!(thinking, crate::thinking_config::ThinkingConfig::Off)
                 || history_has_reasoning(messages)
@@ -1774,6 +1783,34 @@ mod tests {
 
     /// Mixed history: some older assistants have signatures, some don't.
     /// Only the unsigned older ones should get stripped to empty.
+    #[test]
+    fn glm_replay_keeps_every_original_byte_without_inventing_missing_history() {
+        for thinking in [
+            crate::thinking_config::ThinkingConfig::Off,
+            crate::thinking_config::ThinkingConfig::Adaptive {
+                effort: crate::thinking_config::ThinkingEffort::Low,
+            },
+            crate::thinking_config::ThinkingConfig::Adaptive {
+                effort: crate::thinking_config::ThinkingEffort::Max,
+            },
+        ] {
+            let original = vec![
+                serde_json::json!({"role":"user", "content":"request"}),
+                serde_json::json!({"role":"assistant", "reasoning_content":" first\n\t", "reasoning_signature":"captured-signature", "tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":"call-1", "content":"result"}),
+                serde_json::json!({"role":"assistant", "reasoning_content":" ", "content":"space"}),
+                serde_json::json!({"role":"assistant", "reasoning_content":"", "content":"empty"}),
+                serde_json::json!({"role":"assistant", "content":"not captured"}),
+                serde_json::json!({"role":"assistant", "reasoning_content":"second original", "content":"response"}),
+            ];
+            let policy = ReasoningReplayPolicy::infer(&original, &thinking, "openai", "glm-5.3");
+            assert!(policy.is_no_op());
+            let mut projected = original.clone();
+            strip_stale_reasoning_with_policy(&mut projected, &policy);
+            assert_eq!(projected, original);
+        }
+    }
+
     #[test]
     fn strip_stale_reasoning_strips_only_unsigned_older_messages() {
         let mut msgs = vec![
