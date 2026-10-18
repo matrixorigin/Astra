@@ -563,12 +563,15 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
         result.pending_context_assembly_trace = Some((turn_index, trace.to_json_value()));
         let expected_messages = result.final_messages.clone();
         let previous_turn = state.turn;
-        let journal_path = state.journal.as_ref().unwrap().path().to_path_buf();
-        let backup = journal_path.with_extension("before-failed-append");
-        if fail_primary_append {
+        let failed_append_paths = if fail_primary_append {
+            let journal_path = state.journal.as_ref().unwrap().path().to_path_buf();
+            let backup = journal_path.with_extension("before-failed-append");
             std::fs::rename(&journal_path, &backup).unwrap();
             std::fs::create_dir(&journal_path).unwrap();
-        }
+            Some((journal_path, backup))
+        } else {
+            None
+        };
         super::turn_success::apply_turn_success(
             state,
             None,
@@ -576,7 +579,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
             result,
             std::time::Instant::now(),
         );
-        if fail_primary_append {
+        if let Some((journal_path, backup)) = failed_append_paths {
             std::fs::remove_dir(&journal_path).unwrap();
             std::fs::rename(&backup, &journal_path).unwrap();
             assert!(
