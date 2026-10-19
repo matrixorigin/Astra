@@ -146,11 +146,15 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
         self.assertIn("cargo build --locked -p astra-cli --bin mock_mcp_server", producer)
         test_command = re.search(r"run: (cargo nextest run[^\n]+)", producer).group(1)
         args = shlex.split(test_command)
-        self.assertEqual(args[args.index("-p") + 1], "astra-cli")
-        self.assertTrue({"--locked", "--lib", "--bins"}.issubset(args))
-        self.assertNotIn("-E", args, "Run the complete CLI inventory")
-        self.assertNotIn("--partition", args)
-        self.assertEqual(args[args.index("--profile") + 1], "ci")
+        self.assertEqual(
+            args,
+            shlex.split(
+                "cargo nextest run --locked -p astra-cli --lib --bins "
+                "--test cli_pipe --test process_supervisor "
+                "--test shell_execution_boundaries --profile ci"
+            ),
+            "Preserve the complete selected offline CLI inventory without test filters",
+        )
         self.assertLess(producer.index("Prebuild mock MCP server"), producer.index(test_command))
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):

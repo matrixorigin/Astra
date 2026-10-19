@@ -95,9 +95,11 @@ cardinality from the source-owned partition count and scope formatter. It
 requires the exact ordered gate inventory; missing, duplicate, legacy or
 unknown rows and unsupported source declarations fail closed.
 
-CLI tests build and run their complete inventory once, after building the
-standalone mock MCP server. Five protected check labels require that same
-completed job; they do not repeat setup, builds, archive downloads, or tests.
+CLI tests build and run all library/binary unit tests plus the offline
+`cli_pipe`, `process_supervisor`, and `shell_execution_boundaries` integration
+targets once, after building the standalone mock MCP server. Five protected
+check labels require that same completed job; they do not repeat setup, builds,
+archive downloads, or tests.
 Failed, cancelled, or unexpectedly skipped required execution fails closed.
 Caches retain existing trust boundaries, and ordinary fork PR tests run without
 privileged access. The separate optional live-model regression grants provider
