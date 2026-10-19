@@ -195,11 +195,17 @@ fn is_terminal(e: &JournalEvent) -> bool {
     )
 }
 
+#[derive(Default)]
+struct InvocationTerminals {
+    positions: Vec<usize>,
+    first_execution_terminal: Option<usize>,
+}
+
 /// Terminal positions indexed by explicit attempt identity.
 #[derive(Default)]
 struct TerminalIndex<'a> {
     by_run: HashMap<(u32, &'a str), Vec<usize>>,
-    by_invocation: HashMap<CallKey<'a>, Vec<usize>>,
+    by_invocation: HashMap<CallKey<'a>, InvocationTerminals>,
     has_unscoped_terminal: bool,
 }
 
@@ -214,11 +220,23 @@ impl<'a> TerminalIndex<'a> {
             }
             for call in event.tool_calls.iter().flatten() {
                 if let Some(key) = call_key(event, call) {
-                    index.by_invocation.entry(key).or_default().push(position);
+                    index
+                        .by_invocation
+                        .entry(key)
+                        .or_default()
+                        .positions
+                        .push(position);
                 }
             }
         }
         index
+    }
+
+    /// Aggregate buckets retain their counts, but a known invocation shared
+    /// across them cannot certify disjoint execution coverage.
+    fn execution_overlaps(&mut self, key: CallKey<'a>, terminal: usize) -> bool {
+        let entry = self.by_invocation.entry(key).or_default();
+        *entry.first_execution_terminal.get_or_insert(terminal) != terminal
     }
 
     /// Late observations still join their attempt. Prefer its first following
@@ -226,6 +244,8 @@ impl<'a> TerminalIndex<'a> {
     fn owner(&self, event: &JournalEvent, call: &ToolCallRecord, position: usize) -> Option<usize> {
         let positions = call_key(event, call)
             .and_then(|key| self.by_invocation.get(key))
+            .map(|entry| &entry.positions)
+            .filter(|positions| !positions.is_empty())
             .or_else(|| self.by_run.get(&(event.turn?, run_id_of(event)?)))?;
         let after = positions.partition_point(|&i| i <= position);
         positions
@@ -304,7 +324,7 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         executed: 0,
         complete: true,
     };
-    let index = TerminalIndex::new(events);
+    let mut index = TerminalIndex::new(events);
     let mut owned: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
     let mut slots: BTreeMap<(usize, usize, usize), &ToolCallRecord> = BTreeMap::new();
     let mut orphan_calls: HashMap<CallKey<'_>, &ToolCallRecord> = HashMap::new();
@@ -389,6 +409,16 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
             if call.invocation_identity.is_some() && key.is_none() {
                 out.complete = false;
             }
+            if call.was_executed()
+                && key.is_some_and(|key| {
+                    index.execution_overlaps(key, idx)
+                        || orphan_calls
+                            .get(&key)
+                            .is_some_and(|call| call.was_executed())
+                })
+            {
+                out.complete = false;
+            }
             let matched_position = key
                 .and_then(|key| locations.get(&key))
                 .filter(|(_, observed)| compatible_call(call, observed))
@@ -430,6 +460,16 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
             } else {
                 true
             };
+            if call.was_executed()
+                && key.is_some_and(|key| {
+                    index.execution_overlaps(key, idx)
+                        || orphan_calls
+                            .get(&key)
+                            .is_some_and(|call| call.was_executed())
+                })
+            {
+                out.complete = false;
+            }
             slots.insert((position, within, 0), call);
             if uncertain {
                 if key.is_some() {
@@ -740,6 +780,114 @@ mod tests {
         let d = diff_events("a", "b", &[evt(missing.clone()), evt(missing)], &[]);
         assert_eq!(d.a_tool_calls_executed, 2);
         assert!(!d.a_tool_sequence_complete);
+    }
+
+    #[test]
+    fn canonical_identity_cannot_certify_disjoint_terminal_summaries() {
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalWriter, ToolCallDisposition, ToolCallRecord,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let empty = uuid::Uuid::new_v4().to_string();
+        JournalWriter::new(&empty)
+            .unwrap()
+            .append(&JournalEvent::session_start(Some(&empty), None))
+            .unwrap();
+        #[derive(Debug)]
+        enum Shape {
+            Details,
+            Orphan,
+            Aggregates,
+        }
+        for (shape, first_executed, second_chain, second_name, complete) in [
+            (Shape::Details, true, "chain", "bash", false),
+            (Shape::Details, true, "chain", "read_file", false),
+            (Shape::Details, true, "next-chain", "bash", true),
+            (Shape::Details, false, "chain", "bash", true),
+            (Shape::Orphan, true, "chain", "bash", false),
+            (Shape::Orphan, true, "next-chain", "bash", true),
+            (Shape::Aggregates, true, "chain", "bash", false),
+            (Shape::Aggregates, true, "next-chain", "bash", true),
+            (Shape::Orphan, false, "chain", "bash", true),
+        ] {
+            let label = format!("{shape:?}/{first_executed}/{second_chain}/{second_name}");
+            let expected_count = if first_executed { 2 } else { 1 };
+            let sid = uuid::Uuid::new_v4().to_string();
+            let writer = JournalWriter::new(&sid).unwrap();
+            let record = |chain: &str, name: &str, executed: bool| ToolCallRecord {
+                name: name.into(),
+                ok: true,
+                tool_call_id: Some("call".into()),
+                invocation_identity: Some(
+                    astra_turn_types::ToolInvocationIdentity::new(
+                        "owner", &sid, "run", chain, "call",
+                    )
+                    .unwrap(),
+                ),
+                disposition: (!executed).then_some(ToolCallDisposition::Rejected),
+                ..Default::default()
+            };
+            for (index, call) in [
+                record("chain", "bash", first_executed),
+                record(second_chain, second_name, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let turn = index as u32 + 1;
+                if !matches!(shape, Shape::Details) {
+                    writer.append(&evt(json!({
+                        "type":"llm_round", "ts":format!("2026-10-20T00:00:0{}Z", index * 2 + 1),
+                        "session_id":sid, "turn":turn, "producer_scope":{"run_id":"run"},
+                        "tool_calls":[call.clone()]
+                    }))).unwrap();
+                }
+                if !matches!(shape, Shape::Orphan) || index == 1 {
+                    let run = if matches!(shape, Shape::Details) && index == 1 {
+                        "summary-run"
+                    } else {
+                        "run"
+                    };
+                    let mut terminal = JournalEvent::turn(
+                        Some(&sid),
+                        turn,
+                        None,
+                        "user",
+                        "done",
+                        u32::from(call.was_executed()),
+                        0,
+                        0,
+                        1,
+                    )
+                    .with_producer_scope(Some(run));
+                    terminal.ts = format!("2026-10-20T00:00:0{}Z", index * 2 + 2);
+                    if matches!(shape, Shape::Details) {
+                        terminal.tool_calls = Some(vec![call]);
+                    }
+                    writer.append(&terminal).unwrap();
+                }
+            }
+            let diff = super::compute_diff(&sid, &empty).unwrap();
+            assert_eq!(diff.a_tool_calls_executed, expected_count, "{label}");
+            assert_eq!(diff.a_tool_sequence_complete, complete, "{label}");
+            let names = if first_executed {
+                vec!["bash", second_name]
+            } else {
+                vec![second_name]
+            };
+            assert_eq!(diff.a_tool_sequence, names, "{label}");
+            assert_eq!(
+                serde_json::to_value(&diff).unwrap()["a_tool_sequence_complete"],
+                complete,
+                "{label}"
+            );
+            if !complete {
+                let text = render_text(&diff);
+                assert!(text.contains("sequences not comparable"), "{label}: {text}");
+                assert!(!text.contains("→ tool sequence DIFFERS"), "{label}: {text}");
+            }
+        }
     }
 
     #[test]
@@ -1897,7 +2045,8 @@ mod tests {
         // per-round journal rescan took seconds here.
         let mut a = Vec::new();
         for turn in 1..=8000u32 {
-            a.push(rd(turn, "root", "read_file"));
+            let run = format!("run-{turn}");
+            a.push(rd(turn, &run, "read_file"));
             for _ in 0..20 {
                 a.push(identified_evt(
                     json!({"type":"trace_span","ts":"t","session_id":"a","turn":turn}),
@@ -1905,7 +2054,7 @@ mod tests {
             }
             a.push(identified_evt(
                 json!({"type":"turn","ts":"t","session_id":"a","turn":turn,
-                "tool_count":1,"metadata":{"run_id":"root"}}),
+                "tool_count":1,"metadata":{"run_id":run}}),
             ));
         }
         let d = diff_events("a", "b", &a, &[]);

@@ -97,6 +97,9 @@ cannot establish that an external observation is additional coverage; matching
 the aggregate numerically does not resolve that possible overlap.
 When canonical invocation identity establishes duplicate observations, round-internal call
 order takes precedence over a standalone error's persistence position.
+An executed canonical invocation shared by separately counted terminal buckets,
+or by an orphan observation and a terminal bucket, prevents completeness.
+Aggregate evidence totals and retained observations are not discarded.
 Invocation identity alone does not supply a missing canonical position. When
 relocation crosses terminal detail without a comparable position and reverses
 terminal-relative order, ordering is incomplete even if all identities are known.
