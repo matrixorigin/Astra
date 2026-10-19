@@ -80,10 +80,15 @@ but does not discover skill catalogs or connect MCP providers.
 with unowned per-call execution evidence retained separately. Its ordered tool
 sequence includes executed records only; rejected, reused, suppressed and
 deferred records are not executions. Aggregate-only turns and unresolved
-executed errors make the sequence incomplete. An unscoped standalone error
-requires a unique call/run witness to join a terminal: a reused turn number is
-not proof of ownership. Without that witness, retained evidence does not certify
-that it is disjoint from all terminal aggregates, and completeness remains false.
+executed observations without sufficient identity make the sequence incomplete.
+Runtime failures preserve the available producer run scope. Reconciliation
+requires explicit matching run and turn namespaces; call deduplication also
+requires a nonempty provider call ID. A reused turn number, a sole surviving
+call-ID witness or an identical unscoped payload does not establish ownership.
+Unscoped rounds and errors remain separate observations, as do contradictory
+execution facts. Incomplete totals combine terminal aggregates with retained
+unproven evidence and may overcount overlapping or replayed observations; they
+are not an exact physical invocation count.
 When call/run identity establishes duplicate observations, round-internal call
 order takes precedence over a standalone error's persistence position. Order
 between independent concurrent producers remains the journal projection; it is

@@ -642,9 +642,10 @@ pub(super) fn producer_run_id(ev: &session_journal::JournalEvent) -> Option<&str
         .as_ref()
         .map(|scope| scope.run_id.as_str())
         .or_else(|| ev.metadata.as_ref()?.get("run_id")?.as_str())
+        .filter(|run| !run.trim().is_empty())
 }
 
-pub(super) fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
+fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
     ev.producer_scope.as_ref().is_some_and(|scope| {
         scope.parent_run_id.is_some()
             || scope

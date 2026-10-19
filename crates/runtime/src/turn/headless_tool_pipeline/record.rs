@@ -1067,7 +1067,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         &execution.name,
                         &error_msg,
                         rec.clone(),
-                    );
+                    )
+                    .with_producer_scope(self.ctx.current_run_id);
                     let writer = match self.ctx.current_user_id {
                         Some(user_id) => {
                             astra_services::session_journal::JournalWriter::for_user(user_id, sid)

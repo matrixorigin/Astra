@@ -4596,57 +4596,105 @@ mod tests {
 
     #[tokio::test]
     async fn failed_edge_terminal_status_marks_denial_as_error_without_text_matching() {
-        let mut harness = PipelineHarness::new();
-        harness.edge_tool_round[0].output = "Tool execution denied or timed out".to_string();
-        harness.edge_tool_round[0].status = "failed".to_string();
-
-        let mut pipeline = harness.pipeline();
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("expected validated execution"),
-        };
-        let permitted = match pipeline.permit_execution(validated).await {
-            HeadlessPipelineStage::Continue(permitted) => permitted,
-            _ => panic!("expected permitted execution"),
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalEventType, read_journal, read_journal_for_user,
         };
 
-        let executed = pipeline.execute_execution(permitted).await;
-        assert!(executed.is_err, "got: {}", executed.execution.result_str);
-        assert_eq!(
-            pipeline.ctx.turn_guard.errors.total_errors, 1,
-            "one failed execution must have exactly one accounting owner"
-        );
-        assert_eq!(
-            pipeline
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(journal.path());
+        for (run, user, has_session) in [
+            (Some("failed-run"), None, true),
+            (Some("failed-run"), Some("failure-owner"), true),
+            (None, None, true),
+            (Some("   "), Some("failure-owner"), true),
+            (Some("failed-run"), Some("failure-owner"), false),
+        ] {
+            let mut harness = PipelineHarness::new();
+            harness.session_id = uuid::Uuid::new_v4().to_string();
+            let sid = harness.session_id.clone();
+            harness.edge_tool_round[0].output = "Tool execution denied or timed out".to_string();
+            harness.edge_tool_round[0].status = "failed".to_string();
+
+            let mut pipeline = harness.pipeline();
+            pipeline.ctx.current_session_id = has_session.then_some(&sid);
+            pipeline.ctx.current_user_id = user;
+            pipeline.ctx.current_run_id = run;
+            let validated = match pipeline.validate_slot(0) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("expected validated execution"),
+            };
+            let permitted = match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::Continue(permitted) => permitted,
+                _ => panic!("expected permitted execution"),
+            };
+
+            let executed = pipeline.execute_execution(permitted).await;
+            assert!(executed.is_err, "got: {}", executed.execution.result_str);
+            assert_eq!(
+                pipeline.ctx.turn_guard.errors.total_errors, 1,
+                "one failed execution must have exactly one accounting owner"
+            );
+            assert_eq!(
+                pipeline
+                    .ctx
+                    .turn_guard
+                    .health
+                    .get("grep")
+                    .map(|health| health.total_failures),
+                Some(1),
+                "one failed execution must advance tool health exactly once"
+            );
+            pipeline.record_execution(executed).await;
+            let record = pipeline
                 .ctx
-                .turn_guard
-                .health
-                .get("grep")
-                .map(|health| health.total_failures),
-            Some(1),
-            "one failed execution must advance tool health exactly once"
-        );
-        pipeline.record_execution(executed).await;
-        let record = pipeline
-            .ctx
-            .tool_call_records
-            .last()
-            .expect("denied edge execution must be journaled");
-        assert!(
-            !record.ok,
-            "typed edge failure must not be journaled as success"
-        );
-        assert_eq!(
-            record
-                .result_preview
-                .as_deref()
-                .map(|preview| preview.starts_with("Tool execution denied or timed out")),
-            Some(true)
-        );
-        assert_eq!(
-            pipeline.ctx.turn_guard.errors.total_errors, 1,
-            "persisting the already-accounted result must not count it again"
-        );
+                .tool_call_records
+                .last()
+                .expect("denied edge execution must be journaled");
+            assert!(
+                !record.ok,
+                "typed edge failure must not be journaled as success"
+            );
+            assert_eq!(
+                record
+                    .result_preview
+                    .as_deref()
+                    .map(|preview| preview.starts_with("Tool execution denied or timed out")),
+                Some(true)
+            );
+            assert_eq!(
+                pipeline.ctx.turn_guard.errors.total_errors, 1,
+                "persisting the already-accounted result must not count it again"
+            );
+            drop(pipeline);
+            let events = match user {
+                Some(user) => {
+                    assert!(read_journal(&sid).unwrap().is_empty());
+                    read_journal_for_user(user, &sid).unwrap()
+                }
+                None => read_journal(&sid).unwrap(),
+            };
+            if !has_session {
+                assert!(events.is_empty());
+                continue;
+            }
+            let errors: Vec<_> = events
+                .into_iter()
+                .filter(|event| event.event_type == JournalEventType::ToolCallError)
+                .collect();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(
+                errors[0]
+                    .producer_scope
+                    .as_ref()
+                    .map(|scope| scope.run_id.as_str()),
+                run.map(str::trim).filter(|run| !run.is_empty())
+            );
+            let records = errors[0].tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].tool_call_id.as_deref(), Some("call-grep"));
+            assert!(records[0].was_executed());
+            assert!(!records[0].ok);
+        }
     }
 
     #[tokio::test]
