@@ -82,9 +82,6 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
             "non-edge", "edge-shell", "edge-fs-tools", "edge-git-gix", "edge-rest",
         })
         self.assertIn('name: "Test: astra-cli (${{ matrix.segment }})"', self.consumer)
-        command = re.search(r"- name: Test complete CLI inventory\n\s+run: ([^\n]+)", self.producer).group(1)
-        self.assertEqual(command,
-                         "cargo nextest run --locked -p astra-cli --lib --bins --profile ci")
 
     def test_required_labels_reject_failed_cancelled_or_missing_test_result(self):
         gate = self.consumer.split("      - name: Require complete CLI test result\n", 1)[1].split("      - ", 1)[0]

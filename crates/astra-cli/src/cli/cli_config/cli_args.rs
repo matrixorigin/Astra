@@ -110,10 +110,6 @@ pub(crate) struct Cli {
     /// Set a display name for this session
     #[arg(short = 'n', long = "name")]
     pub session_name: Option<String>,
-    /// Minimal mode: skip hooks, auto-memory, background prefetches.
-    /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
-    #[arg(long = "bare")]
-    pub bare: bool,
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     pub no_instructions: bool,
@@ -121,9 +117,6 @@ pub(crate) struct Cli {
     /// One-shot results remain usable, but cannot be recovered or auto-resumed locally.
     #[arg(long = "no-journal-content")]
     pub no_journal_content: bool,
-    /// Print startup timing for each initialization phase
-    #[arg(long = "startup-trace")]
-    pub startup_trace: bool,
     /// Emit structured tracing to stderr (same as ASTRA_DIAGNOSTIC_LOG=1); hidden from --help
     #[arg(long = "diagnostic-log", hide = true)]
     pub diagnostic_log: bool,

@@ -306,6 +306,69 @@ fn model_admission_errors_keep_safe_messages_and_known_codes() {
 }
 
 #[test]
+fn model_access_dependency_codes_survive_mapping_and_classification() {
+    use astra_core::{ErrorKind, classify_model_resolution_error_message};
+
+    // Status/code pairs as authored by the Genesis and UC model-access owners.
+    let cases = [
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "genesis_not_ready",
+            ErrorKind::ServerError,
+        ),
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "genesis_timeout",
+            ErrorKind::ServerError,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "genesis_credential_rejected",
+            ErrorKind::ServerError,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "moi_model_policy_unavailable",
+            ErrorKind::ServerError,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "uc_unavailable",
+            ErrorKind::ServerError,
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            "genesis_access_denied",
+            ErrorKind::PolicyDenied,
+        ),
+    ];
+    for (status, code, kind) in cases {
+        let safe = safe_model_service_error_with_code(status, Some(code));
+        assert!(safe.starts_with(&format!("[{code}] ")), "{code}: {safe}");
+        assert_eq!(
+            classify_model_resolution_error_message(&format!("Model resolution failed: {safe}")),
+            kind,
+            "{code}"
+        );
+    }
+
+    let crate::orchestration::SpawnError::Admission(spawn) =
+        safe_model_spawn_error(StatusCode::SERVICE_UNAVAILABLE, Some("genesis_not_ready"))
+    else {
+        panic!("a known dependency code must remain a classified admission error");
+    };
+    assert_eq!(spawn.kind, ErrorKind::ServerError);
+
+    // Unknown or private codes stay hidden and unclassified.
+    let hidden =
+        safe_model_service_error_with_code(StatusCode::SERVICE_UNAVAILABLE, Some("genesis_debug"));
+    assert_eq!(
+        hidden,
+        "The authorized model catalog is temporarily unavailable."
+    );
+}
+
+#[test]
 fn explain_artifact_publication_requires_a_durable_terminal_status() {
     assert!(explain_artifact_publishable_status(RunStatus::Completed));
     assert!(explain_artifact_publishable_status(RunStatus::Delegated));

@@ -20130,6 +20130,14 @@ const SAFE_MODEL_ERROR_CODES: &[&str] = &[
     "model_admission_batch_too_large",
     "model_admission_incomplete",
     "model_catalog_unavailable",
+    // Server-authored model-access dependency codes. They must survive this
+    // boundary so `classify_model_resolution_error_message` can classify them.
+    "genesis_not_ready",
+    "genesis_timeout",
+    "genesis_credential_rejected",
+    "genesis_access_denied",
+    "moi_model_policy_unavailable",
+    "uc_unavailable",
 ];
 
 fn safe_model_error_code(error_code: Option<&str>) -> Option<&str> {
@@ -20171,6 +20179,15 @@ pub(crate) fn safe_model_service_error(
         Some("model_reasoning_unsupported") => {
             "The requested reasoning control is not supported by the selected model."
         }
+        Some("genesis_access_denied") => "The requested model is not authorized.",
+        Some(
+            "model_catalog_unavailable"
+            | "genesis_not_ready"
+            | "genesis_timeout"
+            | "genesis_credential_rejected"
+            | "moi_model_policy_unavailable"
+            | "uc_unavailable",
+        ) => "The authorized model catalog is temporarily unavailable.",
         _ if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
             "The requested model is not authorized."
         }
@@ -20215,7 +20232,14 @@ pub(crate) fn safe_model_spawn_error(
                 | "model_selection_changed",
             ) => Some(ErrorKind::ToolUnavailable),
             Some("model_admission_incomplete") => Some(ErrorKind::ContractViolation),
-            Some("model_catalog_unavailable") => Some(ErrorKind::ServerError),
+            Some(
+                "model_catalog_unavailable"
+                | "genesis_not_ready"
+                | "genesis_timeout"
+                | "genesis_credential_rejected"
+                | "moi_model_policy_unavailable"
+                | "uc_unavailable",
+            ) => Some(ErrorKind::ServerError),
             _ => None,
         },
     };

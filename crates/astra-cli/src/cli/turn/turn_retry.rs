@@ -67,7 +67,25 @@ async fn try_retry_after_auth_refresh(
     if !dispatch.ctx.permits_admission(state) {
         return None;
     }
-    let new_token = if let Some(admission) = &dispatch.ctx.admission {
+    let new_token = if let Some(server_turn) = dispatch.admitted_server_turn {
+        if !super::turn_auth_retry::should_retry_after_auth_refresh(failure)
+            || !server_turn.attachment_owner.is_current()
+        {
+            return None;
+        }
+        // An explicit environment bearer has no profile refresh authority.
+        // A Server admission can only refresh the owner verified at admission.
+        let owner = server_turn.auth_owner.as_ref()?;
+        if !owner.is_current() {
+            return None;
+        }
+        crate::cli::session::session_runtime::owner_access_token(
+            &server_turn.api,
+            owner,
+            Some(dispatch.token),
+        )
+        .await?
+    } else if let Some(admission) = &dispatch.ctx.admission {
         // A bound submission cannot borrow the ambient profile or infer
         // refresh authority from a rendered error sentence.
         if !super::turn_auth_retry::should_retry_after_auth_refresh(failure) {
@@ -98,6 +116,7 @@ async fn try_retry_after_auth_refresh(
             input_runtime_required_texts: dispatch.input_runtime_required_texts,
             input_runtime_volatile_texts: dispatch.input_runtime_volatile_texts,
             session_id: dispatch.session_id,
+            admitted_server_turn: dispatch.admitted_server_turn,
             semantic_query_override: dispatch.semantic_query_override,
             explain_analyze_terminal_degraded: dispatch.ctx.explain_analyze_terminal_degraded,
         },
@@ -155,6 +174,176 @@ mod tests {
     use std::time::Instant;
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn server_preflight_retry_uses_only_its_admitted_owner_and_preserves_request_inputs() {
+        use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile};
+        use crate::cli::turn::turn_entry::AdmittedServerTurn;
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        for bound_owner in [false, true] {
+            let mut credentials = CredentialsFile::default();
+            credentials.current_profile = Some("ambient-other".into());
+            credentials.profiles.insert(
+                "default".into(),
+                Profile {
+                    account_id: Some("admitted-owner".into()),
+                    access_token: Some("owner-old-access".into()),
+                    refresh_token: Some("owner-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            credentials.profiles.insert(
+                "ambient-other".into(),
+                Profile {
+                    account_id: Some("foreign-owner".into()),
+                    access_token: Some("foreign-access".into()),
+                    refresh_token: Some("foreign-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            cli_utils::save_credentials(&credentials).unwrap();
+            let _identity =
+                cli_utils::install_cli_profile_identity_for_test("default", Some("admitted-owner"))
+                    .unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/auth/refresh"))
+                .and(body_json(serde_json::json!({"refresh_token":"owner-refresh"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id":"admitted-owner", "access_token":"owner-rotated-access", "refresh_token":"owner-rotated-refresh",
+                }))).expect(u64::from(bound_owner)).mount(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/admission-token-probe"))
+                .and(header("authorization", "Bearer owner-rotated-access"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(u64::from(bound_owner))
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let sid = format!("server-preflight-retry-{bound_owner}");
+            let messages = vec![
+                serde_json::json!({"role":"user", "content":"Server question"}),
+                serde_json::json!({"role":"assistant", "content":"Server answer"}),
+            ];
+            let remote = ActiveConversation::empty("admitted-owner", &sid)
+                .unwrap()
+                .prepare_commit(3, None, messages.clone())
+                .unwrap()
+                .next;
+            let continuation =
+                crate::cli::session::session_continuation::continuation_from_resume_bundle(
+                    astra_turn_types::ResumeBundleV1 {
+                        schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                        source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                        cursor: remote.cursor().clone(),
+                        conversation_messages: messages.clone(),
+                        materialized_conversation_root_hash: None,
+                        degraded_reasons: Vec::new(),
+                        repair_actions: Vec::new(),
+                        projections: Default::default(),
+                    },
+                )
+                .unwrap();
+            let bearer = if bound_owner {
+                "owner-old-access"
+            } else {
+                "explicit-environment-bearer"
+            };
+            let auth_owner = if bound_owner {
+                Some(
+                    crate::cli::session::session_runtime::capture_admitted_auth_owner(
+                        &api, None, bearer,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            let admitted = AdmittedServerTurn {
+                attachment_owner: cli_utils::cli_owner_auth_snapshot(),
+                auth_owner,
+                bearer: bearer.into(),
+                api: api.clone().without_bearer_provider(),
+                continuation,
+            };
+            let mut state = SessionState::default();
+            state.set_session_id(&sid);
+            state.turn = 20;
+            state.server_resume_attachment =
+                Some((remote.cursor().clone(), state.session_attachment_epoch));
+            let ctx = TurnContext {
+                api: &api,
+                profile: None,
+                admission: None,
+                post_commit_tx: None,
+                explain_analyze_terminal_degraded: None,
+            };
+            let mut ui = crate::tests::TestUi::default();
+            let mut dispatch = TurnDispatch {
+                ctx: &ctx,
+                line: "continue",
+                effective_line: "continue",
+                user_intent: "continue",
+                input_runtime_required_texts: &[],
+                input_runtime_volatile_texts: &[],
+                token: bearer,
+                session_id: &sid,
+                admitted_server_turn: Some(&admitted),
+                semantic_query_override: None,
+                turn_start: Instant::now(),
+                ui: &mut ui,
+                turn_usage_sink: None,
+            };
+            let attempt = TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
+                error: "typed catalog authentication rejection".into(),
+                partial: crate::PartialTurnData {
+                    error_code: Some(astra_core::ErrorKind::Auth.as_str().into()),
+                    error_metadata: Some(
+                        serde_json::json!({"source":"model_access", "http_status":401}),
+                    ),
+                    ..Default::default()
+                },
+            }));
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = observed.clone();
+            let outcome = settle_turn_attempt(&mut state, &mut dispatch, attempt, move |request| {
+                let captured = captured.clone();
+                Box::pin(async move {
+                    let inputs = crate::cli::turn::turn_stream_runner::probe_admitted_retry_request_for_test(request).await;
+                    *captured.lock().unwrap() = Some(inputs);
+                    TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
+                        error: "deterministic stop after inspecting retry inputs".into(), partial: Default::default(),
+                    }))
+                })
+            }).await.unwrap();
+            assert_eq!(outcome, super::TurnSettlementOutcome::NotStarted);
+            assert_eq!(
+                *observed.lock().unwrap(),
+                bound_owner.then(|| ("owner-rotated-access".to_string(), 21, messages))
+            );
+            assert_eq!(
+                state.turn, 20,
+                "preflight retry must not allocate a local terminal"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                if bound_owner { 2 } else { 0 },
+                "an unowned explicit bearer cannot borrow ambient profile refresh"
+            );
+            assert_eq!(
+                cli_utils::load_credentials().profiles["ambient-other"]
+                    .access_token
+                    .as_deref(),
+                Some("foreign-access")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unstarted_initial_and_retry_preserve_input_and_recovery_state() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let ctx = TurnContext {
@@ -185,6 +374,7 @@ mod tests {
                 input_runtime_volatile_texts: &[],
                 token: "token",
                 session_id: "same-session",
+                admitted_server_turn: None,
                 semantic_query_override: None,
                 turn_start: Instant::now(),
                 ui: &mut ui,
@@ -284,6 +474,7 @@ mod tests {
                 input_runtime_volatile_texts: &[],
                 token: "token",
                 session_id: "sess-stale",
+                admitted_server_turn: None,
                 semantic_query_override: None,
                 turn_start: Instant::now(),
                 ui: &mut ui,

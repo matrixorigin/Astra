@@ -475,7 +475,6 @@ class PtyTui:
                 self.profile,
                 "--model",
                 self.model,
-                "--bare",
                 "--no-instructions",
                 "interactive",
             ]

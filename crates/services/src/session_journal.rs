@@ -1894,9 +1894,16 @@ pub struct SessionExecutionLease {
 
 impl SessionExecutionLease {
     pub fn try_acquire(session_id: &str) -> Result<Self, SessionExecutionLeaseError> {
-        let owner_scope = OwnerScope::local_user();
+        Self::try_acquire_for_owner(&OwnerScope::local_user(), session_id)
+    }
+
+    /// Acquire the same execution fence for an already captured local owner.
+    pub fn try_acquire_for_owner(
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<Self, SessionExecutionLeaseError> {
         let journal_path =
-            journal_file_path_for_owner(&owner_scope, session_id).map_err(|source| {
+            journal_file_path_for_owner(owner_scope, session_id).map_err(|source| {
                 SessionExecutionLeaseError::Io {
                     session_id: session_id.to_string(),
                     source,
@@ -1907,7 +1914,7 @@ impl SessionExecutionLease {
         // macOS relies on the stable owner-local file fence and returns unit.
         #[allow(clippy::let_unit_value)]
         let _kernel_authority =
-            acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
+            acquire_execution_kernel_authority(owner_scope, &journal_path, session_id)?;
         let created_parent_dirs = journal_path
             .parent()
             .map(missing_directories_before_create)
@@ -11967,6 +11974,26 @@ mod turn_event_buffer_tests {
             classify_canonical_commit_presence(&[event], 0, 1, &commit),
             CanonicalCommitPresence::Exact
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_owner_execution_lease_uses_the_existing_owner_local_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let sid = "execution-lease-explicit-owner";
+        let current = OwnerScope::local_user();
+        let captured = SessionExecutionLease::try_acquire_for_owner(&current, sid).unwrap();
+        assert!(matches!(
+            SessionExecutionLease::try_acquire(sid),
+            Err(SessionExecutionLeaseError::Conflict { .. })
+        ));
+        let other = OwnerScope::user("independent-explicit-lease-owner").unwrap();
+        assert_ne!(current, other);
+        let independent = SessionExecutionLease::try_acquire_for_owner(&other, sid).unwrap();
+        drop(captured);
+        assert!(SessionExecutionLease::try_acquire(sid).is_ok());
+        drop(independent);
     }
 
     #[test]

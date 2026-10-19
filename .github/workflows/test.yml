@@ -70,7 +70,7 @@ jobs:
       - name: Prebuild mock MCP server
         run: cargo build --locked -p astra-cli --bin mock_mcp_server
       - name: Test complete CLI inventory
-        run: cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+        run: cargo nextest run --locked -p astra-cli --lib --bins --test cli_pipe --test process_supervisor --test shell_execution_boundaries --profile ci
       - name: Verify native delivery through the production supervisor
         run: |
           cargo build --locked -p astra-cli --bin astra

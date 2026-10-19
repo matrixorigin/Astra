@@ -1484,7 +1484,6 @@ async fn run_cli_turn(
         .arg("stream-json")
         .arg("--session-id")
         .arg(&tenant.session_id)
-        .arg("--bare")
         .arg("--no-instructions")
         .arg("--yes")
         .arg(prompt)

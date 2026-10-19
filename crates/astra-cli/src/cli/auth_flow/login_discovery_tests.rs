@@ -171,7 +171,7 @@ async fn cancelled_memoria_browser_does_not_exchange_credentials() {
 }
 
 #[tokio::test]
-async fn uc_browser_denial_returns_to_tui_without_token_exchange() {
+async fn uc_browser_denial_after_launch_failure_does_not_exchange_tokens() {
     let server = MockServer::start().await;
     let origin = server.uri();
     Mock::given(path("/.well-known/openid-configuration"))
@@ -191,6 +191,8 @@ async fn uc_browser_denial_returns_to_tui_without_token_exchange() {
     discovery.issuer = origin;
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     let response_tx = std::sync::Mutex::new(Some(response_tx));
+    let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_warnings = warnings.clone();
     let observer: LoginObserver = std::sync::Arc::new(move |progress| {
         match progress {
             LoginProgress::OpenBrowser(url) => {
@@ -222,17 +224,29 @@ async fn uc_browser_denial_returns_to_tui_without_token_exchange() {
                         .unwrap();
                 });
             }
+            LoginProgress::BrowserLaunchFailed(reason) => {
+                assert!(reason.contains("Use the sign-in link"));
+                observed_warnings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             LoginProgress::Completing => panic!("denial must never exchange credentials"),
         }
         Ok(())
     });
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        browser_login(&api, None, LoginMethod::Uc(discovery), observer, false),
+        browser_login_with_launcher(
+            &api,
+            None,
+            LoginMethod::Uc(discovery),
+            observer,
+            false,
+            async |_| Err("test launcher unavailable".into()),
+        ),
     )
     .await
     .unwrap();
     assert!(result.unwrap_err().contains("denied or cancelled"));
+    assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1);
     let (content_type, body) = response_rx.await.unwrap();
     assert_eq!(content_type, "text/html; charset=utf-8");
     assert!(body.contains("Couldn’t complete sign-in"));

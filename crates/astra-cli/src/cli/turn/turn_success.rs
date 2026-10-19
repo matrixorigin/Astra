@@ -249,7 +249,7 @@ struct TurnSuccessLiveSnapshot {
     tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
     latest_context_assembly_trace:
-        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+        Option<crate::cli::session::session_state::LocalContextAssemblyTrace>,
     runtime_pipeline_state: Option<serde_json::Value>,
     runtime_compaction_state: Option<serde_json::Value>,
     runtime_consecutive_context_window_errors: u32,

@@ -4786,11 +4786,15 @@ fn context_trace_count(state: &crate::cli::session::session_state::SessionState)
 fn latest_context_trace(
     state: &crate::cli::session::session_state::SessionState,
 ) -> Option<ContextAssemblyTrace> {
-    state.latest_context_assembly_trace.clone().or_else(|| {
-        let session = state.observability_session.as_ref()?;
-        let guard = astra_core::sync_poison::recover_rwlock_read(session);
-        guard.context_traces.last().cloned()
-    })
+    state
+        .latest_context_assembly_trace
+        .as_ref()
+        .map(|cached| cached.trace.clone())
+        .or_else(|| {
+            let session = state.observability_session.as_ref()?;
+            let guard = astra_core::sync_poison::recover_rwlock_read(session);
+            guard.context_traces.last().cloned()
+        })
 }
 
 fn latest_context_trace_since(
@@ -4799,9 +4803,9 @@ fn latest_context_trace_since(
     baseline_count: usize,
 ) -> Option<ContextAssemblyTrace> {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref()
-        && baseline_cached_turn_id != Some(trace.turn_id.as_str())
+        && baseline_cached_turn_id != Some(trace.trace.turn_id.as_str())
     {
-        return Some(trace.clone());
+        return Some(trace.trace.clone());
     }
     let session = state.observability_session.as_ref()?;
     let guard = astra_core::sync_poison::recover_rwlock_read(&session);
@@ -8048,6 +8052,9 @@ pub(crate) async fn run_tui_session(
             }
             Some(progress) = login_progress_rx.recv() => {
                 if login_tasks.is_empty() { continue; }
+                if let crate::cli::auth_flow::LoginProgress::BrowserLaunchFailed(reason) = &progress {
+                    chat_widget.commit_system(history_cell::system::SystemCell::response(reason));
+                }
                 if let crate::cli::auth_flow::LoginProgress::OpenBrowser(url) = progress {
                     chat_widget.commit_system(history_cell::system::SystemCell::response(
                         "Complete sign-in in your browser. Esc cancels while waiting.",
@@ -8121,7 +8128,7 @@ pub(crate) async fn run_tui_session(
                             auth_flow::browser_login(&api, profile.as_deref(), method, Arc::new(move |progress| {
                                 match &progress {
                                     LoginProgress::Completing => phase.begin_exchange()?,
-                                    LoginProgress::OpenBrowser(url) => crate::cli::auth_flow::open_login_url(url),
+                                    LoginProgress::OpenBrowser(_) | LoginProgress::BrowserLaunchFailed(_) => {},
                                 }
                                 let _ = tx.send(progress);
                                 Ok(())
@@ -9319,7 +9326,7 @@ pub(crate) async fn run_tui_session(
                                     let pre_cached_context_trace_turn_id = state
                                         .latest_context_assembly_trace
                                         .as_ref()
-                                        .map(|trace| trace.turn_id.clone());
+                                        .map(|cached| cached.trace.turn_id.clone());
                                     let pre_context_trace_count = context_trace_count(&state);
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
@@ -11282,7 +11289,7 @@ pub(crate) async fn run_tui_session(
                                         pre_cached_context_trace_turn_id.as_deref(),
                                         pre_context_trace_count,
                                     )
-                                    .or_else(|| state.latest_context_assembly_trace.clone());
+                                    .or_else(|| state.latest_context_assembly_trace.as_ref().map(|cached| cached.trace.clone()));
                                     if bottom_pane.footer.context_window.is_none()
                                         && let Some(usage) = footer_context_trace
                                             .as_ref()
@@ -13338,7 +13345,7 @@ mod tests {
         let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
-            auth_flow::browser_login(
+            auth_flow::browser_login_with_launcher(
                 &login_api,
                 None,
                 auth_flow::LoginMethod::Memoria(website),
@@ -13347,11 +13354,13 @@ mod tests {
                         auth_flow::LoginProgress::OpenBrowser(url) => {
                             let _ = opened_tx.send(url);
                         }
+                        auth_flow::LoginProgress::BrowserLaunchFailed(_) => {}
                         auth_flow::LoginProgress::Completing => task_phase.begin_exchange()?,
                     }
                     Ok(())
                 }),
                 false,
+                async |_| std::future::pending().await,
             )
             .await?;
             Ok(LoginEffect::Completed { uc: false })

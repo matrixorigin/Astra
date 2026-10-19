@@ -622,11 +622,7 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
             .and_then(|m| m.get("source"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        run_id: scope.map(|scope| scope.run_id.clone()).or_else(|| {
-            meta.and_then(|m| m.get("run_id"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        }),
+        run_id: producer_run_id(ev).map(String::from),
         local_turn: scope.and_then(|scope| scope.local_turn),
         finish_reason: meta
             .and_then(|m| m.get("finish_reason"))
@@ -641,7 +637,14 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
     }
 }
 
-fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
+pub(super) fn producer_run_id(ev: &session_journal::JournalEvent) -> Option<&str> {
+    ev.producer_scope
+        .as_ref()
+        .map(|scope| scope.run_id.as_str())
+        .or_else(|| ev.metadata.as_ref()?.get("run_id")?.as_str())
+}
+
+pub(super) fn is_child_producer(ev: &session_journal::JournalEvent) -> bool {
     ev.producer_scope.as_ref().is_some_and(|scope| {
         scope.parent_run_id.is_some()
             || scope

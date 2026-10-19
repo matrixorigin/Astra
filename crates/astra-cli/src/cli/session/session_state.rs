@@ -269,6 +269,13 @@ impl SessionModelChoice {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LocalContextAssemblyTrace {
+    /// Producer-assigned local journal turn, independent of the display ID.
+    pub local_turn: u32,
+    pub trace: astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
+}
+
 // NOTE: SessionState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own SessionState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
@@ -340,6 +347,9 @@ pub(crate) struct SessionState {
     /// Monotonic identity of the live session attachment. Deferred work must
     /// carry and match this epoch before it can update mutable session state.
     pub session_attachment_epoch: u64,
+    /// Validated Server restore provenance, bound to this owner/session attachment.
+    /// Its cursor is never advanced or used as a local journal clock.
+    pub(crate) server_resume_attachment: Option<(astra_turn_types::SessionCursorV1, u64)>,
     pub history: Vec<(String, String)>, // (user_msg, assistant_msg)
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
@@ -407,8 +417,7 @@ pub(crate) struct SessionState {
     /// successful commit or recovery sync clears it.
     pub session_persistence_error: Option<String>,
     /// Full context-assembly trace from the last successfully committed turn.
-    pub latest_context_assembly_trace:
-        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    pub latest_context_assembly_trace: Option<LocalContextAssemblyTrace>,
     /// Serialized context-pipeline state restored from the latest heavy checkpoint.
     pub runtime_pipeline_state: Option<serde_json::Value>,
     /// Serialized compaction effectiveness tracker restored from the latest heavy checkpoint.
@@ -602,6 +611,7 @@ impl Default for SessionState {
             notification_threshold_secs: 10,
             active_conversation: None,
             session_attachment_epoch: 0,
+            server_resume_attachment: None,
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
@@ -732,6 +742,7 @@ impl SessionState {
             .checked_add(1)
             .expect("session attachment epoch exhausted");
         self.active_conversation = None;
+        self.server_resume_attachment = None;
         // Invalidate before publishing any new identity. Never pair an old
         // session id with a newly advanced attachment epoch.
         self.perm_manager.clear_active_session_id();
@@ -774,6 +785,7 @@ impl SessionState {
             self.advance_session_attachment();
         } else {
             self.active_conversation = None;
+            self.server_resume_attachment = None;
         }
         self.perm_manager.clear_active_session_id();
         self.session_id = None;

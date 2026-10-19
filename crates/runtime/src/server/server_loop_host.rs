@@ -3108,6 +3108,15 @@ fn skill_auto_route_service_context(
     }
 }
 
+/// Classify a per-round model resolution failure from its retained safe code.
+fn model_resolution_failure(error: &str) -> astra_core::ClassifiedError {
+    let message = format!("Model resolution failed: {error}");
+    astra_core::ClassifiedError::new(
+        astra_core::classify_model_resolution_error_message(&message),
+        message,
+    )
+}
+
 fn resolve_llm_model_for_turn(
     preferred_model: Option<&str>,
     admitted_execution: Option<&astra_services::AdmittedModelExecution>,
@@ -20210,11 +20219,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
             Err(e) => {
-                let message = format!("Model resolution failed: {e}");
-                let error = astra_core::ClassifiedError::new(
-                    astra_core::classify_model_resolution_error_message(&message),
-                    message,
-                );
+                let error = model_resolution_failure(&e);
                 self.complete_request_preparation_phase(
                     state,
                     request_preparation_started,
@@ -50129,14 +50134,125 @@ mod tests {
 
     #[test]
     fn model_resolution_database_error_maps_to_database_outcome() {
-        let message = "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF";
-        let error = astra_core::ClassifiedError::new(
-            astra_core::classify_model_resolution_error_message(message),
-            message,
+        let error = model_resolution_failure(
+            "DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF",
         );
 
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert_eq!(llm_main_error_outcome(&error), "error_database");
+    }
+
+    /// Revalidates the admitted Offering each round; fails once `ready` clears.
+    struct GenesisReadinessCatalog {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    type ModelServiceResult<T> = Result<
+        T,
+        (
+            axum::http::StatusCode,
+            axum::Json<astra_core::ErrorResponse>,
+        ),
+    >;
+
+    #[async_trait]
+    impl astra_services::ModelService for GenesisReadinessCatalog {
+        async fn create_model(
+            &self,
+            _: String,
+            _: astra_services::ModelCreateRequestData,
+        ) -> ModelServiceResult<astra_services::ModelRecord> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn list_models(
+            &self,
+            _: String,
+            _: bool,
+        ) -> ModelServiceResult<Vec<astra_services::ModelListItem>> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn get_model(&self, _: String) -> ModelServiceResult<astra_services::ModelRecord> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn resolve_model_offering(
+            &self,
+            _: String,
+        ) -> ModelServiceResult<astra_services::ResolvedModelOffering> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn update_model(
+            &self,
+            _: String,
+            _: astra_services::ModelUpdateRequestData,
+        ) -> ModelServiceResult<astra_services::ModelRecord> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn delete_model(&self, _: String) -> ModelServiceResult<()> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn check_model(&self, _: String) -> ModelServiceResult<astra_services::ModelRecord> {
+            unreachable!("model revalidation only admits the selected Offering")
+        }
+
+        async fn admit_model_offering(
+            &self,
+            _: String,
+            _: String,
+        ) -> ModelServiceResult<AdmittedModelExecution> {
+            if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(server_gateway_execution())
+            } else {
+                Err(astra_core::error_response_coded(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Genesis model access is not ready",
+                    "genesis_not_ready",
+                ))
+            }
+        }
+    }
+
+    fn server_gateway_execution() -> AdmittedModelExecution {
+        let mut execution =
+            test_gateway_execution("http://catalog/api/v1/chat/completions", Some(1000));
+        execution.execution_placement = astra_services::ModelExecutionPlacement::Server;
+        execution
+    }
+
+    #[tokio::test]
+    async fn later_round_revalidation_keeps_genesis_dependency_classification() {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut host = test_host_builder("user-genesis", "session-genesis")
+            .with_model_service(Some(Arc::new(GenesisReadinessCatalog {
+                ready: ready.clone(),
+            })))
+            .with_admitted_model_execution(Some(server_gateway_execution()))
+            .build();
+        let state = create_test_state();
+        host.resolve_llm_config_for_state(&state)
+            .await
+            .expect("first round admits the selected Offering");
+
+        // A later round (for example after a tool result) revalidates the
+        // same Offering while Genesis is not ready.
+        ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect_err("revalidation must not reuse the cached configuration");
+        let failure = model_resolution_failure(&error);
+
+        assert_eq!(failure.kind, astra_core::ErrorKind::ServerError);
+        assert_eq!(
+            failure.message,
+            "Model resolution failed: [genesis_not_ready] The authorized model catalog is temporarily unavailable."
+        );
+        assert!(!failure.message.contains("Genesis model access"));
     }
 
     #[cfg(feature = "e2e-hooks")]

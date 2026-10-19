@@ -37,7 +37,7 @@ if pid == 0:
     os.write(1, b"RESIZE_HISTORY_SENTINEL " + b"history " * 20 + b"\r\n")
     os.execve(binary, [binary, "--api-url", env["ASTRA_API_URL"],
                        "--profile", "resize-test", "--model", "resize-model",
-                       "--bare", "--no-instructions", "interactive"], env)
+                       "--no-instructions", "interactive"], env)
 
 pending_commands = bytearray()
 running = True

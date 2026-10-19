@@ -160,3 +160,111 @@ async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
         .await;
     assert!(invalid.is_error);
 }
+
+#[test]
+fn user_interrupt_local_fence_follows_actual_sse_executor_not_native_executor() {
+    let original = tempfile::tempdir().unwrap();
+    let active = tempfile::tempdir().unwrap();
+    let native = std::sync::Arc::new(ToolExecutor::new(original.path()));
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    // This factory returns the same Arc installed in CliServerAdmissionHost.
+    let actual = crate::cli::chat_stream::retain_cli_executor(
+        ToolExecutor::new(original.path()),
+        Some(&observer),
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&actual, observer.get().unwrap()));
+    assert!(!std::sync::Arc::ptr_eq(&actual, &native));
+    // Worktree entry mutates only the ordinary executor after publication.
+    *actual.worktree_session.lock().unwrap() = Some(crate::edge_tools::WorktreeSession {
+        worktree_path: active.path().to_path_buf(),
+        branch_name: "synthetic-worktree".into(),
+        original_root: original.path().to_path_buf(),
+        original_head_commit: None,
+    });
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(active.path())
+    );
+    assert_eq!(
+        astra_tools::workspace_observation::workspace_ownership_is_unsettled(
+            &native.effective_project_root()
+        ),
+        Some(false)
+    );
+    let observed = observer.get().unwrap().as_ref();
+    let result = crate::cli::command_router::settle_one_shot_user_interrupt_result(
+        Ok(crate::StreamResult::default()),
+        Some(observed),
+        Some(&native),
+        true,
+        &Default::default(),
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .error
+            .contains("workspace_ownership_unsettled")
+    );
+    let closed = crate::TurnFailure {
+        error: "stdout closed".into(),
+        partial: crate::PartialTurnData {
+            output_transport_failure: Some(
+                crate::cli::stream::streaming_types::OutputTransportFailure::Closed,
+            ),
+            ..Default::default()
+        },
+    };
+    assert!(
+        !crate::cli::command_router::one_shot_stdout_closure_is_settled(
+            &closed,
+            true,
+            true,
+            Some(observed),
+            Some(&native),
+        )
+    );
+    // A former worktree's sticky fence cannot block the original unrelated root.
+    actual.worktree_session.lock().unwrap().take();
+    assert!(
+        crate::cli::command_router::settle_one_shot_user_interrupt_result(
+            Ok(crate::StreamResult::default()),
+            Some(observed),
+            Some(&native),
+            true,
+            &Default::default(),
+        )
+        .is_ok()
+    );
+    assert!(
+        crate::cli::command_router::one_shot_stdout_closure_is_settled(
+            &closed,
+            true,
+            true,
+            Some(observed),
+            Some(&native),
+        )
+    );
+    // Native scope remains a separate negative barrier, never the ordinary owner.
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(original.path())
+    );
+    assert!(
+        crate::cli::command_router::settle_one_shot_user_interrupt_result(
+            Ok(crate::StreamResult::default()),
+            None,
+            Some(&native),
+            true,
+            &Default::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        !crate::cli::command_router::one_shot_stdout_closure_is_settled(
+            &closed,
+            true,
+            true,
+            None,
+            Some(&native),
+        )
+    );
+}
