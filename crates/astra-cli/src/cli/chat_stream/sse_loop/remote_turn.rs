@@ -637,7 +637,6 @@ async fn consume_remote_turn_inner(
             state.current_session_id.as_deref(),
             state.current_run_id.as_deref(),
             state.current_model_identity(),
-            state.session_turn.max(1),
         )
     {
         if let Some(pipeline) = state.pipeline_session.as_mut()

@@ -545,19 +545,22 @@ pub struct ServerLoopExecutionSummary {
 
 impl ServerLoopExecutionSummary {
     /// Select Server-produced feedback for the accepted terminal boundary.
-    /// Clients consume this fact without reconstructing execution state.
+    /// The accepted run and its terminal receipt identify this fact. A local
+    /// replica's turn counter is independent, and a pre-admission Server read
+    /// cannot predict the turn allocated by a concurrent Server admission.
     pub fn runtime_feedback_for(
         &self,
         session_id: Option<&str>,
         run_id: Option<&str>,
         model_id: Option<&str>,
-        session_turn: u32,
     ) -> Option<&RuntimeFeedbackFrame> {
         self.runtime_feedback.as_ref().filter(|frame| {
-            session_id == Some(frame.identity.session_id.as_str())
+            frame.is_valid()
+                && frame.progress.session_turn > 0
+                && session_id == Some(frame.identity.session_id.as_str())
                 && run_id == Some(frame.identity.run_id.as_str())
                 && model_id == Some(frame.identity.model_id.as_str())
-                && frame.progress.session_turn == session_turn
+                && self.tool_ledger_receipt.run_id == frame.identity.run_id
                 // An interrupted summary may include a failed provider
                 // attempt after its last successfully ingested feedback.
                 && frame.progress.llm_rounds_completed <= self.llm_rounds
@@ -2295,66 +2298,67 @@ mod tests {
     }
 
     #[test]
-    fn remote_server_feedback_is_exact_and_bound_to_terminal_progress() {
+    fn remote_server_feedback_uses_accepted_run_identity_and_server_progress() {
         let frame = server_feedback_frame();
         let summary = ServerLoopExecutionSummary {
-            tool_calls_count: 0,
-            observation_tool_calls_count: 0,
-            tools_used: Vec::new(),
             llm_rounds: 3,
             tool_ledger_receipt: server_summary_tool_receipt(0),
-            token_usage_coverage: None,
             runtime_feedback: Some(frame.clone()),
+            ..Default::default()
         };
-        assert_eq!(
+        let select = |summary: &ServerLoopExecutionSummary| {
             summary
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    4,
-                )
-                .cloned(),
-            Some(frame.clone())
-        );
-
-        let mut terminal_includes_failed_attempt = summary.clone();
-        terminal_includes_failed_attempt.llm_rounds = 4;
-        assert_eq!(
-            terminal_includes_failed_attempt
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    4,
-                )
-                .cloned(),
-            Some(frame.clone())
-        );
-        let mut impossible_future_feedback = summary.clone();
-        impossible_future_feedback.llm_rounds = 2;
-        assert!(
-            impossible_future_feedback
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    4,
-                )
+                .runtime_feedback_for(Some("session-1"), Some("run-1"), Some("deepseek-v4-flash"))
                 .cloned()
-                .is_none()
-        );
-        assert!(
-            summary
-                .runtime_feedback_for(
-                    Some("session-1"),
-                    Some("run-1"),
-                    Some("deepseek-v4-flash"),
-                    5,
-                )
-                .cloned()
-                .is_none()
-        );
+        };
+        // Server admission may advance after a restore read. Neither the
+        // replica's counter nor that earlier read can fence this run's turn.
+        for server_turn in [1, 4, 21] {
+            let mut accepted = summary.clone();
+            accepted
+                .runtime_feedback
+                .as_mut()
+                .unwrap()
+                .progress
+                .session_turn = server_turn;
+            assert_eq!(
+                select(&accepted).unwrap().progress.session_turn,
+                server_turn
+            );
+        }
+        let mut interrupted = summary.clone();
+        interrupted.llm_rounds = 4;
+        assert_eq!(select(&interrupted), Some(frame.clone()));
+        let mut future = summary.clone();
+        future.llm_rounds = 2;
+        assert!(select(&future).is_none());
+        let mut foreign_receipt = summary.clone();
+        foreign_receipt.tool_ledger_receipt.run_id = "foreign-run".into();
+        assert!(select(&foreign_receipt).is_none());
+        let mut invalid = summary.clone();
+        invalid
+            .runtime_feedback
+            .as_mut()
+            .unwrap()
+            .progress
+            .session_turn = 0;
+        assert!(select(&invalid).is_none());
+        for (session, run, model) in [
+            (None, Some("run-1"), Some("deepseek-v4-flash")),
+            (
+                Some("foreign-session"),
+                Some("run-1"),
+                Some("deepseek-v4-flash"),
+            ),
+            (
+                Some("session-1"),
+                Some("foreign-run"),
+                Some("deepseek-v4-flash"),
+            ),
+            (Some("session-1"), Some("run-1"), Some("foreign-model")),
+        ] {
+            assert!(summary.runtime_feedback_for(session, run, model).is_none());
+        }
     }
 
     fn dispatch_evaluation_event(accum: &mut ChatTurnSseAccum, event: &Value) {

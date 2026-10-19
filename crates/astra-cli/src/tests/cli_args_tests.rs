@@ -113,7 +113,6 @@ fn cli_bool_flags_default_and_set() {
         ("yes-short", &["-y"], |c| c.yes),
         ("yes-long", &["--yes"], |c| c.yes),
         ("verbose", &["--verbose"], |c| c.verbose),
-        ("bare", &["--bare"], |c| c.bare),
         ("no-instructions", &["--no-instructions"], |c| {
             c.no_instructions
         }),
@@ -195,6 +194,18 @@ fn removed_cli_control_flags_are_rejected() {
             Cli::try_parse_from(args).is_err(),
             "removed control flag should be rejected: {:?}",
             args[1]
+        );
+    }
+}
+
+#[test]
+fn removed_unimplemented_mode_flags_are_rejected() {
+    for flag in ["--bare", "--startup-trace"] {
+        let err = Cli::try_parse_from(["astra", flag]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "removed flag must not be silently accepted: {flag}"
         );
     }
 }
@@ -644,7 +655,6 @@ fn cli_all_top_level_flags_combined() {
         "550e8400-e29b-41d4-a716-446655440000",
         "-n",
         "debug-session",
-        "--bare",
     ])
     .unwrap();
     assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
@@ -662,7 +672,6 @@ fn cli_all_top_level_flags_combined() {
         Some("550e8400-e29b-41d4-a716-446655440000")
     );
     assert_eq!(cli.session_name.as_deref(), Some("debug-session"));
-    assert!(cli.bare);
 }
 
 #[test]

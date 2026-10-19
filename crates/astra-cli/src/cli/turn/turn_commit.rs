@@ -65,7 +65,14 @@ fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &s
     match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
         trace_json.clone(),
     ) {
-        Ok(trace) => state.latest_context_assembly_trace = Some(trace),
+        Ok(trace) => {
+            state.latest_context_assembly_trace = Some(
+                crate::cli::session::session_state::LocalContextAssemblyTrace {
+                    local_turn: state.turn,
+                    trace,
+                },
+            );
+        }
         Err(err) => {
             astra_core::agent_warn!("context_trace", "failed to cache context trace: {err}")
         }
@@ -1519,8 +1526,9 @@ pub(super) mod tests {
             .latest_context_assembly_trace
             .as_ref()
             .expect("cached context trace");
-        assert_eq!(cached_trace.turn_id, "turn-99");
-        assert_eq!(cached_trace.token_budget.total_used, 12_345);
+        assert_eq!(cached_trace.local_turn, state.turn);
+        assert_eq!(cached_trace.trace.turn_id, "turn-99");
+        assert_eq!(cached_trace.trace.token_budget.total_used, 12_345);
     }
 
     #[test]

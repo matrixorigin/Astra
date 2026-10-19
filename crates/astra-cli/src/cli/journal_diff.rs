@@ -18,14 +18,14 @@
 //! presence cover the "did behavior change" question without
 //! drowning the reviewer in wall-of-text diffs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use astra_services::session_journal::{self, JournalEvent, JournalEventType};
+use astra_services::session_journal::{self, JournalEvent, JournalEventType, ToolCallRecord};
 
 use crate::cli::cli_config::cli_args;
-use crate::cli::journal_digest;
+use crate::cli::journal_digest::{self, producer_run_id as run_id_of};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalDiff {
@@ -46,6 +46,16 @@ pub struct JournalDiff {
     /// level diff: "A called [Read, Grep, Read]; B called [Read, Read]".
     pub a_tool_sequence: Vec<String>,
     pub b_tool_sequence: Vec<String>,
+    /// Executed tool calls per run. Taken from each turn's authoritative
+    /// `tool_count` aggregate, so it stays correct when per-call detail
+    /// (`tool_calls`) was not recorded (e.g. server-owned CLI turns).
+    pub a_tool_calls_executed: u64,
+    pub b_tool_calls_executed: u64,
+    /// False when the run executed more calls than its per-call detail
+    /// covers; the sequence is then partial and must not be read as
+    /// the full call list.
+    pub a_tool_sequence_complete: bool,
+    pub b_tool_sequence_complete: bool,
     /// Known root terminal tokens; excludes round observations and child work.
     pub a_tokens: TokenTotals,
     pub b_tokens: TokenTotals,
@@ -121,6 +131,9 @@ pub(crate) fn diff_events(
         total: saturating_delta(a_tokens.total, b_tokens.total),
     };
 
+    let a_tools = tool_activity(a_events);
+    let b_tools = tool_activity(b_events);
+
     JournalDiff {
         a_session: a_session.to_string(),
         b_session: b_session.to_string(),
@@ -129,8 +142,12 @@ pub(crate) fn diff_events(
         only_in_a,
         only_in_b,
         count_deltas,
-        a_tool_sequence: tool_sequence(a_events),
-        b_tool_sequence: tool_sequence(b_events),
+        a_tool_sequence: a_tools.sequence,
+        b_tool_sequence: b_tools.sequence,
+        a_tool_calls_executed: a_tools.executed,
+        b_tool_calls_executed: b_tools.executed,
+        a_tool_sequence_complete: a_tools.complete,
+        b_tool_sequence_complete: b_tools.complete,
         a_tokens,
         b_tokens,
         token_deltas,
@@ -165,21 +182,351 @@ fn token_totals(events: &[JournalEvent]) -> TokenTotals {
     }
 }
 
-fn tool_sequence(events: &[JournalEvent]) -> Vec<String> {
-    // Walk `JournalEvent.tool_calls` (set on Turn / LlmRound events) in
-    // journal order. The per-event vec preserves within-turn ordering;
-    // cross-event traversal preserves turn ordering. Union of both gives
-    // the full tool-call sequence a reviewer sees when reading the run
-    // top-to-bottom.
-    let mut out = Vec::new();
-    for e in events {
-        if let Some(calls) = e.tool_calls.as_ref() {
-            for c in calls {
-                out.push(c.name.clone());
+struct ToolActivity {
+    sequence: Vec<String>,
+    executed: u64,
+    complete: bool,
+}
+
+fn is_terminal(e: &JournalEvent) -> bool {
+    matches!(
+        e.event_type,
+        JournalEventType::Turn | JournalEventType::TurnError
+    )
+}
+
+/// A child observation cannot join an anonymous root terminal. Typed producer
+/// classification is shared with digest; metadata-only rounds also carry purpose.
+fn is_child_round(e: &JournalEvent) -> bool {
+    journal_digest::is_child_producer(e)
+        || (e.producer_scope.is_none()
+            && e.metadata
+                .as_ref()
+                .and_then(|m| m.get("purpose"))
+                .and_then(|p| p.as_str())
+                == Some("sub_agent"))
+}
+
+/// Terminal (`turn` / `turn_error`) positions indexed once per snapshot, so
+/// resolving a round's owner is a few binary searches instead of a scan.
+#[derive(Default)]
+struct TerminalIndex<'a> {
+    /// (turn, run id) -> terminals carrying that run id.
+    by_run: HashMap<(u32, &'a str), Vec<usize>>,
+    /// turn -> terminals without a run id.
+    anonymous: HashMap<u32, Vec<usize>>,
+    /// turn -> all terminals.
+    any: HashMap<u32, Vec<usize>>,
+}
+
+impl<'a> TerminalIndex<'a> {
+    fn new(events: &'a [JournalEvent]) -> Self {
+        let mut idx = Self::default();
+        for (i, e) in events.iter().enumerate() {
+            let Some(turn) = e.turn.filter(|_| is_terminal(e)) else {
+                continue;
+            };
+            match run_id_of(e) {
+                Some(run) => idx.by_run.entry((turn, run)).or_default().push(i),
+                None => idx.anonymous.entry(turn).or_default().push(i),
+            }
+            idx.any.entry(turn).or_default().push(i);
+        }
+        idx
+    }
+
+    /// Index of the terminal that owns the round at `round_idx`, searched
+    /// over the whole snapshot: a round can be written after its terminal.
+    /// A turn number alone does not identify an attempt, so when both sides
+    /// carry a run id they must match. A root round without a run id (or a
+    /// terminal without one) falls back to the turn number. A child round
+    /// only joins a terminal of its own run. Among candidates, an exact
+    /// run-id match wins, then the first terminal after the round, then the
+    /// nearest one before it.
+    fn owner(
+        &self,
+        events: &[JournalEvent],
+        round_idx: usize,
+        inferred_scope: Option<(&str, bool)>,
+    ) -> Option<usize> {
+        let round = &events[round_idx];
+        let turn = round.turn?;
+        let nearest = |list: Option<&Vec<usize>>| {
+            let list = list?;
+            let after = list.partition_point(|&i| i <= round_idx);
+            list.get(after)
+                .or_else(|| after.checked_sub(1).and_then(|b| list.get(b)))
+                .copied()
+        };
+        let child = is_child_round(round) || inferred_scope.is_some_and(|(_, child)| child);
+        match run_id_of(round).or(inferred_scope.map(|(run, _)| run)) {
+            Some(run) => nearest(self.by_run.get(&(turn, run))).or_else(|| {
+                (!child)
+                    .then(|| nearest(self.anonymous.get(&turn)))
+                    .flatten()
+            }),
+            None if child => None,
+            None => nearest(self.any.get(&turn)),
+        }
+    }
+}
+
+/// Non-empty per-call observations from rounds and standalone failures.
+fn round_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
+    matches!(
+        e.event_type,
+        JournalEventType::LlmRound | JournalEventType::ToolCallError
+    )
+    .then_some(e.tool_calls.as_ref())
+    .flatten()
+    .filter(|c| !c.is_empty())
+}
+
+type CallRunIndex<'a> = HashMap<(Option<u32>, &'a str), Option<(&'a str, bool)>>;
+
+type RoundCallIndex<'a> = HashMap<(Option<u32>, &'a str, &'a str), (usize, usize)>;
+
+fn inferred_error_scope<'a>(
+    event: &JournalEvent,
+    call_runs: &CallRunIndex<'a>,
+) -> Option<(&'a str, bool)> {
+    if event.event_type != JournalEventType::ToolCallError || run_id_of(event).is_some() {
+        return None;
+    }
+    let [call] = event.tool_calls.as_deref()? else {
+        return None;
+    };
+    call_runs
+        .get(&(event.turn, call.tool_call_id.as_deref()?))
+        .copied()
+        .flatten()
+}
+
+/// A matching round owns call order; an immediately persisted error is another
+/// observation of that call, even when terminal detail only covers other calls.
+fn normalized_error<'a>(
+    events: &'a [JournalEvent],
+    terminals: &TerminalIndex<'_>,
+    call_runs: &CallRunIndex<'a>,
+    round_positions: &RoundCallIndex<'a>,
+    event_idx: usize,
+) -> Option<((usize, usize), &'a ToolCallRecord)> {
+    let event = &events[event_idx];
+    if event.event_type != JournalEventType::ToolCallError {
+        return None;
+    }
+    let [call] = event.tool_calls.as_deref()? else {
+        return None;
+    };
+    let inferred = inferred_error_scope(event, call_runs);
+    let run = run_id_of(event).or(inferred.map(|(run, _)| run))?;
+    let &(round, offset) =
+        round_positions.get(&(event.turn, run, call.tool_call_id.as_deref()?))?;
+    let representative = &events[round].tool_calls.as_ref()?[offset];
+    if call.name != representative.name
+        || call.was_executed() != representative.was_executed()
+        || terminals.owner(events, event_idx, inferred) != terminals.owner(events, round, None)
+    {
+        return None;
+    }
+    Some(((round, offset), representative))
+}
+
+fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
+    // Terminals own authoritative counts and prefer their own detail over round
+    // projections. Resolve observations across the complete snapshot, including
+    // late writes. Anonymous errors require a unique call/run witness: turn numbers
+    // can be reused after an interrupted attempt. Retain unowned observations.
+    // Place terminal records by call ID or round, preserving interleaved activity.
+    let mut out = ToolActivity {
+        sequence: Vec::new(),
+        executed: 0,
+        complete: true,
+    };
+    let index = TerminalIndex::new(events);
+    // terminal index -> indices of the rounds it owns (journal order).
+    let mut owned: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Sequence chunks keyed by the journal position they are emitted at.
+    let mut slots: BTreeMap<(usize, usize, usize), &ToolCallRecord> = BTreeMap::new();
+    let mut orphan_ids = std::collections::HashSet::new();
+    // Production ToolCallError records lack a run ID. Resolve only an
+    // unambiguous (turn, call ID) witness; never merge different known runs.
+    let mut call_runs: CallRunIndex<'_> = HashMap::new();
+    let mut round_positions: RoundCallIndex<'_> = HashMap::new();
+    // These lookups serve error admission and normalization only.
+    if events
+        .iter()
+        .any(|event| event.event_type == JournalEventType::ToolCallError)
+    {
+        for (idx, e) in events.iter().enumerate() {
+            if let Some(run) = run_id_of(e) {
+                for (offset, call) in e.tool_calls.iter().flatten().enumerate() {
+                    if let Some(id) = call.tool_call_id.as_deref() {
+                        if e.event_type == JournalEventType::LlmRound {
+                            round_positions
+                                .entry((e.turn, run, id))
+                                .or_insert((idx, offset));
+                        }
+                        call_runs
+                            .entry((e.turn, id))
+                            .and_modify(|known| {
+                                if let Some((known_run, child)) = known {
+                                    if *known_run == run {
+                                        *child |= is_child_round(e);
+                                    } else {
+                                        *known = None;
+                                    }
+                                }
+                            })
+                            .or_insert(Some((run, is_child_round(e))));
+                    }
+                }
             }
         }
     }
+    for (idx, e) in events.iter().enumerate() {
+        if let Some(calls) = round_calls(e) {
+            let anonymous_error =
+                e.event_type == JournalEventType::ToolCallError && run_id_of(e).is_none();
+            let inferred_scope = inferred_error_scope(e, &call_runs);
+            let unresolved_error = anonymous_error && inferred_scope.is_none();
+            let owner = (!unresolved_error)
+                .then(|| index.owner(events, idx, inferred_scope))
+                .flatten();
+            match owner {
+                Some(t) => owned.entry(t).or_default().push(idx),
+                None => {
+                    let normalized =
+                        normalized_error(events, &index, &call_runs, &round_positions, idx);
+                    for (offset, call) in calls.iter().enumerate() {
+                        let ((position, within), call) =
+                            normalized.unwrap_or(((idx, offset), call));
+                        if call.tool_call_id.as_deref().is_some_and(|id| {
+                            !orphan_ids.insert((
+                                e.turn,
+                                run_id_of(e).or(inferred_scope.map(|(run, _)| run)),
+                                unresolved_error,
+                                id,
+                            ))
+                        }) {
+                            continue;
+                        }
+                        if unresolved_error && call.was_executed() {
+                            out.complete = false;
+                        }
+                        out.executed = out.executed.saturating_add(u64::from(call.was_executed()));
+                        slots.insert((position, within, 0), call);
+                    }
+                }
+            }
+        }
+    }
+    for (idx, e) in events.iter().enumerate() {
+        if !is_terminal(e) {
+            continue;
+        }
+        let rounds = owned.remove(&idx).unwrap_or_default();
+        let mut locations = HashMap::new();
+        let mut round_locations = HashMap::new();
+        for &r in &rounds {
+            let normalized = normalized_error(events, &index, &call_runs, &round_positions, r);
+            for (offset, call) in round_calls(&events[r]).into_iter().flatten().enumerate() {
+                let (position, call) = normalized.unwrap_or(((r, offset), call));
+                if let Some(id) = call.tool_call_id.as_deref() {
+                    locations.entry(id).or_insert(position);
+                }
+                if events[r].event_type == JournalEventType::LlmRound {
+                    if let Some(round) = call.round {
+                        round_locations.entry(round).or_insert(r);
+                    }
+                }
+            }
+        }
+        let first_round = rounds
+            .iter()
+            .copied()
+            .find(|&r| events[r].event_type == JournalEventType::LlmRound)
+            .map_or(idx, |r| r.min(idx));
+        let mut seen = std::collections::HashSet::new();
+        let mut detailed = match e.tool_calls.as_ref().filter(|c| !c.is_empty()) {
+            Some(calls) => {
+                let mut count = 0;
+                for (offset, call) in calls.iter().enumerate() {
+                    if call
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| !seen.insert(id))
+                    {
+                        continue;
+                    }
+                    let (position, within) = call
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|id| locations.get(id).copied())
+                        .or_else(|| {
+                            call.round
+                                .and_then(|round| round_locations.get(&round).map(|&r| (r, offset)))
+                        })
+                        .unwrap_or((
+                            if call.tool_call_id.is_some() {
+                                idx
+                            } else {
+                                first_round
+                            },
+                            offset,
+                        ));
+                    slots.insert((position, within, offset + 1), call);
+                    count += u64::from(call.was_executed());
+                }
+                count
+            }
+            None => 0,
+        };
+        let terminal_detail = e.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+        for &r in &rounds {
+            // Terminal records supersede their round projections,
+            // but a standalone failure remains evidence unless its ID is covered.
+            if terminal_detail && events[r].event_type != JournalEventType::ToolCallError {
+                continue;
+            }
+            let normalized = normalized_error(events, &index, &call_runs, &round_positions, r);
+            for (offset, call) in round_calls(&events[r]).into_iter().flatten().enumerate() {
+                let ((position, within), call) = normalized.unwrap_or(((r, offset), call));
+                if call
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| !seen.insert(id))
+                {
+                    continue;
+                }
+                slots.insert((position, within, 0), call);
+                detailed += u64::from(call.was_executed());
+            }
+        }
+        let executed = e.tool_count.map(u64::from).unwrap_or(detailed);
+        if detailed != executed {
+            out.complete = false;
+        }
+        out.executed = out.executed.saturating_add(executed);
+    }
+    out.sequence = slots
+        .into_values()
+        .filter(|record| record.was_executed())
+        .map(|record| record.name.clone())
+        .collect();
     out
+}
+
+fn render_tool_sequence(label: &str, seq: &[String], executed: u64, complete: bool) -> String {
+    if complete {
+        format!("tool sequence {label} ({} calls): {seq:?}\n", seq.len())
+    } else {
+        format!(
+            "tool sequence {label} ({executed} executed calls; detailed sequence \
+             unavailable/incomplete, {} recorded): {seq:?}\n",
+            seq.len()
+        )
+    }
 }
 
 fn has_final_text(events: &[JournalEvent]) -> bool {
@@ -264,18 +611,29 @@ pub fn render_text(diff: &JournalDiff) -> String {
     }
 
     s.push('\n');
-    s.push_str(&format!(
-        "tool sequence A ({} calls): {:?}\n",
-        diff.a_tool_sequence.len(),
-        diff.a_tool_sequence
+    s.push_str(&render_tool_sequence(
+        "A",
+        &diff.a_tool_sequence,
+        diff.a_tool_calls_executed,
+        diff.a_tool_sequence_complete,
     ));
-    s.push_str(&format!(
-        "tool sequence B ({} calls): {:?}\n",
-        diff.b_tool_sequence.len(),
-        diff.b_tool_sequence
+    s.push_str(&render_tool_sequence(
+        "B",
+        &diff.b_tool_sequence,
+        diff.b_tool_calls_executed,
+        diff.b_tool_sequence_complete,
     ));
-    if diff.a_tool_sequence != diff.b_tool_sequence {
-        s.push_str("  → tool sequence DIFFERS\n");
+    if diff.a_tool_sequence_complete && diff.b_tool_sequence_complete {
+        if diff.a_tool_sequence != diff.b_tool_sequence {
+            s.push_str("  → tool sequence DIFFERS\n");
+        }
+    } else if diff.a_tool_calls_executed != diff.b_tool_calls_executed {
+        s.push_str(&format!(
+            "  → executed tool-call count DIFFERS ({} → {}); sequences not comparable\n",
+            diff.a_tool_calls_executed, diff.b_tool_calls_executed
+        ));
+    } else {
+        s.push_str("  → sequences not comparable (detail incomplete)\n");
     }
 
     s
@@ -431,6 +789,746 @@ mod tests {
         let d = diff_events("a", "b", &a, &b);
         assert_eq!(d.a_tool_sequence, vec!["Read", "Grep"]);
         assert_eq!(d.b_tool_sequence, vec!["Grep", "Read"]);
+    }
+
+    #[test]
+    fn aggregate_only_turns_do_not_render_as_zero_calls() {
+        // Server-owned CLI turns record `tool_count` / `tools_used` /
+        // `tool_outcomes` but no per-call `tool_calls` detail (#784).
+        // Missing detail must not be reported as "0 calls".
+        let a = vec![
+            evt(json!({
+                "type":"turn","ts":"t1","session_id":"a","turn":1,"tool_count":6,
+                "tools_used":["bash","read"],
+                "tool_outcomes":{"requested":6,"executed":6,"succeeded":5,"failed":1,
+                    "rejected":0,"reused":0,"suppressed":0,"deferred":0}
+            })),
+            evt(json!({"type":"turn","ts":"t2","session_id":"a","turn":2,"tool_count":0})),
+        ];
+        let b = vec![evt(json!({
+            "type":"turn","ts":"t1","session_id":"b","turn":1,"tool_count":82
+        }))];
+        let d = diff_events("a", "b", &a, &b);
+        let txt = render_text(&d);
+        assert!(
+            !txt.contains("(0 calls)"),
+            "missing detail rendered as zero:\n{txt}"
+        );
+        assert!(txt.contains("6 executed"), "{txt}");
+        assert!(txt.contains("82 executed"), "{txt}");
+        assert!(txt.contains("unavailable"), "{txt}");
+    }
+
+    #[test]
+    fn round_and_turn_records_for_same_turn_are_not_double_counted() {
+        // Local runs embed per-call records on each llm_round AND on the
+        // completed turn; the sequence must list each call once.
+        let calls = json!([
+            {"name":"Read","ok":true,"ms":0},
+            {"name":"Grep","ok":true,"ms":0},
+        ]);
+        let a = vec![
+            evt(
+                json!({"type":"llm_round","ts":"t1","session_id":"a","turn":1,
+                "tool_calls":[{"name":"Read","ok":true,"ms":0}]}),
+            ),
+            evt(
+                json!({"type":"llm_round","ts":"t2","session_id":"a","turn":1,
+                "tool_calls":[{"name":"Grep","ok":true,"ms":0}]}),
+            ),
+            evt(json!({"type":"turn","ts":"t3","session_id":"a","turn":1,
+                "tool_count":2,"tool_calls":calls})),
+        ];
+        let d = diff_events("a", "a2", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["Read", "Grep"]);
+    }
+
+    fn rd(turn: u32, run: &str, name: &str) -> JournalEvent {
+        evt(
+            json!({"type":"llm_round","ts":"t","session_id":"a","turn":turn,
+            "metadata":{"run_id":run},"tool_calls":[{"name":name,"ok":true,"ms":0}]}),
+        )
+    }
+
+    #[test]
+    fn failed_turns_are_included_in_the_activity_fold() {
+        let a = vec![evt(
+            json!({"type":"turn_error","ts":"t","session_id":"a","turn":1,
+            "tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+        )];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        let a = vec![evt(
+            json!({"type":"turn_error","ts":"t","session_id":"a","turn":1,"tool_count":6}),
+        )];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_calls_executed, 6);
+        assert!(!d.a_tool_sequence_complete);
+    }
+
+    #[test]
+    fn rounds_of_another_run_with_the_same_turn_are_kept() {
+        let a = vec![
+            rd(1, "run-a", "read_file"),
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"run-b"},"tool_calls":[{"name":"bash","ok":true,"ms":0}]}),
+            ),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn rounds_written_after_their_terminal_are_not_counted_twice() {
+        let a = vec![
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"r1"}}),
+            ),
+            rd(1, "r1", "read_file"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+        assert!(d.a_tool_sequence_complete);
+        // terminal also carries the detail: listed once
+        let a = vec![
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"r1"},"tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+            ),
+            rd(1, "r1", "read_file"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+    }
+
+    #[test]
+    fn unmatched_rounds_keep_their_chronological_position() {
+        let a = vec![
+            rd(1, "r1", "read_file"),
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":2,"tool_count":1,
+                "metadata":{"run_id":"r2"},"tool_calls":[{"name":"bash","ok":true,"ms":0}]}),
+            ),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "bash"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn matched_rounds_keep_their_position_among_unmatched_rounds() {
+        // Root round (turn 1), then a child round with its own producer
+        // scope and no turn, then the root terminal with only `tool_count`.
+        let a = vec![
+            rd(1, "root", "read_file"),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+                "producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"worker"},
+                "tool_calls":[{"name":"grep","ok":true,"ms":0}]})),
+            evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+                "metadata":{"run_id":"root"}}),
+            ),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+        assert!(d.a_tool_sequence_complete);
+        // Same shape when the terminal carries its own per-call detail.
+        let mut a = a;
+        a[2] = evt(
+            json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":1,
+            "metadata":{"run_id":"root"},"tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+        );
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn identified_child_round_is_not_folded_into_an_anonymous_terminal() {
+        let child = |purpose: bool, scope: bool| {
+            let mut v = json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "tool_calls":[{"name":"grep","ok":true,"ms":0}]});
+            if scope {
+                v["producer_scope"] =
+                    json!({"run_id":"child","parent_run_id":"root","agent_id":"worker"});
+            }
+            if purpose {
+                v["metadata"] = json!({"purpose":"sub_agent"});
+            }
+            evt(v)
+        };
+        let terminal = evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+            "tool_count":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0}]}));
+        for (purpose, scope) in [(true, true), (false, true), (true, false)] {
+            let a = vec![child(purpose, scope), terminal.clone()];
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(
+                d.a_tool_sequence,
+                vec!["grep", "read_file"],
+                "purpose={purpose} scope={scope}"
+            );
+            assert_eq!(d.a_tool_calls_executed, 2);
+            assert!(d.a_tool_sequence_complete);
+        }
+        // Explicit root agent identity must not be mistaken for a child.
+        let root = evt(
+            json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"root","agent_id":"root"},
+            "tool_calls":[{"name":"read_file","ok":true,"ms":0}]}),
+        );
+        let diff = diff_events("a", "b", &[root, terminal.clone()], &[]);
+        assert_eq!(diff.a_tool_calls_executed, 1);
+        assert_eq!(diff.a_tool_sequence, ["read_file"]);
+        assert!(diff.a_tool_sequence_complete);
+        // A root round without child identity still uses the legacy fallback.
+        let a = vec![rd(1, "root", "read_file"), terminal];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+    }
+
+    #[test]
+    fn terminal_lookup_prefers_exact_run_then_nearest_following() {
+        let term = |turn: u32, run: Option<&str>, name: &str| {
+            let mut v = json!({"type":"turn","ts":"t","session_id":"a","turn":turn,
+                "tool_count":1,"tool_calls":[{"name":name,"ok":true,"ms":0}]});
+            if let Some(r) = run {
+                v["metadata"] = json!({"run_id": r});
+            }
+            evt(v)
+        };
+        // Exact run match before the round beats an anonymous terminal after it.
+        let a = vec![
+            term(1, Some("r1"), "t_exact"),
+            rd(1, "r1", "round"),
+            term(1, None, "t_anon"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["t_exact", "t_anon"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+        // Without a run id, the first following terminal of that turn wins.
+        let a = vec![
+            term(1, Some("x"), "t_before"),
+            evt(
+                json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "tool_calls":[{"name":"round","ok":true,"ms":0}]}),
+            ),
+            term(1, Some("y"), "t_after1"),
+            term(1, Some("z"), "t_after2"),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["t_before", "t_after1", "t_after2"]);
+        assert_eq!(d.a_tool_calls_executed, 3);
+    }
+
+    async fn assert_unwitnessed_error_after_restore(with_detail: bool) {
+        use astra_services::session_journal::{JournalDirGuard, JournalWriter};
+        use astra_services::session_restore::HybridRestoreService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let empty = uuid::Uuid::new_v4().to_string();
+        JournalWriter::new(&empty)
+            .unwrap()
+            .append(&JournalEvent::session_start(
+                Some(&empty),
+                Some("test-model"),
+            ))
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let writer = JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(&sid), Some("test-model")))
+            .unwrap();
+        let failed = serde_json::from_value(json!({
+            "tool_call_id":"aborted-call","name":"bash","ok":false,
+            "ms":1,"error":"exit 1"
+        }))
+        .unwrap();
+        let error = JournalEvent::tool_call_error(Some(&sid), 1, "bash", "exit 1", failed);
+        assert!(super::run_id_of(&error).is_none());
+        writer.append(&error).unwrap();
+        let restored = HybridRestoreService::local_only()
+            .restore_local_session(&sid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.turn_count, 0);
+        let mut terminal = JournalEvent::turn(
+            Some(&sid),
+            restored.turn_count + 1,
+            Some("test-model"),
+            "continue",
+            "done",
+            1,
+            0,
+            0,
+            0,
+        )
+        .with_run_id(Some("later-run"));
+        if with_detail {
+            terminal.tool_calls = Some(vec![
+                serde_json::from_value(json!({
+                    "tool_call_id":"later-call","name":"read_file","ok":true,"ms":1
+                }))
+                .unwrap(),
+            ]);
+        }
+        writer.append(&terminal).unwrap();
+        let diff = super::compute_diff(&sid, &empty).unwrap();
+        assert_eq!(diff.a_tool_calls_executed, 2);
+        assert!(!diff.a_tool_sequence_complete);
+        let expected = if with_detail {
+            vec!["bash", "read_file"]
+        } else {
+            vec!["bash"]
+        };
+        assert_eq!(diff.a_tool_sequence, expected);
+        let encoded = serde_json::to_value(&diff).unwrap();
+        assert_eq!(encoded["a_tool_calls_executed"], 2);
+        assert_eq!(encoded["a_tool_sequence_complete"], false);
+        assert_eq!(encoded["a_tool_sequence"], json!(expected));
+        let text = render_text(&diff);
+        assert!(
+            text.contains("2 executed calls; detailed sequence"),
+            "{text}"
+        );
+        assert!(!text.contains("tool sequence DIFFERS"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unwitnessed_error_survives_restore_with_detailed_later_turn() {
+        assert_unwitnessed_error_after_restore(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unwitnessed_error_survives_restore_with_aggregate_later_turn() {
+        assert_unwitnessed_error_after_restore(false).await;
+    }
+
+    #[test]
+    fn execution_dispositions_agree_across_counts_sequences_text_and_json() {
+        use astra_services::session_journal::ToolCallDisposition::{
+            Deferred, Executed, Rejected, Reused, Suppressed,
+        };
+        let nonexecuted: Vec<_> = [Rejected, Reused, Suppressed, Deferred]
+            .into_iter()
+            .enumerate()
+            .map(|(i, disposition)| {
+                json!({"tool_call_id":format!("no-exec-{i}"),"name":"not-executed",
+                    "ok":false,"ms":0,"disposition":disposition})
+            })
+            .collect();
+        let mut mixed = vec![
+            json!({"tool_call_id":"read","name":"read_file","ok":true,"ms":1,"disposition":Executed}),
+            json!({"tool_call_id":"bash","name":"bash","ok":false,"ms":1,"disposition":Executed}),
+        ];
+        mixed.extend(nonexecuted.clone());
+        for (records, count, names, complete) in [
+            (mixed.clone(), 2, vec!["read_file", "bash"], true),
+            (nonexecuted, 0, vec![], true),
+            (mixed, 3, vec!["read_file", "bash"], false),
+        ] {
+            let events = [evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+                "tool_count":count,"tool_calls":records}),
+            )];
+            let diff = diff_events("a", "b", &events, &[]);
+            assert_eq!(diff.a_tool_calls_executed, count);
+            assert_eq!(diff.a_tool_sequence, names);
+            assert_eq!(diff.a_tool_sequence_complete, complete);
+            let encoded = serde_json::to_value(&diff).unwrap();
+            assert_eq!(encoded["a_tool_calls_executed"], count);
+            assert_eq!(encoded["a_tool_sequence"], json!(names));
+            assert_eq!(encoded["a_tool_sequence_complete"], complete);
+            let text = render_text(&diff);
+            let label = if complete {
+                format!("({count} calls)")
+            } else {
+                format!("({count} executed calls;")
+            };
+            assert!(text.contains(&label), "{text}");
+        }
+    }
+
+    #[test]
+    fn nonexecuted_orphan_error_keeps_zero_execution_sequence_complete() {
+        let record = serde_json::from_value(json!({
+            "tool_call_id":"rejected-call","name":"bash","ok":false,"ms":0,
+            "disposition":"rejected","error":"permission denied"
+        }))
+        .unwrap();
+        let error =
+            JournalEvent::tool_call_error(Some("a"), 1, "bash", "permission denied", record);
+        let terminal = evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+            "tool_count":0,"metadata":{"run_id":"later-run"}}));
+        for events in [vec![error.clone()], vec![error, terminal]] {
+            let diff = diff_events("a", "b", &events, &[]);
+            assert_eq!(diff.a_tool_calls_executed, 0);
+            assert!(diff.a_tool_sequence.is_empty());
+            assert!(diff.a_tool_sequence_complete);
+            let encoded = serde_json::to_value(&diff).unwrap();
+            assert_eq!(encoded["a_tool_sequence"], json!([]));
+            assert_eq!(encoded["a_tool_sequence_complete"], true);
+            assert!(render_text(&diff).contains("tool sequence A (0 calls): []"));
+        }
+    }
+
+    #[test]
+    fn round_order_is_invariant_under_redundant_error_observation() {
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalWriter, LlmRoundRecord, TurnEventBuffer,
+        };
+
+        fn write_session(terminal_detail: Option<usize>, error: Option<(bool, bool)>) -> String {
+            let sid = uuid::Uuid::new_v4().to_string();
+            let read: super::ToolCallRecord = serde_json::from_value(json!({
+                "tool_call_id":"read","name":"read_file","round":0,
+                "start_offset_ms":0,"ok":true,"ms":1
+            }))
+            .unwrap();
+            let failed: super::ToolCallRecord = serde_json::from_value(json!({
+                "tool_call_id":"failed","name":"bash","round":0,
+                "start_offset_ms":10,"ok":false,"ms":1,"error":"exit 1"
+            }))
+            .unwrap();
+            let mut buffer = TurnEventBuffer::begin_turn(Some(&sid), 1);
+            let mut record = LlmRoundRecord::new(astra_turn_types::InferencePurpose::PrimaryAgent);
+            record.run_id = Some("root".into());
+            record.tool_calls = Some(vec![read.clone(), failed.clone()]);
+            record.tool_calls_returned = 2;
+            buffer.record_llm_round(record);
+            let mut events = buffer.drain();
+            events[0].ts = "2026-10-19T00:00:01Z".into();
+            if let Some((before_round, explicit_run)) = error {
+                let mut event =
+                    JournalEvent::tool_call_error(Some(&sid), 1, "bash", "exit 1", failed.clone());
+                if explicit_run {
+                    event = event.with_run_id(Some("root"));
+                }
+                event.ts = if before_round {
+                    "2026-10-19T00:00:00Z"
+                } else {
+                    "2026-10-19T00:00:02Z"
+                }
+                .into();
+                events.push(event);
+            }
+            if let Some(with_detail) = terminal_detail {
+                let mut event = JournalEvent::turn(
+                    Some(&sid),
+                    1,
+                    Some("test-model"),
+                    "run",
+                    "done",
+                    2,
+                    0,
+                    0,
+                    0,
+                )
+                .with_run_id(Some("root"));
+                event.ts = "2026-10-19T00:00:03Z".into();
+                if with_detail > 0 {
+                    let mut calls = vec![read, failed];
+                    calls.truncate(with_detail);
+                    event = event.with_tool_calls(calls);
+                }
+                // Partial terminal data keeps its independent executed aggregate.
+                event.tool_count = Some(2);
+                events.push(event);
+            }
+            let writer = JournalWriter::new(&sid).unwrap();
+            for event in events {
+                writer.append(&event).unwrap();
+            }
+            sid
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        for terminal in [None, Some(0), Some(1), Some(2)] {
+            // Partial terminal detail needs the standalone error to supplement
+            // the missing failure. Compare it to the complete-detail control.
+            let control = write_session(
+                if terminal == Some(1) {
+                    Some(2)
+                } else {
+                    terminal
+                },
+                None,
+            );
+            for before_round in [true, false] {
+                for explicit_run in [false, true] {
+                    let sid = write_session(terminal, Some((before_round, explicit_run)));
+                    let diff = super::compute_diff(&sid, &control).unwrap();
+                    assert_eq!(
+                        diff.a_tool_sequence,
+                        ["read_file", "bash"],
+                        "terminal={terminal:?}, before={before_round}, explicit={explicit_run}"
+                    );
+                    assert_eq!(diff.a_tool_sequence, diff.b_tool_sequence);
+                    assert_eq!(diff.a_tool_calls_executed, 2);
+                    assert!(diff.a_tool_sequence_complete);
+                    let json = serde_json::to_value(&diff).unwrap();
+                    assert_eq!(json["a_tool_sequence"], json!(["read_file", "bash"]));
+                    assert_eq!(json["a_tool_calls_executed"], 2);
+                    assert_eq!(json["a_tool_sequence_complete"], true);
+                    assert!(!render_text(&diff).contains("tool sequence DIFFERS"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_followup_production_error_without_run_id_is_not_counted_twice() {
+        let record: super::ToolCallRecord = serde_json::from_value(json!({
+            "tool_call_id":"failed-bash","name":"bash","round":0,
+            "ok":false,"ms":1,"error":"exit 1"
+        }))
+        .unwrap();
+        // Use the production constructor: ToolCallError has no run identity.
+        let error = JournalEvent::tool_call_error(Some("a"), 1, "bash", "exit 1", record.clone());
+        assert!(super::run_id_of(&error).is_none());
+        let round = evt(
+            json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"root"},"tool_calls":[record]}),
+        );
+        let terminal = evt(
+            json!({"type":"turn_error","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"root"},"tool_count":1}),
+        );
+        for events in [
+            vec![error.clone(), round.clone()],
+            vec![round.clone(), error.clone()],
+            vec![error.clone(), round.clone(), terminal.clone()],
+            vec![error.clone(), round.clone(), error.clone(), round.clone()],
+            vec![
+                error.clone(),
+                round.clone(),
+                error.clone(),
+                round.clone(),
+                terminal.clone(),
+            ],
+            vec![terminal, round.clone(), error],
+        ] {
+            let diff = diff_events("a", "b", &events, &[]);
+            assert_eq!(diff.a_tool_sequence, ["bash"]);
+            assert_eq!(diff.a_tool_calls_executed, 1);
+            assert!(diff.a_tool_sequence_complete);
+        }
+        // Missing IDs and multi-call errors cannot inherit a round's identity.
+        let failed = round.tool_calls.as_ref().unwrap()[0].clone();
+        let mut missing_id = failed.clone();
+        missing_id.tool_call_id = None;
+        let missing = JournalEvent::tool_call_error(Some("a"), 1, "bash", "exit 1", missing_id);
+        let mut multiple =
+            JournalEvent::tool_call_error(Some("a"), 1, "bash", "exit 1", failed.clone());
+        let mut another = failed;
+        another.tool_call_id = Some("another-failure".into());
+        multiple.tool_calls.as_mut().unwrap().push(another);
+        for (error, retained) in [(missing, 2), (multiple, 3)] {
+            let diff = diff_events("a", "b", &[round.clone(), error], &[]);
+            assert_eq!(diff.a_tool_calls_executed, retained);
+            assert!(!diff.a_tool_sequence_complete);
+        }
+        // Missing run identity on both projections is not a positive witness.
+        // Keep uncertain error evidence separate from a runless round.
+        let mut runless = round.clone();
+        runless.producer_scope = None;
+        let error = JournalEvent::tool_call_error(
+            Some("a"),
+            1,
+            "bash",
+            "exit 1",
+            runless.tool_calls.as_ref().unwrap()[0].clone(),
+        );
+        for events in [
+            vec![runless.clone(), error.clone(), error.clone()],
+            vec![error, runless],
+        ] {
+            let diff = diff_events("a", "b", &events, &[]);
+            assert_eq!(diff.a_tool_calls_executed, 2);
+            assert!(!diff.a_tool_sequence_complete);
+        }
+        // A reused provider ID in a distinct known run is not a duplicate.
+        let mut other = round.clone();
+        other.producer_scope.as_mut().unwrap().run_id = "other".to_string();
+        let diff = diff_events("a", "b", &[round, other], &[]);
+        assert_eq!(diff.a_tool_sequence, ["bash", "bash"]);
+        assert_eq!(diff.a_tool_calls_executed, 2);
+    }
+
+    #[test]
+    fn review_followup_inferred_child_never_joins_anonymous_root() {
+        let record: super::ToolCallRecord = serde_json::from_value(json!({
+            "tool_call_id":"child-failure","name":"bash","ok":false,"ms":1
+        }))
+        .unwrap();
+        let error = JournalEvent::tool_call_error(Some("a"), 1, "bash", "failed", record.clone());
+        let child = evt(
+            json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+            "producer_scope":{"run_id":"child","parent_run_id":"root"},"tool_calls":[record]}),
+        );
+        let root = evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":0}));
+        for a in [
+            vec![error.clone(), child.clone(), root.clone()],
+            vec![root.clone(), child.clone(), error.clone()],
+        ] {
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(d.a_tool_sequence, ["bash"]);
+            assert_eq!(d.a_tool_calls_executed, 1);
+            assert!(d.a_tool_sequence_complete);
+        }
+        let mut other = child.clone();
+        other.producer_scope.as_mut().unwrap().run_id = "other".to_string();
+        let d = diff_events("a", "b", &[error, child, other, root], &[]);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(
+            !d.a_tool_sequence_complete,
+            "conflicting identities cannot prove complete attribution"
+        );
+    }
+
+    #[test]
+    fn review_followup_terminal_detail_preserves_interleaved_rounds() {
+        let call = |id: &str, name: &str, round: u32| json!({"tool_call_id":id,"name":name,"ok":true,"ms":0,"round":round});
+        let mut a = vec![
+            evt(
+                json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[call("a", "read_file", 0)]}),
+            ),
+            evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+                "producer_scope":{"run_id":"child","parent_run_id":"root","agent_id":"worker"},
+                "tool_calls":[call("c", "grep", 0)]})),
+            evt(
+                json!({"type":"llm_round","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[call("b", "bash", 1)]}),
+            ),
+            evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_count":2,
+                "tool_calls":[call("a", "read_file", 0),call("b", "bash", 1)]})),
+        ];
+        let mut b = a.clone();
+        b[3].tool_calls = None;
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_sequence, vec!["read_file", "grep", "bash"]);
+        assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(d.a_tool_sequence_complete);
+        assert!(!render_text(&d).contains("tool sequence DIFFERS"));
+        // Round attribution also preserves order in older records without IDs.
+        for e in &mut a {
+            if let Some(calls) = e.tool_calls.as_mut() {
+                for c in calls {
+                    c.tool_call_id = None;
+                }
+            }
+        }
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_sequence, d.b_tool_sequence);
+    }
+
+    #[test]
+    fn review_followup_standalone_error_is_retained_and_deduplicated() {
+        let failed = json!({"tool_call_id":"failed","name":"bash","ok":false,
+            "ms":1,"error":"failed","round":0});
+        let error = evt(json!({"type":"tool_call_error","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_calls":[failed.clone()]}));
+        let round = evt(json!({"type":"llm_round","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_calls":[failed.clone()]}));
+        let terminal = evt(json!({"type":"turn_error","ts":"t","session_id":"a",
+            "turn":1,"metadata":{"run_id":"root"},"tool_count":1,"tool_calls":[failed]}));
+        for a in [
+            vec![error.clone()],
+            vec![error.clone(), round.clone()],
+            vec![error.clone(), round.clone(), terminal.clone()],
+            vec![error, terminal],
+        ] {
+            let d = diff_events("a", "b", &a, &[]);
+            assert_eq!(d.a_tool_sequence, vec!["bash"]);
+            assert_eq!(d.a_tool_calls_executed, 1);
+            assert!(d.a_tool_sequence_complete);
+        }
+    }
+
+    #[test]
+    fn review_followup_partial_terminal_does_not_overwrite_error() {
+        let a = vec![
+            evt(
+                json!({"type":"tool_call_error","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_calls":[
+                    {"tool_call_id":"f","name":"bash","ok":false,"ms":0}]}),
+            ),
+            evt(json!({"type":"turn","ts":"t","session_id":"a","turn":1,
+                "metadata":{"run_id":"root"},"tool_count":2,"tool_calls":[
+                    {"tool_call_id":"s","name":"read_file","ok":true,"ms":0}]})),
+        ];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_sequence, vec!["bash", "read_file"]);
+        assert_eq!(d.a_tool_calls_executed, 2);
+        assert!(d.a_tool_sequence_complete);
+    }
+
+    #[test]
+    fn indexed_reconciliation_preserves_large_journal_activity() {
+        // 8,000 turns x (1 round + 20 trace events + 1 terminal): the old
+        // per-round journal rescan took seconds here.
+        let mut a = Vec::new();
+        for turn in 1..=8000u32 {
+            a.push(rd(turn, "root", "read_file"));
+            for _ in 0..20 {
+                a.push(evt(
+                    json!({"type":"trace_span","ts":"t","session_id":"a","turn":turn}),
+                ));
+            }
+            a.push(evt(
+                json!({"type":"turn","ts":"t","session_id":"a","turn":turn,
+                "tool_count":1,"metadata":{"run_id":"root"}}),
+            ));
+        }
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_calls_executed, 8000);
+        assert!(d.a_tool_sequence_complete);
+        assert_eq!(d.a_tool_sequence.len(), 8000);
+    }
+
+    #[test]
+    fn executed_count_and_completeness_are_exposed_in_json_fields() {
+        let a = vec![evt(json!({
+            "type":"turn","ts":"t","session_id":"a","turn":1,"tool_count":3,
+            "tool_calls":[{"name":"Read","ok":true,"ms":0}]
+        }))];
+        let b = vec![evt(
+            json!({"type":"turn","ts":"t","session_id":"b","turn":1,"tool_count":0}),
+        )];
+        let d = diff_events("a", "b", &a, &b);
+        assert_eq!(d.a_tool_calls_executed, 3);
+        assert!(
+            !d.a_tool_sequence_complete,
+            "1 record cannot cover 3 executed calls"
+        );
+        assert_eq!(d.b_tool_calls_executed, 0);
+        assert!(
+            d.b_tool_sequence_complete,
+            "a turn with no tool calls is complete"
+        );
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["a_tool_calls_executed"], 3);
+        assert_eq!(json["a_tool_sequence_complete"], false);
+        assert_eq!(json["b_tool_calls_executed"], 0);
+        assert_eq!(json["b_tool_sequence_complete"], true);
+        let txt = render_text(&d);
+        assert!(txt.contains("tool sequence B (0 calls): []"), "{txt}");
+        assert!(
+            txt.contains("executed tool-call count DIFFERS (3 → 0)"),
+            "{txt}"
+        );
     }
 
     #[test]

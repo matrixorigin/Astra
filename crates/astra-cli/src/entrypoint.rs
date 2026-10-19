@@ -267,10 +267,8 @@ async fn run_async() -> i32 {
         settings: _settings_already_applied,
         session_id: cli_session_id,
         session_name,
-        bare,
         no_instructions,
         no_journal_content,
-        startup_trace,
         diagnostic_log: _,
         log_file: _,
         trace_profile: _trace_profile_already_applied,
@@ -293,7 +291,6 @@ async fn run_async() -> i32 {
         return 1;
     }
 
-    let _ = (startup_trace, bare);
     let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,

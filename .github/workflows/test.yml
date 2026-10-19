@@ -70,7 +70,7 @@ jobs:
       - name: Prebuild mock MCP server
         run: cargo build --locked -p astra-cli --bin mock_mcp_server
       - name: Test complete CLI inventory
-        run: cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+        run: cargo nextest run --locked -p astra-cli --lib --bins --test cli_pipe --test process_supervisor --test shell_execution_boundaries --profile ci
       - name: Verify native delivery through the production supervisor
         run: |
           cargo build --locked -p astra-cli --bin astra
@@ -282,7 +282,7 @@ jobs:
         if: matrix.segment == 'dev-tty-reader'
         run: |
           cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         if: matrix.segment == 'reflow'
         with:
           node-version-file: .nvmrc

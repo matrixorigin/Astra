@@ -83,7 +83,6 @@ impl PtyAstra {
                 "pty-journey",
                 "--model",
                 model,
-                "--bare",
                 "--no-instructions",
                 "interactive",
             ])
