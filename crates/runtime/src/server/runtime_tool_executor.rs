@@ -257,6 +257,21 @@ pub(crate) struct PendingRuntimeToolCompletion {
 }
 
 impl PendingRuntimeToolCompletion {
+    pub(crate) fn invocation_identity(&self) -> Option<astra_turn_types::ToolInvocationIdentity> {
+        if let Some(pending) = &self.durable {
+            return Some(pending.identity.clone());
+        }
+        let request = self.boundary.request();
+        astra_turn_types::ToolInvocationIdentity::new(
+            &request.user_id,
+            &request.session_id,
+            &request.run_id,
+            &request.turn_chain_id,
+            &request.tool_call_id,
+        )
+        .ok()
+    }
+
     pub(crate) fn provider_input_settlement(
         &self,
     ) -> Option<crate::turn::run_control::UserIntentInvocationApplication<'_>> {

@@ -693,6 +693,13 @@ impl IngestionEvent {
                 };
 
                 let mut metadata = serde_json::Map::new();
+                if let Some(identity) = &tc.invocation_identity {
+                    metadata.insert(
+                        "invocation_identity".into(),
+                        serde_json::to_value(identity)
+                            .map_err(|error| format!("serialize invocation identity: {error}"))?,
+                    );
+                }
                 metadata.insert("tool_name".into(), Value::String(tool_name.clone()));
                 metadata.insert("tool_call_id".into(), Value::String(tool_call_id));
                 metadata.insert("ok".into(), Value::Bool(tc.ok));
@@ -4128,6 +4135,16 @@ mod tests {
             "bash",
             "exit 7",
             crate::session_journal::ToolCallRecord {
+                invocation_identity: Some(
+                    astra_turn_types::ToolInvocationIdentity::new(
+                        "producer-owner",
+                        "session-1",
+                        "run",
+                        "chain",
+                        "call-1",
+                    )
+                    .unwrap(),
+                ),
                 tool_call_id: Some("call-1".into()),
                 name: "bash".into(),
                 ok: false,
@@ -4142,6 +4159,24 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "tool_call_failed");
+        assert_eq!(events[0].user_id, "user-1");
+        assert_eq!(events[0].session_id, "session-1");
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["invocation_identity"],
+            serde_json::to_value(
+                journal.tool_calls.as_ref().unwrap()[0]
+                    .invocation_identity
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        let redacted =
+            IngestionEvent::expand_journal_event_with_redact(&journal, "user-1", true).unwrap();
+        assert_eq!(
+            redacted[0].metadata.as_ref().unwrap()["invocation_identity"],
+            events[0].metadata.as_ref().unwrap()["invocation_identity"]
+        );
         assert_eq!(events[0].parent_event_id, None);
         assert!(events[0].parent_event_ids.is_empty());
         assert_eq!(

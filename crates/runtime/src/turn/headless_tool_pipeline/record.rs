@@ -774,6 +774,26 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
         // Capture before completion persistence: a failed commit must not erase
         // the scope of a provider execution that already crossed dispatch.
+        let invocation_identity = execution
+            .pending_runtime_completion
+            .as_ref()
+            .and_then(|pending| pending.invocation_identity())
+            .or_else(|| {
+                execution
+                    .confirmed_invocation
+                    .as_ref()
+                    .map(|record| record.identity.clone())
+            })
+            .or_else(|| {
+                astra_turn_types::ToolInvocationIdentity::new(
+                    self.ctx.current_user_id?,
+                    self.ctx.current_session_id?,
+                    self.ctx.current_run_id?,
+                    self.ctx.current_turn_chain_id?,
+                    &execution.id,
+                )
+                .ok()
+            });
         let work_attribution = execution.pending_runtime_completion.as_ref()
             .map(|pending| pending.work_attribution().clone())
             .or_else(|| execution.confirmed_invocation.as_ref().and_then(|record| {
@@ -977,6 +997,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             ));
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
+            rec.invocation_identity = invocation_identity;
             rec.execution_completion = execution_completion;
             rec.work_attribution = Some(work_attribution);
             rec.runtime_args_full = raw_args_full;

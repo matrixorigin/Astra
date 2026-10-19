@@ -4277,6 +4277,7 @@ mod tests {
                 .as_deref()
                 .is_none_or(|value| !value.contains("AKIA1234567890ABCDEF"))
         );
+        assert_eq!(record.invocation_identity.as_ref(), Some(&identity));
         let cached = pipeline
             .ctx
             .idempotency_cache
@@ -4318,6 +4319,7 @@ mod tests {
         assert!(replayed.execution.confirmed_invocation.is_some());
         replay_pipeline.record_execution(replayed).await;
         let replay_record = replay_pipeline.ctx.tool_call_records.last().unwrap();
+        assert_eq!(replay_record.invocation_identity.as_ref(), Some(&identity));
         assert_eq!(
             replay_record
                 .execution_completion
@@ -4595,6 +4597,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_run_guidance_chains_preserve_distinct_record_identities() {
+        use astra_services::session_journal::{
+            JournalDirGuard, JournalEventType, read_journal_for_user,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(dir.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut identities = Vec::new();
+        for chain in ["original", "guided"] {
+            let mut harness = PipelineHarness::new();
+            harness.session_id = sid.clone();
+            harness.edge_tool_round[0].status = "failed".into();
+            let mut pipeline = harness.pipeline();
+            pipeline.ctx.current_user_id = Some("owner");
+            pipeline.ctx.current_session_id = Some(&sid);
+            pipeline.ctx.current_run_id = Some("same-run");
+            pipeline.ctx.current_turn_chain_id = Some(chain);
+            let HeadlessPipelineStage::Continue(validated) = pipeline.validate_slot(0) else {
+                panic!("expected valid tool");
+            };
+            let HeadlessPipelineStage::Continue(permitted) =
+                pipeline.permit_execution(validated).await
+            else {
+                panic!("expected permitted tool");
+            };
+            let executed = pipeline.execute_execution(permitted).await;
+            assert!(executed.is_err);
+            pipeline.record_execution(executed).await;
+            identities.push(
+                pipeline
+                    .ctx
+                    .tool_call_records
+                    .last()
+                    .unwrap()
+                    .invocation_identity
+                    .clone()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(identities[0].run_id, identities[1].run_id);
+        assert_eq!(identities[0].invocation_id, identities[1].invocation_id);
+        assert_ne!(identities[0].storage_key(), identities[1].storage_key());
+        let emitted: Vec<_> = read_journal_for_user("owner", &sid)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == JournalEventType::ToolCallError)
+            .map(|event| {
+                event
+                    .tool_calls
+                    .unwrap()
+                    .remove(0)
+                    .invocation_identity
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(emitted, identities);
+    }
+
+    #[tokio::test]
     async fn failed_edge_terminal_status_marks_denial_as_error_without_text_matching() {
         use astra_services::session_journal::{
             JournalDirGuard, JournalEventType, read_journal, read_journal_for_user,
@@ -4602,12 +4663,30 @@ mod tests {
 
         let journal = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(journal.path());
-        for (run, user, has_session) in [
-            (Some("failed-run"), None, true),
-            (Some("failed-run"), Some("failure-owner"), true),
-            (None, None, true),
-            (Some("   "), Some("failure-owner"), true),
-            (Some("failed-run"), Some("failure-owner"), false),
+        for (run, user, has_session, chain) in [
+            (Some("failed-run"), None, true, Some("chain-a")),
+            (
+                Some("failed-run"),
+                Some("failure-owner"),
+                true,
+                Some("chain-a"),
+            ),
+            (
+                Some("failed-run"),
+                Some("failure-owner"),
+                true,
+                Some("chain-b"),
+            ),
+            (Some("failed-run"), Some("failure-owner"), true, None),
+            (Some("failed-run"), Some("failure-owner"), true, Some(" ")),
+            (None, None, true, Some("chain-a")),
+            (Some("   "), Some("failure-owner"), true, Some("chain-a")),
+            (
+                Some("failed-run"),
+                Some("failure-owner"),
+                false,
+                Some("chain-a"),
+            ),
         ] {
             let mut harness = PipelineHarness::new();
             harness.session_id = uuid::Uuid::new_v4().to_string();
@@ -4619,6 +4698,7 @@ mod tests {
             pipeline.ctx.current_session_id = has_session.then_some(&sid);
             pipeline.ctx.current_user_id = user;
             pipeline.ctx.current_run_id = run;
+            pipeline.ctx.current_turn_chain_id = chain;
             let validated = match pipeline.validate_slot(0) {
                 HeadlessPipelineStage::Continue(validated) => validated,
                 _ => panic!("expected validated execution"),
@@ -4665,6 +4745,23 @@ mod tests {
                 pipeline.ctx.turn_guard.errors.total_errors, 1,
                 "persisting the already-accounted result must not count it again"
             );
+            let frozen_identity = record.invocation_identity.clone();
+            let expected_identity = has_session
+                .then_some(user)
+                .flatten()
+                .zip(run)
+                .zip(chain)
+                .and_then(|((user, run), chain)| {
+                    astra_turn_types::ToolInvocationIdentity::new(
+                        user,
+                        &sid,
+                        run,
+                        chain,
+                        "call-grep",
+                    )
+                    .ok()
+                });
+            assert_eq!(frozen_identity, expected_identity);
             drop(pipeline);
             let events = match user {
                 Some(user) => {
@@ -4691,6 +4788,7 @@ mod tests {
             );
             let records = errors[0].tool_calls.as_ref().unwrap();
             assert_eq!(records.len(), 1);
+            assert_eq!(records[0].invocation_identity, frozen_identity);
             assert_eq!(records[0].tool_call_id.as_deref(), Some("call-grep"));
             assert!(records[0].was_executed());
             assert!(!records[0].ok);

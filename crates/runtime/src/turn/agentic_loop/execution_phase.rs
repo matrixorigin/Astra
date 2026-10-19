@@ -23686,12 +23686,18 @@ mod tests {
                     crate::turn::run_control::UserIntentApplyAck::Applied
                 );
                 if crash_boundary == 2 {
+                    let previous_run = state.current_run_id.clone();
+                    let previous_turn = state.session_turn;
+                    let previous_chain = state.canonical_turn_chain_id.clone();
                     let acknowledged = state.user_intents.acknowledge_apply_events(&[source_index]);
                     assert!(apply_acknowledged_user_intents(
                         &mut host,
                         &mut state,
                         &acknowledged
                     ));
+                    assert_ne!(state.canonical_turn_chain_id, previous_chain);
+                    assert_eq!(state.current_run_id, previous_run);
+                    assert_eq!(state.session_turn, previous_turn);
                 }
             }
             let wire = serde_json::to_value(state.user_intents.durable_continuation()).unwrap();

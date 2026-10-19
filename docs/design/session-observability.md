@@ -83,15 +83,24 @@ deferred records are not executions. Aggregate-only turns and unresolved
 executed observations without sufficient identity make the sequence incomplete.
 Runtime failures preserve the available producer run scope. Reconciliation
 requires explicit matching run and turn namespaces; call deduplication also
-requires a nonempty provider call ID. A reused turn number, a sole surviving
+uses the producer-frozen canonical invocation identity (owner, session, run,
+turn chain and invocation ID). A terminal summary does not relabel its embedded
+records. Different chains within one run remain distinct; round numbers do not
+identify invocations. Missing or malformed optional identity preserves the
+observation without proving replay. A reused turn number, a sole surviving
 call-ID witness or an identical unscoped payload does not establish ownership.
 Unscoped rounds and errors remain separate observations, as do contradictory
 execution facts. Incomplete totals combine terminal aggregates with retained
 unproven evidence and may overcount overlapping or replayed observations; they
-are not an exact physical invocation count.
-When call/run identity establishes duplicate observations, round-internal call
-order takes precedence over a standalone error's persistence position. Order
-between independent concurrent producers remains the journal projection; it is
+are not an exact physical invocation count. Unidentified executed terminal detail
+cannot establish that an external observation is additional coverage; matching
+the aggregate numerically does not resolve that possible overlap.
+When canonical invocation identity establishes duplicate observations, round-internal call
+order takes precedence over a standalone error's persistence position.
+Invocation identity alone does not supply a missing canonical position. When
+relocation crosses terminal detail without a comparable position and reverses
+terminal-relative order, ordering is incomplete even if all identities are known.
+Order between independent concurrent producers remains the journal projection; it is
 not a reconstructed physical execution timeline.
 
 Legacy `llm_round` records without `session_id` can inherit a file's session

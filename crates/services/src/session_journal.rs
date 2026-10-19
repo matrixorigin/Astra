@@ -921,6 +921,14 @@ pub enum RuntimeWorkEstablishmentReceipt {
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    /// Producer-frozen invocation equality, never execution or storage authority.
+    /// Invalid optional identity must not discard the surrounding audit record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_observed_invocation_identity"
+    )]
+    pub invocation_identity: Option<astra_turn_types::ToolInvocationIdentity>,
     /// Producer-owned causality frozen before dispatch; never execution authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_attribution: Option<crate::runs::WorkInvocationAttribution>,
@@ -1096,6 +1104,16 @@ pub struct ToolCallRecord {
     /// cannot establish that dispatch did not happen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_dispatch_rejection: Option<ToolPreDispatchRejection>,
+}
+
+fn deserialize_observed_invocation_identity<'de, D>(
+    deserializer: D,
+) -> Result<Option<astra_turn_types::ToolInvocationIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl fmt::Debug for ToolCallRecord {
@@ -11466,6 +11484,51 @@ mod turn_event_buffer_tests {
         assert_eq!(encoded["result_artifact"]["byte_len"], 42);
         let decoded: ToolCallRecord = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.result_artifact, record.result_artifact);
+    }
+
+    #[test]
+    fn tool_call_identity_is_optional_validated_observation() {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "owner", "session", "run", "chain", "call",
+        )
+        .unwrap();
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            tool_call_id: Some("call".into()),
+            invocation_identity: Some(identity.clone()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        let restored: ToolCallRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.invocation_identity, Some(identity));
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("bad"),
+            serde_json::json!({"user_id":"owner", "session_id":"session",
+                "run_id":"run", "turn_chain_id":" ", "invocation_id":"call"}),
+        ] {
+            let mut raw = encoded.clone();
+            raw["invocation_identity"] = invalid;
+            let retained: ToolCallRecord = serde_json::from_value(raw).unwrap();
+            assert!(retained.invocation_identity.is_none());
+            assert!(retained.was_executed());
+            assert_eq!(retained.name, "bash");
+        }
+        let mut absent = encoded;
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("invocation_identity");
+        let retained: ToolCallRecord = serde_json::from_value(absent).unwrap();
+        assert!(retained.invocation_identity.is_none());
+        assert!(
+            serde_json::to_value(retained)
+                .unwrap()
+                .get("invocation_identity")
+                .is_none()
+        );
     }
 
     #[test]
