@@ -65,34 +65,40 @@ const WALL_DEADLINE_TERMINAL_RESERVE: std::time::Duration = std::time::Duration:
 /// the Server never receives a rounded-up execution slice.
 const WALL_BUDGET_REQUEST_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn settle_one_shot_native_delivery(
-    shutdown: impl std::future::Future<Output = ()>,
-    terminal_deadline: tokio::time::Instant,
-) -> Result<(), String> {
-    tokio::time::timeout_at(terminal_deadline, shutdown)
-        .await
-        .map_err(|_| "user_interrupted; native delivery shutdown did not settle".to_string())
-}
-
-/// Observe a force interrupt without abandoning cleanup that owns local work.
-/// The cleanup future retains its original deadline; a later successful join
-/// cannot erase the observed interrupt at the final recovery boundary.
+/// Keep both signal observations alive while joining the same cleanup future.
+/// A first interrupt during cleanup establishes the existing request deadline;
+/// a second interrupt vetoes recovery without abandoning owned cleanup work.
 async fn settle_one_shot_cleanup_observing_interrupt(
     cleanup: impl std::future::Future<Output = Result<(), String>>,
-    interrupt: &mut (impl std::future::Future<Output = std::io::Result<()>> + Unpin),
-    interrupted: &mut bool,
+    phase: &str,
+    first_interrupt: &mut (impl std::future::Future<Output = std::io::Result<()>> + Unpin),
+    second_interrupt: &mut (impl std::future::Future<Output = std::io::Result<()>> + Unpin),
+    user_interrupted: &mut bool,
+    second_interrupted: &mut bool,
+    terminal_deadline: &mut Option<tokio::time::Instant>,
 ) -> Result<(), String> {
-    if *interrupted {
-        return cleanup.await;
-    }
     tokio::pin!(cleanup);
-    tokio::select! {
-        biased;
-        _ = interrupt => {
-            *interrupted = true;
-            cleanup.await
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut *first_interrupt, if !*user_interrupted => {
+                *user_interrupted = true;
+                let signal_deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                *terminal_deadline = Some(terminal_deadline.map_or(signal_deadline,
+                    |deadline| deadline.min(signal_deadline)));
+            }
+            _ = &mut *second_interrupt, if *user_interrupted && !*second_interrupted => {
+                *second_interrupted = true;
+            }
+            result = &mut cleanup => return result,
+            _ = async {
+                match *terminal_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(format!("request interruption {phase} did not settle")),
         }
-        result = &mut cleanup => result,
     }
 }
 
@@ -2675,51 +2681,79 @@ async fn execute_cli_command_impl(
                     turn_result
                 };
 
+            let interrupted_before_cleanup = user_interrupted;
             if let Some(handle) = native_delivery.take() {
-                if user_interrupted {
-                    let shutdown = settle_one_shot_cleanup_observing_interrupt(
-                        settle_one_shot_native_delivery(
-                            handle.shutdown(),
-                            terminal_deadline.expect("interrupt establishes terminal deadline"),
-                        ),
-                        &mut second_interrupt,
-                        &mut second_interrupted,
-                    )
-                    .await;
-                    if shutdown.is_err() {
-                        request_session_execution_lease.retain_unsettled_owner_until_process_exit();
-                    }
-                    turn_result = apply_one_shot_cleanup_result(
-                        turn_result,
-                        shutdown,
-                        wall_deadline_incremental_state
-                            .as_ref()
-                            .expect("one-shot state"),
-                        &mut interruption_cleanup_settled,
-                    );
-                } else {
-                    handle.shutdown().await;
-                }
-            }
-
-            // Flush the completed Server stream before publishing the result.
-            drop(chat_ctx);
-            let writer_settlement = if user_interrupted {
-                settle_one_shot_cleanup_observing_interrupt(
-                    settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline),
+                let shutdown = settle_one_shot_cleanup_observing_interrupt(
+                    async {
+                        handle.shutdown().await;
+                        Ok(())
+                    },
+                    "native delivery shutdown",
+                    &mut interrupt,
                     &mut second_interrupt,
+                    &mut user_interrupted,
                     &mut second_interrupted,
+                    &mut terminal_deadline,
                 )
-                .await
-            } else {
-                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await
-            };
-            if !user_interrupted {
-                writer_settlement?;
-            } else {
+                .await;
+                if shutdown.is_err() {
+                    request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                }
                 turn_result = apply_one_shot_cleanup_result(
                     turn_result,
-                    writer_settlement,
+                    shutdown,
+                    wall_deadline_incremental_state
+                        .as_ref()
+                        .expect("one-shot state"),
+                    &mut interruption_cleanup_settled,
+                );
+            }
+
+            // Flush the completed stream before publishing. Retain the abort
+            // authority outside the join future in case a late signal bounds
+            // a writer that started without a wall deadline.
+            drop(chat_ctx);
+            let writer_abort = stream_event_writer
+                .as_ref()
+                .map(|writer| writer.abort_handle());
+            let writer_settlement = settle_one_shot_cleanup_observing_interrupt(
+                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline),
+                "stream-event writer",
+                &mut interrupt,
+                &mut second_interrupt,
+                &mut user_interrupted,
+                &mut second_interrupted,
+                &mut terminal_deadline,
+            )
+            .await;
+            if writer_settlement.is_err()
+                && let Some(writer) = writer_abort
+            {
+                writer.abort();
+            }
+            turn_result = apply_one_shot_cleanup_result(
+                turn_result,
+                writer_settlement,
+                wall_deadline_incremental_state
+                    .as_ref()
+                    .expect("one-shot state"),
+                &mut interruption_cleanup_settled,
+            );
+            if !user_interrupted && futures_util::poll!(&mut interrupt).is_ready() {
+                user_interrupted = true;
+            }
+            if !interrupted_before_cleanup && user_interrupted {
+                wall_deadline_cancel_token
+                    .as_ref()
+                    .expect("one-shot token")
+                    .cancel();
+                request_session_execution_lease.retain_unsettled_owner_until_process_exit();
+                turn_result = apply_one_shot_cleanup_result(
+                    turn_result,
+                    Err(
+                        "user_interrupted during final cleanup; execution settlement is unverified"
+                            .into(),
+                    ),
                     wall_deadline_incremental_state
                         .as_ref()
                         .expect("one-shot state"),
@@ -4675,90 +4709,163 @@ mod exit_code_tests {
     }
 
     #[tokio::test]
-    async fn second_interrupt_survives_successful_native_and_writer_cleanup() {
-        for event_writer in [false, true] {
-            for kind in [
-                None,
-                Some(astra_core::ErrorKind::Cancelled),
-                Some(astra_core::ErrorKind::ContractViolation),
-            ] {
-                let started = std::sync::Arc::new(tokio::sync::Notify::new());
-                let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
-                let interrupt = async {
-                    signal_rx.await.unwrap();
-                    Ok::<(), std::io::Error>(())
-                };
-                tokio::pin!(interrupt);
-                let cleanup_started = started.clone();
-                let cleanup_finished = finished.clone();
-                let work = async move {
-                    cleanup_started.notify_one();
-                    release_rx.await.unwrap();
-                    cleanup_finished.store(true, std::sync::atomic::Ordering::SeqCst);
-                };
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                let cleanup = async {
-                    if event_writer {
-                        let writer = tokio::spawn(async move {
+    async fn interrupts_survive_successful_native_and_writer_cleanup() {
+        async fn signal(receiver: tokio::sync::oneshot::Receiver<()>) -> std::io::Result<()> {
+            receiver.await.unwrap();
+            Ok(())
+        }
+        for first_signal in [false, true] {
+            for event_writer in [false, true] {
+                for kind in [
+                    None,
+                    Some(astra_core::ErrorKind::Cancelled),
+                    Some(astra_core::ErrorKind::ContractViolation),
+                ] {
+                    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+                    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+                    let (_unsent, pending_rx) = tokio::sync::oneshot::channel();
+                    let (first_rx, second_rx) = if first_signal {
+                        (signal_rx, pending_rx)
+                    } else {
+                        (pending_rx, signal_rx)
+                    };
+                    let first = signal(first_rx);
+                    let second = signal(second_rx);
+                    tokio::pin!(first, second);
+                    let cleanup_started = started.clone();
+                    let cleanup_finished = finished.clone();
+                    let work = async move {
+                        cleanup_started.notify_one();
+                        release_rx.await.unwrap();
+                        cleanup_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                    };
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let cleanup = async {
+                        if event_writer {
+                            let writer = tokio::spawn(async move {
+                                work.await;
+                                Ok(())
+                            });
+                            super::settle_one_shot_stream_event_writer(Some(writer), Some(deadline))
+                                .await
+                        } else {
                             work.await;
                             Ok(())
-                        });
-                        super::settle_one_shot_stream_event_writer(Some(writer), Some(deadline))
-                            .await
+                        }
+                    };
+                    let mut interrupted = false;
+                    let mut user_interrupted = !first_signal;
+                    let mut deadline = Some(deadline);
+                    let observe = super::settle_one_shot_cleanup_observing_interrupt(
+                        cleanup,
+                        if event_writer {
+                            "stream-event writer"
+                        } else {
+                            "native delivery shutdown"
+                        },
+                        &mut first,
+                        &mut second,
+                        &mut user_interrupted,
+                        &mut interrupted,
+                        &mut deadline,
+                    );
+                    let signal = async {
+                        started.notified().await;
+                        signal_tx.send(()).unwrap();
+                        release_tx.send(()).unwrap();
+                    };
+                    let (cleanup, ()) = tokio::join!(observe, signal);
+                    cleanup.unwrap();
+                    assert!(
+                        user_interrupted,
+                        "the late signal survives successful cleanup"
+                    );
+                    assert_eq!(interrupted, !first_signal);
+                    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+                    // The next phase must join without polling the completed signal.
+                    super::settle_one_shot_cleanup_observing_interrupt(
+                        std::future::ready(Ok(())),
+                        "later cleanup",
+                        &mut first,
+                        &mut second,
+                        &mut user_interrupted,
+                        &mut interrupted,
+                        &mut deadline,
+                    )
+                    .await
+                    .unwrap();
+                    let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+                    let result = match kind {
+                        Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+                        None => Ok(StreamResult {
+                            full_text: "observed result prefix".into(),
+                            prompt_tokens: 7,
+                            ..Default::default()
+                        }),
+                    };
+                    let mut cleanup_settled = true;
+                    let cause = if first_signal {
+                        "user_interrupted during final cleanup"
                     } else {
-                        super::settle_one_shot_native_delivery(work, deadline).await
-                    }
-                };
-                let mut interrupted = false;
-                let observe = super::settle_one_shot_cleanup_observing_interrupt(
-                    cleanup,
-                    &mut interrupt,
-                    &mut interrupted,
-                );
-                let signal = async {
-                    started.notified().await;
-                    signal_tx.send(()).unwrap();
-                    release_tx.send(()).unwrap();
-                };
-                let (cleanup, ()) = tokio::join!(observe, signal);
-                cleanup.unwrap();
-                assert!(interrupted, "the late signal survives successful cleanup");
-                assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
-                // The next phase must join without polling the completed signal.
-                super::settle_one_shot_cleanup_observing_interrupt(
-                    std::future::ready(Ok(())),
-                    &mut interrupt,
-                    &mut interrupted,
-                )
-                .await
-                .unwrap();
-                let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
-                let result = match kind {
-                    Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
-                    None => Ok(StreamResult {
-                        full_text: "observed result prefix".into(),
-                        prompt_tokens: 7,
-                        ..Default::default()
-                    }),
-                };
-                let mut cleanup_settled = true;
-                let result = super::apply_one_shot_cleanup_result(
-                    result,
-                    Err("user_interrupted (second Ctrl+C); partial recovery is disabled".into()),
-                    &state,
-                    &mut cleanup_settled,
-                );
-                assert_one_shot_cleanup_stays_failed(
-                    result,
-                    cleanup_settled,
-                    kind,
-                    &state,
-                    &["second Ctrl+C"],
-                );
+                        "second Ctrl+C"
+                    };
+                    let result = super::apply_one_shot_cleanup_result(
+                        result,
+                        Err(cause.into()),
+                        &state,
+                        &mut cleanup_settled,
+                    );
+                    assert_one_shot_cleanup_stays_failed(
+                        result,
+                        cleanup_settled,
+                        kind,
+                        &state,
+                        &[cause],
+                    );
+                }
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_interrupt_during_cleanup_bounds_the_original_wait() {
+        let started = tokio::time::Instant::now();
+        let first = std::future::ready(Ok::<(), std::io::Error>(()));
+        let second = std::future::pending::<std::io::Result<()>>();
+        tokio::pin!(first, second);
+        let mut user_interrupted = false;
+        let mut second_interrupted = false;
+        let mut deadline = None;
+        let failure = super::settle_one_shot_cleanup_observing_interrupt(
+            std::future::pending(),
+            "native delivery shutdown",
+            &mut first,
+            &mut second,
+            &mut user_interrupted,
+            &mut second_interrupted,
+            &mut deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(user_interrupted);
+        assert!(!second_interrupted);
+        assert_eq!(deadline, Some(started + std::time::Duration::from_secs(10)));
+        assert_eq!(tokio::time::Instant::now(), deadline.unwrap());
+        assert!(failure.contains("native delivery shutdown did not settle"));
+        // A completed cleanup is still a fact even when the budget is spent.
+        super::settle_one_shot_cleanup_observing_interrupt(
+            std::future::ready(Ok(())),
+            "already joined writer",
+            &mut first,
+            &mut second,
+            &mut user_interrupted,
+            &mut second_interrupted,
+            &mut deadline,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4781,9 +4888,21 @@ mod exit_code_tests {
             if kind == Some(astra_core::ErrorKind::Cancelled) {
                 assert!(input.as_ref().unwrap_err().is_clean_local_cancel());
             }
-            let shutdown = super::settle_one_shot_native_delivery(
+            let first = std::future::pending::<std::io::Result<()>>();
+            let second = std::future::pending::<std::io::Result<()>>();
+            tokio::pin!(first, second);
+            let mut user_interrupted = true;
+            let mut second_interrupted = false;
+            let mut deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+            let shutdown = super::settle_one_shot_cleanup_observing_interrupt(
                 std::future::pending(),
-                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                "native delivery shutdown",
+                &mut first,
+                &mut second,
+                &mut user_interrupted,
+                &mut second_interrupted,
+                &mut deadline,
             )
             .await;
             let mut cleanup_settled = true;

@@ -144,9 +144,11 @@ Secondary root-drain, native-shutdown or event-output cleanup failures append
 their causes to an existing failure without replacing its typed evidence or
 observed partial text. Any such failure vetoes resumable partial and closed-pipe
 success, even when the original failure class is cancellation.
-The same second-interrupt listener remains armed through native shutdown and
-event-writer settlement. Observing that signal vetoes partial recovery even if
-cleanup later succeeds; cleanup still joins within its original deadline.
+Both interrupt listeners remain armed through native shutdown and event-writer
+settlement, including cleanup after ordinary stream completion. A late first
+interrupt establishes the same bounded deadline and returns unverified failure;
+a second interrupt vetoes partial recovery even if cleanup later succeeds.
+Cleanup retains its existing join and abort authority within that deadline.
 
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and

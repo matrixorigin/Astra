@@ -550,6 +550,8 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 command.args([
                     "chat",
                     "--no-resume",
+                    "--permission-mode",
+                    "auto",
                     "--json",
                     "-m",
                     "exercise hard failure",
