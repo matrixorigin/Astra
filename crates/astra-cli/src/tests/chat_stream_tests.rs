@@ -1764,13 +1764,18 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             #[cfg(feature = "harness")]
             benchmark_profile: None,
         };
-        let result = Box::pin(stream_chat_sse(ChatTurnParams::basic_cli(
+        let stream = stream_chat_sse(ChatTurnParams::basic_cli(
             &context,
             "fake-token",
             None,
             &mut pm,
-        )))
-        .await;
+        ));
+        assert_eq!(
+            std::mem::size_of_val(&stream),
+            std::mem::size_of::<usize>(),
+            "the shared stream entrypoint must bound every caller's embedded future"
+        );
+        let result = stream.await;
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         let callbacks = callbacks.lock().await;
         if callback_admitted {

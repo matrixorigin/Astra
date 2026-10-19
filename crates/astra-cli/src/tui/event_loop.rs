@@ -4786,11 +4786,15 @@ fn context_trace_count(state: &crate::cli::session::session_state::SessionState)
 fn latest_context_trace(
     state: &crate::cli::session::session_state::SessionState,
 ) -> Option<ContextAssemblyTrace> {
-    state.latest_context_assembly_trace.clone().or_else(|| {
-        let session = state.observability_session.as_ref()?;
-        let guard = astra_core::sync_poison::recover_rwlock_read(session);
-        guard.context_traces.last().cloned()
-    })
+    state
+        .latest_context_assembly_trace
+        .as_ref()
+        .map(|cached| cached.trace.clone())
+        .or_else(|| {
+            let session = state.observability_session.as_ref()?;
+            let guard = astra_core::sync_poison::recover_rwlock_read(session);
+            guard.context_traces.last().cloned()
+        })
 }
 
 fn latest_context_trace_since(
@@ -4799,9 +4803,9 @@ fn latest_context_trace_since(
     baseline_count: usize,
 ) -> Option<ContextAssemblyTrace> {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref()
-        && baseline_cached_turn_id != Some(trace.turn_id.as_str())
+        && baseline_cached_turn_id != Some(trace.trace.turn_id.as_str())
     {
-        return Some(trace.clone());
+        return Some(trace.trace.clone());
     }
     let session = state.observability_session.as_ref()?;
     let guard = astra_core::sync_poison::recover_rwlock_read(&session);
@@ -9319,7 +9323,7 @@ pub(crate) async fn run_tui_session(
                                     let pre_cached_context_trace_turn_id = state
                                         .latest_context_assembly_trace
                                         .as_ref()
-                                        .map(|trace| trace.turn_id.clone());
+                                        .map(|cached| cached.trace.turn_id.clone());
                                     let pre_context_trace_count = context_trace_count(&state);
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
@@ -11282,7 +11286,7 @@ pub(crate) async fn run_tui_session(
                                         pre_cached_context_trace_turn_id.as_deref(),
                                         pre_context_trace_count,
                                     )
-                                    .or_else(|| state.latest_context_assembly_trace.clone());
+                                    .or_else(|| state.latest_context_assembly_trace.as_ref().map(|cached| cached.trace.clone()));
                                     if bottom_pane.footer.context_window.is_none()
                                         && let Some(usage) = footer_context_trace
                                             .as_ref()

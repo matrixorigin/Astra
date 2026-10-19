@@ -269,6 +269,13 @@ impl SessionModelChoice {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LocalContextAssemblyTrace {
+    /// Producer-assigned local journal turn, independent of the display ID.
+    pub local_turn: u32,
+    pub trace: astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
+}
+
 // NOTE: SessionState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own SessionState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
@@ -410,8 +417,7 @@ pub(crate) struct SessionState {
     /// successful commit or recovery sync clears it.
     pub session_persistence_error: Option<String>,
     /// Full context-assembly trace from the last successfully committed turn.
-    pub latest_context_assembly_trace:
-        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    pub latest_context_assembly_trace: Option<LocalContextAssemblyTrace>,
     /// Serialized context-pipeline state restored from the latest heavy checkpoint.
     pub runtime_pipeline_state: Option<serde_json::Value>,
     /// Serialized compaction effectiveness tracker restored from the latest heavy checkpoint.

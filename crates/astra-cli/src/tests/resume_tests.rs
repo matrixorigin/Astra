@@ -525,6 +525,7 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
                     .latest_context_assembly_trace
                     .as_ref()
                     .unwrap()
+                    .trace
                     .turn_id,
                 format!("turn-{expected}")
             );

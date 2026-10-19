@@ -192,10 +192,18 @@ that local journal during explicit Server canonical restore,
 starting at zero for a replica with no local turns. After remote reads, restore
 holds the captured owner's execution lease while reading the current local
 head and merging metadata under that owner's workspace lock. Already committed
-local trace and workspace fields are retained. The Server head must not suppress
+local trace and workspace fields are retained. The live context-trace cache keeps
+its producer-assigned local turn alongside the trace. Journal recovery orders
+that cache independently from workspace repair, so a delayed sidecar cannot
+replace newer live evidence; display trace IDs and the current session head do
+not determine trace freshness. The Server head must not suppress
 subsequent local workspace or context-trace projections. Server cursors are never advanced as local cursors.
 Ordinary local and fresh attachments do not perform this additional request.
 
+The shared CLI stream entrypoint heap-pins its execution future for all callers.
+Interactive cancellation and drain continue to await that same owned future;
+dropping it releases its state within the caller's existing lease scope. This
+bounds embedded caller state without changing execution or settlement ownership.
 
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution

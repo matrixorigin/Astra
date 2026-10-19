@@ -99,7 +99,15 @@ async fn refresh_root_permission_context(
     }
 }
 
-pub(crate) async fn stream_chat_sse(
+/// Keep stream state on the heap at the shared entrypoint. Embedding it in
+/// callers compounds their poll stack before a local tool callback can run.
+pub(crate) fn stream_chat_sse<'a>(
+    p: ChatTurnParams<'a>,
+) -> impl std::future::Future<Output = Result<StreamResult, crate::TurnFailure>> + 'a {
+    Box::pin(stream_chat_sse_inner(p))
+}
+
+async fn stream_chat_sse_inner(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
