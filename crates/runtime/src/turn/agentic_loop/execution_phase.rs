@@ -10796,6 +10796,69 @@ mod tests {
 
     #[test]
     fn workspace_observation_reducer_matches_full_scan_at_every_prefix() {
+        use super::super::verification_frontier::WorkspaceObservationFacts;
+
+        fn check_prefixes(
+            state: &mut AgenticLoopState,
+            records: &[ToolCallRecord],
+            parent_facts: &WorkspaceObservationFacts,
+            remaining: usize,
+            root: Option<&str>,
+        ) -> usize {
+            if remaining == 0 {
+                return 0;
+            }
+            let parent_length = state.stall.tool_call_records.len();
+            let parent_frontier = state.stall.verification_frontier.clone();
+            let mut checked = 0;
+            for record in records {
+                let mut facts = parent_facts.clone();
+                let verified =
+                    state.hooks.stop_hooks.iter().any(|hook| {
+                        hook.authoritative && record_verifies_explicit_hook(record, hook)
+                    });
+                facts.observe(record, parent_length as u64 + 1, verified, root, false);
+                state.stall.tool_call_records.push(record.clone());
+                let expected = full_scan_post_mutation_observation(state);
+                assert_eq!(
+                    successful_post_mutation_observation(state).unwrap(),
+                    expected,
+                    "root={root:?}, hooks={:?}, records={:?}",
+                    state.hooks.stop_hooks,
+                    state.stall.tool_call_records
+                );
+                state
+                    .stall
+                    .verification_frontier
+                    .advance(
+                        root,
+                        &state.hooks.stop_hooks,
+                        &state.stall.tool_call_records,
+                    )
+                    .unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        successful_post_mutation_observation(state).unwrap(),
+                        expected,
+                        "root={root:?}, hooks={:?}, records={:?}",
+                        state.hooks.stop_hooks,
+                        state.stall.tool_call_records
+                    );
+                }
+                assert_eq!(
+                    facts.is_satisfied(),
+                    expected,
+                    "root={root:?}, hooks={:?}, records={:?}",
+                    state.hooks.stop_hooks,
+                    state.stall.tool_call_records
+                );
+                checked += 1 + check_prefixes(state, records, &facts, remaining - 1, root);
+                state.stall.tool_call_records.truncate(parent_length);
+                state.stall.verification_frontier = parent_frontier.clone();
+            }
+            checked
+        }
+
         let records = [
             executed_record("write_file", true, Some(r#"{"path":"/app/solution.py"}"#)),
             executed_record("write_file", false, Some(r#"{"path":"/app/other.py"}"#)),
@@ -10829,55 +10892,18 @@ mod tests {
                         .stop_hooks
                         .push(explicit_verification_hook("verify", "./verify"));
                 }
-                for first in &records {
-                    for second in &records {
-                        for third in &records {
-                            state.stall.tool_call_records.clear();
-                            state.stall.verification_frontier = Default::default();
-                            let mut facts = super::super::verification_frontier::WorkspaceObservationFacts::default();
-                            for record in [first, second, third] {
-                                let verified = state.hooks.stop_hooks.iter().any(|hook| {
-                                    hook.authoritative
-                                        && record_verifies_explicit_hook(record, hook)
-                                });
-                                facts.observe(
-                                    record,
-                                    state.stall.tool_call_records.len() as u64 + 1,
-                                    verified,
-                                    root,
-                                    false,
-                                );
-                                state.stall.tool_call_records.push(record.clone());
-                                let expected = full_scan_post_mutation_observation(&state);
-                                assert_eq!(
-                                    successful_post_mutation_observation(&state).unwrap(),
-                                    expected
-                                );
-                                state
-                                    .stall
-                                    .verification_frontier
-                                    .advance(
-                                        root,
-                                        &state.hooks.stop_hooks,
-                                        &state.stall.tool_call_records,
-                                    )
-                                    .unwrap();
-                                for _ in 0..2 {
-                                    assert_eq!(
-                                        successful_post_mutation_observation(&state).unwrap(),
-                                        expected
-                                    );
-                                }
-                                assert_eq!(
-                                    facts.is_satisfied(),
-                                    full_scan_post_mutation_observation(&state),
-                                    "root={root:?}, explicit={explicit}, records={:?}",
-                                    state.stall.tool_call_records
-                                );
-                            }
-                        }
-                    }
-                }
+                // Share common prefixes without dropping any of the 9^3 traces.
+                assert_eq!(
+                    check_prefixes(
+                        &mut state,
+                        &records,
+                        &WorkspaceObservationFacts::default(),
+                        3,
+                        root
+                    ),
+                    819,
+                    "root={root:?}, explicit={explicit}"
+                );
             }
         }
     }
