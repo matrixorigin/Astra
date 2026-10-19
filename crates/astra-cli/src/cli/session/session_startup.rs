@@ -221,10 +221,28 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
     // recovery window from the journal so `/resume`, `/session`, and explain
     // do not keep presenting an older context surface forever.
     match session_runtime::latest_context_assembly_trace_from_journal(session_id) {
-        Ok(Some((trace_turn, trace))) if trace_turn >= ws.turn_count => {
-            state.latest_context_assembly_trace = Some(trace.clone());
-            ws.last_context_trace = Some(session_recovery::context_trace_signal_from_trace(&trace));
-            dirty = true;
+        Ok(Some((trace_turn, trace))) => {
+            // Live settlement may already hold a newer trace whose sidecar
+            // has not reached the journal/workspace yet. Order by producer
+            // provenance, not the session head or the trace's display ID.
+            if state
+                .latest_context_assembly_trace
+                .as_ref()
+                .is_none_or(|cached| {
+                    cached.trace.session_id != session_id || trace_turn >= cached.local_turn
+                })
+            {
+                state.latest_context_assembly_trace =
+                    Some(super::session_state::LocalContextAssemblyTrace {
+                        local_turn: trace_turn,
+                        trace: trace.clone(),
+                    });
+            }
+            if trace_turn >= ws.turn_count {
+                ws.last_context_trace =
+                    Some(session_recovery::context_trace_signal_from_trace(&trace));
+                dirty = true;
+            }
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(
@@ -1349,63 +1367,98 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn initialize_journal_repairs_workspace_context_trace_from_journal() {
+    fn initialize_journal_orders_trace_recovery_by_local_provenance() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("workspace-context-recovery-{}", uuid::Uuid::new_v4());
-        let writer = session_journal::JournalWriter::new(&sid).unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                Some("gpt-5"),
-            ))
-            .unwrap();
-        let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
-            turn_id: "turn-3".into(),
-            session_id: sid.clone(),
-            ..Default::default()
-        };
-        writer
-            .append(&session_journal::JournalEvent::context_assembly_recorded(
-                Some(&sid),
-                3,
-                trace.to_json_value(),
-            ))
-            .unwrap();
-
-        let mut workspace =
-            astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
-        workspace.turn_count = 3;
-        workspace.last_context_trace =
-            Some(astra_services::session_workspace::ContextTraceSignal {
-                turn_id: "turn-1".into(),
-                captured_at: None,
-                tool_surface: None,
-                memory: None,
-                history: None,
-                budget: None,
-                timing: None,
-                explanations: Vec::new(),
+        for (label, state_turn, cached, workspace_turn) in [
+            ("empty", 3, None, 3),
+            ("newer-live", 4, Some((true, 4)), 3),
+            ("older-live-after-preflight", 30, Some((true, 1)), 3),
+            ("foreign-live", 4, Some((false, 4)), 3),
+            ("empty-with-newer-workspace", 30, None, 9),
+            ("equal-live", 3, Some((true, 3)), 3),
+        ] {
+            let sid = format!("workspace-context-{label}-{}", uuid::Uuid::new_v4());
+            let writer = session_journal::JournalWriter::new(&sid).unwrap();
+            writer
+                .append(&session_journal::JournalEvent::session_start(
+                    Some(&sid),
+                    Some("gpt-5"),
+                ))
+                .unwrap();
+            let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+                turn_id: "opaque-recovered-request".into(),
+                session_id: sid.clone(),
+                ..Default::default()
+            };
+            writer
+                .append(&session_journal::JournalEvent::context_assembly_recorded(
+                    Some(&sid),
+                    3,
+                    trace.to_json_value(),
+                ))
+                .unwrap();
+            let mut workspace =
+                astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+            workspace.turn_count = workspace_turn;
+            workspace.last_context_trace =
+                Some(astra_services::session_workspace::ContextTraceSignal {
+                    turn_id: "previous-workspace-request".into(),
+                    captured_at: None,
+                    tool_surface: None,
+                    memory: None,
+                    history: None,
+                    budget: None,
+                    timing: None,
+                    explanations: Vec::new(),
+                });
+            astra_services::session_workspace::write_workspace(&workspace).unwrap();
+            let mut state = SessionState::default();
+            state.set_session_id(sid.clone());
+            state.turn = state_turn;
+            state.latest_context_assembly_trace = cached.map(|(same_session, local_turn)| {
+                super::super::session_state::LocalContextAssemblyTrace {
+                    local_turn,
+                    trace: astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+                        turn_id: "opaque-live-request".into(),
+                        session_id: if same_session {
+                            sid.clone()
+                        } else {
+                            "another-session".into()
+                        },
+                        ..Default::default()
+                    },
+                }
             });
-        astra_services::session_workspace::write_workspace(&workspace).unwrap();
-
-        let mut state = SessionState::default();
-        initialize_journal(&mut state, &sid);
-
-        let persisted = astra_services::session_workspace::read_workspace(&sid).unwrap();
-        assert_eq!(
-            persisted
-                .last_context_trace
-                .as_ref()
-                .map(|trace| trace.turn_id.as_str()),
-            Some("turn-3")
-        );
-        assert_eq!(
-            state
-                .latest_context_assembly_trace
-                .as_ref()
-                .map(|trace| trace.turn_id.as_str()),
-            Some("turn-3")
-        );
+            initialize_journal(&mut state, &sid);
+            let persisted = astra_services::session_workspace::read_workspace(&sid).unwrap();
+            assert_eq!(persisted.turn_count, workspace_turn, "{label}");
+            assert_eq!(
+                persisted.last_context_trace.as_ref().unwrap().turn_id,
+                if workspace_turn <= 3 {
+                    "opaque-recovered-request"
+                } else {
+                    "previous-workspace-request"
+                },
+                "{label}: workspace recovery has its own ordering boundary"
+            );
+            let preserve_live = cached.is_some_and(|(same_session, turn)| same_session && turn > 3);
+            let recovered = state.latest_context_assembly_trace.as_ref().unwrap();
+            assert_eq!(
+                recovered.local_turn,
+                if preserve_live { 4 } else { 3 },
+                "{label}"
+            );
+            assert_eq!(recovered.trace.session_id, sid, "{label}");
+            assert_eq!(
+                recovered.trace.turn_id,
+                if preserve_live {
+                    "opaque-live-request"
+                } else {
+                    "opaque-recovered-request"
+                },
+                "{label}: only producer provenance orders the live cache"
+            );
+        }
     }
 
     #[test]

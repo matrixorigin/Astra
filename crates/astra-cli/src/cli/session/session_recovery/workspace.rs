@@ -94,7 +94,7 @@ pub(crate) fn latest_context_trace_signal(
     state: &SessionState,
 ) -> Option<astra_services::session_workspace::ContextTraceSignal> {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
-        return Some(context_trace_signal_from_trace(trace));
+        return Some(context_trace_signal_from_trace(&trace.trace));
     }
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;

@@ -122,6 +122,34 @@ Each CLI SSE invocation publishes its server-verified session and run identity
 before terminal output, including resumed sessions. A previously installed
 session id does not bind a new stream observer or authorize timeout cleanup.
 
+One-shot CLI chat registers SIGINT before admission. The first interrupt stops
+local work and uses the captured owner to cancel only the observed exact run,
+within a bounded settlement window (also bounded by any request wall deadline).
+It drains the existing turn and commits the existing canonical partial before
+publishing an interrupted JSON result. Its nullable `interruption_reason` field
+preserves the typed reason, including `user_interrupted`, independently of any
+observed partial text. Cancellation acceptance alone does not
+prove execution settlement. Missing run identity, failed settlement, a drain
+failure or a second interrupt produces an unverified failure instead of a
+successful terminal result or automatic replay. A setup interrupt before stream
+admission sends no run cancellation. After native callback shutdown, a positively
+unsettled local workspace owner blocks resumable partial publication, even when
+the exact Server run has settled. A request-scoped reference published by the
+ordinary SSE executor factory follows that same executor's active worktree;
+the native delivery executor is checked independently. Neither can substitute
+for the other. Observed partial data remains available as an explicit failure,
+and a closed stdout pipe cannot turn a positively unsettled local owner into a
+successful exit. Absent local evidence does not create settlement authority.
+Secondary root-drain, native-shutdown or event-output cleanup failures append
+their causes to an existing failure without replacing its typed evidence or
+observed partial text. Any such failure vetoes resumable partial and closed-pipe
+success, even when the original failure class is cancellation.
+Both interrupt listeners remain armed through native shutdown and event-writer
+settlement, including cleanup after ordinary stream completion. A late first
+interrupt establishes the same bounded deadline and returns unverified failure;
+a second interrupt vetoes partial recovery even if cleanup later succeeds.
+Cleanup retains its existing join and abort authority within that deadline.
+
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and
 retryable; an ambiguous sync result is retried against the journal rather than
@@ -168,6 +196,42 @@ Authenticated CLI session continuation reads the Server-owned canonical resume
 bundle. A local replica cannot override Server ownership, deletion, or a failed
 restore request. Local-only continuation remains available without Server
 authentication; clearing a stale remote pointer does not delete the replica.
+
+An interactive attachment explicitly restored from a Server canonical bundle
+refreshes that bundle through the authenticated resume API before each actual
+model turn, while holding the local execution lease. This adds one resume
+request per turn for those attachments. Its 30-second deadline and the current
+TUI cancellation token bound the wait while the local lease is held. The
+resume and model requests use the same admitted owner bearer, refreshed only
+through that captured owner's existing binding. An environment bearer remains
+an explicit bearer and cannot borrow profile refresh authority. A typed resume
+401 permits one refresh and retry through the captured owner within the same
+deadline; a repeated rejection, 403 or unowned bearer never retries.
+A failed or degraded refresh stops before execution; it cannot fall back to the
+local replica. The returned canonical messages refresh the client continuation
+mirror. Server admission independently restores its conversation and allocates
+its turn; no client message list or predicted Server turn crosses that boundary.
+Server feedback is validated against the accepted session, run, model and
+terminal receipt, never a local counter or a pre-admission prediction.
+The local snapshot supplies one turn allocation for the local journal, tool
+mutation/rollback scopes, checkpoints and traces, plus the canonical commit
+base. Session state and the workspace's sidecar ordering counter are seeded from
+that local journal during explicit Server canonical restore,
+starting at zero for a replica with no local turns. After remote reads, restore
+holds the captured owner's execution lease while reading the current local
+head and merging metadata under that owner's workspace lock. Already committed
+local trace and workspace fields are retained. The live context-trace cache keeps
+its producer-assigned local turn alongside the trace. Journal recovery orders
+that cache independently from workspace repair, so a delayed sidecar cannot
+replace newer live evidence; display trace IDs and the current session head do
+not determine trace freshness. The Server head must not suppress
+subsequent local workspace or context-trace projections. Server cursors are never advanced as local cursors.
+Ordinary local and fresh attachments do not perform this additional request.
+
+The shared CLI stream entrypoint heap-pins its execution future for all callers.
+Interactive cancellation and drain continue to await that same owned future;
+dropping it releases its state within the caller's existing lease scope. This
+bounds embedded caller state without changing execution or settlement ownership.
 
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution

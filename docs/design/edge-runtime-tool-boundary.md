@@ -442,6 +442,15 @@ call's successor. This shared process owner does not itself grant the full Bash
 filesystem/network sandbox to legacy typed helpers: existing provider admission,
 managed-filesystem denial, mutation leases and isolation remain their owners.
 
+On Linux, the invocation subreaper settles ownership only after kernel
+`waitpid(-1, WNOHANG)` reports `ECHILD`. Enumerating its own proc children is an
+auxiliary means to kill adopted descendants. If that enumeration is unavailable,
+the same bounded loop continues waiting and reaping under its original deadline.
+Neither an unavailable or empty scan nor deadline expiry proves settlement; a
+live child at expiry or an unexpected wait error retains unsettled ownership.
+The helper's non-dumpable boundary and nonce-bound terminal receipt remain
+required, and Server run settlement cannot replace this local scope proof.
+
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding
 validation. Its input/output exchange runs concurrently under one five-second

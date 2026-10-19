@@ -8,6 +8,7 @@ pub(crate) async fn login_with_observer(
     discovery: UcDiscovery,
     observer: super::LoginObserver,
     terminal_workspace_prompt: bool,
+    launch: impl AsyncFnOnce(String) -> Result<(), String>,
 ) -> Result<(), String> {
     let store = NativeStore::new()?;
     store.prepare_for_login()?;
@@ -82,8 +83,8 @@ pub(crate) async fn login_with_observer(
         ("code_challenge", &challenge),
         ("code_challenge_method", "S256"),
     ]);
-    observer(super::LoginProgress::OpenBrowser(authorize.to_string()))?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    super::present_login_url(authorize.to_string(), &observer, launch).await?;
     for _ in 0..32 {
         let (mut stream, _) = tokio::time::timeout_at(deadline, listener.accept())
             .await

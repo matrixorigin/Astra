@@ -1406,7 +1406,7 @@ fn context_breakdown_for_panel(
     }
 
     if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
-        return ContextBreakdown::from_trace_with(trace, snapshot);
+        return ContextBreakdown::from_trace_with(&trace.trace, snapshot);
     }
 
     let Some(session) = state.observability_session.as_ref() else {
@@ -4113,19 +4113,24 @@ mod routing_tests {
     #[test]
     fn context_panel_uses_committed_trace_when_observability_ring_is_empty() {
         let mut state = SessionState::default();
-        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
-            turn_id: "turn-7".into(),
-            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
-                max_tokens: 100_000,
-                system_prompt_tokens: 5_000,
-                history_tokens: 12_000,
-                tool_schema_tokens: 3_000,
-                user_message_tokens: 200,
-                total_used: 20_200,
-                ..Default::default()
+        state.latest_context_assembly_trace = Some(
+            crate::cli::session::session_state::LocalContextAssemblyTrace {
+                local_turn: 7,
+                trace: ContextAssemblyTrace {
+                    turn_id: "turn-7".into(),
+                    token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                        max_tokens: 100_000,
+                        system_prompt_tokens: 5_000,
+                        history_tokens: 12_000,
+                        tool_schema_tokens: 3_000,
+                        user_message_tokens: 200,
+                        total_used: 20_200,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             },
-            ..Default::default()
-        });
+        );
         let mut snapshot = ContextSnapshot::default();
 
         let breakdown = context_breakdown_for_panel(&state, &mut snapshot);

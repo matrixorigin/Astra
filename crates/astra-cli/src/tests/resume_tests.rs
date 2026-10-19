@@ -278,3 +278,276 @@ total_tokens_out: 500
 
 // merge_learning_snapshot tests removed: the entity/pattern/calibration
 // learning subsystem has been deleted.
+
+#[tokio::test]
+#[serial_test::serial]
+async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local_clock() {
+    use crate::cli::permission_manager::PermissionManager;
+    use crate::cli::slash::slash_session::restore_session_into_state;
+    use crate::cli::turn::turn_entry::{
+        ChatInput, InteractiveTurnOutcome, TurnContext, handle_chat_input_with_ui,
+    };
+    use astra_services::session_journal::JournalEventType;
+    use astra_services::session_restore::RestoredSession;
+    use astra_turn_core::active_conversation::ActiveConversation;
+    use astra_turn_core::file_edit_journal::EditType;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (temp, _sessions) = isolated_sessions_dir();
+    let _credentials = isolate_credentials();
+    let _environment = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+    let _cloud = crate::test_utils::ProcessEnvGuard::remove("ASTRA_API_URL");
+    let _file_root = crate::test_utils::ProcessEnvGuard::remove("_ASTRA_FILE_CHECKPOINT_ROOT");
+    let owner = "restored-real-turn-owner";
+    let mut credentials = CredentialsFile::default();
+    credentials.profiles.insert(
+        "default".into(),
+        Profile {
+            account_id: Some(owner.into()),
+            access_token: Some("test-token".into()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&credentials).unwrap();
+    let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+        "default",
+        Some(owner),
+    )
+    .unwrap();
+    for (local_turn, server_turn) in [(20, 3), (3, 20), (0, 20)] {
+        let sid = format!(
+            "restored-real-{local_turn}-{server_turn}-{}",
+            uuid::Uuid::new_v4()
+        );
+        let old_file = temp.path().join(format!("historical-{local_turn}.txt"));
+        let new_file = temp.path().join(format!("current-{local_turn}.txt"));
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        if local_turn > 0 {
+            let local = ActiveConversation::empty(owner, &sid)
+                .unwrap()
+                .prepare_commit(
+                    local_turn,
+                    None,
+                    vec![serde_json::json!({"role":"user", "content":"local history"})],
+                )
+                .unwrap();
+            writer
+                .append(
+                    &session_journal::JournalEvent::turn(
+                        Some(&sid),
+                        local_turn,
+                        None,
+                        "local history",
+                        "local answer",
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .with_conversation_commit(local.commit),
+                )
+                .unwrap();
+        }
+        let remote = ActiveConversation::empty(owner, &sid)
+            .unwrap()
+            .prepare_commit(
+                server_turn,
+                None,
+                vec![
+                    serde_json::json!({"role":"user", "content":"Server history"}),
+                    serde_json::json!({"role":"assistant", "content":"Server answer"}),
+                ],
+            )
+            .unwrap()
+            .next;
+        let restored = RestoredSession {
+            session_id: sid.clone(),
+            turn_count: server_turn,
+            model: Some("mock-model".into()),
+            restored_from_cloud: true,
+            resume_bundle: Some(astra_turn_types::ResumeBundleV1 {
+                schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                cursor: remote.cursor().clone(),
+                conversation_messages: remote.materialize(),
+                materialized_conversation_root_hash: None,
+                degraded_reasons: vec![],
+                repair_actions: vec![],
+                projections: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{sid}/resume")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&restored))
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::test_utils::mock_model_access_json(&["mock-model"])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::test_utils::mock_model_catalog_json(&["mock-model"])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let stream_sid = sid.clone();
+        let written_file = new_file.clone();
+        Mock::given(method("POST")).and(path("/chat/stream"))
+            .respond_with(move |request: &wiremock::Request| {
+                let admission: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(admission.get("session_turn").is_none());
+                assert!(admission.get("messages").is_none());
+                let round = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let run = format!("run-{stream_sid}-{round}");
+                let mut body = format!("data: {}\n\n", serde_json::json!({"type":"session_info", "session_id":stream_sid, "run_id":run}));
+                for (index, tool, args) in [
+                    (0, "write_file", serde_json::json!({"path":written_file, "content":"new turn edit"})),
+                    (1, "rollback_file_edits", serde_json::json!({"scope":"current_turn"})),
+                ] {
+                    body.push_str(&format!("data: {}\n\n", serde_json::json!({
+                        "type":"tool_request", "session_id":stream_sid, "run_id":run,
+                        "turn_chain_id":format!("chain-{round}"), "request_id":format!("tool-{round}-{index}"),
+                        "schema_admitted_by_server":true, "execution_timeout_ms":300_000,
+                        "command_timeout_cap_ms":30_000, "execution_deadline_unix_ms":4_102_444_800_000_u64,
+                        "tool":tool, "args":args,
+                    })));
+                }
+                // The accepted Server turn may advance after hydration. Its
+                // feedback remains valid even when it matches neither local
+                // allocation nor the earlier Server head plus one.
+                body.push_str(&super::chat_stream_tests::sse_text_response_with_execution_summary(
+                    "Rolled back this turn", &stream_sid, 2, 0, &["write_file", "rollback_file_edits"], 1,
+                    (&run, server_turn + round + 2),
+                ));
+                ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .insert_header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR)
+                    .set_body_string(body)
+            }).expect(2).mount(&server).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::SessionState::default();
+        restore_session_into_state(&sid, None, &api, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(state.turn, local_turn);
+        state.perm_manager = PermissionManager::new(true);
+        state.cli_context.add_dirs.push(temp.path().to_path_buf());
+        state.session_lessons_loaded = true;
+        std::fs::write(&old_file, "historical edit").unwrap();
+        let historical_turn = if local_turn > server_turn {
+            server_turn + 1
+        } else {
+            1
+        };
+        if local_turn > 0 {
+            state.file_journal.lock().unwrap().record_committed(
+                &old_file,
+                "historical-edit",
+                historical_turn,
+                None,
+                b"historical edit",
+                EditType::Create,
+            );
+        }
+        for round in 0..2 {
+            let mut ui = TestUi::default();
+            let outcome = handle_chat_input_with_ui(
+                ChatInput::Conversation("write then undo only this turn".into()),
+                Some("test-token"),
+                session_runtime::AccessMiss::NotLoggedIn,
+                &mut state,
+                TurnContext {
+                    api: &api,
+                    profile: None,
+                    admission: None,
+                    post_commit_tx: None,
+                    explain_analyze_terminal_degraded: None,
+                },
+                &mut ui,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(outcome, InteractiveTurnOutcome::Completed(_)),
+                "{:?}: {:?}",
+                outcome,
+                ui.errors
+            );
+            for request in server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/tools/result")
+            {
+                let result: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(result["status"], "completed", "{result}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&old_file).unwrap(),
+                "historical edit"
+            );
+            assert!(
+                !new_file.exists(),
+                "the real tool callback must undo its own write"
+            );
+            let expected = local_turn + round + 1;
+            assert_eq!(state.turn, expected);
+            assert!(
+                state.session_persistence_error.is_none(),
+                "{:?}",
+                state.session_persistence_error
+            );
+            let edits = state.file_journal.lock().unwrap().summary();
+            assert_eq!(edits.last().unwrap().1, expected);
+            let index = astra_pipeline::step_checkpoint::read_composite_snapshot_index(owner, &sid)
+                .unwrap();
+            assert_eq!(index.snapshots.last().unwrap().turn, expected);
+            assert_eq!(
+                state
+                    .latest_context_assembly_trace
+                    .as_ref()
+                    .unwrap()
+                    .trace
+                    .turn_id,
+                format!("turn-{expected}")
+            );
+            let pipeline = state.runtime_pipeline_state.as_ref().unwrap();
+            assert_eq!(
+                pipeline["latest_runtime_feedback"]["progress"]["session_turn"],
+                server_turn + round + 2
+            );
+        }
+        let turns: Vec<_> = writer
+            .complete_append_order_snapshot()
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::Turn)
+            .filter_map(|event| event.turn)
+            .collect();
+        let expected = if local_turn == 0 {
+            vec![1, 2]
+        } else {
+            vec![local_turn, local_turn + 1, local_turn + 2]
+        };
+        assert_eq!(turns, expected);
+        server.verify().await;
+    }
+}

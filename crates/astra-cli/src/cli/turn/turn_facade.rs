@@ -380,6 +380,7 @@ pub(crate) struct BasicCliTurnOptions {
     pub(crate) execution_time_budget: Option<crate::cli::chat_stream::ExecutionTimeBudgetClock>,
     pub(crate) incremental_state:
         Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
+    pub(crate) executor_observer: Option<crate::cli::chat_stream::CliExecutorObserver>,
     pub(crate) request_session_execution_lease: Option<
         std::sync::Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>,
     >,
@@ -408,6 +409,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
     params.cancel_token = options.cancel_token;
     params.execution_time_budget = options.execution_time_budget;
     params.incremental_state = options.incremental_state.clone();
+    params.executor_observer = options.executor_observer;
     params.request_session_execution_lease = options.request_session_execution_lease.clone();
     params.approval_request_tx = options.approval_request_tx;
     if let Some(turn_index) = options.turn_index {

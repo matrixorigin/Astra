@@ -482,12 +482,26 @@ pub(crate) async fn handle_chat_input_with_ui(
     // Admission is per actual model turn, not per TUI lifetime. Keep this
     // token in scope through retry and Turn/TurnError settlement, then release
     // it so the next interactive turn (or another surface) can proceed.
-    let _execution_lease = match acquire_interactive_turn_admission(state) {
-        Ok(lease) => lease,
-        Err(error) => {
-            let _ = ui.restore_input(&line, state.session_id.as_deref());
-            return Err(error);
-        }
+    let admission =
+        match acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = ui.restore_input(&line, state.session_id.as_deref());
+                return Err(error);
+            }
+        };
+
+    let token = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+        .map_or(token, |turn| turn.bearer.as_str());
+
+    let ctx = TurnContext {
+        api: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref())
+            .map_or(ctx.api, |turn| &turn.api),
+        ..ctx
     };
 
     ensure_agent_projection_for_turn(state);
@@ -514,6 +528,9 @@ pub(crate) async fn handle_chat_input_with_ui(
             input_runtime_required_texts: &finalized_input.runtime_required_texts,
             input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
             session_id: &session_id,
+            admitted_server_turn: admission
+                .as_ref()
+                .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: None,
             explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
         },
@@ -536,6 +553,9 @@ pub(crate) async fn handle_chat_input_with_ui(
         input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
         token,
         session_id: &session_id,
+        admitted_server_turn: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref()),
         semantic_query_override: None,
         turn_start,
         ui,
@@ -598,7 +618,20 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     )
     .await;
 
-    let _execution_lease = acquire_interactive_turn_admission(state)?;
+    let admission = acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await?;
+
+    let token = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+        .map_or(token, |turn| turn.bearer.as_str());
+
+    let ctx = TurnContext {
+        api: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref())
+            .map_or(ctx.api, |turn| &turn.api),
+        ..ctx
+    };
 
     ensure_agent_projection_for_turn(state);
     let notification_count = state.pending_bg_notifications.len();
@@ -634,6 +667,9 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
             input_runtime_required_texts: &runtime_required_texts,
             input_runtime_volatile_texts: &[],
             session_id: &session_id,
+            admitted_server_turn: admission
+                .as_ref()
+                .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: Some(user_intent.as_str()),
             explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
         },
@@ -653,6 +689,9 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         input_runtime_volatile_texts: &[],
         token,
         session_id: &session_id,
+        admitted_server_turn: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref()),
         semantic_query_override: Some(user_intent.as_str()),
         turn_start,
         ui,
@@ -674,9 +713,28 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     Ok(interactive_outcome(settlement, usage))
 }
 
-pub(super) fn acquire_interactive_turn_admission(
+pub(crate) const INTERACTIVE_SERVER_RESUME_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+pub(crate) struct AdmittedServerTurn {
+    pub(crate) attachment_owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    pub(crate) bearer: String,
+    pub(crate) api: astra_thin_client::ThinClient,
+    pub(crate) continuation: crate::cli::session::session_continuation::SessionContinuation,
+}
+
+pub(super) struct InteractiveTurnAdmission {
+    _lease: SessionExecutionLease,
+    pub(super) server_turn: Option<AdmittedServerTurn>,
+}
+
+pub(super) async fn acquire_interactive_turn_admission(
     state: &mut SessionState,
-) -> Result<Option<SessionExecutionLease>, String> {
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+) -> Result<Option<InteractiveTurnAdmission>, String> {
     let Some(session_id) = state.session_id.clone() else {
         return Ok(None);
     };
@@ -692,11 +750,69 @@ pub(super) fn acquire_interactive_turn_admission(
         }
     };
 
+    // Server authority is attached explicitly at restore and is never inferred
+    // from local journal numbers or a display history. Reject an obsolete binding
+    // rather than falling back to a replica after an account/session change.
+    if let Some((cursor, epoch)) = state.server_resume_attachment.as_ref()
+        && (cursor.session_id != session_id
+            || cursor.owner_id != crate::cli::cli_config::cli_utils::cli_user_id()
+            || *epoch != state.session_attachment_epoch)
+    {
+        return Err("Server resume attachment no longer matches the current account/session; restore the session again".into());
+    }
+    let server_turn = if state.server_resume_attachment.is_some() {
+        let attachment_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let request_api = api.clone().without_bearer_provider();
+        eprintln!("  Restoring authoritative Server continuation…");
+        let refresh = tokio::time::timeout(INTERACTIVE_SERVER_RESUME_TIMEOUT, async {
+            let auth_owner =
+                session_runtime::capture_admitted_auth_owner(&request_api, profile, token).await;
+            let (restored, bearer) = crate::cli::session::session_restore_client::fetch_cloud_session_snapshot_with_bearer(
+                &request_api, &session_id, token, auth_owner.as_ref(),
+            ).await?;
+            let restored = restored.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
+            Ok::<_, String>((restored, bearer, auth_owner))
+        });
+        let cancelled = async {
+            match state.tui_cancel_token.as_ref() {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let (restored, bearer, auth_owner) = tokio::select! {
+            biased;
+            _ = cancelled => return Err("Server continuation refresh cancelled before execution".into()),
+            result = refresh => result.map_err(|_| "Server continuation refresh timed out before execution".to_string())??,
+        };
+        if !attachment_owner.is_current()
+            || auth_owner.as_ref().is_some_and(|owner| !owner.is_current())
+        {
+            return Err(
+                "Server resume account changed during restore; restore the session again".into(),
+            );
+        }
+        let bundle = restored.resume_bundle.filter(|bundle| {
+            bundle.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+        }).ok_or_else(|| "Server continuation is no longer canonical; restore the session again before continuing".to_string())?;
+        let continuation =
+            crate::cli::session::session_continuation::continuation_from_resume_bundle(bundle)
+                .ok_or_else(|| "Server continuation failed causal validation".to_string())?;
+        Some(AdmittedServerTurn {
+            attachment_owner,
+            auth_owner,
+            bearer,
+            api: request_api,
+            continuation,
+        })
+    } else {
+        None
+    };
+
     // The in-memory TUI may have been idle while a headless/app-server turn
     // committed. Refresh every prompt-facing and turn-index authority from one
     // current-generation physical snapshot after admission and before any
-    // model/tool boundary. A remote-only session with no local journal keeps
-    // its already-restored server continuation.
+    // model/tool boundary. This cursor and counter belong to local settlement;
+    // a Server attachment supplies separate request inputs above.
     let writer = JournalWriter::new(&session_id)
         .map_err(|error| format!("failed to open session journal for turn admission: {error}"))?;
     if writer.path().is_file() {
@@ -707,7 +823,6 @@ pub(super) fn acquire_interactive_turn_admission(
             &session_id,
             &events,
         )?;
-        let messages = active.materialize();
         let restored =
             session_runtime::restored_journal_state_from_append_order_events(true, &events);
         state.history = restored.session.history;
@@ -720,12 +835,34 @@ pub(super) fn acquire_interactive_turn_admission(
         state.last_turn_event = restored.last_turn_event;
         state.deferred_tool_activations =
             astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-                &messages,
+                active.messages(),
                 std::mem::take(&mut state.deferred_tool_activations),
             );
         state.active_conversation = Some(active);
+    } else if server_turn.is_some() {
+        // A Server-only restore starts a new local replica lineage. A remote
+        // cursor must never become the previous cursor of a local journal.
+        state.turn = 0;
+        state.last_turn_event = None;
+        state.active_conversation = Some(
+            astra_turn_core::active_conversation::ActiveConversation::empty(
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
+                &session_id,
+            )
+            .map_err(|error| error.to_string())?,
+        );
     }
-    Ok(Some(lease))
+    if let Some(server_turn) = server_turn.as_ref() {
+        state.history = crate::cli::session::session_continuation::history_pairs_from_messages(
+            &server_turn.continuation.messages,
+        );
+        state.deferred_tool_activations =
+            server_turn.continuation.deferred_tool_activations.clone();
+    }
+    Ok(Some(InteractiveTurnAdmission {
+        _lease: lease,
+        server_turn,
+    }))
 }
 
 fn ensure_agent_projection_for_turn(state: &mut SessionState) {
@@ -1285,8 +1422,8 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
+    #[tokio::test]
+    async fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
         use astra_services::session_journal::{JournalEvent, JournalWriter};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1321,7 +1458,9 @@ mod tests {
         state.set_session_id(session_id);
         state.turn = 99;
         state.history = vec![("stale".to_string(), "state".to_string())];
-        let lease = acquire_interactive_turn_admission(&mut state)
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let lease = acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
+            .await
             .expect("admission")
             .expect("known session lease");
 
@@ -1331,7 +1470,8 @@ mod tests {
         assert!(state.history[1].1.contains("Previous turn failed"));
         drop(lease);
         assert!(
-            acquire_interactive_turn_admission(&mut state)
+            acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
+                .await
                 .unwrap()
                 .is_some(),
             "the lease is per turn, not held for the full interactive session"
@@ -1433,6 +1573,7 @@ mod tests {
                     input_runtime_required_texts: &[],
                     input_runtime_volatile_texts: &[],
                     session_id: "catalog-failure-session",
+                    admitted_server_turn: None,
                     semantic_query_override: None,
                     explain_analyze_terminal_degraded: None,
                 },
