@@ -839,6 +839,7 @@ async fn assert_one_shot_sigint(
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("ASTRA_ACCESS_TOKEN", "synthetic-offline-signal-test")
         .env("ASTRA_API_URL", &base)
+        .env("ASTRA_LOCAL_STATE_ROOT", home.path().join("state"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -931,6 +932,31 @@ async fn assert_one_shot_sigint(
         assert_eq!(json["interruption_reason"], "user_interrupted");
         assert_eq!(json["text"], "observed partial");
         assert_eq!(json["server_terminal_unverified"], false);
+        // Exercise canonical replay of what the real router committed before
+        // publishing the interrupted JSON, not just its display envelope.
+        let _journal_root = astra_services::session_journal::JournalDirGuard::new(
+            home.path().join("state/sessions"),
+        );
+        let owner_id = astra_credentials::local_profile_owner_id("sigint-test", None).unwrap();
+        let owner = astra_services::OwnerScope::user(&owner_id).unwrap();
+        let events =
+            astra_services::session_journal::read_journal_for_owner(&owner, "sigint-session")
+                .unwrap();
+        let commits = events
+            .into_iter()
+            .filter_map(|event| event.conversation_commit);
+        let restored = astra_turn_core::active_conversation::ActiveConversation::replay(
+            &owner_id,
+            "sigint-session",
+            commits,
+        )
+        .unwrap()
+        .expect("interrupted partial must have a canonical commit");
+        assert_eq!(restored.cursor().completed_turn, 1);
+        assert_eq!(
+            restored.messages().last().unwrap()["content"],
+            "observed partial"
+        );
     } else {
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(json["final_state"], "failed");

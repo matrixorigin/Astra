@@ -74,6 +74,28 @@ async fn settle_one_shot_native_delivery(
         .map_err(|_| "user_interrupted; native delivery shutdown did not settle".to_string())
 }
 
+/// Observe a force interrupt without abandoning cleanup that owns local work.
+/// The cleanup future retains its original deadline; a later successful join
+/// cannot erase the observed interrupt at the final recovery boundary.
+async fn settle_one_shot_cleanup_observing_interrupt(
+    cleanup: impl std::future::Future<Output = Result<(), String>>,
+    interrupt: &mut (impl std::future::Future<Output = std::io::Result<()>> + Unpin),
+    interrupted: &mut bool,
+) -> Result<(), String> {
+    if *interrupted {
+        return cleanup.await;
+    }
+    tokio::pin!(cleanup);
+    tokio::select! {
+        biased;
+        _ = interrupt => {
+            *interrupted = true;
+            cleanup.await
+        }
+        result = &mut cleanup => result,
+    }
+}
+
 async fn settle_one_shot_stream_event_writer(
     writer: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     terminal_deadline: Option<tokio::time::Instant>,
@@ -2525,6 +2547,11 @@ async fn execute_cli_command_impl(
             let mut user_interrupted = false;
             let mut wall_deadline_root_settled = false;
             let mut wall_deadline_server_terminal_settled = false;
+            // First polled after the initial interruption, then retained through
+            // every settlement phase. Never poll again after it completes.
+            let second_interrupt = tokio::signal::ctrl_c();
+            tokio::pin!(second_interrupt);
+            let mut second_interrupted = false;
             let turn_result = {
                 let turn_future = crate::cli::turn::execute_basic_cli_turn(
                     &chat_ctx,
@@ -2579,8 +2606,12 @@ async fn execute_cli_command_impl(
                                     api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
                                 );
                                 if let Err(error) = tokio::select! {
+                                    biased;
+                                    _ = &mut second_interrupt => {
+                                        second_interrupted = true;
+                                        Err("user_interrupted (second Ctrl+C); remote execution settlement is unverified".to_string())
+                                    }
                                     result = cancel => result,
-                                    _ = tokio::signal::ctrl_c() => Err("user_interrupted (second Ctrl+C); remote execution settlement is unverified".to_string()),
                                 } {
                                     return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
                                         &error,
@@ -2593,8 +2624,12 @@ async fn execute_cli_command_impl(
                                     .saturating_duration_since(tokio::time::Instant::now())
                                     .min(std::time::Duration::from_secs(20));
                                 let drained = tokio::select! {
+                                    biased;
+                                    _ = &mut second_interrupt => {
+                                        second_interrupted = true;
+                                        None
+                                    }
                                     result = tokio::time::timeout(drain_budget, &mut turn_future) => result.ok(),
-                                    _ = tokio::signal::ctrl_c() => None,
                                 };
                                 match drained {
                                     Some(result) => {
@@ -2642,9 +2677,13 @@ async fn execute_cli_command_impl(
 
             if let Some(handle) = native_delivery.take() {
                 if user_interrupted {
-                    let shutdown = settle_one_shot_native_delivery(
-                        handle.shutdown(),
-                        terminal_deadline.expect("interrupt establishes terminal deadline"),
+                    let shutdown = settle_one_shot_cleanup_observing_interrupt(
+                        settle_one_shot_native_delivery(
+                            handle.shutdown(),
+                            terminal_deadline.expect("interrupt establishes terminal deadline"),
+                        ),
+                        &mut second_interrupt,
+                        &mut second_interrupted,
                     )
                     .await;
                     if shutdown.is_err() {
@@ -2665,8 +2704,16 @@ async fn execute_cli_command_impl(
 
             // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);
-            let writer_settlement =
-                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await;
+            let writer_settlement = if user_interrupted {
+                settle_one_shot_cleanup_observing_interrupt(
+                    settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline),
+                    &mut second_interrupt,
+                    &mut second_interrupted,
+                )
+                .await
+            } else {
+                settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await
+            };
             if !user_interrupted {
                 writer_settlement?;
             } else {
@@ -2681,6 +2728,21 @@ async fn execute_cli_command_impl(
             }
 
             if user_interrupted {
+                if !second_interrupted && futures_util::poll!(&mut second_interrupt).is_ready() {
+                    second_interrupted = true;
+                }
+                if second_interrupted {
+                    turn_result = apply_one_shot_cleanup_result(
+                        turn_result,
+                        Err(
+                            "user_interrupted (second Ctrl+C); partial recovery is disabled".into(),
+                        ),
+                        wall_deadline_incremental_state
+                            .as_ref()
+                            .expect("one-shot state"),
+                        &mut interruption_cleanup_settled,
+                    );
+                }
                 // Native shutdown joins callbacks and their local scope cleanup.
                 // Only now can its sticky ownership barrier veto partial recovery.
                 turn_result = settle_one_shot_user_interrupt_result(
@@ -2774,7 +2836,7 @@ async fn execute_cli_command_impl(
                         sr.full_text = "Execution interrupted by the user.".to_string();
                     }
                 }
-                retain_wall_deadline_partial_canonical_messages(&mut sr, &message);
+                retain_interrupted_partial_canonical_messages(&mut sr, &message);
             }
 
             let exit_code = finalize_one_shot_stream_result_with_request_lease(
@@ -3551,10 +3613,6 @@ fn retain_interrupted_partial_canonical_messages(sr: &mut StreamResult, user_mes
         serde_json::json!({"role": "user", "content": user_message}),
         serde_json::json!({"role": "assistant", "content": sr.full_text}),
     ];
-}
-
-fn retain_wall_deadline_partial_canonical_messages(sr: &mut StreamResult, user_message: &str) {
-    retain_interrupted_partial_canonical_messages(sr, user_message);
 }
 
 fn stream_result_from_incremental_snapshot(
@@ -4616,6 +4674,93 @@ mod exit_code_tests {
         }
     }
 
+    #[tokio::test]
+    async fn second_interrupt_survives_successful_native_and_writer_cleanup() {
+        for event_writer in [false, true] {
+            for kind in [
+                None,
+                Some(astra_core::ErrorKind::Cancelled),
+                Some(astra_core::ErrorKind::ContractViolation),
+            ] {
+                let started = std::sync::Arc::new(tokio::sync::Notify::new());
+                let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+                let interrupt = async {
+                    signal_rx.await.unwrap();
+                    Ok::<(), std::io::Error>(())
+                };
+                tokio::pin!(interrupt);
+                let cleanup_started = started.clone();
+                let cleanup_finished = finished.clone();
+                let work = async move {
+                    cleanup_started.notify_one();
+                    release_rx.await.unwrap();
+                    cleanup_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                };
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                let cleanup = async {
+                    if event_writer {
+                        let writer = tokio::spawn(async move {
+                            work.await;
+                            Ok(())
+                        });
+                        super::settle_one_shot_stream_event_writer(Some(writer), Some(deadline))
+                            .await
+                    } else {
+                        super::settle_one_shot_native_delivery(work, deadline).await
+                    }
+                };
+                let mut interrupted = false;
+                let observe = super::settle_one_shot_cleanup_observing_interrupt(
+                    cleanup,
+                    &mut interrupt,
+                    &mut interrupted,
+                );
+                let signal = async {
+                    started.notified().await;
+                    signal_tx.send(()).unwrap();
+                    release_tx.send(()).unwrap();
+                };
+                let (cleanup, ()) = tokio::join!(observe, signal);
+                cleanup.unwrap();
+                assert!(interrupted, "the late signal survives successful cleanup");
+                assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+                // The next phase must join without polling the completed signal.
+                super::settle_one_shot_cleanup_observing_interrupt(
+                    std::future::ready(Ok(())),
+                    &mut interrupt,
+                    &mut interrupted,
+                )
+                .await
+                .unwrap();
+                let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
+                let result = match kind {
+                    Some(kind) => Err(one_shot_cleanup_test_failure(kind)),
+                    None => Ok(StreamResult {
+                        full_text: "observed result prefix".into(),
+                        prompt_tokens: 7,
+                        ..Default::default()
+                    }),
+                };
+                let mut cleanup_settled = true;
+                let result = super::apply_one_shot_cleanup_result(
+                    result,
+                    Err("user_interrupted (second Ctrl+C); partial recovery is disabled".into()),
+                    &state,
+                    &mut cleanup_settled,
+                );
+                assert_one_shot_cleanup_stays_failed(
+                    result,
+                    cleanup_settled,
+                    kind,
+                    &state,
+                    &["second Ctrl+C"],
+                );
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn one_shot_native_shutdown_timeout_preserves_prior_failure_and_cleanup_veto() {
         for kind in [
@@ -5635,7 +5780,7 @@ mod one_shot_persistence_tests {
     use super::{
         ExitCode, HeadlessCanonicalCommitStatus, StreamResult, apply_wall_deadline_interruption,
         finalize_one_shot_stream_result, finalize_one_shot_stream_result_with_request_lease,
-        persist_headless_session_state, retain_wall_deadline_partial_canonical_messages,
+        persist_headless_session_state, retain_interrupted_partial_canonical_messages,
         stream_result_from_incremental_snapshot,
     };
 
@@ -6130,7 +6275,7 @@ mod one_shot_persistence_tests {
             },
         );
         apply_wall_deadline_interruption(&mut result, false);
-        retain_wall_deadline_partial_canonical_messages(&mut result, "perform bounded work");
+        retain_interrupted_partial_canonical_messages(&mut result, "perform bounded work");
 
         let exit_code = finalize_one_shot_stream_result_with_request_lease(
             None,
