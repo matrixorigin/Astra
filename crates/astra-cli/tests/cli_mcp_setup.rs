@@ -28,10 +28,32 @@ fn text(output: &Output) -> String {
 #[test]
 fn local_setup_reuses_scopes_and_preserves_secrets_on_failures() {
     let root = tempfile::tempdir().unwrap();
-    for dir in ["project", "home", "user"] {
+    for dir in ["project", "home"] {
         std::fs::create_dir(root.path().join(dir)).unwrap();
     }
     let root = root.path();
+    for (scope, parent) in [
+        ("project", root.join("project/.astra")),
+        ("user", root.join("user")),
+    ] {
+        let missing = run(root, &["mcp", "remove", "missing", "-s", scope]);
+        assert_eq!(missing.status.code(), Some(3), "{}", text(&missing));
+        assert!(
+            !parent.exists(),
+            "failed remove created {}",
+            parent.display()
+        );
+        std::fs::create_dir(&parent).unwrap();
+        let missing = run(root, &["mcp", "remove", "missing", "-s", scope]);
+        assert_eq!(missing.status.code(), Some(3), "{}", text(&missing));
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+        let lock = parent.join("mcp.json.lock");
+        std::fs::write(&lock, "existing-lock").unwrap();
+        let missing = run(root, &["mcp", "remove", "missing", "-s", scope]);
+        assert_eq!(missing.status.code(), Some(3), "{}", text(&missing));
+        assert_eq!(std::fs::read_to_string(lock).unwrap(), "existing-lock");
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+    }
     let help = run(root, &["mcp", "--help"]);
     assert!(help.status.success(), "{}", text(&help));
     assert!(text(&help).contains(".astra/mcp.json"));
@@ -157,11 +179,21 @@ fn local_setup_reuses_scopes_and_preserves_secrets_on_failures() {
     let user_path = root.join("user/mcp.json");
     let prior: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&user_path).unwrap()).unwrap();
+    for index in (0..20).filter(|index| index % 3 == 0) {
+        let name = format!("concurrent-{index}");
+        let seed = run(
+            root,
+            &["mcp", "add", "-s", "user", &name, "fixture-not-executed"],
+        );
+        assert!(seed.status.success(), "{}", text(&seed));
+    }
     let mut children = Vec::new();
     for index in 0..20 {
         let name = format!("concurrent-{index}");
         let entry = r#"{"command":"fixture-not-executed"}"#;
-        let args = if index % 2 == 0 {
+        let args = if index % 3 == 0 {
+            vec!["mcp", "remove", name.as_str(), "-s", "user"]
+        } else if index % 3 == 1 {
             vec!["mcp", "add-json", name.as_str(), entry, "-s", "user"]
         } else {
             vec![
@@ -190,13 +222,19 @@ fn local_setup_reuses_scopes_and_preserves_secrets_on_failures() {
     let entries = config["mcpServers"].as_object().unwrap();
     assert_eq!(
         entries.len(),
-        prior["mcpServers"].as_object().unwrap().len() + 20
+        prior["mcpServers"].as_object().unwrap().len()
+            + (0..20).filter(|index| index % 3 != 0).count()
     );
+    for (name, entry) in prior["mcpServers"].as_object().unwrap() {
+        assert_eq!(entries.get(name), Some(entry));
+    }
     for index in 0..20 {
-        assert_eq!(
-            entries[&format!("concurrent-{index}")]["command"],
-            "fixture-not-executed"
-        );
+        let name = format!("concurrent-{index}");
+        if index % 3 == 0 {
+            assert!(!entries.contains_key(&name));
+        } else {
+            assert_eq!(entries[&name]["command"], "fixture-not-executed");
+        }
     }
 
     // Only this explicitly requested connectivity check launches the fixture server.

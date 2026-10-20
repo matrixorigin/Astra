@@ -376,6 +376,26 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
 }
 
 fn mcp_remove_at_path(name: &str, path: &std::path::Path) -> Result<(), String> {
+    // Reject absent input before the writer protocol creates directories/locks.
+    // This is only a preflight: the mutation still reads its snapshot under lock.
+    match path.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "MCP config {} must be a regular file",
+                path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("No config file at {}", path.display()));
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect MCP config {}: {error}",
+                path.display()
+            ));
+        }
+    }
     let config_lock = lock_mcp_config(path)?;
     if !path.is_file() {
         return Err(format!("No config file at {}", path.display()));
@@ -581,9 +601,12 @@ mod mcp_cli_tests {
     }
 
     #[test]
-    fn concurrent_additions_preserve_every_committed_entry() {
+    fn concurrent_config_changes_preserve_every_committed_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
+        for index in 0..8 {
+            mcp_add_at_path(&format!("remove-{index}"), "fixture-command", &[], &path).unwrap();
+        }
         let barrier = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             for index in 0..8 {
@@ -593,11 +616,64 @@ mod mcp_cli_tests {
                     barrier.wait();
                     mcp_add_at_path(&format!("fixture-{index}"), "fixture-command", &[], path)
                         .unwrap();
+                    super::mcp_remove_at_path(&format!("remove-{index}"), path).unwrap();
                 });
             }
         });
         let config = read_mcp_config(&path).unwrap();
         assert_eq!(config["mcpServers"].as_object().unwrap().len(), 8);
+        for index in 0..8 {
+            assert_eq!(
+                config["mcpServers"][format!("fixture-{index}")]["command"],
+                "fixture-command"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_same_name_changes_follow_serial_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        mcp_add_at_path("fixture", "old-command", &[], &path).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let remove = || {
+                barrier.wait();
+                super::mcp_remove_at_path("fixture", &path)
+            };
+            let first = scope.spawn(remove);
+            let second = scope.spawn(remove);
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            read_mcp_config(&path).unwrap()["mcpServers"]
+                .get("fixture")
+                .is_none()
+        );
+
+        mcp_add_at_path("fixture", "old-command", &[], &path).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let added = std::thread::scope(|scope| {
+            let remove = scope.spawn(|| {
+                barrier.wait();
+                super::mcp_remove_at_path("fixture", &path)
+            });
+            let add = scope.spawn(|| {
+                barrier.wait();
+                mcp_add_at_path("fixture", "new-command", &[], &path)
+            });
+            remove.join().unwrap().unwrap();
+            add.join().unwrap()
+        });
+        let config = read_mcp_config(&path).unwrap();
+        match added {
+            Ok(()) => assert_eq!(config["mcpServers"]["fixture"]["command"], "new-command"),
+            Err(error) => {
+                assert!(error.contains("already exists"));
+                assert!(config["mcpServers"].get("fixture").is_none());
+            }
+        }
     }
 
     #[test]
@@ -762,7 +838,9 @@ mod mcp_cli_tests {
     #[test]
     fn mcp_remove_nonexistent_server() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mcp.json");
+        let path = dir.path().join("scope/mcp.json");
+        assert!(super::mcp_remove_at_path("missing", &path).is_err());
+        assert!(!dir.path().join("scope").exists());
         make_config(&path, serde_json::json!({}));
         let before = std::fs::read(&path).unwrap();
         assert!(super::mcp_remove_at_path("missing", &path).is_err());
@@ -849,6 +927,17 @@ mod mcp_cli_tests {
             read_mcp_config(&path)
                 .unwrap_err()
                 .contains("expected a regular file")
+        );
+        assert!(
+            super::mcp_remove_at_path("missing", &path)
+                .unwrap_err()
+                .contains("regular file")
+        );
+        assert!(!dir.path().join("mcp.json.lock").exists());
+        assert!(
+            super::mcp_remove_at_path("missing", dir.path())
+                .unwrap_err()
+                .contains("regular file")
         );
     }
 

@@ -65,6 +65,13 @@ still apply; this matrix does not introduce a compatibility mode.
 
 A public capability or profile change must update the affected row or explain
 why the existing assessment still applies in the PR's capability assessment.
+Every PR must include one `## Capability assessment` section using `Updated:`,
+`Unchanged:` or `N/A:` with an explanation. The existing required `Check PR title`
+job validates this statement on PR creation, body edits and source updates,
+without checking out code. Template comments and fenced examples do not count.
+Dependency and release PRs follow the same rule; maintainers complete the
+assessment when automation does not supply it. A justified `N/A:` is appropriate
+only when there is no capability impact.
 Record the implementation and meaningful verification lane; publish run results
 only with their revision, environment and artifact. Keep secrets and private
 endpoints out of evidence links.

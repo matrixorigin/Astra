@@ -33,9 +33,12 @@ impact. -->
 
 ## Capability assessment
 
-<!-- For new/changed public behavior, profiles, defaults or claims, update
-docs/reference/capabilities.md or explain why its current assessment applies.
-Use N/A only for changes without capability impact. -->
+<!-- Required by CI for every PR, including dependency and release PRs. Choose
+one disposition and provide an explanation:
+Updated: name the affected capability, status/profiles and reference update.
+Unchanged: identify the existing assessment and why it remains accurate.
+N/A: explain why this change has no capability impact.
+Review checks the explanation; CI does not infer capability impact from code. -->
 
 ## Verification
 

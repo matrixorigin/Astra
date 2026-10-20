@@ -333,6 +333,11 @@ the replacement version prominently while preparing the patch.
 
 ## Capability snapshot
 
+Release PRs must include a completed `## Capability assessment`, as required
+for all PRs. For version-only preparation, explain that scope after `N/A:`;
+otherwise identify the capability reference updates or why its assessment
+remains accurate. Release preparation does not generate a PR body.
+
 The [current capability reference](../reference/capabilities.md) is versioned with
 the source. Each new Release body links to that file at the selected immutable
 source SHA; generated release notes must preserve the link exactly once. Recovery
