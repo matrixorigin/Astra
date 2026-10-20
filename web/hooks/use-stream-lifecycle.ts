@@ -277,6 +277,8 @@ export function useStreamLifecycle(
     }
   });
   const runControlMutationRef = useRef(false);
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
   const [pendingApproval, setPendingApproval] = useState<PendingRunApproval | null>(null);
   const [approvalResponsePending, setApprovalResponsePending] = useState(false);
   const handleApprovalRequired = useCallback((approval: PendingRunApproval) => {
@@ -1572,56 +1574,54 @@ export function useStreamLifecycle(
       return;
     }
     runControlMutationRef.current = true;
-    const existingAssistantMessageId = [...detail.messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.role === "assistant" &&
-          (message.status === "streaming" ||
-            message.reasoningStatus === "streaming"),
-      )?.id;
-    const assistantMessageId =
-      existingAssistantMessageId ?? crypto.randomUUID();
+    const requestedRunId = detail.activeRun.runId;
+    const requestedSessionId = detail.session?.backendSessionId;
+    const requestedAssistantMessageId = detail.activeRun.assistantMessageId;
+    const sameCurrentRun = (current = detailRef.current) => current.chat.id === detail.chat.id &&
+      current.activeRun?.runId === requestedRunId &&
+      current.session?.backendSessionId === requestedSessionId &&
+      current.activeRun?.assistantMessageId === requestedAssistantMessageId;
     setResumingRun(true);
-    let optimisticMessageId: string | null = null;
     try {
       const result = await resumeChatRun(detail.chat.id);
-      if (!result.activeRun?.runId) {
-        throw new Error("Resume response did not include an active run.");
+      if (!sameCurrentRun()) return;
+      if (result.activeRun?.runId !== requestedRunId) {
+        throw new Error("Resume response did not match the requested run.");
       }
-      const resumedActiveRun = result.activeRun;
+      autoAttachAttemptedRunRef.current = requestedRunId;
+      const responseRun = result.activeRun;
+      // Control succeeded. Keep the selected message while restoring observation.
+      setDetail(current => sameCurrentRun(current) ? { ...current, activeRun: {
+        ...current.activeRun!, status: responseRun.status, waitingFor: responseRun.waitingFor ?? null,
+      } } : current);
+      let resumedActiveRun = responseRun;
+      let messages = detailRef.current.messages;
+      let refreshedDetail: ChatDetail | undefined;
+      const hasContinuation = () => !!resumedActiveRun.assistantMessageId &&
+        messages.some(message => message.id === resumedActiveRun.assistantMessageId && message.role === "assistant") &&
+        Number.isSafeInteger(resumedActiveRun.nextEventIndex) && resumedActiveRun.nextEventIndex! >= 0;
+      if (!hasContinuation()) {
+        const refreshed = await getChat(detail.chat.id);
+        if (!sameCurrentRun()) return;
+        if (refreshed.activeRun?.runId !== requestedRunId ||
+          refreshed.session?.backendSessionId !== requestedSessionId) {
+          throw new Error("The run changed while restoring its stream binding.");
+        }
+        refreshedDetail = refreshed;
+        resumedActiveRun = refreshed.activeRun;
+        messages = refreshed.messages;
+      }
+      setDetail(current => sameCurrentRun(current)
+        ? { ...(refreshedDetail ?? current), activeRun: resumedActiveRun } : current);
+      if (!hasContinuation()) {
+        throw new WebApiError(409,
+          "The run resumed, but its stream continuation is unavailable. Reopen the session to inspect its recorded state.",
+          "stream_continuation_unavailable");
+      }
+      const assistantMessageId = resumedActiveRun.assistantMessageId!;
       const runId = resumedActiveRun.runId;
       const attachLease = claimAttachedRun(runId);
       resetWorkSurfaceRun(runId);
-      const appendedOptimistic =
-        !existingAssistantMessageId &&
-        !detail.messages.some((message) => message.id === assistantMessageId);
-      if (appendedOptimistic) {
-        optimisticMessageId = assistantMessageId;
-      }
-      setDetail((current) => ({
-        ...current,
-        activeRun: {
-          ...resumedActiveRun,
-          assistantMessageId,
-        },
-        messages:
-          existingAssistantMessageId ||
-          current.messages.some((message) => message.id === assistantMessageId)
-            ? current.messages
-            : [
-                ...current.messages,
-                {
-                  id: assistantMessageId,
-                  role: "assistant",
-                  content: "",
-                  createdAt: new Date().toISOString(),
-                  status: "streaming",
-                  reasoning: "",
-                  reasoningStatus: "streaming",
-                },
-              ],
-      }));
       const assistantPatcher = createAssistantPatchController({
         setDetail,
         getAssistantId: () => assistantMessageId,
@@ -1734,10 +1734,7 @@ export function useStreamLifecycle(
           },
           {
             assistantMessageId,
-            nextEventIndex:
-              resumedActiveRun.nextEventIndex ??
-              detail.activeRun?.nextEventIndex ??
-              null,
+            nextEventIndex: resumedActiveRun.nextEventIndex,
           },
         );
       } catch (streamError) {
@@ -1755,15 +1752,6 @@ export function useStreamLifecycle(
           return;
         }
         if (handleProjectionFailure(streamError, assistantMessageId, assistantPatcher)) return;
-        // Roll back optimistic message on stream error
-        if (optimisticMessageId) {
-          setDetail((current) => ({
-            ...current,
-            messages: current.messages.filter(
-              (message) => message.id !== optimisticMessageId,
-            ),
-          }));
-        }
         try {
           const refreshed = await getChat(detail.chat.id);
           setDetail(refreshed);
@@ -1799,15 +1787,6 @@ export function useStreamLifecycle(
         router.replace(chatListHref);
         return;
       }
-      // Roll back optimistic message on resume error
-      if (optimisticMessageId) {
-        setDetail((current) => ({
-          ...current,
-          messages: current.messages.filter(
-            (message) => message.id !== optimisticMessageId,
-          ),
-        }));
-      }
       addToast(
         error instanceof Error
           ? error.message
@@ -1832,10 +1811,10 @@ export function useStreamLifecycle(
     chatListHref,
     claimAttachedRun,
     clearAttachedRun,
-    detail.activeRun?.nextEventIndex,
     detail.activeRun?.runId,
+    detail.activeRun?.assistantMessageId,
     detail.chat.id,
-    detail.messages,
+    detail.session?.backendSessionId,
     nextStreamAbortSignal,
     resetWorkSurfaceRun,
     setDetail,

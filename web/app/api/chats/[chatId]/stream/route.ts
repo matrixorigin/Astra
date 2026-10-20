@@ -795,24 +795,18 @@ export async function GET(
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
 
-  const requestedAssistantMessageId = request.nextUrl.searchParams
-    .get("assistantMessageId")
-    ?.trim();
-  const activeRunAssistantMessageId =
-    chat.activeRun?.runId === runId
-      ? (chat.activeRun.assistantMessageId ?? null)
-      : null;
-  const assistantMessageId =
-    assistantMessageBelongsToChat(chat.messages, requestedAssistantMessageId) ??
-    assistantMessageBelongsToChat(chat.messages, activeRunAssistantMessageId) ??
-    lastAssistantMessageId(chat.messages);
-  if (!assistantMessageId) {
-    return NextResponse.json(
-      { error: "no assistant message is available to resume" },
-      { status: 409 },
-    );
-  }
   const replayOnly = request.nextUrl.searchParams.get("replay_only") === "true";
+  const requestedAssistantMessageId = request.nextUrl.searchParams.get("assistantMessageId");
+  const activeRunAssistantMessageId = chat.activeRun?.runId === runId
+    ? chat.activeRun.assistantMessageId : null;
+  const assistantMessageId = requestedAssistantMessageId !== null
+    ? assistantMessageBelongsToChat(chat.messages, requestedAssistantMessageId.trim())
+    : assistantMessageBelongsToChat(chat.messages, activeRunAssistantMessageId) ??
+      (replayOnly ? lastAssistantMessageId(chat.messages) : null);
+  if (!assistantMessageId) {
+    const error = new ChatStreamProjectionError("stream_continuation_unavailable");
+    return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+  }
 
   let runtime: WebRuntimeClient;
   try {

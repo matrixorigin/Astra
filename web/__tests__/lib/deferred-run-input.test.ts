@@ -208,7 +208,6 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-1',
       status: 'running',
       waitingFor: null,
-      nextEventIndex: 1,
       source: 'backend_poll',
       observedAt: expect.any(String),
     });

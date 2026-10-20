@@ -344,3 +344,12 @@ continuations return an explicit observation error without failing the Run or
 replacing the saved answer. Replay-only observation remains independent. This
 state has the same process lifetime as the Web chat projection; it adds no durable
 or cross-server transcript guarantee.
+
+The Web continuation cursor is the next event not represented by the selected
+message's genuine projection. Backend status polling updates control status,
+not parser progress; a durable event count is only a starting boundary when a
+new queued message is admitted. Public control responses expose a continuation
+cursor only for a matching Session, root Run and assistant projection. Resume
+uses that server-selected assistant, including a completed paused message;
+missing local bindings are refreshed once and reported as unavailable rather
+than creating a browser-only assistant.

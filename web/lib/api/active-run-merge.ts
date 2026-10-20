@@ -59,7 +59,8 @@ export function mergeRunStreamBinding(
   activeRun: ChatActiveRunRecord,
   existing?: NonNullable<ChatDetail["activeRun"]>,
 ): ChatActiveRunRecord {
-  if (!existing || existing.runId !== activeRun.runId) {
+  if (!existing || existing.runId !== activeRun.runId ||
+    activeRun.assistantMessageId && activeRun.assistantMessageId !== existing.assistantMessageId) {
     return activeRun;
   }
   const assistantMessageId =

@@ -55,7 +55,6 @@ import type {
 } from "@/lib/api/types";
 import {
   makeActiveRunRecord,
-  maxNextEventIndex,
   mergeRunStreamBinding,
   normalizeNextEventIndex,
   type ChatActiveRunRecord,
@@ -428,7 +427,7 @@ async function reconcileStoppedRun(
     return null;
   });
   if (!client) {
-    return publicActiveRun(chat.activeRun);
+    return publicActiveRun(chat);
   }
 
   let runStatus: RunStatus;
@@ -444,10 +443,10 @@ async function reconcileStoppedRun(
       if (chat.activeRun?.runId === runId) {
         chat.activeRun = undefined;
       }
-      return publicActiveRun(chat.activeRun);
+      return publicActiveRun(chat);
     }
     console.warn("Failed to reconcile stopped run:", runtimeErrorDetail(error));
-    return publicActiveRun(chat.activeRun);
+    return publicActiveRun(chat);
   }
 
   if (runStatus.sessionId !== backendSessionIdForChat(chat)) {
@@ -455,7 +454,7 @@ async function reconcileStoppedRun(
     if (chat.activeRun?.runId === runId) {
       chat.activeRun = undefined;
     }
-    return publicActiveRun(chat.activeRun);
+    return publicActiveRun(chat);
   }
 
   if (isTerminalChatRunStatus(runStatus.status)) {
@@ -463,7 +462,7 @@ async function reconcileStoppedRun(
     if (chat.activeRun?.runId === runId) {
       chat.activeRun = undefined;
     }
-    return publicActiveRun(chat.activeRun);
+    return publicActiveRun(chat);
   }
 
   if (runBlocksChatTurn(runStatus.status) && chat.activeRun?.runId === runId) {
@@ -481,16 +480,13 @@ async function reconcileStoppedRun(
             status: runStatus.status,
             waitingFor: runStatus.waitingFor ?? null,
             assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-            nextEventIndex: maxNextEventIndex(
-              chat.activeRun.nextEventIndex,
-              runStatus.eventsCount,
-            ),
+            nextEventIndex: chat.activeRun.nextEventIndex ?? null,
           },
       isLocallyStoppedRun(chat, runId) ? "local_mutation" : "backend_poll",
     );
   }
 
-  return publicActiveRun(chat.activeRun);
+  return publicActiveRun(chat);
 }
 
 function compareActiveRunDeterministically(
@@ -544,21 +540,25 @@ function backendSessionIdForChat(chat: ChatRecord) {
 }
 
 function publicActiveRun(
-  activeRun?: ChatActiveRunRecord,
+  chat: ChatRecord,
 ): ChatDetail["activeRun"] {
+  const activeRun = chat.activeRun;
   if (!activeRun) {
     return undefined;
   }
+  const assistant = chat.messages.find(message =>
+    message.id === activeRun.assistantMessageId && message.role === "assistant");
+  const projection = chat.streamProjection;
+  const nextEventIndex = assistant && projection && !projection.state.protocolError &&
+    projection.assistantMessageId === assistant.id && projection.state.runId === activeRun.runId &&
+    projection.sessionId === backendSessionIdForChat(chat)
+    ? normalizeNextEventIndex(projection.state.nextEventIndex) : null;
   return {
     runId: activeRun.runId,
     status: activeRun.status,
     waitingFor: activeRun.waitingFor ?? null,
-    ...(activeRun.assistantMessageId
-      ? { assistantMessageId: activeRun.assistantMessageId }
-      : {}),
-    ...(normalizeNextEventIndex(activeRun.nextEventIndex) !== null
-      ? { nextEventIndex: normalizeNextEventIndex(activeRun.nextEventIndex) }
-      : {}),
+    ...(assistant ? { assistantMessageId: assistant.id } : {}),
+    ...(nextEventIndex !== null ? { nextEventIndex } : {}),
   };
 }
 
@@ -870,7 +870,7 @@ export function getChat(
       messageCount: chat.messages.length,
     },
     project: project ? { id: project.id, name: project.name } : undefined,
-    activeRun: publicActiveRun(chat.activeRun),
+    activeRun: publicActiveRun(chat),
     pendingTurn: chat.pendingTurn,
     workspaceSelection: chat.workspaceSelection,
     workspaceSelectionExplicit: Boolean(chat.workspaceSelection),
@@ -1216,7 +1216,7 @@ export async function queueDeferredRunInput(
     const userMessage = current.messages.find(message => message.id === userMessageId && message.role === "user");
     const assistantMessage = userMessage && findAssistantMessageAfter(current.messages, userMessageId);
     // Idempotent acknowledgement must not reset a live projection or reselect an older message.
-    return userMessage && assistantMessage ? { userMessage, assistantMessage, activeRun: publicActiveRun(current.activeRun) } : undefined;
+    return userMessage && assistantMessage ? { userMessage, assistantMessage, activeRun: publicActiveRun(current) } : undefined;
   };
   const previous = existingResponse(chat);
   if (previous) return previous;
@@ -1273,7 +1273,7 @@ export async function queueDeferredRunInput(
       status: runStatus.status,
       waitingFor: runStatus.waitingFor ?? null,
       assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-      nextEventIndex: maxNextEventIndex(chat.activeRun.nextEventIndex, nextEventIndex),
+      nextEventIndex: chat.activeRun.nextEventIndex ?? null,
     },
     "backend_poll",
   );
@@ -1352,7 +1352,7 @@ export async function queueDeferredRunInput(
   return {
     userMessage,
     assistantMessage,
-    activeRun: publicActiveRun(chat.activeRun),
+    activeRun: publicActiveRun(chat),
   };
 }
 
@@ -1477,7 +1477,7 @@ export async function stopActiveRun(
   }
 
   return {
-    activeRun: publicActiveRun(chat.activeRun),
+    activeRun: publicActiveRun(chat),
     cancelPending,
   };
 }
@@ -1496,30 +1496,41 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     throw new Error("Only paused runs can be resumed.");
   }
 
+  const runId = chat.activeRun.runId;
+  const sessionId = backendSessionIdForChat(chat);
+  const assistantMessageId = chat.activeRun.assistantMessageId;
+  const currentChat = () => {
+    const current = getStore(ownerUserId).chats.find(item => item.id === chatId);
+    if (!current?.activeRun || current.activeRun.runId !== runId ||
+      backendSessionIdForChat(current) !== sessionId ||
+      current.activeRun.assistantMessageId !== assistantMessageId) {
+      throw new Error("The run changed while resume was in progress.");
+    }
+    return current;
+  };
   const client = await requireRuntimeClient({
     auth: "required",
-    operation: `resume active run ${chat.activeRun.runId}`,
+    operation: `resume active run ${runId}`,
   });
-
-  const resumed = await client.sdk.resumeRun(chat.activeRun.runId);
+  currentChat();
+  const resumed = await client.sdk.resumeRun(runId);
+  const current = currentChat();
   if (isArtifactPublicationV1(resumed.artifact_publication)) {
-    const message = chat.messages.find((item) => item.id === chat.activeRun?.assistantMessageId);
+    const message = current.messages.find(item => item.id === assistantMessageId && item.role === "assistant");
     if (message) message.artifactPublication = resumed.artifact_publication;
   }
-  chat.activeRun = makeActiveRunRecord(
+  current.activeRun = makeActiveRunRecord(
     {
-      runId: chat.activeRun.runId,
+      runId,
       status: resumed.status,
       waitingFor: null,
-      assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-      nextEventIndex: chat.activeRun.nextEventIndex ?? null,
+      assistantMessageId: assistantMessageId ?? null,
+      nextEventIndex: current.activeRun!.nextEventIndex ?? null,
     },
     "local_mutation",
   );
 
-  return {
-    activeRun: publicActiveRun(chat.activeRun),
-  };
+  return { activeRun: publicActiveRun(current) };
 }
 
 export function updateStreamingAssistantMessage(
@@ -2106,9 +2117,6 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
         runId: run.runId,
         status: run.status,
         waitingFor: run.waitingFor ?? null,
-        nextEventIndex: normalizeNextEventIndex(
-          (run as { eventsCount?: unknown }).eventsCount,
-        ),
       },
       "backend_poll",
       syncStartedAt,

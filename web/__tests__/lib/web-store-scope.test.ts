@@ -512,7 +512,6 @@ describe("web store user scoping", () => {
       runId: "run-waiting",
       status: "waiting",
       waitingFor: "user_input",
-      nextEventIndex: 0,
     });
   });
 
@@ -541,7 +540,6 @@ describe("web store user scoping", () => {
       runId: "run-freshest",
       status: "running",
       waitingFor: null,
-      nextEventIndex: 0,
     });
   });
 
@@ -575,7 +573,6 @@ describe("web store user scoping", () => {
       runId: "root-run",
       status: "running",
       waitingFor: null,
-      nextEventIndex: 0,
     });
   });
 

@@ -2002,7 +2002,7 @@ describe("chat existing run stream route", () => {
     const backend = makeBackendFrameStream(coalesced ? [frames.join("")] : frames);
     mockRequireRuntimeClient.mockResolvedValue({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) },
       fetchResponse: vi.fn().mockResolvedValue({ ok: true, headers: backend.headers, body: backend.body }) } as never);
-    const url = `http://web.test/api/chats/web-chat-1/stream?runId=root${resumed ? "&last_index=8" : ""}`;
+    const url = `http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=root${resumed ? "&last_index=8" : ""}`;
     const request = new Request(url, { method: "GET" });
     Object.defineProperty(request, "nextUrl", { value: new URL(url) });
     const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
@@ -2027,7 +2027,7 @@ describe("chat existing run stream route", () => {
     mockRequireRuntimeClient.mockResolvedValue({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) }, fetchResponse: vi.fn().mockResolvedValue({
       ok: true, headers: backend.headers, body: backend.body,
     }) } as never);
-    const url = "http://web.test/api/chats/web-chat-1/stream?runId=root";
+    const url = "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=root";
     const request = new Request(url);
     Object.defineProperty(request, "nextUrl", { value: new URL(url) });
     const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
@@ -2068,13 +2068,13 @@ describe("chat existing run stream route", () => {
     } as never);
 
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       {
         method: "GET",
       },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2129,11 +2129,11 @@ describe("chat existing run stream route", () => {
       }),
     } as never);
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       { method: "GET" },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2183,11 +2183,11 @@ describe("chat existing run stream route", () => {
       }),
     } as never);
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       { method: "GET" },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
