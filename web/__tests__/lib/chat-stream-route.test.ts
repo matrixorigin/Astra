@@ -111,7 +111,7 @@ function makeBackendStream() {
   };
 }
 
-function makeBackendFrameStream(frames: string[]) {
+function makeBackendFrameStream(frames: string[], readError?: Error) {
   const encoder = new TextEncoder();
   const chunks = frames.map((frame) => encoder.encode(frame));
   let index = 0;
@@ -126,6 +126,7 @@ function makeBackendFrameStream(frames: string[]) {
       getReader: () => ({
         async read() {
           if (index >= chunks.length) {
+            if (readError) throw readError;
             return { value: undefined, done: true };
           }
           const value = chunks[index];
@@ -1954,6 +1955,76 @@ describe("chat existing run stream route", () => {
         },
       ],
     });
+  });
+
+  it.each([
+    { coalesced: false, resumed: false },
+    { coalesced: true, resumed: false },
+    { coalesced: false, resumed: true },
+  ])("preserves partial output through failure (coalesced=$coalesced, cursor=$resumed)", async ({ coalesced, resumed }) => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    if (resumed) {
+      const stored = mockGetChat("user-a", "web-chat-1")!.messages.find(message => message.id === "assistant-1")!;
+      stored.content = "Useful partial answer";
+      stored.reasoning = "Partial reasoning";
+    }
+    const frames = [
+      { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
+      { type: "text_delta", content: "Useful partial answer" },
+      { type: "reasoning_delta", content: "Partial reasoning" },
+      { type: "run_finished", run_id: "child", status: "cancelled" },
+      { type: "run_error", run_id: "root", error: "Save failed", error_code: "canonical_persistence_failed" },
+      { type: "run_finished", run_id: "root", status: "failed", error: "Save failed" },
+    ].filter(event => !resumed || !["text_delta", "reasoning_delta"].includes(event.type))
+      .map(event => `data: ${JSON.stringify(event)}\n\n`);
+    frames.push("data: [DONE]\n\n");
+    const backend = makeBackendFrameStream(coalesced ? [frames.join("")] : frames);
+    mockRequireRuntimeClient.mockResolvedValue({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) },
+      fetchResponse: vi.fn().mockResolvedValue({ ok: true, headers: backend.headers, body: backend.body }) } as never);
+    const url = `http://web.test/api/chats/web-chat-1/stream?runId=root${resumed ? "&last_index=8" : ""}`;
+    const request = new Request(url, { method: "GET" });
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
+    const wire = await response.text();
+    expect(wire).toContain('"run_id":"child"');
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
+      expect.objectContaining({ content: "Useful partial answer\n\nSave failed", reasoning: "Partial reasoning",
+        reasoningStatus: undefined, status: "failed" }));
+    expect(mockSetChatActiveRun.mock.calls.every(([, , run]) => run?.runId !== "child")).toBe(true);
+  });
+
+  it.each([true, false])("preserves the proxy failure cause through a reset (canonical=%s)", async (canonical) => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const { streamExistingChatRun } = await import("@/lib/api/chats");
+    const events = [
+      { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
+      { type: "text_delta", content: "Useful partial answer" },
+      ...(canonical ? [{ type: "run_error", run_id: "root", error: "Save failed",
+        error_code: "canonical_persistence_failed" }] : []),
+    ];
+    const backend = makeBackendFrameStream(events.map(event => `data: ${JSON.stringify(event)}\n\n`), new Error("upstream reset"));
+    mockRequireRuntimeClient.mockResolvedValue({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) }, fetchResponse: vi.fn().mockResolvedValue({
+      ok: true, headers: backend.headers, body: backend.body,
+    }) } as never);
+    const url = "http://web.test/api/chats/web-chat-1/stream?runId=root";
+    const request = new Request(url);
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    const onText = vi.fn(), onDone = vi.fn();
+    try {
+      await expect(streamExistingChatRun("web-chat-1", "root", { onText, onDone })).rejects.toMatchObject({
+        detail: canonical ? "Save failed" : "upstream reset",
+        code: canonical ? "canonical_persistence_failed" : undefined,
+      });
+      expect(onText).toHaveBeenLastCalledWith("Useful partial answer");
+      expect(onDone).not.toHaveBeenCalled();
+      expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
+        expect.objectContaining({ content: canonical ? "Useful partial answer\n\nSave failed" : "Useful partial answer", status: "failed" }));
+      expect(backend.releaseLock).toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("uses the backend session id when reconnecting an existing run stream", async () => {

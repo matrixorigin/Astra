@@ -602,6 +602,36 @@ export function useStreamLifecycle(
   );
 
   // -- Attach existing run stream --
+  const handleCanonicalPersistenceFailure = useCallback((
+    error: unknown,
+    assistantMessageId: string,
+    assistantPatcher: ReturnType<typeof createAssistantPatchController>,
+  ): boolean => {
+    if (!(error instanceof WebApiError) || error.code !== "canonical_persistence_failed") return false;
+    // The HTTP stream reached the runtime. Keep admitted output, including a
+    // pending animation-frame patch, instead of treating this as reconnect failure.
+    assistantPatcher.flushNow();
+    setDetail((current) => ({
+      ...current,
+      activeRun: current.activeRun?.assistantMessageId === assistantMessageId ? undefined : current.activeRun,
+      messages: current.messages.map((message) => {
+        if (message.id !== assistantMessageId) return message;
+        const suffix = `\n\n${error.detail}`;
+        let content = message.content;
+        if (!content) content = error.detail;
+        else if (content !== error.detail && !content.endsWith(suffix)) content += suffix;
+        return {
+          ...message,
+          content,
+          completedAt: new Date().toISOString(),
+          status: "failed",
+          reasoningStatus: undefined,
+        };
+      }),
+    }));
+    return true;
+  }, [setDetail]);
+
   const attachExistingRunStream = useCallback(
     (
       runId: string,
@@ -736,6 +766,7 @@ export function useStreamLifecycle(
             router.replace(chatListHref);
             return;
           }
+          if (handleCanonicalPersistenceFailure(streamError, assistantMessageId, assistantPatcher)) return;
           if (options?.scheduleRetry?.()) {
             assistantPatcher.patchNow({
               status: "streaming",
@@ -767,6 +798,7 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
+      handleCanonicalPersistenceFailure,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1093,6 +1125,7 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
+        if (handleCanonicalPersistenceFailure(error, currentAssistantId, assistantPatcher)) return;
         if (isWorkspaceSelectionError(error)) {
           setStartingRun(false);
           void refreshEdgeWorkspaces();
@@ -1129,6 +1162,7 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
+      handleCanonicalPersistenceFailure,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1314,6 +1348,7 @@ export function useStreamLifecycle(
               router.replace(chatListHref);
               return;
             }
+            if (handleCanonicalPersistenceFailure(streamError, assistantMessageId, assistantPatcher)) return;
             assistantPatcher.patchNow({
               content:
                 streamError instanceof Error
@@ -1368,6 +1403,7 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
+      handleCanonicalPersistenceFailure,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1714,6 +1750,7 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
+        if (handleCanonicalPersistenceFailure(streamError, assistantMessageId, assistantPatcher)) return;
         // Roll back optimistic message on stream error
         if (optimisticMessageId) {
           setDetail((current) => ({
@@ -1786,6 +1823,7 @@ export function useStreamLifecycle(
     repairExplainAnalyzeFromDurable,
     clearPendingInteraction,
     handleApprovalRequired,
+    handleCanonicalPersistenceFailure,
     canResumeRun,
     chatListHref,
     claimAttachedRun,

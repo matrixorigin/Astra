@@ -15,10 +15,14 @@ import {
   mergeChatArtifacts,
 } from "@/lib/api/stream-artifacts";
 import type { ChatArtifactRef } from "@/lib/api/types";
+import { projectRunWaitingState } from "@/lib/run-status-messages";
 import {
-  extractBlockedReason,
-  projectRunWaitingState,
-} from "@/lib/run-status-messages";
+  blockedWaitingFor,
+  eventMessage,
+  explicitEventMessage,
+  isForeignRunLifecycleEvent,
+  isRunLifecycleEvent,
+} from "@/lib/api/stream-event-helpers";
 
 export interface StreamEventContext {
   ownerUserId: string;
@@ -31,6 +35,8 @@ export interface StreamEventState {
   runId?: string;
   assistantText: string;
   assistantRawText: string;
+  lastFailureMessage?: string;
+  errorCode?: string;
   reasoningText: string;
   artifacts?: ChatArtifactRef[];
   statusFeedbackText?: string;
@@ -49,53 +55,6 @@ function normalizeEventIndex(value: unknown): number | null {
     throw new Error("Malformed stream event index.");
   }
   return Math.trunc(value);
-}
-
-export function blockedWaitingFor(event: StreamEvent) {
-  return (
-    extractBlockedReason(
-      event as {
-        type?: string;
-        reason?: string;
-        error_kind?: string;
-        blocked?: boolean;
-      },
-    ) ?? "blocked"
-  );
-}
-
-export function eventMessage(event: StreamEvent, fallback: string): string {
-  for (const key of ["message", "error", "user_message", "reason"] as const) {
-    const value = (event as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-  }
-  return fallback;
-}
-
-function eventStatusFeedback(event: StreamEvent): string | undefined {
-  for (const key of ["message", "error", "user_message"] as const) {
-    const value = (event as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-  return undefined;
-}
-
-function explicitEventMessage(event: StreamEvent): string {
-  for (const key of ["message", "error", "user_message"] as const) {
-    const value = (event as Record<string, unknown>)[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-  return "";
-}
-
-export function isRunBlockedEvent(type: string): boolean {
-  return type === "run_blocked";
 }
 
 /** Persist observation facts without replaying transcript or lifecycle mutations. */
@@ -135,6 +94,12 @@ export function applyStreamEvent(
 
   if (state.protocolError) {
     return;
+  }
+
+  if (isForeignRunLifecycleEvent(event, state.runId)) return;
+  if (!state.runId && isRunLifecycleEvent(event.type) &&
+    "run_id" in event && typeof event.run_id === "string" && event.run_id.trim()) {
+    state.runId = event.run_id;
   }
 
   const setActiveRun = (run: {
@@ -183,11 +148,31 @@ export function applyStreamEvent(
     );
   };
 
+  const applyRunFailure = (reason?: string | null) => {
+    const message = reason?.trim() ? reason : state.lastFailureMessage ?? "Astra run failed.";
+    if (message !== state.lastFailureMessage) {
+      state.assistantText = state.assistantText ? `${state.assistantText}\n\n${message}` : message;
+      state.lastFailureMessage = message;
+    }
+    state.lastStatus = "failed";
+    state.runLifecycle = "finished";
+    setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
+    updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, {
+      content: state.assistantText,
+      reasoning: state.reasoningText || undefined,
+      reasoningStatus: undefined,
+      status: "failed",
+    });
+  };
+
   switch (event.type) {
     case "session_info": {
       if (typeof event.session_id !== "string") break;
-      if (event.session_id !== expectedSessionId) {
-        const message = `Runtime returned session_id ${event.session_id}, but Web chat is bound to ${expectedSessionId}.`;
+      const conflictingRun = typeof event.run_id === "string" && state.runId && state.runId !== event.run_id;
+      if (event.session_id !== expectedSessionId || conflictingRun) {
+        const message = conflictingRun
+          ? `Runtime changed root run_id from ${state.runId} to ${event.run_id}.`
+          : `Runtime returned session_id ${event.session_id}, but Web chat is bound to ${expectedSessionId}.`;
         state.protocolError = true;
         state.assistantText = message;
         state.lastStatus = "failed";
@@ -205,7 +190,7 @@ export function applyStreamEvent(
         throw new Error(message);
       }
       if (typeof event.run_id === "string") {
-        state.runId = event.run_id;
+        state.runId ??= event.run_id;
         setActiveRun({
           runId: event.run_id,
           status: "running",
@@ -230,7 +215,6 @@ export function applyStreamEvent(
     case "run_started": {
       if (typeof event.run_id !== "string") break;
       state.runLifecycle = "running";
-      state.runId = event.run_id;
       setActiveRun({
         runId: event.run_id,
         status: "running",
@@ -241,7 +225,7 @@ export function applyStreamEvent(
 
     case "run_blocked": {
       state.runLifecycle = "blocked";
-      state.statusFeedbackText = eventStatusFeedback(event);
+      state.statusFeedbackText = explicitEventMessage(event) || undefined;
       // RunBlockedEvent carries no run_id field; keep whatever runId is already known
       const runId = state.runId;
       const waitingFor = blockedWaitingFor(event);
@@ -261,7 +245,6 @@ export function applyStreamEvent(
         );
       }
       if (runId) {
-        state.runId = runId;
         setActiveRun({
           runId,
           status: "blocked",
@@ -279,10 +262,9 @@ export function applyStreamEvent(
       const projection = projectRunWaitingState(event);
       state.runLifecycle = projection.status;
       if (projection.status === "blocked") {
-        state.statusFeedbackText = eventStatusFeedback(event);
+        state.statusFeedbackText = explicitEventMessage(event) || undefined;
       }
       if (runId) {
-        state.runId = runId;
         setActiveRun({
           runId,
           status: projection.status,
@@ -295,7 +277,6 @@ export function applyStreamEvent(
     case "run_paused": {
       if (typeof event.run_id !== "string") break;
       state.runLifecycle = "paused";
-      state.runId = event.run_id;
       setActiveRun({
         runId: event.run_id,
         status: "paused",
@@ -307,7 +288,6 @@ export function applyStreamEvent(
     case "run_input_queued": {
       if (typeof event.run_id !== "string") break;
       state.runLifecycle = "running";
-      state.runId = event.run_id;
       setActiveRun({
         runId: event.run_id,
         status: "input-queued",
@@ -319,7 +299,6 @@ export function applyStreamEvent(
     case "run_resumed": {
       if (typeof event.run_id !== "string") break;
       state.runLifecycle = "running";
-      state.runId = event.run_id;
       setActiveRun({
         runId: event.run_id,
         status: "running",
@@ -329,34 +308,14 @@ export function applyStreamEvent(
     }
 
     case "run_error": {
-      if (state.runId && event.run_id && state.runId !== event.run_id) break;
-      const message = eventMessage(event, "Astra run failed.");
-      if (state.lastStatus !== "failed") {
-        state.assistantText = state.assistantText
-          ? `${state.assistantText}\n\n${message}`
-          : message;
-      }
-      state.lastStatus = "failed";
-      state.runLifecycle = "finished";
-      setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
-      updateStreamingAssistantMessage(
-        ctx.ownerUserId,
-        ctx.chatId,
-        ctx.assistantMessageId,
-        {
-          content: state.assistantText,
-          reasoning: state.reasoningText || undefined,
-          reasoningStatus: undefined,
-          status: "failed",
-        },
-      );
+      state.errorCode = typeof event.error_code === "string" ? event.error_code : undefined;
+      applyRunFailure(eventMessage(event, "Astra run failed."));
       break;
     }
 
     case "run_interrupted": {
       if (typeof event.run_id !== "string") break;
       state.runLifecycle = "paused";
-      state.runId = event.run_id;
       const waitingFor =
         typeof (event as RunInterruptedEvent).waiting_for === "string"
           ? (event as RunInterruptedEvent).waiting_for!
@@ -463,8 +422,9 @@ export function applyStreamEvent(
         typeof (event as RunFinishedEvent).status === "string"
           ? (event as RunFinishedEvent).status!
           : "completed";
-      if (typeof event.run_id === "string") {
-        state.runId = event.run_id;
+      if (status === "failed") {
+        applyRunFailure((event as RunFinishedEvent).error);
+        break;
       }
       if (status === "paused" || status === "interrupted") {
         state.runLifecycle = "paused";
@@ -498,11 +458,6 @@ export function applyStreamEvent(
       if (status === "cancelled") {
         state.assistantText = state.assistantText || "Stopped.";
         state.lastStatus = "complete";
-      } else if (status === "failed") {
-        const err = (event as RunFinishedEvent).error;
-        const message = typeof err === "string" ? err : state.assistantText;
-        state.assistantText = message || state.assistantText;
-        state.lastStatus = "failed";
       } else {
         state.lastStatus = "complete";
       }

@@ -32,6 +32,7 @@ import {
   requireRuntimeClient,
 } from "@/lib/runtime-client";
 import type {
+  ChatMessage,
   SendMessageRequest,
 } from "@/lib/api/types";
 import {
@@ -172,6 +173,7 @@ function proxyRunStream(params: {
   sessionId: string | (() => string);
   runtime: WebRuntimeClient | (() => Promise<WebRuntimeClient>);
   assistantMessageId: string;
+  initialAssistantMessage?: Pick<ChatMessage, "content" | "reasoning">;
   knownArtifactIds: Set<string>;
   replayOnly?: boolean;
   replayFromOrigin?: boolean;
@@ -190,6 +192,7 @@ function proxyRunStream(params: {
     sessionId,
     runtime,
     assistantMessageId,
+    initialAssistantMessage,
     knownArtifactIds,
     replayOnly = false,
     replayFromOrigin = false,
@@ -368,9 +371,9 @@ function proxyRunStream(params: {
         };
 
         const state: StreamEventState = {
-          assistantText: "",
+          assistantText: initialAssistantMessage?.content ?? "",
           assistantRawText: "",
-          reasoningText: "",
+          reasoningText: initialAssistantMessage?.reasoning ?? "",
           lastStatus: "streaming",
           protocolError: false,
           runLifecycle: "running",
@@ -378,7 +381,22 @@ function proxyRunStream(params: {
 
         try {
           for (;;) {
-            const { value, done } = await reader.read();
+            let chunk: ReadableStreamReadResult<Uint8Array>;
+            try {
+              chunk = await reader.read();
+            } catch (error) {
+              if (clientCancelled) return;
+              // The typed root failure has already been forwarded. A subsequent
+              // upstream reset must not replace it with a generic error frame.
+              if (!replayOnly && state.lastStatus === "failed" &&
+                state.errorCode === "canonical_persistence_failed") {
+                backendAbortController.abort();
+                await Promise.resolve(reader.cancel()).catch(() => undefined);
+                break;
+              }
+              throw error;
+            }
+            const { value, done } = chunk;
             if (clientCancelled) {
               return;
             }
@@ -817,5 +835,10 @@ export async function GET(
     knownArtifactIds,
     replayOnly,
     replayFromOrigin: lastIndex === null || lastIndex === 0,
+    // A cursor suffix may contain only the failure. Keep the stored display;
+    // it is not raw provider transcript and must not seed assistantRawText.
+    initialAssistantMessage: !replayOnly && lastIndex !== null && lastIndex > 0
+      ? chat.messages.find(message => message.id === assistantMessageId)
+      : undefined,
   });
 }

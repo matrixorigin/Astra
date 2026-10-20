@@ -4,6 +4,7 @@ import {
   createEmptyWorkSurface,
   hydrateWorkSurface,
   resetWorkSurfaceForRun,
+  type WorkSurfaceEvent,
 } from '@/lib/work-surface';
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from '@/lib/run-status-messages';
 
@@ -52,6 +53,28 @@ const taskGraph = {
 };
 
 describe('work surface reducer', () => {
+  it('keeps child lifecycle from settling parent tools and agents', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session', 'root'), { type: 'run_started', run_id: 'root' });
+    state = applyWorkSurfaceEvent(state, { type: 'tool_call_start', run_id: 'root', call_id: 'call', tool: 'bash' });
+    state = applyWorkSurfaceEvent(state, { type: 'agent_spawned', run_id: 'child', parent_run_id: 'root', agent_id: 'agent',
+      agent_type: 'code-review', description: 'Review the branch' });
+    const before = state;
+    for (const event of [
+      { type: 'run_started', run_id: 'child' },
+      { type: 'run_paused', run_id: 'child' },
+      { type: 'run_resumed', run_id: 'child' },
+      { type: 'run_error', run_id: 'child', error: 'child only' },
+      { type: 'run_finished', run_id: 'child', status: 'failed' },
+    ] satisfies WorkSurfaceEvent[]) {
+      state = applyWorkSurfaceEvent(state, event);
+      expect(state).toBe(before);
+    }
+    expect(state.tools).toHaveLength(1);
+    expect(state.agents).toHaveLength(1);
+    state = applyWorkSurfaceEvent(state, { type: 'run_finished', run_id: 'root', status: 'completed' });
+    expect(state.runStatus).toBe('completed');
+  });
+
   it('projects canonical interruption kinds without exposing wire codes', () => {
     expect(agentInterruptionPresentation('context_overflow')).toEqual({
       label: 'Needs compaction',

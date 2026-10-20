@@ -11,6 +11,7 @@ import {
   setChatActiveRun,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
+import type { StreamEvent } from "@astra/sdk";
 
 const mockSetChatActiveRun = vi.mocked(setChatActiveRun);
 const mockUpdateStreamingAssistantMessage = vi.mocked(updateStreamingAssistantMessage);
@@ -235,14 +236,69 @@ describe("applyStreamEvent", () => {
 
   it("keeps partial output and exposes a terminal persistence failure", () => {
     const state = makeState();
-    state.assistantText = "Useful partial answer";
+    applyStreamEvent({ type: "session_info", session_id: "session-1", run_id: "run-1" }, ctx, state);
+    applyStreamEvent({ type: "text_delta", content: "Useful partial answer" }, ctx, state);
+    applyStreamEvent({ type: "reasoning_delta", content: "Partial reasoning" }, ctx, state);
     applyStreamEvent({ type: "run_error", run_id: "run-1",
       error: "Completion could not be saved.", error_code: "canonical_persistence_failed" }, ctx, state);
     expect(state.assistantText).toBe("Useful partial answer\n\nCompletion could not be saved.");
     applyStreamEvent({ type: "run_error", run_id: "run-1",
       error: "Completion could not be saved.", error_code: "canonical_persistence_failed" }, ctx, state);
     expect(state.assistantText).toBe("Useful partial answer\n\nCompletion could not be saved.");
+    for (const error of ["Completion could not be saved.", undefined]) {
+      applyStreamEvent({ type: "run_finished", run_id: "run-1", status: "failed", error }, ctx, state);
+    }
+    expect(state.assistantRawText).toBe("Useful partial answer");
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "chat-1", "assistant-1",
+      expect.objectContaining({ content: "Useful partial answer\n\nCompletion could not be saved.",
+        reasoning: "Partial reasoning", reasoningStatus: undefined, status: "failed" }));
     expect(state.lastStatus).toBe("failed");
+  });
+
+  it("keeps root lifecycle stable while child events advance the shared cursor", () => {
+    const state = makeState();
+    applyStreamEvent({ type: "session_info", session_id: "session-1", run_id: "root" }, ctx, state);
+    const children = [
+      { type: "run_started" }, { type: "run_input_queued" }, { type: "run_blocked", reason: "offline" },
+      { type: "run_waiting" }, { type: "run_paused" }, { type: "run_resumed" }, { type: "run_interrupted" },
+      { type: "run_error", error: "child only" },
+      ...["completed", "cancelled", "failed"].map(status => ({ type: "run_finished", status })),
+    ];
+    for (const failed of [false, true]) {
+      if (failed) applyStreamEvent({ type: "run_error", run_id: "root", error: "root failure" }, ctx, state);
+      vi.clearAllMocks();
+      const before = { ...state };
+      children.forEach((child, index) => applyStreamEvent(
+        { ...child, run_id: "child", index: index + (failed ? 20 : 0) } as StreamEvent, ctx, state));
+      expect(state).toEqual({ ...before, nextEventIndex: failed ? 31 : 11 });
+      expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
+      expect(mockSetChatActiveRun).not.toHaveBeenCalled();
+    }
+    applyStreamEvent({ type: "run_resumed", run_id: "root" }, ctx, state);
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith("user-a", "chat-1",
+      expect.objectContaining({ runId: "root", nextEventIndex: 31 }));
+  });
+
+  it("retains distinct failure reasons even after an earlier generic error", () => {
+    const state = makeState();
+    applyStreamEvent({ type: "text_delta", content: "Answer mentions save failure" }, ctx, state);
+    applyStreamEvent({ type: "error", message: "generic transport issue" }, ctx, state);
+    applyStreamEvent({ type: "run_error", run_id: "root", error: "save failure" }, ctx, state);
+    applyStreamEvent({ type: "run_finished", run_id: "root", status: "failed", error: "different failure" }, ctx, state);
+    applyStreamEvent({ type: "run_finished", run_id: "root", status: "failed", error: "different failure" }, ctx, state);
+    expect(state.assistantText).toBe("Answer mentions save failure\n\nsave failure\n\ndifferent failure");
+  });
+
+  it("rejects a conflicting root bootstrap without rebinding or accepting later text", () => {
+    const state = makeState();
+    applyStreamEvent({ type: "session_info", session_id: "session-1", run_id: "root" }, ctx, state);
+    expect(() => applyStreamEvent({ type: "session_info", session_id: "session-1", run_id: "other" }, ctx, state))
+      .toThrow("root run_id");
+    const failure = state.assistantText;
+    applyStreamEvent({ type: "text_delta", content: "late" }, ctx, state);
+    expect(state.runId).toBe("root");
+    expect(state.protocolError).toBe(true);
+    expect(state.assistantText).toBe(failure);
   });
 
   it("projects run_error as run failure instead of a protocol disconnect", () => {

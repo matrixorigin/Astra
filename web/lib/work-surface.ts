@@ -8,6 +8,7 @@ import type {
   WorkTaskGraphPageV2,
 } from "@astra/sdk";
 import { toolEventIsCancelled, toolTerminalStatus } from "@astra/sdk";
+import { isForeignRunLifecycleEvent } from "@/lib/api/stream-event-helpers";
 import {
   blockedRunMessage,
   runWaitingStatusMessage,
@@ -339,6 +340,7 @@ export function applyWorkSurfaceEvent(
   state: WorkSurfaceState,
   event: WorkSurfaceEvent,
 ): WorkSurfaceState {
+  if (isForeignRunLifecycleEvent(event, state.runId)) return state;
   const type = typeof event.type === "string" ? event.type : "";
   if (type === "run_blocked") {
     return applyRunBlockedEvent(state, event);

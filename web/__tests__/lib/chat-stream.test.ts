@@ -72,6 +72,86 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it.each([false, true])('keeps child lifecycle observable without changing root callbacks (coalesced=%s)', async coalesced => {
+    const events = [
+      { type: 'session_info', session_id: 'session', run_id: 'root' },
+      { type: 'run_started', run_id: 'child' },
+      { type: 'run_finished', run_id: 'child', status: 'cancelled', index: 7 },
+      { type: 'text_delta', content: 'Root answer' },
+      { type: 'run_finished', run_id: 'root', status: 'completed' },
+    ];
+    const frames = events.map(event => `data: ${JSON.stringify(event)}\n\n`);
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(coalesced ? [frames.join('')] : frames) });
+    const onCancelled = vi.fn(), onDone = vi.fn(), onRunFinished = vi.fn(), onRunUpdated = vi.fn(), onWorkSurfaceEvent = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload,
+      { onCancelled, onDone, onRunFinished, onRunUpdated, onWorkSurfaceEvent })).resolves.toBe('Root answer');
+    expect(onCancelled).not.toHaveBeenCalled();
+    expect(onDone).toHaveBeenCalledWith('Root answer');
+    expect(onRunFinished).toHaveBeenCalledExactlyOnceWith({ runId: 'root', status: 'completed', error: null });
+    expect(onRunUpdated.mock.calls.every(([run]) => run.runId === 'root')).toBe(true);
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'run_finished', run_id: 'child' }));
+  });
+
+  it('retains the canonical failure code through a synthesized terminal', async () => {
+    const frames = [
+      'data: {"type":"session_info","run_id":"root"}\n\n',
+      'data: {"type":"text_delta","content":"Partial answer"}\n\n',
+      'data: {"type":"run_error","run_id":"root","error":"Save failed","error_code":"canonical_persistence_failed"}\n\n',
+      'data: {"type":"run_finished","run_id":"root","status":"failed","error":"Save failed"}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(frames) });
+    const onText = vi.fn(), onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onText, onDone }))
+      .rejects.toMatchObject({ message: 'Save failed', code: 'canonical_persistence_failed' });
+    expect(onText).toHaveBeenLastCalledWith('Partial answer');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { knownFailure: true, abort: false },
+    { knownFailure: true, abort: true },
+    { knownFailure: false, abort: false },
+  ])('keeps canonical failure precedence over a socket reset, but not user abort (%j)', async ({ knownFailure, abort }) => {
+    const controller = new AbortController();
+    let reads = 0;
+    const events = [
+      { type: 'session_info', run_id: 'root' },
+      { type: 'text_delta', content: 'Partial answer' },
+      ...(knownFailure ? [{ type: 'run_error', run_id: 'root', error: 'Save failed', error_code: 'canonical_persistence_failed' }] : []),
+    ];
+    const bytes = new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''));
+    const releaseLock = vi.fn();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: { getReader: () => ({
+      async read() {
+        if (reads++ === 0) return { value: bytes, done: false };
+        if (abort) controller.abort();
+        throw new Error('socket reset');
+      },
+      releaseLock, cancel: vi.fn(),
+    }) } });
+    const onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { signal: controller.signal, onDone })).rejects
+      .toMatchObject(abort ? { name: 'AbortError' } : knownFailure
+        ? { message: 'Save failed', code: 'canonical_persistence_failed' } : { message: 'socket reset' });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it.each([['', false], ['   ', false], ['', true]])('never completes a failed terminal with a blank reason (%j, prior=%s)', async (reason, prior) => {
+    const events = [
+      { type: 'session_info', run_id: 'root' },
+      ...(prior ? [{ type: 'run_error', run_id: 'root', error: 'Save failed', error_code: 'canonical_persistence_failed' }] : []),
+      { type: 'run_finished', run_id: 'root', status: 'failed', error: reason },
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true,
+      body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)) });
+    const onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onDone })).rejects
+      .toThrow(prior ? 'Save failed' : 'Astra run failed.');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
   it('surfaces hook configuration warnings without changing the answer or run status', async () => {
     const onWarning = vi.fn();
     const onRunFinished = vi.fn();

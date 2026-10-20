@@ -388,6 +388,34 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockStreamChatMessage).toHaveBeenCalledOnce();
   });
 
+  it.each(["send", "attach"])("preserves pending answer patches on canonical persistence failure during %s", async mode => {
+    const frames = mockAnimationFrameQueue();
+    const reason = "Completion could not be saved. Reopen the session to check its recorded state before retrying.";
+    const fail = async (handlers: Parameters<typeof streamChatMessage>[2]) => {
+      handlers.onRunStarted?.("run-123");
+      handlers.onText?.("Useful partial answer");
+      handlers.onReasoning?.("Partial reasoning");
+      handlers.onRunUpdated?.({ runId: "run-123", status: "failed", waitingFor: null });
+      throw new WebApiError(500, reason, "canonical_persistence_failed");
+    };
+    mockStreamChatMessage.mockImplementation((_id, _payload, handlers) => fail(handlers));
+    mockStreamExistingChatRun.mockImplementation((_id, _run, handlers) => fail(handlers));
+    try {
+      render(<ChatView initial={makeDetail(mode === "attach" ? defaultActiveRun : null)} />);
+      if (mode === "send") {
+        const user = userEvent.setup();
+        await user.click(screen.getByRole("button", { name: "Submit composer" }));
+      }
+      const expected = `Useful partial answer\n\n${reason}`;
+      expect(await screen.findByText(expected, { normalizer: text => text })).toBeInTheDocument();
+      expect(screen.queryByText(/could not reach the Astra runtime/)).not.toBeInTheDocument();
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(mode === "attach" ? 1 : 0);
+      expect(mockGetChat).not.toHaveBeenCalled();
+    } finally {
+      frames.restore();
+    }
+  });
+
   it("shows workspace selection errors directly in the assistant message", async () => {
     const user = userEvent.setup();
     const message =

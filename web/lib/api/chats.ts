@@ -13,6 +13,8 @@ import {
   blockedWaitingFor,
   eventMessage,
   isRunBlockedEvent,
+  isRunLifecycleEvent,
+  isForeignRunLifecycleEvent,
 } from "@/lib/api/stream-event-helpers";
 import type {
   ChatDetail,
@@ -338,6 +340,19 @@ function applyStreamEvent(
     state.nextEventIndex = Math.max(state.nextEventIndex ?? 0, eventIndex + 1);
   }
 
+  if (type === "session_info" && state.runId && typeof event.run_id === "string" &&
+    event.run_id !== state.runId) {
+    throw new WebApiError(500, "Runtime changed the stream's root run identity.", "contract_violation");
+  }
+  if (isForeignRunLifecycleEvent(event, state.runId)) {
+    forwardWorkSurfaceEvent(event, handlers);
+    return;
+  }
+  if (!state.runId && (type === "session_info" || isRunLifecycleEvent(type)) &&
+    typeof event.run_id === "string" && event.run_id.trim()) {
+    state.runId = event.run_id;
+  }
+
   if (type === "warning") {
     if (typeof event.message === "string" && event.message.trim()) {
       handlers.onWarning?.(event.message);
@@ -388,7 +403,6 @@ function applyStreamEvent(
   }
 
   if (type === "session_info" && typeof event.run_id === "string") {
-    state.runId = event.run_id;
     if (typeof event.session_id === "string") {
       handlers.onSessionBound?.({ sessionId: event.session_id });
     }
@@ -418,7 +432,6 @@ function applyStreamEvent(
   }
 
   if (type === "run_started" && typeof event.run_id === "string") {
-    state.runId = event.run_id;
     forwardWorkSurfaceEvent(event, handlers);
     handlers.onRunStarted?.(event.run_id);
     handlers.onRunUpdated?.(
@@ -432,7 +445,6 @@ function applyStreamEvent(
   }
 
   if (type === "run_input_queued" && typeof event.run_id === "string") {
-    state.runId = event.run_id;
     forwardWorkSurfaceEvent(event, handlers);
     handlers.onRunUpdated?.(
       runUpdate(state, {
@@ -486,7 +498,6 @@ function applyStreamEvent(
         : state.runId;
     state.paused = true;
     if (runId) {
-      state.runId = runId;
       handlers.onRunUpdated?.(
         runUpdate(state, {
           runId,
@@ -519,7 +530,6 @@ function applyStreamEvent(
     );
     state.paused = true;
     if (runId) {
-      state.runId = runId;
       handlers.onRunUpdated?.(
         runUpdate(state, {
           runId,
@@ -537,7 +547,6 @@ function applyStreamEvent(
   }
 
   if (type === "run_paused" && typeof event.run_id === "string") {
-    state.runId = event.run_id;
     forwardWorkSurfaceEvent(event, handlers);
     state.paused = true;
     handlers.onRunUpdated?.(
@@ -551,7 +560,6 @@ function applyStreamEvent(
   }
 
   if (type === "run_resumed" && typeof event.run_id === "string") {
-    state.runId = event.run_id;
     forwardWorkSurfaceEvent(event, handlers);
     state.paused = false;
     handlers.onInteractionResolved?.();
@@ -569,8 +577,8 @@ function applyStreamEvent(
     forwardWorkSurfaceEvent(event, handlers);
     const message = eventMessage(event, "Astra run failed.");
     state.error = message;
+    state.errorCode = typeof event.error_code === "string" ? event.error_code : undefined;
     if (typeof event.run_id === "string") {
-      state.runId = event.run_id;
       handlers.onRunUpdated?.(
         runUpdate(state, {
           runId: event.run_id,
@@ -586,7 +594,6 @@ function applyStreamEvent(
     forwardWorkSurfaceEvent(event, handlers);
     state.paused = true;
     if (typeof event.run_id === "string") {
-      state.runId = event.run_id;
       handlers.onRunUpdated?.(
         runUpdate(state, {
           runId: event.run_id,
@@ -657,9 +664,6 @@ function applyStreamEvent(
     forwardWorkSurfaceEvent(event, handlers);
     const status =
       typeof event.status === "string" ? event.status : "completed";
-    if (typeof event.run_id === "string") {
-      state.runId = event.run_id;
-    }
     if (status === "paused" || status === "interrupted") {
       state.paused = true;
       if (typeof event.run_id === "string") {
@@ -686,10 +690,8 @@ function applyStreamEvent(
       return;
     }
     if (status === "failed") {
-      state.error =
-        typeof event.error === "string"
-          ? event.error
-          : (state.error ?? "Astra run failed.");
+      if (typeof event.error === "string" && event.error.trim()) state.error = event.error;
+      else if (!state.error?.trim()) state.error = "Astra run failed.";
     }
     state.paused = false;
   }
@@ -745,7 +747,19 @@ async function consumeChatStream(
         await reader.cancel();
         throw new DOMException("The chat stream was aborted.", "AbortError");
       }
-      const { value, done } = await reader.read();
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        if (handlers.signal?.aborted) {
+          throw new DOMException("The chat stream was aborted.", "AbortError");
+        }
+        // A trailing socket failure cannot replace the canonical failure the
+        // runtime already reported. Callback/protocol exceptions stay outside.
+        if (state.error && state.errorCode === "canonical_persistence_failed") break;
+        throw error;
+      }
+      const { value, done } = chunk;
       if (handlers.signal?.aborted) {
         throw new DOMException("The chat stream was aborted.", "AbortError");
       }
