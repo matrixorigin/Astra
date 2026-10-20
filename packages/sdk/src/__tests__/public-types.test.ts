@@ -61,6 +61,7 @@ describe('public SDK types', () => {
       type: 'run_error',
       run_id: 'run-1',
       message: 'failed',
+      error_code: 'canonical_persistence_failed',
     };
     const interrupted: RunInterruptedEvent = {
       type: 'run_interrupted',

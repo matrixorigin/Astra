@@ -233,6 +233,18 @@ describe("applyStreamEvent", () => {
     );
   });
 
+  it("keeps partial output and exposes a terminal persistence failure", () => {
+    const state = makeState();
+    state.assistantText = "Useful partial answer";
+    applyStreamEvent({ type: "run_error", run_id: "run-1",
+      error: "Completion could not be saved.", error_code: "canonical_persistence_failed" }, ctx, state);
+    expect(state.assistantText).toBe("Useful partial answer\n\nCompletion could not be saved.");
+    applyStreamEvent({ type: "run_error", run_id: "run-1",
+      error: "Completion could not be saved.", error_code: "canonical_persistence_failed" }, ctx, state);
+    expect(state.assistantText).toBe("Useful partial answer\n\nCompletion could not be saved.");
+    expect(state.lastStatus).toBe("failed");
+  });
+
   it("projects run_error as run failure instead of a protocol disconnect", () => {
     const state = makeState();
 

@@ -227,15 +227,21 @@ pub(crate) fn admit_tool_calls(
 /// executed.
 fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
     // A call that can be normalized keeps its exact canonical representation.
-    // Only malformed/legacy-shaped calls use the typed empty-arguments
+    // Only malformed calls use the typed empty-arguments
     // placeholder below.
     astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call)
         .unwrap_or_else(|_| {
-            serde_json::json!({
-                "id": id,
-                "type": "function",
+            let mut placeholder = serde_json::json!({
+                "id": id, "type": "function",
                 "function": {"name": name, "arguments": "{}"},
-            })
+            });
+            use astra_turn_core::tool::args::shape::{
+                PROVIDER_TOOL_CALL_ID_FIELD, provider_tool_call_id,
+            };
+            if let Some(original) = provider_tool_call_id(tool_call) {
+                placeholder[PROVIDER_TOOL_CALL_ID_FIELD] = Value::String(original.to_owned());
+            }
+            placeholder
         })
 }
 
@@ -360,7 +366,41 @@ where
 
 /// Validate the provider-owned identity carrier before any admission policy or
 /// executor can observe the batch. Representation normalization is allowed at
-/// the provider boundary; identity synthesis is not.
+/// the provider boundary; missing or ambiguous IDs must not be repaired.
+/// Accept one selected model response before any admission or lifecycle effects.
+/// Downstream owners use a single canonical ID. Only provider-history projection
+/// may recover the original wire linkage from the retained call metadata.
+pub(crate) fn accept_provider_tool_calls(
+    mut tool_calls: Vec<Value>,
+    user_id: &str,
+    session_id: &str,
+    run_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    round: u32,
+) -> Result<Vec<Value>, String> {
+    use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+    use sha2::{Digest, Sha256};
+
+    validate_provider_tool_call_identities(&tool_calls)?;
+    for call in &mut tool_calls {
+        let original = call["id"].as_str().expect("validated call ID").to_owned();
+        // A fixed-order serialized tuple frames arbitrary scope and ID strings.
+        let scope = serde_json::to_vec(&(
+            "astra.accepted-provider-call.v1",
+            user_id,
+            session_id,
+            run_id,
+            turn_chain_id,
+            round,
+            &original,
+        ))
+        .expect("string tuple serialization");
+        call["id"] = Value::String(format!("{:x}", Sha256::digest(&scope)));
+        call[PROVIDER_TOOL_CALL_ID_FIELD] = Value::String(original);
+    }
+    Ok(tool_calls)
+}
+
 pub(crate) fn validate_provider_tool_call_identities(tool_calls: &[Value]) -> Result<(), String> {
     let mut seen = HashSet::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
@@ -1554,6 +1594,78 @@ mod tests {
             .cloned()
             .map(CanonicalToolInvocation::ordinary)
             .collect()
+    }
+
+    #[test]
+    fn accepted_call_identity_is_scoped_deterministic_and_overwrites_untrusted_metadata() {
+        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+        let raw = serde_json::json!({"id":"Ab1234567", "type":"function",
+            "function":{"name":"read_file","arguments":"{ \"path\": \"fixture\" }"},
+            PROVIDER_TOOL_CALL_ID_FIELD:"forged"});
+        let accept = |owner, session, run, chain, round| {
+            accept_provider_tool_calls(
+                vec![raw.clone()],
+                owner,
+                session,
+                Some(run),
+                Some(chain),
+                round,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let first = accept("owner", "session", "run", "chain", 7);
+        assert_eq!(first, accept("owner", "session", "run", "chain", 7));
+        assert_eq!(first["function"], raw["function"]);
+        assert_eq!(first[PROVIDER_TOOL_CALL_ID_FIELD], raw["id"]);
+        let id = first["id"].as_str().unwrap();
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|c| c.is_ascii_hexdigit()));
+        for different in [
+            accept("other", "session", "run", "chain", 7),
+            accept("owner", "other", "run", "chain", 7),
+            accept("owner", "session", "other", "chain", 7),
+            accept("owner", "session", "run", "other", 7),
+            accept("owner", "session", "run", "chain", 8),
+        ] {
+            assert_ne!(first["id"], different["id"]);
+        }
+        assert!(
+            accept_provider_tool_calls(
+                vec![raw.clone(), raw.clone()],
+                "owner",
+                "session",
+                Some("run"),
+                Some("chain"),
+                7
+            )
+            .is_err()
+        );
+        let mut missing = raw;
+        missing.as_object_mut().unwrap().remove("id");
+        assert!(
+            accept_provider_tool_calls(
+                vec![missing],
+                "owner",
+                "session",
+                Some("run"),
+                Some("chain"),
+                7
+            )
+            .is_err()
+        );
+        // Already hex-looking provider IDs are still newly accepted, not replay.
+        let hex = serde_json::json!({"id":id,"function":{"name":"read_file","arguments":"{}"}});
+        let accepted = accept_provider_tool_calls(
+            vec![hex],
+            "owner",
+            "session",
+            Some("run"),
+            Some("chain"),
+            7,
+        )
+        .unwrap();
+        assert_ne!(accepted[0]["id"], first["id"]);
     }
 
     #[test]

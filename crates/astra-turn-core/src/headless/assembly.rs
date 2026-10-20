@@ -520,7 +520,7 @@ fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
             if id.is_empty() || name.is_empty() || !args.is_object() {
                 return None;
             }
-            Some(json!({
+            let mut entry = json!({
                 "id": id,
                 "type": "function",
                 "function": {
@@ -528,7 +528,12 @@ fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
                     "arguments": serde_json::to_string(&args)
                         .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
                 }
-            }))
+            });
+            use crate::tool::args::shape::{provider_tool_call_id, PROVIDER_TOOL_CALL_ID_FIELD};
+            if let Some(original) = provider_tool_call_id(tc) {
+                entry[PROVIDER_TOOL_CALL_ID_FIELD] = Value::String(original.to_owned());
+            }
+            Some(entry)
         })
         .collect()
 }

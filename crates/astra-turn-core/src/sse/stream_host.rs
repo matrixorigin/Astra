@@ -1271,8 +1271,12 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     if abort.is_some() {
         accum.stream_complete = false;
         accum.error_kind = abort;
-        accum.full_text.clear();
-        accum.reasoning_content.clear();
+        // A canonical save failure invalidates completion, not text already
+        // received. Keep its partial display while discarding executable work.
+        if accum.error_code.as_deref() != Some("canonical_persistence_failed") {
+            accum.full_text.clear();
+            accum.reasoning_content.clear();
+        }
         accum.tool_calls.clear();
         pending.clear();
         let msg = match abort {
@@ -1469,7 +1473,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
     }
     let effects = dispatch_chat_turn_sse_event_block(event_str, accum, pending);
     let extends_coalescible_batch = {
-        let appended = &pending[pending_len_before..];
+        let appended = pending.get(pending_len_before..).unwrap_or_default();
         !appended.is_empty()
             && appended.iter().all(|item| match item {
                 ChatTurnEdgePending::ToolRequest { tool, args, .. } => {
@@ -2632,6 +2636,57 @@ mod tests {
                 terminal.error_kind,
                 Some(astra_core::ErrorKind::BudgetExhausted)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_preserves_partial_output_without_executing_queued_work() {
+        let frames = [
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\"",
+            ),
+            sse_event("text_delta", ",\"content\":\"partial answer\""),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"queued\",\"tool\":\"read_file\",\"args\":{\"path\":\"fixture\"}",
+            ),
+            sse_event(
+                "run_error",
+                ",\"run_id\":\"root-run\",\"error\":\"Completion could not be saved.\",\"error_code\":\"canonical_persistence_failed\"",
+            ),
+            sse_event(
+                "run_finished",
+                ",\"run_id\":\"root-run\",\"status\":\"failed\",\"error\":\"Completion could not be saved.\"",
+            ),
+            "data: [DONE]\n\n".to_owned(),
+        ];
+        for chunks in [
+            frames
+                .iter()
+                .map(|frame| Ok(frame.as_bytes().to_vec()))
+                .collect::<Vec<_>>(),
+            vec![Ok(frames.concat().into_bytes())],
+        ] {
+            let mut stream = stream::iter(chunks);
+            let mut host = RecordingSseStreamHost::new();
+            let (result, abort) =
+                consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_secs(1)).await;
+            assert_eq!(abort, Some(astra_core::ErrorKind::ContractViolation));
+            assert_eq!(result.accum.full_text, "partial answer");
+            assert_eq!(
+                result.accum.error_code.as_deref(),
+                Some("canonical_persistence_failed")
+            );
+            assert!(
+                result
+                    .accum
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Completion could not be saved")
+            );
+            assert!(result.tool_results.is_empty());
         }
     }
 

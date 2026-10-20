@@ -6854,18 +6854,26 @@ mod tests {
             duration_ms: 2,
             finish_reason: Some("tool_calls".into()),
         });
-        state
-            .stall
-            .tool_call_records
-            .push(astra_services::session_journal::ToolCallRecord {
-                tool_call_id: Some("terminal-evidence-tool".into()),
-                name: "read_file".into(),
-                ok: true,
-                ms: 1,
-                start_offset_ms: Some(3),
-                round: Some(1),
-                ..Default::default()
-            });
+        // The same provider ID in successive rounds must yield independent
+        // immutable evidence, then replay the exact terminal transaction.
+        for round in 0..2 {
+            let accepted = crate::turn::agentic::tool_interception::accept_provider_tool_calls(
+                vec![json!({"id":"terminal-evidence-tool", "type":"function", "function":{"name":"read_file","arguments":"{}"}})],
+                &user_id, &session_id, Some(&run_id), Some("terminal-chain"), round,
+            ).unwrap();
+            state
+                .stall
+                .tool_call_records
+                .push(astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: accepted[0]["id"].as_str().map(str::to_owned),
+                    name: "read_file".into(),
+                    ok: true,
+                    ms: 1,
+                    start_offset_ms: Some(3 + u64::from(round)),
+                    round: Some(round),
+                    ..Default::default()
+                });
+        }
         state.user_intents.record_applied_user_intents(&[
             crate::turn::agentic_loop::host::AppliedUserIntent {
                 intent_id: "terminal-evidence-intent".into(),
@@ -7307,7 +7315,7 @@ mod tests {
         .await
         .expect("load committed durable run");
         assert!(canonical_event_count >= 2);
-        assert_eq!(transcript_count, 5);
+        assert_eq!(transcript_count, 7);
         assert_eq!(terminal_event_count, 2);
         assert_eq!(
             run_row.try_get::<String, _>("status").unwrap(),

@@ -63,6 +63,23 @@ descriptor and provider decision.
 Static and dynamic describe how a declaration enters Astra. They do not create
 different execution semantics.
 
+## Model-issued invocation identity
+
+The shared Server host accepts a selected model response once, before tool
+admission. After validating every provider call ID, it derives a 64-character
+canonical ID from the owner, Session, Run, turn chain, logical loop round and
+original ID using a domain-separated SHA-256 tuple. A later round reusing a
+provider ID is a new invocation; replay uses the stored canonical identity.
+Physical inference retries and optional observation counters do not define it.
+
+Execution, approvals, callbacks, result artifacts, receipts, journal records and
+trace/transcript evidence all retain their existing single canonical-ID path.
+Native runtime-owned calls retain their own IDs. Accepted assistant calls retain
+one bounded original-ID metadata field solely for provider-history projection.
+The existing request adapter restores original assistant/tool pairing and removes
+that field before serializing any provider protocol. Public tool events omit it.
+It grants no execution authority and is not a replay alias or a separate store.
+
 ## First principles
 
 ### Astra owns semantics; protocols supply evidence

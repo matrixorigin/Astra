@@ -787,9 +787,20 @@ impl super::AgenticRunLifecycleService {
                             }
                         }
                         control = fanout_control_rx.recv(), if control_open => {
-                            let Some(DurableLiveFanoutControl::Flush { ack }) = control else {
-                                control_open = false;
-                                continue;
+                            let ack = match control {
+                                Some(DurableLiveFanoutControl::Flush { ack }) => ack,
+                                Some(DurableLiveFanoutControl::PersistenceFailed { detail, ack }) => {
+                                    publish_live_persistence_failure(
+                                        &fanout_runs, &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout, &fanout_user_id,
+                                        &fanout_run_id, "canonical_persistence_failed",
+                                        "Completion could not be saved. Reopen the session to check its recorded state before retrying.",
+                                        &detail,
+                                    ).await;
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                                None => { control_open = false; continue; }
                             };
                             let mut result = Ok(());
                             while let Ok(event) = fanout_rx.try_recv() {

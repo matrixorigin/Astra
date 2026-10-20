@@ -327,3 +327,10 @@ A user should be able to answer:
 - Browser disconnect does not imply cancellation.
 - Cancelled tasks disappear from active task board projection.
 - Resume reconstructs status without stale UI cache.
+
+A failed canonical terminal commit emits a live-only, root-scoped
+`run_error` with `error_code=canonical_persistence_failed`. It preserves partial
+answer text and advises reopening the Session to inspect recorded state before
+retrying. This notification is not a durable terminal or evidence that an
+uncertain transaction committed or rolled back; the canonical recovery owner
+still decides that state. No successful completion is published from this path.

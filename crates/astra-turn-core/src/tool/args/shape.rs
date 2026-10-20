@@ -58,6 +58,21 @@ pub fn parse_tool_call_arguments(tool_call: &Value) -> Result<Value, &'static st
 /// Normalize an admitted tool call into Astra's canonical OpenAI-compatible
 /// execution shape. Provider adapters must normalize their native payloads
 /// before this boundary; flat and mixed legacy shapes fail closed.
+/// Runtime-authored provider linkage, retained only in canonical history.
+/// Execution and public lifecycle events use the canonical top-level `id`.
+pub const PROVIDER_TOOL_CALL_ID_FIELD: &str = "_astra_provider_tool_call_id";
+
+pub fn provider_tool_call_id(call: &Value) -> Option<&str> {
+    call.get(PROVIDER_TOOL_CALL_ID_FIELD)
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 512
+                && id.trim() == *id
+                && !id.chars().any(char::is_control)
+        })
+}
+
 pub fn canonicalize_tool_call_for_execution(tool_call: &Value) -> Result<Value, &'static str> {
     if tool_call.get("name").is_some()
         || tool_call.get("arguments").is_some()
@@ -92,14 +107,15 @@ pub fn canonicalize_tool_call_for_execution(tool_call: &Value) -> Result<Value, 
         .ok_or("tool call id is missing")?;
     let arguments =
         serde_json::to_string(&arguments).map_err(|_| "arguments could not be serialized")?;
-    Ok(serde_json::json!({
+    let mut canonical = serde_json::json!({
         "id": id,
         "type": "function",
-        "function": {
-            "name": name,
-            "arguments": arguments,
-        },
-    }))
+        "function": {"name": name, "arguments": arguments},
+    });
+    if let Some(original) = provider_tool_call_id(tool_call) {
+        canonical[PROVIDER_TOOL_CALL_ID_FIELD] = Value::String(original.to_owned());
+    }
+    Ok(canonical)
 }
 
 pub fn tool_call_arguments_value(tool_call: &Value) -> Value {

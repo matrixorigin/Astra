@@ -171,6 +171,21 @@ fn sanitize_json_except_assistant_tool_arguments(
                 values.remove(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD);
             }
             for (key, child) in values {
+                let protocol_id = (tool_result_frame && key == "tool_call_id")
+                    || (assistant_frame
+                        && path == AssistantToolPath::ToolCallObject
+                        && (key == "id"
+                            || key == crate::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD));
+                if protocol_id
+                    && child.as_str().is_some_and(|id| {
+                        !id.is_empty()
+                            && id.len() <= 512
+                            && id.trim() == id
+                            && !id.chars().any(char::is_control)
+                    })
+                {
+                    continue;
+                }
                 if tool_result_frame
                     && key == crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD
                     && child

@@ -432,6 +432,10 @@ fn enforce_completed_tool_ledger_closure(
 }
 
 enum DurableLiveFanoutControl {
+    PersistenceFailed {
+        detail: String,
+        ack: oneshot::Sender<()>,
+    },
     Flush {
         ack: oneshot::Sender<Result<(), String>>,
     },
@@ -1019,6 +1023,7 @@ async fn publish_live_persistence_failure(
         run_id,
         json!({
             "type": "run_error",
+            "run_id": run_id,
             "error": message,
             "error_code": error_code,
         }),
@@ -16391,6 +16396,7 @@ impl AgenticRunLifecycleService {
                         } else {
                             &[STATUS_RUNNING, STATUS_WAITING]
                         };
+                    let mut terminal_persistence_failure = None;
                     match persist_ctx
                         .persist_atomic_terminal_settlement(
                             &state,
@@ -16531,64 +16537,70 @@ impl AgenticRunLifecycleService {
                                     Err(error) => {
                                         persist_streaming_events = false;
                                         publish_stream_terminal = false;
-                                        runs.write().await.remove(&bg_run_id);
-                                        tracing::warn!(
-                                            target: "astra_runtime::run_lifecycle",
-                                            run_id = %bg_run_id,
-                                            error = %error,
-                                            "failed to persist fallback streaming terminal settlement"
-                                        );
+                                        terminal_persistence_failure = Some(error);
                                     }
                                 }
                             } else {
                                 persist_streaming_events = false;
                                 publish_stream_terminal = false;
-                                runs.write().await.remove(&bg_run_id);
+                                terminal_persistence_failure = core_trace_result.clone().err();
                             }
                         }
                         Err(error) => {
                             persist_streaming_events = false;
                             publish_stream_terminal = false;
-                            let durable_control_terminal =
-                                Self::load_exact_preexisting_control_terminal(
-                                    &run_engine,
-                                    &bg_user_id,
-                                    &bg_run_id,
-                                    execution_owner_generation,
-                                )
-                                .await;
-                            if let Some((waiting_for, status)) = durable_control_terminal {
-                                preexisting_terminal_status = Some(status);
-                                persisted_status = status;
-                                durable_status_committed = true;
-                                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                                    run.status = status;
-                                    run.waiting_for = waiting_for;
-                                    run.live_tx = None;
-                                }
-                                tracing::debug!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %bg_run_id,
-                                    status = status.as_str(),
-                                    error = %error,
-                                    "atomic streaming settlement lost to an exact-generation control terminal; repairing trace and accounting"
-                                );
-                            } else {
-                                core_trace_result = Err(error.clone());
-                                runs.write().await.remove(&bg_run_id);
-                                record_durable_run_event_batch_metrics(
-                                    bg_metrics_registry.as_ref(),
-                                    terminal_metric_path,
-                                    "error",
-                                    &streaming_events_for_durable,
-                                );
-                                tracing::warn!(
-                                    target: "astra_runtime::run_lifecycle",
-                                    run_id = %bg_run_id,
-                                    error = %error,
-                                    "failed to persist atomic streaming canonical terminal settlement"
-                                );
+                            terminal_persistence_failure = Some(error);
+                        }
+                    }
+                    if let Some(error) = terminal_persistence_failure {
+                        let durable_control_terminal =
+                            Self::load_exact_preexisting_control_terminal(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_run_id,
+                                execution_owner_generation,
+                            )
+                            .await;
+                        if let Some((waiting_for, status)) = durable_control_terminal {
+                            preexisting_terminal_status = Some(status);
+                            persisted_status = status;
+                            durable_status_committed = true;
+                            if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                                run.status = status;
+                                run.waiting_for = waiting_for;
+                                run.live_tx = None;
                             }
+                            tracing::debug!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                status = status.as_str(),
+                                error = %error,
+                                "atomic streaming settlement lost to an exact-generation control terminal; repairing trace and accounting"
+                            );
+                        } else {
+                            core_trace_result = Err(error.clone());
+                            if let Some(control) = fanout_control_tx.as_ref() {
+                                let (ack, received) = oneshot::channel();
+                                if control
+                                    .send(DurableLiveFanoutControl::PersistenceFailed {
+                                        detail: error.clone(),
+                                        ack,
+                                    })
+                                    .await
+                                    .is_ok()
+                                {
+                                    let _ = received.await;
+                                }
+                            }
+                            runs.write().await.remove(&bg_run_id);
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                terminal_metric_path,
+                                "error",
+                                &streaming_events_for_durable,
+                            );
+                            tracing::warn!(target: "astra_runtime::run_lifecycle", run_id = %bg_run_id,
+                                    error = %error, "failed to persist streaming canonical terminal settlement");
                         }
                     }
                 }

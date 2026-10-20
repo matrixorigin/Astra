@@ -148,6 +148,7 @@ export type RunErrorEvent = {
   error?: string;
   code?: string;
   error_kind?: string;
+  error_code?: string;
 };
 
 export type RunInterruptedEvent = {

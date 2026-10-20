@@ -13928,10 +13928,11 @@ impl ServerAgenticLoopHost {
                 continue;
             }
             self.start_explain_analyze_tool_admission(tool_call, round_index);
-            self.emit_progress_event(json!({
-                "type": "tool_call",
-                "tool_call": tool_call,
-            }));
+            let mut event = json!({"type": "tool_call", "tool_call": tool_call});
+            if let Some(object) = event.get_mut("tool_call").and_then(Value::as_object_mut) {
+                object.remove(astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD);
+            }
+            self.emit_progress_event(event);
         }
     }
 
@@ -21265,7 +21266,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 {
                     if !crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
                         attempt_llm_messages,
-                        &appended,
+                        &state.messages,
+                        durable_canonical_cursor,
                     ) {
                         let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ContractViolation,
@@ -22393,6 +22395,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // consume this same paired admission; independently resolving the
         // carrier here and again later could let a schema refresh give policy
         // and execution different logical targets.
+        result.tool_calls = crate::turn::agentic::tool_interception::accept_provider_tool_calls(
+            std::mem::take(&mut result.tool_calls),
+            &self.user_id, &self.session_id, state.current_run_id.as_deref(),
+            state.canonical_turn_chain_id.as_deref(), state.current_round_index,
+        ).map_err(|error| astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation, error,
+        ))?;
         let mut preflight_admission = self.canonicalize_tool_admission_for_state(
             state,
             crate::turn::agentic::tool_interception::admit_tool_calls(
@@ -26609,12 +26618,9 @@ mod tests {
     ) -> (AdmittedToolCallOutcome, Vec<Value>) {
         let mut host = test_host_builder(user_id.to_string(), session_id.to_string())
             .with_execution_time_budget(Some(ExecutionTimeBudget {
-                // Preserve the final-answer window while exercising a local
-                // approval timeout before durable reconciliation.
-                remaining_seconds:
-                    astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET
-                        .as_secs()
-                        + 2,
+                // This fixture exercises approval reconciliation only; it has
+                // no following provider request or tool execution to budget.
+                remaining_seconds: 1,
             }))
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .with_interactive_client(true)
@@ -34824,22 +34830,20 @@ mod tests {
                         .any(|message| message.to_string().contains("account-read-complete"))
                 );
             }
-            let invocation_ids = if skill {
-                vec!["source-discover"]
-            } else {
-                vec!["source-discover", "source-select", "source-invoke"]
-            };
-            for invocation_id in invocation_ids {
-                let identity = astra_turn_types::ToolInvocationIdentity::new(
-                    &fixture.scope.user_id,
-                    &fixture.scope.session_id,
-                    &fixture.scope.run_id,
-                    "source-turn",
-                    invocation_id,
-                )
-                .unwrap();
+            let identities = state
+                .stall
+                .tool_call_records
+                .iter()
+                .filter_map(|record| record.invocation_identity.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(identities.len(), if skill { 1 } else { 3 });
+            for identity in identities {
+                assert_eq!(identity.user_id, fixture.scope.user_id);
+                assert_eq!(identity.session_id, fixture.scope.session_id);
+                assert_eq!(identity.run_id, fixture.scope.run_id);
+                assert_eq!(identity.turn_chain_id, "source-turn");
                 let record = ledger
-                    .get(&identity)
+                    .get(identity)
                     .await
                     .unwrap()
                     .expect("canonical invocation receipt");
@@ -36693,6 +36697,7 @@ mod tests {
             crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
                 &attempt_messages,
                 &canonical_appended,
+                0,
             )
         );
     }
@@ -47524,12 +47529,13 @@ mod tests {
         .expect("canonical completed turn commit")
         .expect("completed selection has a delta");
         let committed_messages = committed_segments.concat();
-        assert!(
-            committed_messages.iter().any(|message| {
-                message["role"] == "tool" && message["tool_call_id"] == "call-search-git"
-            }),
-            "completed history must retain the selected invocation contract"
-        );
+        let selected_call = committed_messages.iter()
+            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+            .flatten().find(|call| call[astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] == "call-search-git")
+            .expect("completed history retains original provider linkage");
+        assert!(committed_messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == selected_call["id"]
+        }), "completed history retains the canonical selected invocation pair");
         assert!(complete_tool_pairs(&committed_messages));
 
         // A second user turn is a new execution, not same-run custody recovery.
@@ -51784,6 +51790,132 @@ mod tests {
         assert!(host.take_terminal_control_outcome().is_none());
         inference_ledger.assert_quiescent();
         provider.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn accepted_provider_ids_are_unique_across_rounds_without_changing_wire_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let batches = [
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            vec![0, 8, 9, 10, 11, 12, 13],
+            vec![0, 14, 15, 16, 17, 18],
+            vec![0, 19, 20, 21, 1, 2],
+            vec![0, 1, 2, 3, 4, 5, 6],
+        ];
+        let calls = |batch: &[u32]| {
+            batch.iter().map(|id| json!({
+            "id": if *id == 0 { "bash:83".to_string() } else { format!("call-{id}") },
+            "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"fixture\"}"}
+        })).collect::<Vec<_>>()
+        };
+        let responses = batches.iter().map(|batch| ProviderResponse::OpenAi(json!({
+            "choices": [{"message": {"role":"assistant", "tool_calls":calls(batch)}, "finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5}
+        }))).collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "reused provider IDs",
+            |request| request.path == "/v1/chat/completions",
+            responses,
+        )])
+        .await;
+        let mut host = test_host_builder("identity-owner", "identity-session")
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .with_test_inference_ledger(Default::default())
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(2000),
+            )))
+            .build();
+        let mut state = create_durable_execution_test_state("identity-session");
+        state.canonical_turn_chain_id = Some("identity-chain".into());
+        state
+            .messages
+            .push(json!({"role":"user","content":"Read fixture files without changing anything."}));
+        state.message = "Read fixture files without changing anything.".into();
+        state.user_intent = state.message.clone();
+        let mut receipts = crate::turn::agentic_loop::host::ToolLedgerReceiptAccumulator::default();
+        let mut all_ids = HashSet::new();
+        for (round, batch) in batches.iter().enumerate() {
+            state.current_round_index = round as u32;
+            state.llm_rounds_completed = round as u32;
+            let result = host
+                .execute_turn(&mut state)
+                .await
+                .expect("accepted response");
+            state.commit_volatile_attempt_lease();
+            assert_eq!(result.accum.tool_calls.len(), batch.len());
+            state
+                .messages
+                .push(json!({"role":"assistant","tool_calls":result.accum.tool_calls}));
+            let accepted = state.messages.last().unwrap()["tool_calls"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let records = accepted
+                .iter()
+                .map(|call| astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: call["id"].as_str().map(str::to_owned),
+                    name: "read_file".into(),
+                    ok: true,
+                    round: Some(round as u32),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let attempts = crate::turn::agentic_loop::host::ToolLedgerAttemptBatch::from_validated_provider_calls(&accepted);
+            receipts.observe_round(&attempts, &records);
+            receipts.observe_round(&attempts, &records); // Exact accepted replay closes once.
+            for call in &accepted {
+                let id = call["id"].as_str().unwrap();
+                all_ids.insert(id.to_string());
+                state
+                    .messages
+                    .push(json!({"role":"tool","tool_call_id":id,"content":"fixture result"}));
+            }
+        }
+        provider.assert_complete();
+        let requests = provider.requests.lock().await;
+        for (round, request) in requests.iter().enumerate() {
+            let wire_calls = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["tool_calls"].as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            let original = batches[..round]
+                .iter()
+                .flat_map(|batch| calls(batch))
+                .collect::<Vec<_>>();
+            assert_eq!(wire_calls.len(), original.len());
+            for (wire, raw) in wire_calls.iter().zip(&original) {
+                assert_eq!(
+                    wire["id"], raw["id"],
+                    "provider linkage must stay unchanged"
+                );
+                assert_eq!(wire["function"], raw["function"]);
+            }
+            let results = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect::<Vec<_>>();
+            assert_eq!(results.len(), original.len());
+            for (result, raw) in results.iter().zip(&original) {
+                assert_eq!(result["tool_call_id"], raw["id"]);
+            }
+        }
+        let receipt = receipts.receipt("identity-run", 0);
+        assert_eq!(receipt.attempted, 34);
+        assert_eq!(receipt.terminal, 34);
+        assert!(receipt.is_complete());
+        assert_eq!(
+            all_ids.len(),
+            34,
+            "distinct calls must not collapse to the 22 provider IDs"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -911,6 +911,14 @@ fn apply_one_event(
             Some(_) => {}
         }
     }
+    if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+        && matches!(
+            etype,
+            "tool_request" | "approval_required" | "approval_batch_required"
+        )
+    {
+        return;
+    }
     match etype {
         "warning" => {
             if let Some(message) = event
@@ -1654,6 +1662,36 @@ fn apply_one_event(
                 .get("input_total_tokens")
                 .and_then(Value::as_u64)
                 .filter(|tokens| i64::try_from(*tokens).is_ok());
+        }
+        "run_error" => {
+            // Fanout descendants cannot fail the root observation stream.
+            if accum
+                .root_identity
+                .run_id()
+                .is_some_and(|root| event.get("run_id").and_then(Value::as_str) != Some(root))
+            {
+                return;
+            }
+            if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+                return;
+            }
+            accum.error_message = Some(
+                event
+                    .get("error")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Run failed")
+                    .to_owned(),
+            );
+            accum.error_code = event
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+            accum.pending_attempt_error = true;
+            accum.attempt_error_supersession_eligible = false;
+            accum.explain_analyze_degraded = true;
+            edge_pending.clear();
         }
         "error" => {
             // Indexed errors are durable historical events. An error without
@@ -2846,6 +2884,63 @@ mod tests {
         assert!(a.has_usage);
         assert_eq!(a.prompt_tokens, 100);
         assert_eq!(a.completion_tokens, 50);
+    }
+
+    #[test]
+    fn root_persistence_error_is_sticky_and_preserves_partial_answer() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("run_started", ",\"run_id\":\"root\""),
+            &mut accum,
+            &mut pending,
+        );
+        dispatch_chat_turn_sse_event_block(
+            &sse("text_delta", ",\"content\":\"partial answer\""),
+            &mut accum,
+            &mut pending,
+        );
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_error",
+                ",\"run_id\":\"child\",\"error\":\"child only\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert!(accum.error_message.is_none());
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_error",
+                ",\"run_id\":\"root\",\"error\":\"Completion could not be saved.\",\"error_code\":\"canonical_persistence_failed\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert_eq!(
+            accum.error_message.as_deref(),
+            Some("Completion could not be saved.")
+        );
+        assert_eq!(
+            accum.error_code.as_deref(),
+            Some("canonical_persistence_failed")
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(!accum.server_loop_terminal);
+        assert!(!accum.attempt_error_supersession_eligible);
+        assert_eq!(accum.full_text, "partial answer");
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "approval_required",
+                ",\"request_id\":\"late\",\"tool\":\"bash\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

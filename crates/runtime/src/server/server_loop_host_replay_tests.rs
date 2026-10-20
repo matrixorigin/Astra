@@ -79,6 +79,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
     ] {
         let canonical_before = state.messages.clone();
         state.step_recorder.begin_turn(round);
+        state.current_round_index = round;
         let result = host.execute_turn(&mut state).await.unwrap();
         assert_eq!(
             state.messages, canonical_before,
@@ -89,14 +90,17 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
             &result.accum.reasoning_content,
             false,
         );
-        assert_eq!(assistant, expected);
+        assert_eq!(assistant["reasoning_content"], expected["reasoning_content"]);
+        assert_ne!(assistant["tool_calls"][0]["id"], expected["tool_calls"][0]["id"]);
         assert!(result.accum.error_message.is_none());
         // This projection fixture supplies tool results manually. Adopt the
         // actual provider decision through the same lease owner used by normal
         // execute_turn_and_ingest_phase before starting its next request.
         state.commit_volatile_attempt_lease();
+        let mut canonical_result = tool_result;
+        canonical_result["tool_call_id"] = assistant["tool_calls"][0]["id"].clone();
         state.messages.push(assistant);
-        state.messages.push(tool_result);
+        state.messages.push(canonical_result);
         state.llm_rounds_completed += 1;
     }
     let canonical_before = state.messages.clone();

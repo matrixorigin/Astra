@@ -25048,6 +25048,75 @@ async fn committed_interactions_remain_immediate_delivery_boundaries() {
 }
 
 #[tokio::test]
+async fn canonical_persistence_failure_control_is_live_only_and_sanitized() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("run-persist-error", "owner", "session")
+        .await
+        .unwrap();
+    let (mut run, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "run-persist-error".into(),
+        "session".into(),
+        "owner".into(),
+    );
+    let mut host = server_loop_host::ServerAgenticLoopHostBuilder::new(
+        test_settings(),
+        test_encryptor(),
+        "owner".into(),
+        "session".into(),
+    )
+    .build();
+    let (delivery, mut events) = svc.prepare_stream_delivery(
+        "owner",
+        "session",
+        "run-persist-error",
+        &mut run,
+        &mut host,
+        mpsc::channel(8),
+    );
+    svc.runs
+        .write()
+        .await
+        .insert("run-persist-error".into(), run);
+    let before = store.counters.lock().unwrap().append_calls;
+    let (ack, received) = oneshot::channel();
+    delivery
+        .fanout_control_tx
+        .send(DurableLiveFanoutControl::PersistenceFailed {
+            detail: "synthetic-private SQL payload".into(),
+            ack,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), received)
+        .await
+        .unwrap()
+        .unwrap();
+    let event = events.recv().await.expect("live-only failure");
+    assert_eq!(event["type"], "run_error");
+    assert_eq!(event["run_id"], "run-persist-error");
+    assert_eq!(event["error_code"], "canonical_persistence_failed");
+    assert!(
+        event["error"]
+            .as_str()
+            .unwrap()
+            .contains("Reopen the session")
+    );
+    assert!(!event.to_string().contains("synthetic-private"));
+    assert_eq!(
+        store.counters.lock().unwrap().append_calls,
+        before,
+        "failure notification must not attempt another durable append"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "no successful terminal may follow"
+    );
+    delivery.host_event_bridge.abort();
+}
+
+#[tokio::test]
 async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
     for fail_commit in [false, true] {
         let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));

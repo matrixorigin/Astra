@@ -329,8 +329,13 @@ export function applyStreamEvent(
     }
 
     case "run_error": {
+      if (state.runId && event.run_id && state.runId !== event.run_id) break;
       const message = eventMessage(event, "Astra run failed.");
-      state.assistantText = state.assistantText || message;
+      if (state.lastStatus !== "failed") {
+        state.assistantText = state.assistantText
+          ? `${state.assistantText}\n\n${message}`
+          : message;
+      }
       state.lastStatus = "failed";
       state.runLifecycle = "finished";
       setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
