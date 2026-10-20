@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -9,6 +15,90 @@ from ci_scope import classify, main
 
 
 class CiScopeTests(unittest.TestCase):
+    def assert_rename_selects_expected_scopes(
+        self,
+        source: str,
+        destination: str,
+        expected_scopes: set[str],
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", "-C", str(root), *args], text=True,
+                    stderr=subprocess.PIPE,
+                ).strip()
+
+            git("init", "-q")
+            git("config", "user.name", "CI scope regression")
+            git("config", "user.email", "ci-scope@example.invalid")
+            git("config", "diff.renames", "true")
+            git("config", "commit.gpgsign", "false")
+            original = root / source
+            original.parent.mkdir(parents=True)
+            original.write_text("// unchanged source moved across CI scopes\n")
+            git("add", ".")
+            git("commit", "-qm", "baseline")
+            base = git("rev-parse", "HEAD")
+            (root / destination).parent.mkdir(parents=True, exist_ok=True)
+            git("mv", source, destination)
+            git("commit", "-qm", "move source")
+            head = git("rev-parse", "HEAD")
+            self.assertTrue(git("diff", "--name-status", base, head).startswith("R100"))
+
+            events = [
+                {"before": base, "after": head},
+                {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}},
+            ]
+            for event in events:
+                with self.subTest(event=next(iter(event))):
+                    event_path = root / "event.json"
+                    event_path.write_text(json.dumps(event))
+                    output_path = root / "scope-output"
+                    output_path.write_text("")
+                    result = subprocess.run(
+                        [sys.executable, str(Path(__file__).with_name("ci_scope.py").resolve())],
+                        cwd=root,
+                        env={
+                            **os.environ,
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "GITHUB_OUTPUT": str(output_path),
+                        },
+                        text=True, capture_output=True, check=True,
+                    )
+                    self.assertNotIn("enabling every CI scope", result.stderr)
+                    enabled_scopes = {
+                        name
+                        for name, value in (
+                            line.split("=", maxsplit=1)
+                            for line in output_path.read_text().splitlines()
+                        )
+                        if value == "true"
+                    }
+                    self.assertEqual(enabled_scopes, expected_scopes)
+
+    def test_sdk_to_web_rename_keeps_sdk_validation(self) -> None:
+        self.assert_rename_selects_expected_scopes(
+            "packages/sdk/src/moved.ts",
+            "web/lib/moved.ts",
+            {"sdk", "web"},
+        )
+
+    def test_runtime_to_cli_rename_keeps_runtime_validation(self) -> None:
+        self.assert_rename_selects_expected_scopes(
+            "crates/runtime/src/moved.rs",
+            "crates/astra-cli/src/moved.rs",
+            {
+                "rust",
+                "test_runtime",
+                "test_cli",
+                "test_core",
+                "online_core",
+                "online_integration",
+            },
+        )
+
     def test_documentation_and_governance_use_no_heavy_scope(self) -> None:
         scopes = classify(
             ["README.md", "docs/guides/testing.md", "CITATION.cff", ".github/CODEOWNERS"]

@@ -220,8 +220,12 @@ def changed_paths_from_event() -> list[str]:
         head = event.get("after") or os.environ.get("GITHUB_SHA")
     if not base or not head or set(base) == {"0"}:
         return []
+    # A rename affects both the source and destination scopes. Name-only
+    # output with rename detection reports just the destination, which can
+    # silently skip validation for the code removed from the source area.
     output = subprocess.check_output(
-        ["git", "diff", "--name-only", "-z", base, head], stderr=subprocess.STDOUT
+        ["git", "diff", "--no-renames", "--name-only", "-z", base, head],
+        stderr=subprocess.STDOUT,
     )
     return [item.decode("utf-8") for item in output.split(b"\0") if item]
 
