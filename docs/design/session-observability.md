@@ -353,3 +353,9 @@ cursor only for a matching Session, root Run and assistant projection. Resume
 uses that server-selected assistant, including a completed paused message;
 missing local bindings are refreshed once and reported as unavailable rather
 than creating a browser-only assistant.
+
+Web admits live Run observation only from the committed selected binding. Resume
+and queued input publish that selection; the existing lifecycle owner registers
+POST creation and admits GET observers using one chat/session/run/message lease.
+Replacement and unmount retire only observation, fencing late callbacks, queued
+patches and retries. Cursor and status progress do not replace a live observer.

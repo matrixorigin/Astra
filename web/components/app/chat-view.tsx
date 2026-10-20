@@ -25,7 +25,6 @@ import { IconButton } from "@/components/ui/icon-button";
 import { useChatLifecycleActions } from "@/hooks/use-chat-lifecycle-actions";
 import {
   useStreamLifecycle,
-  canAttachRunStream,
 } from "@/hooks/use-stream-lifecycle";
 import { useWorkspaceSelection } from "@/hooks/use-workspace-selection";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
@@ -131,7 +130,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     workspaceSelectionExplicit: ws.workspaceSelectionExplicit,
     canStopRun,
     canResumeRun,
-    canQueueDeferredInput,
+    runControlBusy,
     setStartingRun,
     setQueueingDeferredInput,
     setResumingRun,
@@ -215,70 +214,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     }
   }, [activeRunStatus, lastQueuedText]);
 
-  // Cleanup on unmount
-  useEffect(
-    () => () => {
-      stream.streamAbortRef.current?.abort();
-      if (stream.autoAttachRetryTimerRef.current) {
-        window.clearTimeout(stream.autoAttachRetryTimerRef.current);
-        stream.autoAttachRetryTimerRef.current = undefined;
-      }
-      stream.stopReconcileRef.current();
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
-
   // Hydrate work surface
   useEffect(() => {
     void hydrateWorkSurfaceForChat();
   }, [hydrateWorkSurfaceForChat]);
-
-  // Auto-attach to an existing run stream
-  useEffect(() => {
-    const activeRun = detail.activeRun;
-    if (!activeRun?.runId) {
-      stream.autoAttachAttemptedRunRef.current = null;
-      stream.autoAttachRetryCountsRef.current.clear();
-      if (stream.autoAttachRetryTimerRef.current) {
-        window.clearTimeout(stream.autoAttachRetryTimerRef.current);
-        stream.autoAttachRetryTimerRef.current = undefined;
-      }
-      return;
-    }
-    if (
-      isArchived ||
-      detail.pendingTurn ||
-      !canAttachRunStream(activeRun.status) ||
-      stream.attachedRunRef.current === activeRun.runId ||
-      stream.autoAttachAttemptedRunRef.current === activeRun.runId
-    ) {
-      return;
-    }
-
-    stream.autoAttachAttemptedRunRef.current = activeRun.runId;
-    const assistantMessageId = stream.ensureStreamingAssistantMessage(
-      activeRun.assistantMessageId,
-    );
-    stream.attachExistingRunStream(
-      activeRun.runId,
-      assistantMessageId,
-      "The run is active, but the web UI could not reconnect to its stream.",
-      {
-        scheduleRetry: () => stream.scheduleAutoAttachRetry(activeRun.runId),
-      },
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    detail.activeRun,
-    detail.pendingTurn,
-    isArchived,
-    runAttachRetrySignal,
-    // Stable callbacks that the effect logically depends on:
-    stream.attachExistingRunStream,
-    stream.ensureStreamingAssistantMessage,
-    stream.scheduleAutoAttachRetry,
-  ]);
 
   // Auto-scroll when messages change
   useEffect(() => {

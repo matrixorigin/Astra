@@ -7,7 +7,7 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import type { WorkTaskGraphPageV2 } from "@astra/sdk";
 import { emitChatLifecycleChange } from "@/lib/chat-lifecycle-events";
 import { ChatView } from "@/components/app/chat-view";
@@ -219,6 +219,8 @@ const defaultActiveRun: NonNullable<ChatDetail["activeRun"]> = {
   runId: "run-123",
   status: "running",
   waitingFor: null,
+  assistantMessageId: "assistant-live",
+  nextEventIndex: 0,
 };
 
 function makeDetail(
@@ -240,8 +242,11 @@ function makeDetail(
       persisted: true,
       messageCount: 0,
     },
-    messages: [],
-    activeRun: activeRun ?? undefined,
+    messages: activeRun?.assistantMessageId ? [{
+      id: activeRun.assistantMessageId, role: "assistant", content: "",
+      createdAt: "2026-06-07T00:00:00.000Z", status: "streaming",
+    }] : [],
+    activeRun: activeRun ? { nextEventIndex: 0, ...activeRun } : undefined,
   };
 }
 
@@ -267,6 +272,12 @@ function mockAnimationFrameQueue() {
       }
       callbacks.delete(id);
       callback(0);
+    },
+    flushAll() {
+      for (const [id, callback] of [...callbacks]) {
+        callbacks.delete(id);
+        callback(0);
+      }
     },
     restore() {
       globalThis.requestAnimationFrame = originalRequestAnimationFrame;
@@ -1138,6 +1149,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         status: "input-queued",
         waitingFor: "user_input",
         assistantMessageId: "queued-assistant-1",
+        nextEventIndex: 0,
       },
     });
 
@@ -1229,6 +1241,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         status: "input-queued",
         waitingFor: "user_input",
         assistantMessageId: "queued-assistant-1",
+        nextEventIndex: 0,
       },
     });
     await waitFor(() => {
@@ -1389,7 +1402,9 @@ describe("ChatView deferred-input unhappy paths", () => {
         .mockRejectedValueOnce(new Error("temporary stream failure"))
         .mockResolvedValueOnce("");
 
-      render(<ChatView initial={makeDetail()} />);
+      const initial = makeDetail();
+      mockGetChat.mockResolvedValue(initial);
+      render(<ChatView initial={initial} />);
 
       await act(async () => {
         await Promise.resolve();
@@ -1398,9 +1413,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(1);
 
       await act(async () => {
-        vi.advanceTimersByTime(1_000);
-        await Promise.resolve();
-        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1_000);
       });
 
       expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
@@ -1477,6 +1490,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       <ChatView
         initial={makeDetail({
           runId: "run-blocked",
+            assistantMessageId: "assistant-blocked",
           status: "blocked",
           waitingFor: "executor_offline",
         })}
@@ -1520,6 +1534,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         status: "input-queued",
         waitingFor: "user_input",
         assistantMessageId: "queued-assistant-1",
+        nextEventIndex: 0,
       },
     });
 
@@ -1581,6 +1596,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         status: "input-queued",
         waitingFor: "user_input",
         assistantMessageId: "queued-assistant-1",
+        nextEventIndex: 0,
       },
     });
 
@@ -1926,7 +1942,10 @@ describe("ChatView deferred-input unhappy paths", () => {
     } finally { fetch.mockRestore(); }
   });
 
-  it.each(["reply", "refresh"])("preserves a newer message binding while the resume %s is delayed", async point => {
+  it.each([
+    { point: "reply", committed: false }, { point: "refresh", committed: false },
+    { point: "reply", committed: true }, { point: "refresh", committed: true },
+  ])("observes the committed newer binding after delayed $point (committed=$committed)", async ({ point, committed }) => {
     const user = userEvent.setup();
     const initial: ChatDetail = {
       ...makeDetail({ runId: "run-123", status: "paused", assistantMessageId: "assistant-a" }),
@@ -1945,20 +1964,176 @@ describe("ChatView deferred-input unhappy paths", () => {
     render(<ChatView initial={initial} />);
     await user.click(screen.getByRole("button", { name: "Resume" }));
     if (point === "refresh") await waitFor(() => expect(mockGetChat).toHaveBeenCalled());
-    act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: {
+    const replaceBinding = () => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: {
       ...initial, activeRun: { runId: "run-123", status: "running", assistantMessageId: "assistant-b", nextEventIndex: 12 },
-    } }));
-    if (point === "reply") await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalledWith("chat-123", "run-123", expect.anything(),
-      { assistantMessageId: "assistant-b", nextEventIndex: 12 }));
-    const observer = mockStreamExistingChatRun.mock.calls[0]?.[2].signal;
+    } });
+    if (committed) act(replaceBinding);
     await act(async () => {
+      if (!committed) replaceBinding();
       if (point === "reply") reply(response);
       else refresh({ ...initial, activeRun: response.activeRun });
     });
-    expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(point === "reply" ? 1 : 0);
-    if (observer) expect(observer.aborted).toBe(false);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalledExactlyOnceWith("chat-123", "run-123", expect.anything(),
+      { assistantMessageId: "assistant-b", nextEventIndex: 12 }));
+    expect(mockStreamExistingChatRun.mock.calls[0][2].signal?.aborted).toBe(false);
     expect(screen.getByText("New selected answer B")).toBeInTheDocument();
     expect(screen.getByText("Paused answer A")).toBeInTheDocument();
+  });
+
+  it.each([false, true])("scopes pending POST transcript recovery to its observer (replaced=%s)", async replaced => {
+    vi.useFakeTimers();
+    try {
+      const userMessage = { id: "pending-user", role: "user" as const, content: "First turn", createdAt: "2026-06-07T00:00:00Z", status: "complete" as const };
+      const assistant = { id: "assistant-a", role: "assistant" as const, content: "", createdAt: "2026-06-07T00:00:01Z", status: "streaming" as const };
+      let resolveTranscript!: (detail: ChatDetail) => void;
+      mockGetChat.mockImplementation(() => new Promise(resolve => { resolveTranscript = resolve; }));
+      mockStreamChatMessage.mockImplementation((_chat, _payload, handlers) => {
+        handlers.onLocalMessages?.({ userMessage, assistantMessage: assistant });
+        handlers.onRunStarted?.("root-a");
+        return new Promise(() => {});
+      });
+      mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+      const initial: ChatDetail = { ...makeDetail(null), messages: [userMessage], pendingTurn: {
+        messageId: userMessage.id, content: userMessage.content, options: composerPayload.options,
+      } };
+      render(<ChatView initial={initial} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(mockStreamChatMessage).toHaveBeenCalledOnce();
+      const creation = mockStreamChatMessage.mock.calls[0][2].signal!;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      expect(mockGetChat).toHaveBeenCalledOnce();
+      let replacement: AbortSignal | undefined;
+      if (replaced) {
+        const next = makeDetail({ runId: "root-b", status: "running", assistantMessageId: "assistant-b", nextEventIndex: 12 });
+        next.messages[0].content = "Selected B";
+        act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+        expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
+        replacement = mockStreamExistingChatRun.mock.calls[0][2].signal;
+      }
+      await act(async () => resolveTranscript({ ...makeDetail(null), messages: [userMessage,
+        { ...assistant, content: "Recovered A", status: "complete" }],
+      }));
+      if (replaced) {
+        expect(replacement?.aborted).toBe(false);
+        expect(screen.getByText("Selected B")).toBeInTheDocument();
+        expect(screen.queryByText("Recovered A")).not.toBeInTheDocument();
+        expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
+      } else {
+        expect(creation.aborted).toBe(true);
+        expect(screen.getByText("Recovered A")).toBeInTheDocument();
+        expect(mockStreamExistingChatRun).not.toHaveBeenCalled();
+        await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+        expect(mockGetChat).toHaveBeenCalledOnce();
+      }
+      expect(mockStopChatRun).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("admits one observer in StrictMode and none after immediate unmount", async () => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    const first = render(<StrictMode><ChatView initial={makeDetail()} /></StrictMode>);
+    first.unmount();
+    await act(async () => { await Promise.resolve(); });
+    expect(mockStreamExistingChatRun).not.toHaveBeenCalled();
+    const second = render(<StrictMode><ChatView initial={makeDetail()} /></StrictMode>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalledOnce());
+    const signal = mockStreamExistingChatRun.mock.calls[0][2].signal!;
+    second.unmount();
+    expect(signal.aborted).toBe(true);
+    expect(mockStopChatRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["message", "root", "session"])("fences stale callbacks, RAF and cleanup after %s replacement", async change => {
+    const frames = mockAnimationFrameQueue();
+    const first = makeDetail({ ...defaultActiveRun, assistantMessageId: "assistant-a" });
+    first.messages = [
+      { id: "assistant-a", role: "assistant", content: "Saved A", createdAt: "2026-06-07T00:00:00Z", status: "streaming" },
+      { id: "assistant-b", role: "assistant", content: "Saved B", createdAt: "2026-06-07T00:00:01Z", status: "streaming" },
+    ];
+    const next: ChatDetail = { ...first, session: { ...first.session!, backendSessionId: change === "session" ? "next-session" : "chat-123" },
+      activeRun: { runId: change === "root" ? "next-root" : "run-123", status: "running", assistantMessageId: "assistant-b", nextEventIndex: 12 } };
+    let finish!: () => void;
+    let fail!: (error: Error) => void;
+    mockStreamExistingChatRun.mockImplementationOnce(() => new Promise((resolve, reject) => {
+      finish = () => resolve(""); fail = reject;
+    })).mockImplementation(() => new Promise(() => {}));
+    try {
+      render(<ChatView initial={first} />);
+      await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalledOnce());
+      const old = mockStreamExistingChatRun.mock.calls[0][2];
+      act(() => old.onText?.("Pending stale A"));
+      act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+      await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2));
+      const current = mockStreamExistingChatRun.mock.calls[1][2];
+      expect(old.signal?.aborted).toBe(true);
+      act(() => {
+        old.onRunUpdated?.({ runId: "run-123", status: "running" });
+        old.onText?.("Late stale A"); old.onDone?.("Stale terminal");
+        frames.flushAll();
+      });
+      await act(async () => {
+        if (change === "message") finish();
+        else fail(change === "root" ? new WebApiError(500, "Stale failure", "canonical_persistence_failed") : new Error("stale socket"));
+      });
+      act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: {
+        ...next, activeRun: { ...next.activeRun!, status: "waiting", nextEventIndex: 20 },
+      } }));
+      expect(current.signal?.aborted).toBe(false);
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Saved A")).toBeInTheDocument();
+      expect(screen.getByText("Saved B")).toBeInTheDocument();
+      expect(screen.queryByText(/Stale terminal|Late stale|Pending stale/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+      expect(mockStopChatRun).not.toHaveBeenCalled();
+    } finally { frames.restore(); }
+  });
+
+  it("retires the old binding's retry timer when a new message is selected", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = makeDetail();
+      mockGetChat.mockResolvedValue(first);
+      mockStreamExistingChatRun.mockRejectedValueOnce(new Error("temporary stream failure"))
+        .mockImplementation(() => new Promise(() => {}));
+      render(<ChatView initial={first} />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
+      const next = { ...first, activeRun: { ...first.activeRun!, assistantMessageId: "assistant-next", nextEventIndex: 12 },
+        messages: [{ id: "assistant-next", role: "assistant" as const, content: "New answer", createdAt: "2026-06-07T00:00:01Z", status: "streaming" as const }] };
+      act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
+      expect(mockStreamExistingChatRun.mock.calls[1][3]).toMatchObject({ assistantMessageId: "assistant-next", nextEventIndex: 12 });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("registers the live POST with the same owner and retains trailing authoritative text", async () => {
+    const user = userEvent.setup();
+    const actual = await vi.importActual<typeof import("@/lib/api/chats")>("@/lib/api/chats");
+    mockStreamChatMessage.mockImplementation(actual.streamChatMessage);
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    const send = (events: object[]) => controller.enqueue(new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")));
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream));
+    try {
+      render(<ChatView initial={makeDetail(null)} />);
+      await user.click(screen.getByRole("button", { name: "Submit composer" }));
+      await act(async () => send([
+        { type: "session_info", session_id: "created-session", run_id: "created-root" },
+        { type: "text_delta", content: "Partial POST answer", index: 8 },
+      ]));
+      await waitFor(() => expect(screen.getByText("Partial POST answer")).toBeInTheDocument());
+      expect(mockStreamExistingChatRun).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+      await act(async () => send([{ type: "run_finished", run_id: "created-root", status: "completed", index: 9 }]));
+      await act(async () => {
+        send([{ type: "turn_complete", assistant_text: "Authoritative POST answer", index: 10 }]); controller.close();
+      });
+      await waitFor(() => expect(screen.getByText("Authoritative POST answer")).toBeInTheDocument());
+      expect(mockStreamChatMessage).toHaveBeenCalledOnce();
+      expect(mockStreamExistingChatRun).not.toHaveBeenCalled();
+    } finally { fetch.mockRestore(); }
   });
 
   it.each([true, false])("refreshes a missing resume binding once (recovered=%s)", async recovered => {
@@ -2058,10 +2233,8 @@ describe("ChatView deferred-input unhappy paths", () => {
         screen.getByText("Refreshed paused transcript"),
       ).toBeInTheDocument();
     });
-    expect(
-      screen.getByText((content) =>
-        content.includes("could not reconnect to its stream"),
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Run paused")).toBeInTheDocument();
+    expect(mockGetChat).toHaveBeenCalledExactlyOnceWith("chat-123");
+    expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
   });
 });
