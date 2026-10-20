@@ -11913,6 +11913,8 @@ impl AgenticRunLifecycleService {
             descriptors.mcp.as_ref(),
             "mcp",
         )?;
+        let tool_call_timeout =
+            runtime_mcp::parse_agent_binding_mcp_tool_call_timeout(&mcp_descriptor.metadata)?;
         let mcp_endpoint_url = mcp_descriptor.endpoint_url.clone();
         let skill_descriptor = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.skills",
@@ -11978,6 +11980,7 @@ impl AgenticRunLifecycleService {
                 );
                 (bundle?, prepared_skills?)
             };
+        bundle = bundle.with_tool_call_timeout(tool_call_timeout);
         if let Some(config) =
             super::super::capability_source::CapabilitySourceConfig::parse(&mcp_descriptor.metadata)
                 .map_err(|error| {

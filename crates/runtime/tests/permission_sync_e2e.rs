@@ -41,6 +41,47 @@ async fn setup_router(dt: Arc<DelegationTracker>) -> Arc<AgentMailboxRouter> {
     Arc::new(AgentMailboxRouter::new(transport, dt))
 }
 
+#[tokio::test]
+async fn root_approval_failure_preserves_the_policy_reason() {
+    use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
+
+    let router = setup_router(tracker()).await;
+    let mut root_mailbox = router
+        .register(addr("root-run", "root"), None)
+        .await
+        .unwrap();
+    for with_mailbox in [false, true] {
+        let context = PermissionSyncContext::shared_root(PermissionMode::Auto);
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"git -C /tmp/project status"}"#),
+            Some(&context),
+            if with_mailbox {
+                Some(&mut root_mailbox)
+            } else {
+                None
+            },
+            REQUEST_TIMEOUT,
+        )
+        .await;
+        let PermissionCheckResult::Denied { reason } = result else {
+            panic!("unavailable approval must not allow execution: {result:?}");
+        };
+        assert!(
+            reason.contains("Git safety:"),
+            "policy cause was lost: {reason}"
+        );
+        assert!(
+            reason.contains("-C"),
+            "the guarded operation was lost: {reason}"
+        );
+        assert!(
+            reason.contains("no parent"),
+            "approval transport cause was lost: {reason}"
+        );
+    }
+}
+
 // ─── E2E: Parent-Child Permission Flow ──────────────────────────────────────
 
 /// Full end-to-end test: child sends permission request, parent processes and responds

@@ -9,7 +9,7 @@ use astra_runtime_env::CapacityProvider;
 use astra_server_types::edge_connection_pool::EdgeToolResult;
 use astra_server_types::edge_ws_protocol::*;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -508,13 +508,7 @@ async fn handle_edge_connection(
             state
                 .edge_connection_pool
                 .gc_reconnect_lock(&user_id, &edge_agent_id);
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "edge registry registration failed".into(),
-                },
-            )
-            .await;
+            close_unavailable_edge_registry(&ws_sink).await;
             return;
         }
     };
@@ -586,26 +580,16 @@ async fn handle_edge_connection(
         state
             .edge_connection_pool
             .gc_reconnect_lock(&user_id, &edge_agent_id);
-        let message = match finalization_result {
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::edge_ws",
-                    user_id = %user_id,
-                    edge_agent_id = %edge_agent_id,
-                    %error,
-                    "edge WebSocket: durable registration finalization failed"
-                );
-                "edge registry finalization failed"
-            }
-            _ => "edge registry registration claim lost",
-        };
-        let _ = send_edge_msg(
-            &ws_sink,
-            EdgeServerMessage::AuthError {
-                message: message.into(),
-            },
-        )
-        .await;
+        if let Err(error) = finalization_result {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge WebSocket: durable registration finalization failed"
+            );
+        }
+        close_unavailable_edge_registry(&ws_sink).await;
         return;
     }
 
@@ -1530,6 +1514,23 @@ async fn send_edge_msg(
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| ())
+}
+
+async fn close_unavailable_edge_registry(
+    sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+) {
+    use futures_util::SinkExt;
+    // Registration storage is unavailable, not an authoritative rejection of
+    // the credentials. Keep the connection unpublished and let the existing
+    // Edge reconnect lifecycle retry without restarting its host process.
+    let _ = sink
+        .lock()
+        .await
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::AGAIN,
+            reason: "edge registry unavailable".into(),
+        })))
+        .await;
 }
 
 async fn fail_inflight_edge_dispatches(

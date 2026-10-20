@@ -654,6 +654,22 @@ reconciliation/deferred events, and compaction cursor progress. Reflect keeps
 the lifecycle events in its durable evidence graph even when they are not
 children of a context decision.
 
+## MCP gateway transport budget
+
+An authenticated MCP capability descriptor may declare
+`metadata.tool_call_timeout_ms`, an integer from 1 through 3,600,000. It bounds
+the gateway's tool-invocation response wait (`tools/call` and effectful
+capability-source RPCs); the existing default is 120,000 ms.
+Malformed explicit declarations fail capability admission before either MCP or
+skill discovery starts, with the same error for live and snapshot preparation.
+
+The gateway chooses a budget that covers its admitted operations and terminal
+receipts. Astra treats tool arguments as provider-owned data and does not infer
+transport deadlines from business-specific arguments. Discovery keeps its
+existing budget. Cancellation signals the same protocol exchange and retains a
+maximum 120-second settlement wait, even for longer configured calls. Without a
+matching terminal response, execution remains outcome-unknown.
+
 ## Resource context
 
 A complete provider-resource subsystem must normalize provider resources,

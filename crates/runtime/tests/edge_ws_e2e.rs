@@ -1596,6 +1596,7 @@ async fn edge_ws_rejects_runtime_token_without_binding() {
 // ── B2: DB registration failure rejects WS connection ────────────────
 
 struct BlockingLeaseEdgeRegistry {
+    finalization_outcome: Result<bool, String>,
     registration_started: Notify,
     release_registration: Notify,
     claim_release_started: Notify,
@@ -1647,6 +1648,7 @@ impl BlockingLeaseEdgeRegistry {
         block_first_release: bool,
     ) -> Self {
         Self {
+            finalization_outcome: Ok(true),
             registration_started: Notify::new(),
             release_registration: Notify::new(),
             claim_release_started: Notify::new(),
@@ -1720,6 +1722,13 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
     ) -> Result<bool, String> {
         self.rollback_count.fetch_add(1, Ordering::SeqCst);
         Ok(true)
+    }
+
+    async fn finalize_registration(
+        &self,
+        _lease: &astra_services::multi_agent::EdgeRegistrationLease,
+    ) -> Result<bool, String> {
+        self.finalization_outcome.clone()
     }
 
     async fn release_registration(
@@ -2170,7 +2179,7 @@ impl astra_services::multi_agent::EdgeRegistryService for FailingEdgeRegistry {
 }
 
 #[tokio::test]
-async fn edge_ws_rejects_connection_when_db_registration_fails() {
+async fn edge_ws_closes_unavailable_when_db_registration_fails() {
     let state = AppState::new(
         ServiceInfo::new("edge-b2-test", "0.0.0-test", ""),
         Arc::new(StubHealthChecker),
@@ -2203,12 +2212,17 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
     .await
     .unwrap();
 
-    let resp: serde_json::Value =
-        serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    let response = ws.next().await.unwrap().unwrap();
+    let Message::Close(Some(close)) = response else {
+        panic!(
+            "DB unavailability must close without permanently rejecting credentials: {response:?}"
+        );
+    };
     assert_eq!(
-        resp["type"], "edge_auth_error",
-        "DB failure must reject the connection: {resp}"
+        close.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Again
     );
+    assert_eq!(close.reason, "edge registry unavailable");
     assert!(
         !state_clone
             .edge_connection_pool
@@ -2216,6 +2230,63 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_closes_unavailable_and_rolls_back_failed_finalization() {
+    for outcome in [Err("private storage failure".to_string()), Ok(false)] {
+        let mut registry = BlockingLeaseEdgeRegistry::new();
+        registry.finalization_outcome = outcome;
+        let registry = Arc::new(registry);
+        let state = AppState::new(
+            ServiceInfo::new("edge-finalize-failure", "0.0.0-test", ""),
+            Arc::new(StubHealthChecker),
+        )
+        .with_auth_service(Arc::new(StubAuthService))
+        .with_edge_registry_service(registry.clone());
+        let observed = state.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, astra_runtime::build_app(state))
+                .await
+                .unwrap()
+        });
+        let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+            .await
+            .unwrap();
+        ws.send(Message::Text(
+            json!({
+                "type": "edge_auth",
+                "edge_agent_id": "edge-finalize-failure",
+                "materialization_id": "materialization-test",
+                "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                "capabilities": edge_capabilities("edge-finalize-failure")
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        registry.registration_started.notified().await;
+        registry.release_registration.notify_one();
+        let response = ws.next().await.unwrap().unwrap();
+        let Message::Close(Some(close)) = response else {
+            panic!("setup failure must close without a credential rejection: {response:?}");
+        };
+        assert_eq!(
+            close.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Again
+        );
+        assert_eq!(close.reason, "edge registry unavailable");
+        assert_eq!(registry.rollback_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !observed
+                .edge_connection_pool
+                .has_connected_edge("test-user-1")
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

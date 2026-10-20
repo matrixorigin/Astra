@@ -14692,6 +14692,76 @@ async fn service_with_in_memory_binding() -> (
 }
 
 #[tokio::test]
+async fn invalid_mcp_timeout_is_rejected_before_live_or_snapshot_discovery() {
+    use astra_services::runs::{
+        RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION, RuntimeCapabilityDescriptorsRequest,
+        RuntimeCapabilityDiscoverySnapshotRequest, RuntimeCapabilitySkillCatalogSnapshotRequest,
+    };
+    use axum::{Router, extract::State, http::Uri};
+
+    async fn unavailable_gateway(
+        State(requests): State<Arc<TokioMutex<Vec<Uri>>>>,
+        uri: Uri,
+    ) -> StatusCode {
+        requests.lock().await.push(uri);
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    let requests = Arc::new(TokioMutex::new(Vec::new()));
+    let app = Router::new()
+        .fallback(unavailable_gateway)
+        .with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (service, _bindings, record) = service_with_in_memory_binding().await;
+    let snapshot = RuntimeCapabilityDiscoverySnapshotRequest {
+        version: RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION.into(),
+        tools: vec![],
+        skill_catalogs: vec![RuntimeCapabilitySkillCatalogSnapshotRequest {
+            agent_binding_id: record.id.clone(),
+            skills: vec![],
+        }],
+    };
+    for discovery_snapshot in [None, Some(snapshot)] {
+        let mut request = prepared_test_request("inspect capabilities");
+        request.agent_binding = Some(test_binding_request(&record.id));
+        request.provider_runtime_authorized = true;
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer test-grant".into(),
+        });
+        let mut mcp = test_runtime_descriptor("tools", "mcp", &format!("{endpoint}/mcp"));
+        mcp.metadata.insert("tool_call_timeout_ms".into(), json!(0));
+        request.capability_descriptors = Some(RuntimeCapabilityDescriptorsRequest {
+            mcp: Some(mcp),
+            skills: Some(test_runtime_descriptor(
+                "skills",
+                "skills",
+                &format!("{endpoint}/skills"),
+            )),
+            discovery_snapshot,
+            ..Default::default()
+        });
+        let constraints = AgenticRunLifecycleService::try_request_constraints(&request).unwrap();
+        let error = service
+            .prepare_runtime_capabilities("test-user", &request, &constraints)
+            .await
+            .err()
+            .expect("invalid timeout must fail capability admission");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("agent_binding_capability_ref_invalid")
+        );
+        assert!(
+            requests.lock().await.is_empty(),
+            "invalid timeout must not start MCP or skill discovery"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn capability_source_prepares_dynamic_plugin_skills_before_policy_with_empty_catalog() {
     use astra_services::runs::{
         RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION, RuntimeCapabilityDescriptorsRequest,

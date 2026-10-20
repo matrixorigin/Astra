@@ -112,6 +112,10 @@ Connection publication follows these invariants:
 - authentication succeeds and its acknowledgement is delivered before the
   connection becomes dispatchable;
 - durable registration failure leaves no active in-memory route;
+- unavailable registration storage or a lost setup claim closes the WebSocket
+  with code 1013 (try again later), allowing the existing Edge reconnect loop
+  to retry; it must not become a permanent credential rejection or a host
+  process exit;
 - reconnect uses a generation-fenced handoff so stale cleanup cannot remove a
   newer connection;
 - native admission reads local and durable registration views behind the

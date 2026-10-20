@@ -74,6 +74,14 @@ Permission scope must be explicit:
 
 Plan mode denial is policy, not permission absence. Diagnostics should distinguish “permission missing” from “plan mode blocks mutation”.
 
+## Approval diagnostics
+
+When an approval cannot be delivered, the tool result must retain both the
+policy reason that required approval and the delivery failure. In particular,
+a root Run with no parent must still explain the guarded operation; a mailbox
+error alone cannot explain how the caller should recover. The action remains
+denied until the existing permission owner grants it.
+
 ## Revocation
 
 Revocation should be durable and provider-visible. Revoked grants should not be silently re-enabled by reconnect or resume.

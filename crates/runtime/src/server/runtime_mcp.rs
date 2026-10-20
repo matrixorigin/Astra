@@ -33,6 +33,7 @@ use tokio::sync::RwLock;
 
 const AGENT_BINDING_MCP_RPC_TIMEOUT_SECS: u64 = 120;
 const AGENT_BINDING_MCP_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const AGENT_BINDING_MCP_MAX_TOOL_CALL_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const AGENT_BINDING_SEMANTIC_READ_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 const AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION: &str =
     astra_services::runs::RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION;
@@ -58,7 +59,35 @@ pub(crate) struct RuntimeMcpBundle {
         crate::server::semantic_read_freshness::ProviderSemanticFreshnessRegistry,
 }
 
+/// Admit the gateway's invocation budget before starting live discovery or
+/// preparing a snapshot. Discovery and cancellation retain separate budgets.
+pub(crate) fn parse_agent_binding_mcp_tool_call_timeout(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Duration, (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = metadata.get("tool_call_timeout_ms") else {
+        return Ok(Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS));
+    };
+    let timeout_ms = value
+        .as_u64()
+        .filter(|value| (1..=AGENT_BINDING_MCP_MAX_TOOL_CALL_TIMEOUT_MS).contains(value))
+        .ok_or_else(|| {
+            mcp_error(
+                StatusCode::BAD_REQUEST,
+                "capability_descriptors.mcp.metadata.tool_call_timeout_ms must be an integer between 1 and 3600000",
+                "agent_binding_capability_ref_invalid",
+            )
+        })?;
+    Ok(Duration::from_millis(timeout_ms))
+}
+
 impl RuntimeMcpBundle {
+    pub(crate) fn with_tool_call_timeout(mut self, timeout: Duration) -> Self {
+        if let Some(runtime) = self.agent_binding_mcp.as_mut() {
+            Arc::make_mut(runtime).tool_call_timeout = timeout;
+        }
+        self
+    }
+
     /// Return the resolver-owned public-alias to provider-native identity
     /// projection. Runtime schema installation must carry this exact map so
     /// an alias is never reinterpreted as an execution name later.
@@ -168,6 +197,7 @@ pub(crate) struct AgentBindingMcpRuntime {
     server_name: String,
     endpoint_url: String,
     authorization: String,
+    tool_call_timeout: Duration,
     tool_names_by_public_name: Arc<HashMap<String, String>>,
     resolved_snapshot: Arc<ResolvedProviderSnapshot>,
     workspace_effects_by_public_name: Arc<HashMap<String, ResolvedToolEffect>>,
@@ -1628,6 +1658,7 @@ impl AgentBindingMcpRuntime {
             server_name: server_name.to_string(),
             endpoint_url: endpoint_url.to_string(),
             authorization: "Bearer test".to_string(),
+            tool_call_timeout: Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
             workspace_effects_by_public_name: Arc::new(
                 public_tool_names
@@ -1743,7 +1774,12 @@ impl AgentBindingMcpRuntime {
             &self.endpoint_url,
             &self.authorization,
             payload,
-            Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
+            match risk {
+                AgentBindingMcpRpcRisk::ToolInvocation => self.tool_call_timeout,
+                AgentBindingMcpRpcRisk::SideEffectFree => {
+                    Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS)
+                }
+            },
             risk,
         );
         tokio::pin!(execution);
@@ -1754,27 +1790,37 @@ impl AgentBindingMcpRuntime {
                 () = cancel_token.cancelled() => {
                     // A notification requests cancellation; only the original
                     // response can settle this invocation's ownership boundary.
-                    let notification = notify_agent_binding_mcp_cancelled(
-                        &self.endpoint_url, &self.authorization, &request_id,
-                    );
-                    tokio::pin!(notification);
-                    tokio::select! {
-                        biased;
-                        result = &mut execution => result,
-                        notified = &mut notification => {
-                            if let Err(error) = notified {
-                                tracing::warn!(
-                                    server = %self.server_name,
-                                    error = %error.redacted(&json!({
-                                        "authorization": &self.authorization,
-                                        "url": &self.endpoint_url,
-                                    })),
-                                    "MCP cancellation notification failed; retaining original invocation"
-                                );
+                    // A longer tool-call budget must not lengthen the existing
+                    // bounded cancellation/receipt wait.
+                    tokio::time::timeout(
+                        Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
+                        async {
+                            let notification = notify_agent_binding_mcp_cancelled(
+                                &self.endpoint_url, &self.authorization, &request_id,
+                            );
+                            tokio::pin!(notification);
+                            tokio::select! {
+                                biased;
+                                result = &mut execution => result,
+                                notified = &mut notification => {
+                                    if let Err(error) = notified {
+                                        tracing::warn!(
+                                            server = %self.server_name,
+                                            error = %error.redacted(&json!({
+                                                "authorization": &self.authorization,
+                                                "url": &self.endpoint_url,
+                                            })),
+                                            "MCP cancellation notification failed; retaining original invocation"
+                                        );
+                                    }
+                                    execution.await
+                                }
                             }
-                            execution.await
-                        }
-                    }
+                        },
+                    ).await.unwrap_or_else(|_| Err(
+                        agent_binding_mcp_timeout_error(format!("MCP cancellation did not settle within {}ms", AGENT_BINDING_MCP_RPC_TIMEOUT_SECS * 1_000))
+                            .after_send(risk)
+                    ))
                 }
             }
         } else {
@@ -2099,6 +2145,7 @@ fn build_agent_binding_mcp_bundle(
         server_name: tool_namespace,
         endpoint_url: endpoint_url.to_string(),
         authorization: authorization.to_string(),
+        tool_call_timeout: Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
         tool_names_by_public_name: Arc::new(tool_names_by_public_name),
         resolved_snapshot: Arc::new(resolved_snapshot.clone()),
         workspace_effects_by_public_name: Arc::new(workspace_effects_by_public_name),
@@ -2155,6 +2202,195 @@ fn build_agent_binding_mcp_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timeout_fixture_bundle(endpoint: &str) -> RuntimeMcpBundle {
+        prepare_agent_binding_mcp_bundle_from_snapshot(
+            "budget", endpoint, "Bearer fixture", None,
+            &[json!({"name":"transform", "inputSchema":{"type":"object"}, "side_effect_class":"write"})],
+        ).unwrap()
+    }
+
+    #[test]
+    fn gateway_tool_call_timeout_metadata_is_explicit_and_bounded() {
+        let default = timeout_fixture_bundle("http://127.0.0.1:1/mcp").with_tool_call_timeout(
+            parse_agent_binding_mcp_tool_call_timeout(&serde_json::Map::new()).unwrap(),
+        );
+        assert_eq!(
+            default.agent_binding_mcp.unwrap().tool_call_timeout,
+            Duration::from_secs(120)
+        );
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("600000"),
+            Value::Null,
+            json!(3_600_001),
+        ] {
+            let metadata = serde_json::Map::from_iter([("tool_call_timeout_ms".into(), value)]);
+            let result = parse_agent_binding_mcp_tool_call_timeout(&metadata);
+            match result {
+                Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+                Ok(_) => panic!("invalid explicit timeout must not become a default"),
+            }
+        }
+        let metadata =
+            serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(630_000))]);
+        let configured = timeout_fixture_bundle("http://127.0.0.1:1/mcp")
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
+        assert_eq!(
+            configured.agent_binding_mcp.unwrap().tool_call_timeout,
+            Duration::from_secs(630)
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_declared_tool_call_timeout_controls_real_http_dispatch() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route("/mcp", post(|Json(body): Json<Value>| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Json(json!({"jsonrpc":"2.0", "id":body["id"], "result":{"content":[{"type":"text","text":"finished"}]}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (timeout_ms, should_complete) in [(50, false), (5_000, true)] {
+            let metadata =
+                serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(timeout_ms))]);
+            let bundle = timeout_fixture_bundle(&endpoint).with_tool_call_timeout(
+                parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap(),
+            );
+            let result = bundle
+                .agent_binding_mcp
+                .as_ref()
+                .unwrap()
+                .call_tool_by_mcp_name(
+                    "mcp__budget__transform",
+                    &json!({}),
+                    "fixture-call",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            if should_complete {
+                assert_eq!(result.unwrap().output, "finished");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is_timeout());
+                assert!(error.side_effects_maybe());
+                assert!(!error.provider_acknowledged);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_call_budget_does_not_shorten_capability_discovery() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/mcp",
+            post(|Json(body): Json<Value>| async move {
+                assert_eq!(body["method"], "capabilities/list");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Json(json!({"jsonrpc":"2.0", "id":body["id"], "result":{"items":[]}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let metadata = serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(50))]);
+        let bundle = timeout_fixture_bundle(&endpoint)
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
+        let result = bundle
+            .agent_binding_mcp
+            .as_ref()
+            .unwrap()
+            .rpc_with_cancel(
+                "capabilities/list",
+                json!({}),
+                AgentBindingMcpRpcRisk::SideEffectFree,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"items":[]}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn extended_gateway_call_keeps_cancellation_settlement_bounded() {
+        use axum::{Router, routing::post};
+        use tokio::sync::Notify;
+        use tokio_util::sync::CancellationToken;
+
+        let started = Arc::new(Notify::new());
+        let notified = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/mcp",
+            post({
+                let started = started.clone();
+                let notified = notified.clone();
+                move |Json(body): Json<Value>| {
+                    let started = started.clone();
+                    let notified = notified.clone();
+                    async move {
+                        match body["method"].as_str().unwrap() {
+                            "tools/call" => {
+                                started.notify_one();
+                                std::future::pending::<(StatusCode, Json<Value>)>().await
+                            }
+                            "notifications/cancelled" => {
+                                notified.notify_one();
+                                (StatusCode::ACCEPTED, Json(Value::Null))
+                            }
+                            other => panic!("unexpected method: {other}"),
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let metadata =
+            serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(3_600_000))]);
+        let bundle = timeout_fixture_bundle(&endpoint)
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
+        let runtime = bundle.agent_binding_mcp.as_ref().unwrap();
+        let token = CancellationToken::new();
+        let args = json!({});
+        let call = runtime.call_tool_by_mcp_name(
+            "mcp__budget__transform",
+            &args,
+            "cancellation-fixture",
+            None,
+            None,
+            Some(&token),
+        );
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => panic!("returned before dispatch: {result:?}"),
+            () = started.notified() => {},
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("dispatch did not reach fixture"),
+        }
+        token.cancel();
+        tokio::select! {
+            result = &mut call => panic!("cancel notification cannot settle execution: {result:?}"),
+            () = notified.notified() => {},
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("cancel notification did not reach fixture"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(121)).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancellation must settle within its 120-second budget, not the one-hour RPC budget")
+            .unwrap_err();
+        assert!(error.is_timeout());
+        assert!(error.side_effects_maybe());
+        assert!(!error.provider_acknowledged);
+        server.abort();
+    }
 
     #[test]
     fn agent_binding_response_correlation_precedes_acknowledgement() {

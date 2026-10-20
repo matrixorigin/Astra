@@ -147,7 +147,10 @@ pub async fn check_tool_permission_with_provider_policy(
 
     // Try to request permission from parent
     let Some(mailbox) = mailbox else {
-        let reason = format!("Tool '{tool_name}' requires permission but no parent available");
+        let reason = format!(
+            "Tool '{tool_name}' requires approval: {}. No approval was granted: no parent available",
+            prompt.reason
+        );
         ctx.write()
             .await
             .record_blocked_tool_with_reason(tool_name, Some(&reason));
@@ -155,7 +158,8 @@ pub async fn check_tool_permission_with_provider_policy(
     };
 
     // Build permission request
-    let mut request = PermissionRequest::new(tool_name, normalized_args).with_reason(prompt.reason);
+    let mut request =
+        PermissionRequest::new(tool_name, normalized_args).with_reason(prompt.reason.clone());
     if let Some(ref hint) = prompt.detail {
         request = request.with_hint(hint.clone());
     }
@@ -200,7 +204,10 @@ pub async fn check_tool_permission_with_provider_policy(
             }
         }
         Err(e) => {
-            let reason = format!("Permission request failed: {}", e);
+            let reason = format!(
+                "Tool '{tool_name}' requires approval: {}. Permission request failed: {e}",
+                prompt.reason
+            );
             ctx.write()
                 .await
                 .record_blocked_tool_with_reason(tool_name, Some(&reason));
