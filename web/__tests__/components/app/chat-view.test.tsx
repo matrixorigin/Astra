@@ -129,8 +129,8 @@ vi.mock("@/components/app/move-chat-modal", () => ({
 }));
 
 vi.mock("@/components/app/message-bubble", () => ({
-  MessageBubble: ({ message }: { message: { content: string } }) => (
-    <div>{message.content}</div>
+  MessageBubble: ({ message }: { message: { content: string; reasoning?: string } }) => (
+    <div data-reasoning={message.reasoning ?? ""}>{message.content}</div>
   ),
 }));
 
@@ -388,13 +388,18 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockStreamChatMessage).toHaveBeenCalledOnce();
   });
 
-  it.each(["send", "attach"])("preserves pending answer patches on canonical persistence failure during %s", async mode => {
+  it.each([
+    { mode: "send", clear: "none" }, { mode: "attach", clear: "none" },
+    { mode: "attach", clear: "stream" }, { mode: "attach", clear: "done" },
+  ])("preserves pending answer patches on canonical failure ($mode, reasoning clear=$clear)", async ({ mode, clear }) => {
     const frames = mockAnimationFrameQueue();
     const reason = "Completion could not be saved. Reopen the session to check its recorded state before retrying.";
     const fail = async (handlers: Parameters<typeof streamChatMessage>[2]) => {
       handlers.onRunStarted?.("run-123");
       handlers.onText?.("Useful partial answer");
       handlers.onReasoning?.("Partial reasoning");
+      if (clear === "stream") handlers.onReasoning?.("");
+      if (clear === "done") handlers.onReasoningDone?.("");
       handlers.onRunUpdated?.({ runId: "run-123", status: "failed", waitingFor: null });
       throw new WebApiError(500, reason, "canonical_persistence_failed");
     };
@@ -407,13 +412,28 @@ describe("ChatView deferred-input unhappy paths", () => {
         await user.click(screen.getByRole("button", { name: "Submit composer" }));
       }
       const expected = `Useful partial answer\n\n${reason}`;
-      expect(await screen.findByText(expected, { normalizer: text => text })).toBeInTheDocument();
+      const message = await screen.findByText(expected, { normalizer: text => text });
+      expect(message).toHaveAttribute("data-reasoning", clear === "none" ? "Partial reasoning" : "");
       expect(screen.queryByText(/could not reach the Astra runtime/)).not.toBeInTheDocument();
       expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(mode === "attach" ? 1 : 0);
       expect(mockGetChat).not.toHaveBeenCalled();
     } finally {
       frames.restore();
     }
+  });
+
+  it.each(["stream_projection_busy", "stream_continuation_unavailable"])("preserves the answer and active run on %s", async code => {
+    const reason = "The observer cannot resume this stream.";
+    mockStreamExistingChatRun.mockRejectedValue(new WebApiError(409, reason, code));
+    const initial = makeDetail({ ...defaultActiveRun, assistantMessageId: "assistant" });
+    initial.messages = [{ id: "assistant", role: "assistant", content: "Saved partial answer",
+      reasoning: "Saved reasoning", status: "streaming", createdAt: "2026-06-07T00:00:00Z" }];
+    render(<ToastProvider><ChatView initial={initial} /></ToastProvider>);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(reason));
+    expect(screen.getByText("Saved partial answer")).toBeInTheDocument();
+    expect(screen.queryByText(/could not reach the Astra runtime/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+    expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
   });
 
   it("shows workspace selection errors directly in the assistant message", async () => {

@@ -334,3 +334,13 @@ answer text and advises reopening the Session to inspect recorded state before
 retrying. This notification is not a durable terminal or evidence that an
 uncertain transaction committed or rolled back; the canonical recovery owner
 still decides that state. No successful completion is published from this path.
+
+Web keeps one genuine text/reasoning projection for the selected message in its
+existing user-scoped chat state across observer connections. Reconnect initializes
+the browser from that projection and resumes at its captured cursor; rendered
+text and failure diagnostics never substitute for raw parser state. One observer
+may write that projection at a time. Conflicting observers or missing/ahead
+continuations return an explicit observation error without failing the Run or
+replacing the saved answer. Replay-only observation remains independent. This
+state has the same process lifetime as the Web chat projection; it adds no durable
+or cross-server transcript guarantee.

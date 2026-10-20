@@ -1105,3 +1105,25 @@ async function waitUntil(assertion: () => void) {
     }
   }
 }
+
+describe("Web continuation initialization", () => {
+  const initial = { type: "chat_stream_init", assistant_message_id: "assistant", session_id: "session",
+    state: { assistantRawText: "Partial ", assistantText: "Partial", reasoningText: "",
+      runId: "root", nextEventIndex: 8, lastStatus: "streaming", runLifecycle: "running" } };
+  it.each(["wrong run", "wrong message", "bad raw", "repeated", "late", "wrong session"])("rejects %s initialization", async (kind) => {
+    const frame = structuredClone(initial);
+    if (kind === "wrong run") frame.state.runId = "other";
+    if (kind === "wrong message") frame.assistant_message_id = "other";
+    const frames: unknown[] = [kind === "bad raw" ? { ...frame, state: { ...frame.state, assistantRawText: null } } : frame];
+    if (kind === "repeated") frames.push(initial);
+    if (kind === "late") frames.unshift({ type: "session_info", session_id: "session", run_id: "root" });
+    if (kind === "wrong session") frames.push({ type: "session_info", session_id: "other", run_id: "root" });
+    const body = sseBody(frames.map(event => `data: ${JSON.stringify(event)}\n\n`));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, body }));
+    const onDone = vi.fn();
+    await expect(streamExistingChatRun("chat", "root", { onDone }, { nextEventIndex: 8, assistantMessageId: "assistant" }))
+      .rejects.toMatchObject({ code: "contract_violation" });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(body.releaseLock).toHaveBeenCalled();
+  });
+});

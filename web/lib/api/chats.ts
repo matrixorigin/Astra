@@ -13,6 +13,7 @@ import {
   blockedWaitingFor,
   eventMessage,
   isRunBlockedEvent,
+  isChatStreamInitialization,
   isRunLifecycleEvent,
   isForeignRunLifecycleEvent,
 } from "@/lib/api/stream-event-helpers";
@@ -228,6 +229,11 @@ export type ChatStreamHandlers = {
 };
 
 type ChatStreamState = {
+  sessionId?: string;
+  expectedRunId?: string;
+  expectedAssistantMessageId?: string | null;
+  initialized?: boolean;
+  seenUpstreamEvent?: boolean;
   runId?: string;
   rawText: string;
   text: string;
@@ -324,6 +330,7 @@ function applyAssistantText(
   } else if (state.reasoningFromThinkingTags) {
     state.reasoning = "";
     state.reasoningFromThinkingTags = false;
+    handlers.onReasoningDone?.("");
   }
   handlers.onText?.(state.text);
 }
@@ -334,6 +341,33 @@ function applyStreamEvent(
   handlers: ChatStreamHandlers,
 ) {
   const type = typeof event.type === "string" ? event.type : "";
+  if (type === "chat_stream_init") {
+    if (state.initialized || state.seenUpstreamEvent || !isChatStreamInitialization(event) ||
+      state.expectedRunId && event.state.runId !== state.expectedRunId ||
+      state.expectedAssistantMessageId && event.assistant_message_id !== state.expectedAssistantMessageId) {
+      throw new WebApiError(500, "Invalid Web stream initialization.", "contract_violation");
+    }
+    const initial = event.state;
+    state.initialized = true;
+    state.sessionId = event.session_id;
+    state.runId = initial.runId;
+    state.nextEventIndex = initial.nextEventIndex ?? 0;
+    state.rawText = initial.assistantRawText;
+    state.text = initial.assistantText;
+    state.reasoning = initial.reasoningText;
+    state.reasoningFromThinkingTags = initial.reasoningFromThinkingTags;
+    state.error = initial.lastStatus === "failed" ? initial.lastFailureMessage ?? "Astra run failed." : undefined;
+    state.errorCode = initial.errorCode;
+    state.cancelled = initial.terminalStatus === "cancelled";
+    state.paused = initial.runLifecycle === "paused" || initial.runLifecycle === "waiting" || initial.runLifecycle === "blocked";
+    handlers.onText?.(state.text);
+    handlers.onReasoning?.(state.reasoning);
+    return;
+  }
+  state.seenUpstreamEvent = true;
+  if (type === "session_info" && state.sessionId && event.session_id !== state.sessionId) {
+    throw new WebApiError(500, "Runtime changed the stream's session identity.", "contract_violation");
+  }
   const replayFromEventIndex = state.nextEventIndex ?? 0;
   const eventIndex = normalizeEventIndex(event.index);
   if (eventIndex !== null) {
@@ -406,6 +440,9 @@ function applyStreamEvent(
     if (typeof event.session_id === "string") {
       handlers.onSessionBound?.({ sessionId: event.session_id });
     }
+    // Initialization already restored the selected root; bootstrap is a binding
+    // check, not another lifecycle start (including for paused/failed roots).
+    if (state.initialized) return;
     handlers.onRunStarted?.(event.run_id);
     handlers.onRunUpdated?.(
       runUpdate(state, {
@@ -702,6 +739,7 @@ async function consumeChatStream(
   handlers: ChatStreamHandlers,
   initialNextEventIndex = 0,
   replayOnly = false,
+  expectedBinding?: { runId: string; assistantMessageId?: string | null },
 ) {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
@@ -731,6 +769,9 @@ async function consumeChatStream(
     text: "",
     reasoning: "",
     nextEventIndex: initialNextEventIndex,
+    runId: expectedBinding?.runId,
+    expectedRunId: expectedBinding?.runId,
+    expectedAssistantMessageId: expectedBinding?.assistantMessageId,
   };
   let buffer = "";
   let abortListener: (() => void) | undefined;
@@ -855,7 +896,7 @@ export async function streamExistingChatRun(
     `/api/chats/${encodeURIComponent(chatId)}/stream?${params.toString()}`,
     { method: "GET", signal: handlers.signal },
   );
-  return consumeChatStream(response, handlers, nextEventIndex ?? 0, options?.replayOnly);
+  return consumeChatStream(response, handlers, nextEventIndex ?? 0, options?.replayOnly, { runId, assistantMessageId: options?.assistantMessageId });
 }
 
 export function updateChatProject(chatId: string, projectId: string | null) {

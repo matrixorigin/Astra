@@ -5,6 +5,10 @@ vi.mock("@/lib/api/auth-guard", () => ({
 }));
 
 vi.mock("@/lib/api/web-store", () => ({
+  claimChatStreamProjection: vi.fn(),
+  withChatStreamProjection: vi.fn((_lease, apply) => { apply(); return true; }),
+  releaseChatStreamProjection: vi.fn(),
+  ChatStreamProjectionError: class extends Error {},
   beginStreamingMessage: vi.fn(),
   ensureChatBackendSession: vi.fn(),
   getChat: vi.fn(),
@@ -50,6 +54,7 @@ vi.mock("@/lib/runtime-client", () => ({
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   beginStreamingMessage,
+  claimChatStreamProjection,
   ensureChatBackendSession,
   getChat,
   resolveModelOfferingSelection,
@@ -66,6 +71,15 @@ import workspaceBindingContract from "../../../fixtures/contracts/workspace_bind
 const SERVER_INTERACTION_API_MAJOR_HEADER =
   "x-astra-agent-interaction-api-major";
 const SERVER_INTERACTION_API_MAJOR = "3";
+
+const mockClaimProjection = vi.mocked(claimChatStreamProjection);
+beforeEach(() => {
+  mockClaimProjection.mockImplementation((ownerUserId, chatId, assistantMessageId, writer, binding) => ({
+    ownerUserId, chatId, writer, projection: { assistantMessageId, sessionId: binding.sessionId, writer,
+      state: { assistantText: "", assistantRawText: "", reasoningText: "", lastStatus: "streaming",
+        protocolError: false, runLifecycle: "running", runId: binding.runId, nextEventIndex: binding.nextEventIndex ?? 0 } },
+  }));
+});
 
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
@@ -1967,6 +1981,13 @@ describe("chat existing run stream route", () => {
       const stored = mockGetChat("user-a", "web-chat-1")!.messages.find(message => message.id === "assistant-1")!;
       stored.content = "Useful partial answer";
       stored.reasoning = "Partial reasoning";
+      const { applyStreamEvent } = await import("@/lib/api/stream-event-handler");
+      const lease = mockClaimProjection("user-a", "web-chat-1", "assistant-1", new AbortController(),
+        { sessionId: "runtime-session-1", runId: "root" });
+      const ctx = { ownerUserId: "user-a", chatId: "web-chat-1", assistantMessageId: "assistant-1", getSessionId: () => "runtime-session-1" };
+      applyStreamEvent({ type: "text_delta", content: stored.content }, ctx, lease.projection.state);
+      applyStreamEvent({ type: "reasoning_delta", content: stored.reasoning, index: 7 }, ctx, lease.projection.state);
+      mockClaimProjection.mockReturnValue(lease);
     }
     const frames = [
       { type: "session_info", session_id: "runtime-session-1", run_id: "root" },

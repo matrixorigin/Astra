@@ -10,13 +10,18 @@ import {
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   beginStreamingMessage,
+  claimChatStreamProjection,
+  withChatStreamProjection,
+  releaseChatStreamProjection,
+  ChatStreamProjectionError,
+  type ChatStreamProjectionLease,
   ensureChatBackendSession,
   getChat,
   resolveModelOfferingSelection,
   requireSelectedOfferingId,
-  setChatActiveRun,
+  setChatActiveRun as setStoredActiveRun,
   updateChatWorkspaceSelection,
-  updateStreamingAssistantMessage,
+  updateStreamingAssistantMessage as updateStoredAssistant,
 } from "@/lib/api/web-store";
 import { fetchSessionArtifacts } from "@/lib/api/stream-artifacts";
 import {
@@ -32,7 +37,6 @@ import {
   requireRuntimeClient,
 } from "@/lib/runtime-client";
 import type {
-  ChatMessage,
   SendMessageRequest,
 } from "@/lib/api/types";
 import {
@@ -173,7 +177,7 @@ function proxyRunStream(params: {
   sessionId: string | (() => string);
   runtime: WebRuntimeClient | (() => Promise<WebRuntimeClient>);
   assistantMessageId: string;
-  initialAssistantMessage?: Pick<ChatMessage, "content" | "reasoning">;
+  projectionLease?: ChatStreamProjectionLease;
   knownArtifactIds: Set<string>;
   replayOnly?: boolean;
   replayFromOrigin?: boolean;
@@ -192,7 +196,7 @@ function proxyRunStream(params: {
     sessionId,
     runtime,
     assistantMessageId,
-    initialAssistantMessage,
+    projectionLease,
     knownArtifactIds,
     replayOnly = false,
     replayFromOrigin = false,
@@ -203,30 +207,37 @@ function proxyRunStream(params: {
   const currentRuntime =
     typeof runtime === "function" ? runtime : () => Promise.resolve(runtime);
 
+  let lease = projectionLease;
+  if (!replayOnly && !lease) {
+    try {
+      lease = claimChatStreamProjection(ownerUserId, chatId, assistantMessageId,
+        backendAbortController, { sessionId: "" });
+    } catch (error) {
+      if (!(error instanceof ChatStreamProjectionError)) throw error;
+      return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+    }
+  }
+  const mutate = (apply: () => void) => lease ? withChatStreamProjection(lease, apply) : (apply(), true);
+  const updateStreamingAssistantMessage: typeof updateStoredAssistant = (...args) => {
+    let result: ReturnType<typeof updateStoredAssistant> = null;
+    mutate(() => { result = updateStoredAssistant(...args); });
+    return result;
+  };
+  const setChatActiveRun: typeof setStoredActiveRun = (...args) => {
+    let result: ReturnType<typeof setStoredActiveRun>;
+    mutate(() => { result = setStoredActiveRun(...args); });
+    return result;
+  };
+
   let backendReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let clientCancelled = false;
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const enqueueFrame = (event: unknown) => {
-        if (clientCancelled) {
-          return false;
-        }
+        if (clientCancelled || !mutate(() => {})) return false;
         try {
           controller.enqueue(sseFrame(event));
-          return true;
-        } catch {
-          clientCancelled = true;
-          backendAbortController.abort();
-          return false;
-        }
-      };
-      const enqueueChunk = (chunk: Uint8Array) => {
-        if (clientCancelled) {
-          return false;
-        }
-        try {
-          controller.enqueue(chunk);
           return true;
         } catch {
           clientCancelled = true;
@@ -253,7 +264,7 @@ function proxyRunStream(params: {
         });
       }
 
-      void (async () => {
+      const runProxy = async () => {
         let resolvedBackendResponse: Response;
         try {
           resolvedBackendResponse =
@@ -262,6 +273,14 @@ function proxyRunStream(params: {
                   enqueueFrame(event);
                 })
               : backendResponse;
+          mutate(() => {
+            if (!lease) return;
+            const sessionId = currentSessionId();
+            if (lease.projection.sessionId && lease.projection.sessionId !== sessionId) {
+              throw new Error("The stream session binding changed.");
+            }
+            lease.projection.sessionId = sessionId;
+          });
         } catch (error) {
           if (clientCancelled) {
             return;
@@ -288,9 +307,7 @@ function proxyRunStream(params: {
           closeController();
           return;
         }
-        if (clientCancelled) {
-          return;
-        }
+        if (clientCancelled || !mutate(() => {})) { closeController(); return; }
         if (!resolvedBackendResponse.ok || !resolvedBackendResponse.body) {
           const detail = await readErrorDetail(resolvedBackendResponse);
           if (clientCancelled) {
@@ -316,7 +333,6 @@ function proxyRunStream(params: {
           interactionProtocolHeader,
         );
         if (actualInteractionProtocol !== expectedInteractionProtocol) {
-          backendAbortController.abort();
           const message = actualInteractionProtocol
             ? `Astra Server interaction protocol ${actualInteractionProtocol} is incompatible with Web ${expectedInteractionProtocol}. Restart or upgrade the Server.`
             : "Astra Server is missing the interaction protocol contract. Restart or upgrade the Server before starting another turn.";
@@ -329,11 +345,13 @@ function proxyRunStream(params: {
             );
             setChatActiveRun(ownerUserId, chatId, undefined);
           }
+          mutate(() => { if (lease) lease.projection.state.protocolError = true; });
           enqueueFrame({
             type: "error",
             code: "RUNTIME_PROTOCOL_MISMATCH",
             message,
           });
+          backendAbortController.abort();
           closeController();
           return;
         }
@@ -370,15 +388,38 @@ function proxyRunStream(params: {
           applyExplainAnalyzeObservation(event, ctx, true);
         };
 
-        const state: StreamEventState = {
-          assistantText: initialAssistantMessage?.content ?? "",
-          assistantRawText: "",
-          reasoningText: initialAssistantMessage?.reasoning ?? "",
-          lastStatus: "streaming",
-          protocolError: false,
-          runLifecycle: "running",
+        const state: StreamEventState = lease?.projection.state ?? {
+          assistantText: "", assistantRawText: "", reasoningText: "",
+          lastStatus: "streaming", protocolError: false, runLifecycle: "running",
+        };
+        if (projectionLease) {
+          const { assistantRawText, assistantText, reasoningText, reasoningFromThinkingTags,
+            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus } = state;
+          if (!enqueueFrame({ type: "chat_stream_init", assistant_message_id: assistantMessageId,
+            session_id: currentSessionId(), state: { assistantRawText, assistantText, reasoningText,
+              reasoningFromThinkingTags, runId, nextEventIndex, lastStatus, runLifecycle,
+              lastFailureMessage, errorCode, terminalStatus } })) return;
+        }
+        const forwardFrame = (frame: string) => {
+          const event = eventFromSseFrame(frame, replayOnly);
+          if ((event as { type?: string } | null)?.type === "chat_stream_init") {
+            mutate(() => { throw new Error("Runtime supplied a reserved Web initialization frame."); });
+          }
+          const duplicate = !replayOnly && event && typeof event.index === "number" &&
+            Number.isSafeInteger(event.index) && event.index >= 0 &&
+            event.index < (state.nextEventIndex ?? 0) && event.type !== "session_info";
+          if (duplicate) return true;
+          if (!mutate(() => {
+            if (!event) return;
+            if (replayOnly) { observeReplay(event); return; }
+            applyBackendStreamEvent(event, ctx, state);
+          })) return false;
+          if (clientCancelled) return false;
+          controller.enqueue(encoder.encode(`${frame}\n\n`));
+          return true;
         };
 
+        let upstreamDone = false;
         try {
           for (;;) {
             let chunk: ReadableStreamReadResult<Uint8Array>;
@@ -390,8 +431,6 @@ function proxyRunStream(params: {
               // upstream reset must not replace it with a generic error frame.
               if (!replayOnly && state.lastStatus === "failed" &&
                 state.errorCode === "canonical_persistence_failed") {
-                backendAbortController.abort();
-                await Promise.resolve(reader.cancel()).catch(() => undefined);
                 break;
               }
               throw error;
@@ -401,21 +440,15 @@ function proxyRunStream(params: {
               return;
             }
             if (done) {
+              upstreamDone = true;
               break;
-            }
-            if (!enqueueChunk(value)) {
-              return;
             }
             buffer += decoder.decode(value, { stream: true });
 
             const frames = buffer.split(/\r?\n\r?\n/);
             buffer = frames.pop() ?? "";
             for (const frame of frames) {
-              const event = eventFromSseFrame(frame, replayOnly);
-              if (event) {
-                if (replayOnly) observeReplay(event);
-                else applyBackendStreamEvent(event, ctx, state);
-              }
+              if (!forwardFrame(frame)) return;
             }
           }
 
@@ -424,13 +457,7 @@ function proxyRunStream(params: {
             if (tail) {
               buffer += tail;
             }
-            if (buffer.trim()) {
-              const event = eventFromSseFrame(buffer, replayOnly);
-              if (event) {
-                if (replayOnly) observeReplay(event);
-                else applyBackendStreamEvent(event, ctx, state);
-              }
-            }
+            if (buffer.trim() && !forwardFrame(buffer)) return;
           }
 
           if (clientCancelled) {
@@ -445,6 +472,7 @@ function proxyRunStream(params: {
           if (!replayOnly && state.lastStatus === "streaming") {
             if (
               state.runLifecycle === "paused" ||
+              state.runLifecycle === "waiting" ||
               state.runLifecycle === "blocked"
             ) {
               updateStreamingAssistantMessage(
@@ -503,8 +531,6 @@ function proxyRunStream(params: {
           if (clientCancelled) {
             return;
           }
-          backendAbortController.abort();
-          await Promise.resolve(reader.cancel()).catch(() => undefined);
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
           if (!replayOnly) {
@@ -523,13 +549,19 @@ function proxyRunStream(params: {
             { explainAnalyzeDegraded: true });
           enqueueFrame({ type: "error", message });
         } finally {
+          if (!upstreamDone) {
+            backendAbortController.abort();
+            await Promise.resolve(reader.cancel()).catch(() => undefined);
+          }
+          if (lease) releaseChatStreamProjection(lease);
           backendReader = null;
           reader.releaseLock();
           if (!clientCancelled) {
             closeController();
           }
         }
-      })();
+      };
+      void runProxy().finally(() => { if (lease) releaseChatStreamProjection(lease); });
     },
     async cancel() {
       clientCancelled = true;
@@ -811,12 +843,21 @@ export async function GET(
   const lastIndex = normalizedLastIndex(
     request.nextUrl.searchParams.get("last_index"),
   );
-  const backendStreamPath = `${chatRunStreamPath(runId)}${buildQueryString(
-    {
-      ...(lastIndex === null ? {} : { last_index: lastIndex }),
-      ...(replayOnly ? { replay_only: "true" } : {}),
-    },
-  )}`;
+  let projectionLease: ChatStreamProjectionLease | undefined;
+  if (!replayOnly) {
+    try {
+      projectionLease = claimChatStreamProjection(ownerUserId, chatId, assistantMessageId,
+        backendAbortController, { sessionId, runId, nextEventIndex: lastIndex ?? 0 });
+    } catch (error) {
+      if (!(error instanceof ChatStreamProjectionError)) throw error;
+      return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+    }
+  }
+  const resumeIndex = projectionLease?.projection.state.nextEventIndex ?? lastIndex;
+  const backendStreamPath = `${chatRunStreamPath(runId)}${buildQueryString({
+    ...(resumeIndex === null ? {} : { last_index: resumeIndex }),
+    ...(replayOnly ? { replay_only: "true" } : {}),
+  })}`;
 
   return proxyRunStream({
     backendResponse: () =>
@@ -835,10 +876,6 @@ export async function GET(
     knownArtifactIds,
     replayOnly,
     replayFromOrigin: lastIndex === null || lastIndex === 0,
-    // A cursor suffix may contain only the failure. Keep the stored display;
-    // it is not raw provider transcript and must not seed assistantRawText.
-    initialAssistantMessage: !replayOnly && lastIndex !== null && lastIndex > 0
-      ? chat.messages.find(message => message.id === assistantMessageId)
-      : undefined,
+    projectionLease,
   });
 }

@@ -24,6 +24,7 @@ import {
   updateChatModel,
   type PendingRunApproval,
 } from "@/lib/api/chats";
+import { appendRunFailure } from "@/lib/api/stream-event-helpers";
 import { mergeStreamRunUpdate } from "@/lib/api/active-run-merge";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
 import {
@@ -602,12 +603,18 @@ export function useStreamLifecycle(
   );
 
   // -- Attach existing run stream --
-  const handleCanonicalPersistenceFailure = useCallback((
+  const handleProjectionFailure = useCallback((
     error: unknown,
     assistantMessageId: string,
     assistantPatcher: ReturnType<typeof createAssistantPatchController>,
   ): boolean => {
-    if (!(error instanceof WebApiError) || error.code !== "canonical_persistence_failed") return false;
+    if (!(error instanceof WebApiError)) return false;
+    if (error.code === "stream_projection_busy" || error.code === "stream_continuation_unavailable") {
+      assistantPatcher.flushNow();
+      addToast(error.detail, "error");
+      return true;
+    }
+    if (error.code !== "canonical_persistence_failed") return false;
     // The HTTP stream reached the runtime. Keep admitted output, including a
     // pending animation-frame patch, instead of treating this as reconnect failure.
     assistantPatcher.flushNow();
@@ -616,10 +623,7 @@ export function useStreamLifecycle(
       activeRun: current.activeRun?.assistantMessageId === assistantMessageId ? undefined : current.activeRun,
       messages: current.messages.map((message) => {
         if (message.id !== assistantMessageId) return message;
-        const suffix = `\n\n${error.detail}`;
-        let content = message.content;
-        if (!content) content = error.detail;
-        else if (content !== error.detail && !content.endsWith(suffix)) content += suffix;
+        const content = appendRunFailure(message.content, error.detail);
         return {
           ...message,
           content,
@@ -630,7 +634,7 @@ export function useStreamLifecycle(
       }),
     }));
     return true;
-  }, [setDetail]);
+  }, [setDetail, addToast]);
 
   const attachExistingRunStream = useCallback(
     (
@@ -766,7 +770,7 @@ export function useStreamLifecycle(
             router.replace(chatListHref);
             return;
           }
-          if (handleCanonicalPersistenceFailure(streamError, assistantMessageId, assistantPatcher)) return;
+          if (handleProjectionFailure(streamError, assistantMessageId, assistantPatcher)) return;
           if (options?.scheduleRetry?.()) {
             assistantPatcher.patchNow({
               status: "streaming",
@@ -798,7 +802,7 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
-      handleCanonicalPersistenceFailure,
+      handleProjectionFailure,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1125,7 +1129,7 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
-        if (handleCanonicalPersistenceFailure(error, currentAssistantId, assistantPatcher)) return;
+        if (handleProjectionFailure(error, currentAssistantId, assistantPatcher)) return;
         if (isWorkspaceSelectionError(error)) {
           setStartingRun(false);
           void refreshEdgeWorkspaces();
@@ -1162,7 +1166,7 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
-      handleCanonicalPersistenceFailure,
+      handleProjectionFailure,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1348,7 +1352,7 @@ export function useStreamLifecycle(
               router.replace(chatListHref);
               return;
             }
-            if (handleCanonicalPersistenceFailure(streamError, assistantMessageId, assistantPatcher)) return;
+            if (handleProjectionFailure(streamError, assistantMessageId, assistantPatcher)) return;
             assistantPatcher.patchNow({
               content:
                 streamError instanceof Error
@@ -1403,7 +1407,7 @@ export function useStreamLifecycle(
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
       handleApprovalRequired,
-      handleCanonicalPersistenceFailure,
+      handleProjectionFailure,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1750,7 +1754,7 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
-        if (handleCanonicalPersistenceFailure(streamError, assistantMessageId, assistantPatcher)) return;
+        if (handleProjectionFailure(streamError, assistantMessageId, assistantPatcher)) return;
         // Roll back optimistic message on stream error
         if (optimisticMessageId) {
           setDetail((current) => ({
@@ -1823,7 +1827,7 @@ export function useStreamLifecycle(
     repairExplainAnalyzeFromDurable,
     clearPendingInteraction,
     handleApprovalRequired,
-    handleCanonicalPersistenceFailure,
+    handleProjectionFailure,
     canResumeRun,
     chatListHref,
     claimAttachedRun,

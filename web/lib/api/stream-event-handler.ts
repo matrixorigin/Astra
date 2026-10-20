@@ -17,6 +17,7 @@ import {
 import type { ChatArtifactRef } from "@/lib/api/types";
 import { projectRunWaitingState } from "@/lib/run-status-messages";
 import {
+  appendRunFailure,
   blockedWaitingFor,
   eventMessage,
   explicitEventMessage,
@@ -36,6 +37,7 @@ export interface StreamEventState {
   assistantText: string;
   assistantRawText: string;
   lastFailureMessage?: string;
+  terminalStatus?: string;
   errorCode?: string;
   reasoningText: string;
   artifacts?: ChatArtifactRef[];
@@ -118,8 +120,10 @@ export function applyStreamEvent(
     rawText: string,
     status: "streaming" | "complete" | "failed",
   ) => {
+    if (state.lastStatus === "failed") status = "failed";
     const split = splitThinkingTags(rawText);
-    state.assistantText = split.visibleText;
+    state.assistantText = state.lastStatus === "failed" && state.lastFailureMessage
+      ? appendRunFailure(split.visibleText, state.lastFailureMessage) : split.visibleText;
     if (split.hasThinking) {
       state.reasoningText = split.reasoning;
       state.reasoningFromThinkingTags = true;
@@ -134,7 +138,7 @@ export function applyStreamEvent(
       {
         content: state.assistantText,
         reasoning: state.reasoningText || undefined,
-        reasoningStatus: state.reasoningText
+        reasoningStatus: status === "failed" ? undefined : state.reasoningText
           ? split.reasoningOpen
             ? "streaming"
             : "complete"
@@ -150,10 +154,8 @@ export function applyStreamEvent(
 
   const applyRunFailure = (reason?: string | null) => {
     const message = reason?.trim() ? reason : state.lastFailureMessage ?? "Astra run failed.";
-    if (message !== state.lastFailureMessage) {
-      state.assistantText = state.assistantText ? `${state.assistantText}\n\n${message}` : message;
-      state.lastFailureMessage = message;
-    }
+    state.assistantText = appendRunFailure(state.assistantText, message);
+    state.lastFailureMessage = message;
     state.lastStatus = "failed";
     state.runLifecycle = "finished";
     setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
@@ -191,6 +193,7 @@ export function applyStreamEvent(
       }
       if (typeof event.run_id === "string") {
         state.runId ??= event.run_id;
+        if (state.runLifecycle !== "running") break;
         setActiveRun({
           runId: event.run_id,
           status: "running",
@@ -422,6 +425,7 @@ export function applyStreamEvent(
         typeof (event as RunFinishedEvent).status === "string"
           ? (event as RunFinishedEvent).status!
           : "completed";
+      state.terminalStatus = status;
       if (status === "failed") {
         applyRunFailure((event as RunFinishedEvent).error);
         break;
