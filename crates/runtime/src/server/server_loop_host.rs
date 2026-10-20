@@ -4549,8 +4549,8 @@ const MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS: usize = 20_000;
 struct HostEventGapState {
     dropped: AtomicU64,
     recovery_lock: std::sync::Mutex<()>,
-    unacknowledged_explain_events: std::sync::Mutex<Vec<Value>>,
-    recoverable_explain_event_ids: std::sync::Mutex<Vec<String>>,
+    unacknowledged_explain_events: std::sync::Mutex<indexmap::IndexMap<Option<String>, Value>>,
+    recoverable_explain_event_ids: std::sync::Mutex<indexmap::IndexSet<String>>,
     explain_recovery_overflowed: AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -4587,10 +4587,8 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending
-            .iter()
-            .any(|value| value.get("event_id").and_then(Value::as_str) == Some(event_id))
-        {
+        let event_id = Some(event_id.to_owned());
+        if pending.contains_key(&event_id) {
             return true;
         }
         if pending.len() >= MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
@@ -4599,7 +4597,7 @@ impl HostEventGapTracker {
                 .store(true, Ordering::Release);
             return false;
         }
-        pending.push(event);
+        pending.insert(event_id, event);
         true
     }
 
@@ -4618,12 +4616,9 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !pending
-            .iter()
-            .any(|value| value.get("event_id").and_then(Value::as_str) == event_id.as_deref())
-        {
+        if !pending.contains_key(&event_id) {
             if pending.len() < MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
-                pending.push(event);
+                pending.insert(event_id.clone(), event);
             } else {
                 self.0
                     .explain_recovery_overflowed
@@ -4637,9 +4632,9 @@ impl HostEventGapTracker {
                 .recoverable_explain_event_ids
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !recoverable.iter().any(|pending| pending == &event_id) {
+            if !recoverable.contains(&event_id) {
                 if recoverable.len() < MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
-                    recoverable.push(event_id);
+                    recoverable.insert(event_id);
                 } else {
                     self.0
                         .explain_recovery_overflowed
@@ -4666,7 +4661,7 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|event| event.get("event_id").and_then(Value::as_str) != Some(event_id));
+            .shift_remove(&Some(event_id.to_owned()));
     }
 
     pub(crate) fn pending_recovery_snapshot(&self) -> (u64, Vec<Value>, bool) {
@@ -4680,15 +4675,6 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending_by_id: HashMap<&str, &Value> = pending
-            .iter()
-            .filter_map(|event| {
-                event
-                    .get("event_id")
-                    .and_then(Value::as_str)
-                    .map(|id| (id, event))
-            })
-            .collect();
         let recoverable_ids = self
             .0
             .recoverable_explain_event_ids
@@ -4697,8 +4683,8 @@ impl HostEventGapTracker {
             .clone();
         let mut events = Vec::with_capacity(recoverable_ids.len());
         for event_id in recoverable_ids {
-            if let Some(event) = pending_by_id.get(event_id.as_str()) {
-                events.push((*event).clone());
+            if let Some(event) = pending.get(&Some(event_id)) {
+                events.push(event.clone());
             } else {
                 self.0
                     .explain_recovery_overflowed
@@ -4733,7 +4719,7 @@ impl HostEventGapTracker {
             .filter_map(|event| event.get("event_id").and_then(Value::as_str))
             .collect();
         recoverable.retain(|id| !acknowledged_ids.contains(id.as_str()));
-        pending.retain(|event| {
+        pending.retain(|_, event| {
             !event
                 .get("event_id")
                 .and_then(Value::as_str)
@@ -4767,7 +4753,9 @@ impl HostEventGapTracker {
                 .unacknowledged_explain_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        )
+        .into_values()
+        .collect();
         self.0
             .recoverable_explain_event_ids
             .lock()
@@ -31216,8 +31204,7 @@ mod tests {
         assert_eq!(request.executor.executor_id, "edge-1");
     }
 
-    #[tokio::test]
-    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+    fn weather_deferred_contract_fixture() -> (Value, Map<String, Value>) {
         let tool_name = "mcp__weather__forecast";
         let schema = json!({
             "type": "function",
@@ -31253,6 +31240,13 @@ mod tests {
             json!(200_000),
         );
 
+        (schema, edge_profile)
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_rejects_unbound_native_identity() {
+        let tool_name = "mcp__weather__forecast";
+        let (_, edge_profile) = weather_deferred_contract_fixture();
         for native_ids in [json!({}), json!({tool_name: ""})] {
             let mut unbound_profile = edge_profile.clone();
             unbound_profile.insert(
@@ -31274,6 +31268,12 @@ mod tests {
                 "missing/invalid native identity must stay unbound"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+        let tool_name = "mcp__weather__forecast";
+        let (schema, mut edge_profile) = weather_deferred_contract_fixture();
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS.to_string(),
             json!({tool_name: tool_name}),
@@ -34615,8 +34615,11 @@ mod tests {
         assert!(!crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
     }
 
-    #[test]
-    fn capability_source_production_loop_discovers_selects_invokes_and_records_exact_identity() {
+    fn assert_capability_source_production_loop(
+        skill: bool,
+        distinct_bindings: bool,
+        large_tool: bool,
+    ) {
         async fn run_case(
             catalog_size: usize,
             distinct_bindings: bool,
@@ -34910,27 +34913,45 @@ mod tests {
         std::thread::Builder::new()
             .name("capability-source-loop-test".into())
             .stack_size(astra_core::process_runtime::PROCESS_WORKER_STACK_BYTES)
-            .spawn(|| {
+            .spawn(move || {
                 tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    if large_tool {
+                        run_case(1, false, false, true).await;
+                        return;
+                    }
                     let mut measurements = Vec::new();
-                    for skill in [false, true] {
-                    for distinct_bindings in [false, true] {
-                        for catalog_size in [10, 100, 1000] {
-                            let measured = run_case(catalog_size, distinct_bindings, skill, false).await;
-                            let selected_phase = if skill { "selected_skill_body" } else { "selected_schema" };
-                            for (phase, (bytes, tokens)) in ["initial", "candidate_page", selected_phase].into_iter().zip(measured) {
-                                eprintln!("capability_source inventory={catalog_size} distinct_bindings={distinct_bindings} skill={skill} phase={phase} bytes={bytes} estimated_tokens={tokens}");
-                            }
-                            measurements.push(measured);
-                        }
+                    for catalog_size in [10, 100, 1000] {
+                        measurements.push(run_case(catalog_size, distinct_bindings, skill, false).await);
                     }
-                    }
-                    for group in measurements.chunks(3) {
-                        assert!(group.iter().all(|value| *value == group[0]), "actual LLM-visible initial, bounded candidates and exact schema must not grow with the external catalog: {group:?}");
-                    }
-                    run_case(1, false, false, true).await;
+                    assert!(measurements.iter().all(|value| *value == measurements[0]),
+                        "actual LLM-visible initial, bounded candidates and exact schema must not grow with the external catalog: {measurements:?}");
                 });
             }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn capability_source_production_loop_tools_shared_binding() {
+        assert_capability_source_production_loop(false, false, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_tools_distinct_bindings() {
+        assert_capability_source_production_loop(false, true, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_skills_shared_binding() {
+        assert_capability_source_production_loop(true, false, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_skills_distinct_bindings() {
+        assert_capability_source_production_loop(true, true, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_large_schema() {
+        assert_capability_source_production_loop(false, false, true);
     }
 
     #[tokio::test]
@@ -53512,6 +53533,38 @@ mod tests {
             .await
             .expect("a terminal progress drop must wake the bridge immediately");
         assert_eq!(gap.take_recovery_snapshot().0, 1);
+    }
+
+    #[test]
+    fn explain_gap_recovery_preserves_first_value_order_and_missing_id_failure() {
+        let gap = HostEventGapTracker::default();
+        let first = json!({"event_id": "z", "value": "first"});
+        let second = json!({"event_id": "a"});
+        assert!(gap.track_explain_analyze_event(first.clone()));
+        assert!(gap.track_explain_analyze_event(json!({"event_id": "z", "value": "duplicate"})));
+        gap.record_explain_analyze_drop(json!({"event_id": "z", "value": "dropped"}));
+        gap.record_explain_analyze_drop(second.clone());
+        gap.record_explain_analyze_drop(first.clone());
+        assert_eq!(
+            gap.pending_recovery_snapshot(),
+            (3, vec![first.clone(), second.clone()], true)
+        );
+        gap.acknowledge_recovery_batch(1, &[first]);
+        assert_eq!(
+            gap.pending_recovery_snapshot(),
+            (2, vec![second.clone()], true)
+        );
+        let missing = json!({"value": "missing identity"});
+        gap.record_explain_analyze_drop(missing.clone());
+        assert_eq!(
+            gap.pending_recovery_snapshot(),
+            (3, vec![second.clone()], false)
+        );
+        assert_eq!(
+            gap.take_recovery_snapshot(),
+            (3, vec![second, missing], false)
+        );
+        assert_eq!(gap.pending_recovery_snapshot(), (0, vec![], false));
     }
 
     #[test]

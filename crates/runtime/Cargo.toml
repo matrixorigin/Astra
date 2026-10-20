@@ -84,6 +84,7 @@ thiserror.workspace = true
 astra-harness = { workspace = true, optional = true }
 notify = { version = "8.2", default-features = false, features = ["macos_kqueue"] }
 dashmap = "6.1.0"
+indexmap = "2"
 fs2 = "0.4"
 tempfile = "3"
 

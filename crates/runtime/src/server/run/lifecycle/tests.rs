@@ -24698,9 +24698,8 @@ fn agent_progress_is_live_only_while_agent_lifecycle_is_durable() {
 
 #[tokio::test]
 async fn production_fanout_flushes_sparse_event_before_terminal() {
-    // Keep the model open beyond the event deadline: a terminal-triggered
-    // flush must not make the sparse-event timer test pass accidentally.
-    let llm = spawn_incremental_terminal_test_llm(Duration::from_secs(1)).await;
+    // Completion is explicitly held until the sparse event is observed.
+    let llm = spawn_gated_terminal_test_llm().await;
     let store = Arc::new(
         FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(Duration::from_millis(40)),
     );
@@ -24723,6 +24722,9 @@ async fn production_fanout_flushes_sparse_event_before_terminal() {
         astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
     let mut stream = ok(owner.stream_chat("user-1".to_owned(), request).await);
     let mut rx = stream.event_rx.take().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), llm.blocked_entered.notified())
+        .await
+        .expect("provider must be ready before measuring sparse delivery");
     owner
         .server_agent_progress_broadcaster
         .emit(test_agent_spawned(
@@ -24742,6 +24744,7 @@ async fn production_fanout_flushes_sparse_event_before_terminal() {
     })
     .await
     .expect("sparse durable event must flush within 500ms without capacity or terminal");
+    llm.release_blocked.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut completed = false;
         while let Some(event) = rx.recv().await {
@@ -25045,6 +25048,65 @@ async fn committed_interactions_remain_immediate_delivery_boundaries() {
         })
     );
     assert!(pending.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_fanout_sparse_timer_flushes_only_after_deadline_and_commit() {
+    let append_delay = Duration::from_millis(40);
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(append_delay));
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("sparse-run", "owner", "session")
+        .await
+        .unwrap();
+    let (mut run, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "sparse-run".into(),
+        "session".into(),
+        "owner".into(),
+    );
+    let mut host = server_loop_host::ServerAgenticLoopHostBuilder::new(
+        test_settings(),
+        test_encryptor(),
+        "owner".into(),
+        "session".into(),
+    )
+    .build();
+    let (tx, rx) = mpsc::channel(8);
+    let (delivery, mut events) = svc.prepare_stream_delivery(
+        "owner",
+        "session",
+        "sparse-run",
+        &mut run,
+        &mut host,
+        (tx.clone(), rx),
+    );
+    svc.runs.write().await.insert("sparse-run".into(), run);
+    let canary = json!({"type": "agent_spawned", "agent_id": "sparse-canary"});
+    let before = store.counters.lock().unwrap().append_calls;
+    tx.send(canary.clone()).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(DURABLE_LIVE_BATCH_FLUSH_INTERVAL - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(store.counters.lock().unwrap().append_calls, before);
+    assert!(events.try_recv().is_err());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        events.try_recv().is_err(),
+        "uncommitted event must remain private"
+    );
+    tokio::time::advance(append_delay).await;
+    let event = tokio::time::timeout(Duration::from_millis(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event, canary);
+    assert_eq!(store.counters.lock().unwrap().append_calls, before + 1);
+    assert!(
+        events.try_recv().is_err(),
+        "no terminal or capacity flush was injected"
+    );
+    delivery.host_event_bridge.abort();
 }
 
 #[tokio::test]

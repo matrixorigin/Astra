@@ -8766,6 +8766,8 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_request_without_catalog_timeout_obeys_total_budget() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(
@@ -9451,6 +9453,8 @@ mod tests {
 
     #[tokio::test]
     async fn retry_backoff_crossing_total_budget_does_not_create_ghost_attempt() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -12122,6 +12126,8 @@ mod tests {
 
     #[tokio::test]
     async fn durable_admission_timeout_never_starts_provider_transport() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -12166,6 +12172,7 @@ mod tests {
 
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.began.load(Ordering::SeqCst), 1);
         assert!(!observer.dispatched.load(Ordering::SeqCst));
     }
 

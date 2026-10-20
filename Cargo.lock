@@ -493,6 +493,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "http-body-util",
+ "indexmap",
  "nix 0.31.3",
  "notify",
  "percent-encoding",
