@@ -1,3 +1,12 @@
+Capability assessment: <Updated|Unchanged|N/A>: <explanation>
+
+<!-- Replace the first line, choosing exactly one disposition. It must start at
+character zero and fit within 1024 characters. Only that raw line is validated;
+the Markdown below has no effect on this check. Updated: identify affected
+capabilities, status/profiles and reference changes. Unchanged: explain why the
+existing assessment remains accurate. N/A: explain the absence of capability
+impact. Review verifies accuracy; CI does not infer impact from code. -->
+
 ## Summary
 
 <!-- What changed, why is it needed, and who benefits? -->
@@ -30,15 +39,6 @@ impact. -->
 - Existing implementations and callers searched:
 - Superseded code, states, tables, shims, or self-only tests removed:
 - If parallel implementations remain, their boundary and retirement condition:
-
-## Capability assessment
-
-<!-- Required by CI for every PR, including dependency and release PRs. Choose
-one disposition and provide an explanation:
-Updated: name the affected capability, status/profiles and reference update.
-Unchanged: identify the existing assessment and why it remains accurate.
-N/A: explain why this change has no capability impact.
-Review checks the explanation; CI does not infer capability impact from code. -->
 
 ## Verification
 

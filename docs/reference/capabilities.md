@@ -65,13 +65,23 @@ still apply; this matrix does not introduce a compatibility mode.
 
 A public capability or profile change must update the affected row or explain
 why the existing assessment still applies in the PR's capability assessment.
-Every PR must include one `## Capability assessment` section using `Updated:`,
-`Unchanged:` or `N/A:` with an explanation. The existing required `Check PR title`
-job validates this statement on PR creation, body edits and source updates,
-without checking out code. Template comments and fenced examples do not count.
-Dependency and release PRs follow the same rule; maintainers complete the
-assessment when automation does not supply it. A justified `N/A:` is appropriate
-only when there is no capability impact.
+Every PR must start with the raw metadata line
+`Capability assessment: <disposition>: <reason>`, choosing exactly `Updated`,
+`Unchanged` or `N/A` and replacing the reason with an explanation. Start at
+character zero, with the literal spaces shown, and keep the line within 1,024
+Unicode characters (excluding its LF or CRLF terminator). Leading blank lines,
+indentation and BOM are rejected. A reason cannot be empty or a placeholder.
+Only this first line is authoritative; later labels and Markdown content are
+ignored. Markdown escapes, code and HTML-like text are raw data, including in
+the reason; the check does not promise rendered visibility.
+
+The existing required `Check PR title` job validates this field on PR creation,
+body edits and source updates without checking out code. Dependency and release
+PRs follow the same rule; maintainers complete the line when automation does not
+supply it. `Updated` identifies affected capabilities, status/profiles and
+reference changes; `Unchanged` explains why the existing assessment remains
+accurate. A justified `N/A` is appropriate only when there is no capability
+impact. Review owns the accuracy and completeness of this explanation.
 Record the implementation and meaningful verification lane; publish run results
 only with their revision, environment and artifact. Keep secrets and private
 endpoints out of evidence links.

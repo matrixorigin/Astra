@@ -333,10 +333,11 @@ the replacement version prominently while preparing the patch.
 
 ## Capability snapshot
 
-Release PRs must include a completed `## Capability assessment`, as required
-for all PRs. For version-only preparation, explain that scope after `N/A:`;
-otherwise identify the capability reference updates or why its assessment
-remains accurate. Release preparation does not generate a PR body.
+Release PRs must start with the same raw capability metadata line as all PRs,
+for example `Capability assessment: N/A: Version-only preparation changes no capability behavior.`
+For other changes, choose `Updated` or `Unchanged` and explain the reference
+updates or why its assessment remains accurate. See the [first-line contract](../reference/capabilities.md#keeping-claims-accurate).
+Release preparation does not generate a PR body.
 
 The [current capability reference](../reference/capabilities.md) is versioned with
 the source. Each new Release body links to that file at the selected immutable

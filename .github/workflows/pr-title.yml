@@ -50,51 +50,15 @@ jobs:
 
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
               body = json.load(source)["pull_request"].get("body") or ""
-          sections = []
-          current = None
-          fence = None
-          comment = False
-          for line in body.splitlines():
-              if fence is not None:
-                  if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*", line):
-                      fence = None
-                  continue
-              opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-              if not comment and opening:
-                  fence = opening[1]
-                  continue
-              # Fenced examples are opaque, including literal comment markers.
-              visible = []
-              while line:
-                  if comment:
-                      end = line.find("-->")
-                      if end < 0:
-                          break
-                      line = line[end + 3:]
-                      comment = False
-                  else:
-                      start = line.find("<!--")
-                      if start < 0:
-                          visible.append(line)
-                          break
-                      visible.append(line[:start])
-                      line = line[start + 4:]
-                      comment = True
-              line = "".join(visible)
-              heading = re.match(r"^ {0,3}(#{1,2})\s+(.+?)\s*#*\s*$", line)
-              if heading:
-                  current = [] if heading[1] == "##" and heading[2] == "Capability assessment" else None
-                  if current is not None:
-                      sections.append(current)
-              elif current is not None:
-                  current.append(line)
-
-          assessment = "\n".join(sections[0]).strip() if len(sections) == 1 else ""
-          disposition = re.fullmatch(r"(Updated|Unchanged|N/A):\s*(.*)", assessment, re.DOTALL)
+          # A raw first-line field, not a Markdown section or rendered-text check.
+          line, separator, _ = body.partition("\n") if isinstance(body, str) else ("", "", "")
+          if separator and line.endswith("\r"):
+              line = line[:-1]
+          disposition = re.fullmatch(r"Capability assessment: (Updated|Unchanged|N/A): ([^\r\n]*)", line) if len(line) <= 1024 else None
           explanation = disposition[2].strip() if disposition else ""
           placeholder = re.fullmatch(r"[\W_]*(?:TODO|TBD|None|N/?A|explanation)[\W_]*", explanation, re.IGNORECASE)
           if not re.search(r"[^\W_]", explanation) or placeholder or re.match(r"(?:TODO|TBD)\b", explanation, re.IGNORECASE):
-              print("::error::Provide exactly one '## Capability assessment' section with Updated:, Unchanged:, or N/A: and an explanation. Comments and fenced examples do not count.")
+              print("::error::Start the PR body with 'Capability assessment: Updated|Unchanged|N/A: explanation' (one disposition, at most 1024 characters).")
               sys.exit(1)
           print("Capability assessment supplied; reviewers verify its accuracy.")
           PY
