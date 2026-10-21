@@ -133,6 +133,10 @@ class ManualHarnessProgressTests(unittest.TestCase):
                      "passed":False, "evaluation":"reported", "diagnostic":{
                          "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
                          "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0],
+                         "predicate_mismatches":[
+                             {"predicate_index":index,"failure_count":1,"first_mismatch":{
+                                 "path":path,"reason":"scalar_mismatch","expected_type":"string","actual_type":"string"}}
+                             for index,path in [(1,"/error_kind"),(2,"/status")]],
                          "observed_outcomes":[{"count":1,"outcome":{"disposition":"rejected","ok":False,
                              "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed","validation":None}}],
                          "outcomes_omitted":0}}
@@ -144,6 +148,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
             summary = (root / "job-summary").read_text()
             self.assertIn("expected 1..1, observed 0", summary)
             self.assertIn("[1, 0, 0]", summary)
+            self.assertIn("scalar_mismatch", summary)
+            self.assertIn("/error_kind", summary)
             self.assertIn("not configured", summary)
             self.assertIn("tool_invalid_args", summary)
             self.assertIn("Failure stage: argument validation", summary)
@@ -158,6 +164,16 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("does not prove the requested model was checked", command.stdout)
             self.assertEqual(json.loads((root / "summary.json").read_text())["runs"][0]["criteria"][0]
                              ["diagnostic"]["observed_outcomes"], check["diagnostic"]["observed_outcomes"])
+            mismatch = check["diagnostic"]["predicate_mismatches"][0]
+            for field, bad in [("reason", "private-sentinel"), ("actual_value", "private-sentinel"),
+                               ("actual_type", {}), ("path", "/" + "x" * 512)]:
+                original = dict(mismatch["first_mismatch"])
+                mismatch["first_mismatch"][field] = bad
+                write_events(root, data)
+                _, invalid = self.publish(root, "failure")
+                self.assertEqual(invalid["observation_error"], "invalid_progress")
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                mismatch["first_mismatch"] = original
             outcome = check["diagnostic"]["observed_outcomes"][0]["outcome"]
             outcome["validation"] = {"issues":[{"code":"required","path":"/description"}], "omitted":3}
             write_events(root, data)

@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v3";
+pub const SCHEMA: &str = "astra.harness_progress.v4";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
 fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<Value>> {
@@ -266,6 +266,63 @@ mod tests {
     }
 
     #[test]
+    fn policy_mismatch_progress_preserves_verdict_without_publishing_values() {
+        let policy = json!({"mode":"fixed", "selector":{
+            "kind":"configured_name", "model_name":"configured"}});
+        for (actual, reason, path) in [
+            (json!({}), "missing", "/requested_model_policy"),
+            (
+                json!({"requested_model_policy":null}),
+                "type_mismatch",
+                "/requested_model_policy",
+            ),
+            (
+                json!({"requested_model_policy":{"mode":"fixed", "selector":{
+                "kind":"configured_name", "model_name":"private-sentinel"}}}),
+                "scalar_mismatch",
+                "/requested_model_policy/selector/model_name",
+            ),
+            (
+                json!({"requested_model_policy":{"mode":"fixed", "selector":{
+                "kind":"configured_name", "model_name":"configured", "private-sentinel":null}}}),
+                "unexpected_members",
+                "/requested_model_policy/selector",
+            ),
+        ] {
+            let mut capture =
+                serde_json::to_value(crate::execution_capture::tests::tool_capture()).unwrap();
+            capture["transcript"]["items"][0]["tool_calls"][0]["arguments"] =
+                json!(actual.to_string());
+            let mut outcome = RunOutcome::new("model");
+            outcome.run_id = Some("root".into());
+            outcome.session_id = Some("session".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(serde_json::from_value(capture).unwrap());
+            outcome.stream_capture = Some(stream);
+            let criterion: Criterion = serde_json::from_value(json!({
+                "type":"execution_tool_count", "name":"agent", "min":1,"max":1,"root_only":true,
+                "predicates":[{"document":"arguments","path":"/requested_model_policy","equals":policy}]
+            })).unwrap();
+            let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+            let projected = criteria(&results, &outcome).unwrap();
+            assert_eq!(projected[0]["passed"], false);
+            let diagnostic = &projected[0]["diagnostic"];
+            assert_eq!(diagnostic["actual"], 0);
+            assert_eq!(diagnostic["predicate_matches"], json!([0]));
+            assert_eq!(diagnostic["predicate_mismatches"][0]["failure_count"], 1);
+            let detail = &diagnostic["predicate_mismatches"][0]["first_mismatch"];
+            assert_eq!(detail["reason"], reason);
+            assert_eq!(detail["path"], path);
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
+    }
+
+    #[test]
     fn canonical_predicate_failure_reports_counts_without_publishing_documents() {
         let mut capture =
             serde_json::to_value(crate::execution_capture::tests::tool_capture()).unwrap();
@@ -296,6 +353,12 @@ mod tests {
             json!({
                 "kind":"tool_count", "min":1,"max":1,"actual":0,"considered":1,
                 "expected_ok":false,"outcome_matches":1,"error_matches":null,"predicate_matches":[1,0,0],
+                "predicate_mismatches":[
+                    {"predicate_index":1,"failure_count":1,"first_mismatch":{
+                        "path":"/error_kind","reason":"scalar_mismatch","expected_type":"string","actual_type":"string"}},
+                    {"predicate_index":2,"failure_count":1,"first_mismatch":{
+                        "path":"/status","reason":"scalar_mismatch","expected_type":"string","actual_type":"string"}}
+                ],
                 "observed_outcomes":[{"count":1,"outcome":{"disposition":"executed","ok":false,
                     "status":"rejected","error_kind":"tool_invalid_args","execution":"not_reported","validation":null}}],
                 "outcomes_omitted":0

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v3"
+SCHEMA = "astra.harness_progress.v4"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -104,7 +104,7 @@ def safe_diagnostic(value, depth):
         return
     kind = value.get("kind")
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
-              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "observed_outcomes", "outcomes_omitted"},
+              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes", "outcomes_omitted"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
               "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
@@ -163,7 +163,7 @@ def safe_diagnostic(value, depth):
         if any(type(value[k]) is not int or not -(1 << 31) <= value[k] < (1 << 31) for k in fields[kind]):
             raise ValueError("invalid exit diagnostic")
     else:
-        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "observed_outcomes"}:
+        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes"}:
             integer(value[key])
         if kind == "tool_count":
             if value["expected_ok"] is not None and type(value["expected_ok"]) is not bool:
@@ -174,6 +174,7 @@ def safe_diagnostic(value, depth):
                 raise ValueError("invalid predicate counts")
             for count in value["predicate_matches"]:
                 integer(count)
+            safe_predicate_mismatches(value)
             outcomes = value["observed_outcomes"]
             if (not isinstance(outcomes, list) or len(outcomes) > 16
                 or len(json.dumps(outcomes, separators=(",", ":"), ensure_ascii=False).encode()) > 8192):
@@ -196,6 +197,52 @@ def safe_diagnostic(value, depth):
                 observed += entry["count"]
             if observed != value["considered"]:
                 raise ValueError("incomplete outcome accounting")
+
+
+def safe_predicate_mismatches(value):
+    entries = value["predicate_mismatches"]
+    if not isinstance(entries, list) or len(entries) > 16:
+        raise ValueError("invalid predicate mismatches")
+    seen = set()
+    types = {"missing", "null", "boolean", "number", "string", "array", "object"}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"predicate_index", "failure_count", "first_mismatch"}:
+            raise ValueError("invalid predicate mismatch")
+        index = integer(entry["predicate_index"])
+        if (index >= len(value["predicate_matches"]) or index in seen
+            or integer(entry["failure_count"]) == 0
+            or entry["failure_count"] != value["outcome_matches"] - value["predicate_matches"][index]):
+            raise ValueError("invalid predicate mismatch accounting")
+        seen.add(index)
+        detail = entry["first_mismatch"]
+        if not isinstance(detail, dict):
+            raise ValueError("invalid predicate mismatch detail")
+        reason = detail.get("reason")
+        if reason == "truncated":
+            if set(detail) != {"reason", "limit"} or detail["limit"] not in ("path", "structure"):
+                raise ValueError("invalid predicate truncation")
+            continue
+        fields = {"missing": {"expected_type", "actual_type"},
+                  "type_mismatch": {"expected_type", "actual_type"},
+                  "scalar_mismatch": {"expected_type", "actual_type"},
+                  "substring_absent": {"expected_type", "actual_type"},
+                  "unexpected_members": {"count"},
+                  "array_length_mismatch": {"expected_length", "actual_length"}}
+        if not isinstance(reason, str) or reason not in fields or set(detail) != {"reason", "path"} | fields[reason]:
+            raise ValueError("unexpected predicate mismatch detail")
+        path = detail["path"]
+        if (not isinstance(path, str) or len(path.encode()) > 512
+            or (path and not path.startswith("/"))):
+            raise ValueError("invalid predicate mismatch path")
+        for key in fields[reason]:
+            if key.endswith("_type"):
+                if not isinstance(detail[key], str) or detail[key] not in types:
+                    raise ValueError("invalid predicate JSON type")
+            else:
+                integer(detail[key])
+    failed = sum(count < value["outcome_matches"] for count in value["predicate_matches"])
+    if len(seen) != failed:
+        raise ValueError("incomplete predicate mismatch accounting")
 
 
 def safe_criteria(items, *, owner_passed, depth=0):
@@ -259,6 +306,8 @@ def check_lines(items, prefix):
                     reason += f"; error-text matches={diagnostic['error_matches']}"
                 reason += f"; independent predicate matches (YAML order)={diagnostic['predicate_matches']}"
                 reason += "; all predicates must match the SAME call"
+                if diagnostic["predicate_mismatches"]:
+                    reason += "; first predicate mismatches=" + json.dumps(diagnostic["predicate_mismatches"], sort_keys=True)
                 reason += "; observed outcomes=" + json.dumps(diagnostic["observed_outcomes"], sort_keys=True)
                 if diagnostic["outcomes_omitted"]:
                     reason += f"; omitted observations={diagnostic['outcomes_omitted']}"

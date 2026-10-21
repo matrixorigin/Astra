@@ -864,6 +864,108 @@ impl JournalJsonPredicate {
             _ => false,
         }
     }
+
+    fn mismatch(&self, value: Option<&serde_json::Value>) -> serde_json::Value {
+        // Diagnostics must not publish tool arguments, results, or unknown keys.
+        // Paths come only from the declared predicate and expected structure.
+        if self.path.len() > 512 {
+            return serde_json::json!({"reason":"truncated", "limit":"path"});
+        }
+        if let Some(expected) = &self.equals {
+            first_json_mismatch(expected, value, &self.path, 0, &mut 64)
+                .expect("only mismatching predicates request diagnostics")
+        } else {
+            serde_json::json!({
+                "path":self.path,
+                "reason": match value {
+                    None => "missing",
+                    Some(serde_json::Value::String(_)) => "substring_absent",
+                    _ => "type_mismatch",
+                },
+                "expected_type":"string", "actual_type":json_kind(value),
+            })
+        }
+    }
+}
+
+fn json_kind(value: Option<&serde_json::Value>) -> &'static str {
+    use serde_json::Value;
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn first_json_mismatch(
+    expected: &serde_json::Value,
+    actual: Option<&serde_json::Value>,
+    path: &str,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<serde_json::Value> {
+    use serde_json::{Value, json};
+    if path.len() > 512 || depth > 8 || *remaining == 0 {
+        return Some(json!({"reason":"truncated", "limit":"structure"}));
+    }
+    *remaining -= 1;
+    let detail = |reason| {
+        json!({"path":path, "reason":reason,
+        "expected_type":json_kind(Some(expected)), "actual_type":json_kind(actual)})
+    };
+    let Some(actual) = actual else {
+        return Some(detail("missing"));
+    };
+    if json_kind(Some(expected)) != json_kind(Some(actual)) {
+        return Some(detail("type_mismatch"));
+    }
+    match (expected, actual) {
+        (Value::Object(expected), Value::Object(actual)) => {
+            for (key, expected) in expected {
+                if key.len() > 512 {
+                    return Some(json!({"reason":"truncated", "limit":"path"}));
+                }
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let child_path = format!("{path}/{escaped}");
+                if let Some(detail) = first_json_mismatch(
+                    expected,
+                    actual.get(key),
+                    &child_path,
+                    depth + 1,
+                    remaining,
+                ) {
+                    return Some(detail);
+                }
+            }
+            (actual.len() > expected.len()).then(|| {
+                json!({"path":path,
+                "reason":"unexpected_members", "count":actual.len() - expected.len()})
+            })
+        }
+        (Value::Array(expected), Value::Array(actual)) => {
+            if expected.len() != actual.len() {
+                return Some(json!({"path":path, "reason":"array_length_mismatch",
+                    "expected_length":expected.len(), "actual_length":actual.len()}));
+            }
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                if let Some(detail) = first_json_mismatch(
+                    expected,
+                    Some(actual),
+                    &format!("{path}/{index}"),
+                    depth + 1,
+                    remaining,
+                ) {
+                    return Some(detail);
+                }
+            }
+            None
+        }
+        _ => (actual != expected).then(|| detail("scalar_mismatch")),
+    }
 }
 
 /// How severe a criterion failure is.
@@ -1134,6 +1236,7 @@ pub(crate) fn execution_contract_proof(
             let mut outcome_matches = 0;
             let mut error_matches = 0;
             let mut predicate_matches = vec![0usize; predicates.len()];
+            let mut predicate_mismatches = vec![None; predicates.len()];
             let mut observed_outcomes: Vec<serde_json::Value> = Vec::new();
             let mut outcome_bytes = 0;
             let mut outcomes_omitted = 0usize;
@@ -1178,11 +1281,29 @@ pub(crate) fn execution_contract_proof(
                         let matched = predicate
                             .matches(document.and_then(|value| value.pointer(&predicate.path)));
                         predicate_matches[index] += usize::from(matched);
+                        if !matched && predicate_mismatches[index].is_none() {
+                            predicate_mismatches[index] = Some(predicate.mismatch(
+                                document.and_then(|value| value.pointer(&predicate.path)),
+                            ));
+                        }
                         all_match &= matched;
                     }
                     all_match
                 })
                 .count() as u32;
+            let predicate_mismatches: Vec<_> = predicate_mismatches
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, first_mismatch)| {
+                    first_mismatch.map(|first_mismatch| {
+                        serde_json::json!({
+                            "predicate_index":index,
+                            "failure_count":outcome_matches - predicate_matches[index],
+                            "first_mismatch":first_mismatch,
+                        })
+                    })
+                })
+                .collect();
             Ok((
                 count >= *min && count <= *max,
                 serde_json::json!({
@@ -1190,6 +1311,7 @@ pub(crate) fn execution_contract_proof(
                     "considered":considered, "expected_ok":ok, "outcome_matches":outcome_matches,
                     "error_matches":error_contains.as_ref().map(|_| error_matches),
                     "predicate_matches":predicate_matches,
+                    "predicate_mismatches":predicate_mismatches,
                     "observed_outcomes":observed_outcomes, "outcomes_omitted":outcomes_omitted,
                 }),
             ))
@@ -6204,6 +6326,91 @@ pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn predicate_mismatch_distinguishes_structure_without_values() {
+        use serde_json::json;
+        for (expected, actual, reason, path) in [
+            (json!(null), None, "missing", "/value"),
+            (json!({}), Some(json!(null)), "type_mismatch", "/value"),
+            (
+                json!([1]),
+                Some(json!([])),
+                "array_length_mismatch",
+                "/value",
+            ),
+            (json!([1]), Some(json!([2])), "scalar_mismatch", "/value/0"),
+            (
+                json!({"a/b~":true}),
+                Some(json!({"a/b~":false})),
+                "scalar_mismatch",
+                "/value/a~1b~0",
+            ),
+            (
+                json!({}),
+                Some(json!({"private-sentinel":"private-sentinel"})),
+                "unexpected_members",
+                "/value",
+            ),
+        ] {
+            let predicate = super::JournalJsonPredicate {
+                document: super::JournalToolDocument::Arguments,
+                path: "/value".into(),
+                equals: Some(expected),
+                contains: None,
+            };
+            assert!(!predicate.matches(actual.as_ref()));
+            let detail = predicate.mismatch(actual.as_ref());
+            assert_eq!(detail["reason"], reason);
+            assert_eq!(detail["path"], path);
+            assert!(!detail.to_string().contains("private-sentinel"));
+        }
+        let predicate = super::JournalJsonPredicate {
+            document: super::JournalToolDocument::Arguments,
+            path: "/value".into(),
+            equals: None,
+            contains: Some("required".into()),
+        };
+        let detail = predicate.mismatch(Some(&json!("private-sentinel")));
+        assert_eq!(detail["reason"], "substring_absent");
+        assert!(!detail.to_string().contains("private-sentinel"));
+    }
+
+    #[test]
+    fn predicate_mismatch_truncates_deep_wide_and_long_paths() {
+        use serde_json::{Value, json};
+        let mut deep = json!("expected");
+        let mut actual = json!("private-sentinel");
+        for _ in 0..10 {
+            deep = json!({"nested":deep});
+            actual = json!({"nested":actual});
+        }
+        let wide: serde_json::Map<_, _> =
+            (0..80).map(|i| (format!("key{i:03}"), json!(i))).collect();
+        let mut wide_actual = wide.clone();
+        wide_actual.insert("key079".into(), json!("private-sentinel"));
+        for (expected, actual, path) in [
+            (deep, actual, "/value".into()),
+            (
+                Value::Object(wide),
+                Value::Object(wide_actual),
+                "/value".into(),
+            ),
+            (json!(true), json!(false), format!("/{}", "x".repeat(512))),
+            (json!({("x".repeat(4096)):true}), json!({}), "/value".into()),
+        ] {
+            let predicate = super::JournalJsonPredicate {
+                document: super::JournalToolDocument::Arguments,
+                path,
+                equals: Some(expected),
+                contains: None,
+            };
+            assert!(!predicate.matches(Some(&actual)));
+            let detail = predicate.mismatch(Some(&actual));
+            assert_eq!(detail["reason"], "truncated");
+            assert!(detail.to_string().len() < 100);
+        }
+    }
+
     #[test]
     fn document_predicates_preserve_null_and_only_match_string_contains() {
         let null: super::JournalJsonPredicate =

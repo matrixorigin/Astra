@@ -399,13 +399,18 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v3`. Argument failures include bounded
+Progress uses `astra.harness_progress.v4`. Argument failures include bounded
 validator-authored rule codes and canonical built-in field paths; array indices
 become `*`, and unknown/provider fields are opaque. Private error text, arguments,
 provider responses and judge rationale are not public artifacts. Issue/outcome
 omissions are counted. If a receipt lacks rule details, analysis explicitly says
 the exact invalid field is unknown; an argument rejection does not prove model
-admission was reached. The unavailable-model negative control intentionally
+admission was reached. Failed execution predicates also report one bounded first
+structural difference per predicate: declared paths, JSON types, fixed reasons
+and counts, never actual values or unexpected member names. Missing keys, nulls,
+extra members and value differences remain distinct; truncated diagnostics are
+explicit and never change matching or the verdict.
+The unavailable-model negative control intentionally
 requires one valid first attempt: accepting a schema error would erase coverage.
 
 The default registered model is DeepSeek-v4.1-Flash and uses the deployment's declared
