@@ -2389,7 +2389,7 @@ mod tests {
             _criterion: &Criterion,
             _o: &RunOutcome,
             _evidence: Option<&crate::judger::SemanticJudgerEvidence>,
-        ) -> Result<JudgerResult, String> {
+        ) -> Result<JudgerResult, astra_core::ClassifiedError> {
             Ok(JudgerResult {
                 assessment: JudgerAssessment::Grade(self.score),
                 rationale: "fixed".into(),
@@ -3246,7 +3246,7 @@ mod tests {
                 _criterion: &Criterion,
                 _o: &RunOutcome,
                 _evidence: Option<&crate::judger::SemanticJudgerEvidence>,
-            ) -> Result<JudgerResult, String> {
+            ) -> Result<JudgerResult, astra_core::ClassifiedError> {
                 *self.hits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 Ok(JudgerResult {
                     assessment: JudgerAssessment::Grade(1.0),
@@ -4735,7 +4735,7 @@ mod tests {
                 criterion: &Criterion,
                 outcome: &RunOutcome,
                 evidence: Option<&crate::judger::SemanticJudgerEvidence>,
-            ) -> Result<crate::judger::JudgerResult, String> {
+            ) -> Result<crate::judger::JudgerResult, astra_core::ClassifiedError> {
                 self.questions
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -4744,10 +4744,11 @@ mod tests {
                         | Criterion::HardJudger { question, .. } => question.clone(),
                         _ => panic!("expected judger criterion"),
                     });
-                self.states
-                    .lock()
-                    .unwrap()
-                    .push(crate::judger::build_judger_request(criterion, outcome, evidence)?.state);
+                self.states.lock().unwrap().push(
+                    crate::judger::build_judger_request(criterion, outcome, evidence)
+                        .expect("valid request fixture")
+                        .state,
+                );
                 Ok(crate::judger::JudgerResult {
                     assessment: JudgerAssessment::Acceptance(true),
                     rationale: "ok".into(),
@@ -5248,13 +5249,14 @@ mod tests {
             criterion: &Criterion,
             outcome: &RunOutcome,
             evidence: Option<&crate::judger::SemanticJudgerEvidence>,
-        ) -> Result<JudgerResult, String> {
+        ) -> Result<JudgerResult, astra_core::ClassifiedError> {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            let evidence = evidence.ok_or("semantic evidence missing")?;
-            let request = crate::judger::build_judger_request(criterion, outcome, Some(evidence))?;
+            let evidence = evidence.expect("semantic evidence fixture");
+            let request = crate::judger::build_judger_request(criterion, outcome, Some(evidence))
+                .expect("valid request fixture");
             let body = request.state["verified_child_evidence"]["children"][0]["content"]
                 .as_str()
-                .ok_or("verified child body missing")?;
+                .expect("verified child body fixture");
             self.child_bodies
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())

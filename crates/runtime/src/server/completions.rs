@@ -54,10 +54,11 @@ fn provider_admission_http_error(
             "model_provider_admission_rejected",
         ),
     };
-    crate::error_response_coded(
+    crate::error_response_coded_with_metadata(
         status,
         "LLM provider admission rejected this request",
         error_code,
+        serde_json::json!({"error_kind": error.kind}),
     )
 }
 
@@ -319,10 +320,11 @@ fn provider_request_http_error(
     } else {
         (StatusCode::BAD_GATEWAY, "model_provider_request_failed")
     };
-    crate::error_response_coded(
+    crate::error_response_coded_with_metadata(
         status,
         format!("Upstream LLM request failed ({}): {detail}", error.kind),
         code,
+        serde_json::json!({"error_kind": error.kind}),
     )
 }
 
@@ -335,10 +337,11 @@ fn inference_ledger_http_error(
     if crate::turn::llm::durable::inference_scope_rejection(&error)
         == Some(astra_services::InferenceScopeRejection::Unavailable)
     {
-        return crate::error_response_coded(
+        return crate::error_response_coded_with_metadata(
             StatusCode::BAD_REQUEST,
             "The requested inference scope is unavailable",
             "invalid_inference_scope",
+            serde_json::json!({"error_kind": astra_core::ErrorKind::InvalidRequest}),
         );
     }
     let (status, error_code) = match error.kind {
@@ -354,10 +357,11 @@ fn inference_ledger_http_error(
             "inference_ledger_unavailable",
         ),
     };
-    crate::error_response_coded(
+    crate::error_response_coded_with_metadata(
         status,
         "Durable inference admission or settlement failed",
         error_code,
+        serde_json::json!({"error_kind": error.kind}),
     )
 }
 
@@ -409,6 +413,27 @@ mod tests {
     use axum::http::{HeaderValue, header::AUTHORIZATION};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn completion_failures_preserve_typed_causes_in_http_metadata() {
+        use astra_core::{ClassifiedError, ErrorKind};
+        for kind in [
+            ErrorKind::ProviderDeadline,
+            ErrorKind::RateLimit,
+            ErrorKind::PaymentRequired,
+            ErrorKind::DatabaseError,
+            ErrorKind::ContractViolation,
+        ] {
+            for map in [
+                provider_request_http_error,
+                provider_admission_http_error,
+                inference_ledger_http_error,
+            ] {
+                let (_, body) = map(ClassifiedError::new(kind, "private-provider-sentinel"));
+                assert_eq!(body.metadata, Some(json!({"error_kind":kind})));
+            }
+        }
+    }
 
     #[test]
     fn inference_scope_http_mapping_uses_typed_cause_not_diagnostic_text() {

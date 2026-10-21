@@ -1,5 +1,6 @@
 //! One auxiliary judgment, using the canonical Server session and inference owners.
 
+use astra_core::{ErrorKind, ErrorResponse};
 use astra_thin_client::{
     CompletionOperation, CompletionRequest, SessionCreateRequest, ThinClient, ThinClientError,
 };
@@ -10,6 +11,24 @@ use serde_json::{Value, json};
 // budget. A bounded reserve permits adapters that consume internal reasoning
 // before emitting the typed answer; the Server still enforces its resource cap.
 const MIN_JUDGE_COMPLETION_TOKENS: usize = 2_048;
+
+fn client_failure_kind(error: &ThinClientError) -> ErrorKind {
+    match error {
+        ThinClientError::Api { body, .. } => serde_json::from_str::<ErrorResponse>(body)
+            .ok()
+            .and_then(|response| response.metadata)
+            .and_then(|metadata| metadata.get("error_kind").cloned())
+            .and_then(|kind| serde_json::from_value(kind).ok())
+            .unwrap_or(ErrorKind::Unknown),
+        ThinClientError::Http(_) => ErrorKind::Network,
+        ThinClientError::Json(_) | ThinClientError::InvalidProviderInteractionResponse(_) => {
+            ErrorKind::ContractViolation
+        }
+        ThinClientError::InvalidAuthHeader => ErrorKind::Auth,
+        ThinClientError::ResponseTooLarge { .. } => ErrorKind::ResourceLimit,
+        _ => ErrorKind::Unknown,
+    }
+}
 
 /// The command's model selector uses the same catalog resolver as chat, with
 /// the typed judgment purpose retained on every catalog page.
@@ -41,11 +60,11 @@ pub(crate) async fn execute(
     let judgment: JudgmentRequest = match serde_json::from_str(message) {
         Ok(request) => request,
         Err(error) => {
-            return json!({"ok":false,"stage":"validate_request","error":error.to_string()});
+            return json!({"ok":false,"stage":"validate_request","error_kind":ErrorKind::InvalidRequest,"error":error.to_string()});
         }
     };
     if let Err(error) = judgment.validate() {
-        return json!({"ok":false,"stage":"validate_request","error":error});
+        return json!({"ok":false,"stage":"validate_request","error_kind":ErrorKind::InvalidRequest,"error":error});
     }
     let max_tokens = match u32::try_from(
         judgment
@@ -54,7 +73,7 @@ pub(crate) async fn execute(
     ) {
         Ok(budget) => budget,
         Err(_) => {
-            return json!({"ok":false,"stage":"validate_request","error":"judgment output budget exceeds transport limits"});
+            return json!({"ok":false,"stage":"validate_request","error_kind":ErrorKind::ResourceLimit,"error":"judgment output budget exceeds transport limits"});
         }
     };
     // A distinct real session keeps evaluation usage out of the measured agent
@@ -75,7 +94,7 @@ pub(crate) async fn execute(
     {
         Ok(session) => session,
         Err(error) => {
-            return json!({"ok": false, "stage": "create_session", "error": error.to_string()});
+            return json!({"ok": false, "stage": "create_session", "error_kind": client_failure_kind(&error), "error": error.to_string()});
         }
     };
     let Some(session_id) = session
@@ -83,7 +102,7 @@ pub(crate) async fn execute(
         .and_then(Value::as_str)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
     else {
-        return json!({"ok": false, "stage": "create_session", "error": "Server omitted a valid session_id"});
+        return json!({"ok": false, "stage": "create_session", "error_kind": ErrorKind::ContractViolation, "error": "Server omitted a valid session_id"});
     };
     // Every invocation (including a quorum vote) has its own
     // session, so these coordinates identify exactly one auxiliary operation.
@@ -134,13 +153,22 @@ pub(crate) async fn execute(
                 Some(Ok(normalized)) => (Some(normalized.response), Some(normalized.provenance)),
                 _ => (None, None),
             };
+            let error_kind = error.as_ref().map(|_| {
+                if finish_reason == Some("length") {
+                    ErrorKind::ResourceLimit
+                } else if text.is_none() || finish_reason == Some("stop") {
+                    ErrorKind::ContractViolation
+                } else {
+                    ErrorKind::Unknown
+                }
+            });
             (
                 json!({
                     "ok": error.is_none(), "stage": "completion", "session_id": session_id,
                     "completion_id": response.id, "offering_id": response.offering_id,
                     "model": response.model, "text": text, "usage": response.usage,
                     "judgment": answers, "provenance": provenance,
-                    "finish_reason": finish_reason, "error": error,
+                    "finish_reason": finish_reason, "error": error, "error_kind": error_kind,
                 }),
                 true,
             )
@@ -154,6 +182,7 @@ pub(crate) async fn execute(
             (
                 json!({"ok": false, "stage": "completion", "session_id": session_id,
                 "offering_id": offering_id, "error": error.to_string(),
+                "error_kind": client_failure_kind(&error),
                 "delivery_uncertain": !close}),
                 close,
             )
@@ -281,6 +310,14 @@ mod tests {
             let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
             assert_eq!(result["ok"], false);
             assert_eq!(result["finish_reason"], reason);
+            assert_eq!(
+                result["error_kind"],
+                if reason == "length" {
+                    "resource_limit"
+                } else {
+                    "unknown"
+                }
+            );
             assert_eq!(result["completion_id"], "completion-1");
             assert!(result["judgment"].is_null());
         }
@@ -341,21 +378,50 @@ mod tests {
 
     #[tokio::test]
     async fn completion_rejection_preserves_identity_and_does_not_retry() {
-        let server = session_server(
-            ResponseTemplate::new(429).set_body_string("capacity exhausted"),
-            Some(200),
-        )
-        .await;
-        let api = ThinClient::new(&server.uri(), None).unwrap();
-        let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
-        assert_eq!(result["ok"], false);
-        assert_eq!(result["session_id"], SESSION);
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap()
-                .contains("capacity exhausted")
-        );
+        for (status, metadata, expected) in [
+            (
+                429,
+                json!({"error_kind":"rate_limit"}),
+                ErrorKind::RateLimit,
+            ),
+            (
+                502,
+                json!({"error_kind":"provider_deadline"}),
+                ErrorKind::ProviderDeadline,
+            ),
+            (
+                503,
+                json!({"error_kind":"database_error"}),
+                ErrorKind::DatabaseError,
+            ),
+            (
+                429,
+                json!({"error_kind":"private-kind-sentinel"}),
+                ErrorKind::Unknown,
+            ),
+            (429, Value::Null, ErrorKind::Unknown),
+        ] {
+            let explicit_rejection = status < 500;
+            let server = session_server(
+                ResponseTemplate::new(status).set_body_json(json!({
+                    "detail":"[auth] private-provider-sentinel", "metadata":metadata,
+                })),
+                explicit_rejection.then_some(200),
+            )
+            .await;
+            let api = ThinClient::new(&server.uri(), None).unwrap();
+            let result = execute(&api, "test-token", "offering-1", &judgment_input(), 37).await;
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["stage"], "completion");
+            assert_eq!(result["error_kind"], json!(expected));
+            assert_eq!(result["session_id"], SESSION);
+            assert_eq!(result["delivery_uncertain"], !explicit_rejection);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if explicit_rejection { 3 } else { 2 },
+                "no retry or uncertain-session closure"
+            );
+        }
     }
 
     #[tokio::test]
@@ -370,6 +436,7 @@ mod tests {
         assert_eq!(result["ok"], false);
         assert_eq!(result["session_id"], SESSION);
         assert_eq!(result["delivery_uncertain"], true);
+        assert_eq!(result["error_kind"], "contract_violation");
     }
     #[tokio::test]
     async fn invalid_typed_request_does_not_create_session() {
@@ -382,6 +449,7 @@ mod tests {
             let result = execute(&api, "test-token", "offering-1", message, 37).await;
             assert_eq!(result["ok"], false);
             assert_eq!(result["stage"], "validate_request");
+            assert_eq!(result["error_kind"], "invalid_request");
         }
         assert!(server.received_requests().await.unwrap().is_empty());
     }

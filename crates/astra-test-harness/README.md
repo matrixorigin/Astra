@@ -399,7 +399,10 @@ loss or file-write failure cancels via the existing runner and fails closed.
 Selected custom source revisions must support this option and the repository
 helper; unsupported sources fail explicitly, without an old-log fallback.
 
-Progress uses `astra.harness_progress.v4`. Argument failures include bounded
+Progress uses `astra.harness_progress.v5`. Unavailable judges report the canonical
+error kind and a fixed failure stage; unknown causes remain `unknown`. Required
+quorum failures retain the first typed cause and still fail closed. Raw errors
+and individual vote diagnostics remain private. Argument failures include bounded
 validator-authored rule codes and canonical built-in field paths; array indices
 become `*`, and unknown/provider fields are opaque. Private error text, arguments,
 provider responses and judge rationale are not public artifacts. Issue/outcome

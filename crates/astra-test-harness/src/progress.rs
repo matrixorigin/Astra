@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::sync::broadcast;
 
-pub const SCHEMA: &str = "astra.harness_progress.v4";
+pub const SCHEMA: &str = "astra.harness_progress.v5";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
 fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<Value>> {
@@ -42,8 +42,10 @@ fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<
                     json!({"kind":"count", "min":min, "max":max, "actual":outcome.turn_rounds}),
                 Criterion::ExitCode { code } =>
                     json!({"kind":"exit", "expected":code, "actual":outcome.exit_code}),
-                Criterion::Judger { threshold, .. } | Criterion::HardJudger { threshold, .. } =>
-                    json!({"kind":"judge", "threshold":threshold, "assessment":crate::judger::assessment_status(c)}),
+                Criterion::Judger { threshold, .. } | Criterion::HardJudger { threshold, .. } => {
+                    let (assessment, failure) = crate::judger::assessment_summary(c);
+                    json!({"kind":"judge", "threshold":threshold, "assessment":assessment, "failure":failure})
+                }
                 Criterion::PromptCacheReuseScope { .. } => {
                     let diagnostic = c.full_detail.as_deref()
                         .and_then(|raw| serde_json::from_str::<crate::criteria::CacheScopeDiagnostic>(raw).ok());
@@ -815,9 +817,12 @@ mod tests {
                 _: &Criterion,
                 _: &RunOutcome,
                 _: Option<&crate::judger::SemanticJudgerEvidence>,
-            ) -> Result<crate::judger::JudgerResult, String> {
+            ) -> Result<crate::judger::JudgerResult, astra_core::ClassifiedError> {
                 if self.0 {
-                    return Err("private-sentinel".into());
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        "private-sentinel",
+                    ));
                 }
                 Ok(crate::judger::JudgerResult {
                     assessment: crate::judger::JudgerAssessment::Acceptance(false),
@@ -841,6 +846,59 @@ mod tests {
             let projected = criteria(&[result], &outcome).unwrap();
             assert_eq!(projected[0]["passed"], false);
             assert_eq!(projected[0]["diagnostic"]["assessment"], expected);
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_cli_judge_projects_only_typed_failure_through_required_quorum() {
+        use crate::judger::{AstraCliJudger, JudgerConfig, QuorumAgg, QuorumJudger};
+        let directory = tempfile::tempdir().unwrap();
+        let shim = directory.path().join("judge");
+        let criterion = Criterion::HardJudger {
+            question: "private-sentinel".into(),
+            threshold: 0.8,
+            model: None,
+        };
+        let outcome = RunOutcome::new("model");
+        for (wire_kind, expected_kind) in [
+            ("provider_deadline", "provider_deadline"),
+            ("rate_limit", "rate_limit"),
+            ("private-sentinel", "unknown"),
+        ] {
+            crate::test_support::write_executable_shim(&shim, format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"ok\":false,\"stage\":\"completion\",\"error_kind\":\"{wire_kind}\",\"error\":\"private-sentinel\",\"text\":\"SCORE: 1.0\"}}'\nexit 5\n"
+            )).unwrap();
+            let judge = QuorumJudger::new(
+                AstraCliJudger::new(JudgerConfig::new(&shim, "model")),
+                2,
+                QuorumAgg::Max,
+            );
+            let result = crate::judger::evaluate_judger(&judge, &criterion, &outcome, None)
+                .await
+                .unwrap();
+            assert!(!result.passed);
+            assert!(result.score.is_none());
+            assert!(
+                result
+                    .full_detail
+                    .as_ref()
+                    .unwrap()
+                    .contains("private-sentinel")
+            );
+            let projected = criteria(&[result], &outcome).unwrap();
+            assert_eq!(
+                projected[0]["diagnostic"],
+                json!({
+                    "kind":"judge", "threshold":0.8, "assessment":"unavailable",
+                    "failure":{"error_kind":expected_kind,"stage":"completion"}
+                })
+            );
             assert!(
                 !serde_json::to_string(&projected)
                     .unwrap()

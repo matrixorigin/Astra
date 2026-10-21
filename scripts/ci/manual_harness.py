@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v4"
+SCHEMA = "astra.harness_progress.v5"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -48,7 +48,8 @@ ERROR_KINDS = {"rate_limit", "payment_required", "server_error", "auth", "contex
                "tool_rounds_exhausted", "network", "tool_not_found", "tool_invalid_args",
                "policy_denied", "tool_timeout", "tool_unavailable", "tool_binding",
                "tool_outcome_unknown", "resource_limit", "database_error", "stall",
-               "missing_model_selection", "cancelled", "unknown", "other", "not_reported",
+               "missing_model_selection", "cancelled", "unknown"}
+OUTCOME_ERROR_KINDS = ERROR_KINDS | {"other", "not_reported",
                "delegation_model_scope_unresolved", "delegation_model_unavailable",
                "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
                "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
@@ -106,7 +107,7 @@ def safe_diagnostic(value, depth):
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
               "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes", "outcomes_omitted"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
-              "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"},
+              "judge": {"threshold", "assessment", "failure"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
     fields["cache_scope"] = {"scope", "observations", "post_cold_cache_read_tokens", "executions", "executions_omitted"}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
@@ -156,6 +157,17 @@ def safe_diagnostic(value, depth):
             raise ValueError("invalid judge assessment")
         if type(value["threshold"]) not in (int, float) or not math.isfinite(value["threshold"]) or not 0 <= value["threshold"] <= 1:
             raise ValueError("invalid judge threshold")
+        failure = value["failure"]
+        if (value["assessment"] == "unavailable") != (failure is not None):
+            raise ValueError("inconsistent judge failure")
+        if failure is not None and (not isinstance(failure, dict)
+            or set(failure) != {"error_kind", "stage"}
+            or not isinstance(failure["error_kind"], str)
+            or failure["error_kind"] not in ERROR_KINDS
+            or not isinstance(failure["stage"], str)
+            or failure["stage"] not in {"request_preparation", "subprocess", "completion",
+                "response_validation", "assessment", "aggregation", "unknown"}):
+            raise ValueError("invalid judge failure")
     elif kind == "proof":
         if type(value["proven"]) is not bool:
             raise ValueError("invalid proof")
@@ -188,7 +200,7 @@ def safe_diagnostic(value, depth):
                     or (outcome["ok"] is not None and type(outcome["ok"]) is not bool)
                     or outcome["disposition"] not in ("executed", "rejected", "reused", "suppressed", "deferred")
                     or outcome["status"] not in OUTCOME_STATUSES
-                    or outcome["error_kind"] not in ERROR_KINDS
+                    or outcome["error_kind"] not in OUTCOME_ERROR_KINDS
                     or outcome["execution"] not in ("executed", "not_executed", "unknown", "not_reported")):
                     raise ValueError("invalid outcome tags")
                 safe_validation(outcome["validation"])
@@ -288,7 +300,9 @@ def check_lines(items, prefix):
             threshold = diagnostic.get("threshold", "unknown")
             assessment = diagnostic.get("assessment")
             if assessment == "unavailable":
-                reason = "LLM judge unavailable: evaluation failed; this is NOT a negative quality verdict"
+                failure = diagnostic["failure"]
+                reason = (f"LLM judge unavailable: {failure['error_kind']} at {failure['stage']}; "
+                          "this is NOT a negative quality verdict")
             elif assessment in ("accepted", "rejected"):
                 reason = f"LLM judge {assessment} the declared criterion (acceptance verdict, not a numeric grade)"
             elif check["evaluation"] == "scored":

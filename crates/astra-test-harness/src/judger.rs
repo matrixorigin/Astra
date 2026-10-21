@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use astra_core::{ClassifiedError, ErrorKind};
 use astra_turn_types::{
     JUDGMENT_SCHEMA_VERSION, JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest,
     JudgmentResponse, JudgmentResponseProvenance,
@@ -106,30 +107,85 @@ pub enum JudgerAssessment {
 #[serde(deny_unknown_fields)]
 struct JudgerDiagnostics {
     assessment: Option<JudgerAssessment>,
+    failure: Option<JudgerFailureSummary>,
     detail: String,
 }
 
-pub(crate) fn assessment_status(result: &CriterionResult) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JudgerFailureStage {
+    RequestPreparation,
+    Subprocess,
+    Completion,
+    ResponseValidation,
+    Assessment,
+    Aggregation,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JudgerFailureSummary {
+    error_kind: ErrorKind,
+    stage: JudgerFailureStage,
+}
+
+fn judger_error(
+    kind: ErrorKind,
+    stage: JudgerFailureStage,
+    message: impl Into<String>,
+) -> ClassifiedError {
+    ClassifiedError::new(kind, message)
+        .with_details_json(serde_json::json!({"stage": stage}).to_string())
+}
+
+impl JudgerFailureSummary {
+    fn from_error(error: &ClassifiedError) -> Self {
+        let stage = error
+            .details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|context| context.get("stage").cloned())
+            .and_then(|stage| serde_json::from_value(stage).ok())
+            .unwrap_or(JudgerFailureStage::Unknown);
+        Self {
+            error_kind: error.kind,
+            stage,
+        }
+    }
+}
+
+pub(crate) fn assessment_summary(
+    result: &CriterionResult,
+) -> (&'static str, Option<JudgerFailureSummary>) {
     let Some(diagnostic) = result
         .full_detail
         .as_deref()
         .and_then(|raw| serde_json::from_str::<JudgerDiagnostics>(raw).ok())
     else {
-        return "unreported";
+        return ("unreported", None);
     };
     match diagnostic.assessment {
-        Some(JudgerAssessment::Grade(score)) if result.score == Some(score) => "graded",
+        Some(JudgerAssessment::Grade(score))
+            if result.score == Some(score) && diagnostic.failure.is_none() =>
+        {
+            ("graded", None)
+        }
         Some(JudgerAssessment::Acceptance(accepted))
-            if result.score.is_none() && result.passed == accepted =>
+            if result.score.is_none()
+                && result.passed == accepted
+                && diagnostic.failure.is_none() =>
         {
             if accepted {
-                "accepted"
+                ("accepted", None)
             } else {
-                "rejected"
+                ("rejected", None)
             }
         }
-        None if result.score.is_none() && !result.passed => "unavailable",
-        _ => "unreported",
+        None if result.score.is_none() && !result.passed && diagnostic.failure.is_some() => {
+            ("unavailable", diagnostic.failure)
+        }
+        _ => ("unreported", None),
     }
 }
 
@@ -180,8 +236,8 @@ pub fn validate_builtin_judger_timeout(seconds: u64) -> Result<(), String> {
 }
 
 /// Injectable scoring backend. Tests use a fake impl; production uses
-/// [`AstraCliJudger`]. Returning a `Result<JudgerResult, String>` keeps
-/// error messages human-readable in the report.
+/// [`AstraCliJudger`]. Typed failures preserve their cause without exposing
+/// private messages through public progress.
 #[async_trait]
 pub trait Judger: Send + Sync {
     async fn judge(
@@ -189,7 +245,7 @@ pub trait Judger: Send + Sync {
         criterion: &Criterion,
         outcome: &RunOutcome,
         evidence: Option<&SemanticJudgerEvidence>,
-    ) -> Result<JudgerResult, String>;
+    ) -> Result<JudgerResult, ClassifiedError>;
 }
 
 /// Run one Judger criterion against an outcome using the provided
@@ -209,7 +265,11 @@ pub async fn evaluate_judger(
             if matches!(result.assessment, JudgerAssessment::Acceptance(_))
                 && !matches!(criterion, Criterion::HardJudger { .. })
             {
-                Err("quality judging requires a grade, not an acceptance verdict".into())
+                Err(judger_error(
+                    ErrorKind::ContractViolation,
+                    JudgerFailureStage::Assessment,
+                    "quality judging requires a grade, not an acceptance verdict",
+                ))
             } else {
                 Ok(result)
             }
@@ -234,6 +294,7 @@ pub async fn evaluate_judger(
             let full_detail = Some(
                 serde_json::to_string(&JudgerDiagnostics {
                     assessment: Some(score.assessment),
+                    failure: None,
                     detail: format!("{label}\n{}", score.full_rationale),
                 })
                 .expect("judge diagnostics serialize"),
@@ -261,10 +322,14 @@ pub async fn evaluate_judger(
             criterion: criterion.clone(),
             severity: crate::criteria::criterion_severity(criterion),
             passed: false,
-            detail: format!("judger call failed: {}", truncate_for_judger(&e, 200)),
+            detail: format!(
+                "judger call failed: {}",
+                truncate_for_judger(&e.message, 200)
+            ),
             full_detail: Some(
                 serde_json::to_string(&JudgerDiagnostics {
                     assessment: None,
+                    failure: Some(JudgerFailureSummary::from_error(&e)),
                     detail: format!("judger call failed: {e}"),
                 })
                 .expect("judge diagnostics serialize"),
@@ -292,13 +357,24 @@ impl Judger for AstraCliJudger {
         criterion: &Criterion,
         outcome: &RunOutcome,
         evidence: Option<&SemanticJudgerEvidence>,
-    ) -> Result<JudgerResult, String> {
-        let (_, _, model_override) =
-            judger_parameters(criterion).ok_or("not a judger criterion")?;
+    ) -> Result<JudgerResult, ClassifiedError> {
+        let (_, _, model_override) = judger_parameters(criterion).ok_or_else(|| {
+            judger_error(
+                ErrorKind::InvalidRequest,
+                JudgerFailureStage::RequestPreparation,
+                "not a judger criterion",
+            )
+        })?;
         let judger_model = model_override
             .unwrap_or(self.cfg.default_model.as_str())
             .to_string();
-        let request = build_judger_request(criterion, outcome, evidence)?;
+        let request = build_judger_request(criterion, outcome, evidence).map_err(|message| {
+            judger_error(
+                ErrorKind::InvalidRequest,
+                JudgerFailureStage::RequestPreparation,
+                message,
+            )
+        })?;
         run_judger_call(&self.cfg, &judger_model, &request).await
     }
 }
@@ -456,13 +532,18 @@ async fn run_judger_call(
     cfg: &JudgerConfig,
     model: &str,
     request: &JudgmentRequest,
-) -> Result<JudgerResult, String> {
+) -> Result<JudgerResult, ClassifiedError> {
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::process::Command;
 
-    validate_builtin_judger_timeout(cfg.timeout_seconds)?;
-
+    validate_builtin_judger_timeout(cfg.timeout_seconds).map_err(|message| {
+        judger_error(
+            ErrorKind::InvalidRequest,
+            JudgerFailureStage::RequestPreparation,
+            message,
+        )
+    })?;
     let mut cmd = Command::new(&cfg.astra_bin);
     if let Some(profile) = &cfg.profile {
         cmd.arg("--profile").arg(profile);
@@ -470,45 +551,99 @@ async fn run_judger_call(
     cmd.arg("session")
         .arg("judge")
         .arg("-m")
-        .arg(serde_json::to_string(request).map_err(|e| format!("encode judgment request: {e}"))?)
+        .arg(serde_json::to_string(request).map_err(|error| {
+            judger_error(
+                ErrorKind::InvalidRequest,
+                JudgerFailureStage::RequestPreparation,
+                format!("encode judgment request: {error}"),
+            )
+        })?)
         .arg("--model")
         .arg(model)
         .arg("--timeout-seconds")
         .arg(cfg.timeout_seconds.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        // Capture stderr too (was previously discarded to Stdio::null)
-        // so pipe backpressure can't block the child; wait_with_output
-        // drains both concurrently.
         .stderr(Stdio::piped())
-        // See exec.rs for the kill_on_drop rationale.
         .kill_on_drop(true);
-
-    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-    // The Server owns the inference deadline. Leave transport, profile/model
-    // resolution and session closure room to settle before this process watchdog.
+    let child = cmd.spawn().map_err(|error| {
+        judger_error(
+            ErrorKind::ToolUnavailable,
+            JudgerFailureStage::Subprocess,
+            format!("spawn: {error}"),
+        )
+    })?;
+    // The Server owns inference deadlines; leave transport and closure room.
     let timeout = Duration::from_secs(cfg.timeout_seconds.saturating_add(60));
-
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .map_err(|_| format!("judger timeout after {}s", timeout.as_secs()))?
-        .map_err(|e| format!("judger wait: {e}"))?;
-
-    let stdout_body = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr_body = String::from_utf8_lossy(&output.stderr).into_owned();
+        .map_err(|_| {
+            judger_error(
+                ErrorKind::ToolTimeout,
+                JudgerFailureStage::Subprocess,
+                format!("judger timeout after {}s", timeout.as_secs()),
+            )
+        })?
+        .map_err(|error| {
+            judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Subprocess,
+                format!("judger wait: {error}"),
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code();
     if !output.status.success() {
-        return Err(format!(
+        // Failed-process stdout is diagnostic data; never recover a score from it.
+        let mut error = serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .ok()
+            .and_then(|envelope| cli_judger_failure(&envelope))
+            .unwrap_or_else(|| {
+                judger_error(
+                    ErrorKind::Unknown,
+                    JudgerFailureStage::Subprocess,
+                    "judger subprocess failed",
+                )
+            });
+        error.message = format!(
             "judger subprocess failed (exit_code={exit_code:?})\n{}",
-            judger_failure_output(&stdout_body, &stderr_body)
-        ));
+            judger_failure_output(&stdout, &stderr)
+        );
+        return Err(error);
     }
-    parse_judgment_result(&stdout_body, request).map_err(|error| {
-        format!(
-            "{error} (exit_code={exit_code:?})\n{}",
-            judger_failure_output(&stdout_body, &stderr_body)
-        )
+    parse_judgment_result(&stdout, request).map_err(|mut error| {
+        error.message = format!(
+            "{} (exit_code={exit_code:?})\n{}",
+            error.message,
+            judger_failure_output(&stdout, &stderr)
+        );
+        error
     })
+}
+
+fn cli_judger_failure(envelope: &serde_json::Value) -> Option<ClassifiedError> {
+    if envelope.get("ok").and_then(serde_json::Value::as_bool) != Some(false) {
+        return None;
+    }
+    let kind = envelope
+        .get("error_kind")
+        .cloned()
+        .and_then(|kind| serde_json::from_value(kind).ok())
+        .unwrap_or(ErrorKind::Unknown);
+    let stage = match envelope.get("stage").and_then(serde_json::Value::as_str) {
+        Some("validate_request") => JudgerFailureStage::RequestPreparation,
+        Some("create_session" | "completion") => JudgerFailureStage::Completion,
+        _ => JudgerFailureStage::Unknown,
+    };
+    Some(judger_error(
+        kind,
+        stage,
+        format!(
+            "judger completion failed: {}",
+            envelope.get("error").unwrap_or(&serde_json::Value::Null)
+        ),
+    ))
 }
 
 /// Failed processes can put their typed interruption in stdout. Preserve it as
@@ -544,35 +679,44 @@ fn judger_failure_output(stdout: &str, stderr: &str) -> String {
 pub(crate) fn parse_judgment_result(
     stdout_body: &str,
     request: &JudgmentRequest,
-) -> Result<JudgerResult, String> {
+) -> Result<JudgerResult, ClassifiedError> {
+    let invalid = |message: String| {
+        judger_error(
+            ErrorKind::ContractViolation,
+            JudgerFailureStage::ResponseValidation,
+            message,
+        )
+    };
     let envelope: serde_json::Value = serde_json::from_str(stdout_body.trim())
-        .map_err(|error| format!("judger response is not valid JSON: {error}"))?;
+        .map_err(|error| invalid(format!("judger response is not valid JSON: {error}")))?;
+    if let Some(error) = cli_judger_failure(&envelope) {
+        return Err(error);
+    }
     if envelope.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(format!(
-            "judger completion failed: {}",
-            envelope.get("error").unwrap_or(&serde_json::Value::Null)
-        ));
+        return Err(invalid("judger response omitted success status".into()));
     }
     let response: JudgmentResponse = serde_json::from_value(
         envelope
             .get("judgment")
             .cloned()
-            .ok_or("judger response missing normalized judgment")?,
+            .ok_or_else(|| invalid("judger response missing normalized judgment".into()))?,
     )
-    .map_err(|error| format!("invalid normalized judgment: {error}"))?;
-    response.validate_for(request).map_err(str::to_owned)?;
+    .map_err(|error| invalid(format!("invalid normalized judgment: {error}")))?;
+    response
+        .validate_for(request)
+        .map_err(|message| invalid(message.into()))?;
     let provenance: JudgmentResponseProvenance = serde_json::from_value(
         envelope
             .get("provenance")
             .cloned()
-            .ok_or("judger response missing provenance")?,
+            .ok_or_else(|| invalid("judger response missing provenance".into()))?,
     )
-    .map_err(|error| format!("invalid judgment provenance: {error}"))?;
+    .map_err(|error| invalid(format!("invalid judgment provenance: {error}")))?;
     if request.questions.contains_key(ACCEPTANCE_ID) {
         let answer = response
             .answers
             .get(ACCEPTANCE_ID)
-            .ok_or("missing acceptance answer")?;
+            .ok_or_else(|| invalid("missing acceptance answer".into()))?;
         let accepted = determined_noul(answer, provenance)?;
         let rationale = format!("Criterion accepted: {accepted}");
         return Ok(JudgerResult {
@@ -580,29 +724,42 @@ pub(crate) fn parse_judgment_result(
             rationale: rationale.clone(),
             full_rationale: format!(
                 "{rationale}\nDecision diagnostics: {}",
-                serde_json::to_string_pretty(&envelope).map_err(|error| error.to_string())?
+                serde_json::to_string_pretty(&envelope)
+                    .map_err(|error| invalid(error.to_string()))?
             ),
             votes: Vec::new(),
         });
     }
     let mut selected = None;
     for (id, score, category) in RUBRIC {
-        let answer = response.answers.get(*id).ok_or("missing rubric category")?;
-        let selected_category = determined_noul(answer, provenance)?;
-        if !selected_category {
+        let answer = response
+            .answers
+            .get(*id)
+            .ok_or_else(|| invalid("missing rubric category".into()))?;
+        if !determined_noul(answer, provenance)? {
             continue;
         }
         if selected.replace((*score, *category)).is_some() {
-            return Err("multiple affirmative rubric categories".into());
+            return Err(judger_error(
+                ErrorKind::ContractViolation,
+                JudgerFailureStage::Assessment,
+                "multiple affirmative rubric categories",
+            ));
         }
     }
-    let (score, category) = selected.ok_or("no affirmative rubric category")?;
+    let (score, category) = selected.ok_or_else(|| {
+        judger_error(
+            ErrorKind::Unknown,
+            JudgerFailureStage::Assessment,
+            "no affirmative rubric category",
+        )
+    })?;
     Ok(JudgerResult {
         assessment: JudgerAssessment::Grade(score),
         rationale: category.into(),
         full_rationale: format!(
             "Rubric category: {category}\nDecision diagnostics: {}",
-            serde_json::to_string_pretty(&envelope).map_err(|error| error.to_string())?
+            serde_json::to_string_pretty(&envelope).map_err(|error| invalid(error.to_string()))?
         ),
         votes: Vec::new(),
     })
@@ -611,27 +768,42 @@ pub(crate) fn parse_judgment_result(
 fn determined_noul(
     answer: &astra_turn_types::JudgmentAnswer,
     provenance: JudgmentResponseProvenance,
-) -> Result<bool, String> {
+) -> Result<bool, ClassifiedError> {
+    let invalid = |message| {
+        judger_error(
+            ErrorKind::ContractViolation,
+            JudgerFailureStage::ResponseValidation,
+            message,
+        )
+    };
     match provenance {
         JudgmentResponseProvenance::ProviderProbability => {
             let value = answer
                 .native_noul_probability()
-                .ok_or("native judgment contains a discrete decision")?;
+                .ok_or_else(|| invalid("native judgment contains a discrete decision"))?;
             if value <= 0.2 {
                 Ok(false)
             } else if value >= 0.8 {
                 Ok(true)
             } else {
-                Err("uncertain judgment answer".into())
+                Err(judger_error(
+                    ErrorKind::Unknown,
+                    JudgerFailureStage::Assessment,
+                    "uncertain judgment answer",
+                ))
             }
         }
         JudgmentResponseProvenance::DiscreteDecision => match answer
             .discrete_noul_decision()
-            .ok_or("discrete judgment contains a provider probability")?
+            .ok_or_else(|| invalid("discrete judgment contains a provider probability"))?
         {
             JudgmentNoulDecision::Yes => Ok(true),
             JudgmentNoulDecision::No => Ok(false),
-            JudgmentNoulDecision::Unknown => Err("uncertain judgment answer".into()),
+            JudgmentNoulDecision::Unknown => Err(judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Assessment,
+                "uncertain judgment answer",
+            )),
         },
     }
 }
@@ -692,11 +864,12 @@ impl<J: Judger> Judger for QuorumJudger<J> {
         criterion: &Criterion,
         outcome: &RunOutcome,
         evidence: Option<&SemanticJudgerEvidence>,
-    ) -> Result<JudgerResult, String> {
+    ) -> Result<JudgerResult, ClassifiedError> {
         let mut assessments = Vec::with_capacity(self.n as usize);
         let mut rationales: Vec<String> = Vec::with_capacity(self.n as usize);
         let mut first_short: Option<String> = None;
         let mut errors: Vec<String> = Vec::new();
+        let mut first_error = None;
         for i in 0..self.n {
             match self.inner.judge(criterion, outcome, evidence).await {
                 Ok(s) => {
@@ -712,28 +885,41 @@ impl<J: Judger> Judger for QuorumJudger<J> {
                         s.full_rationale
                     ));
                 }
-                Err(e) => errors.push(format!("run {}/{}: {e}", i + 1, self.n)),
+                Err(error) => {
+                    errors.push(format!("run {}/{}: {error}", i + 1, self.n));
+                    first_error.get_or_insert(error);
+                }
             }
         }
         if assessments.is_empty() {
-            return Err(format!(
-                "all {} judge runs failed: {}",
-                self.n,
-                errors.join("; ")
-            ));
+            let mut error = first_error.unwrap_or_else(|| {
+                judger_error(
+                    ErrorKind::InvalidRequest,
+                    JudgerFailureStage::Aggregation,
+                    "no judge runs configured",
+                )
+            });
+            error.message = format!("all {} judge runs failed: {}", self.n, errors.join("; "));
+            return Err(error);
         }
         if matches!(criterion, Criterion::HardJudger { .. }) && !errors.is_empty() {
-            return Err(format!(
+            let mut error = first_error.expect("a required vote failed");
+            error.message = format!(
                 "required judgment votes incomplete: {}\n{}",
                 errors.join("; "),
                 rationales.join("\n\n")
-            ));
+            );
+            return Err(error);
         }
         let assessment = aggregate_assessments(&assessments, self.agg).map_err(|error| {
-            format!(
-                "{error}\n{}\n{}",
-                rationales.join("\n\n"),
-                errors.join("; ")
+            judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Aggregation,
+                format!(
+                    "{error}\n{}\n{}",
+                    rationales.join("\n\n"),
+                    errors.join("; ")
+                ),
             )
         })?;
         let scores = assessments
@@ -975,10 +1161,18 @@ impl Judger for ExternalCmdJudger {
         criterion: &Criterion,
         outcome: &RunOutcome,
         evidence: Option<&SemanticJudgerEvidence>,
-    ) -> Result<JudgerResult, String> {
+    ) -> Result<JudgerResult, ClassifiedError> {
         use tokio::process::Command;
 
-        let (question, _, _) = judger_parameters(criterion).ok_or("not a judger criterion")?;
+        let prepare = |message: String| {
+            judger_error(
+                ErrorKind::InvalidRequest,
+                JudgerFailureStage::RequestPreparation,
+                message,
+            )
+        };
+        let (question, _, _) =
+            judger_parameters(criterion).ok_or_else(|| prepare("not a judger criterion".into()))?;
         let mut input = serde_json::json!({
             "protocol_version": "1.1",
             "question": question,
@@ -996,22 +1190,33 @@ impl Judger for ExternalCmdJudger {
         });
 
         if let Some(evidence) = evidence {
-            let request = build_judger_request(criterion, outcome, Some(evidence))?;
+            let request =
+                build_judger_request(criterion, outcome, Some(evidence)).map_err(prepare)?;
             input["verified_child_evidence"] = request.state["verified_child_evidence"].clone();
             input["policy"] = request.state["policy"].clone();
             input["outcome"]["text"] = evidence.0["parent_response"].clone();
             input["outcome"]["stderr"] = serde_json::json!("");
-            if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len()
+            if serde_json::to_vec(&input)
+                .map_err(|e| prepare(e.to_string()))?
+                .len()
                 > SEMANTIC_JUDGER_REQUEST_CAP
             {
-                return Err("complete semantic judgment exceeds judge budget".into());
+                return Err(judger_error(
+                    ErrorKind::ResourceLimit,
+                    JudgerFailureStage::RequestPreparation,
+                    "complete semantic judgment exceeds judge budget",
+                ));
             }
         }
         if self.cmd.trim().is_empty() {
-            return Err("judger-cmd is empty".to_string());
+            return Err(judger_error(
+                ErrorKind::ToolUnavailable,
+                JudgerFailureStage::Subprocess,
+                "judger-cmd is empty",
+            ));
         }
 
-        let payload = serde_json::to_vec(&input).map_err(|e| e.to_string())?;
+        let payload = serde_json::to_vec(&input).map_err(|e| prepare(e.to_string()))?;
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(self.timeout_seconds);
         let mut command = Command::new("sh");
@@ -1024,11 +1229,13 @@ impl Judger for ExternalCmdJudger {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let mut process = ExternalJudgeProcess(
-            command
-                .spawn()
-                .map_err(|e| format!("spawn judger-cmd {}: {e}", self.cmd))?,
-        );
+        let mut process = ExternalJudgeProcess(command.spawn().map_err(|error| {
+            judger_error(
+                ErrorKind::ToolUnavailable,
+                JudgerFailureStage::Subprocess,
+                format!("spawn judger-cmd {}: {error}", self.cmd),
+            )
+        })?);
         let group_id = process.0.id();
         let mut stdin = process.0.stdin.take().expect("piped stdin");
         let stdout = process.0.stdout.take().expect("piped stdout");
@@ -1059,18 +1266,34 @@ impl Judger for ExternalCmdJudger {
             error => {
                 crate::exec::kill_process_group_and_reap(&mut process.0, group_id).await;
                 return Err(match error {
-                    Ok(Err(error)) => format!("judger-cmd I/O: {error}"),
-                    _ => format!("judger-cmd timed out after {}s", self.timeout_seconds),
+                    Ok(Err(error)) => judger_error(
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            ErrorKind::ResourceLimit
+                        } else {
+                            ErrorKind::Unknown
+                        },
+                        JudgerFailureStage::Subprocess,
+                        format!("judger-cmd I/O: {error}"),
+                    ),
+                    _ => judger_error(
+                        ErrorKind::ToolTimeout,
+                        JudgerFailureStage::Subprocess,
+                        format!("judger-cmd timed out after {}s", self.timeout_seconds),
+                    ),
                 });
             }
         };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "judger-cmd exited {}: {}",
-                output.status,
-                stderr.chars().take(500).collect::<String>()
+            return Err(judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Subprocess,
+                format!(
+                    "judger-cmd exited {}: {}",
+                    output.status,
+                    stderr.chars().take(500).collect::<String>()
+                ),
             ));
         }
 
@@ -1081,12 +1304,22 @@ impl Judger for ExternalCmdJudger {
             score: f64,
             rationale: String,
         }
-        let response: ExternalJudgerResponse = serde_json::from_str(stdout.trim())
-            .map_err(|e| format!("judger-cmd stdout not valid JSON typed envelope: {e}"))?;
+        let response: ExternalJudgerResponse =
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                judger_error(
+                    ErrorKind::ContractViolation,
+                    JudgerFailureStage::ResponseValidation,
+                    format!("judger-cmd stdout not valid JSON typed envelope: {e}"),
+                )
+            })?;
         if !response.score.is_finite() || !(0.0..=1.0).contains(&response.score) {
-            return Err(format!(
-                "external judger score {} is outside the required finite range [0,1]",
-                response.score
+            return Err(judger_error(
+                ErrorKind::ContractViolation,
+                JudgerFailureStage::Assessment,
+                format!(
+                    "external judger score {} is outside the required finite range [0,1]",
+                    response.score
+                ),
             ));
         }
 
@@ -1228,7 +1461,7 @@ mod tests {
                     .judge(&hard_criterion(1.0), &outcome, Some(&evidence))
                     .await
                     .unwrap_err();
-                assert!(error.contains("exceeds judge budget"), "{error}");
+                assert!(error.message.contains("exceeds judge budget"), "{error}");
             }
         }
     }
@@ -1328,7 +1561,7 @@ echo '{"score":0.0,"rationale":"child is wrong despite correct parent"}'
         .to_string()
     }
 
-    fn acceptance_result(accepted: bool) -> Result<JudgerResult, String> {
+    fn acceptance_result(accepted: bool) -> Result<JudgerResult, ClassifiedError> {
         Ok(JudgerResult {
             assessment: JudgerAssessment::Acceptance(accepted),
             rationale: format!("accepted={accepted}"),
@@ -1527,7 +1760,11 @@ print({response:?})
                 QuorumAgg::Max,
                 vec![
                     acceptance_result(true),
-                    Err("recorded missing answer".into()),
+                    Err(judger_error(
+                        ErrorKind::Unknown,
+                        JudgerFailureStage::Unknown,
+                        "recorded missing answer",
+                    )),
                 ],
             ),
             (
@@ -1691,15 +1928,15 @@ print({response:?})
             .await
             .expect_err("shim exits non-zero, so the score must fail closed");
         assert!(
-            err.contains("judger subprocess failed"),
+            err.message.contains("judger subprocess failed"),
             "subprocess status must be authoritative: {err}"
         );
         assert!(
-            err.contains("rate limit exceeded"),
+            err.message.contains("rate limit exceeded"),
             "subprocess stderr must flow into the error: {err}"
         );
         assert!(
-            err.contains("exit_code=Some(42)"),
+            err.message.contains("exit_code=Some(42)"),
             "subprocess exit code must appear: {err}"
         );
     }
@@ -1813,7 +2050,7 @@ print({response:?})
     /// In-memory Judger impl that returns canned scores. Lives in
     /// tests because no production caller should want canned scores.
     pub struct FakeJudger {
-        pub result: Result<JudgerResult, String>,
+        pub result: Result<JudgerResult, ClassifiedError>,
     }
 
     #[async_trait]
@@ -1823,7 +2060,7 @@ print({response:?})
             _criterion: &Criterion,
             _outcome: &RunOutcome,
             _evidence: Option<&SemanticJudgerEvidence>,
-        ) -> Result<JudgerResult, String> {
+        ) -> Result<JudgerResult, ClassifiedError> {
             self.result.clone()
         }
     }
@@ -1875,7 +2112,11 @@ print({response:?})
     #[tokio::test]
     async fn evaluate_judger_fails_on_backend_error() {
         let j = FakeJudger {
-            result: Err("rate limit".into()),
+            result: Err(judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Unknown,
+                "rate limit",
+            )),
         };
         let c = Criterion::Judger {
             question: "q?".into(),
@@ -2001,10 +2242,11 @@ print({response:?})
 
     /// Inner judger that cycles through a canned sequence of results per call.
     struct ScriptedJudger {
-        results: std::sync::Mutex<std::collections::VecDeque<Result<JudgerResult, String>>>,
+        results:
+            std::sync::Mutex<std::collections::VecDeque<Result<JudgerResult, ClassifiedError>>>,
     }
     impl ScriptedJudger {
-        fn new(seq: Vec<Result<JudgerResult, String>>) -> Self {
+        fn new(seq: Vec<Result<JudgerResult, ClassifiedError>>) -> Self {
             Self {
                 results: std::sync::Mutex::new(seq.into_iter().collect()),
             }
@@ -2017,16 +2259,18 @@ print({response:?})
             _criterion: &Criterion,
             _o: &RunOutcome,
             _evidence: Option<&SemanticJudgerEvidence>,
-        ) -> Result<JudgerResult, String> {
-            self.results
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err("scripted sequence exhausted".into()))
+        ) -> Result<JudgerResult, ClassifiedError> {
+            self.results.lock().unwrap().pop_front().unwrap_or_else(|| {
+                Err(judger_error(
+                    ErrorKind::Unknown,
+                    JudgerFailureStage::Unknown,
+                    "scripted sequence exhausted",
+                ))
+            })
         }
     }
 
-    fn score_of(x: f64, r: &str) -> Result<JudgerResult, String> {
+    fn score_of(x: f64, r: &str) -> Result<JudgerResult, ClassifiedError> {
         Ok(JudgerResult {
             assessment: JudgerAssessment::Grade(x),
             rationale: r.into(),
@@ -2141,7 +2385,11 @@ print({response:?})
     async fn quorum_tolerates_partial_errors_and_returns_available_scores() {
         // 1st run errors, 2nd + 3rd succeed. Median of 2 = (0.5+0.9)/2 = 0.7.
         let inner = ScriptedJudger::new(vec![
-            Err("transient network blip".into()),
+            Err(judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Unknown,
+                "transient network blip",
+            )),
             score_of(0.5, "maybe"),
             score_of(0.9, "yes"),
         ]);
@@ -2157,15 +2405,26 @@ print({response:?})
 
     #[tokio::test]
     async fn quorum_fails_when_all_runs_fail() {
-        let inner = ScriptedJudger::new(vec![Err("timeout".into()), Err("rate limit".into())]);
+        let inner = ScriptedJudger::new(vec![
+            Err(judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Unknown,
+                "timeout",
+            )),
+            Err(judger_error(
+                ErrorKind::Unknown,
+                JudgerFailureStage::Unknown,
+                "rate limit",
+            )),
+        ]);
         let q = QuorumJudger::new(inner, 2, QuorumAgg::Median);
         let res = q
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await;
         let err = res.unwrap_err();
-        assert!(err.contains("all 2 judge runs failed"));
-        assert!(err.contains("timeout"));
-        assert!(err.contains("rate limit"));
+        assert!(err.message.contains("all 2 judge runs failed"));
+        assert!(err.message.contains("timeout"));
+        assert!(err.message.contains("rate limit"));
     }
 
     // ── model_family + warn_if_same_family tests ──
@@ -2231,7 +2490,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("out-of-range score must fail closed");
-        assert!(error.contains("range"), "{error}");
+        assert!(error.message.contains("range"), "{error}");
     }
 
     #[tokio::test]
@@ -2241,7 +2500,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("empty cmd must fail");
-        assert!(err.contains("empty"), "{err}");
+        assert!(err.message.contains("empty"), "{err}");
     }
 
     #[tokio::test]
@@ -2255,7 +2514,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("non-zero exit must fail");
-        assert!(err.contains("provider crashed"), "{err}");
+        assert!(err.message.contains("provider crashed"), "{err}");
     }
 
     #[tokio::test]
@@ -2269,7 +2528,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("garbage stdout must fail");
-        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(err.message.contains("not valid JSON"), "{err}");
     }
 
     #[tokio::test]
@@ -2283,7 +2542,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("missing score field must fail");
-        assert!(err.contains("score"), "{err}");
+        assert!(err.message.contains("score"), "{err}");
     }
 
     #[tokio::test]
@@ -2296,7 +2555,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("missing rationale must fail closed");
-        assert!(err.contains("rationale"), "{err}");
+        assert!(err.message.contains("rationale"), "{err}");
     }
 
     #[tokio::test]
@@ -2309,7 +2568,7 @@ print({response:?})
             .judge(&quality_criterion("q"), &dummy_outcome(), None)
             .await
             .expect_err("timeout must fail");
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.message.contains("timed out"), "{err}");
     }
 
     #[cfg(unix)]
@@ -2330,7 +2589,7 @@ print({response:?})
             if expected.is_empty() {
                 assert_eq!(grade(&result.unwrap()), 1.0);
             } else {
-                assert!(result.unwrap_err().contains(expected), "{command}");
+                assert!(result.unwrap_err().message.contains(expected), "{command}");
             }
         })).await;
     }

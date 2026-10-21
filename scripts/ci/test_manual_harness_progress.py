@@ -96,6 +96,20 @@ class ManualHarnessProgressTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 h.safe_diagnostic(dict(valid, **changes), 0)
 
+    def test_judge_failure_accepts_only_fixed_typed_metadata(self):
+        base = {"kind":"judge", "assessment":"unavailable", "threshold":0.8,
+                "failure":{"error_kind":"provider_deadline", "stage":"completion"}}
+        h.safe_diagnostic(base, 0)
+        for failure in (None, {}, {"error_kind":{}, "stage":"completion"},
+                        {"error_kind":"unknown", "stage":[]},
+                        {"error_kind":"private-sentinel", "stage":"completion"},
+                        {"error_kind":"unknown", "stage":"private-sentinel"},
+                        {**base["failure"], "detail":"private-sentinel"}):
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                h.safe_diagnostic({**base, "failure":failure}, 0)
+        with self.assertRaises(ValueError):
+            h.safe_diagnostic({**base, "assessment":"accepted"}, 0)
+
     def test_captured_root_lifecycle_is_a_closed_unavailable_diagnostic(self):
         for state in ("running", "waiting", "paused", "delegated", "interrupted", "failed", "cancelled"):
             diagnostic = {"kind": "child_adoption", "status": "unavailable", "reason": f"root_{state}"}
@@ -199,7 +213,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
                 outcome[field] = prior
             for assessment in ("rejected", "unavailable"):
-                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment})
+                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment, "failure": {"error_kind":"provider_deadline", "stage":"completion"} if assessment == "unavailable" else None})
                 write_events(root, data)
                 code, _ = self.publish(root, "failure")
                 self.assertEqual(code, 1)

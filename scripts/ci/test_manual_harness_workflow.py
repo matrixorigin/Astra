@@ -235,7 +235,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                             "Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n"
                             "Path(sys.argv[sys.argv.index('--report-file')+1]).write_text('{}')\n"
                             "import os\n"
-                            "e={'schema':'astra.harness_progress.v4','type':'suite_started',"
+                            "e={'schema':'astra.harness_progress.v5','type':'suite_started',"
                             "'run_id':'cli','sequence':1,'total':1,'commit':os.environ['ASTRA_BUILD_SOURCE_GIT_SHA']}\n"
                             "Path(sys.argv[sys.argv.index('--progress-file')+1]).write_text(json.dumps(e)+'\\n')\n")
             stub.chmod(0o700)
