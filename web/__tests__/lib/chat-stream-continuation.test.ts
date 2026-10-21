@@ -12,7 +12,7 @@ import { GET, POST } from "@/app/api/chats/[chatId]/stream/route";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { getStore, getChat, claimChatStreamProjection, withChatStreamProjection,
-  releaseChatStreamProjection, beginStreamingMessage, queueDeferredRunInput, resumeActiveRun, getChatHydrated } from "@/lib/api/web-store";
+  releaseChatStreamProjection, beginStreamingMessage, queueDeferredRunInput, resumeActiveRun, stopActiveRun, updateStreamingAssistantMessage, setChatActiveRun, getChatHydrated } from "@/lib/api/web-store";
 import { WebRuntimeClient, getRuntimeClient as getStoreRuntimeClient, requireRuntimeClient as requireStoreRuntimeClient } from "@/lib/runtime-client/server";
 import { streamExistingChatRun, streamChatMessage } from "@/lib/api/chats";
 import { isNotFoundError } from "@/lib/api/errors";
@@ -667,4 +667,135 @@ it.each([true, false])("resolves an omitted message only from the active owner (
   expect(response.status).toBe(bound ? 200 : 409);
   await response.text();
   expect(selectedMessage().content).toBe("Partial answer");
+});
+
+
+it.each([false, true])("revalidates Stop after runtime admission (replaced=%s)", async replaced => {
+  await prefix("Original answer A");
+  const binding = { runId: "root", sessionId: "session", assistantMessageId: assistantId };
+  const client = runtime(backend([{ ...bootstrap, run_id: "new-root" }]));
+  const cancel = vi.spyOn(client.sdk, "cancelRun").mockResolvedValue({} as never);
+  let admit!: (value: WebRuntimeClient) => void;
+  vi.mocked(requireStoreRuntimeClient).mockImplementationOnce(() => new Promise(resolve => { admit = resolve; }));
+  const stopping = stopActiveRun("owner", "chat", binding, { skipSync: true });
+  // Attach the rejection handler before completing asynchronous admission.
+  const settled = stopping.then(value => ({ value }), error => ({ error }));
+  if (replaced) await (await startPost()).text();
+  admit(client);
+  const result = await settled;
+  if (replaced) {
+    expect(result).toMatchObject({ error: { message: expect.stringContaining("selected run changed") } });
+    expect(cancel).not.toHaveBeenCalled();
+  } else {
+    expect(result).toHaveProperty("value");
+    expect(cancel).toHaveBeenCalledExactlyOnceWith("root");
+  }
+  expect(getChat("owner", "chat")?.activeRun?.runId).toBe(replaced ? "new-root" : "root");
+});
+
+it("rejects a stale Stop request before it can cancel the successor", async () => {
+  await prefix("Original answer A");
+  const oldAssistantId = assistantId;
+  const client = runtime(backend([{ ...bootstrap, run_id: "new-root" }]));
+  const cancel = vi.spyOn(client.sdk, "cancelRun").mockResolvedValue({} as never);
+  await (await startPost()).text();
+  expect(getChat("owner", "chat")?.activeRun?.runId).toBe("new-root");
+  const { POST: stop } = await import("@/app/api/chats/[chatId]/stop/route");
+  const response = await stop(new Request("http://web.test/api/chats/chat/stop", {
+    method: "POST", body: JSON.stringify({ runId: "root", sessionId: "session", assistantMessageId: oldAssistantId }),
+  }), { params: Promise.resolve({ chatId: "chat" }) });
+  expect(cancel).not.toHaveBeenCalled();
+  expect(response.status).toBe(409);
+  expect(getChat("owner", "chat")?.activeRun?.runId).toBe("new-root");
+});
+
+
+it.each(["session", "root", "message"])("rejects a stale Stop %s before runtime admission", async changed => {
+  await prefix("Saved answer");
+  vi.mocked(requireStoreRuntimeClient).mockClear();
+  const binding = { runId: "root", sessionId: "session", assistantMessageId: assistantId };
+  if (changed === "session") binding.sessionId = "other-session";
+  if (changed === "root") binding.runId = "other-root";
+  if (changed === "message") binding.assistantMessageId = "other-assistant";
+  await expect(stopActiveRun("owner", "chat", binding, { skipSync: true }))
+    .rejects.toThrow("selected run changed");
+  expect(requireStoreRuntimeClient).not.toHaveBeenCalled();
+  expect(selectedMessage().content).toBe("Saved answer");
+});
+
+it.each(["completed", "rejected"])("fences late Stop %s after dispatch and replacement", async outcome => {
+  await prefix("Original answer A");
+  const binding = { runId: "root", sessionId: "session", assistantMessageId: assistantId };
+  const client = runtime(backend([{ ...bootstrap, run_id: "new-root" }]));
+  let settle!: () => void;
+  const cancel = vi.spyOn(client.sdk, "cancelRun").mockImplementation(() => new Promise((resolve, reject) => {
+    settle = () => outcome === "completed" ? resolve({} as never) : reject(new Error("cancel rejected"));
+  }));
+  const result = await stopActiveRun("owner", "chat", binding, { skipSync: true, cancelTimeoutMs: 1 });
+  expect(result?.cancelPending).toBe(true);
+  await (await startPost()).text();
+  const successor = getChat("owner", "chat");
+  settle();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(cancel).toHaveBeenCalledExactlyOnceWith("root");
+  expect(getChat("owner", "chat")).toEqual(successor);
+  expect(getChat("owner", "chat")?.activeRun?.runId).toBe("new-root");
+});
+
+it("fences a Stop status read that completes after a new public POST", async () => {
+  await prefix("Original answer A");
+  const binding = { runId: "root", sessionId: "session", assistantMessageId: assistantId };
+  const client = runtime(backend([{ ...bootstrap, run_id: "new-root" }]));
+  vi.spyOn(client.sdk, "cancelRun").mockResolvedValue({} as never);
+  let settle!: (value: unknown) => void;
+  const status = vi.spyOn(client.sdk, "getRunStatus").mockImplementation(() => new Promise(resolve => { settle = resolve as never; }));
+  vi.mocked(getStoreRuntimeClient).mockResolvedValue(client);
+  const stopping = stopActiveRun("owner", "chat", binding, { skipSync: true });
+  await vi.waitFor(() => expect(status).toHaveBeenCalledExactlyOnceWith("root"));
+  await (await startPost()).text();
+  const successor = getChat("owner", "chat");
+  settle({ runId: "root", sessionId: "session", status: "cancelled" });
+  await stopping;
+  expect(getChat("owner", "chat")).toEqual(successor);
+});
+
+it("cancels a runtime-only root without stopping an unrelated assistant", async () => {
+  await prefix("Unrelated assistant output");
+  const record = getStore("owner").chats.find(item => item.id === "chat")!;
+  record.activeRun!.assistantMessageId = undefined;
+  const client = runtime(backend([]));
+  const cancel = vi.spyOn(client.sdk, "cancelRun").mockResolvedValue({} as never);
+  const before = { ...record.messages.at(-1)! };
+  await stopActiveRun("owner", "chat", { runId: "root", sessionId: "session", assistantMessageId: null }, { skipSync: true });
+  expect(cancel).toHaveBeenCalledExactlyOnceWith("root");
+  expect(record.messages.at(-1)).toEqual(before);
+});
+
+
+it.each(["output", "root facts"])("preserves newer %s on late Stop rejection", async progress => {
+  await prefix("Original answer");
+  const binding = { runId: "root", sessionId: "session", assistantMessageId: assistantId };
+  const client = runtime(backend([]));
+  let reject!: (error: Error) => void;
+  vi.spyOn(client.sdk, "cancelRun").mockImplementation(() => new Promise((_resolve, failure) => { reject = failure; }));
+  await stopActiveRun("owner", "chat", binding, { skipSync: true, cancelTimeoutMs: 1 });
+  const record = getStore("owner").chats.find(item => item.id === "chat")!;
+  record.streamProjection!.state.nextEventIndex = 12;
+  if (progress === "output") {
+    updateStreamingAssistantMessage("owner", "chat", assistantId, {
+      content: "New answer", artifacts: [{ id: "new-artifact", kind: "file", title: "New attachment" }],
+    });
+  } else {
+    setChatActiveRun("owner", "chat", { ...record.activeRun!, status: "waiting", waitingFor: "user_input", nextEventIndex: 12 });
+  }
+  reject(new Error("cancel rejected"));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const current = getChat("owner", "chat")!;
+  expect(current.activeRun?.nextEventIndex).toBe(12);
+  if (progress === "output") {
+    expect(current.messages.at(-1)).toMatchObject({ content: "New answer", artifacts: [{ id: "new-artifact" }] });
+    expect(current.activeRun?.status).toBe("input-queued");
+  } else {
+    expect(current.activeRun).toMatchObject({ status: "waiting", waitingFor: "user_input" });
+  }
 });

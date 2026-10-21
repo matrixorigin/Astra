@@ -1,3 +1,4 @@
+import type { StopRunRequest } from "@/lib/api/types";
 import { parseChatSseFrame, isReplayObservationEvent } from "@/lib/api/chat-sse-frame";
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError, streamObservationInterrupted } from "@/lib/api/errors";
@@ -150,11 +151,12 @@ export function queueChatRunInput(chatId: string, payload: SendMessageRequest) {
   );
 }
 
-export function stopChatRun(chatId: string) {
+export function stopChatRun(chatId: string, binding: StopRunRequest) {
   return requestJson<ActiveRunMutationResponse>(
     `/api/chats/${encodeURIComponent(chatId)}/stop`,
     {
       method: "POST",
+      body: JSON.stringify({ sessionId: binding.sessionId, runId: binding.runId, assistantMessageId: binding.assistantMessageId }),
     },
   );
 }

@@ -340,3 +340,10 @@ export type SkillListResponse = {
   limit: number;
   nextCursor: RuntimeSkillListCursor | null;
 };
+
+/** Explicit target of a Stop request; null assistant is a runtime-only binding. */
+export type StopRunRequest = {
+  sessionId: string;
+  runId: string;
+  assistantMessageId: string | null;
+};

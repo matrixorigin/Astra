@@ -7,6 +7,7 @@ vi.mock("@/lib/api/auth-guard", () => ({
 vi.mock("@/lib/api/web-store", () => ({
   getChat: vi.fn(),
   stopActiveRun: vi.fn(),
+  StaleRunBindingError: class StaleRunBindingError extends Error {},
 }));
 
 vi.mock("@/lib/runtime-client", () => ({
@@ -74,13 +75,13 @@ describe("chat stop route", () => {
     });
 
     const { POST } = await import("@/app/api/chats/[chatId]/stop/route");
-    const response = await POST(new Request("http://test.local"), {
+    const response = await POST(new Request("http://test.local", { method: "POST", body: JSON.stringify({ sessionId: "chat-stop", runId: "run-stop", assistantMessageId: null }) }), {
       params: Promise.resolve({ chatId: "chat-stop" }),
     });
 
     expect(response.status).toBe(200);
     expect(mockGetChat).toHaveBeenCalledWith("user-a", "chat-stop");
-    expect(mockStopActiveRun).toHaveBeenCalledWith("user-a", "chat-stop", {
+    expect(mockStopActiveRun).toHaveBeenCalledWith("user-a", "chat-stop", { sessionId: "chat-stop", runId: "run-stop", assistantMessageId: null }, {
       skipSync: true,
       cancelTimeoutMs: 1500,
     });
@@ -93,4 +94,23 @@ describe("chat stop route", () => {
       cancelPending: true,
     });
   });
+
+  it.each([
+    undefined, null, [], {},
+    { sessionId: "session", runId: "root" },
+    { sessionId: "session", runId: "", assistantMessageId: null },
+    { sessionId: 7, runId: "root", assistantMessageId: null },
+    { sessionId: "session", runId: "root", assistantMessageId: 7 },
+    { sessionId: "session", runId: "root\n", assistantMessageId: null },
+  ])("rejects missing or malformed Stop binding %j", async body => {
+    mockRequireRuntimeUser.mockResolvedValue({ user: { user_id: "user-a" } } as never);
+    const { POST } = await import("@/app/api/chats/[chatId]/stop/route");
+    const response = await POST(new Request("http://test.local", {
+      method: "POST", body: JSON.stringify(body),
+    }), { params: Promise.resolve({ chatId: "chat-stop" }) });
+    expect(response.status).toBe(400);
+    expect(mockStopActiveRun).not.toHaveBeenCalled();
+    expect(mockGetChat).not.toHaveBeenCalled();
+  });
+
 });

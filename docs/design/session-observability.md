@@ -368,3 +368,16 @@ review and explicit resubmission; only accepted input receives queued feedback.
 Plan-review approvals derive bounded correlation IDs from the Session and tool
 invocation at the existing approval producer. Native invocation IDs are unchanged;
 the review ID and its durable event keys fit the existing interaction columns.
+
+Stop uses the same selected chat/Session/root/assistant binding as observation.
+The request requires the initiating Session, root and nullable assistant; a missing
+or malformed binding is rejected, and a changed binding is a conflict before any
+cancellation is dispatched. A runtime-only root has an explicit null assistant
+and never completes another message by fallback. After dispatch, cancellation
+continues only against its captured root; delayed responses, reconciliation and
+rollback cannot mutate a successor binding or newer root facts. Browser cleanup
+belongs to the initiating operation, and Stop status reads never overlap.
+
+If Stop fails and the same binding remains attachable, live observation recovers
+through the existing bounded GET retry owner without resetting its budget or
+replaying the turn.

@@ -971,7 +971,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     await user.click(screen.getByRole("button", { name: "Stop run" }));
 
     await waitFor(() => {
-      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123", { chatId: "chat-123", sessionId: "chat-123", runId: "run-123", assistantMessageId: expect.any(String) });
     });
     expect(screen.getByText("Stopped.")).toBeInTheDocument();
     expect(
@@ -1338,7 +1338,7 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     await user.click(screen.getByRole("button", { name: "Stop run" }));
     await waitFor(() => {
-      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123", { chatId: "chat-123", sessionId: "chat-123", runId: "run-123", assistantMessageId: expect.any(String) });
     });
     expect(screen.getByText("Stopped.")).toBeInTheDocument();
     expect(
@@ -1401,7 +1401,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     await user.click(screen.getByRole("button", { name: "Stop run" }));
 
     await waitFor(() => {
-      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123", { chatId: "chat-123", sessionId: "chat-123", runId: "run-123", assistantMessageId: expect.any(String) });
     });
     await waitFor(() => {
       expect(mockGetChat).toHaveBeenCalledWith("chat-123");
@@ -1450,7 +1450,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         await Promise.resolve();
       });
 
-      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123");
+      expect(mockStopChatRun).toHaveBeenCalledWith("chat-123", { chatId: "chat-123", sessionId: "chat-123", runId: "run-123", assistantMessageId: expect.any(String) });
       await act(async () => {
         vi.advanceTimersByTime(10_000);
         await Promise.resolve();
@@ -2420,4 +2420,155 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(mockGetChat).toHaveBeenCalledExactlyOnceWith("chat-123");
     expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    { point: "reply", replaced: false }, { point: "reply", replaced: "root" },
+    { point: "refresh", replaced: false }, { point: "refresh", replaced: "root" },
+    { point: "reply", replaced: "session" }, { point: "refresh", replaced: "message" },
+  ])("fences Stop $point after binding replacement (replaced=$replaced)", async ({ point, replaced }) => {
+    const initial = makeDetail();
+    initial.messages[0].content = "Original answer A";
+    const next = makeDetail({ runId: replaced === "root" ? "new-root" : "run-123", status: "running",
+      assistantMessageId: replaced === "session" ? "assistant-live" : "assistant-b", nextEventIndex: 12 });
+    if (replaced === "session") next.session!.backendSessionId = "new-session";
+    next.messages[0].content = "Selected answer B";
+    let reply!: () => void;
+    let refresh!: (value: ChatDetail) => void;
+    mockStopChatRun.mockImplementation(() => new Promise((resolve, reject) => {
+      reply = () => point === "reply" ? resolve({}) : reject(new Error("Stop rejected"));
+    }));
+    mockGetChat.mockImplementation(() => new Promise(resolve => { refresh = resolve; }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ToastProvider><ChatView initial={initial} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalledOnce());
+    await userEvent.setup().click(screen.getByRole("button", { name: "Stop run" }));
+    expect(mockStopChatRun).toHaveBeenCalledExactlyOnceWith("chat-123", { chatId: "chat-123", sessionId: "chat-123", runId: "run-123", assistantMessageId: expect.any(String) });
+    if (point === "refresh") {
+      await act(async () => reply());
+      await waitFor(() => expect(mockGetChat).toHaveBeenCalledOnce());
+    }
+    if (replaced) act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+    await act(async () => { if (point === "reply") reply(); else refresh(initial); });
+    if (replaced) {
+      expect(screen.getByText("Selected answer B")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+      expect(mockStreamExistingChatRun).toHaveBeenLastCalledWith("chat-123", next.activeRun!.runId, expect.anything(),
+        { assistantMessageId: next.activeRun!.assistantMessageId, nextEventIndex: 12 });
+    } else if (point === "reply") {
+      expect(screen.queryByRole("button", { name: "Stop run" })).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByText("Original answer A")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+    }
+  });
+
+  it("releases a replaced Stop promptly without letting its finalizer unlock the successor", async () => {
+    let settleA!: () => void;
+    let settleB!: () => void;
+    mockStopChatRun.mockImplementationOnce(() => new Promise(resolve => { settleA = () => resolve({}); }))
+      .mockImplementationOnce(() => new Promise(resolve => { settleB = () => resolve({}); }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ChatView initial={makeDetail()} />);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Stop run" }));
+    const next = makeDetail({ ...defaultActiveRun, runId: "new-root", assistantMessageId: "assistant-b" });
+    act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+    expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Stop run" }));
+    await act(async () => settleA());
+    expect(screen.getByRole("button", { name: "Submit composer" })).toBeDisabled();
+    expect(mockStopChatRun).toHaveBeenCalledTimes(2);
+    await act(async () => settleB());
+    expect(screen.getByRole("button", { name: "Submit composer" })).toBeEnabled();
+  });
+
+  it("retires Stop effects on unmount before a late pending ACK", async () => {
+    vi.useFakeTimers();
+    try {
+      let settle!: () => void;
+      mockStopChatRun.mockImplementation(() => new Promise(resolve => {
+        settle = () => resolve({ cancelPending: true, activeRun: { ...defaultActiveRun, status: "cancelling" } });
+      }));
+      const { unmount } = render(<ChatView initial={makeDetail()} />);
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Stop run" })); });
+      unmount();
+      await act(async () => settle());
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+      expect(mockGetChat).not.toHaveBeenCalled();
+      expect(pushMock).not.toHaveBeenCalled();
+      expect(replaceMock).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps Stop reconciliation single-flight and discards a superseded read", async () => {
+    vi.useFakeTimers();
+    try {
+      let settle!: (value: ChatDetail) => void;
+      mockGetChat.mockImplementation(() => new Promise(resolve => { settle = resolve; }));
+      mockStopChatRun.mockResolvedValue({ cancelPending: true, activeRun: { ...defaultActiveRun, status: "cancelling" } });
+      render(<ChatView initial={makeDetail()} />);
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Stop run" })); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(mockGetChat).toHaveBeenCalledOnce();
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(mockGetChat).toHaveBeenCalledOnce();
+      const next = makeDetail({ ...defaultActiveRun, runId: "new-root", assistantMessageId: "assistant-b" });
+      next.messages[0].content = "Successor output";
+      act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+      await act(async () => settle(makeDetail()));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+      expect(mockGetChat).toHaveBeenCalledOnce();
+      expect(screen.getByText("Successor output")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
+    } finally { vi.useRealTimers(); }
+  });
+
+
+  it.each(["ACK", "failure refresh"])("preserves a newer terminal observation across Stop %s", async point => {
+    let settle!: () => void;
+    let refresh!: (value: ChatDetail) => void;
+    mockStopChatRun.mockImplementation(() => new Promise((resolve, reject) => {
+      settle = () => point === "ACK" ? resolve({}) : reject(new Error("Stop rejected"));
+    }));
+    mockGetChat.mockImplementation(() => new Promise(resolve => { refresh = resolve; }));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Stop run" }));
+    if (point === "failure refresh") await act(async () => settle());
+    const terminal = makeDetail(null);
+    terminal.messages = [{ id: "assistant-live", role: "assistant", content: "New canonical result",
+      createdAt: "2026-06-07T00:00:00Z", status: "complete" }];
+    act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: terminal }));
+    await act(async () => { if (point === "ACK") settle(); else refresh(makeDetail()); });
+    expect(screen.getByText("New canonical result")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop run" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Stop rejected")).not.toBeInTheDocument();
+  });
+
+
+  it.each([true, false])("reattaches the same running binding after failed Stop (refresh=%s)", async refreshed => {
+    vi.useFakeTimers();
+    try {
+      const initial = makeDetail({ ...defaultActiveRun, nextEventIndex: 8 });
+      initial.messages[0].content = "Saved partial output";
+      mockStreamExistingChatRun.mockImplementationOnce(() => new Promise(() => {}))
+        .mockImplementationOnce((_chat, _run, handlers) => {
+          handlers.onText?.("Recovered live output");
+          return new Promise(() => {});
+        });
+      mockStopChatRun.mockRejectedValue(new Error("Stop rejected"));
+      if (refreshed) mockGetChat.mockResolvedValue(initial);
+      else mockGetChat.mockRejectedValue(new Error("Refresh unavailable"));
+      render(<ToastProvider><ChatView initial={initial} /></ToastProvider>);
+      await act(async () => { await Promise.resolve(); });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Stop run" })); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_100); });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
+      expect(mockStreamExistingChatRun).toHaveBeenLastCalledWith("chat-123", "run-123", expect.anything(),
+        { assistantMessageId: "assistant-live", nextEventIndex: 8 });
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+      expect(screen.getByText("Recovered live output")).toBeInTheDocument();
+      expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
 });

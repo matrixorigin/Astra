@@ -25,7 +25,7 @@ import {
   type PendingRunApproval,
 } from "@/lib/api/chats";
 import { appendRunFailure } from "@/lib/api/stream-event-helpers";
-import { mergeStreamRunUpdate } from "@/lib/api/active-run-merge";
+import { chatRunBinding, sameRunBinding, mergeStreamRunUpdate, type ChatRunBinding } from "@/lib/api/active-run-merge";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
 import {
   WebApiError,
@@ -106,32 +106,16 @@ export function canAttachRunStream(status: string | undefined | null) {
   return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
 }
 
-function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
-  const index = [...messages]
-    .reverse()
-    .findIndex(
-      (message) =>
-        message.role === "assistant" &&
-        (message.status === "streaming" ||
-          message.reasoningStatus === "streaming"),
-    );
-  if (index < 0) {
-    return messages;
-  }
-  const actualIndex = messages.length - 1 - index;
-  return messages.map((message, i) =>
-    i === actualIndex
-      ? {
-          ...message,
-          status: "complete" as const,
-          content: message.content.trim()
-            ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
-            : "Stopped.",
-          completedAt: new Date().toISOString(),
-          reasoningStatus: "complete" as const,
-        }
-      : message,
-  );
+function stoppedAssistant(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    status: "complete",
+    content: message.content.trim()
+      ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
+      : "Stopped.",
+    completedAt: new Date().toISOString(),
+    reasoningStatus: "complete",
+  };
 }
 
 function withClientTimeout<T>(
@@ -150,28 +134,19 @@ function withClientTimeout<T>(
   });
 }
 
-type StreamBinding = {
-  chatId: string;
-  sessionId: string | null;
-  runId: string;
-  assistantMessageId: string;
-};
+type StreamBinding = ChatRunBinding & { assistantMessageId: string };
 
 function streamBinding(detail: ChatDetail): StreamBinding | null {
-  const run = detail.activeRun;
-  return run?.runId && run.assistantMessageId ? {
-    chatId: detail.chat.id,
-    sessionId: detail.session?.backendSessionId ?? null,
-    runId: run.runId,
-    assistantMessageId: run.assistantMessageId,
-  } : null;
+  const binding = chatRunBinding(detail);
+  return binding?.assistantMessageId ? { ...binding, assistantMessageId: binding.assistantMessageId } : null;
 }
 
-function sameStreamBinding(left: StreamBinding | null, right: StreamBinding | null) {
-  return left === right || !!left && !!right && left.chatId === right.chatId &&
-    left.sessionId === right.sessionId && left.runId === right.runId &&
-    left.assistantMessageId === right.assistantMessageId;
-}
+type StopOperation = {
+  binding: ChatRunBinding;
+  retired: boolean;
+  release: () => void;
+  retire: () => void;
+};
 
 export interface UseStreamLifecycleParams {
   detail: ChatDetail;
@@ -254,15 +229,16 @@ export function useStreamLifecycle(
   const reconcileTimerRef = useRef<number | undefined>(undefined);
   const reconcileIntervalRef = useRef<number | undefined>(undefined);
   const stopReconcileRef = useRef<() => void>(() => {
-    if (reconcileTimerRef.current) {
-      window.clearTimeout(reconcileTimerRef.current);
-      reconcileTimerRef.current = undefined;
-    }
     if (reconcileIntervalRef.current) {
       window.clearInterval(reconcileIntervalRef.current);
       reconcileIntervalRef.current = undefined;
     }
+    if (reconcileTimerRef.current) {
+      window.clearTimeout(reconcileTimerRef.current);
+      reconcileTimerRef.current = undefined;
+    }
   });
+  const stopOperationRef = useRef<StopOperation | null>(null);
   const runControlMutationRef = useRef(false);
   const detailRef = useRef(detail);
   detailRef.current = detail;
@@ -332,8 +308,8 @@ export function useStreamLifecycle(
     if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
     autoAttachRetryTimerRef.current = window.setTimeout(() => {
       autoAttachRetryTimerRef.current = undefined;
-      if (!sameStreamBinding(streamBinding(detailRef.current), binding)) return;
-      if (sameStreamBinding(autoAttachAttemptedRunRef.current, binding)) autoAttachAttemptedRunRef.current = null;
+      if (!sameRunBinding(streamBinding(detailRef.current), binding)) return;
+      if (sameRunBinding(autoAttachAttemptedRunRef.current, binding)) autoAttachAttemptedRunRef.current = null;
       _setRunAttachRetrySignal(signal => signal + 1);
     }, Math.min(1_000 * 2 ** attempts, 8_000));
     return true;
@@ -341,7 +317,7 @@ export function useStreamLifecycle(
 
   // -- Hydrate work surface --
   const hydrateWorkSurfaceForChat = useCallback(
-    async (options?: { silent?: boolean }) => {
+    async (options?: { silent?: boolean; isCurrent?: () => boolean }) => {
       const sessionId = detail.session?.backendSessionId ?? null;
       if (!options?.silent) {
         setWorkSurface((current) =>
@@ -351,14 +327,14 @@ export function useStreamLifecycle(
       try {
         const response = await getChatWorkSurface(detail.chat.id);
         setWorkSurface((current) =>
-          hydrateWorkSurface(
+          options?.isCurrent && !options.isCurrent() ? current : hydrateWorkSurface(
             current,
             response as unknown as WorkSurfaceProjection,
           ),
         );
       } catch (error) {
         setWorkSurface((current) =>
-          failWorkSurfaceLoad(
+          options?.isCurrent && !options.isCurrent() ? current : failWorkSurfaceLoad(
             current,
             error instanceof Error
               ? error.message
@@ -574,7 +550,7 @@ export function useStreamLifecycle(
     const lease = claimAttachedRun(binding);
     let receiving = true;
     const ownsSelection = (current: ChatDetail) => attachedRunLeaseRef.current === lease &&
-      sameStreamBinding(streamBinding(current), binding);
+      sameRunBinding(streamBinding(current), binding);
     const canReceive = () => receiving && !signal.aborted && ownsSelection(detailRef.current);
     // React may execute an update after a replacement was queued in the same batch.
     // EOF closes callbacks, but already-queued updates retain their valid lease.
@@ -699,8 +675,8 @@ export function useStreamLifecycle(
     const binding = streamBinding(detail);
     const hasAssistant = !!binding && detail.messages.some(message =>
       message.id === binding.assistantMessageId && message.role === "assistant");
-    if (attachedRunRef.current && (!sameStreamBinding(attachedRunRef.current, binding) || !hasAssistant)) clearAttachedRun();
-    if (!sameStreamBinding(autoAttachAttemptedRunRef.current, binding)) {
+    if (attachedRunRef.current && (!sameRunBinding(attachedRunRef.current, binding) || !hasAssistant)) clearAttachedRun();
+    if (!sameRunBinding(autoAttachAttemptedRunRef.current, binding)) {
       autoAttachAttemptedRunRef.current = null;
       const selectedKey = binding ? JSON.stringify(binding) : null;
       for (const key of autoAttachRetryCountsRef.current.keys()) {
@@ -709,6 +685,8 @@ export function useStreamLifecycle(
       if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
       autoAttachRetryTimerRef.current = undefined;
     }
+    const stop = stopOperationRef.current;
+    if (stop && !sameRunBinding(chatRunBinding(detail), stop.binding)) stop.retire();
     if (!canAttachRunStream(detail.activeRun?.status)) {
       autoAttachAttemptedRunRef.current = null;
       autoAttachRetryCountsRef.current.clear();
@@ -716,9 +694,9 @@ export function useStreamLifecycle(
       autoAttachRetryTimerRef.current = undefined;
       return;
     }
-    if (isArchived || detail.pendingTurn || runControlBusy || !binding?.sessionId ||
-      sameStreamBinding(attachedRunRef.current, binding) ||
-      sameStreamBinding(autoAttachAttemptedRunRef.current, binding) ||
+    if (isArchived || detail.pendingTurn || runControlBusy || !detail.session?.backendSessionId || !binding ||
+      sameRunBinding(attachedRunRef.current, binding) ||
+      sameRunBinding(autoAttachAttemptedRunRef.current, binding) ||
       !Number.isSafeInteger(detail.activeRun?.nextEventIndex) || detail.activeRun!.nextEventIndex! < 0 ||
       !hasAssistant) return;
     autoAttachAttemptedRunRef.current = binding;
@@ -900,7 +878,7 @@ export function useStreamLifecycle(
           onRunStarted: (runId) => {
             if (!canReceive()) return;
             streamRunId = runId;
-            streamRunLease = claimAttachedRun({ chatId: detail.chat.id, sessionId: streamSessionId,
+            streamRunLease = claimAttachedRun({ chatId: detail.chat.id, sessionId: streamSessionId ?? detail.session?.backendSessionId ?? detail.chat.id,
               runId, assistantMessageId: currentAssistantId });
             resetWorkSurfaceRun(runId);
             setStartingRun(false);
@@ -1135,10 +1113,8 @@ export function useStreamLifecycle(
         addToast(error.message, "error");
         throw error;
       }
-      const matchesRequestedBinding = (current: ChatDetail) => current.chat.id === detail.chat.id &&
-        current.session?.backendSessionId === detail.session?.backendSessionId &&
-        current.activeRun?.runId === detail.activeRun?.runId &&
-        current.activeRun?.assistantMessageId === detail.activeRun?.assistantMessageId;
+      const binding = chatRunBinding(detail);
+      const matchesRequestedBinding = (current: ChatDetail) => sameRunBinding(chatRunBinding(current), binding);
       runControlMutationRef.current = true;
       setQueueingDeferredInput(true);
 
@@ -1176,143 +1152,137 @@ export function useStreamLifecycle(
 
   // -- Stop active run --
   const stopActiveRun = useCallback(() => {
-    if (!detail.activeRun?.runId || !canStopRun) {
-      return;
-    }
-    const runId = detail.activeRun.runId;
-    const previousActiveRun = detail.activeRun;
-    const previousMessages = detail.messages;
-    if (runControlMutationRef.current) {
-      return;
-    }
+    const binding = chatRunBinding(detail);
+    if (!binding || !canStopRun || runControlMutationRef.current) return;
+    stopOperationRef.current?.retire();
+    stopReconcileRef.current();
+    const previousRun = detail.activeRun!;
+    const cancellingRun = { ...previousRun, status: "cancelling", waitingFor: "cancel_requested" };
+    const previousMessage = detail.messages.find(message => message.id === binding.assistantMessageId && message.role === "assistant");
+    const stoppedMessage = previousMessage ? stoppedAssistant(previousMessage) : undefined;
+    let released = false;
+    let timer: number | undefined;
+    const operation: StopOperation = {
+      binding, retired: false,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (stopOperationRef.current !== operation) return;
+        runControlMutationRef.current = false;
+        setStoppingRun(false);
+      },
+      retire: () => {
+        operation.retired = true;
+        if (timer !== undefined) {
+          window.clearTimeout(timer);
+          if (reconcileTimerRef.current === timer) reconcileTimerRef.current = undefined;
+          timer = undefined;
+        }
+        operation.release();
+        if (stopOperationRef.current === operation) stopOperationRef.current = null;
+      },
+    };
+    stopOperationRef.current = operation;
+    const owns = (current = detailRef.current) => !operation.retired &&
+      sameRunBinding(chatRunBinding(current), binding);
+    const hydrate = () => {
+      if (owns()) void hydrateWorkSurfaceForChat({ silent: true, isCurrent: owns });
+    };
+    const applyRefresh = (refreshed: ChatDetail, snapshot: ChatDetail) => setDetail(current =>
+      owns(current) && current === snapshot && refreshed.chat.id === binding.chatId &&
+      (refreshed.session?.backendSessionId ?? refreshed.chat.id) === binding.sessionId
+        ? refreshed : current);
     runControlMutationRef.current = true;
     setStoppingRun(true);
-    streamAbortRef.current?.abort();
-    clearAttachedRun(runId);
-    setDetail((current) => ({
+    if (sameRunBinding(attachedRunRef.current, streamBinding(detail))) clearAttachedRun(binding.runId);
+    setDetail(current => !owns(current) ? current : {
       ...current,
-      activeRun:
-        current.activeRun?.runId === runId
-          ? {
-              ...current.activeRun,
-              status: "cancelling",
-              waitingFor: "cancel_requested",
-            }
-          : current.activeRun,
-      messages: completeLatestStreamingAssistantAsStopped(current.messages),
-    }));
-    void hydrateWorkSurfaceForChat({ silent: true });
-    void withClientTimeout(
-      stopChatRun(detail.chat.id),
-      STOP_REQUEST_TIMEOUT_MS,
-      "Stop request timed out.",
-    )
-      .then((result) => {
-        setDetail((current) => ({
-          ...current,
-          activeRun: result.activeRun,
-        }));
-        void hydrateWorkSurfaceForChat({ silent: true });
-        if (result.cancelPending) {
-          const startedAt = Date.now();
-          let noticeShown = false;
-          const reconcileStop = async () => {
-            const refreshed = await getChat(detail.chat.id).catch(() => null);
-            if (!refreshed) {
-              return;
-            }
-            setDetail(refreshed);
-            void hydrateWorkSurfaceForChat({ silent: true });
-            const activeRun = refreshed.activeRun;
-            const stillCancelling =
-              activeRun?.runId === runId && activeRun.status === "cancelling";
-            if (!stillCancelling) {
-              stopReconcileRef.current();
-              return;
-            }
-            if (
-              !noticeShown &&
-              Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS
-            ) {
-              noticeShown = true;
-              addToast(
-                "Stop request is still being processed by the runtime.",
-                "info",
-              );
-            }
-          };
-          stopReconcileRef.current();
-          reconcileTimerRef.current = window.setTimeout(() => {
-            void reconcileStop();
-            reconcileIntervalRef.current = window.setInterval(() => {
-              void reconcileStop();
-            }, STOP_RECONCILE_INTERVAL_MS);
-          }, STOP_RECONCILE_INITIAL_DELAY_MS);
+      activeRun: current.activeRun === previousRun ? cancellingRun : current.activeRun,
+      messages: current.messages.map(message => message === previousMessage ? stoppedMessage! : message),
+    });
+    hydrate();
+    const startedAt = Date.now();
+    let noticeShown = false;
+    const scheduleReconciliation = (delay: number) => {
+      if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+      timer = window.setTimeout(async () => {
+        if (reconcileTimerRef.current === timer) reconcileTimerRef.current = undefined;
+        timer = undefined;
+        if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+        const snapshot = detailRef.current;
+        const refreshed = await getChat(binding.chatId).catch(() => null);
+        if (!owns()) return;
+        if (refreshed) applyRefresh(refreshed, snapshot);
+        hydrate();
+        if (!noticeShown && Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS) {
+          noticeShown = true;
+          addToast("Stop request is still being processed by the runtime.", "info");
         }
-      })
-      .catch((error: unknown) => {
+        scheduleReconciliation(STOP_RECONCILE_INTERVAL_MS);
+      }, delay);
+      reconcileTimerRef.current = timer;
+    };
+    void (async () => {
+      try {
+        const result = await withClientTimeout(stopChatRun(binding.chatId, binding),
+          STOP_REQUEST_TIMEOUT_MS, "Stop request timed out.");
+        if (!owns()) return;
+        if (result.activeRun && (result.activeRun.runId !== binding.runId ||
+          (result.activeRun.assistantMessageId ?? null) !== binding.assistantMessageId)) {
+          throw new Error("Stop response did not match the requested run.");
+        }
+        setDetail(current => !owns(current) || current.activeRun !== cancellingRun ? current : {
+          ...current,
+          activeRun: result.activeRun ? mergeStreamRunUpdate(result.activeRun, current.activeRun) : undefined,
+        });
+        hydrate();
+        if (result.cancelPending) scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS);
+      } catch (error) {
+        if (!owns()) return;
         if (isAuthRequiredError(error)) {
-          router.push(
-            `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-          );
+          router.push(`/login?next=${encodeURIComponent(`/chats/${binding.chatId}`)}`);
           return;
         }
         if (isNotFoundError(error)) {
           router.replace(chatListHref);
           return;
         }
-        void withClientTimeout(
-          getChat(detail.chat.id),
-          STOP_FAILURE_REFRESH_TIMEOUT_MS,
-          "Timed out refreshing the active run after stop failed.",
-        )
-          .then((refreshed) => {
-            setDetail(refreshed);
-            void hydrateWorkSurfaceForChat({ silent: true });
-          })
-          .catch(() => {
-            setDetail((current) => {
-              if (
-                current.activeRun?.runId !== runId ||
-                current.activeRun.status !== "cancelling"
-              ) {
-                return current;
-              }
-              return {
-                ...current,
-                activeRun: previousActiveRun,
-                messages: previousMessages,
-              };
-            });
-            void hydrateWorkSurfaceForChat({ silent: true });
+        const snapshot = detailRef.current;
+        try {
+          const refreshed = await withClientTimeout(getChat(binding.chatId),
+            STOP_FAILURE_REFRESH_TIMEOUT_MS, "Timed out refreshing the active run after stop failed.");
+          if (!owns()) return;
+          applyRefresh(refreshed, snapshot);
+        } catch {
+          setDetail(current => {
+            if (!owns(current) || current.activeRun !== cancellingRun) return current;
+            return {
+              ...current, activeRun: previousRun,
+              messages: current.messages.map(message => {
+                if (!previousMessage || !stoppedMessage || message.id !== previousMessage.id) return message;
+                return {
+                  ...message,
+                  ...Object.fromEntries((["content", "status", "completedAt", "reasoningStatus"] as const)
+                    .filter(key => message[key] === stoppedMessage[key])
+                    .map(key => [key, previousMessage[key]])),
+                };
+              }),
+            };
           });
-        addToast(
-          error instanceof Error
-            ? error.message
-            : "Failed to stop the active run.",
-          "error",
-        );
-      })
-      .finally(() => {
-        runControlMutationRef.current = false;
-        setStoppingRun(false);
-      });
-  }, [
-    addToast,
-    canStopRun,
-    chatListHref,
-    clearAttachedRun,
-    detail.activeRun,
-    detail.chat.id,
-    detail.messages,
-    hydrateWorkSurfaceForChat,
-    reconcileIntervalRef,
-    reconcileTimerRef,
-    setDetail,
-    setStoppingRun,
-    stopReconcileRef,
-    router,
-  ]);
+        }
+        if (owns()) {
+          hydrate();
+          scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS);
+          const recoveredBinding = streamBinding(detailRef.current);
+          if (recoveredBinding) scheduleAutoAttachRetry(recoveredBinding);
+          addToast(error instanceof Error ? error.message : "Failed to stop the active run.", "error");
+        }
+      } finally {
+        operation.release();
+      }
+    })();
+  }, [addToast, canStopRun, chatListHref, clearAttachedRun, detail,
+    hydrateWorkSurfaceForChat, scheduleAutoAttachRetry, setDetail, setStoppingRun, router]);
 
   // -- Resume active run --
   const resumeActiveRun = useCallback(async () => {
@@ -1324,12 +1294,9 @@ export function useStreamLifecycle(
     }
     runControlMutationRef.current = true;
     const requestedRunId = detail.activeRun.runId;
-    const requestedSessionId = detail.session?.backendSessionId;
-    const requestedAssistantMessageId = detail.activeRun.assistantMessageId;
-    const sameCurrentRun = (current = detailRef.current) => current.chat.id === detail.chat.id &&
-      current.activeRun?.runId === requestedRunId &&
-      current.session?.backendSessionId === requestedSessionId &&
-      current.activeRun?.assistantMessageId === requestedAssistantMessageId;
+    const binding = chatRunBinding(detail)!;
+    const requestedSessionId = binding.sessionId;
+    const sameCurrentRun = (current = detailRef.current) => sameRunBinding(chatRunBinding(current), binding);
     setResumingRun(true);
     try {
       const result = await resumeChatRun(detail.chat.id);
@@ -1393,8 +1360,7 @@ export function useStreamLifecycle(
       runControlMutationRef.current = false;
       setResumingRun(false);
     }
-  }, [addToast, canResumeRun, chatListHref, detail.activeRun?.runId, detail.activeRun?.assistantMessageId,
-    detail.chat.id, detail.session?.backendSessionId, setDetail, setResumingRun, router]);
+  }, [addToast, canResumeRun, chatListHref, detail, setDetail, setResumingRun, router]);
 
   // -- Refresh --
   const refresh = useCallback(async () => {
@@ -1468,16 +1434,13 @@ export function useStreamLifecycle(
       if (reconcileTimerRef.current) {
         window.clearTimeout(reconcileTimerRef.current);
       }
-      if (reconcileIntervalRef.current) {
-        window.clearInterval(reconcileIntervalRef.current);
-      }
       stopReconcile();
+      stopOperationRef.current?.retire();
     };
   }, [
     streamAbortRef,
     autoAttachRetryTimerRef,
     reconcileTimerRef,
-    reconcileIntervalRef,
     stopReconcileRef,
     clearAttachedRun,
   ]);

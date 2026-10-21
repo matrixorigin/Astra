@@ -1,5 +1,28 @@
 import type { ChatDetail } from "@/lib/api/types";
 
+/** The selected control target; cursor and status progress do not change ownership. */
+export type ChatRunBinding = {
+  chatId: string;
+  sessionId: string;
+  runId: string;
+  assistantMessageId: string | null;
+};
+
+export function chatRunBinding(detail: ChatDetail): ChatRunBinding | null {
+  return detail.activeRun?.runId ? {
+    chatId: detail.chat.id,
+    sessionId: detail.session?.backendSessionId ?? detail.chat.id,
+    runId: detail.activeRun.runId,
+    assistantMessageId: detail.activeRun.assistantMessageId ?? null,
+  } : null;
+}
+
+export function sameRunBinding(left: ChatRunBinding | null, right: ChatRunBinding | null) {
+  return left === right || !!left && !!right && left.chatId === right.chatId &&
+    left.sessionId === right.sessionId && left.runId === right.runId &&
+    left.assistantMessageId === right.assistantMessageId;
+}
+
 export type ChatActiveRunSource = "backend_poll" | "stream" | "local_mutation";
 
 export type ChatActiveRunRecord = NonNullable<ChatDetail["activeRun"]> & {

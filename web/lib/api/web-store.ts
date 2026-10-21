@@ -40,6 +40,7 @@ import {
 } from "@/lib/workspace-authority";
 import type {
   ChatDetail,
+  StopRunRequest,
   ChatListResponse,
   ChatMessage,
   ChatSummary,
@@ -56,6 +57,8 @@ import type {
 } from "@/lib/api/types";
 import {
   makeActiveRunRecord,
+  sameRunBinding,
+  type ChatRunBinding,
   mergeRunStreamBinding,
   normalizeNextEventIndex,
   type ChatActiveRunRecord,
@@ -223,90 +226,36 @@ function isStoppableAssistantMessage(message: ChatMessage) {
   );
 }
 
-function findStoppableAssistantMessage(
-  chat: ChatRecord,
-  assistantMessageId?: string | null,
-) {
-  if (assistantMessageId) {
-    const matched = chat.messages.find(
-      (message) =>
-        message.id === assistantMessageId &&
-        isStoppableAssistantMessage(message),
-    );
-    if (matched) {
-      return matched;
-    }
-  }
-
-  for (let index = chat.messages.length - 1; index >= 0; index -= 1) {
-    const message = chat.messages[index];
-    if (message && isStoppableAssistantMessage(message)) {
-      return message;
-    }
-  }
-  return null;
-}
-
-function cloneChatMessage(message: ChatMessage): ChatMessage {
+function stoppedAssistantMessageController(assistantMessageId: string | null) {
+  let snapshot: { message: ChatMessage; applied: ChatMessage; lastMessageAt: string;
+    lastMessagePreview: ChatRecord["lastMessagePreview"]; appliedAt: string } | undefined;
   return {
-    ...message,
-    attachments: message.attachments
-      ? message.attachments.map((attachment) => ({ ...attachment }))
-      : undefined,
-    artifacts: message.artifacts
-      ? message.artifacts.map((artifact) => ({ ...artifact }))
-      : undefined,
-  };
-}
-
-function stoppedAssistantMessageController(
-  chat: ChatRecord,
-  assistantMessageId?: string | null,
-): {
-  complete: (currentChat: ChatRecord) => boolean;
-  restore: (currentChat: ChatRecord) => void;
-} {
-  const message = findStoppableAssistantMessage(chat, assistantMessageId);
-  const snapshot = message
-    ? {
-        message: cloneChatMessage(message),
-        lastMessageAt: chat.lastMessageAt,
-        lastMessagePreview: chat.lastMessagePreview,
-      }
-    : null;
-  return {
-    complete(currentChat) {
-      const currentMessage = findStoppableAssistantMessage(
-        currentChat,
-        assistantMessageId,
-      );
-      if (!currentMessage) {
-        return false;
-      }
-
-      currentMessage.content = currentMessage.content.trim()
-        ? `${currentMessage.content}${currentMessage.content.endsWith("\n") ? "" : "\n"}\nStopped.`
-        : "Stopped.";
-      currentMessage.status = "complete";
-      currentMessage.completedAt = nowIso();
-      currentMessage.reasoningStatus = "complete";
-      currentChat.lastMessageAt = nowIso();
-      currentChat.lastMessagePreview = currentMessage.content;
+    complete(chat: ChatRecord) {
+      if (snapshot || !assistantMessageId) return false;
+      const message = chat.messages.find(item => item.id === assistantMessageId && isStoppableAssistantMessage(item));
+      if (!message) return false;
+      const previous = { ...message };
+      const timestamp = nowIso();
+      Object.assign(message, {
+        content: message.content.trim()
+          ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.` : "Stopped.",
+        status: "complete", completedAt: timestamp, reasoningStatus: "complete",
+      });
+      snapshot = { message: previous, applied: { ...message }, lastMessageAt: chat.lastMessageAt,
+        lastMessagePreview: chat.lastMessagePreview, appliedAt: timestamp };
+      chat.lastMessageAt = timestamp;
+      chat.lastMessagePreview = message.content;
       return true;
     },
-    restore(currentChat) {
-      if (!snapshot) {
-        return;
-      }
-      const messageIndex = currentChat.messages.findIndex(
-        (message) => message.id === snapshot.message.id,
-      );
-      if (messageIndex === -1) {
-        return;
-      }
-      currentChat.messages[messageIndex] = cloneChatMessage(snapshot.message);
-      currentChat.lastMessageAt = snapshot.lastMessageAt;
-      currentChat.lastMessagePreview = snapshot.lastMessagePreview;
+    restore(chat: ChatRecord) {
+      if (!snapshot) return;
+      const { message: previous, applied } = snapshot;
+      const message = chat.messages.find(item => item.id === previous.id);
+      if (!message) return;
+      Object.assign(message, Object.fromEntries((["content", "status", "completedAt", "reasoningStatus"] as const)
+        .filter(key => message[key] === applied[key]).map(key => [key, previous[key]])));
+      if (chat.lastMessageAt === snapshot.appliedAt) chat.lastMessageAt = snapshot.lastMessageAt;
+      if (chat.lastMessagePreview === applied.content) chat.lastMessagePreview = snapshot.lastMessagePreview;
     },
   };
 }
@@ -408,86 +357,36 @@ function isLocallyStoppedRun(
 }
 
 async function reconcileStoppedRun(
-  ownerUserId: string,
-  chatId: string,
   runId: string,
-): Promise<ChatDetail["activeRun"]> {
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  if (!chat) {
-    return undefined;
-  }
+  ownedChat: () => ChatRecord | undefined,
+): Promise<void> {
+  if (!ownedChat()) return;
   const client = await getRuntimeClient({
-    auth: "required",
-    operation: `reconcile stopped run ${runId}`,
-  }).catch((error) => {
-    console.warn(
-      "Failed to initialize runtime client for stop reconciliation:",
-      runtimeErrorDetail(error),
-    );
-    return null;
-  });
-  if (!client) {
-    return publicActiveRun(chat);
-  }
-
-  let runStatus: RunStatus;
+    auth: "required", operation: `reconcile stopped run ${runId}`,
+  }).catch(() => null);
+  if (!client || !ownedChat()) return;
+  let status: RunStatus;
   try {
-    runStatus = await client.sdk.getRunStatus(runId);
+    status = await client.sdk.getRunStatus(runId);
   } catch (error) {
-    if (
-      error instanceof RuntimeClientError &&
-      error.status &&
-      [404, 409, 410].includes(error.status)
-    ) {
+    const chat = ownedChat();
+    if (!chat) return;
+    if (error instanceof RuntimeClientError && error.status && [404, 409, 410].includes(error.status)) {
       forgetLocallyStoppedRun(chat, runId);
-      if (chat.activeRun?.runId === runId) {
-        chat.activeRun = undefined;
-      }
-      return publicActiveRun(chat);
-    }
-    console.warn("Failed to reconcile stopped run:", runtimeErrorDetail(error));
-    return publicActiveRun(chat);
-  }
-
-  if (runStatus.sessionId !== backendSessionIdForChat(chat)) {
-    forgetLocallyStoppedRun(chat, runId);
-    if (chat.activeRun?.runId === runId) {
       chat.activeRun = undefined;
+    } else {
+      console.warn("Failed to reconcile stopped run:", runtimeErrorDetail(error));
     }
-    return publicActiveRun(chat);
+    return;
   }
-
-  if (isTerminalChatRunStatus(runStatus.status)) {
+  const chat = ownedChat();
+  if (!chat || status.runId !== runId || status.sessionId !== backendSessionIdForChat(chat)) return;
+  if (isTerminalChatRunStatus(status.status)) {
     forgetLocallyStoppedRun(chat, runId);
-    if (chat.activeRun?.runId === runId) {
-      chat.activeRun = undefined;
-    }
-    return publicActiveRun(chat);
+    chat.activeRun = undefined;
   }
-
-  if (runBlocksChatTurn(runStatus.status) && chat.activeRun?.runId === runId) {
-    chat.activeRun = makeActiveRunRecord(
-      isLocallyStoppedRun(chat, runId)
-        ? {
-            runId,
-            status: "cancelling",
-            waitingFor: "cancel_requested",
-            assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-            nextEventIndex: chat.activeRun.nextEventIndex ?? null,
-          }
-        : {
-            runId: runStatus.runId,
-            status: runStatus.status,
-            waitingFor: runStatus.waitingFor ?? null,
-            assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-            nextEventIndex: chat.activeRun.nextEventIndex ?? null,
-          },
-      isLocallyStoppedRun(chat, runId) ? "local_mutation" : "backend_poll",
-    );
-  }
-
-  return publicActiveRun(chat);
+  // Nonterminal polling cannot reverse an admitted local cancellation. The
+  // existing stopped-run marker and hydration owner retain that intent.
 }
 
 function compareActiveRunDeterministically(
@@ -1357,130 +1256,79 @@ export async function queueDeferredRunInput(
   };
 }
 
+function storedRunBinding(chat: ChatRecord): ChatRunBinding | null {
+  return chat.activeRun?.runId ? {
+    chatId: chat.id, sessionId: backendSessionIdForChat(chat), runId: chat.activeRun.runId,
+    assistantMessageId: chat.activeRun.assistantMessageId ?? null,
+  } : null;
+}
+
+export class StaleRunBindingError extends Error {
+  constructor() { super("The selected run changed while Stop was in progress."); }
+}
+
 export async function stopActiveRun(
   ownerUserId: string,
   chatId: string,
+  requested: StopRunRequest,
   options?: { skipSync?: boolean; cancelTimeoutMs?: number },
 ) {
-  if (!options?.skipSync) {
-    await syncBackendSessions(ownerUserId);
-  }
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  if (!chat) {
-    return null;
-  }
-  if (!chat.activeRun?.runId) {
-    throw new Error("No active run is available to stop.");
-  }
-
-  const previousActiveRun = chat.activeRun;
-  const runId = previousActiveRun.runId;
-  const stoppedMessage = stoppedAssistantMessageController(
-    chat,
-    previousActiveRun.assistantMessageId ?? null,
-  );
+  if (!options?.skipSync) await syncBackendSessions(ownerUserId);
+  const findChat = () => getStore(ownerUserId).chats.find(item => item.id === chatId);
+  if (!findChat()) return null;
+  const binding: ChatRunBinding = { ...requested, chatId };
+  const boundChat = () => {
+    const chat = findChat();
+    return chat && sameRunBinding(storedRunBinding(chat), binding) ? chat : undefined;
+  };
+  if (!boundChat()) throw new StaleRunBindingError();
   const client = await requireRuntimeClient({
-    auth: "required",
-    operation: `cancel active run ${runId}`,
+    auth: "required", operation: `cancel active run ${binding.runId}`,
   });
-
-  let stoppedMessageCompleted = false;
-  const persistStoppedAssistantMessage = () => {
-    if (stoppedMessageCompleted) {
-      return;
-    }
-    const currentStore = getStore(ownerUserId);
-    const currentChat = currentStore.chats.find((item) => item.id === chatId);
-    if (!currentChat) {
-      return;
-    }
-    stoppedMessageCompleted = stoppedMessage.complete(currentChat);
-    if (stoppedMessageCompleted && currentChat.projectId) {
-      touchProjectInStore(currentStore, currentChat.projectId);
+  const chat = boundChat();
+  if (!chat) throw new StaleRunBindingError();
+  const previousRun = chat.activeRun!;
+  const cancellingRun = makeActiveRunRecord({ ...previousRun, status: "cancelling" }, "local_mutation");
+  chat.activeRun = cancellingRun;
+  rememberLocallyStoppedRun(chat, binding.runId);
+  const ownedChat = () => {
+    const current = boundChat();
+    return current?.activeRun === cancellingRun ? current : undefined;
+  };
+  const message = stoppedAssistantMessageController(binding.assistantMessageId);
+  const completeMessage = () => {
+    const current = ownedChat();
+    if (!current) return;
+    if (message.complete(current) && current.projectId) {
+      touchProjectInStore(getStore(ownerUserId), current.projectId);
     }
   };
-
-  rememberLocallyStoppedRun(chat, runId);
-  chat.activeRun = makeActiveRunRecord(
-    {
-      runId,
-      status: "cancelling",
-      waitingFor: previousActiveRun.waitingFor ?? null,
-      assistantMessageId: previousActiveRun.assistantMessageId ?? null,
-      nextEventIndex: previousActiveRun.nextEventIndex ?? null,
-    },
-    "local_mutation",
-  );
-
-  const restorePreviousRun = () => {
-    const currentChat = getStore(ownerUserId).chats.find(
-      (item) => item.id === chatId,
-    );
-    if (currentChat?.activeRun?.runId !== runId) {
-      return;
-    }
-    forgetLocallyStoppedRun(currentChat, runId);
-    if (stoppedMessageCompleted) {
-      stoppedMessage.restore(currentChat);
-    }
-    currentChat.activeRun = makeActiveRunRecord(
-      {
-        runId,
-        status: previousActiveRun.status,
-        waitingFor: previousActiveRun.waitingFor ?? null,
-        assistantMessageId: previousActiveRun.assistantMessageId ?? null,
-        nextEventIndex: previousActiveRun.nextEventIndex ?? null,
-      },
-      "local_mutation",
-    );
+  const restore = () => {
+    const current = ownedChat();
+    if (!current) return;
+    forgetLocallyStoppedRun(current, binding.runId);
+    message.restore(current);
+    current.activeRun = previousRun;
   };
-
   let cancelPending: boolean;
   try {
-    cancelPending = await settleRuntimeCancel(
-      client.sdk.cancelRun(runId),
-      options?.cancelTimeoutMs,
-      (settled) => {
+    cancelPending = await settleRuntimeCancel(client.sdk.cancelRun(binding.runId), options?.cancelTimeoutMs,
+      settled => {
         if (settled.status === "completed") {
-          persistStoppedAssistantMessage();
-          void reconcileStoppedRun(ownerUserId, chatId, runId);
-          return;
-        }
-        restorePreviousRun();
-      },
-    );
+          completeMessage();
+          void reconcileStoppedRun(binding.runId, ownedChat);
+        } else restore();
+      });
   } catch (error) {
-    restorePreviousRun();
+    restore();
     throw error;
   }
-
-  if (cancelPending) {
-    const currentChat = getStore(ownerUserId).chats.find(
-      (item) => item.id === chatId,
-    );
-    if (currentChat?.activeRun?.runId === runId) {
-      currentChat.activeRun = makeActiveRunRecord(
-        {
-          runId,
-          status: "cancelling",
-          waitingFor: "cancel_requested",
-          assistantMessageId: previousActiveRun.assistantMessageId ?? null,
-          nextEventIndex: previousActiveRun.nextEventIndex ?? null,
-        },
-        "local_mutation",
-      );
-    }
-    persistStoppedAssistantMessage();
-  } else {
-    persistStoppedAssistantMessage();
-    await reconcileStoppedRun(ownerUserId, chatId, runId);
-  }
-
-  return {
-    activeRun: publicActiveRun(chat),
-    cancelPending,
-  };
+  const current = ownedChat();
+  if (cancelPending && current) cancellingRun.waitingFor = "cancel_requested";
+  completeMessage();
+  if (!cancelPending) await reconcileStoppedRun(binding.runId, ownedChat);
+  const selected = findChat();
+  return selected ? { activeRun: publicActiveRun(selected), cancelPending } : null;
 }
 
 export async function resumeActiveRun(ownerUserId: string, chatId: string) {
@@ -1500,11 +1348,10 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
   const runId = chat.activeRun.runId;
   const sessionId = backendSessionIdForChat(chat);
   const assistantMessageId = chat.activeRun.assistantMessageId;
+  const binding = storedRunBinding(chat)!;
   const currentChat = () => {
     const current = getStore(ownerUserId).chats.find(item => item.id === chatId);
-    if (!current?.activeRun || current.activeRun.runId !== runId ||
-      backendSessionIdForChat(current) !== sessionId ||
-      current.activeRun.assistantMessageId !== assistantMessageId) {
+    if (!current || !sameRunBinding(storedRunBinding(current), binding)) {
       throw new Error("The run changed while resume was in progress.");
     }
     return current;
