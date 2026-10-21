@@ -144,6 +144,7 @@ function streamBinding(detail: ChatDetail): StreamBinding | null {
 type StopOperation = {
   binding: ChatRunBinding;
   retired: boolean;
+  ensureReconciliation: () => void;
   release: () => void;
   retire: () => void;
 };
@@ -686,7 +687,12 @@ export function useStreamLifecycle(
       autoAttachRetryTimerRef.current = undefined;
     }
     const stop = stopOperationRef.current;
-    if (stop && !sameRunBinding(chatRunBinding(detail), stop.binding)) stop.retire();
+    if (stop && (!sameRunBinding(chatRunBinding(detail), stop.binding) || !canAttachRunStream(detail.activeRun?.status))) {
+      stop.retire();
+    } else if (stop && detail.activeRun?.status === "cancelling") {
+      if (!runControlBusy) stop.ensureReconciliation();
+      return;
+    }
     if (!canAttachRunStream(detail.activeRun?.status)) {
       autoAttachAttemptedRunRef.current = null;
       autoAttachRetryCountsRef.current.clear();
@@ -1172,6 +1178,7 @@ export function useStreamLifecycle(
     let timer: number | undefined;
     const operation: StopOperation = {
       binding, retired: false,
+      ensureReconciliation: () => scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS),
       release: () => {
         if (released) return;
         released = true;
@@ -1212,23 +1219,29 @@ export function useStreamLifecycle(
     const startedAt = Date.now();
     let noticeShown = false;
     const scheduleReconciliation = (delay: number) => {
-      if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
-      timer = window.setTimeout(async () => {
-        if (reconcileTimerRef.current === timer) reconcileTimerRef.current = undefined;
-        timer = undefined;
-        if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
-        const snapshot = detailRef.current;
-        const refreshed = await getChat(binding.chatId).catch(() => null);
-        if (!owns()) return;
-        if (refreshed) applyRefresh(refreshed, snapshot);
-        hydrate();
-        if (!noticeShown && Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS) {
-          noticeShown = true;
-          addToast("Stop request is still being processed by the runtime.", "info");
+      if (!released || timer !== undefined || !owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+      // Reserve this cycle through its awaited read so committed renders cannot
+      // admit a second timer or overlapping reconciliation request.
+      const cycle = window.setTimeout(async () => {
+        try {
+          if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+          const snapshot = detailRef.current;
+          const refreshed = await getChat(binding.chatId).catch(() => null);
+          if (!owns() || detailRef.current.activeRun?.status !== "cancelling") return;
+          if (refreshed) applyRefresh(refreshed, snapshot);
+          hydrate();
+          if (!noticeShown && Date.now() - startedAt >= STOP_RECONCILE_NOTICE_MS) {
+            noticeShown = true;
+            addToast("Stop request is still being processed by the runtime.", "info");
+          }
+        } finally {
+          if (timer === cycle) timer = undefined;
+          if (reconcileTimerRef.current === cycle) reconcileTimerRef.current = undefined;
+          scheduleReconciliation(STOP_RECONCILE_INTERVAL_MS);
         }
-        scheduleReconciliation(STOP_RECONCILE_INTERVAL_MS);
       }, delay);
-      reconcileTimerRef.current = timer;
+      timer = cycle;
+      reconcileTimerRef.current = cycle;
     };
     void (async () => {
       try {
@@ -1244,7 +1257,6 @@ export function useStreamLifecycle(
           activeRun: result.activeRun ? mergeStreamRunUpdate(result.activeRun, current.activeRun) : undefined,
         });
         hydrate();
-        if (result.cancelPending) scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS);
       } catch (error) {
         if (!owns()) return;
         if (isAuthRequiredError(error)) {
@@ -1280,7 +1292,6 @@ export function useStreamLifecycle(
         }
         if (owns()) {
           hydrate();
-          scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS);
           addToast(error instanceof Error ? error.message : "Failed to stop the active run.", "error");
         }
       } finally {

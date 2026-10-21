@@ -377,6 +377,11 @@ and never completes another message by fallback. After dispatch, cancellation
 continues only against its captured root; delayed responses, reconciliation and
 rollback cannot mutate a successor binding or newer root facts. Browser cleanup
 belongs to the initiating operation, and Stop status reads never overlap.
+Reconciliation follows the committed cancelling lifecycle independently of ACK
+latency, including roots without an assistant message. The `cancelPending`
+response flag describes the bounded acknowledgement wait, not execution
+settlement. A scheduled or in-flight status read occupies the same operation's
+single reconciliation slot until it settles.
 
 When a committed Stop outcome restores the same attachable binding, live
 observation recovers through the existing bounded GET retry owner. This includes

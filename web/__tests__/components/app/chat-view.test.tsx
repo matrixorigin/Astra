@@ -2517,12 +2517,21 @@ describe("ChatView deferred-input unhappy paths", () => {
       expect(mockGetChat).toHaveBeenCalledOnce();
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
       expect(mockGetChat).toHaveBeenCalledOnce();
+      const newer = makeDetail({ ...defaultActiveRun, status: "cancelling", nextEventIndex: 12 });
+      newer.messages[0].content = "Newer cancelling output";
+      act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: newer }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(mockGetChat).toHaveBeenCalledOnce();
+      await act(async () => settle(makeDetail()));
+      expect(screen.getByText("Newer cancelling output")).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(mockGetChat).toHaveBeenCalledTimes(2);
       const next = makeDetail({ ...defaultActiveRun, runId: "new-root", assistantMessageId: "assistant-b" });
       next.messages[0].content = "Successor output";
       act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
       await act(async () => settle(makeDetail()));
       await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
-      expect(mockGetChat).toHaveBeenCalledOnce();
+      expect(mockGetChat).toHaveBeenCalledTimes(2);
       expect(screen.getByText("Successor output")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
     } finally { vi.useRealTimers(); }
@@ -2551,13 +2560,11 @@ describe("ChatView deferred-input unhappy paths", () => {
 
 
   it.each([
-    { pending: false, outcome: "running", refreshed: true, reconnect: true },
-    { pending: false, outcome: "running", refreshed: false, reconnect: true },
-    ...["running", "waiting", "blocked", "input-queued"].map(outcome =>
-      ({ pending: true, outcome, refreshed: true, reconnect: true })),
-    ...["paused", "terminal"].map(outcome =>
-      ({ pending: true, outcome, refreshed: true, reconnect: false })),
-  ])("recovers Stop observation (pending=$pending, outcome=$outcome, refresh=$refreshed)", async ({ pending, outcome, refreshed, reconnect }) => {
+    { reply: "error", outcome: "running", refreshed: true, reconnect: true },
+    { reply: "error", outcome: "running", refreshed: false, reconnect: true },
+    ...["accepted", "pending"].flatMap(reply => ["running", "waiting", "blocked", "input-queued", "paused", "terminal"]
+      .map(outcome => ({ reply, outcome, refreshed: true, reconnect: outcome !== "paused" && outcome !== "terminal" }))),
+  ])("recovers Stop observation (reply=$reply, outcome=$outcome, refresh=$refreshed)", async ({ reply, outcome, refreshed, reconnect }) => {
     vi.useFakeTimers();
     try {
       const initial = makeDetail({ ...defaultActiveRun, nextEventIndex: 8 });
@@ -2567,7 +2574,7 @@ describe("ChatView deferred-input unhappy paths", () => {
           handlers.onText?.("Recovered live output");
           return new Promise(() => {});
         });
-      if (pending) mockStopChatRun.mockResolvedValue({ cancelPending: true,
+      if (reply !== "error") mockStopChatRun.mockResolvedValue({ cancelPending: reply === "pending",
         activeRun: { ...defaultActiveRun, status: "cancelling", nextEventIndex: 8 } });
       else mockStopChatRun.mockRejectedValue(new Error("Stop rejected"));
       if (refreshed) mockGetChat.mockResolvedValue({ ...initial,
@@ -2578,7 +2585,7 @@ describe("ChatView deferred-input unhappy paths", () => {
       expect(mockStreamExistingChatRun).toHaveBeenCalledOnce();
       await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Stop run" })); });
       expect(mockStreamExistingChatRun.mock.calls[0][2].signal?.aborted).toBe(true);
-      if (pending) await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      if (reply !== "error") await act(async () => { await vi.advanceTimersByTimeAsync(500); });
       expect(mockGetChat).toHaveBeenCalledOnce();
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
       expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(reconnect ? 2 : 1);
@@ -2591,7 +2598,11 @@ describe("ChatView deferred-input unhappy paths", () => {
         expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
       } else {
         expect(screen.queryByRole("button", { name: "Stop run" })).not.toBeInTheDocument();
+        expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Submit composer" })).toBeEnabled();
       }
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(mockGetChat).toHaveBeenCalledOnce();
       expect(mockStreamChatMessage).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
   });
@@ -2658,6 +2669,46 @@ describe("ChatView deferred-input unhappy paths", () => {
       expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(2);
       expect(mockGetChat).toHaveBeenCalledOnce();
       expect(screen.getByText("Blocked output")).toBeInTheDocument();
+      expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    { assistant: true, terminalAck: true, failFirstRead: false },
+    { assistant: false, terminalAck: true, failFirstRead: false },
+    { assistant: false, terminalAck: false, failFirstRead: false },
+    { assistant: false, terminalAck: false, failFirstRead: true },
+  ])("settles Stop without an unnecessary observer (assistant=$assistant, terminal ACK=$terminalAck, read failure=$failFirstRead)", async ({ assistant, terminalAck, failFirstRead }) => {
+    vi.useFakeTimers();
+    try {
+      const initial = makeDetail({ ...defaultActiveRun, assistantMessageId: assistant ? "assistant-live" : undefined });
+      initial.messages = [{ id: "unrelated", role: "assistant", content: "Unrelated saved answer",
+        createdAt: "2026-06-07T00:00:00Z", status: "complete" }, ...initial.messages];
+      mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+      mockStopChatRun.mockResolvedValue({ cancelPending: false,
+        activeRun: terminalAck ? undefined : { ...initial.activeRun!, status: "cancelling" } });
+      if (failFirstRead) mockGetChat.mockRejectedValueOnce(new Error("Status temporarily unavailable"));
+      mockGetChat.mockResolvedValue({ ...initial, activeRun: undefined });
+      render(<ChatView initial={initial} />);
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Stop run" })); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      if (failFirstRead) {
+        expect(mockGetChat).toHaveBeenCalledOnce();
+        expect(screen.getByRole("button", { name: "Submit composer" })).toBeDisabled();
+        expect(screen.getByText("Stopping")).toBeInTheDocument();
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      }
+      expect(screen.getByRole("button", { name: "Submit composer" })).toBeEnabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(mockGetChat).toHaveBeenCalledTimes(terminalAck ? 0 : failFirstRead ? 2 : 1);
+      expect(mockStopChatRun).toHaveBeenCalledExactlyOnceWith("chat-123", {
+        chatId: "chat-123", sessionId: "chat-123", runId: "run-123", assistantMessageId: assistant ? "assistant-live" : null,
+      });
+      expect(mockStreamExistingChatRun).toHaveBeenCalledTimes(assistant ? 1 : 0);
+      expect(screen.getByText("Unrelated saved answer")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Submit composer" })).toBeEnabled();
+      expect(screen.queryByText("Stopping")).not.toBeInTheDocument();
       expect(mockStreamChatMessage).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
   });

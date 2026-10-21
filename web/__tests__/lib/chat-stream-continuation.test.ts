@@ -799,3 +799,24 @@ it.each(["output", "root facts"])("preserves newer %s on late Stop rejection", a
     expect(current.activeRun).toMatchObject({ status: "waiting", waitingFor: "user_input" });
   }
 });
+
+it.each(["cancellation_requested", "unavailable", "cancelled"])("returns the retained cancellation lifecycle after a fast Stop ACK (%s)", async statusValue => {
+  await prefix("Saved answer");
+  const client = runtime(backend([]));
+  const cancel = vi.spyOn(client.sdk, "cancelRun").mockResolvedValue(undefined);
+  const status = vi.spyOn(client.sdk, "getRunStatus");
+  if (statusValue === "unavailable") status.mockRejectedValue(new Error("status unavailable"));
+  else status.mockResolvedValue({ runId: "root", sessionId: "session", status: statusValue } as never);
+  vi.mocked(getStoreRuntimeClient).mockResolvedValue(client);
+  const { POST: stop } = await import("@/app/api/chats/[chatId]/stop/route");
+  const response = await stop(new Request("http://web.test/api/chats/chat/stop", {
+    method: "POST", body: JSON.stringify({ sessionId: "session", runId: "root", assistantMessageId: assistantId }),
+  }), { params: Promise.resolve({ chatId: "chat" }) });
+  expect(response.status).toBe(200);
+  const result = await response.json();
+  expect(result.cancelPending).toBe(false);
+  if (statusValue === "cancelled") expect(result.activeRun).toBeUndefined();
+  else expect(result.activeRun).toMatchObject({ runId: "root", status: "cancelling", assistantMessageId: assistantId, nextEventIndex: 8 });
+  expect(cancel).toHaveBeenCalledExactlyOnceWith("root");
+  expect(status).toHaveBeenCalledExactlyOnceWith("root");
+});
