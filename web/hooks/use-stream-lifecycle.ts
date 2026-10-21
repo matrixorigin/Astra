@@ -1109,12 +1109,15 @@ export function useStreamLifecycle(
   // -- Queue deferred input --
   const queueDeferredInput = useCallback(
     async ({ text, options }: { text: string; options: ComposerOptions }) => {
-      if (detail.chat.archivedAt) {
-        return;
+      if (detail.chat.archivedAt || runControlMutationRef.current) {
+        const error = new Error("Input was not queued. Review this session before submitting again.");
+        addToast(error.message, "error");
+        throw error;
       }
-      if (runControlMutationRef.current) {
-        return;
-      }
+      const matchesRequestedBinding = (current: ChatDetail) => current.chat.id === detail.chat.id &&
+        current.session?.backendSessionId === detail.session?.backendSessionId &&
+        current.activeRun?.runId === detail.activeRun?.runId &&
+        current.activeRun?.assistantMessageId === detail.activeRun?.assistantMessageId;
       runControlMutationRef.current = true;
       setQueueingDeferredInput(true);
 
@@ -1125,47 +1128,29 @@ export function useStreamLifecycle(
           options,
           pendingMessageId,
         });
-        setDetail(current => current.chat.id !== detail.chat.id ||
-          current.session?.backendSessionId !== detail.session?.backendSessionId ||
-          current.activeRun?.runId !== detail.activeRun?.runId ||
-          current.activeRun?.assistantMessageId !== detail.activeRun?.assistantMessageId ? current : {
+        setDetail(current => !matchesRequestedBinding(current) ? current : {
             ...current, activeRun: result.activeRun,
             messages: [...current.messages.filter(message => message.id !== result.userMessage.id && message.id !== result.assistantMessage.id),
               result.userMessage, result.assistantMessage].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)),
           });
       } catch (error) {
-        if (isAuthRequiredError(error)) {
-          router.push(
-            `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
-          );
-          return;
-        }
-        if (isNotFoundError(error)) {
-          router.replace(chatListHref);
-          return;
-        }
         if (error instanceof WebApiError && error.status === 409) {
           const refreshed = await getChat(detail.chat.id).catch(() => null);
-          if (refreshed) {
-            setDetail(refreshed);
-            if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
-              void startStream({ text, options, appendUser: true });
-              return;
-            }
+          if (refreshed?.chat.id === detail.chat.id) {
+            setDetail(current => matchesRequestedBinding(current) ? refreshed : current);
           }
         }
         addToast(
-          error instanceof Error
-            ? error.message
-            : "Failed to queue input for the active run.",
+          `Queued input could not be confirmed. Your draft was kept. Review this session before submitting again.${error instanceof Error ? ` ${error.message}` : ""}`,
           "error",
         );
+        throw error;
       } finally {
         runControlMutationRef.current = false;
         setQueueingDeferredInput(false);
       }
     },
-    [addToast, chatListHref, detail, setDetail, setQueueingDeferredInput, router, startStream],
+    [addToast, detail, setDetail, setQueueingDeferredInput],
   );
 
   // -- Stop active run --

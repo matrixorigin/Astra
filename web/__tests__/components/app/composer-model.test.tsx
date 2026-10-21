@@ -64,7 +64,7 @@ const deepseekModels = [
   },
 ];
 
-describe("Composer model selection", () => {
+describe("Composer submission and model selection", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
@@ -125,4 +125,31 @@ describe("Composer model selection", () => {
       },
     });
   });
+
+  it.each(["form", "enter"])("restores an unconfirmed draft and skill tokens for explicit retry (%s)", async trigger => {
+    mockListModels.mockResolvedValue({ items: deepseekModels, accesses: [],
+      defaultOfferingId: "deepseek-v4-flash-anthropic", catalogRevision: "sha256:catalog",
+      observedAt: "2026-07-20T00:00:00Z", source: "astra" });
+    const onSubmit = vi.fn().mockRejectedValueOnce(new Error("queue conflict")).mockResolvedValue(undefined);
+    render(<Composer onSubmit={onSubmit} />);
+    const editor = screen.getByRole("textbox", { name: /how can i help you today/i });
+    editor.innerHTML = '<span data-composer-skill-token="true" data-skill-name="review" contenteditable="false">/review</span> Keep this draft';
+    const html = editor.innerHTML;
+    fireEvent.input(editor);
+    const send = screen.getByRole("button", { name: "Send message" });
+    await waitFor(() => expect(send).not.toBeDisabled());
+    if (trigger === "form") fireEvent.submit(editor.closest("form")!);
+    else fireEvent.keyDown(editor, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    await waitFor(() => expect(editor.innerHTML).toBe(html));
+    expect(onSubmit.mock.calls[0][0]).toEqual(expect.objectContaining({
+      text: "/review Keep this draft", options: expect.objectContaining({ activeSkills: ["review"] }),
+    }));
+    expect(send).not.toBeDisabled();
+    fireEvent.click(send);
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(onSubmit.mock.calls[1]).toEqual(onSubmit.mock.calls[0]);
+    await waitFor(() => expect(editor.textContent).toBe(""));
+  });
+
 });

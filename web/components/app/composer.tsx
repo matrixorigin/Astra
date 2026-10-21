@@ -528,9 +528,8 @@ export function Composer({
           activeTools: submittedTools,
         },
       });
-    } catch (error) {
+    } catch {
       restoreEditor(snapshot);
-      throw error;
     } finally {
       setSubmitting(false);
       requestAnimationFrame(() => editorRef.current?.focus());

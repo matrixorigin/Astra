@@ -29,6 +29,7 @@ import {
   updateChatWorkspaceSelection,
 } from "@/lib/api/chats";
 
+let composerSubmissionError: unknown;
 const pushMock = vi.fn();
 const replaceMock = vi.fn();
 const refreshMock = vi.fn();
@@ -173,7 +174,7 @@ vi.mock("@/components/app/composer", () => ({
             text: composerPayload.text,
             attachments: [],
             options: composerPayload.options,
-          })
+          }).catch(error => { composerSubmissionError = error; })
         }
       >
         Submit composer
@@ -297,6 +298,7 @@ describe("ChatView deferred-input unhappy paths", () => {
         activeSkills: [],
       },
     };
+    composerSubmissionError = undefined;
     pushMock.mockReset();
     replaceMock.mockReset();
     refreshMock.mockReset();
@@ -360,8 +362,9 @@ describe("ChatView deferred-input unhappy paths", () => {
     });
     expect(mockGetChat).not.toHaveBeenCalled();
     expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    expect(composerSubmissionError).toBeInstanceOf(WebApiError);
     expect(
-      screen.getByText("runtime temporarily unavailable"),
+      screen.getByText(/runtime temporarily unavailable/),
     ).toBeInTheDocument();
   });
 
@@ -854,7 +857,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     }
   });
 
-  it("falls back to a fresh stream only after an explicit stale-run conflict", async () => {
+  it("refreshes a queue conflict and requires explicit submission for a fresh run", async () => {
     const user = userEvent.setup();
     mockQueueChatRunInput.mockRejectedValue(
       new WebApiError(409, "no active run is available for deferred input"),
@@ -869,6 +872,9 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => {
       expect(mockGetChat).toHaveBeenCalledWith("chat-123");
     });
+    expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    expect(screen.queryByText("Message queued")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
     await waitFor(() => {
       expect(mockStreamChatMessage).toHaveBeenCalledWith(
         "chat-123",
@@ -881,6 +887,74 @@ describe("ChatView deferred-input unhappy paths", () => {
       );
     });
     expect(window.alert).not.toHaveBeenCalled();
+  });
+
+  it.each(["committed", "batched", "session", "message"] as const)("ignores stale queue-conflict recovery (%s)", async scope => {
+    const batched = scope === "batched";
+    const user = userEvent.setup();
+    let refresh!: (value: ChatDetail) => void;
+    mockQueueChatRunInput.mockRejectedValue(new WebApiError(409, "no active run"));
+    mockGetChat.mockImplementation(() => new Promise(resolve => { refresh = resolve; }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ChatView initial={makeDetail()} />);
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+    await waitFor(() => expect(mockGetChat).toHaveBeenCalledOnce());
+    const next = makeDetail({ runId: "root-b", status: "running", assistantMessageId: "assistant-b", nextEventIndex: 12 });
+    if (scope === "session") {
+      next.activeRun = { ...makeDetail().activeRun!, nextEventIndex: 12 };
+      next.session = { ...next.session!, backendSessionId: "session-b" };
+      next.messages = makeDetail().messages;
+    }
+    if (scope === "message") next.activeRun!.runId = "run-123";
+    next.messages[0].content = "Selected queue replacement B";
+    const replace = () => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next });
+    if (!batched) act(replace);
+    await act(async () => {
+      if (batched) replace();
+      refresh(makeDetail(null));
+    });
+    expect(screen.getByText("Selected queue replacement B")).toBeInTheDocument();
+    expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    expect(mockStreamExistingChatRun).toHaveBeenLastCalledWith("chat-123", next.activeRun!.runId, expect.anything(),
+      { assistantMessageId: next.activeRun!.assistantMessageId, nextEventIndex: 12 });
+    expect(mockStreamExistingChatRun.mock.lastCall?.[2].signal?.aborted).toBe(false);
+  });
+
+  it.each([401, 404, 500])("does not navigate away for a stale queue error (%s)", async status => {
+    const user = userEvent.setup();
+    let reject!: (error: Error) => void;
+    mockQueueChatRunInput.mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ChatView initial={makeDetail()} />);
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+    const next = makeDetail({ runId: "root-b", status: "running", assistantMessageId: "assistant-b", nextEventIndex: 12 });
+    next.messages[0].content = "Selected B after queue error";
+    act(() => emitChatLifecycleChange({ action: "unarchive", chatId: "chat-123", chat: next }));
+    await act(async () => reject(new WebApiError(status, "queue response failed")));
+    expect(screen.getByText("Selected B after queue error")).toBeInTheDocument();
+    expect(pushMock).not.toHaveBeenCalled();
+    expect(replaceMock).not.toHaveBeenCalled();
+    expect(mockGetChat).not.toHaveBeenCalled();
+    expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    expect(composerSubmissionError).toBeInstanceOf(WebApiError);
+    expect(mockStreamExistingChatRun.mock.lastCall?.[2].signal?.aborted).toBe(false);
+  });
+
+  it("keeps observation and reports failure when queue-conflict refresh fails", async () => {
+    const user = userEvent.setup();
+    mockQueueChatRunInput.mockRejectedValue(new WebApiError(409, "queue conflict"));
+    mockGetChat.mockRejectedValue(new Error("refresh unavailable"));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    const initial = makeDetail();
+    initial.messages[0].content = "Current answer";
+    render(<ToastProvider><ChatView initial={initial} /></ToastProvider>);
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+    await waitFor(() => expect(composerSubmissionError).toBeInstanceOf(WebApiError));
+    expect(screen.getByText("Current answer")).toBeInTheDocument();
+    expect(screen.getByText(/Queued input could not be confirmed/)).toBeInTheDocument();
+    expect(mockGetChat).toHaveBeenCalledOnce();
+    expect(mockStreamChatMessage).not.toHaveBeenCalled();
+    expect(mockStreamExistingChatRun.mock.lastCall?.[2].signal?.aborted).toBe(false);
   });
 
   it("shows an explicit stop action instead of pretending queued input interrupts immediately", async () => {

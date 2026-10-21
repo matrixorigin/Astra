@@ -470,13 +470,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                   }
                   onSubmit={async ({ text, options }) => {
                     if (canQueueDeferredInput) {
-                      try {
-                        await stream.queueDeferredInput({ text, options });
-                        setLastQueuedText(text);
-                      } catch (error) {
-                        // API failed — don't show "queued" in UI
-                        console.error("Failed to queue deferred input:", error);
-                      }
+                      await stream.queueDeferredInput({ text, options });
+                      setLastQueuedText(text);
                       return;
                     }
                     void stream.startStream({

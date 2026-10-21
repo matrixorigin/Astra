@@ -359,3 +359,8 @@ and queued input publish that selection; the existing lifecycle owner registers
 POST creation and admits GET observers using one chat/session/run/message lease.
 Replacement and unmount retire only observation, fencing late callbacks, queued
 patches and retries. Cursor and status progress do not replace a live observer.
+
+Deferred-input conflicts refresh the selected observation only while the initiating
+chat/session/run/message still owns it. A conflict never implicitly starts a new
+Run. Unconfirmed submissions report an error and retain the Composer draft for
+review and explicit resubmission; only accepted input receives queued feedback.
