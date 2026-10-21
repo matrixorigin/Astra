@@ -1,9 +1,11 @@
 use std::ops::{Deref, DerefMut};
 
 use sqlx::{
-    Connection, MySql, MySqlConnection, Transaction, TransactionManager,
-    mysql::MySqlTransactionManager, pool::PoolConnection,
+    Connection, MySql, MySqlConnection, Transaction, mysql::MySqlTransactionManager,
+    pool::PoolConnection,
 };
+
+use sqlx_core::transaction::TransactionManager;
 
 mod sealed {
     pub trait TransactionConnection {}

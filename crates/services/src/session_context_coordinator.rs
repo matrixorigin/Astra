@@ -3830,7 +3830,7 @@ impl DatabaseSessionContextCoordinator {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             [node.parent_manifest_root.is_some()],
         );
-        let manifest_already_exists = match sqlx::query(&manifest_insert_sql)
+        let manifest_already_exists = match sqlx::query(manifest_insert_sql)
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -5058,7 +5058,7 @@ async fn load_execution_switch_in_tx(
     } else {
         base.to_string()
     };
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -5093,7 +5093,7 @@ async fn load_execution_switch_by_request_in_tx(
     } else {
         base.to_string()
     };
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -5441,7 +5441,7 @@ async fn update_database_state(
             fork_base_json.is_some(),
         ],
     );
-    let result = sqlx::query(&update_sql)
+    let result = sqlx::query(update_sql)
         .bind(head_json)
         .bind(canonical_root)
         .bind(manifest_root)

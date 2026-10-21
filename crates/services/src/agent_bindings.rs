@@ -612,7 +612,7 @@ async fn load_binding_row(
     id: &str,
 ) -> Result<Option<AgentBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
     let sql = format!("SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE id = ?");
-    let row = query(&sql)
+    let row = query(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -640,7 +640,7 @@ async fn load_binding_by_idempotency_key(
     let sql = format!(
         "SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE owner_user_id = ? AND principal_scope_id = ? AND idempotency_key = ?"
     );
-    let row = query(&sql)
+    let row = query(sqlx::AssertSqlSafe(sql))
         .bind(&scope.owner_user_id)
         .bind(&scope.principal_scope_id)
         .bind(idempotency_key)
@@ -658,7 +658,7 @@ async fn load_binding_by_name(
     let sql = format!(
         "SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE owner_user_id = ? AND principal_scope_id = ? AND binding_name = ?"
     );
-    let row = query(&sql)
+    let row = query(sqlx::AssertSqlSafe(sql))
         .bind(&scope.owner_user_id)
         .bind(&scope.principal_scope_id)
         .bind(binding_name)

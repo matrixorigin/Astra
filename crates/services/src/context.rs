@@ -287,7 +287,7 @@ impl ContextService for DatabaseContextService {
             "SELECT {} FROM ctx_snapshots WHERE context_capture_id = ? AND user_id = ?",
             SNAPSHOT_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&capture_id)
             .bind(&user_id)
             .fetch_one(&pool)
@@ -375,7 +375,7 @@ impl ContextService for DatabaseContextService {
              FROM ctx_snapshots cs \
              WHERE cs.context_capture_id = ? AND cs.user_id = ?"
             .to_string();
-        let row = query(&sql)
+        let row = query(sqlx::AssertSqlSafe(sql))
             .bind(&context_capture_id)
             .bind(&user_id)
             .fetch_optional(&pool)

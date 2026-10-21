@@ -1906,9 +1906,9 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
         ] {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id=? AND session_id=?"
-                ))
+                )))
                 .bind(USER_ID)
                 .bind(&session)
                 .execute(pool.get()),
@@ -2327,9 +2327,9 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         ] {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id=? AND session_id=?"
-                ))
+                )))
                 .bind(USER_ID)
                 .bind(&session)
                 .execute(pool.get()),

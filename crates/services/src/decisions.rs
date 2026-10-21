@@ -403,7 +403,7 @@ impl DecisionService for DatabaseDecisionService {
                 .await
                 .map_err(internal_error)?;
             }
-            let row = query(&select_sql)
+            let row = query(sqlx::AssertSqlSafe(select_sql))
                 .bind(&decision_id)
                 .bind(&user_id)
                 .fetch_one(&mut *tx)
@@ -511,8 +511,8 @@ impl DecisionService for DatabaseDecisionService {
              CAST(d.model_params AS CHAR) AS model_params_json, \
              DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_decision_audits d \
-             WHERE d.decision_id = ? AND d.user_id = ?".to_string();
-        let row = query(&sql)
+             WHERE d.decision_id = ? AND d.user_id = ?";
+        let row = query(sql)
             .bind(&decision_id)
             .bind(&user_id)
             .fetch_optional(&pool)
@@ -545,8 +545,8 @@ impl DecisionService for DatabaseDecisionService {
              LEFT JOIN ctx_snapshots cs \
                ON d.context_capture_id = cs.context_capture_id \
               AND cs.user_id = d.user_id \
-             WHERE d.decision_id = ? AND d.user_id = ?".to_string();
-        let row = query(&sql)
+             WHERE d.decision_id = ? AND d.user_id = ?";
+        let row = query(sql)
             .bind(&decision_id)
             .bind(&user_id)
             .fetch_optional(&pool)

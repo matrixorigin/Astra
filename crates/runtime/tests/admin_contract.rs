@@ -948,11 +948,13 @@ async fn model_router_http_dashboard_canary_outcome_and_rollback_on_matrixone() 
         "agent_sessions",
         "model_router_deployments",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-            .bind(&owner)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
     }
     sqlx::query(
         "DELETE FROM auth_audit_logs WHERE resource_type = 'model_router' AND resource_id IN (?, ?)",

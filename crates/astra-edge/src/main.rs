@@ -35,7 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::client::IntoClientRequest,
 };
 use tokio_util::sync::CancellationToken;
@@ -666,12 +666,7 @@ async fn connect_via_proxy(
     // handshake inside the tunnel before sending the WebSocket upgrade.
     // For ws://, no TLS is needed; send the upgrade directly over the tunnel.
     if ws_url.starts_with("wss://") {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = Connector::Rustls(std::sync::Arc::new(tls_config));
+        let connector = Connector::Rustls(astra_core::net::public_root_tls_config());
         let request = edge_ws_request(ws_url, token)?;
         let tls_and_ws = client_async_tls_with_config(request, tcp, None, Some(connector));
         let (ws_stream, _) = tokio::time::timeout(connect_timeout, tls_and_ws)
@@ -753,7 +748,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             })?
     } else {
         let request = edge_ws_request(&url, &token_snapshot)?;
-        let (ws, _) = connect_async(request).await.map_err(|e| {
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
+        )
+        .await
+        .map_err(|e| {
             tracing::error!(
                 target: "astra.edge",
                 edge_id = %config.edge_id,

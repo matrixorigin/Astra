@@ -22,14 +22,17 @@ async fn schema_rejects_missing_capture_columns_in_existing_table() {
         .await
         .expect("connect bootstrap catalog");
     settings.database = format!("astra_test_probe_capture_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE `{}`", settings.database))
-        .execute(&mut admin)
-        .await
-        .unwrap();
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE `{}`",
+        settings.database
+    )))
+    .execute(&mut admin)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE `{}`.agent_events (user_id VARCHAR(128) NOT NULL, event_id VARCHAR(128) NOT NULL, PRIMARY KEY(user_id, event_id))",
         settings.database,
-    )).execute(&mut admin).await.unwrap();
+    ))).execute(&mut admin).await.unwrap();
     // There is deliberately no collision table in this fixture. An empty
     // receipt batch must succeed without issuing a collision statement.
     let mut empty_connection =
@@ -44,10 +47,13 @@ async fn schema_rejects_missing_capture_columns_in_existing_table() {
     empty_connection.close().await.unwrap();
     let bootstrap = astra_services::storage::ensure_core_schema(&settings, &catalog).await;
     // The only destructive target is the unique database this test created.
-    sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
-        .execute(&mut admin)
-        .await
-        .expect("remove isolated schema probe");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE `{}`",
+        settings.database
+    )))
+    .execute(&mut admin)
+    .await
+    .expect("remove isolated schema probe");
     let error = bootstrap.expect_err("missing capture columns must prevent startup");
     assert!(
         error.to_string().contains("payload_hash"),
@@ -247,7 +253,7 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
         .await
         .unwrap();
     let manifest_select = select.replace("'agent_event'", "'context_manifest'");
-    let manifest_rows = sqlx::query(&manifest_select)
+    let manifest_rows = sqlx::query(sqlx::AssertSqlSafe(manifest_select))
         .bind(&owner)
         .fetch_all(&mut *tx)
         .await

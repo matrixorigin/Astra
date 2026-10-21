@@ -115,11 +115,13 @@ async fn cleanup(pool: &SharedPool, owner: &str) {
         ("agent_session_lifecycle_fences", "user_id"),
         ("agent_sessions", "user_id"),
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
-            .bind(owner)
-            .execute(pool.get())
-            .await
-            .expect("clean fixture");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE {column} = ?"
+        )))
+        .bind(owner)
+        .execute(pool.get())
+        .await
+        .expect("clean fixture");
     }
 }
 

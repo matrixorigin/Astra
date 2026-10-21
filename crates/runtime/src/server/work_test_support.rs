@@ -44,11 +44,13 @@ pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("works", "owner_id"),
         ("agent_sessions", "user_id"),
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE {owner_column} = ?"))
-            .bind(owner_id)
-            .execute(&mut *transaction)
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE {owner_column} = ?"
+        )))
+        .bind(owner_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap_or_else(|error| panic!("clean {table}: {error}"));
     }
     transaction
         .commit()
@@ -256,6 +258,6 @@ pub(crate) async fn patch_operation_ownership(
         table,
         "work_patch_commit_operations" | "work_patch_materialization_operations"
     ));
-    sqlx::query_as(&format!("SELECT operation_phase, executor_token, DATE_FORMAT(recovery_after, '%Y-%m-%dT%H:%i:%s.%fZ') FROM {table} WHERE operation_id = ?"))
+    sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT operation_phase, executor_token, DATE_FORMAT(recovery_after, '%Y-%m-%dT%H:%i:%s.%fZ') FROM {table} WHERE operation_id = ?")))
         .bind(operation).fetch_one(pool.get()).await.unwrap()
 }

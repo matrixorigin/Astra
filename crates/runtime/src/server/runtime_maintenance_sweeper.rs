@@ -219,7 +219,7 @@ mod tests {
         .await
         .unwrap();
         pool.close().await;
-        sqlx::query(&format!("DROP DATABASE `{database}`"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
             .execute(control.get())
             .await
             .unwrap();

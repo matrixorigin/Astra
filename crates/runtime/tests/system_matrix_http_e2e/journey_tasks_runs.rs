@@ -895,7 +895,10 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
     let dropped = AssertUnwindSafe(async {
         tokio::time::timeout(
             Duration::from_secs(30),
-            sqlx::query(&format!("DROP DATABASE IF EXISTS `{database}`")).execute(catalog.get()),
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS `{database}`"
+            )))
+            .execute(catalog.get()),
         )
         .await
         .expect("bounded handoff catalog cleanup")

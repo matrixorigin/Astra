@@ -21,10 +21,13 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     settings.database = format!("astra_schema_it_{}", uuid::Uuid::new_v4().simple());
     settings.db_pool_max_connections = 4;
     settings.db_pool_min_connections = 1;
-    sqlx::query(&format!("CREATE DATABASE `{}`", settings.database))
-        .execute(&admin)
-        .await
-        .expect("create isolated schema database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE `{}`",
+        settings.database
+    )))
+    .execute(&admin)
+    .await
+    .expect("create isolated schema database");
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
         .expect("fresh core schema bootstrap");
@@ -398,10 +401,13 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     while pool.get().size() > 0 {
         drop(pool.get().acquire().await.unwrap().detach());
     }
-    sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
-        .execute(&admin)
-        .await
-        .expect("drop isolated schema database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE `{}`",
+        settings.database
+    )))
+    .execute(&admin)
+    .await
+    .expect("drop isolated schema database");
     while admin.size() > 0 {
         drop(admin.acquire().await.unwrap().detach());
     }

@@ -346,8 +346,10 @@ impl CoreSchemaAuthority {
 
 macro_rules! core_schema_create {
     ($pool:expr, $table_name:literal, $ddl:expr $(,)?) => {{
-        let ddl = $ddl;
-        ($pool).authority.declare(($pool).owner, $table_name, ddl);
+        let ddl = sqlx::SqlSafeStr::into_sql_str($ddl);
+        ($pool)
+            .authority
+            .declare(($pool).owner, $table_name, ddl.as_str());
         query(ddl)
     }};
 }
@@ -413,25 +415,15 @@ impl<'c> Executor<'c> for &'c CoreSchemaExecutor {
         (&self.pool).fetch_optional(query)
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: sqlx::SqlStr,
         parameters: &'e [sqlx::mysql::MySqlTypeInfo],
-    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::mysql::MySqlStatement<'q>, sqlx::Error>>
+    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::mysql::MySqlStatement, sqlx::Error>>
     where
         'c: 'e,
     {
         (&self.pool).prepare_with(sql, parameters)
-    }
-
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::Describe<MySql>, sqlx::Error>>
-    where
-        'c: 'e,
-    {
-        (&self.pool).describe(sql)
     }
 }
 
@@ -1722,7 +1714,10 @@ async fn ensure_matrixone_database_exists(
         "CREATE DATABASE IF NOT EXISTS {}",
         crate::snapshot_sql::quote_mysql_identifier(&settings.database)
     );
-    let create_result = query(&ddl).execute(admin_pool.pool()).await.map(|_| ());
+    let create_result = query(sqlx::AssertSqlSafe(ddl))
+        .execute(admin_pool.pool())
+        .await
+        .map(|_| ());
     finish_bootstrap_operation(create_result, admin_pool.release().await)
 }
 
@@ -3167,7 +3162,9 @@ async fn verify_inference_canonical_transition_wal_schema_contract(
     }
     let mut reasons = inference_canonical_transition_wal_schema_mismatches(&columns, &indexes);
     let show_create = format!("SHOW CREATE TABLE `{database}`.`{table}`");
-    let create_row = query(&show_create).fetch_one(pool).await?;
+    let create_row = query(sqlx::AssertSqlSafe(show_create))
+        .fetch_one(pool)
+        .await?;
     let create_sql: String = create_row.try_get(1_usize)?;
     let database_version: String = query_scalar("SELECT VERSION()").fetch_one(pool).await?;
     if database_reports_check_constraints_in_show_create(&database_version) {
@@ -3722,7 +3719,9 @@ async fn ensure_core_schema_while_leased(
     let agent_events_sql = agent_events_create_sql();
     pool.authority
         .declare("storage", "agent_events", &agent_events_sql);
-    query(&agent_events_sql).execute(&pool).await?;
+    query(sqlx::AssertSqlSafe(agent_events_sql))
+        .execute(&pool)
+        .await?;
 
     let workspace_schema = pool.owned_by("workspace_records");
     for (table_name, ddl) in [
@@ -4936,7 +4935,7 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)
         )",
     );
-    core_schema_create!(pool, "ctx_snapshots", &ctx_snapshot_ddl)
+    core_schema_create!(pool, "ctx_snapshots", sqlx::AssertSqlSafe(ctx_snapshot_ddl))
         .execute(&pool)
         .await?;
 

@@ -627,7 +627,7 @@ async fn verify_core_session_tables_deleted(
             crate::snapshot_sql::quote_mysql_identifier(table),
             crate::snapshot_sql::quote_mysql_identifier(owner_column),
         );
-        let remaining: i64 = sqlx::query_scalar(&sql)
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(session_id)
             .bind(user_id)
             .fetch_one(&mut **tx)

@@ -29,7 +29,7 @@ const _: () = assert!(
 
 // Physical completion is not logical settlement. These joins also reject
 // orphaned or contradictory diagnostic owners rather than erasing evidence.
-fn push_retention_owner_joins<'a>(query: &mut QueryBuilder<'a, MySql>, owners: &[&'a str]) {
+fn push_retention_owner_joins(query: &mut QueryBuilder<MySql>, owners: &[&str]) {
     // MatrixOne does not propagate the bounded tenant predicates across all
     // joins. Bind each side explicitly; otherwise even a tiny page scans the
     // global attempt, invocation and debt tables.
@@ -74,10 +74,10 @@ pub struct ModelRequestContextExpiryPage {
     pub more: bool,
 }
 
-fn validate_expired_attempt_keys_query<'a>(
-    attempt_keys: &'a [(String, String)],
+fn validate_expired_attempt_keys_query(
+    attempt_keys: &[(String, String)],
     cutoff: Option<chrono::NaiveDateTime>,
-) -> QueryBuilder<'a, MySql> {
+) -> QueryBuilder<MySql> {
     let mut query = QueryBuilder::<MySql>::new(
         "SELECT context.user_id, context.attempt_id FROM model_request_context_events context",
     );
@@ -109,7 +109,7 @@ fn validate_expired_attempt_keys_query<'a>(
     query
 }
 
-fn delete_attempt_keys_query<'a>(attempt_keys: &'a [(String, String)]) -> QueryBuilder<'a, MySql> {
+fn delete_attempt_keys_query(attempt_keys: &[(String, String)]) -> QueryBuilder<MySql> {
     let mut query = QueryBuilder::<MySql>::new("DELETE FROM model_request_context_events WHERE ");
     for (index, (user_id, attempt_id)) in attempt_keys.iter().enumerate() {
         if index > 0 {
@@ -168,9 +168,9 @@ async fn eligible_context_attempts(
         .await
 }
 
-fn lock_provider_attempts_for_context_expiry_query<'a>(
-    attempt_keys: &'a [(String, String)],
-) -> QueryBuilder<'a, MySql> {
+fn lock_provider_attempts_for_context_expiry_query(
+    attempt_keys: &[(String, String)],
+) -> QueryBuilder<MySql> {
     let mut query = QueryBuilder::<MySql>::new(
         "SELECT user_id, attempt_id FROM inference_provider_attempts WHERE ",
     );
@@ -189,9 +189,9 @@ fn lock_provider_attempts_for_context_expiry_query<'a>(
     query
 }
 
-fn mark_provider_attempt_context_expired_query<'a>(
-    attempt_keys: &'a [(String, String)],
-) -> QueryBuilder<'a, MySql> {
+fn mark_provider_attempt_context_expired_query(
+    attempt_keys: &[(String, String)],
+) -> QueryBuilder<MySql> {
     let mut query = QueryBuilder::<MySql>::new(
         "UPDATE inference_provider_attempts
          SET context_expired_at = COALESCE(context_expired_at, NOW(6))

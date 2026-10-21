@@ -7,6 +7,10 @@
 //! this policy in the shared dependency rather than loading roots per client.
 //! Certificate-chain and hostname verification remain enabled.
 //!
+//! WebSocket and proxy TLS use bundled Mozilla public roots through
+//! [`public_root_tls_config`]. WSS callers must pass this explicit configuration;
+//! the WebSocket dependency does not select or load a trust store.
+//!
 //! # Proxy policy
 //!
 //! Three tiers, by traffic destination — pick the matching helper instead of
@@ -249,4 +253,18 @@ mod apply_env_proxy_tests {
             },
         );
     }
+}
+
+/// Mozilla public roots for WebSocket and proxy TLS. Keep this trust policy
+/// explicit: HTTP clients separately include native platform roots.
+pub fn public_root_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default TLS protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    std::sync::Arc::new(config)
 }

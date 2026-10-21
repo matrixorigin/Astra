@@ -9576,9 +9576,9 @@ pub(crate) mod tests {
             "agent_runs",
             "agent_sessions",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&identity.user_id)
             .bind(&identity.session_id)
             .execute(pool)

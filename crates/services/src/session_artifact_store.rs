@@ -862,7 +862,7 @@ impl DatabaseSessionArtifactStore {
                       < CAST(? AS UNSIGNED)",
             );
         }
-        let mut update = query(&update)
+        let mut update = query(sqlx::AssertSqlSafe(update))
             .bind(record.source.as_deref())
             .bind(turn)
             .bind(round)

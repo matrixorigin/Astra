@@ -2183,9 +2183,9 @@ async fn resolve_active_llm_offering_uncached(
     offering_id: &str,
     pool: &sqlx::Pool<sqlx::MySql>,
 ) -> Result<ResolvedActiveLlmModel, ModelOfferingResolutionError> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id = ? LIMIT 1"
-    ))
+    )))
     .bind(offering_id)
     .fetch_optional(pool)
     .await
@@ -2230,9 +2230,9 @@ async fn resolve_active_llm_model_uncached(
 ) -> Result<ResolvedActiveLlmModel, String> {
     // Model identity is a configured name, not free-form text. Resolve it
     // once and fail closed; candidate-aware selection belongs upstream.
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_name = ? LIMIT 1"
-    ))
+    )))
     .bind(name)
     .fetch_optional(pool)
     .await
@@ -2292,9 +2292,9 @@ pub async fn resolve_reasoning_offering(
     //    pull all active rows and pick the minimum completion price.
     let pool = require_pool(pool, matrixone).await?;
 
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 AND provider != 'typesafe'"
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .map_err(|e| format!("DB query reasoning: {e}"))?;
@@ -2452,9 +2452,9 @@ pub async fn resolve_memory_offerings(
         return Ok(Vec::new());
     }
 
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1 AND provider != 'typesafe'"
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .map_err(|e| format!("DB query memory model: {e}"))?;
@@ -3309,9 +3309,9 @@ impl DatabaseModelService {
         model_id: &str,
     ) -> Result<Option<sqlx::mysql::MySqlRow>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        query(&format!(
+        query(sqlx::AssertSqlSafe(format!(
             "SELECT {USER_MODEL_SELECT_COLS} FROM user_llm_models WHERE user_id = ? AND model_id = ?"
-        ))
+        )))
         .bind(user_id)
         .bind(model_id)
         .fetch_optional(&pool)
@@ -3344,7 +3344,10 @@ impl DatabaseModelService {
             )
         };
         let rows = if is_admin || deployment_allowed {
-            query(&sql).fetch_all(&pool).await.map_err(internal_error)?
+            query(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .map_err(internal_error)?
         } else {
             Vec::new()
         };
@@ -3354,11 +3357,11 @@ impl DatabaseModelService {
             models.push(Self::model_list_item_from_row(&row)?);
         }
         if !is_admin && !user_id.is_empty() {
-            let user_rows = query(&format!(
+            let user_rows = query(sqlx::AssertSqlSafe(format!(
                 "SELECT {USER_MODEL_SELECT_COLS} \
                  FROM user_llm_models WHERE user_id = ? AND is_active = 1 \
                  ORDER BY provider, model_alias, model_id",
-            ))
+            )))
             .bind(&user_id)
             .fetch_all(&pool)
             .await
@@ -3765,10 +3768,10 @@ impl ModelService for DatabaseModelService {
         user_id: String,
     ) -> Result<Vec<UserModelRecord>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let rows = query(&format!(
+        let rows = query(sqlx::AssertSqlSafe(format!(
             "SELECT {USER_MODEL_SELECT_COLS} FROM user_llm_models \
              WHERE user_id = ? ORDER BY is_default DESC, model_alias ASC, model_id ASC"
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&pool)
         .await
@@ -4226,7 +4229,7 @@ impl ModelService for DatabaseModelService {
             "SELECT {} FROM infra_llm_models WHERE model_id = ?",
             MODEL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&model_id)
             .fetch_one(&pool)
             .await
@@ -4271,7 +4274,7 @@ impl ModelService for DatabaseModelService {
         let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
         let count_sql =
             format!("SELECT COUNT(*) AS total FROM infra_llm_models WHERE {visibility}");
-        let total_i64: i64 = query(&count_sql)
+        let total_i64: i64 = query(sqlx::AssertSqlSafe(count_sql))
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?
@@ -4285,7 +4288,7 @@ impl ModelService for DatabaseModelService {
             "SELECT {} FROM infra_llm_models WHERE {}{}{}",
             MODEL_LIST_SELECT_COLS, visibility, cursor_sql, MODEL_LIST_ORDER_SQL
         );
-        let mut list_query = query(&sql);
+        let mut list_query = query(sqlx::AssertSqlSafe(sql));
         if let Some(cursor) = &cursor {
             list_query = list_query
                 .bind(&cursor.provider)
@@ -4340,7 +4343,7 @@ impl ModelService for DatabaseModelService {
                     CAST(MAX(updated_at) AS CHAR) AS max_updated_at \
              FROM infra_llm_models WHERE {visibility}"
         );
-        let row = query(&fingerprint_sql)
+        let row = query(sqlx::AssertSqlSafe(fingerprint_sql))
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
@@ -4387,7 +4390,7 @@ impl ModelService for DatabaseModelService {
             "SELECT {} FROM infra_llm_models WHERE model_name = ?",
             MODEL_SELECT_COLS
         );
-        let row = query(&sql)
+        let row = query(sqlx::AssertSqlSafe(sql))
             .bind(&model_name)
             .fetch_optional(&pool)
             .await
@@ -4441,10 +4444,10 @@ impl ModelService for DatabaseModelService {
         }
         validate_update_context_window(request.context_window)?;
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let existing = query(&format!(
+        let existing = query(sqlx::AssertSqlSafe(format!(
             "SELECT {MODEL_SELECT_COLS}, CAST(updated_at AS CHAR) AS configuration_updated_at \
              FROM infra_llm_models WHERE model_name = ?"
-        ))
+        )))
         .bind(&model_name)
         .fetch_optional(&pool)
         .await
@@ -4599,9 +4602,9 @@ impl ModelService for DatabaseModelService {
                 "Model changed during update; refresh and retry",
             ));
         }
-        let row = query(&format!(
+        let row = query(sqlx::AssertSqlSafe(format!(
             "SELECT {MODEL_SELECT_COLS} FROM infra_llm_models WHERE model_id = ?"
-        ))
+        )))
         .bind(&model_id)
         .fetch_one(&mut *tx)
         .await
@@ -4780,7 +4783,7 @@ impl ModelService for DatabaseModelService {
              AND provider = ? AND base_url <=> ? AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ?",
             MODEL_SELECT_COLS
         );
-        let result_row = query(&sql)
+        let result_row = query(sqlx::AssertSqlSafe(sql))
             .bind(&model_id)
             .bind(&model_name)
             .bind(&provider)

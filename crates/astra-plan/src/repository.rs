@@ -257,7 +257,7 @@ impl PlanRepository for CloudPlanRepository {
                      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                     [state.session_hint.is_some(), state.plan_md.is_some()],
                 );
-                let res = sqlx::query(&insert_sql)
+                let res = sqlx::query(insert_sql)
                     .bind(plan_id)
                     .bind(user_id)
                     .bind(state.session_hint.as_deref())
@@ -413,7 +413,7 @@ impl PlanRepository for CloudPlanRepository {
         }
         sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
 
-        let mut q = sqlx::query(&sql).bind(user_id);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(user_id);
         if let Some(sid) = filter.session_id {
             q = q.bind(sid);
         }

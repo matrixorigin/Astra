@@ -444,7 +444,7 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
         );
 
         // Build and execute search query
-        let mut search_q = query(&sql);
+        let mut search_q = query(sqlx::AssertSqlSafe(sql));
         for b in &binds {
             search_q = search_q.bind(b);
         }

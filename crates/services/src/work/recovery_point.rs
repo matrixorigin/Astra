@@ -310,11 +310,11 @@ impl DatabaseWorkRecoveryPointRepository {
 
         // The request row is checked before any mutable-state admission. This
         // is the idempotency boundary after a lost HTTP response.
-        if let Some(row) = query(&format!(
+        if let Some(row) = query(sqlx::AssertSqlSafe(format!(
             "{RECOVERY_POINT_SELECT_SQL}
                  WHERE owner_id = ? AND work_id = ? AND request_id = ?
                  LIMIT 1 FOR UPDATE"
-        ))
+        )))
         .bind(request.owner_id.as_str())
         .bind(request.work_id.as_str())
         .bind(request.request_id.as_str())
@@ -607,12 +607,12 @@ impl DatabaseWorkRecoveryPointRepository {
             Some(&manifest_hash),
         )
         .await?;
-        let row = query(&format!(
+        let row = query(sqlx::AssertSqlSafe(format!(
             "{RECOVERY_POINT_SELECT_SQL}
              WHERE owner_id = ? AND work_id = ? AND branch_id = ?
                AND recovery_point_id = ?
              LIMIT 1"
-        ))
+        )))
         .bind(request.owner_id.as_str())
         .bind(request.work_id.as_str())
         .bind(request.branch_id.as_str())
@@ -638,7 +638,7 @@ impl DatabaseWorkRecoveryPointRepository {
         let sql = format!(
             "{RECOVERY_POINT_SELECT_SQL} WHERE owner_id = ? AND work_id = ? AND recovery_point_id = ? LIMIT 1"
         );
-        let row = query(&sql)
+        let row = query(sqlx::AssertSqlSafe(sql))
             .bind(owner_id.as_str())
             .bind(work_id.as_str())
             .bind(recovery_point_id)

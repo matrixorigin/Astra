@@ -343,14 +343,17 @@ mod tests {
         settings.database = format!("astra_test_collision_ttl_{}", uuid::Uuid::new_v4().simple());
         settings.db_pool_max_connections = 1;
         settings.db_pool_min_connections = 1;
-        sqlx::query(&format!("CREATE DATABASE `{}`", settings.database))
-            .execute(&mut admin)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE `{}`",
+            settings.database
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
         // Clone only the production table: unrelated expired fixtures cannot
         // consume LIMIT 1, and no unrelated maintenance work enters this test.
         let result: Result<_, sqlx::Error> = async {
-            sqlx::query(&format!("CREATE TABLE `{}`.observation_identity_collisions LIKE `{source}`.observation_identity_collisions", settings.database))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE `{}`.observation_identity_collisions LIKE `{source}`.observation_identity_collisions", settings.database)))
                 .execute(&mut admin).await?;
             let pool = astra_core::SharedPool::new(&settings).await?;
             sqlx::query("INSERT INTO observation_identity_collisions (user_id, identity_kind, identity_id, stored_payload_hash, attempted_payload_hash, source, expires_at) VALUES ('expired-older','agent_event','one','a','b','ttl-test',DATE_SUB(NOW(6),INTERVAL 2 SECOND)), ('expired','agent_event','one','a','b','ttl-test',DATE_SUB(NOW(6),INTERVAL 1 SECOND)), ('retained','agent_event','one','a','b','ttl-test',DATE_ADD(NOW(6),INTERVAL 7 DAY))")
@@ -366,10 +369,13 @@ mod tests {
             Ok((deleted, after_first, repeated, exhausted, owners))
         }.await;
         // The destructive target is exactly the randomly named database above.
-        sqlx::query(&format!("DROP DATABASE `{}`", settings.database))
-            .execute(&mut admin)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE `{}`",
+            settings.database
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
         let (deleted, after_first, repeated, exhausted, owners) = result.unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(after_first, ["expired", "retained"]);

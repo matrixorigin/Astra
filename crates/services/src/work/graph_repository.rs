@@ -740,7 +740,7 @@ pub(super) async fn retire_revised_item_attempts(
 }
 
 fn append_revised_attempt_predicates(
-    update: &mut QueryBuilder<'_, MySql>,
+    update: &mut QueryBuilder<MySql>,
     revised: &[super::WorkItemRevisionRef],
 ) {
     for (index, item) in revised.iter().enumerate() {

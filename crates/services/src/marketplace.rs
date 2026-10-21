@@ -265,9 +265,9 @@ impl MarketplaceService for DatabaseMarketplaceService {
         .await
         .map_err(internal_error)?;
 
-        let row = query(&format!(
+        let row = query(sqlx::AssertSqlSafe(format!(
             "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE installation_id = ?"
-        ))
+        )))
         .bind(&installation_id)
         .fetch_one(&pool)
         .await
@@ -339,9 +339,9 @@ impl MarketplaceService for DatabaseMarketplaceService {
         .await
         .map_err(internal_error)?;
 
-        let row = query(&format!(
+        let row = query(sqlx::AssertSqlSafe(format!(
             "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE installation_id = ?"
-        ))
+        )))
         .bind(&installation_id)
         .fetch_one(&pool)
         .await
@@ -390,9 +390,9 @@ impl MarketplaceService for DatabaseMarketplaceService {
         .await
         .map_err(internal_error)?;
 
-        let row = query(&format!(
+        let row = query(sqlx::AssertSqlSafe(format!(
             "SELECT {INSTALLED_LIST_SELECT} FROM skill_installations WHERE installation_id = ?"
-        ))
+        )))
         .bind(&installation_id)
         .fetch_one(&pool)
         .await
@@ -421,7 +421,7 @@ impl MarketplaceService for DatabaseMarketplaceService {
                  ORDER BY installed_at DESC, installation_id DESC LIMIT ?"
             )
         };
-        let mut list_query = query(&list_sql).bind(&user_id);
+        let mut list_query = query(sqlx::AssertSqlSafe(list_sql)).bind(&user_id);
         if let Some(cursor) = &cursor {
             let installed_at = installed_list_cursor_db_installed_at(cursor)?;
             let installation_id = installed_list_cursor_installation_id(cursor)?;

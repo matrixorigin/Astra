@@ -200,7 +200,7 @@ async fn insert_run_row(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, -1, NOW(6), NOW(6))",
         [parent_run_id.is_some(), retry_of.is_some()],
     );
-    sqlx::query(&insert_sql)
+    sqlx::query(insert_sql)
         .bind(run_id)
         .bind(user_id)
         .bind(session_id)

@@ -1295,14 +1295,14 @@ async fn cleanup_interrupted_matrix_e2e_sessions(state: &astra_runtime::AppState
     // only crash recovery: a recent fixture may belong to another test in the
     // same binary or a parallel nextest process and is therefore live. The
     // lease fence is deliberately much longer than the heartbeat interval.
-    let users = sqlx::query(&format!(
+    let users = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT user_id, is_active FROM auth_users
          WHERE username LIKE 'prod_matrix_%'
            AND (is_active = 1 OR display_name = 'e2e-cleaning')
            AND COALESCE(last_login_at, created_at) <
                DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL {} MINUTE)",
         INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES
-    ))
+    )))
     .fetch_all(pool.get())
     .await
     .expect("list old interrupted matrix E2E users");
@@ -1340,14 +1340,14 @@ async fn cleanup_interrupted_matrix_e2e_sessions(state: &astra_runtime::AppState
 /// Atomically cross the expiry fence. A heartbeat that renewed after the
 /// candidate SELECT wins this CAS, so cleanup cannot act on a stale snapshot.
 pub async fn try_claim_interrupted_matrix_e2e_fixture(pool: &SharedPool, user_id: &str) -> bool {
-    let claim = sqlx::query(&format!(
+    let claim = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE auth_users
          SET is_active = 0, display_name = 'e2e-cleaning'
          WHERE user_id = ? AND is_active = 1
            AND COALESCE(last_login_at, created_at) <
                DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL {} MINUTE)",
         INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES
-    ))
+    )))
     .bind(user_id)
     .execute(pool.get())
     .await

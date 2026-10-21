@@ -72,7 +72,7 @@ async fn scalar_count(
 ) -> i64 {
     let statement =
         format!("SELECT COUNT(*) AS count FROM {table} WHERE owner_id = ? AND work_id = ?");
-    sqlx::query(&statement)
+    sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(owner_id)
         .bind(work_id)
         .fetch_one(pool.get())

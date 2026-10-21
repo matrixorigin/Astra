@@ -2620,9 +2620,9 @@ mod tests {
             "agent_sessions",
             "agent_session_lifecycle_fences",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
             .execute(pool.get())
@@ -2640,9 +2640,9 @@ mod tests {
             "conversation_manifest_nodes",
             "session_context_heads",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -3367,7 +3367,7 @@ mod tests {
             let update = format!(
                 "UPDATE run_checkpoints SET {column} = ? WHERE user_id = ? AND checkpoint_id = ?"
             );
-            sqlx::query(&update)
+            sqlx::query(sqlx::AssertSqlSafe(update.as_str()))
                 .bind(invalid)
                 .bind(&key.owner_user_id)
                 .bind(&checkpoint_id)
@@ -3381,7 +3381,7 @@ mod tests {
                 ),
                 "invalid {column} must not authorize handoff"
             );
-            sqlx::query(&update)
+            sqlx::query(sqlx::AssertSqlSafe(update))
                 .bind(original)
                 .bind(&key.owner_user_id)
                 .bind(&checkpoint_id)

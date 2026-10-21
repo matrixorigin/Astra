@@ -159,7 +159,7 @@ impl SweeperLease {
              VALUES (?, ?, NOW(6) + INTERVAL ? SECOND)",
             self.table_name
         );
-        let insert_result = sqlx::query(&insert_sql)
+        let insert_result = sqlx::query(sqlx::AssertSqlSafe(insert_sql))
             .bind(&self.lease_name)
             .bind(&self.pod_id)
             .bind(ttl_secs)
@@ -179,7 +179,7 @@ impl SweeperLease {
              WHERE sweeper_name = ? AND (expires_at < NOW(6) OR owner_pod_id = ?)",
             self.table_name
         );
-        let update_result = sqlx::query(&update_sql)
+        let update_result = sqlx::query(sqlx::AssertSqlSafe(update_sql))
             .bind(&self.pod_id)
             .bind(ttl_secs)
             .bind(&self.lease_name)
@@ -198,10 +198,12 @@ impl SweeperLease {
             "SELECT owner_pod_id, expires_at, CAST(NOW(6) AS DATETIME(6)) FROM {} WHERE sweeper_name = ?",
             self.table_name
         );
-        let row = sqlx::query_as::<_, (String, NaiveDateTime, NaiveDateTime)>(&select_sql)
-            .bind(&self.lease_name)
-            .fetch_optional(&mut *conn)
-            .await;
+        let row = sqlx::query_as::<_, (String, NaiveDateTime, NaiveDateTime)>(sqlx::AssertSqlSafe(
+            select_sql,
+        ))
+        .bind(&self.lease_name)
+        .fetch_optional(&mut *conn)
+        .await;
 
         match row {
             Ok(Some((owner, expires_at, database_now))) if owner == self.pod_id => {

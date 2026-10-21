@@ -9,17 +9,20 @@ async fn nullable_string_parameters_round_trip_across_cached_statement_shapes() 
     let pool = common::setup_pool().await;
     let mut connection = pool.get().acquire().await.unwrap();
     let table = format!("bind_compat_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {table} (id VARCHAR(64) PRIMARY KEY, c2 VARCHAR(64), c3 VARCHAR(64), c4 VARCHAR(64), c5 VARCHAR(64), c6 VARCHAR(64), c7 VARCHAR(64), c8 VARCHAR(64), c9 VARCHAR(64), c10 VARCHAR(64), CONSTRAINT chk_stage_status CHECK ((c8 = 'accepted' AND c9 IS NULL) OR (c8 = 'terminal' AND c9 IN ('succeeded', 'failed'))))"
-    ))
+    )))
     .execute(&mut *connection)
     .await
     .unwrap();
     let insert_sql = format!(
         "INSERT INTO {table} (id, c2, c3, c4, c5, c6, c7, c8, c9, c10) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
-    let accepted_insert = matrixone_statement_with_null_shape(&insert_sql, [false, false]);
-    sqlx::query(&accepted_insert)
+    let accepted_insert = matrixone_statement_with_null_shape(
+        sqlx::AssertSqlSafe(insert_sql.as_str()),
+        [false, false],
+    );
+    sqlx::query(accepted_insert)
         .bind("accepted-id")
         .bind("two")
         .bind("three")
@@ -33,8 +36,9 @@ async fn nullable_string_parameters_round_trip_across_cached_statement_shapes() 
         .execute(&mut *connection)
         .await
         .unwrap();
-    let terminal_insert = matrixone_statement_with_null_shape(&insert_sql, [false, true]);
-    sqlx::query(&terminal_insert)
+    let terminal_insert =
+        matrixone_statement_with_null_shape(sqlx::AssertSqlSafe(insert_sql), [false, true]);
+    sqlx::query(terminal_insert)
         .bind("terminal-id")
         .bind("two")
         .bind("three")
@@ -48,9 +52,9 @@ async fn nullable_string_parameters_round_trip_across_cached_statement_shapes() 
         .execute(&mut *connection)
         .await
         .unwrap();
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT c7, c8, c9, c10 FROM {table} WHERE id = 'terminal-id'"
-    ))
+    )))
     .fetch_one(&mut *connection)
     .await
     .unwrap();
@@ -67,7 +71,7 @@ async fn nullable_string_parameters_round_trip_across_cached_statement_shapes() 
         row.try_get::<Option<String>, _>("c10").unwrap().as_deref(),
         Some("ten")
     );
-    sqlx::query(&format!("DROP TABLE {table}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
         .execute(&mut *connection)
         .await
         .unwrap();
@@ -79,19 +83,21 @@ async fn bound_string_relation_returns_every_requested_row() {
     let pool = common::setup_pool().await;
     let mut connection = pool.get().acquire().await.unwrap();
     let table = format!("bound_set_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE {table} (id VARCHAR(64) PRIMARY KEY, value VARCHAR(64) NOT NULL)"
-    ))
+    )))
     .execute(&mut *connection)
     .await
     .unwrap();
     for value in ["alpha", "bravo", "charlie", "delta"] {
-        sqlx::query(&format!("INSERT INTO {table} (id, value) VALUES (?, ?)"))
-            .bind(value)
-            .bind(value)
-            .execute(&mut *connection)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {table} (id, value) VALUES (?, ?)"
+        )))
+        .bind(value)
+        .bind(value)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
     }
 
     let requested = ["delta", "alpha", "charlie", "bravo"];
@@ -107,7 +113,56 @@ async fn bound_string_relation_returns_every_requested_row() {
         .collect::<Vec<_>>();
     assert_eq!(values, ["alpha", "bravo", "charlie", "delta"]);
 
-    sqlx::query(&format!("DROP TABLE {table}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne"]
+async fn driver_values_preserve_unicode_binary_json_and_microseconds() {
+    let pool = common::setup_pool().await;
+    let mut connection = pool.get().acquire().await.unwrap();
+    let table = format!("driver_values_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {table} (text_value TEXT, binary_value BLOB, json_value JSON, time_value DATETIME(6))"
+    )))
+    .execute(&mut *connection).await.unwrap();
+    let text = "多会话 café 🦀";
+    let bytes = vec![0u8, 255, 128, 0, 65];
+    let json = serde_json::json!({"label":text,"optional":null,"items":[1,true]});
+    let time = chrono::NaiveDate::from_ymd_opt(2026, 10, 21)
+        .unwrap()
+        .and_hms_micro_opt(12, 34, 56, 123_456)
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {table} VALUES (?, ?, ?, ?)"
+    )))
+    .bind(text)
+    .bind(&bytes)
+    .bind(serde_json::to_string(&json).unwrap())
+    .bind(time)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT text_value, binary_value, CAST(json_value AS CHAR) AS json_text, time_value FROM {table}"
+    )))
+    .fetch_one(&mut *connection).await.unwrap();
+    assert_eq!(row.try_get::<String, _>("text_value").unwrap(), text);
+    assert_eq!(row.try_get::<Vec<u8>, _>("binary_value").unwrap(), bytes);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&row.try_get::<String, _>("json_text").unwrap())
+            .unwrap(),
+        json
+    );
+    assert_eq!(
+        row.try_get::<chrono::NaiveDateTime, _>("time_value")
+            .unwrap(),
+        time
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
         .execute(&mut *connection)
         .await
         .unwrap();

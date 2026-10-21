@@ -227,9 +227,9 @@ async fn canonical_commit_releases_only_its_own_completed_writer() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&owner)
         .execute(pool.get())
@@ -383,9 +383,9 @@ async fn cancelled_session_authority_lock_releases_its_physical_checkout() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -550,9 +550,9 @@ async fn complete_turn_authority_renews_atomically_in_database() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -771,9 +771,9 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
             "session_context_authority_events",
             "session_context_heads",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?"
-            ))
+            )))
             .bind(&key.isolation_domain).bind(&key.owner_user_id)
             .bind(&key.session_id).bind(&key.branch_id)
             .execute(pool.get()).await.expect("clean owner-scoped execution fixture");
@@ -917,9 +917,9 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -982,9 +982,9 @@ async fn execution_read_is_non_mutating_during_an_active_turn() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&owner_id)
         .bind(&session_id)
@@ -993,9 +993,9 @@ async fn execution_read_is_non_mutating_during_an_active_turn() {
         .expect("clean execution read fixture");
     }
     for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
@@ -1103,9 +1103,9 @@ async fn session_lifecycle_fence_rejects_context_admission_before_child_locks() 
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&owner_id)
         .bind(&session_id)
@@ -1114,9 +1114,9 @@ async fn session_lifecycle_fence_rejects_context_admission_before_child_locks() 
         .expect("clean lifecycle fence context fixture");
     }
     for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
@@ -1426,9 +1426,9 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         "session_execution_bindings",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id IN (?, ?)"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -1607,9 +1607,9 @@ async fn independent_sessions_share_one_physical_checkout() {
             "session_context_authority_events",
             "session_context_heads",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -1618,9 +1618,9 @@ async fn independent_sessions_share_one_physical_checkout() {
             .expect("clean execution claim fixture");
         }
         for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
             .execute(pool.get())
@@ -1840,9 +1840,9 @@ async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .execute(pool.get())

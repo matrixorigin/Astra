@@ -826,9 +826,9 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
         "agent_session_lifecycle_fences",
         "agent_sessions",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id IN (?, ?)"
-        ))
+        )))
         .bind(&user)
         .bind(&session)
         .bind(&other_session)
@@ -1381,7 +1381,7 @@ async fn tool_output_batches_fence_all_tools_without_session_diagnostic_mutation
                 }
             }
             for table in ["session_tool_output_batches", "session_tool_outputs"] {
-                let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?"))
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?")))
                     .bind(&user_id).bind(&session_id).bind(&batch_id).fetch_one(pool.get()).await.unwrap();
                 let expected = if state == "active"
                     && (table == "session_tool_output_batches" || !items.is_empty())
@@ -1391,9 +1391,9 @@ async fn tool_output_batches_fence_all_tools_without_session_diagnostic_mutation
                     0
                 };
                 assert_eq!(count, expected, "{state}/{name}/{table}");
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?"
-                ))
+                )))
                 .bind(&user_id)
                 .bind(&session_id)
                 .bind(&batch_id)
@@ -1714,7 +1714,7 @@ async fn concurrent_run_inserts_share_one_session_slot() {
         "agent_sessions",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())
@@ -1823,7 +1823,7 @@ async fn session_deletion_competes_safely_with_run_admission() {
         ),
     ] {
         let statement = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
-        let count: i64 = sqlx::query_scalar(&statement)
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
             .bind(&session_id)
             .bind(&run_id)
@@ -1847,7 +1847,7 @@ async fn session_deletion_competes_safely_with_run_admission() {
         "agent_session_lifecycle_fences",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())
@@ -1976,10 +1976,10 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 );
             }
-            sqlx::raw_sql(&format!(
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "SET @control_u{ordinal}='{}',@control_r{ordinal}='{}'",
                 key.user_id, key.run_id
-            ))
+            )))
             .execute(&mut *connection)
             .await
             .unwrap();
@@ -1991,17 +1991,17 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
         arguments.truncate(statements[0].matches('?').count());
         // Inspect the emitted production SELECT, not a test-owned query copy.
         // MatrixOne supports this prepared diagnostic but not JSON EXPLAIN.
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "PREPARE control_scan FROM '{}'",
             statements[0].replace('\'', "''")
-        ))
+        )))
         .execute(&mut *connection)
         .await
         .unwrap();
-        let rows = sqlx::raw_sql(&format!(
+        let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "EXPLAIN ANALYZE FORCE EXECUTE control_scan USING {}",
             arguments.join(",")
-        ))
+        )))
         .fetch_all(&mut *connection)
         .await
         .unwrap();
@@ -2067,11 +2067,13 @@ async fn control_batch_preserves_database_identity_positions_and_isolates_corrup
     assert!(results[1].as_ref().unwrap().is_none());
     for table in ["agent_runs", "agent_sessions"] {
         for owner in [&user, &other] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
-                .bind(owner)
-                .execute(independent.get())
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id=?"
+            )))
+            .bind(owner)
+            .execute(independent.get())
+            .await
+            .unwrap();
         }
     }
     independent.close().await;
@@ -2552,11 +2554,13 @@ async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atom
         "agent_sessions",
         "agent_session_lifecycle_fences",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-            .bind(&user)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
     }
 }
 

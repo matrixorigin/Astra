@@ -675,7 +675,7 @@ async fn historical_moi_works_with_fresh_astra() {
     let mut admin = MySqlConnection::connect(&settings.matrixone.database_url_with_password())
         .await
         .expect("test MatrixOne");
-    sqlx::query(&format!("CREATE DATABASE `{database}`"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
         .execute(&mut admin)
         .await
         .unwrap();
@@ -767,7 +767,7 @@ async fn historical_moi_works_with_fresh_astra() {
     );
     state.close_database_pools().await;
     gateway_task.abort();
-    sqlx::query(&format!("DROP DATABASE `{database}`"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
         .execute(&mut admin)
         .await
         .unwrap();

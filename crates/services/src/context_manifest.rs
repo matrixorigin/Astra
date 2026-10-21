@@ -570,7 +570,7 @@ impl DatabaseContextManifestStore {
                 manifest.turn_intent.is_some(),
             ],
         );
-        sqlx::query(&manifest_insert_sql)
+        sqlx::query(manifest_insert_sql)
             .bind(&manifest.manifest_id)
             .bind(&manifest.user_id)
             .bind(&manifest.session_id)

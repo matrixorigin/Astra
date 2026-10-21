@@ -127,11 +127,13 @@ async fn batch_tradeoff_probe() {
                 "agent_session_lifecycle_fences",
                 "agent_sessions",
             ] {
-                sqlx::query(&format!("DELETE FROM {table} WHERE user_id LIKE ?"))
-                    .bind(format!("{prefix}-u%"))
-                    .execute(&pool)
-                    .await
-                    .unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE user_id LIKE ?"
+                )))
+                .bind(format!("{prefix}-u%"))
+                .execute(&pool)
+                .await
+                .unwrap();
             }
         }
     }

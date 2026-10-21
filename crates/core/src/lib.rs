@@ -274,13 +274,14 @@ pub mod work_unit;
 /// identities as normal statements, so this preserves one write contract on
 /// both versions without disabling prepared-statement caching globally.
 pub fn matrixone_statement_with_null_shape(
-    sql: &str,
+    sql: impl sqlx::SqlSafeStr,
     nullable_values_present: impl IntoIterator<Item = bool>,
-) -> String {
-    let mut statement = String::with_capacity(sql.len() + 48);
-    statement.push_str(sql);
+) -> sqlx::SqlStr {
+    let sql = sql.into_sql_str();
+    let mut statement = String::with_capacity(sql.as_str().len() + 48);
+    statement.push_str(sql.as_str());
     statement.push_str(&matrixone_null_shape_comment(nullable_values_present));
-    statement
+    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(statement))
 }
 
 /// Return the MatrixOne prepared-statement discriminator used by dynamic SQL
@@ -303,7 +304,7 @@ pub fn matrixone_null_shape_comment(
 /// `IN (?, ...)` predicate across joins. A derived `UNION ALL` relation keeps
 /// every value bound and returns the complete result on both 4.1.4 and 4.2.
 pub fn push_matrixone_bound_string_set<'args>(
-    query: &mut QueryBuilder<'args, MySql>,
+    query: &mut QueryBuilder<MySql>,
     values: impl IntoIterator<Item = &'args str>,
 ) {
     query.push("(");

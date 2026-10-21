@@ -1185,7 +1185,7 @@ impl DatabaseEdgeRegistryService {
                 "SELECT {EDGE_AGENT_RECORD_COLUMNS}, registration_state \
                  FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?"
             );
-            let row = sqlx::query(&lookup_sql)
+            let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
                 .bind(user_id)
                 .bind(edge_agent_id)
                 .fetch_optional(&mut *transaction)
@@ -1841,7 +1841,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              ORDER BY last_heartbeat_at DESC LIMIT 1"
         );
-        let row = sqlx::query(&lookup_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
             .bind(edge_agent_id)
             .bind(workspace_id)
             .bind(workspace_id)
@@ -1867,7 +1867,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              LIMIT 1"
         );
-        let row = sqlx::query(&lookup_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
             .bind(user_id)
             .bind(edge_agent_id)
             .bind(workspace_id)
@@ -1886,7 +1886,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
              WHERE user_id = ? AND registration_state = 1 \
              ORDER BY last_heartbeat_at DESC"
         );
-        let rows = sqlx::query(&list_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
@@ -1911,7 +1911,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND CHAR_LENGTH(TRIM(worktree_path)) > 0 \
              ORDER BY edge_agent_id ASC LIMIT ?"
         );
-        let rows = sqlx::query(&list_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
             .bind(user_id)
             .bind(i64::from(limit.clamp(1, 100)))
             .fetch_all(&self.pool)

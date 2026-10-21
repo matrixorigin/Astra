@@ -167,9 +167,9 @@ impl CancellationFixture {
 
     async fn cleanup(self) {
         for table in ["tool_invocation_ledger", "agent_events"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&self.key.owner_user_id)
             .bind(&self.key.session_id)
             .execute(self.pool.get())
@@ -180,9 +180,9 @@ impl CancellationFixture {
             "session_context_operation_receipts",
             "session_context_authority_events",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE owner_user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&self.key.owner_user_id)
             .bind(&self.key.session_id)
             .execute(self.pool.get())

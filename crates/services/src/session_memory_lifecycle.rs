@@ -457,7 +457,7 @@ impl SessionMemoryLifecycleStore {
             let query = format!(
                 "UPDATE agent_session_memory_work SET state_json = ?, complete = ?, {scheduling}, updated_at = NOW(6) WHERE user_id = ? AND session_id = ?"
             );
-            sqlx::query(&query)
+            sqlx::query(sqlx::AssertSqlSafe(query))
                 .bind(serde_json::to_string(&work).map_err(|error| error.to_string())?)
                 .bind(!work.pending())
                 .bind(user)
@@ -504,7 +504,7 @@ impl SessionMemoryLifecycleStore {
         let query = format!(
             "UPDATE agent_session_memory_work SET lease_token = NULL, lease_expires_at = NULL, next_attempt_at = {due}, attempts = {attempts}, updated_at = NOW(6) WHERE user_id = ? AND session_id = ? AND lease_token = ?"
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(&claim.user_id)
             .bind(&claim.session_id)
             .bind(&claim.token)

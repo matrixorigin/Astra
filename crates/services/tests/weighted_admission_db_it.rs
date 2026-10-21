@@ -45,9 +45,9 @@ async fn assert_partition_capacity(pool: &astra_core::SharedPool, global: Admiss
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT scope_name, {columns} FROM session_weighted_admission_gates ORDER BY scope_name"
-    ))
+    )))
     .fetch_all(pool.get())
     .await
     .unwrap();

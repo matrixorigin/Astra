@@ -1005,7 +1005,7 @@ async fn load_durable_tool_observations_by_session(
          FROM agent_run_events WHERE {} ORDER BY session_id, run_id, event_idx",
         predicates.join(" AND ")
     );
-    let mut q = query(&sql);
+    let mut q = query(sqlx::AssertSqlSafe(sql));
     for bind in binds {
         q = q.bind(bind);
     }
@@ -1335,7 +1335,9 @@ async fn load_turn_observed_metrics(
          ) ORDER BY created_at ASC, event_id ASC",
         content_cap,
     );
-    let mut query = query(&sql).bind(session_id).bind(user_id);
+    let mut query = query(sqlx::AssertSqlSafe(sql))
+        .bind(session_id)
+        .bind(user_id);
     for run_id in &root_runs {
         query = query.bind(run_id);
     }
@@ -1496,7 +1498,9 @@ async fn load_turn_observed_metrics(
            AND event_type IN ('run_started', 'run_error', 'run_finished') \
          ORDER BY event_idx ASC"
     );
-    let mut run_query = sqlx::query(&run_sql).bind(session_id).bind(user_id);
+    let mut run_query = sqlx::query(sqlx::AssertSqlSafe(run_sql))
+        .bind(session_id)
+        .bind(user_id);
     for run_id in &root_runs {
         run_query = run_query.bind(run_id);
     }
@@ -2107,7 +2111,9 @@ async fn fetch_turn_page_rows(
             ""
         }
     );
-    let mut q = query(&turn_sql).bind(session_id).bind(user_id);
+    let mut q = query(sqlx::AssertSqlSafe(turn_sql))
+        .bind(session_id)
+        .bind(user_id);
     if let Some(cursor) = cursor {
         q = q
             .bind(&cursor.created_at)
@@ -2310,7 +2316,7 @@ async fn fetch_audit_session_cursor_rows(
         seek_clause = seek_clause,
         order_dir = query_parts.order_dir
     );
-    let mut q = query(&sql);
+    let mut q = query(sqlx::AssertSqlSafe(sql));
     for v in &query_parts.bind_values {
         q = q.bind(v);
     }
@@ -2374,7 +2380,7 @@ async fn fetch_audit_session_page_rows(
         seek_clause = seek_clause,
         order_dir = query_parts.order_dir
     );
-    let mut q = query(&sql);
+    let mut q = query(sqlx::AssertSqlSafe(sql));
     for v in &query_parts.bind_values {
         q = q.bind(v);
     }
@@ -2401,7 +2407,7 @@ async fn count_audit_session_list_rows(
         "SELECT COUNT(*) AS cnt FROM ({base_sql}) session_rows",
         base_sql = query_parts.base_sql
     );
-    let mut q = query(&sql);
+    let mut q = query(sqlx::AssertSqlSafe(sql));
     for v in &query_parts.bind_values {
         q = q.bind(v);
     }
@@ -3307,7 +3313,9 @@ impl DatabaseSessionAuditService {
         }
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
 
-        let mut query = query(&sql).bind(user_id).bind(RUNTIME_PROMOTION_EVENT_TYPE);
+        let mut query = query(sqlx::AssertSqlSafe(sql))
+            .bind(user_id)
+            .bind(RUNTIME_PROMOTION_EVENT_TYPE);
         if let Some(since) = since {
             query = query.bind(since);
         }
@@ -3346,7 +3354,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         // One pass over agent_events: counts, tokens, duration bounds, distinct models.
         // MatrixOne rejects `SEPARATOR CHAR(31)`; embed the unit-separator as a literal (same as MySQL).
-        let metrics_row = query(&format!(
+        let metrics_row = query(sqlx::AssertSqlSafe(format!(
             "SELECT \
                COALESCE(MAX(CASE WHEN event_type = 'user_query' AND parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count, \
                COUNT(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) AS error_count, \
@@ -3374,7 +3382,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              FROM agent_events e \
              WHERE e.session_id = ? AND e.user_id = ?",
             sep = SESSION_AUDIT_MODEL_SEP,
-        ))
+        )))
         .bind(session_id)
         .bind(user_id)
         .bind(session_id)
@@ -3627,7 +3635,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              ORDER BY created_at ASC",
             agent_events_content_cap::TURN_DETAIL_CHILD
         );
-        let child_rows = query(&child_sql)
+        let child_rows = query(sqlx::AssertSqlSafe(child_sql))
             .bind(session_id)
             .bind(user_id)
             .bind(&parent.event_id)
@@ -3738,7 +3746,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              ORDER BY created_at DESC LIMIT 200",
             agent_events_content_cap::TOOL_LAST_ERROR
         );
-        let error_rows = query(&err_sql)
+        let error_rows = query(sqlx::AssertSqlSafe(err_sql))
             .bind(session_id)
             .bind(user_id)
             .fetch_all(&pool)
@@ -3779,7 +3787,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              LIMIT 200",
             agent_events_content_cap::ERROR_LIST_ENTRY
         );
-        let rows = query(&list_err_sql)
+        let rows = query(sqlx::AssertSqlSafe(list_err_sql))
             .bind(session_id)
             .bind(user_id)
             .fetch_all(&pool)
@@ -3972,7 +3980,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                FROM agent_events e \
               WHERE {where_clause}"
         );
-        let mut aq = sqlx::query(&agg_sql);
+        let mut aq = sqlx::query(sqlx::AssertSqlSafe(agg_sql));
         for v in &bind_values {
             aq = aq.bind(v);
         }
@@ -4011,7 +4019,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              FROM agent_run_events WHERE {}",
             durable_where.join(" AND ")
         );
-        let mut durable_agg_query = query(&durable_agg_sql);
+        let mut durable_agg_query = query(sqlx::AssertSqlSafe(durable_agg_sql));
         for bind in durable_binds {
             durable_agg_query = durable_agg_query.bind(bind);
         }
@@ -4060,7 +4068,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              ORDER BY cnt DESC \
              LIMIT 10"
         );
-        let mut tq = sqlx::query(&tools_sql);
+        let mut tq = sqlx::query(sqlx::AssertSqlSafe(tools_sql));
         for v in &bind_values {
             tq = tq.bind(v);
         }
@@ -4092,7 +4100,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              ORDER BY sess_cnt DESC \
              LIMIT 5"
         );
-        let mut mq = sqlx::query(&models_sql);
+        let mut mq = sqlx::query(sqlx::AssertSqlSafe(models_sql));
         for v in &bind_values {
             mq = mq.bind(v);
         }
@@ -4120,7 +4128,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
                  GROUP BY model ORDER BY sess_cnt DESC LIMIT 5",
                 model_time_predicates,
             );
-            let mut durable_model_query = query(&durable_model_sql).bind(user_id);
+            let mut durable_model_query =
+                query(sqlx::AssertSqlSafe(durable_model_sql)).bind(user_id);
             if let Some(since) = since.as_deref() {
                 durable_model_query = durable_model_query.bind(since);
             }
@@ -4244,7 +4253,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
               ORDER BY agg.total_calls DESC \
               LIMIT ?"
         );
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         for v in &bind_values {
             q = q.bind(v);
         }
@@ -4263,7 +4272,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         if !rows.is_empty() {
             error_sql.push_str(" LIMIT 500");
         }
-        let mut eq = sqlx::query(&error_sql);
+        let mut eq = sqlx::query(sqlx::AssertSqlSafe(error_sql));
         for v in &bind_values {
             eq = eq.bind(v);
         }

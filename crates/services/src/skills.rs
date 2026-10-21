@@ -443,7 +443,7 @@ impl SkillService for DatabaseSkillService {
                  WHERE {VISIBLE_SKILL_PREDICATE}{SKILL_LIST_ORDER_SQL}",
             )
         };
-        let mut list_query = query(&list_sql).bind(&user_id);
+        let mut list_query = query(sqlx::AssertSqlSafe(list_sql)).bind(&user_id);
         if let Some(cursor) = &cursor {
             let cursor = validate_skill_list_cursor(cursor)?;
             list_query = list_query
@@ -498,7 +498,7 @@ impl SkillService for DatabaseSkillService {
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM skills_registry WHERE skill_id = ? AND {VISIBLE_SKILL_PREDICATE}",
         );
-        let row = query(&by_id_sql)
+        let row = query(sqlx::AssertSqlSafe(by_id_sql))
             .bind(&skill_id)
             .bind(&user_id)
             .fetch_optional(&pool)
@@ -515,7 +515,7 @@ impl SkillService for DatabaseSkillService {
                      FROM skills_registry WHERE skill_name = ? AND version = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
                 );
-                query(&by_name_version_sql)
+                query(sqlx::AssertSqlSafe(by_name_version_sql))
                     .bind(name)
                     .bind(version)
                     .bind(&user_id)
@@ -531,7 +531,7 @@ impl SkillService for DatabaseSkillService {
                      FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
                 );
-                query(&by_name_latest_sql)
+                query(sqlx::AssertSqlSafe(by_name_latest_sql))
                     .bind(name)
                     .bind(&user_id)
                     .bind(&user_id)
@@ -575,7 +575,7 @@ impl SkillService for DatabaseSkillService {
              FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
              ORDER BY {USER_OWNED_SKILL_FIRST_ORDER} LIMIT 1",
         );
-        let row = query(&info_sql)
+        let row = query(sqlx::AssertSqlSafe(info_sql))
             .bind(&skill_name)
             .bind(&user_id)
             .bind(&user_id)
@@ -625,7 +625,7 @@ impl SkillService for DatabaseSkillService {
              FROM skills_registry WHERE skill_name = ? AND {VISIBLE_SKILL_PREDICATE} \
              ORDER BY {USER_OWNED_SKILL_FIRST_ORDER}",
         );
-        let rows = query(&versions_sql)
+        let rows = query(sqlx::AssertSqlSafe(versions_sql))
             .bind(&skill_name)
             .bind(&user_id)
             .bind(&user_id)
@@ -664,7 +664,7 @@ impl SkillService for DatabaseSkillService {
                      FROM skills_registry WHERE source = ? AND {VISIBLE_SKILL_PREDICATE} \
                      ORDER BY skill_name LIMIT ?",
                 );
-                let rows = query(&group_sql)
+                let rows = query(sqlx::AssertSqlSafe(group_sql))
                     .bind(&source)
                     .bind(&user_id)
                     .bind(per_group)

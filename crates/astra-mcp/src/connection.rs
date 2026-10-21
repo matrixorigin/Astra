@@ -811,9 +811,16 @@ async fn connect_ws(
         .body(())
         .map_err(|e| McpError::InvalidConfig(format!("invalid WebSocket request: {e}")))?;
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| McpError::Initialize(format!("WebSocket connect to {url}: {e}")))?;
+    let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(tokio_tungstenite::Connector::Rustls(
+            astra_core::net::public_root_tls_config(),
+        )),
+    )
+    .await
+    .map_err(|e| McpError::Initialize(format!("WebSocket connect to {url}: {e}")))?;
 
     let (mut ws_sink, mut ws_read) = ws_stream.split();
 

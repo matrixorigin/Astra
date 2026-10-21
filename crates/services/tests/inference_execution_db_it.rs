@@ -145,10 +145,12 @@ async fn session_success_ledger_cost_probe() {
         before_ids.push(id);
         // UUID-generated hex literal remains identifiable even when trace
         // does not expand prepared statement bindings.
-        sqlx::query(&format!("SELECT '{suffix}' AS astra_cost_begin_sentinel"))
-            .fetch_one(&mut **connection)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT '{suffix}' AS astra_cost_begin_sentinel"
+        )))
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
     }
     before_ids.sort_unstable();
     assert_ne!(before_ids[0], before_ids[1]);
@@ -210,10 +212,12 @@ async fn session_success_ledger_cost_probe() {
             enabled, "1",
             "measurement connection lost its capture setting"
         );
-        sqlx::query(&format!("SELECT '{suffix}' AS astra_cost_end_sentinel"))
-            .fetch_one(&mut **connection)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT '{suffix}' AS astra_cost_end_sentinel"
+        )))
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
     }
     after_ids.sort_unstable();
     assert_eq!(
@@ -7026,7 +7030,7 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE 'lease-fair-%'");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .execute(pool)
             .await
             .unwrap_or_else(|error| panic!("cleanup stale fair fixture `{statement}`: {error}"));
@@ -7184,7 +7188,7 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .bind(format!("{user_prefix}%"))
             .execute(pool)
             .await

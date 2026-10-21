@@ -252,7 +252,7 @@ pub(super) async fn change_branch_retention(
              WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND branch_revision = ?
                AND {archive_predicate}"
         );
-        let branch_update = query(&statement)
+        let branch_update = query(sqlx::AssertSqlSafe(statement))
             .bind(next_branch_revision.get())
             .bind(change.owner_id.as_str())
             .bind(change.work_id.as_str())

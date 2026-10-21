@@ -200,7 +200,7 @@ async fn query_session_history_rows(
     sql.push_str(if order == "asc" { "ASC" } else { "DESC" });
     sql.push_str(&format!(" LIMIT {}", limit.max(1)));
 
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(context.user_id)
         .bind(context.session_id);
     if let Some(before_seq) = before_seq {

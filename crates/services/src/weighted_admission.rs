@@ -956,7 +956,7 @@ async fn lock_distributed_admission_gate(
     let statement = format!(
         "SELECT {ADMISSION_GATE_COLUMNS} FROM session_weighted_admission_gates WHERE scope_name = ? FOR UPDATE"
     );
-    let row = sqlx::query(&statement)
+    let row = sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(&scope)
         .fetch_one(&mut **tx)
         .await

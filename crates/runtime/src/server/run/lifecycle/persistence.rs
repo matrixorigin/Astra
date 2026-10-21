@@ -4040,9 +4040,9 @@ mod tests {
             "skill_selection_events",
             "ctx_decision_audits",
         ] {
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&user)
             .bind(&session)
             .fetch_one(pool.get())
@@ -4426,9 +4426,9 @@ mod tests {
                             tx.rollback().await.unwrap();
                         }
                         for table in ["skill_selection_events", "ctx_decision_audits"] {
-                            let count: i64 = sqlx::query_scalar(&format!(
+                            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                                 "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-                            ))
+                            )))
                             .bind(&user)
                             .bind(&session)
                             .fetch_one(worker.get())
@@ -4483,9 +4483,9 @@ mod tests {
                     "skill_selection_events",
                     "ctx_decision_audits",
                 ] {
-                    let count: i64 = sqlx::query_scalar(&format!(
+                    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                         "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-                    ))
+                    )))
                     .bind(&user)
                     .bind(&session)
                     .fetch_one(observer.get())
@@ -5815,9 +5815,9 @@ mod tests {
             "agent_session_execution_slots",
             "agent_runs",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
-            ))
+            )))
             .bind(&user)
             .bind(&run)
             .execute(db)
@@ -6381,9 +6381,9 @@ mod tests {
                     .unwrap();
             assert_eq!(before, after, "{case}: rejected append changed run");
             for table in ["agent_events", "session_transcript_items"] {
-                let count: i64 = sqlx::query_scalar(&format!(
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM {table} WHERE user_id IN (?, ?)"
-                ))
+                )))
                 .bind(&user)
                 .bind(&foreign)
                 .fetch_one(db)
@@ -6426,9 +6426,9 @@ mod tests {
             cleanup_core_persist_fixture_for_owner(db, session, owner).await;
         }
         for table in ["agent_run_events", "run_display_projections", "agent_runs"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND run_id = ?"
-            ))
+            )))
             .bind(&user)
             .bind(&run)
             .execute(db)

@@ -240,11 +240,13 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
             "auth_external_identities" => "astra_user_id",
             _ => "user_id",
         };
-        sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
-            .bind(&tokens.user_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE {column} = ?"
+        )))
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
     server.abort();
 }
@@ -454,12 +456,13 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         ("auth_tokens", "scope_user_id"),
         ("auth_refresh_tokens", "user_id"),
     ] {
-        let rows: i64 =
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"))
-                .bind(&failed_user)
-                .fetch_one(shared.get())
-                .await
-                .unwrap();
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} = ?"
+        )))
+        .bind(&failed_user)
+        .fetch_one(shared.get())
+        .await
+        .unwrap();
         assert_eq!(rows, 0, "failed login left rows in {table}");
     }
 

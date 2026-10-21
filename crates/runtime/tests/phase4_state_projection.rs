@@ -100,7 +100,7 @@ async fn insert_state_item(
     item_id
 }
 
-async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: &str) -> String {
+async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: impl sqlx::SqlSafeStr) -> String {
     let rows = sqlx::raw_sql(sql).fetch_all(pool.get()).await.unwrap();
     let mut text = String::new();
     for row in rows {
@@ -213,11 +213,11 @@ async fn personal_skill_activation_pins_version_and_records_ui_events() {
     assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 1);
     let plan = explain_analyze_text(
         &pool,
-        &format!(
+        sqlx::AssertSqlSafe(format!(
             "EXPLAIN ANALYZE SELECT event_id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
              WHERE user_id = '{}' AND session_id = '{}' ORDER BY created_at DESC LIMIT 5",
             user_id, session_id
-        ),
+        )),
     )
     .await;
     assert!(

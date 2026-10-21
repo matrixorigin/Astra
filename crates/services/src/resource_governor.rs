@@ -272,7 +272,7 @@ impl DatabaseResourceGovernor {
             ResourceLimits::DEFAULT_MAX_CONCURRENT_BASH,
             ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY,
         );
-        sqlx::query(&resource_limits_ddl)
+        sqlx::query(sqlx::AssertSqlSafe(resource_limits_ddl))
             .execute(self.pool.get())
             .await?;
 

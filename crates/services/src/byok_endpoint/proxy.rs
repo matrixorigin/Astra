@@ -73,20 +73,11 @@ impl EgressProxy {
         {
             return Err(invalid());
         }
-        let roots =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| invalid())?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
         Ok(Some(Self {
             url,
             username,
             password,
-            tls: Arc::new(tls),
+            tls: astra_core::net::public_root_tls_config(),
         }))
     }
 

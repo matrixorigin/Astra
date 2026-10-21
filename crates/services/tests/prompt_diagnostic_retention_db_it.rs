@@ -401,7 +401,7 @@ async fn insert_prompt_diagnostic(
          VALUES (?, ?, ?, ?, 0, 0, 'retention-test', 'test-model', 'test-provider',
                  1, 0, REPEAT('a', 64), '{{}}', {age}, UNIX_TIMESTAMP({age}) * 1000)"
     );
-    sqlx::query(&request_sql)
+    sqlx::query(sqlx::AssertSqlSafe(request_sql))
         .bind(request_id)
         .bind(session_id)
         .bind(user_id)
@@ -417,7 +417,7 @@ async fn insert_prompt_diagnostic(
          VALUES (?, ?, ?, 0, 'message:0:user', 'message', 0,
                  'append', ?, REPEAT('b', 64), {age})"
     );
-    sqlx::query(&delta_sql)
+    sqlx::query(sqlx::AssertSqlSafe(delta_sql))
         .bind(user_id)
         .bind(session_id)
         .bind(request_id)
@@ -434,7 +434,7 @@ async fn age_prompt_diagnostic(pool: &Pool<MySql>, user_id: &str, request_id: &s
              created_at_unix_ms = UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {days} DAY)) * 1000
          WHERE user_id = ? AND request_id = ?"
     );
-    sqlx::query(&request_sql)
+    sqlx::query(sqlx::AssertSqlSafe(request_sql))
         .bind(user_id)
         .bind(request_id)
         .execute(pool)
@@ -445,7 +445,7 @@ async fn age_prompt_diagnostic(pool: &Pool<MySql>, user_id: &str, request_id: &s
          SET created_at = DATE_SUB(NOW(6), INTERVAL {days} DAY)
          WHERE user_id = ? AND request_id = ?"
     );
-    sqlx::query(&delta_sql)
+    sqlx::query(sqlx::AssertSqlSafe(delta_sql))
         .bind(user_id)
         .bind(request_id)
         .execute(pool)
@@ -521,7 +521,7 @@ async fn cleanup_fixture(pool: &Pool<MySql>, user_id: &str, session_id: &str) {
         "agent_session_lifecycle_fences",
     ] {
         let sql = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(session_id)
             .execute(pool)

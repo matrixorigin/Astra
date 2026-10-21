@@ -123,7 +123,7 @@ async fn lock_proposal(
     .map_err(|source| WorkRepositoryError::persistence("lock Work proposal sequence", source))?
     .ok_or(WorkRepositoryError::NotFound)?;
     let select = format!("{SELECT_WORK_PROPOSAL} FOR UPDATE");
-    let row = query(&select)
+    let row = query(sqlx::AssertSqlSafe(select))
         .bind(decision.owner_id().as_str())
         .bind(decision.work_id().as_str())
         .bind(decision.proposal_id().as_str())

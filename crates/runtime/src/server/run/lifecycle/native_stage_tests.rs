@@ -461,11 +461,13 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         "edge_pending_dispatch",
         "edge_agent_registry",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-            .bind(&user)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
     }
     for id in [&child, &parent] {
         cleanup_lifecycle_run_fixture(&pool, &user, id).await;

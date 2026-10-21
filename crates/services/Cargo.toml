@@ -57,13 +57,14 @@ reqwest.workspace = true
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
+
 percent-encoding = "2"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["chrono", "json"] }
+sqlx-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

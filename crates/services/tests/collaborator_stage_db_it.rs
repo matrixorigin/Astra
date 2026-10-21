@@ -689,9 +689,9 @@ impl Fixture {
             "tool_invocation_archive_chunks",
             "edge_pending_dispatch",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&self.user_id)
             .bind(&self.session_id)
             .execute(self.pool.get())
@@ -1275,7 +1275,7 @@ async fn native_interaction_lookup_work_does_not_grow_with_guidance_history() {
                 let mut explain = format!("EXPLAIN ANALYZE {sql}");
                 explain = explain.replacen('?', &format!("'{key}'"), 1);
                 explain = explain.replacen('?', &origin.control_epoch.to_string(), 1);
-                let rows = sqlx::raw_sql(&explain)
+                let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(explain))
                     .fetch_all(fixture.pool.get())
                     .await
                     .unwrap();

@@ -113,7 +113,7 @@ async fn insert_device_lease(
           status, last_monotonic_id, expires_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'new_device', 'active', 7, {expires_sql}, NOW(6), NOW(6))"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(lease_id)
         .bind(user_id)
         .bind(session_id)

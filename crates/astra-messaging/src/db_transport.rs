@@ -246,7 +246,7 @@ async fn ensure_table_column(
     pool: &Pool<MySql>,
     table: &str,
     column: &str,
-    alteration: &str,
+    alteration: &'static str,
 ) -> Result<(), sqlx::Error> {
     if table_column_exists(pool, table, column).await? {
         return Ok(());
@@ -520,12 +520,12 @@ impl DatabaseTransport {
         // Keep the existing column, but fence the owner at registration
         // granularity rather than reusing one transport-wide instance ID.
         let lease_duration_ms = DIRECTORY_LEASE_DURATION.as_millis() as i64;
-        let renewed = query(&format!(
+        let renewed = query(sqlx::AssertSqlSafe(format!(
             "UPDATE agent_mailbox_directory
              SET lease_expires_at_ms = {DIRECTORY_DB_NOW_MS} + ?, updated_at = NOW(6), owner_instance_id = ?
              WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
                AND owner_instance_id = ? AND accepts_structured_requests = ?"
-        ))
+        )))
         .bind(lease_duration_ms)
         .bind(subscription.id())
         .bind(delegation_id)
@@ -542,12 +542,12 @@ impl DatabaseTransport {
 
         // Expired ownership is reclaimable. Live ownership is never silently
         // overwritten, even when another replica races this registration.
-        query(&format!(
+        query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM agent_mailbox_directory
              WHERE delegation_id = ? AND agent_id = ?
                AND lease_expires_at_ms <= {DIRECTORY_DB_NOW_MS}
                AND accepts_structured_requests = ?"
-        ))
+        )))
         .bind(delegation_id)
         .bind(&addr.agent_id)
         .bind(subscription.capabilities().accepts_structured_requests)
@@ -555,11 +555,11 @@ impl DatabaseTransport {
         .await
         .map_err(|error| MailboxError::Transport(format!("directory reclaim: {error}")))?;
 
-        let inserted = query(&format!(
+        let inserted = query(sqlx::AssertSqlSafe(format!(
             "INSERT IGNORE INTO agent_mailbox_directory
              (delegation_id, agent_id, run_id, owner_instance_id, lease_expires_at_ms, accepts_structured_requests)
              VALUES (?, ?, ?, ?, {DIRECTORY_DB_NOW_MS} + ?, ?)"
-        ))
+        )))
         .bind(delegation_id)
         .bind(&addr.agent_id)
         .bind(&addr.run_id)
@@ -988,11 +988,11 @@ impl MessageTransport for DatabaseTransport {
         delegation_id: &str,
         agent_id: &str,
     ) -> Result<ResolvedMailbox, MailboxError> {
-        let row = query(&format!(
+        let row = query(sqlx::AssertSqlSafe(format!(
             "SELECT run_id, accepts_structured_requests FROM agent_mailbox_directory
              WHERE delegation_id = ? AND agent_id = ?
                AND lease_expires_at_ms > {DIRECTORY_DB_NOW_MS}"
-        ))
+        )))
         .bind(delegation_id)
         .bind(agent_id)
         .fetch_optional(&self.pool)
@@ -1018,11 +1018,11 @@ impl MessageTransport for DatabaseTransport {
     }
 
     async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError> {
-        let rows = query(&format!(
+        let rows = query(sqlx::AssertSqlSafe(format!(
             "SELECT run_id, agent_id FROM agent_mailbox_directory
              WHERE delegation_id = ? AND lease_expires_at_ms > {DIRECTORY_DB_NOW_MS}
              ORDER BY agent_id ASC, run_id ASC"
-        ))
+        )))
         .bind(delegation_id)
         .fetch_all(&self.pool)
         .await
@@ -1200,12 +1200,12 @@ async fn poll_loop(
             && tokio::time::Instant::now() >= next_directory_renewal
         {
             let lease_duration_ms = DIRECTORY_LEASE_DURATION.as_millis() as i64;
-            match query(&format!(
+            match query(sqlx::AssertSqlSafe(format!(
                 "UPDATE agent_mailbox_directory
                  SET lease_expires_at_ms = {DIRECTORY_DB_NOW_MS} + ?, updated_at = NOW(6)
                  WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
                    AND owner_instance_id = ?"
-            ))
+            )))
             .bind(lease_duration_ms)
             .bind(delegation_id)
             .bind(&addr.agent_id)
@@ -1913,7 +1913,7 @@ async fn acknowledge_database_batch(
              WHERE is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ? AND ({predicates})"
         )
     };
-    let mut statement = query(&sql).bind(consumer_id);
+    let mut statement = query(sqlx::AssertSqlSafe(sql)).bind(consumer_id);
     for (_, message_id, claim_token) in entries {
         statement = statement.bind(message_id).bind(claim_token);
     }
@@ -3581,10 +3581,10 @@ mod tests {
             .connect_with(admin_options)
             .await
             .expect("connect MatrixOne bootstrap catalog");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE DATABASE IF NOT EXISTS {}",
             quote_mysql_identifier(&database)
-        ))
+        )))
         .execute(&admin_pool)
         .await
         .expect("create MatrixOne test database");

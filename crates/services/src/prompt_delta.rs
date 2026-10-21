@@ -65,9 +65,9 @@ pub(crate) struct PromptDiagnosticExpiry {
     pub prompt_deltas: u64,
 }
 
-fn push_prompt_request_key_predicates<'a>(
-    query: &mut sqlx::QueryBuilder<'a, sqlx::MySql>,
-    request_keys: &'a [(String, String, String)],
+fn push_prompt_request_key_predicates(
+    query: &mut sqlx::QueryBuilder<sqlx::MySql>,
+    request_keys: &[(String, String, String)],
 ) {
     for (index, (user_id, session_id, request_id)) in request_keys.iter().enumerate() {
         if index > 0 {
@@ -86,7 +86,7 @@ fn push_prompt_request_key_predicates<'a>(
 
 fn delete_prompt_deltas_query(
     request_keys: &[(String, String, String)],
-) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+) -> sqlx::QueryBuilder<sqlx::MySql> {
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_deltas WHERE ");
     push_prompt_request_key_predicates(&mut query, request_keys);
     query.push(" ORDER BY user_id ASC, session_id ASC, request_id ASC, delta_seq ASC");
@@ -95,7 +95,7 @@ fn delete_prompt_deltas_query(
 
 fn delete_prompt_requests_query(
     request_keys: &[(String, String, String)],
-) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+) -> sqlx::QueryBuilder<sqlx::MySql> {
     let mut query =
         sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_request_records WHERE ");
     push_prompt_request_key_predicates(&mut query, request_keys);
@@ -216,11 +216,17 @@ mod retention_tests {
         )];
         let delete_deltas = delete_prompt_deltas_query(&keys);
         let delete_requests = delete_prompt_requests_query(&keys);
-        assert!(delete_deltas.sql().starts_with("DELETE FROM prompt_deltas"));
-        assert!(delete_deltas.sql().contains("delta_seq ASC"));
+        assert!(
+            delete_deltas
+                .sql()
+                .as_str()
+                .starts_with("DELETE FROM prompt_deltas")
+        );
+        assert!(delete_deltas.sql().as_str().contains("delta_seq ASC"));
         assert!(
             delete_requests
                 .sql()
+                .as_str()
                 .starts_with("DELETE FROM prompt_request_records")
         );
     }
@@ -773,7 +779,7 @@ pub async fn persist_prompt_request(
                 previous_request_id.is_some(),
             ],
         );
-        sqlx::query(&request_insert_sql)
+        sqlx::query(request_insert_sql)
         .bind(&plan.request_id)
         .bind(&input.session_id)
         .bind(&input.user_id)
@@ -908,7 +914,7 @@ pub async fn count_prompt_requests_for_session(
 
 async fn count_prompt_requests(
     pool: &SharedPool,
-    sql: &str,
+    sql: &'static str,
     user_id: &str,
     bind_value: &str,
 ) -> Result<u32, String> {
@@ -923,7 +929,7 @@ async fn count_prompt_requests(
 
 async fn load_latest_prompt_observability(
     pool: &SharedPool,
-    sql: &str,
+    sql: &'static str,
     user_id: &str,
     bind_value: &str,
 ) -> Result<Option<PromptRequestObservability>, String> {

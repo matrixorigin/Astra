@@ -3426,9 +3426,9 @@ pub async fn run_stream_context_trace_persistence() {
         "ctx_decision_audits",
         "skill_selection_events",
     ] {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(user_id)
         .bind(&session_id)
         .fetch_one(pool)

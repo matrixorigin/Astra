@@ -294,11 +294,13 @@ async fn session_creation_returns_database_generated_fields_after_commit() {
         "agent_session_lifecycle_fences",
         "auth_audit_logs",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-            .bind(&user_id)
-            .execute(&pool)
-            .await
-            .expect("clean up test-owned rows");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean up test-owned rows");
     }
 }
 
@@ -1897,9 +1899,9 @@ async fn count_user_session_rows(
     user_id: &str,
     session_id: &str,
 ) -> i64 {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
-    ))
+    )))
     .bind(session_id)
     .bind(user_id)
     .fetch_one(pool)
@@ -1989,7 +1991,7 @@ async fn cleanup_session_delete_fixture_for_owner(
         "agent_sessions",
     ] {
         let sql = format!("DELETE FROM {table} WHERE session_id = ? AND user_id = ?");
-        let _ = sqlx::query(&sql)
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(session_id)
             .bind(user_id)
             .execute(pool)
@@ -1998,7 +2000,7 @@ async fn cleanup_session_delete_fixture_for_owner(
 
     for table in ["workspace_records", "workspace_cleanup_debts"] {
         let sql = format!("DELETE FROM {table} WHERE session_id = ? AND owner_id = ?");
-        let _ = sqlx::query(&sql)
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(session_id)
             .bind(user_id)
             .execute(pool)
@@ -2053,7 +2055,7 @@ async fn cleanup_restore_fixture_for_owner(
             "agent_session_lifecycle_fences",
         ] {
             let sql = format!("DELETE FROM {table} WHERE session_id = ? AND user_id = ?");
-            let _ = sqlx::query(&sql)
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(sid)
                 .bind(user_id)
                 .execute(pool)
@@ -3573,7 +3575,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
              VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?, ?)",
             [tool.is_some(), model.is_some()],
         );
-        sqlx::query(&insert_sql)
+        sqlx::query(insert_sql)
             .bind(eid)
             .bind(&s1)
             .bind(&user_id)
@@ -5706,9 +5708,9 @@ async fn client_context_trace_requires_owned_session_on_live_matrixone() {
         .expect_err("Client cannot create a missing session");
     assert_eq!(rejected.0, axum::http::StatusCode::NOT_FOUND);
     for table in ["agent_sessions", "agent_events"] {
-        let (rows,): (i64,) = sqlx::query_as(&format!(
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&user_id)
         .bind(&session_id)
         .fetch_one(&pool)
@@ -8082,9 +8084,9 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ("ctx_snapshots", "ctx_snapshots"),
         ("ctx_decision_audits", "ctx_decision_audits"),
     ] {
-        let owner_remaining = sqlx::query(&format!(
+        let owner_remaining = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
-        ))
+        )))
         .bind(&session_id)
         .bind(&owner_user_id)
         .fetch_one(&pool)
@@ -8094,9 +8096,9 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("decode owner row count");
         assert_eq!(owner_remaining, 0, "{label} owner rows must be deleted");
 
-        let foreign_remaining = sqlx::query(&format!(
+        let foreign_remaining = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
-        ))
+        )))
         .bind(&session_id)
         .bind(&other_user_id)
         .fetch_one(&pool)

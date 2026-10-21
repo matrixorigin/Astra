@@ -376,7 +376,7 @@ fn event_list_can_use_session_summary(filter: &EventListFilter) -> bool {
         && filter.causal_chain_id.is_none()
 }
 
-fn push_event_list_filters<'a>(qb: &mut QueryBuilder<'a, MySql>, filter: &'a EventListFilter) {
+fn push_event_list_filters(qb: &mut QueryBuilder<MySql>, filter: &EventListFilter) {
     qb.push_bind(&filter.user_id);
     if let Some(sid) = &filter.session_id {
         qb.push(" AND session_id = ");
@@ -668,7 +668,7 @@ impl EventService for DatabaseEventService {
                 "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
                 EVENT_DETAIL_SELECT_COLS
             );
-            if let Some(row) = query(&select_sql)
+            if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
                 .bind(existing_id)
                 .bind(&user_id)
                 .fetch_optional(&mut *tx)
@@ -755,7 +755,7 @@ impl EventService for DatabaseEventService {
                 meta_duration_ms.is_some(),
             ],
         );
-        let insert_result = match query(&insert_sql)
+        let insert_result = match query(insert_sql)
             .bind(&event_id)
             .bind(&session_id)
             .bind(&user_id)
@@ -780,7 +780,7 @@ impl EventService for DatabaseEventService {
                     "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
                     EVENT_DETAIL_SELECT_COLS
                 );
-                if let Some(row) = query(&select_sql)
+                if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
                     .bind(&event_id)
                     .bind(&user_id)
                     .fetch_optional(&mut *tx)
@@ -863,7 +863,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&event_id)
             .bind(&user_id)
             .fetch_one(&mut *tx)
@@ -949,7 +949,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&event_id)
             .bind(&user_id)
             .fetch_optional(&pool)
@@ -977,7 +977,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE causal_chain_id = ? AND user_id = ? ORDER BY created_at ASC LIMIT ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let rows = query(&select_sql)
+        let rows = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&causal_chain_id)
             .bind(&user_id)
             .bind(MAX_CAUSAL_CHAIN_EVENTS)
@@ -1082,7 +1082,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&event_id)
             .bind(&user_id)
             .fetch_optional(&pool)

@@ -1297,12 +1297,13 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
             "work_runtime_event_outbox",
             "work_item_attempts",
         ] {
-            let remaining: i64 =
-                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE owner_id = ?"))
-                    .bind(&owner)
-                    .fetch_one(pool.get())
-                    .await
-                    .expect("verify cleanup of durable execution artifacts");
+            let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE owner_id = ?"
+            )))
+            .bind(&owner)
+            .fetch_one(pool.get())
+            .await
+            .expect("verify cleanup of durable execution artifacts");
             assert_eq!(remaining, 0, "Work cleanup left rows in {table}");
         }
         return;
@@ -1786,10 +1787,10 @@ async fn exercise_primary_continuation_entry(
         // Both the compacted turn and its restored successor keep real Work
         // authority without manufacturing answer-derived decisions or summaries.
         for table in ["session_state_items", "session_state_item_events"] {
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? \
                  AND category IN ('decision', 'summary')"
-            ))
+            )))
             .bind(owner)
             .bind(session)
             .fetch_one(pool.get())
@@ -13051,9 +13052,9 @@ async fn transcript_prompt_hydration_preserves_lineage_budget_and_owner_on_matri
         )
         .await;
     for table in ["session_transcript_items", "agent_runs"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&user_id)
         .bind(&session_id)
         .execute(pool.get())
@@ -13597,10 +13598,10 @@ async fn cleanup_lifecycle_execution_binding(
         "session_execution_bindings",
         "session_context_heads",
     ] {
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? \
              AND session_id = ? AND branch_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -29174,11 +29175,13 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     drop(control);
     tokio::time::sleep(Duration::from_millis(50)).await;
     for table in ["agent_runs", "agent_sessions"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id LIKE ?"))
-            .bind(format!("{prefix}-%"))
-            .execute(independent.get())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id LIKE ?"
+        )))
+        .bind(format!("{prefix}-%"))
+        .execute(independent.get())
+        .await
+        .unwrap();
     }
     independent.close().await;
     pool.close().await;
@@ -37213,9 +37216,9 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             "unknown or refused input must not replay"
         );
         for table in ["tool_invocation_ledger", "edge_pending_dispatch"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&user)
             .bind(&session)
             .execute(pool.get())

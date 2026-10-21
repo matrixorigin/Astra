@@ -245,7 +245,7 @@ impl AgentService for DatabaseAgentService {
             "SELECT {} FROM agent_agents WHERE agent_id = ?",
             AGENT_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&agent_id)
             .fetch_one(&pool)
             .await
@@ -264,7 +264,7 @@ impl AgentService for DatabaseAgentService {
             "SELECT {} FROM agent_agents WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ?",
             AGENT_LIST_SELECT_COLS
         );
-        let rows = query(&select_sql)
+        let rows = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&user_id)
             .bind(MAX_AGENT_LIST_ROWS)
             .fetch_all(&pool)
@@ -301,7 +301,7 @@ impl AgentService for DatabaseAgentService {
             "SELECT {} FROM agent_agents WHERE agent_id = ? AND owner_user_id = ?",
             AGENT_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&agent_id)
             .bind(&user_id)
             .fetch_optional(&pool)
@@ -374,7 +374,7 @@ impl AgentService for DatabaseAgentService {
             "SELECT {} FROM agent_agents WHERE agent_id = ?",
             AGENT_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&agent_id)
             .fetch_one(&pool)
             .await

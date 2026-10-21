@@ -215,7 +215,7 @@ async fn insert_event(
             payload_hash.is_some(),
         ],
     );
-    query(&insert_sql)
+    query(insert_sql)
         .bind(event.owner_id.as_str())
         .bind(event.work_id.as_str())
         .bind(event_seq.get())

@@ -177,7 +177,7 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("agent_sessions", "user_id"),
     ] {
         let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(owner_id)
             .execute(pool.get())
             .await

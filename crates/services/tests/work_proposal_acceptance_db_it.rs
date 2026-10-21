@@ -189,9 +189,9 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
         ("work_item_revisions", 4_i64),
         ("work_item_edges", 2_i64),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE owner_id = ? AND work_id = ?"
-        ))
+        )))
         .bind(&owner_id)
         .bind(&work_id)
         .fetch_one(pool.get())

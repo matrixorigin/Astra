@@ -213,7 +213,7 @@ async fn cross_process_identity_and_delete_fence() {
         children[1].send("deleted").await;
         assert_eq!(children[1].receive().await, "rejected");
         for table in ["agent_sessions", "agent_events"] {
-            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"))
+            let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?")))
                 .bind(&owner).bind("shared").fetch_one(&pool).await.unwrap();
             assert_eq!(rows, 0, "late write cannot resurrect deleted data");
         }

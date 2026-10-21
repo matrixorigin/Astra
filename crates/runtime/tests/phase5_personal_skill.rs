@@ -53,7 +53,7 @@ async fn insert_session(pool: &astra_core::SharedPool, session_id: &str, user_id
     .unwrap();
 }
 
-async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: &str) -> String {
+async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: impl sqlx::SqlSafeStr) -> String {
     let rows = sqlx::raw_sql(sql).fetch_all(pool.get()).await.unwrap();
     let mut text = String::new();
     for row in rows {
@@ -280,11 +280,11 @@ async fn l2_47_personal_skill_search_uses_owner_skill_name_index() {
         .unwrap();
     let plan = explain_analyze_text(
         &pool,
-        &format!(
+        sqlx::AssertSqlSafe(format!(
             "EXPLAIN ANALYZE SELECT source_id FROM user_skill_sources FORCE INDEX (idx_user_skill_owner_name) \
              WHERE owner_user_id = '{}' AND skill_name >= '{}' ORDER BY skill_name LIMIT 10",
             user_id, skill_name
-        ),
+        )),
     )
     .await;
     assert!(

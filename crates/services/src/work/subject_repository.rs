@@ -101,7 +101,7 @@ async fn load_context(
          WHERE w.owner_id = ? AND w.work_id = ?
          LIMIT 1"
     );
-    let row = query(&statement)
+    let row = query(sqlx::AssertSqlSafe(statement))
         .bind(branch_id.as_str())
         .bind(owner_id.as_str())
         .bind(work_id.as_str())
@@ -202,7 +202,7 @@ async fn load_subject_in_transaction(
          WHERE s.owner_id = ? AND s.work_id = ? AND s.branch_id = ?
          LIMIT 1"
     );
-    let row = query(&statement)
+    let row = query(sqlx::AssertSqlSafe(statement))
         .bind(owner_id.as_str())
         .bind(work_id.as_str())
         .bind(branch_id.as_str())

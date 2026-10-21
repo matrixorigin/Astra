@@ -2163,7 +2163,7 @@ where
         "SELECT {columns} FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(expected_session_id)
         .bind(run_id)
@@ -2189,7 +2189,7 @@ where
          FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(expected_session_id)
         .bind(run_id)
@@ -11530,7 +11530,7 @@ impl BoundedRunControlConnection {
             deadline.at,
             connection
                 .connection_mut()
-                .execute(bounded_lock_wait.as_str()),
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(bounded_lock_wait))),
         )
         .await
         {
@@ -11565,7 +11565,9 @@ impl BoundedRunControlConnection {
         );
         match tokio::time::timeout_at(
             deadline.at,
-            self.connection.connection_mut().execute(reset.as_str()),
+            self.connection
+                .connection_mut()
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(reset))),
         )
         .await
         {
@@ -11942,7 +11944,7 @@ impl DatabaseRunStateStore {
                 projection.latest_checkpoint_version.is_some(),
             ],
         );
-        sqlx::query(&upsert_sql)
+        sqlx::query(upsert_sql)
             .bind(&projection.run_id)
             .bind(&projection.user_id)
             .bind(&projection.session_id)
@@ -13031,7 +13033,7 @@ impl DatabaseRunStateStore {
                     CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested
              FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(expected_session_id)
             .bind(run_id)
@@ -14356,7 +14358,7 @@ impl DatabaseRunStateStore {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| db_error("acquire_run_metadata_for_user", run_id, source))?;
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(run_id)
             .fetch_optional(connection.connection_mut())
@@ -14441,7 +14443,7 @@ impl DatabaseRunStateStore {
         let sql = format!(
             "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS} FROM run_display_projections WHERE user_id = ? AND run_id = ?"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(run_id)
             .fetch_optional(self.pool.get())
@@ -14669,7 +14671,7 @@ impl DatabaseRunStateStore {
                projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
             [run.waiting_for.is_some(), run.error_message.is_some()],
         );
-        sqlx::query(&upsert_sql)
+        sqlx::query(upsert_sql)
             .bind(&run.run_id)
             .bind(&run.user_id)
             .bind(&run.session_id)
@@ -14862,11 +14864,11 @@ impl DatabaseRunStateStore {
         })
         .transpose()?;
         let projection = build_run_display_projection(&run, latest_event_type, latest_checkpoint);
-        let existing = sqlx::query(&format!(
+        let existing = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {RUN_DISPLAY_PROJECTION_COLUMNS}
              FROM run_display_projections
              WHERE user_id = ? AND run_id = ? FOR UPDATE"
-        ))
+        )))
         .bind(user_id)
         .bind(run_id)
         .fetch_optional(&mut *tx)
@@ -14962,7 +14964,7 @@ impl DatabaseRunStateStore {
                 projection.latest_checkpoint_version.is_some(),
             ],
         );
-        sqlx::query(&upsert_sql)
+        sqlx::query(upsert_sql)
             .bind(&projection.run_id)
             .bind(&projection.user_id)
             .bind(&projection.session_id)
@@ -15447,7 +15449,7 @@ impl DatabaseRunStateStore {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             null_shape.iter().copied(),
         );
-        sqlx::query(&insert_sql)
+        sqlx::query(insert_sql)
             .bind(&record.run_id)
             .bind(&record.user_id)
             .bind(&record.session_id)
@@ -15730,7 +15732,7 @@ impl DatabaseRunStateStore {
         }
         let sql =
             format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&expected.user_id)
             .bind(&expected.run_id)
             .fetch_optional(connection.connection_mut())
@@ -16962,7 +16964,7 @@ impl DatabaseRunStateStore {
                 projection.latest_event_type.is_some(),
             ],
         );
-        sqlx::query(&insert_projection_sql)
+        sqlx::query(insert_projection_sql)
             .bind(&projection.run_id)
             .bind(&projection.user_id)
             .bind(&projection.session_id)
@@ -24695,7 +24697,7 @@ impl RunStateStore for DatabaseRunStateStore {
                  WHERE user_id = ?{RUN_LIST_CURSOR_PREDICATE_SQL}\
                  {RUN_LIST_ORDER_SQL} LIMIT ?"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(user_id)
                 .bind(updated_at.clone())
                 .bind(updated_at)
@@ -24708,7 +24710,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
                  WHERE user_id = ?{RUN_LIST_ORDER_SQL} LIMIT ?"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(user_id)
                 .bind(query_limit)
                 .fetch_all(self.pool.get())
@@ -24767,7 +24769,7 @@ impl RunStateStore for DatabaseRunStateStore {
                  {RUN_LIST_CURSOR_PREDICATE_SQL}\
                  {RUN_LIST_ORDER_SQL} LIMIT ?"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(user_id)
                 .bind(session_id)
                 .bind(STATUS_RUNNING)
@@ -24785,7 +24787,7 @@ impl RunStateStore for DatabaseRunStateStore {
                  WHERE user_id = ? AND session_id = ? AND status IN (?, ?, ?)\
                  {RUN_LIST_ORDER_SQL} LIMIT ?"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(user_id)
                 .bind(session_id)
                 .bind(STATUS_RUNNING)
@@ -25304,7 +25306,7 @@ impl RunStateStore for DatabaseRunStateStore {
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE status = ? ORDER BY updated_at ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(STATUS_RUNNING)
             .fetch_all(self.pool.get())
             .await
@@ -25591,7 +25593,7 @@ impl RunStateStore for DatabaseRunStateStore {
              ORDER BY updated_at DESC \
              LIMIT 1",
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(session_id)
             .bind(STATUS_RUNNING)
@@ -25616,7 +25618,7 @@ impl RunStateStore for DatabaseRunStateStore {
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE user_id = ? AND delegation_id = ? ORDER BY depth ASC, created_at ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(delegation_id)
             .fetch_all(self.pool.get())
@@ -25645,7 +25647,7 @@ impl DatabaseRunStateStore {
                       updated_at DESC, created_at DESC, run_id DESC \
              LIMIT ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(session_id)
             .bind(STATUS_COMPLETED)
@@ -26354,7 +26356,7 @@ impl DatabaseRunStateStore {
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE status = ? ORDER BY updated_at ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(status)
             .fetch_all(self.pool.get())
             .await
@@ -32034,11 +32036,13 @@ mod tests {
             } else {
                 "user_id"
             };
-            sqlx::query(&format!("DELETE FROM {table} WHERE {owner_column} = ?"))
-                .bind(user)
-                .execute(pool.get())
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE {owner_column} = ?"
+            )))
+            .bind(user)
+            .execute(pool.get())
+            .await
+            .unwrap();
         }
     }
 
@@ -32700,9 +32704,9 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("reset exact live authority");
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE agent_runs SET {mutation} WHERE user_id = ? AND run_id = ?"
-            ))
+            )))
             .bind(&user)
             .bind(&run_id)
             .execute(pool.get())
@@ -32771,7 +32775,9 @@ mod tests {
         let original = database_session_lock_wait_timeout(&mut target).await;
         let seeded = if original == 17 { 117 } else { 17 };
         target
-            .execute(format!("SET SESSION lock_wait_timeout = {seeded}").as_str())
+            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET SESSION lock_wait_timeout = {seeded}"
+            ))))
             .await
             .expect("seed target session setting");
         drop(target);
@@ -32789,7 +32795,9 @@ mod tests {
         let observed = database_session_lock_wait_timeout(&mut reused).await;
         assert_eq!(observed, seeded, "request path leaked its bounded setting");
         reused
-            .execute(format!("SET SESSION lock_wait_timeout = {original}").as_str())
+            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET SESSION lock_wait_timeout = {original}"
+            ))))
             .await
             .expect("restore fixture session setting");
         drop(reused);
@@ -32884,11 +32892,15 @@ mod tests {
             19
         };
         worker_a
-            .execute(format!("SET SESSION lock_wait_timeout = {seeded_a}").as_str())
+            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET SESSION lock_wait_timeout = {seeded_a}"
+            ))))
             .await
             .expect("seed first worker");
         worker_b
-            .execute(format!("SET SESSION lock_wait_timeout = {seeded_b}").as_str())
+            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET SESSION lock_wait_timeout = {seeded_b}"
+            ))))
             .await
             .expect("seed second worker");
         drop(worker_a);
@@ -32983,7 +32995,9 @@ mod tests {
                 panic!("unexpected restored worker setting {value}");
             };
             connection
-                .execute(format!("SET SESSION lock_wait_timeout = {original}").as_str())
+                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "SET SESSION lock_wait_timeout = {original}"
+                ))))
                 .await
                 .expect("restore worker fixture setting");
         }

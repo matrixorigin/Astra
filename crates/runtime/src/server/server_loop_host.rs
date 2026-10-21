@@ -25213,7 +25213,7 @@ mod tests {
         settings.database = "mysql".into();
         let bootstrap = SharedPool::new(&settings).await.unwrap();
         let database = format!("astra_test_probe_adopt_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE `{database}`"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
             .execute(bootstrap.get())
             .await
             .unwrap();
@@ -25650,7 +25650,7 @@ mod tests {
                         facts[field] = Value::Null;
                     }
                     for table in ["agent_runs", "run_checkpoints"] {
-                        sqlx::query(&format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"))
+                        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")))
                             .bind(malformed.to_string()).bind(&user).bind(run_id)
                             .execute(pool.get()).await.unwrap();
                     }
@@ -25661,9 +25661,9 @@ mod tests {
                     assert!(RuntimeExecutionHandoff::from_adopted(&invalid).is_err());
                 }
                 for table in ["agent_runs", "run_checkpoints"] {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"
-                    ))
+                    )))
                     .bind(&checkpoint.checkpoint_json)
                     .bind(&user)
                     .bind(run_id)
@@ -25848,7 +25848,7 @@ mod tests {
         // All handles share this test-owned pool. Close it before removing only
         // the fresh UUID catalog above; on assertion failure retain it for diagnosis.
         pool.get().close().await;
-        sqlx::query(&format!("DROP DATABASE `{database}`"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
             .execute(bootstrap.get())
             .await
             .unwrap();
@@ -50843,28 +50843,43 @@ mod tests {
         host.always_load_tool_names.insert(public_name.to_owned());
         let mut state = loop_state(session, Vec::new(), "Revise the current agent.");
         host.prepare_model_selection(&mut state).await.unwrap();
-        let result = host
-            .execute_turn(&mut state)
-            .await
-            .expect("actual idless provider turn");
-        state.commit_volatile_attempt_lease();
-        let admission = AgenticLoopHost::admit_tool_calls(
-            &mut host,
-            &result.accum.tool_calls,
-            Some("tool_calls"),
+        let error = match host.execute_turn(&mut state).await {
+            Ok(_) => panic!("provider control without identity must fail at model acceptance"),
+            Err(error) => error,
+        };
+        state.restore_volatile_attempt_lease();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            error
+                .message
+                .contains("provider tool-call identity is missing or malformed"),
+            "{error:?}"
         );
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("rejected provider usage"),
+        )
+        .unwrap();
+        assert_eq!(details["qualified_usage"]["input_tokens"], 8);
+        assert_eq!(details["qualified_usage"]["output_tokens"], 3);
+        assert!(state.stall.tool_call_records.is_empty());
+        assert!(state.tool_results.is_empty());
         assert!(host.take_terminal_control_outcome().is_none());
-        let delivered = host
-            .handle_admitted_tool_invocations(&mut state, &admission.admitted)
-            .await;
-        assert!(delivered.results.is_empty());
-        assert_eq!(delivered.control, AdmittedToolCallControl::Continue);
         assert!(host.edge_callback_ledger.lock().await.is_empty());
         assert!(host.take_emitted_events().iter().all(|event| !matches!(
             event["type"].as_str(),
-            Some("runtime.control.handoff.requested" | "tool_request" | "approval_request")
+            Some(
+                "runtime.control.handoff.requested"
+                    | "tool_call"
+                    | "tool_call_start"
+                    | "tool_call_end"
+                    | "tool_request"
+                    | "approval_request"
+                    | "approval_required"
+                    | "approval_batch_required"
+            )
         )));
         gateway.assert_complete();
         inference.assert_quiescent();

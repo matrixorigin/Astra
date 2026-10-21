@@ -1277,7 +1277,7 @@ async fn verify_cli_non_durable_authority(
             "SELECT COUNT(*) AS row_count FROM {table} \
              WHERE user_id = ? AND (run_id = ? OR run_id = ?)"
         );
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(user_id)
             .bind(execution_id)
             .bind(turn_chain_id)

@@ -277,7 +277,10 @@ impl DataVersioningService for DatabaseDataVersioningService {
             &request.name,
             &self.matrixone.database,
         );
-        query(&sql).execute(&pool).await.map_err(internal_error)?;
+        query(sqlx::AssertSqlSafe(sql))
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
 
@@ -507,7 +510,10 @@ impl DataVersioningService for DatabaseDataVersioningService {
         let full_name = format!("{}__{}", sandbox_name, request.checkpoint_name);
         let sql =
             crate::snapshot_sql::create_snapshot_for_db_sql(&full_name, &self.matrixone.database);
-        query(&sql).execute(&pool).await.map_err(internal_error)?;
+        query(sqlx::AssertSqlSafe(sql))
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
 

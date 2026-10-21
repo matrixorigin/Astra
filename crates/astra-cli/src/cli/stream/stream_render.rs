@@ -9068,9 +9068,13 @@ mod tests {
             let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
             let mut cache = EdgeToolCache::new(2);
             let mut execution = std::pin::pin!(async {
-                let response = reqwest::get(format!("{}/delayed-admission", server.uri()))
+                let response = api
+                    .http_client()
+                    .get(format!("{}/delayed-admission", server.uri()))
+                    .send()
                     .await
                     .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
                 let result = super::consume_turn_sse(
                     super::ChatTurnPrepLineGuard::maybe_start(false, None),
                     response,

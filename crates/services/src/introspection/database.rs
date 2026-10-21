@@ -958,7 +958,7 @@ impl IntrospectionService for DatabaseIntrospectionService {
                  ORDER BY cs.created_at DESC, cs.context_capture_id DESC \
                  LIMIT 1"
             );
-            query(&sql)
+            query(sqlx::AssertSqlSafe(sql))
                 .bind(user_id)
                 .bind(user_id)
                 .bind(session_id)
@@ -1013,7 +1013,10 @@ impl IntrospectionService for DatabaseIntrospectionService {
                      LIMIT 1"
                 )
             };
-            let mut q = query(&sql).bind(user_id).bind(user_id).bind(session_id);
+            let mut q = query(sqlx::AssertSqlSafe(sql))
+                .bind(user_id)
+                .bind(user_id)
+                .bind(session_id);
             if let Some(cursor) = cursor.as_ref() {
                 q = q
                     .bind(&cursor.created_at)

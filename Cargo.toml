@@ -84,7 +84,8 @@ serde_yaml_ng = "0.10.0"
 sha2 = "0.10.9"
 similar = "2.7.0"
 hex = "0.4.3"
-sqlx = { version = "0.8.6", default-features = false, features = ["mysql", "runtime-tokio-rustls"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["mysql", "mysql-rsa", "runtime-tokio", "tls-rustls-ring-webpki"] }
+sqlx-core = { version = "=0.9.0", default-features = false }
 tokio = { version = "1.47.1", features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
 libc = "0.2"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -119,9 +120,11 @@ tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = { version = "0.2", default-features = false }
 percent-encoding = "2.3"
 http-body-util = "0.1"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# WSS callers supply the explicit public-root connector from astra-core::net.
+# Enabling a roots feature here would add a second trust-policy owner.
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0.10"
 clap = { version = "4", features = ["derive", "env"] }
 hostname = "0.4"
 insta = { version = "1.41", features = ["yaml"] }

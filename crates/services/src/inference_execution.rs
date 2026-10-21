@@ -958,7 +958,7 @@ async fn insert_model_request_context_event_with_expiry(
                 usage_present,
             ],
         );
-        sqlx::query(&insert_sql)
+        sqlx::query(insert_sql)
             .bind(event_id)
             .bind(&attempt.user_id)
             .bind(&attempt.attempt_id)
@@ -1229,7 +1229,7 @@ async fn insert_recovered_model_request_terminal_tx(
             observed_usage.is_some(),
         ],
     );
-    sqlx::query(&insert_sql)
+    sqlx::query(insert_sql)
         .bind(event_id)
         .bind(user_id)
         .bind(attempt_id)
@@ -2297,7 +2297,7 @@ fn validate_ambiguous_provider_attempt_admission(
     )))
 }
 
-fn ambiguous_canonical_admission_proof_sql(parent_present: bool) -> String {
+fn ambiguous_canonical_admission_proof_sql(parent_present: bool) -> sqlx::SqlStr {
     matrixone_statement_with_null_shape(
         "SELECT wal.payload_json AS canonical_payload
          FROM inference_canonical_transition_heads AS head
@@ -2398,7 +2398,7 @@ where
     // character width (matrixorigin/matrixone#28103).
     let proof_sql =
         ambiguous_canonical_admission_proof_sql(attempt.canonical_parent_transition_id.is_some());
-    let proof = sqlx::query(&proof_sql)
+    let proof = sqlx::query(proof_sql)
         .bind(&attempt.user_id)
         .bind(session_id)
         .bind(i64::from(turn))
@@ -2895,7 +2895,7 @@ async fn insert_inference_canonical_transition_wal(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         [attempt.canonical_parent_transition_id.is_some()],
     );
-    let inserted = sqlx::query(&insert_sql)
+    let inserted = sqlx::query(insert_sql)
         .bind(&attempt.user_id)
         .bind(entry.session_id)
         .bind(i64::from(entry.turn))
@@ -2964,7 +2964,7 @@ async fn insert_inference_provider_attempt_admission(
             attempt.canonical_transition_hash.is_some(),
         ],
     );
-    let result = sqlx::query(&insert_sql)
+    let result = sqlx::query(insert_sql)
         .bind(&attempt.attempt_id)
         .bind(i64::from(attempt.attempt_index))
         .bind(&attempt.provider)
@@ -3745,7 +3745,7 @@ pub async fn begin_inference_provider_attempt(
             attempt.canonical_transition_hash.is_some(),
         ],
     );
-    let result = sqlx::query(&insert_sql)
+    let result = sqlx::query(insert_sql)
         .bind(&attempt.attempt_id)
         .bind(i64::from(attempt.attempt_index))
         .bind(&attempt.provider)
@@ -7729,9 +7729,9 @@ pub async fn load_session_auxiliary_capture(
     // Delegation/model-selector judgments use request-specific operation IDs;
     // classify their usage by the admitted introspection purpose instead of
     // attempting to enumerate hashed operation identities.
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
-    ))
+    )))
         .bind(user_id)
         .bind(session_id)
         .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid reflection capture budget"))?)
@@ -8218,12 +8218,13 @@ mod tests {
             ("inference_provider_attempts", 0),
             ("inference_invocation_settlement_debts", 1),
         ] {
-            let count: i64 =
-                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?"))
-                    .bind(&user_id)
-                    .fetch_one(pool.get())
-                    .await
-                    .unwrap();
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ?"
+            )))
+            .bind(&user_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
             assert_eq!(
                 count, expected,
                 "paused recovery has an unexpected row count in {table}"
@@ -8289,11 +8290,13 @@ mod tests {
             "agent_runs",
             "agent_sessions",
         ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-                .bind(&user_id)
-                .execute(pool.get())
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ?"
+            )))
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
         }
     }
 
@@ -8383,11 +8386,13 @@ mod tests {
             "inference_routes",
             "agent_sessions",
         ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
-                .bind(&user_id)
-                .execute(pool.get())
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ?"
+            )))
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
         }
     }
 
@@ -8505,11 +8510,13 @@ mod tests {
             "inference_routes",
             "agent_sessions",
         ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
-                .bind(&user)
-                .execute(pool.get())
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id=?"
+            )))
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
         }
         sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
             .bind(&request.provider)
@@ -8817,8 +8824,8 @@ mod tests {
     fn ambiguous_canonical_proof_separates_root_and_child_statement_identities() {
         let root = ambiguous_canonical_admission_proof_sql(false);
         let child = ambiguous_canonical_admission_proof_sql(true);
-        assert!(root.ends_with("/* astra-null-shape:0 */"));
-        assert!(child.ends_with("/* astra-null-shape:1 */"));
+        assert!(root.as_str().ends_with("/* astra-null-shape:0 */"));
+        assert!(child.as_str().ends_with("/* astra-null-shape:1 */"));
         assert_ne!(root, child);
     }
 

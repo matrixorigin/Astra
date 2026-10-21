@@ -1683,7 +1683,7 @@ impl DatabaseToolInvocationLedger {
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ? AND state = ?{owner_predicate}"
         );
-        let mut query = sqlx::query(&query)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(state_label(next))
             .bind(outcome_json)
             .bind(&identity.user_id)

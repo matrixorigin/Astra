@@ -755,7 +755,7 @@ mod tests {
         );
 
         assert_ne!(without_chain_sql, with_chain_sql);
-        assert!(with_chain_sql.contains("astra-null-shape:001"));
+        assert!(with_chain_sql.as_str().contains("astra-null-shape:001"));
     }
 
     #[test]
