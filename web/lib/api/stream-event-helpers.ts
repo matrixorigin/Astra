@@ -1,7 +1,29 @@
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
 import { extractBlockedReason } from "@/lib/run-status-messages";
+import { WebApiError } from "@/lib/api/errors";
 
 type StreamEventLike = Record<string, unknown> & { type?: string };
+
+const RUN_FINISHED_STATUSES = ["completed", "failed", "cancelled", "paused", "interrupted", "delegated"];
+
+export function rootRunFinishedStatus(event: StreamEventLike, runId: string | undefined): string {
+  if (!runId || event.run_id !== runId || typeof event.status !== "string" ||
+    !RUN_FINISHED_STATUSES.includes(event.status)) {
+    throw new WebApiError(502, "Invalid root run completion.", "contract_violation");
+  }
+  return event.status;
+}
+
+export function isResumableRunLifecycle(lifecycle: StreamEventState["runLifecycle"]) {
+  return lifecycle === "paused" || lifecycle === "waiting" || lifecycle === "blocked";
+}
+
+/** Both a confirmed resume response and its stream receipt resume this same projection. */
+export function resumeStreamProjection(state: StreamEventState) {
+  state.runLifecycle = "running";
+  state.lastStatus = "streaming";
+  state.terminalStatus = undefined;
+}
 
 export function isRunLifecycleEvent(type: string): boolean {
   return type.startsWith("run_");
@@ -80,7 +102,7 @@ export function isChatStreamInitialization(event: Record<string, unknown>): even
     typeof state.lastStatus === "string" && ["streaming", "complete", "failed"].includes(state.lastStatus) &&
     typeof state.runLifecycle === "string" && ["running", "paused", "waiting", "blocked", "finished"].includes(state.runLifecycle) &&
     (state.terminalStatus === undefined || typeof state.terminalStatus === "string" &&
-      ["completed", "failed", "cancelled", "paused", "interrupted", "delegated"].includes(state.terminalStatus)) &&
+      RUN_FINISHED_STATUSES.includes(state.terminalStatus)) &&
     (state.nextEventIndex === undefined || typeof state.nextEventIndex === "number" &&
       Number.isSafeInteger(state.nextEventIndex) && state.nextEventIndex >= 0);
 }

@@ -23,6 +23,8 @@ import {
   explicitEventMessage,
   isForeignRunLifecycleEvent,
   isRunLifecycleEvent,
+  rootRunFinishedStatus,
+  resumeStreamProjection,
 } from "@/lib/api/stream-event-helpers";
 
 export interface StreamEventContext {
@@ -41,7 +43,6 @@ export interface StreamEventState {
   errorCode?: string;
   reasoningText: string;
   artifacts?: ChatArtifactRef[];
-  statusFeedbackText?: string;
   reasoningFromThinkingTags?: boolean;
   lastStatus: "streaming" | "complete" | "failed";
   protocolError: boolean;
@@ -103,6 +104,8 @@ export function applyStreamEvent(
     "run_id" in event && typeof event.run_id === "string" && event.run_id.trim()) {
     state.runId = event.run_id;
   }
+  if (state.lastStatus === "failed" && isRunLifecycleEvent(event.type) &&
+    event.type !== "run_error" && event.type !== "run_finished") return;
 
   const setActiveRun = (run: {
     runId: string;
@@ -228,24 +231,12 @@ export function applyStreamEvent(
 
     case "run_blocked": {
       state.runLifecycle = "blocked";
-      state.statusFeedbackText = explicitEventMessage(event) || undefined;
       // RunBlockedEvent carries no run_id field; keep whatever runId is already known
       const runId = state.runId;
       const waitingFor = blockedWaitingFor(event);
       const message = explicitEventMessage(event);
       if (message && !state.assistantText) {
-        state.assistantText = message;
-        updateStreamingAssistantMessage(
-          ctx.ownerUserId,
-          ctx.chatId,
-          ctx.assistantMessageId,
-          {
-            content: state.assistantText,
-            reasoning: state.reasoningText || undefined,
-            reasoningStatus: state.reasoningText ? "streaming" : undefined,
-            status: "streaming",
-          },
-        );
+        applyAssistantText(message, "streaming");
       }
       if (runId) {
         setActiveRun({
@@ -265,7 +256,8 @@ export function applyStreamEvent(
       const projection = projectRunWaitingState(event);
       state.runLifecycle = projection.status;
       if (projection.status === "blocked") {
-        state.statusFeedbackText = explicitEventMessage(event) || undefined;
+        const message = explicitEventMessage(event);
+        if (message && !state.assistantText) applyAssistantText(message, "streaming");
       }
       if (runId) {
         setActiveRun({
@@ -301,7 +293,9 @@ export function applyStreamEvent(
 
     case "run_resumed": {
       if (typeof event.run_id !== "string") break;
-      state.runLifecycle = "running";
+      resumeStreamProjection(state);
+      updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId,
+        { status: "streaming", reasoningStatus: state.reasoningText ? "streaming" : undefined });
       setActiveRun({
         runId: event.run_id,
         status: "running",
@@ -311,7 +305,9 @@ export function applyStreamEvent(
     }
 
     case "run_error": {
-      state.errorCode = typeof event.error_code === "string" ? event.error_code : undefined;
+      if (state.errorCode !== "canonical_persistence_failed") {
+        state.errorCode = typeof event.error_code === "string" ? event.error_code : undefined;
+      }
       applyRunFailure(eventMessage(event, "Astra run failed."));
       break;
     }
@@ -398,7 +394,7 @@ export function applyStreamEvent(
         state.assistantRawText = event.assistant_text;
         applyAssistantText(
           state.assistantRawText,
-          state.lastStatus === "streaming" ? "complete" : state.lastStatus,
+          state.lastStatus,
         );
       }
       break;
@@ -421,10 +417,9 @@ export function applyStreamEvent(
     }
 
     case "run_finished": {
-      const status =
-        typeof (event as RunFinishedEvent).status === "string"
-          ? (event as RunFinishedEvent).status!
-          : "completed";
+      const status = rootRunFinishedStatus(event, state.runId);
+      if (state.errorCode === "canonical_persistence_failed" ||
+        state.lastStatus === "failed" && status !== "failed") break;
       state.terminalStatus = status;
       if (status === "failed") {
         applyRunFailure((event as RunFinishedEvent).error);

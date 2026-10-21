@@ -275,8 +275,8 @@ describe("applyStreamEvent", () => {
       expect(mockSetChatActiveRun).not.toHaveBeenCalled();
     }
     applyStreamEvent({ type: "run_resumed", run_id: "root" }, ctx, state);
-    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith("user-a", "chat-1",
-      expect.objectContaining({ runId: "root", nextEventIndex: 31 }));
+    expect(mockSetChatActiveRun).not.toHaveBeenCalled();
+    expect(state.runLifecycle).toBe("finished");
   });
 
   it("retains distinct failure reasons even after an earlier generic error", () => {

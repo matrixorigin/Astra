@@ -1,4 +1,5 @@
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
+import { resumeStreamProjection } from "@/lib/api/stream-event-helpers";
 import { isArtifactPublicationV1 } from "@astra/sdk";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
@@ -1512,9 +1513,23 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     auth: "required",
     operation: `resume active run ${runId}`,
   });
-  currentChat();
+  const beforeResume = currentChat();
+  const previousRun = beforeResume.activeRun;
+  const projection = beforeResume.streamProjection;
+  const lifecycle = projection?.state.runLifecycle;
+  const lastStatus = projection?.state.lastStatus;
+  const terminalStatus = projection?.state.terminalStatus;
+  const writer = projection?.writer;
   const resumed = await client.sdk.resumeRun(runId);
   const current = currentChat();
+  // Child observations can advance the shared cursor. Only newer root facts
+  // supersede this acknowledgement; metadata polling cannot retire parser state.
+  if (current.streamProjection !== projection ||
+    current.activeRun !== previousRun && current.activeRun?.source !== "backend_poll" ||
+    projection && (projection.state.runLifecycle !== lifecycle ||
+      projection.state.lastStatus !== lastStatus || projection.state.terminalStatus !== terminalStatus)) {
+    return { activeRun: publicActiveRun(current) };
+  }
   if (isArtifactPublicationV1(resumed.artifact_publication)) {
     const message = current.messages.find(item => item.id === assistantMessageId && item.role === "assistant");
     if (message) message.artifactPublication = resumed.artifact_publication;
@@ -1529,6 +1544,15 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     },
     "local_mutation",
   );
+  if (resumed.status === "running" && projection && !projection.state.protocolError &&
+    projection.assistantMessageId === assistantMessageId && projection.sessionId === sessionId &&
+    projection.state.runId === runId && projection.state.runLifecycle === "paused") {
+    writer?.abort();
+    resumeStreamProjection(projection.state);
+    updateStreamingAssistantMessage(ownerUserId, chatId, projection.assistantMessageId, {
+      status: "streaming", reasoningStatus: projection.state.reasoningText ? "streaming" : undefined,
+    });
+  }
 
   return { activeRun: publicActiveRun(current) };
 }

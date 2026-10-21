@@ -702,12 +702,18 @@ export function useStreamLifecycle(
     if (attachedRunRef.current && (!sameStreamBinding(attachedRunRef.current, binding) || !hasAssistant)) clearAttachedRun();
     if (!sameStreamBinding(autoAttachAttemptedRunRef.current, binding)) {
       autoAttachAttemptedRunRef.current = null;
-      autoAttachRetryCountsRef.current.clear();
+      const selectedKey = binding ? JSON.stringify(binding) : null;
+      for (const key of autoAttachRetryCountsRef.current.keys()) {
+        if (key !== selectedKey) autoAttachRetryCountsRef.current.delete(key);
+      }
       if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
       autoAttachRetryTimerRef.current = undefined;
     }
     if (!canAttachRunStream(detail.activeRun?.status)) {
       autoAttachAttemptedRunRef.current = null;
+      autoAttachRetryCountsRef.current.clear();
+      if (autoAttachRetryTimerRef.current) window.clearTimeout(autoAttachRetryTimerRef.current);
+      autoAttachRetryTimerRef.current = undefined;
       return;
     }
     if (isArchived || detail.pendingTurn || runControlBusy || !binding?.sessionId ||
@@ -1047,6 +1053,20 @@ export function useStreamLifecycle(
           router.replace(chatListHref);
           return;
         }
+        if (error instanceof WebApiError && error.code === "stream_observation_interrupted") {
+          assistantPatcher.flushNow();
+          let observed = detailRef.current;
+          try {
+            const refreshed = await getChat(detail.chat.id);
+            if (!canReceive()) return;
+            observed = refreshed;
+            updateDetail(refreshed);
+          } catch { /* Keep the admitted answer and run when refresh is unavailable. */ }
+          if (!canReceive()) return;
+          const binding = streamBinding(observed);
+          if (!binding || !scheduleAutoAttachRetry(binding)) addToast(error.detail, "warning");
+          return;
+        }
         if (handleProjectionFailure(error, currentAssistantId, assistantPatcher, updateDetail)) return;
         if (isWorkspaceSelectionError(error)) {
           setStartingRun(false);
@@ -1087,6 +1107,7 @@ export function useStreamLifecycle(
       clearPendingInteraction,
       handleApprovalRequired,
       handleProjectionFailure,
+      scheduleAutoAttachRetry,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,

@@ -15,6 +15,7 @@ import { getStore, getChat, claimChatStreamProjection, withChatStreamProjection,
   releaseChatStreamProjection, beginStreamingMessage, queueDeferredRunInput, resumeActiveRun, getChatHydrated } from "@/lib/api/web-store";
 import { WebRuntimeClient, getRuntimeClient as getStoreRuntimeClient, requireRuntimeClient as requireStoreRuntimeClient } from "@/lib/runtime-client/server";
 import { streamExistingChatRun, streamChatMessage } from "@/lib/api/chats";
+import { isNotFoundError } from "@/lib/api/errors";
 
 function chat(owner = "owner", id = "chat") {
   const record = { id, title: "Chat", projectId: null, createdAt: "2026-10-21T00:00:00Z",
@@ -24,7 +25,7 @@ function chat(owner = "owner", id = "chat") {
   getStore(owner).chats.push(record);
 }
 
-function backend(events: Array<Record<string, unknown>>, pending = false) {
+function backend(events: Array<Record<string, unknown>>, pending = false, readError?: Error) {
   let emitted = false;
   let finish: (() => void) | undefined;
   const cancel = vi.fn(() => { finish?.(); });
@@ -35,6 +36,7 @@ function backend(events: Array<Record<string, unknown>>, pending = false) {
         emitted = true;
         return { done: false, value: new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")) };
       }
+      if (readError) throw readError;
       if (pending) await new Promise<void>(resolve => { finish = resolve; });
       return { done: true, value: undefined };
     }) }) }, cancel, releaseLock };
@@ -96,6 +98,92 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+it.each(["EOF", "read reset", "fetch reset", "HTTP unavailable"])("preserves a disconnected projection on %s and continues the same run", async transport => {
+  await prefix("Partial answer ", "Saved reasoning");
+  const next = backend([bootstrap], false, transport === "read reset" ? new Error("socket reset") : undefined);
+  const client = runtime(next);
+  if (transport === "fetch reset") vi.mocked(client.fetchResponse).mockRejectedValue(new TypeError("fetch failed"));
+  if (transport === "HTTP unavailable") vi.mocked(client.fetchResponse).mockResolvedValue(new Response("Unavailable", { status: 503 }));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(8));
+  const onDone = vi.fn();
+  await expect(streamExistingChatRun("chat", "root", { onDone },
+    { nextEventIndex: 8, assistantMessageId: assistantId })).rejects
+    .toMatchObject({ code: "stream_observation_interrupted" });
+  expect(selectedMessage()).toMatchObject({ content: "Partial answer", reasoning: "Saved reasoning", status: "streaming" });
+  expect(getChat("owner", "chat")?.activeRun).toMatchObject({ runId: "root", nextEventIndex: 8 });
+  expect(onDone).not.toHaveBeenCalled();
+
+  runtime(backend([bootstrap, { type: "text_delta", content: "continued", index: 8 },
+    { type: "run_finished", run_id: "root", status: "completed", index: 9 }]));
+  vi.mocked(globalThis.fetch).mockResolvedValue(await attach(8));
+  await expect(streamExistingChatRun("chat", "root", { onDone },
+    { nextEventIndex: 8, assistantMessageId: assistantId })).resolves.toBe("Partial answer continued");
+  expect(onDone).toHaveBeenCalledExactlyOnceWith("Partial answer continued");
+  expect(selectedMessage()).toMatchObject({ content: "Partial answer continued", status: "complete" });
+  expect(getChat("owner", "chat")?.activeRun).toBeUndefined();
+});
+
+it.each(["failed", "completed", "paused"])("restores known %s evidence before the upstream reconnect fails", async status => {
+  await prefix("Saved answer", undefined, status === "failed", status === "failed" ? undefined :
+    { type: "run_finished", run_id: "root", status });
+  const cursor = status === "failed" ? 8 : 9;
+  const client = runtime(backend([]));
+  vi.mocked(client.fetchResponse).mockRejectedValue(new TypeError("fetch failed"));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(cursor));
+  const onText = vi.fn(), onDone = vi.fn(), onPaused = vi.fn();
+  const observation = streamExistingChatRun("chat", "root", { onText, onDone, onPaused },
+    { nextEventIndex: cursor, assistantMessageId: assistantId });
+  if (status === "failed") {
+    await expect(observation).rejects.toMatchObject({ code: "canonical_persistence_failed", detail: "Save failed" });
+    expect(onDone).not.toHaveBeenCalled();
+  } else {
+    await expect(observation).resolves.toBe("Saved answer");
+    expect(status === "paused" ? onPaused : onDone).toHaveBeenCalledExactlyOnceWith("Saved answer");
+  }
+  expect(onText).toHaveBeenLastCalledWith(status === "failed" ? "Saved answer\n\nSave failed" : "Saved answer");
+});
+
+it.each([
+  { name: "empty", text: "", reasoning: "" },
+  { name: "partial", text: "Partial answer", reasoning: "" },
+  { name: "reasoning only", text: "", reasoning: "Thinking" },
+])("does not finalize a first POST at EOF with $name output", async ({ text, reasoning }) => {
+  runtime(backend([bootstrap, { type: "text_delta", content: text },
+    { type: "reasoning_delta", content: reasoning }, { type: "run_input_queued", run_id: "root", index: 7 }]));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await startPost());
+  const onDone = vi.fn();
+  await expect(streamChatMessage("chat", payload, { onDone })).rejects
+    .toMatchObject({ code: "stream_observation_interrupted" });
+  expect(selectedMessage()).toMatchObject({ content: text, status: "streaming" });
+  expect(getChat("owner", "chat")?.activeRun).toMatchObject({ runId: "root", nextEventIndex: 8 });
+  expect(onDone).not.toHaveBeenCalled();
+});
+
+it.each(["completed", "delegated"])("accepts an explicit %s receipt with no visible text", async status => {
+  runtime(backend([bootstrap, { type: "run_finished", run_id: "root", status, index: 0 }]));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await startPost());
+  const onDone = vi.fn();
+  await expect(streamChatMessage("chat", payload, { onDone })).resolves.toBe("");
+  expect(onDone).toHaveBeenCalledExactlyOnceWith("");
+  expect(selectedMessage().status).toBe("complete");
+  expect(getChat("owner", "chat")?.activeRun).toBeUndefined();
+});
+
+it("retires a paused receipt on a real resume before an interrupted suffix", async () => {
+  await prefix("Partial answer", undefined, false,
+    { type: "run_finished", run_id: "root", status: "paused" });
+  runtime(backend([bootstrap, { type: "run_resumed", run_id: "root", index: 9 }]));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(9));
+  const onDone = vi.fn(), onPaused = vi.fn();
+  await expect(streamExistingChatRun("chat", "root", { onDone, onPaused },
+    { nextEventIndex: 9, assistantMessageId: assistantId })).rejects
+    .toMatchObject({ code: "stream_observation_interrupted" });
+  expect(selectedMessage()).toMatchObject({ content: "Partial answer", status: "streaming" });
+  expect(getChat("owner", "chat")?.activeRun).toMatchObject({ runId: "root", status: "running", nextEventIndex: 10 });
+  expect(onDone).not.toHaveBeenCalled();
+  expect(onPaused).not.toHaveBeenCalled();
+});
+
 it.each([
   { name: "visible boundary whitespace", raw: "Useful partial answer ", delta: "plus suffix", answer: "Useful partial answer plus suffix" },
   { name: "open thinking block", raw: "Visible<thinking>hidden", delta: " more</thinking> answer", answer: "Visible answer", reasoning: "hidden more" },
@@ -109,7 +197,8 @@ it.each([
 ])("continues genuine raw state across GET disconnect: $name", async ({ raw, separate, delta, answer, reasoning, replacement, late }) => {
   await prefix(raw, separate);
   const next = backend([bootstrap, { type: "text_delta", content: delta }, ...(replacement ? [replacement] : []),
-    failure, ...(late ? [late] : []), terminal]);
+    failure, ...(late ? [late] : []), terminal,
+    { type: "run_finished", run_id: "root", status: "completed" }]);
   const nextRuntime = runtime(next);
   const response = await attach(8);
   vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
@@ -429,6 +518,77 @@ it("resumes the same completed paused assistant through GET and the public consu
   expect(onReasoning).toHaveBeenCalledWith("Saved reasoning");
   expect(getChat("owner", "chat")!.messages).toHaveLength(count);
   expect(selectedMessage()).toMatchObject({ content: "Paused partial answer continued", reasoning: "Saved reasoning", status: "complete" });
+});
+
+it.each(["fetch failure", "EOF"])("retires the paused receipt after resume succeeds before %s", async transport => {
+  await prefix("Paused answer", "Saved reasoning", false,
+    { type: "run_finished", run_id: "root", status: "paused" });
+  const client = runtime(backend([bootstrap]));
+  vi.spyOn(client.sdk, "resumeRun").mockResolvedValue({ status: "running" });
+  if (transport === "fetch failure") vi.mocked(client.fetchResponse).mockRejectedValue(new TypeError("fetch failed"));
+  await expect(resumeActiveRun("owner", "chat")).resolves.toMatchObject({ activeRun: { status: "running" } });
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(9));
+  const onDone = vi.fn(), onPaused = vi.fn();
+  await expect(streamExistingChatRun("chat", "root", { onDone, onPaused },
+    { nextEventIndex: 9, assistantMessageId: assistantId })).rejects
+    .toMatchObject({ code: "stream_observation_interrupted" });
+  expect(onDone).not.toHaveBeenCalled();
+  expect(onPaused).not.toHaveBeenCalled();
+  expect(selectedMessage()).toMatchObject({ content: "Paused answer", reasoning: "Saved reasoning", status: "streaming" });
+  expect(getChat("owner", "chat")?.activeRun).toMatchObject({ runId: "root", status: "running", nextEventIndex: 9 });
+});
+
+it("keeps an upstream run 404 separate from a missing Web chat", async () => {
+  await prefix("Partial answer");
+  const client = runtime(backend([]));
+  vi.mocked(client.fetchResponse).mockResolvedValue(new Response("Run unavailable", { status: 404 }));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(8));
+  const error = await streamExistingChatRun("chat", "root", {},
+    { nextEventIndex: 8, assistantMessageId: assistantId }).catch(error => error);
+  expect(isNotFoundError(error)).toBe(false);
+  expect(error).toMatchObject({ code: "stream_observation_interrupted" });
+  expect(selectedMessage()).toMatchObject({ content: "Partial answer", status: "streaming" });
+});
+
+it.each(["waiting", "child", "canonical failure"])("orders resume acknowledgement against %s observations", async fact => {
+  await prefix("Paused answer", undefined, false,
+    { type: "run_finished", run_id: "root", status: "paused" });
+  const events = fact === "child"
+    ? [{ type: "run_finished", run_id: "child", status: "completed", index: 9 }]
+    : fact === "canonical failure" ? [failure]
+    : [{ type: "run_resumed", run_id: "root", index: 9 },
+      { type: "run_waiting", run_id: "root", reason: "waiting: tool_approval", index: 10 }];
+  const client = runtime(backend([bootstrap, ...events]));
+  let acknowledge!: (value: { status: string }) => void;
+  const resume = vi.spyOn(client.sdk, "resumeRun").mockImplementation(() => new Promise(resolve => { acknowledge = resolve; }));
+  const pending = resumeActiveRun("owner", "chat");
+  await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+  await (await attach(9)).text();
+  acknowledge({ status: "running" });
+  if (fact === "canonical failure") {
+    await expect(pending).rejects.toThrow("run changed");
+    expect(getChat("owner", "chat")?.activeRun).toBeUndefined();
+    expect(selectedMessage()).toMatchObject({ content: "Paused answer\n\nSave failed", status: "failed" });
+  } else {
+    await expect(pending).resolves.toMatchObject({ activeRun: { runId: "root",
+      status: fact === "child" ? "running" : "waiting", nextEventIndex: fact === "child" ? 10 : 11 } });
+    expect(selectedMessage()).toMatchObject({ content: "Paused answer", status: "streaming" });
+  }
+});
+
+it("keeps the paused receipt when resume is rejected", async () => {
+  await prefix("Paused answer", undefined, false,
+    { type: "run_finished", run_id: "root", status: "paused" });
+  const client = runtime(backend([]));
+  vi.spyOn(client.sdk, "resumeRun").mockRejectedValue(new Error("Resume rejected"));
+  await expect(resumeActiveRun("owner", "chat")).rejects.toThrow("Resume rejected");
+  vi.mocked(client.fetchResponse).mockRejectedValue(new TypeError("fetch failed"));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(9));
+  const onPaused = vi.fn();
+  await expect(streamExistingChatRun("chat", "root", { onPaused },
+    { nextEventIndex: 9, assistantMessageId: assistantId })).resolves.toBe("Paused answer");
+  expect(onPaused).toHaveBeenCalledExactlyOnceWith("Paused answer");
+  expect(getChat("owner", "chat")?.activeRun?.status).toBe("paused");
 });
 
 it("hydrates status without advancing the genuine projection cursor", async () => {

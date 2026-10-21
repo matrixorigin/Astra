@@ -12,6 +12,12 @@ export class WebApiError extends Error {
   }
 }
 
+export function streamObservationInterrupted() {
+  return new WebApiError(502,
+    "The run stream was interrupted. Reconnect to continue observing this run.",
+    "stream_observation_interrupted");
+}
+
 export function isAuthRequiredError(error: unknown) {
   return error instanceof Error && error.message === "AUTH_REQUIRED";
 }

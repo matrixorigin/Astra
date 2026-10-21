@@ -602,6 +602,7 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendFrameStream([
       'data: {"type":"run_started","run_id":"run-soft","index":"bad"}\n\n',
       'data: {"type":"text_done","full_text":"done"}\n\n',
+      'data: {"type":"run_finished","run_id":"run-soft","status":"completed"}\n\n',
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
@@ -2035,13 +2036,12 @@ describe("chat existing run stream route", () => {
     const onText = vi.fn(), onDone = vi.fn();
     try {
       await expect(streamExistingChatRun("web-chat-1", "root", { onText, onDone })).rejects.toMatchObject({
-        detail: canonical ? "Save failed" : "upstream reset",
-        code: canonical ? "canonical_persistence_failed" : undefined,
+        code: canonical ? "canonical_persistence_failed" : "stream_observation_interrupted",
       });
       expect(onText).toHaveBeenLastCalledWith("Useful partial answer");
       expect(onDone).not.toHaveBeenCalled();
       expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
-        expect.objectContaining({ content: canonical ? "Useful partial answer\n\nSave failed" : "Useful partial answer", status: "failed" }));
+        expect.objectContaining({ content: canonical ? "Useful partial answer\n\nSave failed" : "Useful partial answer", status: canonical ? "failed" : "streaming" }));
       expect(backend.releaseLock).toHaveBeenCalled();
     } finally {
       fetchSpy.mockRestore();
@@ -2165,7 +2165,7 @@ describe("chat existing run stream route", () => {
     );
   });
 
-  it("fails the local run state when a backend stream event has a malformed cursor", async () => {
+  it("ignores a malformed event cursor but requires a terminal receipt", async () => {
     const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
       'data: {"type":"session_info","session_id":"runtime-session-1","run_id":"run-1"}\n\n',
@@ -2208,18 +2208,15 @@ describe("chat existing run stream route", () => {
     expect(body).not.toContain("Malformed stream event index.");
     expect(body).toContain("should not win");
     expect(backend.cancel).not.toHaveBeenCalled();
-    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
-      "user-a",
-      "web-chat-1",
-      undefined,
-    );
+    expect(mockSetChatActiveRun).not.toHaveBeenCalledWith("user-a", "web-chat-1", undefined);
+    expect(body).toContain("stream_observation_interrupted");
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "web-chat-1",
       "assistant-1",
       expect.objectContaining({
         content: "should not win",
-        status: "complete",
+        status: "streaming",
       }),
     );
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(

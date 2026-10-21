@@ -72,6 +72,37 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it.each([
+    { name: 'empty', events: [] },
+    { name: 'text only', events: [{ type: 'text_done', full_text: 'Partial' }] },
+    { name: 'turn text', events: [{ type: 'turn_complete', assistant_text: 'Partial' }] },
+    { name: 'child completion', events: [{ type: 'run_finished', run_id: 'child', status: 'completed' }] },
+  ])('rejects $name EOF without a root receipt', async ({ events }) => {
+    const frames = [{ type: 'session_info', run_id: 'root' }, ...events]
+      .map(event => `data: ${JSON.stringify(event)}\n\n`);
+    frames.push('data: [DONE]\n\n');
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(frames) });
+    const onDone = vi.fn(), onCancelled = vi.fn(), onPaused = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onDone, onCancelled, onPaused }))
+      .rejects.toMatchObject({ code: 'stream_observation_interrupted' });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(onCancelled).not.toHaveBeenCalled();
+    expect(onPaused).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { run_id: 'root' }, { run_id: 'root', status: 'unknown' }, { status: 'completed' },
+  ])('rejects a malformed terminal receipt (%j)', async receipt => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      'data: {"type":"session_info","run_id":"root"}\n\n',
+      `data: ${JSON.stringify({ type: 'run_finished', ...receipt })}\n\n`,
+    ]) });
+    const onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onDone }))
+      .rejects.toMatchObject({ code: 'contract_violation' });
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('keeps child lifecycle observable without changing root callbacks (coalesced=%s)', async coalesced => {
     const events = [
       { type: 'session_info', session_id: 'session', run_id: 'root' },
@@ -133,7 +164,7 @@ describe('streamChatMessage cancellation semantics', () => {
     const onDone = vi.fn();
     await expect(streamChatMessage('chat', defaultPayload, { signal: controller.signal, onDone })).rejects
       .toMatchObject(abort ? { name: 'AbortError' } : knownFailure
-        ? { message: 'Save failed', code: 'canonical_persistence_failed' } : { message: 'socket reset' });
+        ? { message: 'Save failed', code: 'canonical_persistence_failed' } : { code: 'stream_observation_interrupted' });
     expect(onDone).not.toHaveBeenCalled();
     expect(releaseLock).toHaveBeenCalledOnce();
   });
@@ -668,6 +699,7 @@ describe('streamChatMessage cancellation semantics', () => {
   it('passes AbortSignal to fetch and releases the reader lock', async () => {
     const body = sseBody([
       'data: {"type":"run_started","run_id":"run-123"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
     ]);
     const signal = new AbortController().signal;
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -769,6 +801,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"tool_transport_started","call_id":"call-1","tool":"bash","transport":"server_local"}\n\n',
         'data: {"type":"tool_transport_completed","call_id":"call-1","tool":"bash","transport":"server_local","duration_ms":12}\n\n',
         'data: {"type":"tool_call_end","call_id":"call-1","tool":"bash","success":true,"result":"ok"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
     });
 
@@ -778,7 +811,9 @@ describe('streamChatMessage cancellation semantics', () => {
       }),
     ).resolves.toBe('');
 
-    expect(onWorkSurfaceEvent).toHaveBeenCalledTimes(6);
+    expect(onWorkSurfaceEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: 'run_finished', run_id: 'run-123', status: 'completed' }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
@@ -870,8 +905,10 @@ describe('streamChatMessage cancellation semantics', () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
+        'data: {"type":"session_info","run_id":"root"}\n\n',
         'data: {"type":"text_delta","content":"draft"}\n\n',
         'data: {"type":"turn_complete","assistant_text":"final answer"}\n\n',
+        'data: {"type":"run_finished","run_id":"root","status":"completed"}\n\n',
       ]),
     });
 
@@ -1000,7 +1037,9 @@ describe('streamChatMessage cancellation semantics', () => {
   it('streams an existing run with an encoded GET URL', async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
-      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
+      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n',
+        'data: {"type":"run_finished","run_id":"run/123","status":"completed"}\n\n',
+      ]),
     });
 
     await expect(
@@ -1016,7 +1055,9 @@ describe('streamChatMessage cancellation semantics', () => {
   it('streams an existing run from the stored cursor into the bound assistant message', async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
-      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
+      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n',
+        'data: {"type":"run_finished","run_id":"run/123","status":"completed"}\n\n',
+      ]),
     });
 
     await expect(
@@ -1063,6 +1104,7 @@ describe('streamChatMessage cancellation semantics', () => {
       body: sseBody([
         'data: {"type":"run_input_queued","run_id":"run-123","index":"4"}\n\n',
         'data: {"type":"text_done","full_text":"continued"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
     });
 

@@ -8,6 +8,7 @@ import {
   chatRunStreamPath,
 } from "@astra/sdk";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
+import { WebApiError, streamObservationInterrupted } from "@/lib/api/errors";
 import {
   beginStreamingMessage,
   claimChatStreamProjection,
@@ -245,6 +246,10 @@ function proxyRunStream(params: {
           return false;
         }
       };
+      const interruptObservation = () => {
+        const error = streamObservationInterrupted();
+        enqueueFrame({ type: "error", message: error.detail, status: error.status, code: error.code });
+      };
       const closeController = () => {
         if (clientCancelled) {
           return;
@@ -265,6 +270,18 @@ function proxyRunStream(params: {
       }
 
       const runProxy = async () => {
+        const state: StreamEventState = lease?.projection.state ?? {
+          assistantText: "", assistantRawText: "", reasoningText: "",
+          lastStatus: "streaming", protocolError: false, runLifecycle: "running",
+        };
+        if (projectionLease) {
+          const { assistantRawText, assistantText, reasoningText, reasoningFromThinkingTags,
+            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus } = state;
+          if (!enqueueFrame({ type: "chat_stream_init", assistant_message_id: assistantMessageId,
+            session_id: currentSessionId(), state: { assistantRawText, assistantText, reasoningText,
+              reasoningFromThinkingTags, runId, nextEventIndex, lastStatus, runLifecycle,
+              lastFailureMessage, errorCode, terminalStatus } })) return;
+        }
         let resolvedBackendResponse: Response;
         try {
           resolvedBackendResponse =
@@ -291,6 +308,13 @@ function proxyRunStream(params: {
             error instanceof RuntimeClientError ? error.status : undefined;
           const code =
             error instanceof RuntimeClientError ? error.code : undefined;
+          if (!replayOnly && projectionLease) {
+            if (state.lastStatus === "streaming" && state.runLifecycle === "running") {
+              interruptObservation();
+            }
+            closeController();
+            return;
+          }
           if (!replayOnly) {
             updateStreamingAssistantMessage(
               ownerUserId,
@@ -309,6 +333,14 @@ function proxyRunStream(params: {
         }
         if (clientCancelled || !mutate(() => {})) { closeController(); return; }
         if (!resolvedBackendResponse.ok || !resolvedBackendResponse.body) {
+          if (!replayOnly && projectionLease) {
+            if (state.lastStatus === "streaming" && state.runLifecycle === "running") {
+              interruptObservation();
+            }
+            backendAbortController.abort();
+            closeController();
+            return;
+          }
           const detail = await readErrorDetail(resolvedBackendResponse);
           if (clientCancelled) {
             return;
@@ -388,18 +420,6 @@ function proxyRunStream(params: {
           applyExplainAnalyzeObservation(event, ctx, true);
         };
 
-        const state: StreamEventState = lease?.projection.state ?? {
-          assistantText: "", assistantRawText: "", reasoningText: "",
-          lastStatus: "streaming", protocolError: false, runLifecycle: "running",
-        };
-        if (projectionLease) {
-          const { assistantRawText, assistantText, reasoningText, reasoningFromThinkingTags,
-            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus } = state;
-          if (!enqueueFrame({ type: "chat_stream_init", assistant_message_id: assistantMessageId,
-            session_id: currentSessionId(), state: { assistantRawText, assistantText, reasoningText,
-              reasoningFromThinkingTags, runId, nextEventIndex, lastStatus, runLifecycle,
-              lastFailureMessage, errorCode, terminalStatus } })) return;
-        }
         const forwardFrame = (frame: string) => {
           const event = eventFromSseFrame(frame, replayOnly);
           if ((event as { type?: string } | null)?.type === "chat_stream_init") {
@@ -427,13 +447,13 @@ function proxyRunStream(params: {
               chunk = await reader.read();
             } catch (error) {
               if (clientCancelled) return;
-              // The typed root failure has already been forwarded. A subsequent
-              // upstream reset must not replace it with a generic error frame.
-              if (!replayOnly && state.lastStatus === "failed" &&
-                state.errorCode === "canonical_persistence_failed") {
+              // Transport loss cannot override an observed failure or resumable/terminal state.
+              if (!replayOnly && (state.lastStatus === "failed" || state.runLifecycle !== "running")) {
                 break;
               }
-              throw error;
+              if (replayOnly) throw error;
+              interruptObservation();
+              return;
             }
             const { value, done } = chunk;
             if (clientCancelled) {
@@ -469,43 +489,9 @@ function proxyRunStream(params: {
               { explainAnalyzeRepair: { token: repairToken, complete: true } });
           }
 
-          if (!replayOnly && state.lastStatus === "streaming") {
-            if (
-              state.runLifecycle === "paused" ||
-              state.runLifecycle === "waiting" ||
-              state.runLifecycle === "blocked"
-            ) {
-              updateStreamingAssistantMessage(
-                ownerUserId,
-                chatId,
-                assistantMessageId,
-                {
-                  content: state.assistantText || state.statusFeedbackText || "",
-                  reasoning: state.reasoningText || undefined,
-                  reasoningStatus: state.reasoningText
-                    ? "streaming"
-                    : undefined,
-                  status: "streaming",
-                },
-              );
-            } else {
-              state.lastStatus = state.assistantText ? "complete" : "failed";
-              setChatActiveRun(ownerUserId, chatId, undefined);
-              updateStreamingAssistantMessage(
-                ownerUserId,
-                chatId,
-                assistantMessageId,
-                {
-                  content:
-                    state.assistantText ||
-                    "Astra completed the run without returning visible text.",
-                  reasoning: state.reasoningText || undefined,
-                  reasoningStatus:
-                    state.lastStatus === "complete" ? "complete" : undefined,
-                  status: state.lastStatus,
-                },
-              );
-            }
+          if (!replayOnly && state.lastStatus === "streaming" && state.runLifecycle === "running") {
+            interruptObservation();
+            return;
           }
 
           if (!replayOnly && state.lastStatus === "complete") {
@@ -533,6 +519,9 @@ function proxyRunStream(params: {
           }
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
+          if (error instanceof WebApiError && error.code === "contract_violation") {
+            mutate(() => { state.protocolError = true; });
+          }
           if (!replayOnly) {
             setChatActiveRun(ownerUserId, chatId, undefined);
             updateStreamingAssistantMessage(
@@ -547,7 +536,8 @@ function proxyRunStream(params: {
           }
           if (replayOnly) updateStreamingAssistantMessage(ownerUserId, chatId, assistantMessageId,
             { explainAnalyzeDegraded: true });
-          enqueueFrame({ type: "error", message });
+          enqueueFrame({ type: "error", message,
+            ...(error instanceof WebApiError ? { status: error.status, code: error.code } : {}) });
         } finally {
           if (!upstreamDone) {
             backendAbortController.abort();

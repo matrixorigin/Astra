@@ -88,6 +88,21 @@ Browser disconnect is not the same as run cancellation.
 - If backend dispatch is blocked, surface blocked provider state.
 - If a stream cursor is malformed, do not corrupt active run projection.
 
+Only a matching root `run_finished` with a supported explicit status establishes
+the run outcome. Text reconciliation (`text_done` or `turn_complete`), `[DONE]`
+and transport EOF do not prove completion. An observation interrupted while the
+root is running preserves its partial answer, parser state, applied cursor and
+active binding; the Web error envelope reports `stream_observation_interrupted`
+without recording a run failure. POST recovery uses the existing bounded GET
+attachment flow and never automatically resubmits a turn. Paused, waiting and
+blocked observations retain their resumable state. Finite observation-only
+replay does not settle the run or require a terminal receipt.
+The selected binding keeps its retry budget across transport admissions;
+changing the binding or leaving an attachable lifecycle retires that budget.
+A confirmed resume retires the matching paused receipt before reconnect;
+newer applied root facts take precedence over a delayed acknowledgement.
+Upstream run-observation failures do not become missing-Web-chat errors.
+
 ## Web-visible diagnostics
 
 A Web user should see:
