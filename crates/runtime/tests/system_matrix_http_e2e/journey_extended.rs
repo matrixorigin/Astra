@@ -1,6 +1,7 @@
 //! Journeys that do not belong in the monolithic product matrix: session cancel/delete, `/chat/stream`,
 //! auth/session negative paths (replaces stub `auth_contract` / `session_contract` coverage),
 //! models admin CRUD with DB checks (replaces `model_crud_contract`).
+use super::harness::call_id_for;
 use super::harness::{ProviderResponse, ProviderScript};
 use axum::http::StatusCode;
 use futures_util::StreamExt;
@@ -472,7 +473,7 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
         if !posted_duplicates
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-dup-tool-1",
+                &json!({"path":"dup.txt"}),
                 &ctx.edge_agent_id,
                 "completed",
                 tool_output,
@@ -500,7 +501,8 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
         .iter()
         .filter(|event| {
             event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-dup-tool-1")
+                && event["request_id"]
+                    == call_id_for(&events, "read_file", |args| args["path"] == "dup.txt")
         })
         .count();
     assert_eq!(
@@ -561,7 +563,9 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
     )
     .bind(&ctx.user_id)
     .bind(&run_id)
-    .bind("tc-dup-tool-1")
+    .bind(call_id_for(&events, "read_file", |args| {
+        args["path"] == "dup.txt"
+    }))
     .fetch_one(&ctx.pool)
     .await
     .expect("count durable duplicate tool results");
@@ -725,7 +729,7 @@ pub async fn run_server_stream_partial_batch_failure() {
         if !posted_first
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-partial-1",
+                &json!({"path":"a.txt"}),
                 &ctx.edge_agent_id,
                 "completed",
                 ok_output,
@@ -753,7 +757,7 @@ pub async fn run_server_stream_partial_batch_failure() {
         if !posted_second
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-partial-2",
+                &json!({"path":"b.txt"}),
                 &ctx.edge_agent_id,
                 // Edge callback statuses are a closed wire contract. Use the
                 // canonical terminal failure rather than the old display-only
@@ -800,12 +804,15 @@ pub async fn run_server_stream_partial_batch_failure() {
         tool_requests, 2,
         "expected two tool_request events: {events:?}"
     );
-    for request_id in ["tc-partial-1", "tc-partial-2"] {
+    for request_id in [
+        call_id_for(&events, "read_file", |args| args["path"] == "a.txt"),
+        call_id_for(&events, "read_file", |args| args["path"] == "b.txt"),
+    ] {
         let ends = events
             .iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-                    && event.get("call_id").and_then(Value::as_str) == Some(request_id)
+                    && event.get("call_id").and_then(Value::as_str) == Some(request_id.as_str())
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -868,7 +875,10 @@ pub async fn run_server_stream_partial_batch_failure() {
         .and_then(|event| event["run_id"].as_str())
         .expect("session_info run_id")
         .to_string();
-    for request_id in ["tc-partial-1", "tc-partial-2"] {
+    for request_id in [
+        call_id_for(&events, "read_file", |args| args["path"] == "a.txt"),
+        call_id_for(&events, "read_file", |args| args["path"] == "b.txt"),
+    ] {
         let count: i64 = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             sqlx::query_scalar(
@@ -878,7 +888,7 @@ pub async fn run_server_stream_partial_batch_failure() {
             )
             .bind(&ctx.user_id)
             .bind(&run_id)
-            .bind(request_id)
+            .bind(&request_id)
             .fetch_one(&ctx.pool),
         )
         .await
@@ -994,7 +1004,7 @@ pub async fn run_server_stream_out_of_order_tool_results() {
         if !posted_out_of_order {
             let second_payload = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-race-2",
+                &json!({"path":"race-b.txt"}),
                 &ctx.edge_agent_id,
                 "completed",
                 second_output,
@@ -1002,7 +1012,7 @@ pub async fn run_server_stream_out_of_order_tool_results() {
             );
             let first_payload = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-race-1",
+                &json!({"path":"race-a.txt"}),
                 &ctx.edge_agent_id,
                 "completed",
                 first_output,
@@ -1059,12 +1069,15 @@ pub async fn run_server_stream_out_of_order_tool_results() {
         tool_requests, 2,
         "expected two tool_request events: {events:?}"
     );
-    for request_id in ["tc-race-1", "tc-race-2"] {
+    for request_id in [
+        call_id_for(&events, "read_file", |args| args["path"] == "race-a.txt"),
+        call_id_for(&events, "read_file", |args| args["path"] == "race-b.txt"),
+    ] {
         let ends = events
             .iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str) == Some("tool_call_end")
-                    && event.get("call_id").and_then(Value::as_str) == Some(request_id)
+                    && event.get("call_id").and_then(Value::as_str) == Some(request_id.as_str())
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1127,7 +1140,10 @@ pub async fn run_server_stream_out_of_order_tool_results() {
         .and_then(|event| event["run_id"].as_str())
         .expect("session_info run_id")
         .to_string();
-    for request_id in ["tc-race-1", "tc-race-2"] {
+    for request_id in [
+        call_id_for(&events, "read_file", |args| args["path"] == "race-a.txt"),
+        call_id_for(&events, "read_file", |args| args["path"] == "race-b.txt"),
+    ] {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_run_events \
              WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call_end' \
@@ -1135,7 +1151,7 @@ pub async fn run_server_stream_out_of_order_tool_results() {
         )
         .bind(&ctx.user_id)
         .bind(&run_id)
-        .bind(request_id)
+        .bind(&request_id)
         .fetch_one(&ctx.pool)
         .await
         .expect("count durable out-of-order callback result");

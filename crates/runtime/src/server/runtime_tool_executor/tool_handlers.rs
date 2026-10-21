@@ -597,6 +597,18 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
     }
 }
 
+fn plan_review_request_id(session_id: &str, invocation_id: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    match invocation_id {
+        Some(id) => {
+            let identity =
+                serde_json::to_vec(&(session_id, id)).expect("string tuple serialization");
+            format!("plan-review:{:x}", Sha256::digest(identity))
+        }
+        None => format!("plan-review:{}", uuid::Uuid::new_v4()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ExitPlanModeToolHandler;
 
@@ -637,18 +649,7 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
                 context.plan_resume_hint_handle.as_ref(),
                 context.plan_authoring_active_handle.as_ref(),
                 context.approval_gate.as_deref(),
-                &invocation
-                    .tool_call_id
-                    .map(|tool_call_id| {
-                        format!("plan-review:{}:{tool_call_id}", context.session_id)
-                    })
-                    .unwrap_or_else(|| {
-                        format!(
-                            "plan-review:{}:{}",
-                            context.session_id,
-                            uuid::Uuid::new_v4()
-                        )
-                    }),
+                &plan_review_request_id(&context.session_id, invocation.tool_call_id),
                 args,
             )
             .await,
@@ -1527,6 +1528,33 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_review_ids_are_bounded_and_invocation_scoped() {
+        let session = "long-session:".repeat(128);
+        for id in ["a".repeat(64), "native:".repeat(1024)] {
+            let review = super::plan_review_request_id(&session, Some(&id));
+            assert_eq!(review.len(), 76);
+            assert_eq!(super::plan_review_request_id(&session, Some(&id)), review);
+            assert_ne!(
+                super::plan_review_request_id("another-session", Some(&id)),
+                review
+            );
+            assert_ne!(
+                super::plan_review_request_id(&session, Some(&(id + ":next"))),
+                review
+            );
+        }
+        assert_ne!(
+            super::plan_review_request_id("a:b", Some("c")),
+            super::plan_review_request_id("a", Some("b:c"))
+        );
+        let first = super::plan_review_request_id(&session, None);
+        let second = super::plan_review_request_id(&session, None);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 48);
+        assert!(uuid::Uuid::parse_str(first.strip_prefix("plan-review:").unwrap()).is_ok());
+    }
+
     #[tokio::test]
     async fn dynamic_mcp_adapter_does_not_promote_argument_call_identity() {
         use astra_tools::tool_engine::DynamicToolHandler;

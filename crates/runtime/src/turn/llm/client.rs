@@ -3985,6 +3985,22 @@ fn strip_internal_runtime_markers_with_ids(
             {
                 message["tool_call_id"] = Value::String(original.clone());
             }
+            // Cache annotations carry provider linkage in structural result
+            // blocks as well as the enclosing tool message. Leave result data
+            // and unknown/orphan identities to their existing owners.
+            if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for block in blocks {
+                    if block["type"] == "tool_result" {
+                        if let Some(original) = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| provider_ids.get(id))
+                        {
+                            block["tool_use_id"] = Value::String(original.clone());
+                        }
+                    }
+                }
+            }
         }
         astra_turn_core::tool::result::advisory::project_advisories(message);
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
@@ -8124,6 +8140,72 @@ pub(crate) fn parse_openai_sse_json_stream(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn annotated_tool_results_preserve_provider_linkage_and_cache_markers() {
+        use astra_turn_core::context::serializer::annotate_last_message_cache_breakpoint;
+        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+        let mut messages = vec![json!({"role":"user","content":"Read twice"})];
+        for (id, output) in [
+            ("canonical-first", "first result"),
+            ("canonical-second", "second result"),
+        ] {
+            messages.push(json!({"role":"assistant","tool_calls":[{
+                "id":id,PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567","type":"function",
+                "function":{"name":"read_file","arguments":"{}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":output}));
+            annotate_last_message_cache_breakpoint(&mut messages);
+        }
+        let projected = project_provider_message_metadata(&messages);
+        assert_eq!(projected[4]["content"][0]["tool_use_id"], "Ab1234567");
+        assert_eq!(projected[4]["content"][0]["content"], "second result");
+        assert_eq!(
+            projected[4]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &projected, &messages, 4
+        ));
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-test",
+            "anthropic",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let wire = body["messages"].as_array().unwrap();
+        let results: Vec<_> = wire
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_result")
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "both genuine outputs must reach the provider: {body}"
+        );
+        assert!(results.iter().all(|b| b["tool_use_id"] == "Ab1234567"));
+        assert_eq!(results[1]["content"], "second result");
+        assert_eq!(results[1]["cache_control"]["type"], "ephemeral");
+        assert!(!body.to_string().contains(PROVIDER_TOOL_CALL_ID_FIELD));
+        // Structural linkage is projected; similarly named user data is not.
+        let mut with_data = messages.clone();
+        with_data[4]["content"][0]["content"] = json!({"tool_use_id":"canonical-second"});
+        with_data[4]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"tool_result","tool_use_id":"orphan","content":"unowned"}));
+        let projected = project_provider_message_metadata(&with_data);
+        assert_eq!(
+            projected[4]["content"][0]["content"]["tool_use_id"],
+            "canonical-second"
+        );
+        assert_eq!(projected[4]["content"][1]["tool_use_id"], "orphan");
+    }
+
     #[test]
     fn provider_id_projection_preserves_reused_wire_ids_and_tool_only_suffix() {
         use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;

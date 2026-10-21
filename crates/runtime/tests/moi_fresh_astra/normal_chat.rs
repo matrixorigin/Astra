@@ -75,12 +75,16 @@ pub(super) fn assert_tool_events(events: &[Value]) {
         let starts: Vec<_> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| e["type"] == "tool_call" && e["tool_call"]["id"] == call)
+            .filter(|(_, e)| e["type"] == "tool_call" && e["tool_call"]["function"]["name"] == tool)
             .collect();
+        assert_eq!(starts.len(), 1, "tool start identity: {events:?}");
+        let canonical_id = &starts[0].1["tool_call"]["id"];
+        assert_eq!(canonical_id.as_str().unwrap().len(), 64);
+        assert_ne!(canonical_id, call);
         let ends: Vec<_> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| e["type"] == "tool_call_end" && e["call_id"] == call)
+            .filter(|(_, e)| e["type"] == "tool_call_end" && e["call_id"] == *canonical_id)
             .collect();
         assert_eq!(starts.len(), 1, "tool start identity: {events:?}");
         assert_eq!(ends.len(), 1, "tool result identity: {events:?}");

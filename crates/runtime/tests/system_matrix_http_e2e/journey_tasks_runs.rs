@@ -737,8 +737,15 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let results: Vec<_> = messages.iter().filter(|m| m["role"] == "tool"
             && m["tool_call_id"] == "handoff-search").collect();
         assert_eq!(results.len(), 1);
-        let saved_result = payload["heavy"]["messages"].as_array().unwrap().iter()
-            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "handoff-search").unwrap();
+        let saved_messages = payload["heavy"]["messages"].as_array().unwrap();
+        let saved_calls: Vec<_> = saved_messages.iter().filter_map(|m| m["tool_calls"].as_array())
+            .flatten().filter(|call| call[astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] == "handoff-search").collect();
+        assert_eq!(saved_calls.len(), 1);
+        let saved_id = &saved_calls[0]["id"];
+        assert_eq!(saved_id.as_str().unwrap().len(), 64);
+        assert_ne!(saved_id, "handoff-search");
+        let saved_result = saved_messages.iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == *saved_id).unwrap();
         assert_eq!(results[0]["content"], saved_result["content"], "restore exact settled tool output");
         // Run accounting settles independently of the canonical turn. Hold
         // its actual head so this ordering cannot depend on database timing.

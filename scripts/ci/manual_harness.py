@@ -563,10 +563,12 @@ def run(root, command, timeout, grace, started_at=None):
             replay.read(root / "progress.jsonl", final=True, emit=True)
             return execution["exit_code"] or (0 if replay.summary(execution, "success")["success"] else 1)
     finally:
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-        write_json(root / "execution.json", execution)
-        write_json(root / "summary.json", replay.summary(execution))
+        try:
+            write_json(root / "execution.json", execution)
+            write_json(root / "summary.json", replay.summary(execution))
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 def publish(root):

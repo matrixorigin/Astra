@@ -364,3 +364,7 @@ Deferred-input conflicts refresh the selected observation only while the initiat
 chat/session/run/message still owns it. A conflict never implicitly starts a new
 Run. Unconfirmed submissions report an error and retain the Composer draft for
 review and explicit resubmission; only accepted input receives queued feedback.
+
+Plan-review approvals derive bounded correlation IDs from the Session and tool
+invocation at the existing approval producer. Native invocation IDs are unchanged;
+the review ID and its durable event keys fit the existing interaction columns.

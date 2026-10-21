@@ -105,7 +105,9 @@ async fn server_lifecycle_parallel_reads_preserve_actual_results_and_pairing() {
         "each actual invocation emits one canonical call"
     );
     let call = &emitted[0]["tool_call"];
-    assert_eq!(call["id"], "call-read-evidence");
+    assert_eq!(call["id"].as_str().unwrap().len(), 64);
+    assert_ne!(call["id"], "call-read-evidence");
+    assert_ne!(call["id"], emitted[1]["tool_call"]["id"]);
     assert_eq!(call["function"]["name"], "read_file");
     assert_eq!(call["function"]["arguments"], "{\"path\":\"evidence.txt\"}");
     assert!(call.get("name").is_none());

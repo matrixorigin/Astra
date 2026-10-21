@@ -107,7 +107,7 @@ async fn run_tool_backed_chat_turn(
         if !posted_result
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "ctx-trace-tool-1",
+                &json!({"path":"README.md"}),
                 &ctx.edge_agent_id,
                 "completed",
                 "# README\nfrom tool-backed matrix e2e\n",

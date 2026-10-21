@@ -506,6 +506,44 @@ while True: time.sleep(.05)
                     process.kill()
                     process.wait()
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
+    def test_cancel_finalization_survives_repeated_supervisor_signals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = self.stub(root, "graceful")
+            wrapper = root / "slow_finalizer.py"
+            wrapper.write_text("import sys,time\n"
+                f"sys.path.insert(0, {str(SCRIPT.parent)!r})\n"
+                "import manual_harness as h\n"
+                "original=h.write_json\n"
+                "def write(path,value):\n"
+                "    if path.name=='execution.json' and value.get('exit_code')==130: time.sleep(.15)\n"
+                "    return original(path,value)\n"
+                "h.write_json=write\n"
+                "raise SystemExit(h.main())\n")
+            process = subprocess.Popen(supervised([sys.executable, str(wrapper), "run", "--root", str(root),
+                "--timeout-seconds", "10", "--grace-seconds", "1", "--", str(launcher)]),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={**os.environ, "ASTRA_BUILD_SOURCE_GIT_SHA":SHA})
+            try:
+                end = time.monotonic() + 3
+                while not (root / "progress.jsonl").exists() and time.monotonic() < end:
+                    time.sleep(.01)
+                self.assertTrue((root / "progress.jsonl").exists())
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 130, stderr)
+                self.assertNotIn("private-sentinel", stdout + stderr)
+                execution = json.loads((root / "execution.json").read_text())
+                self.assertEqual(execution, {"exit_code":130, "termination":"cancelled"})
+                summary = json.loads((root / "summary.json").read_text())
+                self.assertEqual(summary["execution"], execution)
+                self.assertFalse(summary["success"])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "existing process supervisor uses Linux subreaper")
     def test_existing_supervisor_reaps_separately_grouped_descendants_after_hard_stop(self):
         with tempfile.TemporaryDirectory() as tmp:

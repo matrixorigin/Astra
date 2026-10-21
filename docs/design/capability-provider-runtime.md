@@ -80,6 +80,10 @@ The existing request adapter restores original assistant/tool pairing and remove
 that field before serializing any provider protocol. Public tool events omit it.
 It grants no execution authority and is not a replay alias or a separate store.
 
+Provider-history ID restoration includes structural tool-result blocks created by
+cache annotation. Their output and cache markers survive native wire conversion;
+result payload data and unowned IDs are not rewritten.
+
 ## First principles
 
 ### Astra owns semantics; protocols supply evidence

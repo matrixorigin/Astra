@@ -490,7 +490,7 @@ pub fn tool_result_payload(parts: astra_thin_client::ToolResultRequestParts) -> 
 
 pub fn maybe_tool_result_payload_from_sse(
     raw_sse: &str,
-    request_id: &str,
+    args: &Value,
     edge_agent_id: &str,
     status: &str,
     output: &str,
@@ -498,8 +498,10 @@ pub fn maybe_tool_result_payload_from_sse(
 ) -> Option<Value> {
     let event = parse_sse_events(raw_sse).into_iter().find(|event| {
         event.get("type").and_then(Value::as_str) == Some("tool_request")
-            && event.get("request_id").and_then(Value::as_str) == Some(request_id)
+            && event["tool"] == "read_file"
+            && event["args"] == *args
     })?;
+    let request_id = event["request_id"].as_str().expect("canonical request ID");
     let field = |name: &str| {
         event
             .get(name)
@@ -1352,3 +1354,5 @@ pub async fn try_claim_interrupted_matrix_e2e_fixture(pool: &SharedPool, user_id
     .expect("claim old interrupted Matrix E2E fixture");
     claim.rows_affected() == 1
 }
+
+pub use super::test_support::call_id_for;

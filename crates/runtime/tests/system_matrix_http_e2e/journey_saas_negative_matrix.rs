@@ -539,7 +539,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
         if !posted_result
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-saas-tool-ok",
+                &json!({"path":"saas-probe.txt"}),
                 &ctx.edge_agent_id,
                 "completed",
                 tool_output,

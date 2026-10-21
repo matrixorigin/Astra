@@ -22,8 +22,8 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, cleanup_session_data, delete_json, get_json, parse_sse_events,
-    post_json, seeded_model_selection, sse_first_data_json_with_type,
+    E2E_PASSWORD, bootstrap, call_id_for, cleanup_session_data, delete_json, get_json,
+    parse_sse_events, post_json, seeded_model_selection, sse_first_data_json_with_type,
     try_claim_interrupted_matrix_e2e_fixture,
 };
 
@@ -62,9 +62,29 @@ async fn captured_tool_receipt(
         outputs.iter().all(|candidate| candidate == model_output),
         "receipt changed between requests"
     );
+    let wire_calls: Vec<_> = requests
+        .iter()
+        .filter_map(|request| request.body["messages"].as_array())
+        .flatten()
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .filter(|call| call["id"] == call_id)
+        .collect();
+    let wire_call = wire_calls
+        .first()
+        .expect("provider received its original invocation linkage");
+    let wire_args: Value =
+        serde_json::from_str(wire_call["function"]["arguments"].as_str().unwrap()).unwrap();
+    let (logical_name, logical_args) = if wire_call["function"]["name"] == "invoke_tool" {
+        (wire_args["name"].as_str().unwrap(), &wire_args["arguments"])
+    } else {
+        (wire_call["function"]["name"].as_str().unwrap(), &wire_args)
+    };
+    let canonical_id = call_id_for(events, logical_name, |args| args == logical_args);
+    assert_ne!(canonical_id, call_id);
     let terminals: Vec<_> = events
         .iter()
-        .filter(|event| event["type"] == "tool_call_end" && event["call_id"] == call_id)
+        .filter(|event| event["type"] == "tool_call_end" && event["call_id"] == canonical_id)
         .collect();
     assert_eq!(terminals.len(), 1, "one terminal per invocation");
     let terminal = terminals[0];
@@ -84,7 +104,7 @@ async fn captured_tool_receipt(
         .bind(&ctx.user_id)
         .bind(&ctx.session_id)
         .bind(root["run_id"].as_str().unwrap())
-        .bind(call_id)
+        .bind(&canonical_id)
         .fetch_all(&ctx.pool)
         .await
         .unwrap();
@@ -94,7 +114,7 @@ async fn captured_tool_receipt(
             &ctx.session_id,
             root["run_id"].as_str().unwrap(),
             &chains[0],
-            call_id,
+            &canonical_id,
         )
         .unwrap();
         let record = astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(
@@ -750,7 +770,7 @@ async fn assert_concurrent_fanout_stream(
         case.name,
     );
 
-    let call_id = format!("{}-fanout-start", case.name);
+    let call_id = call_id_for(&events, "agent_fanout", |args| args["action"] == "start");
     let aggregate = events
         .iter()
         .find(|event| {
@@ -1193,15 +1213,23 @@ pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(exp
         .expect("bounded correction/wait/final sequence")
     {
         bytes.extend_from_slice(&chunk.unwrap());
-        if !wait_observed
-            && parse_sse_events(&String::from_utf8_lossy(&bytes))
-                .iter()
-                .any(|event| {
-                    event["type"] == "tool_call_end"
-                        && event["call_id"] == "wait-for-result"
-                        && event["success"] == true
-                })
-        {
+        if !wait_observed && {
+            let events = parse_sse_events(&String::from_utf8_lossy(&bytes));
+            events.iter().any(|event| {
+                event["type"] == "tool_call"
+                    && serde_json::from_str::<Value>(
+                        event["tool_call"]["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("{}"),
+                    )
+                    .is_ok_and(|args| args["action"] == "wait")
+            }) && events.iter().any(|event| {
+                event["type"] == "tool_call_end"
+                    && event["call_id"]
+                        == call_id_for(&events, "agent", |args| args["action"] == "wait")
+                    && event["success"] == true
+            })
+        } {
             wait_observed = true;
             releases.0[0].notify_one();
         }
@@ -2216,7 +2244,13 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
     let provider_child_ids = loop {
         let chunk = tokio::time::timeout_at(provider_entry_deadline, stream.next())
             .await
-            .expect("all fanout children must enter provider I/O before cancellation")
+            .unwrap_or_else(|_| {
+                let observed = parse_sse_events(&String::from_utf8_lossy(&stream_bytes));
+                let progress: Vec<_> = observed.iter().filter(|event| event["type"] == "agent_progress")
+                    .map(|event| (&event["agent_id"], &event["status"])).collect();
+                let failures: Vec<_> = observed.iter().filter(|event| event["type"] == "tool_call_end" && event["success"] == false).collect();
+                panic!("all fanout children must enter provider I/O before cancellation; progress={progress:?}; failures={failures:?}")
+            })
             .expect("stream ended before all fanout children entered provider I/O")
             .expect("root cancellation stream chunk");
         stream_bytes.extend_from_slice(&chunk);

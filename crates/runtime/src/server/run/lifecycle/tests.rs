@@ -15218,9 +15218,20 @@ async fn server_subrun_initializes_descendant_admission_identity_from_owned_run(
     assert_eq!(descendant_run.session_id, session);
     assert_eq!(descendant_run.parent_run_id.as_deref(), Some(run.as_str()));
     gateway.assert_complete();
-    let identity =
-        astra_turn_types::ToolInvocationIdentity::new(owner, &session, &run, &run, "nested-call")
-            .unwrap();
+    let invocation_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT invocation_id FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ? AND run_id = ?")
+        .bind(owner).bind(&session).bind(&run).fetch_all(pool.get()).await.unwrap();
+    assert_eq!(invocation_ids.len(), 1, "one actual descendant admission");
+    assert_eq!(invocation_ids[0].len(), 64);
+    assert_ne!(invocation_ids[0], "nested-call");
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        owner,
+        &session,
+        &run,
+        &run,
+        &invocation_ids[0],
+    )
+    .unwrap();
     let record = ledger
         .get(&identity)
         .await
@@ -27857,6 +27868,9 @@ async fn stream_chat_plan_tools_refresh_host_prompt_and_gate() {
                     let tool = event["tool"].as_str().unwrap();
                     let request_id = event["request_id"].as_str().unwrap().to_owned();
                     if tool == "exit_plan_mode" {
+                        assert_eq!(request_id.len(), 76, "bounded approval correlation ID");
+                        assert!(format!("server-approval-required:{request_id}").len() <= 128);
+
                         assert!(
                             !workspace.join("proof.txt").exists(),
                             "plan write must be blocked before approval"
@@ -27899,7 +27913,13 @@ async fn stream_chat_plan_tools_refresh_host_prompt_and_gate() {
         "{events:?}"
     );
     assert_eq!(
-        std::fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        std::fs::read_to_string(workspace.join("proof.txt")).unwrap_or_else(|error| {
+            let writes: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "tool_call_end" && event["tool"] == "write_file")
+                .collect();
+            panic!("proof.txt: {error}; actual write receipts: {writes:?}")
+        }),
         "approved\n"
     );
     assert_eq!(

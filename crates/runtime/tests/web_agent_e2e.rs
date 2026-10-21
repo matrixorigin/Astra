@@ -9,6 +9,7 @@
 //! ```
 
 mod test_support;
+use test_support::call_id_for;
 
 use astra_runtime::server::provider_test_support::{
     InferenceLedgerFixture, ProviderGateway, ProviderRequest, ProviderResponse, ProviderScript,
@@ -1494,7 +1495,7 @@ let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Ar
             .messages
             .iter()
             .find(|message| {
-                message.get("tool_call_id").and_then(Value::as_str) == Some("tc-financial-analysis")
+                message.get("tool_call_id").and_then(Value::as_str) == Some(call_id_for(&events, "skill", |args| args["skill_name"] == "financial-analysis").as_str())
             })
             .and_then(|message| message.get("content").and_then(Value::as_str))
             .expect("skill instructions reach the follow-up model round");
@@ -2136,7 +2137,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let serialized = serde_json::to_string(&events).unwrap();
     let launch_receipt = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"].as_str() == Some("call-spawn-reviewer"))
+        .find(|event| event["call_id"].as_str() == Some(call_id_for(&events, "agent", |args| args["description"] == "structured child review").as_str()))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("spawn should return a canonical launch receipt: {serialized}"));
@@ -2399,7 +2400,10 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
 
     let result = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"].as_str() == Some("call-fanout"))
+        .find(|event| {
+            event["call_id"].as_str()
+                == Some(call_id_for(&events, "agent_fanout", |_| true).as_str())
+        })
         .and_then(|event| match &event["result"] {
             Value::String(result) => serde_json::from_str::<Value>(result).ok(),
             result @ Value::Object(_) => Some(result.clone()),
@@ -2473,15 +2477,23 @@ async fn web_agent_parallel_direct_spawns_with_unavailable_model_policy_fail_clo
 
         }
     })).await;
-    for id in ["direct-a", "direct-b"] {
-        let result = find_events(&events, "tool_call_end")
-            .into_iter()
-            .find(|event| event["call_id"].as_str() == Some(id))
-            .and_then(|event| event["result"].as_str())
-            .and_then(|result| serde_json::from_str::<Value>(result).ok())
-            .expect("direct spawn must return a structured rejection");
+    let rejections: Vec<_> = find_events(&events, "tool_call_end")
+        .into_iter()
+        .filter_map(|event| {
+            let result: Value = serde_json::from_str(event["result"].as_str()?).ok()?;
+            (result["error_kind"] == "delegation_model_unavailable").then_some((event, result))
+        })
+        .collect();
+    assert_eq!(
+        rejections.len(),
+        2,
+        "each proposed child must receive one rejection"
+    );
+    assert_ne!(rejections[0].0["call_id"], rejections[1].0["call_id"]);
+    for (event, result) in rejections {
+        assert_eq!(event["call_id"].as_str().unwrap().len(), 64);
+        assert_eq!(event["success"], false);
         assert_eq!(result["status"], "failed");
-        assert_eq!(result["error_kind"], "delegation_model_unavailable");
         assert_eq!(result["advisory"]["executed"], false);
     }
     assert!(find_event_type(&events, "agent_spawned").is_empty());
@@ -2570,7 +2582,9 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     // child completion below when CI is running another E2E concurrently.
     let child_request = wait_for_sse(&mut rx, "tool_request", 10).await;
     assert_eq!(child_request["tool"], "read_file");
-    assert_eq!(child_request["request_id"], "call-child-read-file");
+    let child_call_id = child_request["request_id"].as_str().unwrap().to_owned();
+    assert_eq!(child_call_id.len(), 64);
+    assert_ne!(child_call_id, "call-child-read-file");
     assert_eq!(
         post_tool_result_from_event(
             &app,
@@ -2608,7 +2622,15 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     );
     let spawn_result = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"].as_str() == Some("call-spawn-edge-reviewer"))
+        .find(|event| {
+            event["call_id"].as_str()
+                == Some(
+                    call_id_for(&events, "agent", |args| {
+                        args["description"] == "edge child review"
+                    })
+                    .as_str(),
+                )
+        })
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("edge spawn must return a canonical result: {serialized}"));
@@ -2632,7 +2654,13 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     let routing = find_events(&events, "tool_routing_decision")
         .into_iter()
         .find(|event| {
-            event["call_id"].as_str() == Some("call-spawn-edge-reviewer")
+            event["call_id"].as_str()
+                == Some(
+                    call_id_for(&events, "agent", |args| {
+                        args["description"] == "edge child review"
+                    })
+                    .as_str(),
+                )
                 && event["tool"].as_str() == Some("agent")
         })
         .unwrap_or_else(|| {
@@ -2677,7 +2705,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(
         find_events(&events, "tool_call_end")
             .into_iter()
-            .filter(|event| event["call_id"].as_str() == Some("call-child-read-file"))
+            .filter(|event| event["call_id"].as_str() == Some(child_call_id.as_str()))
             .count(),
         0,
         "the client-owned callback lane must not be duplicated onto the attached parent stream"
@@ -2688,7 +2716,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .iter()
         .position(|event| {
             event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some("call-child-read-file")
+                && event["call_id"].as_str() == Some(child_call_id.as_str())
         })
         .unwrap_or_else(|| panic!("child replay lost its durable tool terminal: {child_replay:?}"));
     let child_finished_index = child_replay
@@ -2704,7 +2732,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
             .iter()
             .filter(|event| {
                 event["type"].as_str() == Some("tool_call_end")
-                    && event["call_id"].as_str() == Some("call-child-read-file")
+                    && event["call_id"].as_str() == Some(child_call_id.as_str())
             })
             .count(),
         1,
@@ -2771,7 +2799,9 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
     );
     let spawn = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"] == "spawn-discovery-child")
+        .find(|event| {
+            event["call_id"] == call_id_for(&events, "agent", |args| args["action"] == "spawn")
+        })
         .and_then(|event| event["result"].as_str())
         .map(|text| serde_json::from_str::<Value>(text).unwrap())
         .expect("launch receipt");
@@ -2980,28 +3010,24 @@ async fn execute_edge_callback_turn(
         if !test_tool_uses_client_ledger(step.tool_name) {
             continue;
         }
-        if step.requires_approval {
+        let approved_id = if step.requires_approval {
             let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
-            assert_eq!(
-                approval["request_id"].as_str(),
-                Some(step.request_id),
-                "{}: approval should match {}",
-                case_name,
-                step.request_id
-            );
-            let status =
-                post_approval_respond(app, &approval_identity, step.request_id, "allow").await;
-            assert_eq!(status, StatusCode::OK, "{}: approval accepted", case_name);
-        }
-
+            let id = approval["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(approval["tool"], step.tool_name);
+            assert_eq!(id.len(), 64);
+            let status = post_approval_respond(app, &approval_identity, &id, "allow").await;
+            assert_eq!(status, StatusCode::OK, "{case_name}: approval accepted");
+            Some(id)
+        } else {
+            None
+        };
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        assert_eq!(
-            request["request_id"].as_str(),
-            Some(step.request_id),
-            "{}: tool_request should match {}",
-            case_name,
-            step.request_id
-        );
+        assert_eq!(request["tool"], step.tool_name);
+        assert_eq!(request["args"], step.args);
+        assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+        if let Some(id) = approved_id {
+            assert_eq!(request["request_id"], id);
+        }
         let status =
             post_tool_result_from_event(app, &request, step.result_output, "completed").await;
         assert_eq!(
@@ -3081,7 +3107,8 @@ async fn run_tool_scenario(case: EdgeCallbackScenario) {
         assert_eq!(
             find_events(&events, "tool_request")
                 .iter()
-                .filter(|event| event["request_id"] == step.request_id)
+                .filter(|event| event["request_id"]
+                    == call_id_for(&events, step.tool_name, |args| args == &step.args))
                 .count(),
             1
         );
@@ -3271,7 +3298,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     let tool_call = find_event(&events, "tool_call")
         .unwrap_or_else(|| panic!("expected tool_call event: {events:?}"));
-    assert_eq!(tool_call["tool_call"]["id"], "call-bash-binding");
+    assert_eq!(tool_call["tool_call"]["function"]["name"], "bash");
+    assert_ne!(tool_call["tool_call"]["id"], "call-bash-binding");
     // The provider event is an intent, not an execution receipt.  It must not
     // claim the host's default owner before admission selects a route.
     assert!(tool_call.get("workspace").is_none());
@@ -3281,7 +3309,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     // Route-owned lifecycle events are the authoritative execution evidence.
     let tool_end = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"] == "call-bash-binding")
+        .find(|event| event["call_id"] == call_id_for(&events, "bash", |_| true))
         .unwrap_or_else(|| panic!("expected routed tool_call_end event: {events:?}"));
     assert_eq!(tool_end["workspace"]["kind"], "server_sandbox");
     assert_eq!(tool_end["executor"]["kind"], "server_local");
@@ -3506,7 +3534,8 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         .collect();
     for (index, (id, output)) in outputs.iter().enumerate() {
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        assert_eq!(request["request_id"], *id);
+        assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+        assert_ne!(request["request_id"], *id);
         if index == 0 {
             assert_eq!(request["args"], complex_args);
             assert_eq!(
@@ -3574,9 +3603,10 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
             .iter()
             .map(|call| call["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        outputs[..5]
+        find_events(&events, "tool_call")
             .iter()
-            .map(|(id, _)| id.as_str())
+            .take(5)
+            .map(|event| event["tool_call"]["id"].as_str().unwrap())
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -3591,9 +3621,9 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         .collect::<Vec<_>>();
     assert_eq!(
         result_ids,
-        outputs
+        find_events(&events, "tool_call")
             .iter()
-            .map(|(id, _)| id.as_str())
+            .map(|event| event["tool_call"]["id"].as_str().unwrap())
             .collect::<Vec<_>>()
     );
     assert!(messages.iter().all(|message| {
@@ -3683,7 +3713,13 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let result = requests[0]
         .messages
         .iter()
-        .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-1"))
+        .find(|message| {
+            message.get("tool_call_id").and_then(Value::as_str)
+                == Some(
+                    call_id_for(&events, "skill", |args| args["skill_name"] == "test-skill")
+                        .as_str(),
+                )
+        })
         .and_then(|message| message.get("content").and_then(Value::as_str))
         .unwrap_or("");
     assert!(
@@ -3839,7 +3875,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         "one Server loop should emit one observation"
     );
     assert!(requests[0].messages.iter().any(|message| {
-        message.get("tool_call_id").and_then(Value::as_str) == Some("tc-cli-server-skill")
+        message.get("tool_call_id").and_then(Value::as_str)
+            == Some(call_id_for(&events, "skill", |_| true).as_str())
     }));
     drop(requests);
 
@@ -3901,7 +3938,13 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .messages
         .iter()
         .find(|message| {
-            message.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-unknown")
+            message.get("tool_call_id").and_then(Value::as_str)
+                == Some(
+                    call_id_for(&events, "skill", |args| {
+                        args["skill_name"] == "missing-skill"
+                    })
+                    .as_str(),
+                )
         })
         .and_then(|message| message.get("content").and_then(Value::as_str))
         .unwrap_or("");
@@ -4043,7 +4086,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-err-1"));
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(request["request_id"], "tc-err-1");
     assert_eq!(
         post_tool_result_from_event(&app, &request, "status=error: file not found", "failed").await,
         StatusCode::OK
@@ -4105,12 +4149,19 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     // Wait for the approval_required SSE, then approve, then post tool result.
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_approval_respond(&app, &approval_identity, "tc-approve-1", "allow").await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let st = post_approval_respond(
+        &app,
+        &approval_identity,
+        approval["request_id"].as_str().unwrap(),
+        "allow",
+    )
+    .await;
     assert_eq!(st, 200, "approval POST failed");
 
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-approve-1"));
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(request["request_id"], "tc-approve-1");
     let st = post_tool_result_from_event(&app, &request, "written", "completed").await;
     assert_eq!(st, 200, "tool result POST failed");
 
@@ -4211,29 +4262,31 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .iter()
         .filter_map(|req| req.get("request_id").and_then(Value::as_str))
         .collect();
-    assert_eq!(approval_ids, vec!["tc-write-a", "tc-write-b"]);
+    assert_eq!(approval_ids.len(), 2);
+    assert_ne!(approval_ids[0], approval_ids[1]);
+    assert!(approval_ids.iter().all(|id| id.len() == 64));
 
     let read_request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(
-        read_request["request_id"].as_str(),
-        Some("tc-read-first"),
+        read_request["tool"].as_str(),
+        Some("read_file"),
         "earlier read-only call should execute before later approval-gated block"
     );
     let st = post_tool_result_from_event(&app, &read_request, "read-ok", "completed").await;
     assert_eq!(st, 200, "read-only tool result POST failed");
 
-    let st = post_approval_respond(&app, &approval_identity, "tc-write-a", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, approval_ids[0], "allow").await;
     assert_eq!(st, 200, "first approval POST failed");
-    let st = post_approval_respond(&app, &approval_identity, "tc-write-b", "allow").await;
+    let st = post_approval_respond(&app, &approval_identity, approval_ids[1], "allow").await;
     assert_eq!(st, 200, "second approval POST failed");
 
     let write_request_a = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
+    assert_eq!(write_request_a["request_id"], approval_ids[0]);
     let st = post_tool_result_from_event(&app, &write_request_a, "write-a-ok", "completed").await;
     assert_eq!(st, 200, "first write result POST failed");
 
     let write_request_b = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
+    assert_eq!(write_request_b["request_id"], approval_ids[1]);
     let st = post_tool_result_from_event(&app, &write_request_b, "write-b-ok", "completed").await;
     assert_eq!(st, 200, "second write result POST failed");
 
@@ -4246,14 +4299,14 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .iter()
         .position(|event| {
             event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-read-first")
+                && event["request_id"] == read_request["request_id"]
         })
         .expect("read tool_request");
     let first_write_request_pos = events
         .iter()
         .position(|event| {
             event.get("type").and_then(Value::as_str) == Some("tool_request")
-                && event.get("request_id").and_then(Value::as_str) == Some("tc-write-a")
+                && event["request_id"] == approval_ids[0]
         })
         .expect("first write tool_request");
     assert!(
@@ -4311,8 +4364,14 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     // Deny the approval.
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_approval_respond(&app, &approval_identity, "tc-deny-1", "deny").await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let st = post_approval_respond(
+        &app,
+        &approval_identity,
+        approval["request_id"].as_str().unwrap(),
+        "deny",
+    )
+    .await;
     assert_eq!(st, 200, "approval deny POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4362,7 +4421,8 @@ async fn cancelled_edge_run_stops_inference_and_clears_its_callback_ledger() {
     let response=chat_stream_start(&app,json!({"message":MESSAGE,"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},"context":{"edge_tools":[tool_schema("read_file")]}})).await;
     let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"], "native-cancel");
+    assert_eq!(request["tool"], "read_file");
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
     let run_id = request["run_id"].as_str().unwrap();
     let (status, list) = list_runs(&app, 10).await;
     assert_eq!(status, StatusCode::OK);
@@ -4543,9 +4603,8 @@ async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() 
                         }
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
-    // Execution identity belongs to the provider. The runtime must not mint
-    // one because doing so makes replay, callback, and durable pairing
-    // ambiguous.
+    // A canonical invocation requires unambiguous provider linkage. Missing
+    // linkage must fail before admission or Edge delivery.
     let payload = json!({
         "message": "auto-id test",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
@@ -4579,7 +4638,8 @@ async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() 
             .iter()
             .any(|event| event["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("provider tool-call protocol violation"))),
+                .is_some_and(|message| message
+                    .contains("provider tool-call identity is missing or malformed"))),
         "the identity contract failure must remain observable: {events:?}"
     );
 
@@ -4672,18 +4732,19 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let approval_identity = wait_for_approval_identity(&mut rx).await;
-    wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
     let st = post_approval_respond(
         &app,
         &approval_identity,
-        "tc-session-approve",
+        approval["request_id"].as_str().unwrap(),
         "allow_session",
     )
     .await;
     assert_eq!(st, 200);
 
     let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(request["request_id"].as_str(), Some("tc-session-approve"));
+    assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(request["request_id"], "tc-session-approve");
     let st = post_tool_result_from_event(&app, &request, "ok", "completed").await;
     assert_eq!(st, 200);
 
@@ -5433,7 +5494,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         ("tc-guidance-r9", "[package]\nname = \"astra\""),
     ] {
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        assert_eq!(request["request_id"].as_str(), Some(id));
+        assert_eq!(request["request_id"].as_str().unwrap().len(), 64);
+        assert_ne!(request["request_id"], id);
         let status = post_tool_result_from_event(&app, &request, result, "completed").await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -5535,7 +5597,9 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .expect("reader task failed");
     assert_eq!(
         callback_request_ids.first().map(String::as_str),
-        Some("tc-analysis-r1"),
+        find_events(&events, "tool_call")
+            .first()
+            .and_then(|e| e["tool_call"]["id"].as_str()),
         "the first logical call must be dispatched before results can be reused"
     );
     assert!(
@@ -5614,14 +5678,16 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(first["request_id"], "tc-budget-r1");
     assert_eq!(
         post_tool_result_from_event(&app, &first, "module contents", "completed").await,
         StatusCode::OK
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
+    assert_eq!(second["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(second["request_id"], "tc-budget-r2");
     assert_eq!(
         post_tool_result_from_event(&app, &second, "src/lib.rs\nsrc/main.rs", "completed").await,
         StatusCode::OK
@@ -5691,7 +5757,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(body).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(first["request_id"], "tc-hard-limit-r1");
     assert_eq!(
         post_tool_result_from_event(&app, &first, "module contents", "completed").await,
         StatusCode::OK
@@ -5769,11 +5836,11 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
     assert_eq!(
         tool_requests[0]["request_id"].as_str(),
-        Some("tc-hard-limit-r1")
+        first["request_id"].as_str()
     );
     let rejected = find_events(&events, "tool_call_end")
         .into_iter()
-        .find(|event| event["call_id"] == "tc-hard-limit-r2")
+        .find(|event| event["tool"] == "glob")
         .expect("the denied second provider attempt must have one terminal projection");
     assert_eq!(rejected["status"], "rejected");
     assert_eq!(rejected["success"], false);
@@ -5844,7 +5911,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(first["request_id"].as_str(), Some("tc-budget-fail-r1"));
+    assert_eq!(first["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(first["request_id"], "tc-budget-fail-r1");
     assert_eq!(
         post_tool_result_from_event(&app, &first, "transient read failure", "partial_failure")
             .await,
@@ -5852,7 +5920,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(second["request_id"].as_str(), Some("tc-budget-fail-r2"));
+    assert_eq!(second["request_id"].as_str().unwrap().len(), 64);
+    assert_ne!(second["request_id"], "tc-budget-fail-r2");
     assert_eq!(
         post_tool_result_from_event(&app, &second, "permission denied", "denied").await,
         StatusCode::OK
