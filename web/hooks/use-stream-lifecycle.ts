@@ -696,12 +696,20 @@ export function useStreamLifecycle(
     }
     if (isArchived || detail.pendingTurn || runControlBusy || !detail.session?.backendSessionId || !binding ||
       sameRunBinding(attachedRunRef.current, binding) ||
-      sameRunBinding(autoAttachAttemptedRunRef.current, binding) ||
       !Number.isSafeInteger(detail.activeRun?.nextEventIndex) || detail.activeRun!.nextEventIndex! < 0 ||
       !hasAssistant) return;
+    const attempted = sameRunBinding(autoAttachAttemptedRunRef.current, binding);
+    if (stop && !stop.retired && sameRunBinding(stop.binding, binding) && detail.activeRun?.status !== "cancelling") {
+      // Recovery follows committed selection, including a late cancellation
+      // rejection. Hand off once; normal observation owns all later retries.
+      stop.retire();
+      if (attempted && !autoAttachRetryTimerRef.current) scheduleAutoAttachRetry(binding);
+    }
+    if (attempted) return;
     autoAttachAttemptedRunRef.current = binding;
     attachExistingRunStream(binding, detail.activeRun!.nextEventIndex!);
-  }, [detail, isArchived, runControlBusy, runAttachRetrySignal, attachExistingRunStream, clearAttachedRun]);
+  }, [detail, isArchived, runControlBusy, runAttachRetrySignal, attachExistingRunStream,
+    clearAttachedRun, scheduleAutoAttachRetry]);
 
   // -- Start new stream --
   const startStream = useCallback(
@@ -1273,8 +1281,6 @@ export function useStreamLifecycle(
         if (owns()) {
           hydrate();
           scheduleReconciliation(STOP_RECONCILE_INITIAL_DELAY_MS);
-          const recoveredBinding = streamBinding(detailRef.current);
-          if (recoveredBinding) scheduleAutoAttachRetry(recoveredBinding);
           addToast(error instanceof Error ? error.message : "Failed to stop the active run.", "error");
         }
       } finally {
@@ -1282,7 +1288,7 @@ export function useStreamLifecycle(
       }
     })();
   }, [addToast, canStopRun, chatListHref, clearAttachedRun, detail,
-    hydrateWorkSurfaceForChat, scheduleAutoAttachRetry, setDetail, setStoppingRun, router]);
+    hydrateWorkSurfaceForChat, setDetail, setStoppingRun, router]);
 
   // -- Resume active run --
   const resumeActiveRun = useCallback(async () => {

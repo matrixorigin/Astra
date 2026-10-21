@@ -378,6 +378,8 @@ continues only against its captured root; delayed responses, reconciliation and
 rollback cannot mutate a successor binding or newer root facts. Browser cleanup
 belongs to the initiating operation, and Stop status reads never overlap.
 
-If Stop fails and the same binding remains attachable, live observation recovers
-through the existing bounded GET retry owner without resetting its budget or
-replaying the turn.
+When a committed Stop outcome restores the same attachable binding, live
+observation recovers through the existing bounded GET retry owner. This includes
+reconciliation after a pending cancellation is rejected, not only an HTTP error.
+The handoff preserves the budget and cursor, never replays the turn, and leaves
+paused/terminal outcomes to their existing lifecycle semantics.
