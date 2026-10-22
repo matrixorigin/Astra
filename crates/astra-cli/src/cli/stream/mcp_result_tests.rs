@@ -222,6 +222,7 @@ async fn callback_through_pipeline(
         max_consecutive_empty_name: 3,
         tool_call_records: &mut records,
         tool_event_hooks: &astra_runtime::skills::hooks::ToolEventHookRegistry::default(),
+        client_skill_execution: None,
         term: &mut NoopHeadlessTerminal,
         mailbox: None,
         permission_context: None,

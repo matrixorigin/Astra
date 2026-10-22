@@ -247,6 +247,8 @@ activation of that Skill; they do not instruct premature completion of the task.
 The activation owner captures the complete safety-governed body before
 model-budget truncation. Normal delivery and recovery derive from those same
 bytes; continuation preserves emitted redaction markers without regenerating
-them or replaying activation. Client-pipeline callbacks are governed before
-entering the invocation facts; ordinary delivery consumes that same governed
+them or replaying activation. Existing continuation bodies pass through this
+same safety projection when accepted. Client-pipeline invocation facts are
+recorded from the complete final governed result after PostToolUse hooks and
+successful result persistence; ordinary delivery consumes that same governed
 callback body.

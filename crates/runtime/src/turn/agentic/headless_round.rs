@@ -156,6 +156,12 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub max_consecutive_empty_name: u32,
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
+    /// Existing Skill ledger and current client catalog, borrowed by the final
+    /// result owner so recovery retains the post-hook body before truncation.
+    pub client_skill_execution: Option<(
+        &'a [astra_turn_types::SkillCatalogIdentity],
+        &'a mut crate::turn::agentic_loop::host::SkillExecutionState,
+    )>,
     pub term: &'a mut dyn HeadlessRoundTerminal,
     pub mailbox: Option<&'a mut astra_messaging::router::AgentMailbox>,
     pub permission_context: Option<&'a PermissionSyncHandle>,
@@ -314,6 +320,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         max_consecutive_empty_name,
         tool_call_records,
         tool_event_hooks,
+        client_skill_execution,
         term,
         mailbox,
         permission_context,
@@ -454,6 +461,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             max_consecutive_empty_name,
             tool_call_records,
             tool_event_hooks,
+            client_skill_execution,
             term,
             mailbox,
             permission_context,

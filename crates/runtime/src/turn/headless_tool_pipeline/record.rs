@@ -967,6 +967,32 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
             };
 
+        // The final governed source is still complete here, even if persistence
+        // replaced its presentation with an artifact or bounded inline result.
+        // Admit instructions only after hooks, finalization and persistence have
+        // succeeded; the original callback supplies provenance, never content.
+        if !is_err
+            && execution.edge_terminal_authority
+            && execution.name == crate::turn::skill_tool::SKILL_TOOL_NAME
+            && let Some((catalog, skill_execution)) = self.ctx.client_skill_execution.as_mut()
+            && let Some(call) =
+                self.ctx.tool_calls.iter().find(|call| {
+                    call.get("id").and_then(Value::as_str) == Some(execution.id.as_str())
+                })
+            && let Some(edge) = self.ctx.edge_tool_round.iter().find(|edge| {
+                edge.tool_call_id() == Some(execution.id.as_str())
+                    && edge.tool_name() == execution.name
+            })
+        {
+            skill_execution.record_client_pipeline_skill(
+                catalog,
+                call,
+                edge,
+                &journal_result_source,
+                self.ctx.session_turn,
+            );
+        }
+
         if !runtime_advisories.is_empty() || execution.tool_result_fields.is_some() {
             astra_turn_core::tool::result::advisory::set_advisories(
                 execution
