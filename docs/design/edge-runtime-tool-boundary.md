@@ -201,6 +201,13 @@ explicit `allow_structural_change` control.
 Text replacements reject invalid UTF-8 before changing file bytes or recording
 journal entries, rather than silently replacing unrelated bytes during decoding.
 
+The CLI file-state guard compares current bytes with the captured content
+digest; a modification-time change alone does not invalidate read authority.
+Only a confirmed missing target may proceed without tracked content identity.
+Metadata, content-read and state-lock failures reject validation. Whole-file
+overwrites still require complete content authority, and publication retains
+its independent prepared-preimage check.
+
 Single and batch replacement candidates share the same matching owner, including
 quote-normalized ambiguity rejection, quote-style preservation and structural
 validation. Batch edits resolve sequentially against the current candidate;

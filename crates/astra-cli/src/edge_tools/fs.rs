@@ -5405,6 +5405,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn staleness_allows_identical_content_after_mtime_changes() {
+        for rewrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = test_executor_in(dir.path());
+            let path = dir.path().join("doc.md");
+            std::fs::write(&path, "original\n").unwrap();
+            exe.read_file(&json!({"path": "doc.md"}));
+            let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            if rewrite {
+                std::fs::write(&path, "original\n").unwrap();
+            }
+            let changed_mtime = original_mtime + std::time::Duration::from_secs(10);
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(changed_mtime)
+                .unwrap();
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                original_mtime
+            );
+
+            let result: Value = serde_json::from_str(&exe.write_file(&json!({
+                "path": "doc.md", "content": "agent update\n"
+            })))
+            .unwrap();
+            assert_eq!(result["success"], true, "rewrite={rewrite}: {result}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "agent update\n");
+        }
+    }
+
+    #[test]
+    fn staleness_preserves_external_content_regardless_of_mtime() {
+        for epoch in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = test_executor_in(dir.path());
+            let path = dir.path().join("doc.md");
+            std::fs::write(&path, "original\n").unwrap();
+            exe.read_file(&json!({"path": "doc.md"}));
+            let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let mtime = if epoch {
+                std::time::UNIX_EPOCH
+            } else {
+                original_mtime
+            };
+            std::fs::write(&path, "external update\n").unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+
+            let args = json!({"path": "doc.md", "content": "agent update\n"});
+            let result: Value = serde_json::from_str(&exe.write_file(&args)).unwrap();
+            assert_eq!(result["success"], false, "epoch={epoch}: {result}");
+            assert!(result["error"].as_str().unwrap().contains("read_file"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "external update\n");
+
+            exe.read_file(&json!({"path": "doc.md"}));
+            let result: Value = serde_json::from_str(&exe.write_file(&args)).unwrap();
+            assert_eq!(result["success"], true, "fresh read: {result}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "agent update\n");
+        }
+    }
+
+    #[test]
+    fn staleness_requires_read_before_multi_edit_at_epoch_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "original\n").unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            std::time::UNIX_EPOCH
+        );
+        let args = json!({
+            "path": "doc.md", "edits": [{"old_str": "original", "new_str": "updated"}]
+        });
+
+        let result = exe.multi_edit(&args);
+        assert!(result.contains("has not been read"), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+        exe.read_file(&json!({"path": "doc.md"}));
+        let result = exe.multi_edit(&args);
+        assert!(result.contains("Applied 1 edit"), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated\n");
+    }
+
+    #[tokio::test]
+    async fn staleness_keeps_independent_session_read_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = test_executor_in(dir.path());
+        let second = test_executor_in(dir.path());
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "original\n").unwrap();
+        let read = json!({"path": "doc.md"});
+        let (first_read, second_read) = tokio::join!(
+            first.execute("read_file", &read),
+            second.execute("read_file", &read)
+        );
+        assert!(first_read.contains("original"), "{first_read}");
+        assert!(second_read.contains("original"), "{second_read}");
+
+        let result = first
+            .execute(
+                "write_file",
+                &json!({"path": "doc.md", "content": "first\n"}),
+            )
+            .await;
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        let update = json!({"path": "doc.md", "content": "second\n"});
+        let result = second.execute("write_file", &update).await;
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["success"], false, "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        let result = second.execute("read_file", &read).await;
+        assert!(result.contains("first"), "{result}");
+        let result = second.execute("write_file", &update).await;
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+    }
+
     /// Scenario: external modification between read and write (linter, user edit).
     /// The staleness guard must catch this.
     #[test]
