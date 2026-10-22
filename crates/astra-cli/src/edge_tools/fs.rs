@@ -560,13 +560,26 @@ impl ToolExecutor {
         }
 
         let is_ranged = has_range;
-        let normalized_range = is_ranged.then(|| {
-            normalize_read_file_line_range(
+        let normalized_range = if is_ranged {
+            let total_lines = raw_content.lines().count();
+            let range = normalize_read_file_line_range(
                 start_raw.map(|n| n as usize),
                 end_raw.map(|n| n as usize),
-                raw_content.lines().count(),
-            )
-        });
+                total_lines,
+            );
+            // A full-file optimization must not turn a past-EOF request
+            // (including a ranged read of an empty file) into success.
+            if range.start_line > total_lines {
+                return Err(format!(
+                    "Error: start_line {} exceeds file length {}",
+                    range.start_line, total_lines
+                )
+                .into());
+            }
+            Some(range)
+        } else {
+            None
+        };
         // Auto-expand: promote ranged reads to full-file reads when the file
         // is small enough. This eliminates fragmented multi-range reads that
         // waste tool calls (e.g., 6 read_file calls for different hunks of
@@ -676,16 +689,8 @@ impl ToolExecutor {
                 .to_string()
                 .into());
         };
-        let s = range.start_line.saturating_sub(1).min(lines.len());
+        let s = range.start_line.saturating_sub(1);
         let e = range.end_line.min(lines.len());
-        if s >= lines.len() {
-            return Err(format!(
-                "Error: start_line {} exceeds file length {}",
-                range.start_line,
-                lines.len()
-            )
-            .into());
-        }
         if s >= e {
             return Ok(format!(
                 "(empty range: start_line {} >= end_line {} or file has only {} lines)",

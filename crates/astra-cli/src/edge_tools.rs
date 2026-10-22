@@ -11619,6 +11619,7 @@ pub(crate) mod tests {
     mod executor_core_tests;
 
     mod lsp_tests;
+    mod read_file_range_tests;
     mod sandbox_tests;
     mod schema_tests;
     mod self_mod_tests;
