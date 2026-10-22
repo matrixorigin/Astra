@@ -1575,6 +1575,71 @@ pub(crate) struct InvokedSkillRef<'a> {
     pub content: &'a str,
 }
 
+/// Presence is established by delivered instructions, never by a call, a
+/// short receipt or user-authored prose. Reuse canonical call pairing and the
+/// existing authority/rendering owners rather than tracking another cache.
+fn retained_invoked_skills<'a>(
+    history: &[Value],
+    runtime_context: &[Value],
+    skills: &[InvokedSkillRef<'a>],
+) -> std::collections::HashSet<&'a str> {
+    let by_name: std::collections::HashMap<_, _> =
+        skills.iter().map(|skill| (skill.name, skill)).collect();
+    let mut retained = std::collections::HashSet::new();
+    for (index, call) in
+        astra_turn_core::compression_types::unique_tool_observations(history).into_values()
+    {
+        if !crate::turn::skill_tool::is_skill_activation_call(call) {
+            continue;
+        }
+        let Some(name) = crate::turn::skill_tool::extract_skill_name(call) else {
+            continue;
+        };
+        let Some((&name, skill)) = by_name.get_key_value(name.as_str()) else {
+            continue;
+        };
+        if !skill.content.is_empty()
+            && astra_turn_core::prompt_facing::extract_text_content(&history[index])
+                .is_some_and(|text| text.starts_with(skill.content))
+        {
+            retained.insert(name);
+        }
+    }
+    let matches_attachment = |name: &str, payload: &str| {
+        by_name.get_key_value(name).and_then(|(&name, skill)| {
+            let expected =
+                astra_turn_core::cloud_attachments::SkillAttachment::new(name, skill.content)
+                    .to_message();
+            (expected["content"].as_str() == Some(payload)).then_some(name)
+        })
+    };
+    for (index, message) in history.iter().enumerate() {
+        if astra_turn_types::append_only_runtime_authority_is_active(history, index)
+            && let Ok(frame) = astra_turn_types::parse_append_only_runtime_authority_frame(message)
+            && let Some(name) = frame.kind.strip_prefix("invoked_skill_context:")
+            && let Some(name) = matches_attachment(name, &frame.payload)
+        {
+            retained.insert(name);
+        }
+    }
+    // Rehoming already validated lifetime and provenance. Only the latest
+    // projection of each kind can establish the body that will reach the wire.
+    let mut seen = std::collections::HashSet::new();
+    for message in runtime_context.iter().rev() {
+        if let Some(name) = runtime_authority_kind_for_projection(message)
+            .and_then(|kind| kind.strip_prefix("invoked_skill_context:"))
+            && seen.insert(name)
+            && is_runtime_system_context(message)
+            && is_required_runtime_preamble(message)
+            && let Some(payload) = message["content"].as_str()
+            && let Some(name) = matches_attachment(name, payload)
+        {
+            retained.insert(name);
+        }
+    }
+    retained
+}
+
 const COMPACTION_CONTEXT_NOTE: &str = "\
 Context was compacted before this point. This runtime note is not a new user \
 request and does not authorize resuming old tasks. Use the latest real user \
@@ -1752,11 +1817,15 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
 
     if !attachments.invoked_skills.is_empty() {
         let mut builder = astra_turn_core::cloud_attachments::AttachmentBuilder::new();
-        // Caller supplies `invoked_skills` already in the preferred order
-        // (most-recent-first). Emitting in the same order matches legacy
-        // output — do not re-sort here; re-sorting would flip bytes.
+        let retained = retained_invoked_skills(
+            &compacted_messages,
+            &runtime_system_messages,
+            &attachments.invoked_skills,
+        );
         for skill in &attachments.invoked_skills {
-            builder.add_skill(skill.name, skill.content);
+            if !retained.contains(skill.name) {
+                builder.add_skill(skill.name, skill.content);
+            }
         }
         let built = builder.build();
         runtime_system_messages.extend(built.to_messages().into_iter().filter_map(|message| {
@@ -3250,6 +3319,109 @@ mod tests {
                 astra_turn_types::runtime_authority_lifetime(frame),
                 Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn)
             );
+        }
+    }
+
+    #[test]
+    fn retained_skill_frames_preserve_lifetime_payload_and_recovery_budget() {
+        let content = "x".repeat(astra_turn_core::cloud_attachments::MAX_CHARS_PER_SKILL);
+        let names = ["a", "b", "c", "d", "e", "new"];
+        let attachments = PostCompactAttachments {
+            invoked_skills: names
+                .iter()
+                .map(|name| InvokedSkillRef {
+                    name,
+                    content: &content,
+                })
+                .collect(),
+        };
+        let assemble = |history, preamble, attachments: &PostCompactAttachments<'_>, capability| {
+            assemble_llm_messages_with_cache_capability_output(
+                vec![json!({"role":"system", "content":"stable"})],
+                preamble,
+                Vec::new(),
+                history,
+                attachments,
+                "sid",
+                "openai",
+                "deployment",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(capability),
+                &cache_cfg(),
+            )
+            .unwrap()
+        };
+        let first = assemble(
+            vec![json!({"role":"user", "content":"work"})],
+            Vec::new(),
+            &attachments,
+            append_only_required_capability(),
+        );
+        assert_eq!(first.new_append_only_runtime_messages.len(), 5);
+        let mut history = vec![json!({"role":"user", "content":"work"})];
+        history.extend(first.new_append_only_runtime_messages);
+        let next = assemble(
+            history.clone(),
+            Vec::new(),
+            &attachments,
+            append_only_required_capability(),
+        );
+        assert_eq!(
+            next.new_append_only_runtime_messages.len(),
+            1,
+            "already delivered frames must not consume the budget needed by the missing skill"
+        );
+        assert_eq!(
+            astra_turn_types::runtime_authority_kind(&next.new_append_only_runtime_messages[0]),
+            Some("invoked_skill_context:new")
+        );
+
+        let single = PostCompactAttachments {
+            invoked_skills: vec![InvokedSkillRef {
+                name: "a",
+                content: &content,
+            }],
+        };
+        for case in ["active", "expired", "changed", "rehomed"] {
+            let mut projected = history[..2].to_vec();
+            let mut preamble = Vec::new();
+            if case == "expired" {
+                projected.push(json!({"role":"user", "content":"next human request"}));
+            } else if case == "changed" {
+                projected[1]["content"] = projected[1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .replace("xxxx", "yyyy")
+                    .into();
+            } else if case == "rehomed" {
+                preamble = rehome_append_only_runtime_authority(&mut projected).unwrap();
+            }
+            let result = assemble(
+                projected,
+                preamble,
+                &single,
+                if case == "rehomed" {
+                    required_only_tail_capability()
+                } else {
+                    append_only_required_capability()
+                },
+            );
+            assert_eq!(
+                result.new_append_only_runtime_messages.len(),
+                usize::from(matches!(case, "expired" | "changed")),
+                "{case}"
+            );
+            if case == "rehomed" {
+                assert_eq!(
+                    result
+                        .messages
+                        .iter()
+                        .filter(|m| runtime_authority_kind_for_projection(m)
+                            == Some("invoked_skill_context:a"))
+                        .count(),
+                    1
+                );
+            }
         }
     }
 

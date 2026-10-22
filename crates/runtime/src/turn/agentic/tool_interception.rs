@@ -1145,16 +1145,16 @@ pub(crate) fn dedup_skill_calls(
                 let message = if locked_out {
                     format!(
                         "BLOCKED: Skill '{}' is locked out for this turn after {} re-entries. \
-                         This call was NOT executed. Produce your final answer now using the \
-                         instructions already loaded (turn {}).",
+                         This call was NOT executed. Do not activate this skill again. Use the \
+                         instructions already loaded (turn {}) and continue unfinished authorized work.",
                         name, reentry, invoked_at,
                     )
                 } else if reentry >= 2 {
                     format!(
                         "STOP: Skill '{}' is already loaded (turn {}, reentry={}). \
                          You have called `skill` with this name {} times. \
-                         Do NOT call `skill` again for the remainder of this turn. \
-                         Respond to the user directly from the evidence you already have.",
+                         Do NOT call `skill` again with this name for the remainder of this turn. \
+                         Use the loaded instructions and continue unfinished authorized work.",
                         name, invoked_at, reentry, reentry,
                     )
                 } else {
@@ -1279,7 +1279,7 @@ async fn intercept_skill_calls(
     }
 
     let current_turn = (state.max_turns - state.remaining_turns) as u32;
-    for result in &sr {
+    for result in &mut sr {
         if let Some(tc) = fresh_tool_calls
             .iter()
             .find(|t| t.get("id").and_then(Value::as_str) == Some(result.tool_call_id.as_str()))
@@ -1287,6 +1287,10 @@ async fn intercept_skill_calls(
             let name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(name) = name {
                 if result.ok && crate::turn::skill_tool::is_skill_activation_call(tc) {
+                    result.result = astra_turn_core::tool_result_sanitize::tool_result_content_for_model_unbounded(
+                        crate::turn::skill_tool::SKILL_TOOL_NAME,
+                        &result.result,
+                    );
                     let execution_topology = crate::turn::skill_tool::declared_execution_topology(
                         resolver.as_ref(),
                         &name,
@@ -2852,6 +2856,8 @@ mod tests {
             "STOP message should be directive, got: {}",
             res2.result
         );
+        assert!(res2.result.contains("continue unfinished authorized work"));
+        assert!(!res2.result.contains("Respond to the user directly"));
         assert_eq!(meta2.reentry_count, 2);
         assert!(
             !meta2.locked_out,
@@ -2870,6 +2876,8 @@ mod tests {
             "third re-entry should hit BLOCKED lockout, got: {}",
             res3.result
         );
+        assert!(res3.result.contains("continue unfinished authorized work"));
+        assert!(!res3.result.contains("final answer now"));
         assert!(meta3.locked_out);
         assert_eq!(meta3.reentry_count, 3);
         assert_eq!(

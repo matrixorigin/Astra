@@ -935,7 +935,12 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         skill_result.push_str("\n\n");
         skill_result.push_str(&notice);
     }
-    let content_for_model = astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
+    let skill_result =
+        astra_turn_core::tool_result_sanitize::tool_result_content_for_model_unbounded(
+            crate::turn::skill_tool::SKILL_TOOL_NAME,
+            &skill_result,
+        );
+    let content_for_model = astra_turn_core::tool_result_sanitize::truncate_tool_result_for_model(
         crate::turn::skill_tool::SKILL_TOOL_NAME,
         &skill_result,
     );

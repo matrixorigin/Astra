@@ -233,3 +233,18 @@ continues to use `detect_workspace_context`.
 The unused `theme::strip_ansi` source API is retired. Terminal rendering tests
 use the same ANSI parser as production width calculation; rendering and
 terminal-control behavior remain unchanged.
+
+Admitted Skill instructions are recovered from the existing execution facts when
+absent from the actual request history, including ordinary requests after a
+pre-turn rewrite and continuation restore. A local compaction flag is not a
+presence certificate. A unique activation/result pair carrying the delivered
+body, or a valid active recovery frame carrying its bounded rendering, avoids
+reinjection. Calls, resource reads, short receipts and user-authored quotations
+do not prove instruction delivery. Recovery uses the existing attachment budget
+and wire placement without resolving or activating the Skill again, performing
+auxiliary inference, or accessing the database. Re-entry limits block repeated
+activation of that Skill; they do not instruct premature completion of the task.
+The activation owner captures the complete safety-governed body before
+model-budget truncation. Normal delivery and recovery derive from those same
+bytes; continuation preserves emitted redaction markers without regenerating
+them or replaying activation.

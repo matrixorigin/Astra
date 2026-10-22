@@ -19956,7 +19956,6 @@ mod tests {
                     volatile_preamble: Vec::new(),
                     compacted_messages: history,
                     state: &mut state,
-                    compaction_boundary_hit: false,
                     thinking: &thinking,
                     session_id: "session",
                     provider: "openai",

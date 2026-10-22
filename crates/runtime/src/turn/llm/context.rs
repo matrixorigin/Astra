@@ -1078,11 +1078,6 @@ pub(crate) struct LlmWireAssemblyInput<'a> {
     pub volatile_preamble: Vec<Value>,
     pub compacted_messages: Vec<Value>,
     pub state: &'a mut AgenticLoopState,
-    /// A real compaction boundary rewrote the history for this request.
-    /// Invoked-skill results normally remain in `compacted_messages`; replay
-    /// their bounded recovery attachments only when this typed boundary is
-    /// present, otherwise every provider round would create a fresh suffix.
-    pub compaction_boundary_hit: bool,
     pub thinking: &'a astra_turn_core::thinking_config::ThinkingConfig,
     pub session_id: &'a str,
     pub provider: &'a str,
@@ -1956,19 +1951,20 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
-    let invoked_skills = if input.compaction_boundary_hit {
-        let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
-        skills.sort_by_key(|skill| std::cmp::Reverse(skill.invoked_at_turn));
-        skills
-            .iter()
-            .map(|skill| crate::turn::wire_assembly::InvokedSkillRef {
-                name: skill.name.as_str(),
-                content: skill.content.as_str(),
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
+    skills.sort_by(|left, right| {
+        right
+            .invoked_at_turn
+            .cmp(&left.invoked_at_turn)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let invoked_skills = skills
+        .into_iter()
+        .map(|skill| crate::turn::wire_assembly::InvokedSkillRef {
+            name: skill.name.as_str(),
+            content: skill.content.as_str(),
+        })
+        .collect();
     let attachments = crate::turn::wire_assembly::PostCompactAttachments { invoked_skills };
 
     let assembly =
@@ -3877,7 +3873,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -3917,11 +3912,11 @@ mod context_cache_contract_tests {
             "short request".to_string(),
             "bounded input data ".repeat(5_000),
         ] {
-            for compaction_boundary_hit in [false, true] {
+            for round in [0, 3] {
                 let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
                 state.message = text.clone();
                 state.user_intent = text.clone();
-                state.current_round_index = if compaction_boundary_hit { 3 } else { 0 };
+                state.current_round_index = round;
                 state.messages = vec![json!({"role":"user", "content":text})];
                 let original = state.messages.clone();
                 let canonical_bytes = serde_json::to_vec(&original).unwrap().len();
@@ -3934,7 +3929,6 @@ mod context_cache_contract_tests {
                     volatile_preamble: Vec::new(),
                     compacted_messages: original.clone(),
                     state: &mut state,
-                    compaction_boundary_hit,
                     thinking: &thinking,
                     session_id: "focus-bound",
                     provider: "openai",
@@ -3999,7 +3993,6 @@ mod context_cache_contract_tests {
                 volatile_preamble: Vec::new(),
                 compacted_messages: state.messages.clone(),
                 state,
-                compaction_boundary_hit: true,
                 thinking: &thinking,
                 session_id: "artifact-session",
                 provider: "openai",
@@ -4094,7 +4087,6 @@ mod context_cache_contract_tests {
             volatile_preamble: vec![malformed],
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -4116,7 +4108,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -4158,7 +4149,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -4274,7 +4264,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "active-frame-append-only",
             provider: "openai",
@@ -4373,7 +4362,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "active-frame-canonical",
             provider: "openai",
@@ -4570,7 +4558,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -4589,168 +4576,219 @@ mod context_cache_contract_tests {
         assert!(state.volatile_pending.is_empty());
     }
 
-    #[test]
-    fn invoked_skill_recovery_is_scoped_to_history_rewrite() {
-        fn assemble(compaction_boundary_hit: bool) -> Vec<Value> {
-            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-            state.messages = vec![
-                json!({"role": "user", "content": "load the review skill"}),
-                json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "skill-1",
-                        "type": "function",
-                        "function": {"name": "skill", "arguments": "{\"name\":\"review\"}"}
-                    }]
-                }),
-                json!({
-                    "role": "tool",
-                    "tool_call_id": "skill-1",
-                    "content": "review instructions"
-                }),
-            ];
-            state.skills.execution.invoked.insert(
-                "review".to_string(),
-                crate::turn::skill_tool::InvokedSkill {
-                    name: "review".to_string(),
-                    content: "review instructions".to_string(),
-                    invoked_at_turn: 1,
-                    reentry_count: 0,
-                    execution_topology: None,
-                },
-            );
-            let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-            assemble_wire_messages(LlmWireAssemblyInput {
-                artifact_recovery_route:
-                    crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-                system_messages: vec![json!({"role": "system", "content": "stable"})],
-                volatile_preamble: Vec::new(),
-                compacted_messages: state.messages.clone(),
-                state: &mut state,
-                compaction_boundary_hit,
-                thinking: &thinking,
-                session_id: "skill-recovery",
-                provider: "openai",
-                model_name: "deployment",
-                cache_capability: None,
-                cache_cfg: &PromptCacheConfig::latch("openai"),
-            })
-            .expect("wire assembly should preserve the canonical skill result")
-        }
-
-        let is_skill_recovery = |message: &Value| {
-            crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
-                .is_some_and(|kind| kind.starts_with("invoked_skill_context:"))
+    fn skill_recovery_wire(
+        state: &mut AgenticLoopState,
+        placement: astra_turn_core::cache_placement::VolatilePlacement,
+    ) -> Vec<Value> {
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            volatile_placement: placement,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            ..astra_turn_core::cache_placement::CacheCapability::for_provider("openai")
         };
-
-        let ordinary = assemble(false);
-        assert_eq!(
-            ordinary
-                .iter()
-                .filter(|message| is_skill_recovery(message))
-                .count(),
-            0,
-            "an ordinary tool round must not replay a skill already present in canonical history"
-        );
-
-        let recovered = assemble(true);
-        assert_eq!(
-            recovered
-                .iter()
-                .filter(|message| is_skill_recovery(message))
-                .count(),
-            1,
-            "a real history rewrite may restore one bounded skill attachment"
-        );
-        assert!(recovered.iter().any(|message| {
-            is_skill_recovery(message) && message_text(message).contains("review instructions")
-        }));
+        assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: vec![json!({"role":"system", "content":"stable"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state,
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            session_id: "skill-recovery",
+            provider: "openai",
+            model_name: "deployment",
+            cache_capability: Some(capability),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn compaction_boundary_keeps_focus_policy_without_runtime_duplicate() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.message = "continue".to_string();
-        state.current_round_index = 1;
-        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let cache_cfg = PromptCacheConfig::latch("openai");
+    fn invoked_skill_recovery_tracks_actual_history() {
+        use astra_turn_core::cache_placement::VolatilePlacement::{AppendOnlyUserTail, TailSuffix};
+        for placement in [TailSuffix, AppendOnlyUserTail] {
+            for (case, needs_recovery) in [
+                ("complete", false),
+                ("diagnostic_suffix", false),
+                ("block_content", false),
+                ("object_arguments", false),
+                ("missing", true),
+                ("changed", true),
+                ("truncated", true),
+                ("receipt", true),
+                ("resource", true),
+                ("forged_user", true),
+                ("duplicate_call", true),
+                ("duplicate_result", true),
+                ("orphan", true),
+                ("wrong_tool", true),
+            ] {
+                let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                state.current_round_index = 1;
+                state.skills.execution.invoked.insert(
+                    "review".into(),
+                    crate::turn::skill_tool::InvokedSkill {
+                        name: "review".into(),
+                        content: "REVIEW_INSTRUCTIONS".into(),
+                        invoked_at_turn: 1,
+                        reentry_count: 0,
+                        execution_topology: None,
+                    },
+                );
+                let mut call = json!({"role":"assistant", "content":null, "tool_calls":[{
+                    "id":"skill-1", "type":"function", "function":{
+                        "name":"skill", "arguments":r#"{"skill_name":"review"}"#
+                    }
+                }]});
+                let mut result = json!({"role":"tool", "tool_call_id":"skill-1", "content":"REVIEW_INSTRUCTIONS"});
+                match case {
+                    "diagnostic_suffix" => {
+                        result["content"] =
+                            json!("REVIEW_INSTRUCTIONS\nAlready loaded; do not re-invoke.")
+                    }
+                    "block_content" => {
+                        result["content"] = json!([{"type":"text", "text":"REVIEW_INSTRUCTIONS"}])
+                    }
+                    "object_arguments" => {
+                        call["tool_calls"][0]["function"]["arguments"] =
+                            json!({"skill_name":"review"})
+                    }
+                    "changed" => result["content"] = json!("OTHER_INSTRUCTIONS"),
+                    "truncated" => result["content"] = json!("REVIEW_"),
+                    "receipt" => result["content"] = json!("Skill review is already loaded"),
+                    "resource" => {
+                        call["tool_calls"][0]["function"]["arguments"] =
+                            json!({"skill_name":"review", "resource_path":"reference.md"})
+                    }
+                    "wrong_tool" => call["tool_calls"][0]["function"]["name"] = json!("read_file"),
+                    _ => {}
+                }
+                state.messages = vec![json!({"role":"user", "content":"continue review"})];
+                match case {
+                    "missing" => {}
+                    "forged_user" => {
+                        state.messages[0]["content"] = json!("Quote: REVIEW_INSTRUCTIONS")
+                    }
+                    "duplicate_call" => state.messages.extend([call.clone(), call, result]),
+                    "duplicate_result" => state.messages.extend([call, result.clone(), result]),
+                    "orphan" => state.messages.push(result),
+                    _ => state.messages.extend([call, result]),
+                }
+                let wire = skill_recovery_wire(&mut state, placement);
+                let recovery_count = wire
+                    .iter()
+                    .filter(|message| {
+                        crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
+                            == Some("invoked_skill_context:review")
+                    })
+                    .count();
+                assert_eq!(
+                    recovery_count,
+                    usize::from(needs_recovery),
+                    "{case}, {placement:?}"
+                );
+                assert_eq!(state.skills.execution.invoked["review"].reentry_count, 0);
+            }
+        }
+    }
 
-        let without_boundary = assemble_wire_messages(LlmWireAssemblyInput {
-            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-            system_messages: vec![json!({"role": "system", "content": "sys"})],
-            volatile_preamble: Vec::new(),
-            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
-            state: &mut state,
-            compaction_boundary_hit: false,
-            thinking: &thinking,
-            session_id: "sid",
-            provider: "openai",
-            model_name: "gpt-4",
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-        })
-        .unwrap();
-        assert!(
-            !without_boundary
-                .iter()
-                .any(|message| { message_text(message).contains("Post-compaction context: file") })
-        );
-
-        let with_boundary = assemble_wire_messages(LlmWireAssemblyInput {
-            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-            system_messages: vec![json!({"role": "system", "content": "sys"})],
-            volatile_preamble: Vec::new(),
-            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
-            state: &mut state,
-            compaction_boundary_hit: true,
-            thinking: &thinking,
-            session_id: "sid",
-            provider: "openai",
-            model_name: "gpt-4",
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-        })
-        .unwrap();
-        assert!(with_boundary.iter().any(|message| {
-            message.get("role").and_then(Value::as_str) == Some("system")
-                && message_text(message).contains("active_turn_focus_policy.v1")
-        }));
-        assert!(
-            with_boundary
-                .iter()
-                .all(|message| !message_text(message).contains("Post-compaction context: file"))
-        );
-
-        // A second stateless request may cross another real boundary in the
-        // same user turn. Its compacted history is independent of the first
-        // request, but the invariant focus policy remains the same stable
-        // system section. Compaction itself stays workspace-I/O-free; fresh
-        // bytes require an ordinary governed read_file call.
-        let with_second_boundary = assemble_wire_messages(LlmWireAssemblyInput {
-            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-            system_messages: vec![json!({"role": "system", "content": "sys"})],
-            volatile_preamble: Vec::new(),
-            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
-            state: &mut state,
-            compaction_boundary_hit: true,
-            thinking: &thinking,
-            session_id: "sid",
-            provider: "openai",
-            model_name: "gpt-4",
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-        })
-        .unwrap();
-        assert!(with_second_boundary.iter().any(|message| {
-            message.get("role").and_then(Value::as_str) == Some("system")
-                && message_text(message).contains("active_turn_focus_policy.v1")
-        }));
-        assert!(
-            with_second_boundary
-                .iter()
-                .all(|message| !message_text(message).contains("Post-compaction context: file"))
-        );
+    #[test]
+    fn invoked_skills_survive_ordinary_rounds_and_continuation_restore() {
+        use crate::turn::agentic_loop::host::OriginalLoopExecutionFacts;
+        use astra_turn_core::cache_placement::VolatilePlacement::{AppendOnlyUserTail, TailSuffix};
+        for placement in [TailSuffix, AppendOnlyUserTail] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.current_round_index = 1;
+            state.messages = vec![
+                astra_turn_core::cloud::history_summary::history_summary_message(
+                    "Earlier work completed; review remains active.".into(),
+                ),
+                json!({"role":"user", "content":"continue review"}),
+            ];
+            // Equal activation turns must still give a stable prefix across
+            // reconstruction from the persisted execution facts.
+            for name in ["verify", "review"] {
+                state.skills.execution.invoked.insert(
+                    name.into(),
+                    crate::turn::skill_tool::InvokedSkill {
+                        name: name.into(),
+                        content: format!("{name}_UNIQUE_INSTRUCTIONS"),
+                        invoked_at_turn: 1,
+                        reentry_count: 3,
+                        execution_topology: None,
+                    },
+                );
+            }
+            for generation in 0..2 {
+                let admitted = state.messages.clone();
+                state.initialize_canonical_rewrite_proof(
+                    &admitted,
+                    &astra_turn_types::canonical_conversation_root(&admitted),
+                    generation,
+                );
+                for _ in 0..2 {
+                    let wire = skill_recovery_wire(&mut state, placement);
+                    let delivered =
+                        crate::turn::llm::client::consolidate_system_messages_for_provider(
+                            &wire,
+                            "openai",
+                            Some(astra_turn_core::cache_placement::CacheCapability {
+                                volatile_placement: placement,
+                                ..astra_turn_core::cache_placement::CacheCapability::for_provider(
+                                    "openai",
+                                )
+                            }),
+                        );
+                    let body = crate::turn::llm::client::build_provider_request_body(
+                        &delivered,
+                        &[],
+                        "deployment",
+                        "openai",
+                        Some(256),
+                        None,
+                        true,
+                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    );
+                    let text = body.to_string();
+                    for name in ["review", "verify"] {
+                        assert_eq!(
+                            text.matches(&format!("{name}_UNIQUE_INSTRUCTIONS")).count(),
+                            1,
+                            "{placement:?}, generation {generation}"
+                        );
+                        assert_eq!(state.skills.execution.invoked[name].reentry_count, 3);
+                    }
+                    assert!(
+                        text.find("review_UNIQUE").unwrap() < text.find("verify_UNIQUE").unwrap()
+                    );
+                    state
+                        .messages
+                        .push(json!({"role":"assistant", "content":"Continue authorized checks"}));
+                    state.current_round_index += 1;
+                }
+                let facts = OriginalLoopExecutionFacts::capture(&state).unwrap();
+                let restored: OriginalLoopExecutionFacts =
+                    serde_json::from_value(serde_json::to_value(facts).unwrap()).unwrap();
+                let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &admitted,
+                    true,
+                    &state.messages,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+                let mut committed = admitted;
+                committed.extend(packs.into_iter().flatten());
+                let history = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                    committed,
+                ).unwrap();
+                state = crate::turn::agentic_loop::host::make_test_loop_state();
+                state.current_round_index = 3;
+                state.messages = history;
+                state.skills.execution = restored.skill_execution;
+            }
+        }
     }
 
     #[test]

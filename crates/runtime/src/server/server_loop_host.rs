@@ -17885,7 +17885,6 @@ impl ServerAgenticLoopHost {
         cache_cfg: &PromptCacheConfig,
         final_tools: &[Value],
         requested_output_tokens: usize,
-        compaction_boundary_hit: bool,
     ) -> Result<
         (
             Vec<Value>,
@@ -17900,7 +17899,6 @@ impl ServerAgenticLoopHost {
         let mut assembly = None;
         let mut selected_output_tokens = requested_output_tokens;
         let mut final_wire_compaction_boundary = None;
-        let mut compaction_boundary_hit = compaction_boundary_hit;
         for pass in 0..2 {
             let candidate = crate::turn::llm::context::assemble_wire_messages_with_drained(
                 &mut crate::turn::llm::context::LlmWireAssemblyInput {
@@ -17913,7 +17911,6 @@ impl ServerAgenticLoopHost {
                     volatile_preamble: volatile_preamble.clone(),
                     compacted_messages: history.clone(),
                     state,
-                    compaction_boundary_hit,
                     thinking: &thinking,
                     session_id: &self.session_id,
                     provider: &llm_cfg.provider,
@@ -17975,7 +17972,6 @@ impl ServerAgenticLoopHost {
                     active_work_context,
                 );
                 final_wire_compaction_boundary = Some(boundary);
-                compaction_boundary_hit = true;
                 continue;
             }
             state.restore_volatile_attempt_lease();
@@ -20692,7 +20688,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &cache_cfg,
                 &final_tools,
                 max_output_tokens,
-                compaction_boundary_hit,
             ) {
             Ok(assembled) => assembled,
             Err(error) => {
@@ -24748,7 +24743,6 @@ mod tests {
                 &PromptCacheConfig::default(),
                 &[],
                 256,
-                false,
             )
             .expect("final wire fits the bounded test window");
 
@@ -24816,7 +24810,6 @@ mod tests {
                 &PromptCacheConfig::default(),
                 &[],
                 256,
-                false,
             )
             .expect("bounded emergency history rewrite should settle");
 

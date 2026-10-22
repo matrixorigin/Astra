@@ -158,7 +158,9 @@ impl SkillContext {
 pub struct InvokedSkill {
     /// Canonical skill name.
     pub name: String,
-    /// Full instructions returned on first invocation.
+    /// Complete safety-governed instructions captured at activation, before
+    /// model-budget truncation. Recovery/resume reuse these bytes and their
+    /// emitted redaction markers without resolving or sanitizing them again.
     pub content: String,
     /// Turn number captured at activation time, **before** the LLM turn that
     /// triggered the activation has committed.
