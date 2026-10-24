@@ -1,8 +1,8 @@
 //! Shared identity-fencing primitives for durable observation writes.
 //!
 //! A caller owns the persisted identity and payload schema. This module owns
-//! only deterministic hashing and the three outcomes a storage implementation
-//! may expose after an owner-scoped identity readback.
+//! deterministic hashing, insertion proofs, and the three capture outcomes.
+//! Ambiguous inserts require an owner-scoped identity readback.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -39,6 +39,26 @@ pub enum DurableCaptureOutcome {
         stored_payload_hash: String,
         attempted_payload_hash: String,
     },
+}
+
+/// Prove that an INSERT IGNORE batch created every distinct, bounded event ID.
+/// A short insert, replay, collision, or potentially truncated identity still
+/// requires owner-scoped readback. Database-collation aliases cannot pass the
+/// count check when they collapse into one stored identity.
+pub fn all_agent_event_rows_were_inserted<'a>(
+    reported_rows_inserted: u64,
+    mut event_ids: impl ExactSizeIterator<Item = &'a str>,
+) -> bool {
+    if event_ids.len() == 0 || usize::try_from(reported_rows_inserted).ok() != Some(event_ids.len())
+    {
+        return false;
+    }
+    let mut identities = std::collections::HashSet::with_capacity(event_ids.len());
+    event_ids.all(|event_id| {
+        !event_id.is_empty()
+            && event_id.len() <= crate::storage::AGENT_EVENT_ID_LEN
+            && identities.insert(event_id)
+    })
 }
 
 /// Classify a row read back in the inserting transaction. Write markers must
@@ -183,6 +203,24 @@ fn hash_frame(hasher: &mut Sha256, value: &[u8]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn full_insert_requires_exact_count_and_distinct_bounded_identities() {
+        let prove =
+            |count, ids: &[&str]| all_agent_event_rows_were_inserted(count, ids.iter().copied());
+        assert!(prove(2, &["a", "b"]));
+        assert!(!prove(1, &["a", "b"]));
+        assert!(!prove(3, &["a", "b"]));
+        assert!(!prove(0, &[]));
+        assert!(!prove(0, &["a"]));
+        assert!(!prove(2, &["a", "a"]));
+        assert!(!prove(1, &[""]));
+        assert!(prove(1, &[&"x".repeat(crate::storage::AGENT_EVENT_ID_LEN)]));
+        assert!(!prove(
+            1,
+            &[&"x".repeat(crate::storage::AGENT_EVENT_ID_LEN + 1)]
+        ));
+    }
 
     #[test]
     fn classification_requires_both_matching_hash_and_attempt() {

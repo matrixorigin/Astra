@@ -51,7 +51,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
             }
         }, vec![ProviderResponse::OpenAi(json!({"model":"glm-5.3", "choices":[{"index":0,"message":{"role":"assistant","content":"finished","reasoning_content":"final"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}))]),
     ]).await;
-    let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
     let mut execution = test_gateway_execution(
         format!("{}/v1/chat/completions", provider.base_url),
         Some(2000),
@@ -63,7 +63,7 @@ async fn glm_captured_reasoning_is_exact_on_second_and_third_provider_requests()
     let mut host = test_host_builder("replay-user", "replay-session")
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_admitted_model_execution(Some(execution))
         .build();
     let mut state = create_durable_execution_test_state("replay-session");

@@ -987,6 +987,61 @@ pub(crate) enum LlmStreamUpdate {
     ToolCall { index: usize, tool_call: Value },
 }
 
+/// Exact transport-owned identity of one observed physical provider request.
+///
+/// This bridges transport-owned serialized bytes and the turn-level trace.
+/// Identity is allocated before dispatch for request-local diagnostics;
+/// identity alone does not prove admission, delivery or durable recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderRequestObservation {
+    pub request_id: String,
+    pub request_hash: String,
+    pub attempt: u32,
+    pub protocol: crate::turn::llm::client::LlmProviderProtocol,
+    pub provider_wire_bytes: u64,
+    pub composition: crate::turn::llm::client::ProviderWireComposition,
+    pub fingerprints: crate::turn::llm::client::ProviderWireFingerprints,
+}
+
+impl ProviderRequestObservation {
+    pub(crate) fn from_wire(
+        request_id: String,
+        attempt: u32,
+        wire: &ProviderWireRequestIdentity,
+    ) -> Self {
+        Self {
+            request_id,
+            request_hash: wire.provider_wire_hash.clone(),
+            attempt,
+            protocol: wire.protocol,
+            provider_wire_bytes: wire.provider_wire_bytes,
+            composition: wire.composition.clone(),
+            fingerprints: wire.fingerprints.clone(),
+        }
+    }
+
+    pub(crate) fn matches_wire(&self, wire: &ProviderWireRequestIdentity) -> bool {
+        self.request_hash == wire.provider_wire_hash
+            && self.protocol == wire.protocol
+            && self.provider_wire_bytes == wire.provider_wire_bytes
+            && self.composition == wire.composition
+            && self.fingerprints == wire.fingerprints
+    }
+}
+
+/// One physical request and its terminal fact, when observed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderAttemptObservation {
+    pub request: ProviderRequestObservation,
+    /// Runtime transport observation for this physical attempt. Admission and
+    /// dispatch are separate facts; one retry starting transport must not make
+    /// another merely prepared request look sent.
+    pub dispatch_started: bool,
+    pub terminal: Option<astra_services::InferenceInvocationTerminal>,
+    /// None means not dispatched; an empty sample means dispatched, unknown.
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+}
+
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 
 /// Short-lived provider route material for one model call.
@@ -1144,9 +1199,11 @@ pub(crate) enum ProviderAttemptAdmission {
     Paused(u32),
 }
 
-/// Durable observer for physical provider requests.
+/// Execution control and observations for physical provider requests.
 ///
-/// `begin_attempt` must commit and return `Admitted` before HTTP is sent. A
+/// `begin_attempt` must validate its owner's authority and return `Admitted`
+/// before HTTP is sent. Durable accounting observers commit their admission;
+/// Run-owned agent observers use existing Run controls without a database write. A
 /// `Paused` index is retained for re-admission after the pause wait; it grants
 /// no delivery authority. Every admitted index is completed exactly once,
 /// including retryable failures. Logical invocation lifecycle remains owned
@@ -4033,55 +4090,6 @@ fn strip_internal_runtime_markers_with_ids(
     }
 }
 
-/// Project canonical messages through provider presentation and metadata removal.
-///
-/// Canonical history retains typed provenance so intent, recovery, and
-/// append-only authority consumers can distinguish runtime-owned messages.
-/// Provider requests render per-tool guidance and remove internal metadata.
-/// Equality checks across these representations must use this same projection,
-/// including its derived content, roles, ordering, and provider-visible fields.
-#[cfg(test)]
-fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
-    let mut projected = messages.to_vec();
-    for message in &mut projected {
-        crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
-    }
-    strip_internal_runtime_markers(&mut projected);
-    projected
-}
-
-/// Return whether the request ends in the exact provider-visible projection
-/// of a staged canonical append.
-///
-/// This is intentionally a shape check, not a content classifier: the only
-/// differences accounted for are the same typed metadata and derived guidance
-/// presentation handled at the provider boundary.
-pub(crate) fn provider_request_preserves_projected_canonical_suffix(
-    provider_messages: &[Value],
-    canonical_history: &[Value],
-    append_cursor: usize,
-) -> bool {
-    let Some(suffix_len) = canonical_history.len().checked_sub(append_cursor) else {
-        return false;
-    };
-    let Some(suffix_start) = provider_messages.len().checked_sub(suffix_len) else {
-        return false;
-    };
-    if suffix_len == 0 {
-        return true;
-    }
-    // Scan only IDs in the prefix; never clone earlier argument/output payloads.
-    // A tool-only suffix still needs its earlier assistant's wire-ID metadata.
-    let mut actual = provider_messages[suffix_start..].to_vec();
-    strip_internal_runtime_markers_with_ids(&mut actual, &provider_history_ids(provider_messages));
-    let mut expected = canonical_history[append_cursor..].to_vec();
-    strip_internal_runtime_markers_with_ids(
-        &mut expected,
-        &provider_history_ids(canonical_history),
-    );
-    actual == expected
-}
-
 fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
@@ -4845,6 +4853,7 @@ pub(crate) async fn call_llm_and_collect(
 
 /// Execute one logical provider boundary with explicit tool authority and optional budget.
 /// An explicit budget is a new logical invocation, never a hidden transport retry.
+#[cfg(test)]
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
@@ -4918,14 +4927,32 @@ fn discrete_judgment_provenance(
     .then_some(astra_turn_types::JudgmentResponseProvenance::DiscreteDecision)
 }
 
-async fn call_llm_and_collect_with_total_budget(
-    call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+/// A fully projected streaming request. Observations and transport share these
+/// exact serialized bytes; preparing a request grants no execution authority.
+pub(crate) struct PreparedStreamingCall<'a> {
+    purpose: astra_turn_types::InferencePurpose,
+    route: LlmExecutionRoute<'a>,
+    request: PreparedProviderRequest,
+    wire_output_limit: Option<usize>,
+    authorized_tool_names: HashSet<String>,
+    url: String,
+    judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     tool_choice: RuntimeToolChoice,
-    total_budget: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    preparation_elapsed: std::time::Duration,
+}
+
+impl PreparedStreamingCall<'_> {
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &ProviderWireRequestIdentity {
+        self.request.identity()
+    }
+}
+
+pub(crate) fn prepare_streaming_call(
+    call: LlmCall<'_>,
+    tool_choice: RuntimeToolChoice,
+) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
+    let preparation_started = Instant::now();
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
@@ -4934,19 +4961,13 @@ async fn call_llm_and_collect_with_total_budget(
     }
     call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
-    let logical_total_budget = total_budget;
-    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
-    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
-    let LlmCall {
-        purpose,
-        messages,
-        tools,
-        cache_capability,
-        route,
-        max_output_tokens,
-        temperature,
-        thinking,
-    } = call;
+    let messages = call.messages;
+    let tools = call.tools;
+    let cache_capability = call.cache_capability;
+    let route = &call.route;
+    let max_output_tokens = call.max_output_tokens;
+    let temperature = call.temperature;
+    let thinking = call.thinking;
     let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
         route.request_body_overrides,
         route.fixed_temperature,
@@ -4959,41 +4980,13 @@ async fn call_llm_and_collect_with_total_budget(
     } else {
         temperature
     };
-    let LlmExecutionRoute {
-        fixed_temperature: _,
-        supported_reasoning_efforts: _,
-        thinking_protocol,
-        model_name,
-        wire_model_name,
-        api_key,
-        base_url,
-        provider,
-        header_overrides,
-        request_body_overrides,
-        completions_url_override,
-        request_timeout,
-    } = route;
-    let cooldown = rate_limit_cooldown();
-    // `model_key` indexes rate-limit state on the local row name.
-    let model_key = model_name;
-    // `upstream_name` is what goes in the outbound request body + URL.
-    let upstream_name = wire_model_name.unwrap_or(model_name);
+    let provider = route.provider;
+    let model_name = route.model_name;
+    let upstream_name = route.wire_model_name.unwrap_or(model_name);
+    let base_url = route.base_url;
+    let request_body_overrides = route.request_body_overrides;
+    let thinking_protocol = route.thinking_protocol;
     validate_request_body_overrides(request_body_overrides)?;
-
-    let started = Instant::now();
-    let controlled_attempt_observer =
-        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
-            inner,
-            started,
-            work_budget: total_budget,
-            logical_budget: logical_total_budget,
-            cancel,
-        });
-    let attempt_observer = controlled_attempt_observer
-        .as_ref()
-        .map(|observer| observer as &dyn ProviderAttemptObserver);
-    let client = global_llm_client();
-
     // Project system messages according to the declared transport/cache shape.
     // A current-user-only capability consolidates them at the head; protocols
     // that admit a runtime system suffix preserve that boundary.
@@ -5057,14 +5050,115 @@ async fn call_llm_and_collect_with_total_budget(
 
     let url = llm_request_url(
         base_url,
-        completions_url_override,
+        route.completions_url_override,
         provider,
         upstream_name,
         true,
     );
+    Ok(PreparedStreamingCall {
+        purpose: call.purpose,
+        route: call.route,
+        request: prepared_request,
+        wire_output_limit,
+        authorized_tool_names,
+        url,
+        judgment_provenance,
+        tool_choice,
+        preparation_elapsed: preparation_started.elapsed(),
+    })
+}
+
+#[cfg(test)]
+async fn call_llm_and_collect_with_total_budget(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let prepared = prepare_streaming_call(call, tool_choice)?;
+    call_prepared_llm_with_total_budget(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    )
+    .await
+}
+
+pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: Option<std::time::Duration>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let total_budget = total_budget.unwrap_or_else(|| match prepared.tool_choice {
+        RuntimeToolChoice::Auto => llm_total_budget(),
+        RuntimeToolChoice::None => auxiliary_execution_budget(prepared.purpose, llm_total_budget()),
+    });
+    call_prepared_llm_with_total_budget(
+        prepared,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        total_budget,
+    )
+    .await
+}
+
+async fn call_prepared_llm_with_total_budget(
+    prepared: PreparedStreamingCall<'_>,
+    cancel: LlmCancel<'_>,
+    mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let PreparedStreamingCall {
+        purpose,
+        route,
+        request: prepared_request,
+        wire_output_limit,
+        authorized_tool_names,
+        url,
+        judgment_provenance,
+        preparation_elapsed,
+        ..
+    } = prepared;
+    let LlmExecutionRoute {
+        model_name,
+        api_key,
+        base_url: _,
+        provider,
+        header_overrides,
+        request_timeout,
+        completions_url_override,
+        ..
+    } = route;
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
-
+    let model_key = model_name;
+    let cooldown = rate_limit_cooldown();
+    let logical_total_budget = total_budget;
+    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
+    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
+    // Count request projection against provider work, while a retained pause
+    // or database admission wait keeps its existing separate deadline owner.
+    let started = Instant::now() - preparation_elapsed;
+    let controlled_attempt_observer =
+        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
+            inner,
+            started,
+            work_budget: total_budget,
+            logical_budget: logical_total_budget,
+            cancel,
+        });
+    let attempt_observer = controlled_attempt_observer
+        .as_ref()
+        .map(|observer| observer as &dyn ProviderAttemptObserver);
+    let client = global_llm_client();
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
     let mut last_model_gateway_error = None;
@@ -7300,22 +7394,6 @@ pub(crate) async fn call_llm_nonstream(
     .await
 }
 
-#[cfg(test)]
-pub(crate) async fn call_llm_nonstream_no_tool_choice(
-    client: &reqwest::Client,
-    call: LlmCall<'_>,
-    timeout: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_nonstream_with_attempt_observer_and_tool_choice(
-        client,
-        call,
-        timeout,
-        None,
-        RuntimeToolChoice::None,
-    )
-    .await
-}
-
 pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     client: &reqwest::Client,
     call: LlmCall<'_>,
@@ -7332,7 +7410,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     .await
 }
 
-async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
@@ -8138,133 +8216,6 @@ pub(crate) fn parse_openai_sse_json_stream(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn annotated_tool_results_preserve_provider_linkage_and_cache_markers() {
-        use astra_turn_core::context::serializer::annotate_last_message_cache_breakpoint;
-        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
-        let mut messages = vec![json!({"role":"user","content":"Read twice"})];
-        for (id, output) in [
-            ("canonical-first", "first result"),
-            ("canonical-second", "second result"),
-        ] {
-            messages.push(json!({"role":"assistant","tool_calls":[{
-                "id":id,PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567","type":"function",
-                "function":{"name":"read_file","arguments":"{}"}}]}));
-            messages.push(json!({"role":"tool","tool_call_id":id,"content":output}));
-            annotate_last_message_cache_breakpoint(&mut messages);
-        }
-        let projected = project_provider_message_metadata(&messages);
-        assert_eq!(projected[4]["content"][0]["tool_use_id"], "Ab1234567");
-        assert_eq!(projected[4]["content"][0]["content"], "second result");
-        assert_eq!(
-            projected[4]["content"][0]["cache_control"]["type"],
-            "ephemeral"
-        );
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &projected, &messages, 4
-        ));
-        let body = build_provider_request_body(
-            &messages,
-            &[],
-            "claude-test",
-            "anthropic",
-            None,
-            None,
-            true,
-            &ThinkingConfig::Off,
-        );
-        let wire = body["messages"].as_array().unwrap();
-        let results: Vec<_> = wire
-            .iter()
-            .filter_map(|m| m["content"].as_array())
-            .flatten()
-            .filter(|b| b["type"] == "tool_result")
-            .collect();
-        assert_eq!(
-            results.len(),
-            2,
-            "both genuine outputs must reach the provider: {body}"
-        );
-        assert!(results.iter().all(|b| b["tool_use_id"] == "Ab1234567"));
-        assert_eq!(results[1]["content"], "second result");
-        assert_eq!(results[1]["cache_control"]["type"], "ephemeral");
-        assert!(!body.to_string().contains(PROVIDER_TOOL_CALL_ID_FIELD));
-        // Structural linkage is projected; similarly named user data is not.
-        let mut with_data = messages.clone();
-        with_data[4]["content"][0]["content"] = json!({"tool_use_id":"canonical-second"});
-        with_data[4]["content"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"type":"tool_result","tool_use_id":"orphan","content":"unowned"}));
-        let projected = project_provider_message_metadata(&with_data);
-        assert_eq!(
-            projected[4]["content"][0]["content"]["tool_use_id"],
-            "canonical-second"
-        );
-        assert_eq!(projected[4]["content"][1]["tool_use_id"], "orphan");
-    }
-
-    #[test]
-    fn provider_id_projection_preserves_reused_wire_ids_and_tool_only_suffix() {
-        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
-        let canonical = vec![
-            json!({"role":"assistant","reasoning_content":"signed reasoning", "reasoning_signature":"signature",
-                "tool_calls":[{"id":"canonical-first",PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567", "type":"function", "function":{"name":"read_file","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"canonical-first","name":"read_file","content":"first result"}),
-            json!({"role":"assistant","tool_calls":[{"id":"canonical-second",PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567", "type":"function", "function":{"name":"read_file","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"canonical-second","name":"read_file","content":"second result"}),
-        ];
-        let projected = project_provider_message_metadata(&canonical);
-        for index in [0, 2] {
-            assert_eq!(projected[index]["tool_calls"][0]["id"], "Ab1234567");
-            assert!(
-                projected[index]["tool_calls"][0]
-                    .get(PROVIDER_TOOL_CALL_ID_FIELD)
-                    .is_none()
-            );
-            assert_eq!(projected[index + 1]["tool_call_id"], "Ab1234567");
-        }
-        assert_eq!(
-            projected[0]["reasoning_signature"],
-            canonical[0]["reasoning_signature"]
-        );
-        assert_eq!(project_provider_message_metadata(&projected), projected);
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &projected, &canonical, 3
-        ));
-        let mut corrupt = projected.clone();
-        corrupt[3]["tool_call_id"] = json!("wrong");
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &corrupt, &canonical, 3
-        ));
-        // Plain unmarked runtime calls are unchanged by provider projection.
-        let native = vec![
-            json!({"role":"assistant","tool_calls":[{"id":"native","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
-            json!({"role":"tool","tool_call_id":"native","content":"result"}),
-        ];
-        assert_eq!(project_provider_message_metadata(&native), native);
-        for provider in ["openai", "anthropic", "bedrock"] {
-            let body = build_provider_request_body(
-                &canonical,
-                &[],
-                "fixture",
-                provider,
-                None,
-                None,
-                false,
-                &ThinkingConfig::Off,
-            );
-            let wire = body.to_string();
-            assert!(wire.contains("Ab1234567"), "{provider}: {wire}");
-            assert!(!wire.contains("canonical-first"));
-            assert!(!wire.contains("canonical-second"));
-            assert!(!wire.contains(PROVIDER_TOOL_CALL_ID_FIELD));
-        }
-        let durable = astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
-            canonical.clone(),
-        );
-        assert_eq!(project_provider_message_metadata(&durable), projected);
-    }
 
     #[test]
     fn payment_required_preserves_owner_codes_without_echoing_provider_secrets() {
@@ -16470,35 +16421,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_guidance_projection_preserves_canonical_suffix_and_does_not_accumulate() {
-        use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
-        let canonical = vec![json!({
-            "role":"tool", "tool_call_id":"call-probe", "content":r#"{"executed":false}"#,
-            TOOL_RESULT_ADVISORIES_FIELD:["inspect the existing operation"],
-        })];
-        let projected = project_provider_message_metadata(&canonical);
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &projected, &canonical, 0
-        ));
-        assert_eq!(project_provider_message_metadata(&projected), projected);
-        assert_eq!(canonical[0]["content"], r#"{"executed":false}"#);
-        assert!(
-            projected[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("inspect the existing operation")
-        );
-        assert!(projected[0].get(TOOL_RESULT_ADVISORIES_FIELD).is_none());
-        let mut missing_guidance = projected.clone();
-        missing_guidance[0]["content"] = canonical[0]["content"].clone();
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &missing_guidance,
-            &canonical,
-            0
-        ));
-    }
-
-    #[test]
     fn provider_projection_preserves_nested_tool_result_data() {
         let messages = vec![json!({
             "role": "user",
@@ -16523,77 +16445,6 @@ mod tests {
                 .get(astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
                 .is_some_and(|value| value == &json!({"unexpected": "nested"}))
         );
-    }
-
-    #[test]
-    fn canonical_suffix_check_compares_the_exact_provider_metadata_projection() {
-        let mut assistant = json!({"role": "assistant", "content": "tool result accepted"});
-        assert!(astra_turn_types::mark_turn_message(
-            &mut assistant,
-            "turn-chain-1"
-        ));
-        let work_frame =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "establish the admitted work graph",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        let budget_frame =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "finish before the admitted deadline",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        let canonical_appended = vec![assistant, work_frame, budget_frame.clone()];
-
-        // The main assembly was already consolidated, while the dispatch-time
-        // budget frame was appended afterward. This mixed representation is
-        // the real provider-attempt boundary that exposed the regression.
-        let mut provider_messages = vec![
-            json!({"role": "system", "content": "stable policy"}),
-            json!({"role": "user", "content": "do the task"}),
-        ];
-        provider_messages.extend(project_provider_message_metadata(
-            &canonical_appended[..canonical_appended.len() - 1],
-        ));
-        provider_messages.push(budget_frame);
-
-        assert!(!provider_messages.ends_with(&canonical_appended));
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &canonical_appended,
-            0
-        ));
-
-        let mut changed_content = canonical_appended.clone();
-        changed_content[0]["content"] = Value::String("different response".to_string());
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &changed_content,
-            0
-        ));
-
-        let mut reordered = canonical_appended.clone();
-        reordered.swap(0, 1);
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &reordered,
-            0
-        ));
-        assert!(!provider_request_preserves_projected_canonical_suffix(
-            &provider_messages[..2],
-            &canonical_appended,
-            0
-        ));
-        assert!(provider_request_preserves_projected_canonical_suffix(
-            &provider_messages,
-            &[],
-            0
-        ));
     }
 
     #[test]

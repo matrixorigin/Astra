@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
+
+use astra_services::SessionContextCoordinator as _;
 
 use astra_core::history_work::{HistoryWorkScenario, HistoryWorkScenarioReport, HistoryWorkSite};
 use astra_core::history_work_baseline::{
@@ -22,9 +23,6 @@ use astra_core::history_work_baseline::{
     ProviderUsageSource, ScenarioWorkEvidence, TenantAdmissionEvidence, WindowClass,
     scenario_capture_evidence, write_json_atomic,
 };
-use astra_turn_core::conversation_log::db_store::DbCslStore;
-use astra_turn_core::conversation_log::manager::CslManager;
-use astra_turn_core::conversation_log::{CslStore, SessionStateCompact};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -776,11 +774,24 @@ pub(super) async fn seed_structured_history_with_pool(
     tenant: &LiveTenant,
     offering: &ResolvedOffering,
 ) -> AnyResult<()> {
-    let store: Arc<dyn CslStore> = Arc::new(
-        DbCslStore::new(shared_pool.settings().clone(), tenant.user_id.clone())?
-            .with_pool(shared_pool.clone()),
+    // Seed through the same canonical conversation owner consumed by Server
+    // Runs. Raw/CSL-only rows are intentionally not an alternate prompt source.
+    let coordinator = astra_services::DatabaseSessionContextCoordinator::new(shared_pool.clone());
+    let key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        &tenant.user_id,
+        &tenant.session_id,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
     );
-    let mut manager = CslManager::new(store, tenant.session_id.clone(), Default::default())?;
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &tenant.user_id,
+        "phase0-history-fixture",
+        astra_turn_types::ActorKindV1::Server,
+        astra_turn_types::SessionSurfaceV1::Server,
+        None,
+        astra_turn_types::AuthorityEpochsV1::default(),
+    );
+    let mut cursor = None;
     let target_tokens = offering.context_window_tokens.saturating_mul(78) / 100;
     let unit = "durable_fact { key: phase0_history, value: preserved_across_turns };\n";
     let unit_tokens = u64::from(astra_turn_core::section_types::estimate_text_tokens(unit)).max(1);
@@ -791,9 +802,8 @@ pub(super) async fn seed_structured_history_with_pool(
     let repeats = usize::try_from(repeats_per_message)
         .map_err(|_| invalid("history repeat count exceeds usize"))?;
     let bulk = unit.repeat(repeats);
-    let mut messages = Vec::with_capacity(message_count as usize);
     for turn in 1..=HISTORY_TURNS {
-        messages.push(json!({
+        let user_message = json!({
             "role": "user",
             "content": format!("turn={turn}; request=retain typed production history\n{bulk}"),
             "metadata": {
@@ -801,8 +811,8 @@ pub(super) async fn seed_structured_history_with_pool(
                 "turn": turn,
                 "kind": "user_requirement"
             }
-        }));
-        messages.push(json!({
+        });
+        let assistant_message = json!({
             "role": "assistant",
             "content": format!("turn={turn}; acknowledgement=durably retained\n{bulk}"),
             "metadata": {
@@ -810,10 +820,56 @@ pub(super) async fn seed_structured_history_with_pool(
                 "turn": turn,
                 "kind": "assistant_checkpoint"
             }
-        }));
-        manager
-            .persist_turn(turn, &messages, &SessionStateCompact::default())
-            .await?;
+        });
+        let reservation = match coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                cursor.as_ref(),
+                &actor,
+                Duration::from_secs(60),
+                &format!("phase0-history-writer:{turn}"),
+                &format!("phase0-history-turn:{turn}"),
+                None,
+            )
+            .await?
+        {
+            astra_services::AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => {
+                reservation
+            }
+            other => {
+                return Err(invalid(format!(
+                    "canonical history admission failed: {other:?}"
+                )));
+            }
+        };
+        let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+            schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: turn,
+            journal_event_seq: u64::from(turn),
+            conversation_seq: u64::from(turn),
+            compaction_generation: 0,
+            config_version_id: None,
+            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
+            logical_segments: vec![vec![user_message], vec![assistant_message]],
+        };
+        cursor = Some(
+            match coordinator
+                .commit_turn_and_release_writer(
+                    &reservation,
+                    delta,
+                    &format!("phase0-history-commit:{turn}"),
+                )
+                .await?
+            {
+                astra_turn_types::CoordinatorMutationV1::Applied { cursor }
+                | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { cursor } => cursor,
+                other => {
+                    return Err(invalid(format!(
+                        "canonical history commit failed: {other:?}"
+                    )));
+                }
+            },
+        );
     }
     Ok(())
 }
@@ -1184,12 +1240,11 @@ async fn load_run_evidence(
 
     let (correlation, projection) = match &stream.authority {
         StreamAuthority::DurableRun { run_id } => {
-            let run = wait_for_projection(pool, &tenant.user_id, run_id).await?;
+            let run = wait_for_canonical_run(pool, &tenant.user_id, run_id).await?;
             let run_status: String = run.try_get("run_status")?;
-            let projection_status: String = run.try_get("projection_status")?;
-            if run_status != "completed" || projection_status != run_status {
+            if run_status != "completed" {
                 return Err(invalid(format!(
-                    "run/projection status mismatch: run={run_status}, projection={projection_status}"
+                    "canonical run is not complete: {run_status}"
                 )));
             }
             let run_offering: String = run.try_get("model_offering_id")?;
@@ -1200,15 +1255,8 @@ async fn load_run_evidence(
                 )));
             }
             let durable = non_negative_i64(run.try_get("last_event_idx")?, "last_event_idx")?;
-            let projected =
-                non_negative_i64(run.try_get("projection_event_idx")?, "projection_event_idx")?;
-            if durable == 0 || projected == 0 {
-                return Err(invalid(format!(
-                    "run projection cursors must be positive: durable={durable}, projected={projected}"
-                )));
-            }
-            if projected > durable {
-                return Err(invalid("run projection is ahead of durable event index"));
+            if durable == 0 {
+                return Err(invalid("canonical Run event watermark must be positive"));
             }
             (
                 CorrelationEvidence::DurableRun {
@@ -1220,8 +1268,6 @@ async fn load_run_evidence(
                 },
                 ProjectionEvidence::DurableRun {
                     durable_event_index: durable,
-                    projected_event_index: projected,
-                    lag_events: durable - projected,
                 },
             )
         }
@@ -1272,7 +1318,7 @@ async fn verify_cli_non_durable_authority(
     execution_id: &str,
     turn_chain_id: &str,
 ) -> AnyResult<()> {
-    for table in ["agent_runs", "run_display_projections"] {
+    for table in ["agent_runs"] {
         let query = format!(
             "SELECT COUNT(*) AS row_count FROM {table} \
              WHERE user_id = ? AND (run_id = ? OR run_id = ?)"
@@ -1298,7 +1344,7 @@ fn bridge_inference_operation_id(user_query_event_id: &str) -> String {
     format!("bridge_chat_{}", &digest[..32])
 }
 
-async fn wait_for_projection(
+async fn wait_for_canonical_run(
     pool: &MySqlPool,
     user_id: &str,
     run_id: &str,
@@ -1306,12 +1352,8 @@ async fn wait_for_projection(
     let deadline = tokio::time::Instant::now() + PROJECTION_TIMEOUT;
     loop {
         let row = sqlx::query(
-            "SELECT r.status AS run_status, r.last_event_idx, r.model_offering_id, \
-                    r.resolved_model_name, p.status AS projection_status, p.projection_event_idx \
-             FROM agent_runs r \
-             INNER JOIN run_display_projections p \
-               ON p.user_id = r.user_id AND p.run_id = r.run_id \
-             WHERE r.user_id = ? AND r.run_id = ? LIMIT 1",
+            "SELECT status AS run_status, last_event_idx, model_offering_id, resolved_model_name \
+             FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
         )
         .bind(user_id)
         .bind(run_id)
@@ -1319,20 +1361,14 @@ async fn wait_for_projection(
         .await?;
         if let Some(row) = row {
             let durable: i64 = row.try_get("last_event_idx")?;
-            let projected: i64 = row.try_get("projection_event_idx")?;
             let run_status: String = row.try_get("run_status")?;
-            let projection_status: String = row.try_get("projection_status")?;
-            if durable >= 0
-                && projected == durable
-                && run_status == "completed"
-                && projection_status == run_status
-            {
+            if durable >= 0 && run_status == "completed" {
                 return Ok(row);
             }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(invalid(format!(
-                "authoritative run projection did not converge within {:?}: {run_id}",
+                "canonical Run did not complete within {:?}: {run_id}",
                 PROJECTION_TIMEOUT
             )));
         }

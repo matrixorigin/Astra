@@ -48,11 +48,9 @@ use std::{
 use astra_services::runs::{
     AtomicOrphanRunCancellationRequest, AtomicRunActionAdmissionRequest,
     AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
-    AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest,
-    AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
-    AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
-    DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
-    DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
+    AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest, AtomicRunUserIntentApply,
+    AtomicRunUserIntentApplyRequest, DurableCancellationOrigin, DurableRunCheckpointRecord,
+    DurableRunEventDelta, DurableRunInteractionAttachmentGuard, DurableRunInteractionKind,
     DurableRunInteractionProjection, DurableRunInteractionResolveOutcome, DurableRunListPage,
     DurableRunObservation, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
     DurableRunStatusSnapshot, DurableRunUserIntentControlDelta, DurableRunWorkScope,
@@ -60,9 +58,9 @@ use astra_services::runs::{
     GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode,
     ResolvedModelSelection, RunExecutionBoundaryAuthorization,
     RunExecutionBoundaryAuthorizationRequest, RunListCursor, RunStateStore, RunStatusCasRequest,
-    RunUsageOwnerUpdateRequest, RunUserIntentAdmissionTransition, RuntimeProfileRequest,
-    SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE,
-    durable_run_status_is_terminal, durable_run_status_kind,
+    RunUsageOwnerUpdateRequest, RuntimeProfileRequest, SkillAutoRouteExecutionPolicy,
+    TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE, durable_run_status_is_terminal,
+    durable_run_status_kind,
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::thinking_config::ThinkingConfig;
@@ -166,7 +164,7 @@ pub enum TerminalTransitionOutcome {
 
 /// What a bounded owner transition and its optional durable receipt proved.
 enum OwnerTerminalAttempt {
-    Committed { needs_projection_repair: bool },
+    Committed,
     Superseded(Box<DurableRunRecord>),
     NotCommitted,
 }
@@ -383,10 +381,9 @@ struct RunOwnerLeaseKey {
 
 /// Process-local mirror of the exact durable owner-lease safety window.
 ///
-/// Heartbeat renewal and provider-boundary authorization both extend this
-/// deadline after their exact durable lease update succeeds. Their shared
-/// operation mutex prevents the two paths from contending on the same run row
-/// or interpreting each other's in-flight update as lost authority.
+/// Only successful heartbeat renewal extends this deadline. Model boundaries
+/// consume the confirmed window locally; terminal persistence shares the
+/// heartbeat operation mutex to coordinate retirement without another lease.
 struct RunOwnerLeaseAuthority {
     state: tokio::sync::watch::Sender<RunOwnerLeaseState>,
     operation: tokio::sync::Mutex<()>,
@@ -541,12 +538,20 @@ impl RunOwnerLeaseHeartbeat {
 /// mode differently from a durable explicit `headless` mode.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStartContext {
+    /// Exact original input, kept outside the bounded opening/status frames.
+    pub original_input: Option<String>,
     pub(crate) delegation_authority: crate::orchestration::DelegationAuthority,
     pub interaction_mode: RequestedTurnInteractionMode,
     pub interactive_client: Option<bool>,
     pub turn_intent_policy: TurnIntentExecutionPolicy,
     pub skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// A binding known before Run creation belongs to its atomic opening batch.
+    /// Provisioned capacity establishes this pair later, after claiming the Run.
+    pub(crate) initial_execution_contract: Option<(
+        crate::server::tool_transport::ExecutionBindingSnapshot,
+        astra_turn_types::StopHookObligations,
+    )>,
     /// Exact runtime child instance, distinct from its reusable agent profile.
     /// Only an internal child admission may establish this recovery identity.
     pub(crate) child_runtime_id: Option<String>,
@@ -599,11 +604,13 @@ pub struct RunStartContext {
 impl Default for RunStartContext {
     fn default() -> Self {
         Self {
+            original_input: None,
             interaction_mode: RequestedTurnInteractionMode::Headless,
             interactive_client: None,
             turn_intent_policy: TurnIntentExecutionPolicy::default(),
             skill_auto_route_policy: SkillAutoRouteExecutionPolicy::default(),
             execution_metadata: None,
+            initial_execution_contract: None,
             child_runtime_id: None,
             collaborator_stage: None,
             execution_restrictions: None,
@@ -1366,17 +1373,11 @@ impl RunEngine {
                     "run {run_id} has no active process-local owner-lease authority at generation {expected_owner_generation}"
                 )
             })?;
-        let state = authority.current_state();
-        if !state.active {
-            return Err(format!(
-                "run {run_id} owner-lease authority is no longer active at generation {expected_owner_generation}"
-            ));
-        }
-        if state.deadline <= tokio::time::Instant::now() {
-            return Err(format!(
-                "run {run_id} owner-lease authority expired before provider-boundary authorization at generation {expected_owner_generation}"
-            ));
-        }
+        Self::validate_owner_lease_state(
+            run_id,
+            expected_owner_generation,
+            authority.current_state(),
+        )?;
         Ok(authority)
     }
 
@@ -1419,12 +1420,6 @@ impl RunEngine {
         Ok(())
     }
 
-    fn owner_lease_deadline_error(run_id: &str, expected_owner_generation: u64) -> String {
-        format!(
-            "provider-boundary execution authorization reached the owner-lease safety deadline for run {run_id} at generation {expected_owner_generation}"
-        )
-    }
-
     /// Start renewing the store owner's active-run lease until the returned
     /// guard is dropped. Stores without shared owner leases return `None`.
     pub(crate) fn start_owner_lease_heartbeat(
@@ -1463,12 +1458,16 @@ impl RunEngine {
                 policy.next_renewal_at(tokio::time::Instant::now(), fence_deadline);
             let mut ownership_lost = false;
             let mut retired = false;
+            let mut executor_exited = false;
             'heartbeat: loop {
                 let mut renewal_due = false;
                 let operation_guard = loop {
                     tokio::select! {
                         biased;
-                        _ = &mut stop_rx => break 'heartbeat,
+                        _ = &mut stop_rx => {
+                            executor_exited = true;
+                            break 'heartbeat;
+                        },
                         _ = tokio::time::sleep_until(fence_deadline) => {
                             if heartbeat_authority.current_state().terminal_in_progress {
                                 // The SQL generation fence still owns a
@@ -1476,7 +1475,10 @@ impl RunEngine {
                                 // reconciliation within the durable lease's
                                 // safety margin before declaring owner loss.
                                 let settled = tokio::select! {
-                                    _ = &mut stop_rx => break 'heartbeat,
+                                    _ = &mut stop_rx => {
+                                        executor_exited = true;
+                                        break 'heartbeat;
+                                    },
                                     settled = tokio::time::timeout(policy.safety_margin, async {
                                         loop {
                                             let state = heartbeat_authority.current_state();
@@ -1561,7 +1563,10 @@ impl RunEngine {
                     );
                     let renewed = tokio::select! {
                         biased;
-                        _ = &mut stop_rx => break 'heartbeat,
+                        _ = &mut stop_rx => {
+                            executor_exited = true;
+                            break 'heartbeat;
+                        },
                         result = tokio::time::timeout_at(renewal_started_at + policy.attempt_wait, renewal) => result,
                     };
                     match renewed {
@@ -1615,6 +1620,7 @@ impl RunEngine {
                 break;
             }
 
+            retired |= heartbeat_authority.current_state().retired;
             heartbeat_authority.deactivate();
             {
                 let mut registered = authorities
@@ -1633,7 +1639,7 @@ impl RunEngine {
                 execution_lease_lost.store(true, Ordering::Release);
                 execution_cancel_token.cancel();
             }
-            if ownership_lost || retired {
+            if (ownership_lost || retired) && !executor_exited {
                 // A terminal commit is not executor exit. Keep the exact
                 // lease until the guard drops; bound a hung executor by TTL.
                 if tokio::time::timeout(policy.lease_duration, &mut stop_rx)
@@ -1644,6 +1650,11 @@ impl RunEngine {
                 }
             }
 
+            // The exact terminal receipt already cleared durable ownership.
+            // Parking/error exits still release their live generation below.
+            if retired {
+                return;
+            }
             match tokio::time::timeout(
                 OWNER_LEASE_RELEASE_MAX_WAIT,
                 engine.store.release_owner_lease(
@@ -1985,6 +1996,7 @@ impl RunEngine {
                 );
             }
             return Ok(RunExecutionAuthority {
+                opening_control_tail: None,
                 owner_generation: receipt.owner_generation,
                 owner_lease_expires_at: lease_expires_at,
             });
@@ -2030,7 +2042,7 @@ impl RunEngine {
         execution_deadline: Option<tokio::time::Instant>,
     ) -> Result<
         astra_services::runs::CollaboratorStageReceipt,
-        astra_services::runs::CollaboratorStoreError,
+        astra_services::runs::RunAdmissionError,
     > {
         let build_record = self.build_run_start_record(
             run_id,
@@ -2046,11 +2058,11 @@ impl RunEngine {
         let record = match execution_deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, build_record)
                 .await
-                .map_err(|_| astra_services::runs::CollaboratorStoreError::DeadlineExpired)??,
+                .map_err(|_| astra_services::runs::RunAdmissionError::DeadlineExpired)??,
             None => build_record.await?,
         };
         if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Err(astra_services::runs::CollaboratorStoreError::DeadlineExpired);
+            return Err(astra_services::runs::RunAdmissionError::DeadlineExpired);
         }
         self.store
             .insert_run_with_collaborator_stage(record, admission, execution_deadline)
@@ -2074,6 +2086,26 @@ impl RunEngine {
             .await?;
         self.store
             .claim_run_start(record, requested_session_id)
+            .await
+    }
+
+    pub(crate) async fn admit_run_with_context(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        requested_session_id: Option<&str>,
+        context: RunStartContext,
+        claim_existing: bool,
+        participant: &mut dyn astra_services::runs::RunStartTransactionParticipant,
+    ) -> Result<DurableRunStartClaim, astra_services::runs::RunAdmissionError> {
+        let record = self
+            .build_run_start_record(
+                run_id, user_id, session_id, None, None, None, None, context, true,
+            )
+            .await?;
+        self.store
+            .insert_run_with_participant(record, claim_existing, requested_session_id, participant)
             .await
     }
 
@@ -2128,7 +2160,30 @@ impl RunEngine {
             .map(runtime_profile_label)
             .map(str::to_string);
         let run_started_data = run_started_event_data(&context);
+        let mut events = vec![serde_json::json!({
+            "event_type": "run_started",
+            "data": run_started_data,
+        })];
+        if let Some((snapshot, completion_checks)) = context.initial_execution_contract.as_ref() {
+            events.extend(super::binding_resolution::binding_snapshot_events(
+                run_id,
+                session_id,
+                snapshot,
+                completion_checks,
+            ));
+        }
+        let mut opening = astra_services::runs::DurableRunOpening::capture(&events)?;
+        if let Some(input) = context.original_input.take() {
+            opening
+                .as_mut()
+                .ok_or("Run input requires an immutable opening")?
+                .bind_input(input)?;
+        }
         let record = DurableRunRecord {
+            opening,
+            opening_hash: None,
+            context_admission_hash: None,
+            terminal_receipt_json: None,
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
@@ -2162,10 +2217,7 @@ impl RunEngine {
             runtime_profile,
             start_request_fingerprint: context.start_request_fingerprint,
             work_binding: context.work_binding,
-            events: vec![serde_json::json!({
-                "event_type": "run_started",
-                "data": run_started_data
-            })],
+            events,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -2373,7 +2425,7 @@ impl RunEngine {
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
-        forbid_open_settlement_generation: Option<u64>,
+        expected_run_generation: Option<u64>,
         event: serde_json::Value,
     ) -> Result<GuardedRunStatusTransition, String> {
         self.store
@@ -2386,7 +2438,7 @@ impl RunEngine {
                     status,
                     waiting_for,
                     error_message,
-                    forbid_open_settlement_generation,
+                    expected_run_generation,
                     event,
                 },
             )
@@ -2729,9 +2781,7 @@ impl RunEngine {
         let Some(local_deadline) = local_deadline else {
             return transition.await.map(|committed| {
                 if committed {
-                    OwnerTerminalAttempt::Committed {
-                        needs_projection_repair: false,
-                    }
+                    OwnerTerminalAttempt::Committed
                 } else {
                     OwnerTerminalAttempt::NotCommitted
                 }
@@ -2740,9 +2790,7 @@ impl RunEngine {
         match tokio::time::timeout_at(local_deadline, transition).await {
             Ok(result) => result.map(|committed| {
                 if committed {
-                    OwnerTerminalAttempt::Committed {
-                        needs_projection_repair: false,
-                    }
+                    OwnerTerminalAttempt::Committed
                 } else {
                     OwnerTerminalAttempt::NotCommitted
                 }
@@ -2763,9 +2811,7 @@ impl RunEngine {
                 )
                 .await
                 {
-                    Ok(Ok(TerminalReceipt::Committed)) => Ok(OwnerTerminalAttempt::Committed {
-                        needs_projection_repair: true,
-                    }),
+                    Ok(Ok(TerminalReceipt::Committed)) => Ok(OwnerTerminalAttempt::Committed),
                     Ok(Ok(TerminalReceipt::Superseded(durable))) => {
                         Ok(OwnerTerminalAttempt::Superseded(durable))
                     }
@@ -2862,10 +2908,8 @@ impl RunEngine {
                     .map(RunOwnerLeaseTerminalOperation::deadline),
             )
             .await?;
-        let needs_projection_repair = match terminal_attempt {
-            OwnerTerminalAttempt::Committed {
-                needs_projection_repair,
-            } => Some(needs_projection_repair),
+        let committed = match terminal_attempt {
+            OwnerTerminalAttempt::Committed => true,
             OwnerTerminalAttempt::Superseded(durable) => {
                 if durable.run_generation == expected_owner_generation
                     && durable_run_status_is_terminal(&durable.status)
@@ -2875,16 +2919,13 @@ impl RunEngine {
                 }
                 return Ok(TerminalTransitionOutcome::Superseded(durable));
             }
-            OwnerTerminalAttempt::NotCommitted => None,
+            OwnerTerminalAttempt::NotCommitted => false,
         };
-        if let Some(needs_projection_repair) = needs_projection_repair {
+        if committed {
             if let Some(operation) = terminal_operation.take() {
                 operation.retire();
             }
-            if needs_projection_repair {
-                self.repair_terminal_projection_bounded(user_id, expected_session_id, run_id)
-                    .await;
-            }
+
             let durable = self
                 .load_run(user_id, run_id)
                 .await?
@@ -2945,10 +2986,8 @@ impl RunEngine {
                         .map(RunOwnerLeaseTerminalOperation::deadline),
                 )
                 .await?;
-            let needs_projection_repair = match cancellation_attempt {
-                OwnerTerminalAttempt::Committed {
-                    needs_projection_repair,
-                } => Some(needs_projection_repair),
+            let committed = match cancellation_attempt {
+                OwnerTerminalAttempt::Committed => true,
                 OwnerTerminalAttempt::Superseded(durable) => {
                     if durable.run_generation == expected_owner_generation
                         && durable_run_status_is_terminal(&durable.status)
@@ -2958,16 +2997,13 @@ impl RunEngine {
                     }
                     return Ok(TerminalTransitionOutcome::Superseded(durable));
                 }
-                OwnerTerminalAttempt::NotCommitted => None,
+                OwnerTerminalAttempt::NotCommitted => false,
             };
-            if let Some(needs_projection_repair) = needs_projection_repair {
+            if committed {
                 if let Some(operation) = terminal_operation.take() {
                     operation.retire();
                 }
-                if needs_projection_repair {
-                    self.repair_terminal_projection_bounded(user_id, expected_session_id, run_id)
-                        .await;
-                }
+
                 let cancelled = self.load_run(user_id, run_id).await?.ok_or_else(|| {
                     format!("run {run_id} disappeared after cancellation settlement")
                 })?;
@@ -3044,40 +3080,6 @@ impl RunEngine {
             );
         }
         Ok(TerminalReceipt::Committed)
-    }
-
-    async fn repair_terminal_projection_bounded(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) {
-        // The timed-out store future may have been dropped after COMMIT but
-        // before its display refresh. This rare-path repair is best effort
-        // and must run only after the confirmed owner heartbeat is retired.
-        match tokio::time::timeout(
-            TERMINAL_RECEIPT_MAX_WAIT,
-            self.store.repair_terminal_projection_after_receipt(
-                user_id,
-                expected_session_id,
-                run_id,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "terminal receipt confirmed but display projection repair failed"
-            ),
-            Err(_) => tracing::warn!(
-                user_id,
-                run_id,
-                "terminal receipt confirmed but display projection repair timed out"
-            ),
-        }
     }
 
     /// Persist the semantic run aggregate only for the exact execution
@@ -3170,27 +3172,6 @@ impl RunEngine {
             .map(|outcome| outcome.map(|outcome| outcome.run))
     }
 
-    /// Load the current durable display projection for a run.
-    pub async fn load_run_projection(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.store.load_run_projection(user_id, run_id).await
-    }
-
-    /// Rebuild the durable display projection from authoritative run facts.
-    pub async fn rebuild_run_projection(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-        self.store
-            .rebuild_run_projection(user_id, expected_session_id, run_id)
-            .await
-    }
-
     /// Append an event to the durable event log.
     pub async fn append_event(
         &self,
@@ -3253,6 +3234,14 @@ impl RunEngine {
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
         self.store.load_run(user_id, run_id).await
+    }
+
+    pub(crate) async fn load_run_admission(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::StoredRunAdmission>, String> {
+        self.store.load_run_admission(user_id, run_id).await
     }
 
     pub async fn load_run_observation(
@@ -3326,17 +3315,6 @@ impl RunEngine {
     ) -> Result<(), String> {
         self.store
             .request_session_cancellation(user_id, session_id)
-            .await
-    }
-
-    pub async fn has_open_run_settlement(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        generation: u64,
-    ) -> Result<bool, String> {
-        self.store
-            .has_open_run_settlement(user_id, run_id, generation)
             .await
     }
 
@@ -4501,74 +4479,6 @@ fn user_intent_indices_with_disposition(
         .collect()
 }
 
-impl RunEngine {
-    async fn transition_user_intent_admission(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_owner_generation: u64,
-        transition: RunUserIntentAdmissionTransition,
-    ) -> Result<(), String> {
-        match self
-            .store
-            .transition_user_intent_admission(AtomicRunUserIntentAdmissionTransitionRequest {
-                user_id,
-                run_id,
-                expected_session_id,
-                expected_owner_generation,
-                transition,
-            })
-            .await?
-        {
-            AtomicRunUserIntentAdmissionTransition::Changed { .. } => Ok(()),
-            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { .. }
-                if transition == RunUserIntentAdmissionTransition::Fence =>
-            {
-                Ok(())
-            }
-            AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized { .. }
-                if transition == RunUserIntentAdmissionTransition::Reopen =>
-            {
-                Ok(())
-            }
-            AtomicRunUserIntentAdmissionTransition::AlreadyInState { .. }
-                if transition == RunUserIntentAdmissionTransition::Fence =>
-            {
-                Ok(())
-            }
-            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { .. }
-            | AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized { .. }
-            | AtomicRunUserIntentAdmissionTransition::AlreadyInState { .. } => Err(format!(
-                "user-intent admission transition returned authority for the wrong operation on run {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::Inactive { status } => Err(format!(
-                "run became {status} before user-intent admission transition: {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
-                actual_owner_generation,
-            } => Err(format!(
-                "stale execution generation {expected_owner_generation} cannot change user-intent admission for run {run_id}; current generation is {actual_owner_generation}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::OwnerMismatch {
-                actual_owner_pod_id,
-            } => Err(format!(
-                "this executor no longer owns user-intent admission for run {run_id}; current owner is {}",
-                actual_owner_pod_id.as_deref().unwrap_or("none")
-            )),
-            AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired => Err(format!(
-                "execution owner lease expired before user-intent admission transition for run {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::IdentityConflict => Err(format!(
-                "user-intent admission transition identity conflict for run {run_id}"
-            )),
-            AtomicRunUserIntentAdmissionTransition::Missing => Err(format!(
-                "run not found while changing user-intent admission: {run_id}"
-            )),
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
     async fn permission_mode_snapshot(
@@ -4670,131 +4580,32 @@ impl UserIntentProvider for RunEngine {
                     .to_string(),
             );
         };
-        let outcome = if let Some(policy) = self.owner_lease_policy() {
+        if self.owner_lease_policy().is_some() {
+            // The opening transaction and successful heartbeat already proved
+            // this exact owner/generation until a conservative local deadline.
+            // Model rounds consume that live authority; only the heartbeat
+            // renews it. Remote controls arrive through the existing watcher,
+            // while effectful tools retain their transactional dispatch fence.
             let authority = self.owner_lease_authority(
                 user_id,
                 expected_session_id,
                 run_id,
                 expected_owner_generation,
             )?;
-            let mut lease_updates = authority.subscribe();
-            let _operation_guard = loop {
-                let state = *lease_updates.borrow_and_update();
-                Self::validate_owner_lease_state(run_id, expected_owner_generation, state)?;
-                tokio::select! {
-                    biased;
-                    changed = lease_updates.changed() => {
-                        changed.map_err(|_| {
-                            format!(
-                                "run {run_id} owner-lease authority closed during provider-boundary authorization at generation {expected_owner_generation}"
-                            )
-                        })?;
-                    }
-                    _ = tokio::time::sleep_until(state.deadline) => {
-                        let current = authority.current_state();
-                        if !current.active || current.deadline <= state.deadline {
-                            return Err(Self::owner_lease_deadline_error(
-                                run_id,
-                                expected_owner_generation,
-                            ));
-                        }
-                    }
-                    guard = authority.operation.lock() => break guard,
-                }
-            };
-
-            let mut last_error = None;
-            let mut outcome = None;
-            for attempt in 1..=OWNER_LEASE_MAX_ATTEMPTS {
-                let authorization_started_at = tokio::time::Instant::now();
-                let state = authority.current_state();
-                Self::validate_owner_lease_state(run_id, expected_owner_generation, state)?;
-                if !policy.attempt_fits(authorization_started_at, state.deadline) {
-                    return Err(Self::owner_lease_deadline_error(
-                        run_id,
-                        expected_owner_generation,
-                    ));
-                }
-                let authorization = self.store.authorize_execution_boundary(
-                    RunExecutionBoundaryAuthorizationRequest {
-                        user_id,
-                        run_id,
-                        expected_session_id,
-                        expected_owner_generation,
-                    },
-                );
-                let result = tokio::select! {
-                    biased;
-                    changed = lease_updates.changed() => {
-                        changed.map_err(|_| {
-                            format!(
-                                "run {run_id} owner-lease authority closed during provider-boundary authorization at generation {expected_owner_generation}"
-                            )
-                        })?;
-                        Self::validate_owner_lease_state(
-                            run_id,
-                            expected_owner_generation,
-                            *lease_updates.borrow_and_update(),
-                        )?;
-                        continue;
-                    }
-                    result = tokio::time::timeout(policy.attempt_wait, authorization) => result,
-                };
-                match result {
-                    Ok(Ok(RunExecutionBoundaryAuthorization::Authorized { lease_renewed })) => {
-                        if lease_renewed {
-                            authority.refresh(policy.fence_deadline(authorization_started_at));
-                        }
-                        outcome =
-                            Some(RunExecutionBoundaryAuthorization::Authorized { lease_renewed });
-                        break;
-                    }
-                    Ok(Ok(resolved)) => {
-                        outcome = Some(resolved);
-                        break;
-                    }
-                    Ok(Err(error)) => {
-                        last_error = Some(error);
-                        tracing::warn!(
-                            target: "astra_runtime::run_engine",
-                            run_id,
-                            expected_owner_generation,
-                            attempt,
-                            "provider-boundary execution authorization failed"
-                        );
-                    }
-                    Err(_) => {
-                        last_error = Some(format!(
-                            "provider-boundary execution authorization attempt timed out after {}ms",
-                            policy.attempt_wait.as_millis()
-                        ));
-                        tracing::warn!(
-                            target: "astra_runtime::run_engine",
-                            run_id,
-                            expected_owner_generation,
-                            attempt,
-                            timeout_ms = policy.attempt_wait.as_millis() as u64,
-                            "provider-boundary execution authorization timed out"
-                        );
-                    }
-                }
+            if authority.current_state().terminal_in_progress {
+                return Err("provider dispatch cannot overlap terminal settlement".into());
             }
-            outcome.ok_or_else(|| {
-                format!(
-                    "provider-boundary execution authorization failed after {OWNER_LEASE_MAX_ATTEMPTS} attempts for run {run_id}: {}",
-                    last_error.unwrap_or_else(|| "unknown authorization failure".to_string())
-                )
-            })?
-        } else {
-            self.store
-                .authorize_execution_boundary(RunExecutionBoundaryAuthorizationRequest {
-                    user_id,
-                    run_id,
-                    expected_session_id,
-                    expected_owner_generation,
-                })
-                .await?
-        };
+            return Ok(ProviderBoundaryAuthorization::Authorized);
+        }
+        let outcome = self
+            .store
+            .authorize_execution_boundary(RunExecutionBoundaryAuthorizationRequest {
+                user_id,
+                run_id,
+                expected_session_id,
+                expected_owner_generation,
+            })
+            .await?;
         Ok(match outcome {
             RunExecutionBoundaryAuthorization::Authorized { .. } => {
                 ProviderBoundaryAuthorization::Authorized
@@ -4831,55 +4642,6 @@ impl UserIntentProvider for RunEngine {
                 }
             }
         })
-    }
-
-    async fn fence_user_intent_submissions(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        let UserIntentAdmissionAuthority::DurableOwnerGeneration(expected_owner_generation) =
-            authority
-        else {
-            return Err(
-                "durable user-intent admission fencing requires exact owner generation".to_string(),
-            );
-        };
-        self.transition_user_intent_admission(
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_owner_generation,
-            RunUserIntentAdmissionTransition::Fence,
-        )
-        .await
-    }
-
-    async fn reopen_user_intent_submissions(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        let UserIntentAdmissionAuthority::DurableOwnerGeneration(expected_owner_generation) =
-            authority
-        else {
-            return Err(
-                "durable user-intent admission reopening requires exact owner generation"
-                    .to_string(),
-            );
-        };
-        self.transition_user_intent_admission(
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_owner_generation,
-            RunUserIntentAdmissionTransition::Reopen,
-        )
-        .await
     }
 
     async fn poll_user_intents(
@@ -5105,9 +4867,6 @@ impl UserIntentProvider for RunEngine {
                 );
                 Ok(UserIntentApplyAck::RunTerminalReturned)
             }
-            AtomicRunUserIntentApply::SettlementFenced => Err(format!(
-                "user-intent apply was fenced by settlement for run {run_id}"
-            )),
             AtomicRunUserIntentApply::Inactive { status } if status == STATUS_PAUSED => {
                 Ok(UserIntentApplyAck::Paused)
             }
@@ -5307,6 +5066,7 @@ mod tests {
             engine
                 .confirm_started_execution_authority(
                     RunExecutionAuthority {
+                        opening_control_tail: None,
                         owner_generation: 0,
                         owner_lease_expires_at: None
                     },
@@ -5716,271 +5476,133 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_boundary_refreshes_heartbeat_without_competing_renewal() {
+    async fn model_rounds_reuse_exact_owner_without_store_calls_or_extending_the_lease() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_provider_authorization_delay(Duration::from_secs(25)),
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120)),
         );
         let engine = RunEngine::new(store.clone());
         let execution = engine
             .start_run("run-1", "user-1", "session-1")
             .await
-            .expect("run start");
+            .unwrap();
         let guard = engine
             .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "run-1".to_string(),
+                "user-1".into(),
+                "session-1".into(),
+                "run-1".into(),
                 execution.owner_generation,
                 test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
-            .expect("heartbeat-enabled store");
-        let initial_deadline = engine
+            .unwrap();
+        let authority = engine
             .owner_lease_authority("user-1", "session-1", "run-1", execution.owner_generation)
-            .expect("active lease authority")
-            .current_state()
-            .deadline;
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
+            .unwrap();
+        let deadline = authority.current_state().deadline;
+        let identity =
+            UserIntentAdmissionAuthority::DurableOwnerGeneration(execution.owner_generation);
+        for _ in 0..4 {
+            assert_eq!(
                 UserIntentProvider::authorize_provider_boundary(
                     &engine,
                     "user-1",
                     "session-1",
                     "run-1",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
+                    identity,
                 )
                 .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(25)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            authorization.await.expect("authorization task").unwrap(),
-            ProviderBoundaryAuthorization::Authorized
-        );
-        let refreshed_deadline = engine
-            .owner_lease_authority("user-1", "session-1", "run-1", execution.owner_generation)
-            .expect("refreshed lease authority")
-            .current_state()
-            .deadline;
-        assert!(refreshed_deadline > initial_deadline);
-        assert_eq!(
-            store.lease_renewals(),
-            0,
-            "the heartbeat must not issue a competing lease update while provider authorization owns the lease operation"
-        );
-        drop(guard);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn provider_live_authority_reread_does_not_fabricate_a_new_lease_window() {
-        let store = Arc::new(
-            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_lease_renewal_behavior(LeaseRenewalBehavior::Pending)
-                .with_first_provider_authorization_delay(Duration::from_secs(31))
-                .with_provider_authorization_delay(Duration::from_secs(20))
-                .with_provider_authorization_live_reread(),
-        );
-        let engine = RunEngine::new(store.clone());
-        let execution = engine
-            .start_run("provider-live-reread", "user-1", "session-1")
-            .await
-            .expect("run start");
-        let lease_lost = Arc::new(AtomicBool::new(false));
-        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        let guard = engine
-            .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "provider-live-reread".to_string(),
-                execution.owner_generation,
-                test_confirmed_execution_authority(&engine),
-                lease_lost.clone(),
-                cancel.clone(),
-            )
-            .expect("heartbeat-enabled store");
-        let initial_deadline = engine
-            .owner_lease_authority(
+                .unwrap(),
+                ProviderBoundaryAuthorization::Authorized
+            );
+            assert_eq!(authority.current_state().deadline, deadline);
+        }
+        assert_eq!(store.provider_authorizations(), 0);
+        assert_eq!(store.lease_renewals(), 0);
+        for (user, session, generation) in [
+            ("other-user", "session-1", execution.owner_generation),
+            ("user-1", "other-session", execution.owner_generation),
+            ("user-1", "session-1", execution.owner_generation + 1),
+        ] {
+            assert!(
+                UserIntentProvider::authorize_provider_boundary(
+                    &engine,
+                    user,
+                    session,
+                    "run-1",
+                    UserIntentAdmissionAuthority::DurableOwnerGeneration(generation)
+                )
+                .await
+                .is_err()
+            );
+        }
+        let terminal = RunOwnerLeaseTerminalAuthority(Arc::clone(&authority));
+        let operation = terminal.begin().await.unwrap();
+        assert!(
+            UserIntentProvider::authorize_provider_boundary(
+                &engine,
                 "user-1",
                 "session-1",
-                "provider-live-reread",
-                execution.owner_generation,
+                "run-1",
+                identity,
             )
-            .expect("active lease authority")
-            .current_state()
-            .deadline;
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
-                UserIntentProvider::authorize_provider_boundary(
-                    &engine,
-                    "user-1",
-                    "session-1",
-                    "provider-live-reread",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
-                )
-                .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 1);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 2);
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            authorization.await.expect("authorization task").unwrap(),
-            ProviderBoundaryAuthorization::Authorized
+            .await
+            .unwrap_err()
+            .contains("terminal settlement")
         );
-        assert_eq!(
-            engine
-                .owner_lease_authority(
-                    "user-1",
-                    "session-1",
-                    "provider-live-reread",
-                    execution.owner_generation,
-                )
-                .expect("live reread keeps existing authority")
-                .current_state()
-                .deadline,
-            initial_deadline,
-            "a live-authority reread must not claim that durable expiry advanced"
-        );
-
-        tokio::task::yield_now().await;
-        assert_eq!(store.lease_renewals(), 1);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert!(tokio::time::Instant::now() < initial_deadline);
-        assert!(lease_lost.load(Ordering::Acquire));
-        assert!(cancel.is_cancelled());
-        assert_eq!(
-            store.lease_renewals(),
-            1,
-            "the old fence must reject a second attempt that cannot finish safely"
-        );
+        drop(operation);
         drop(guard);
+        assert!(
+            UserIntentProvider::authorize_provider_boundary(
+                &engine,
+                "user-1",
+                "session-1",
+                "run-1",
+                identity,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_boundary_wait_fails_closed_when_heartbeat_stops() {
+    async fn expired_confirmed_owner_cannot_dispatch_even_before_the_watcher_runs() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_provider_authorization_delay(Duration::from_secs(25)),
-        );
-        let engine = RunEngine::new(store);
-        let execution = engine
-            .start_run("run-1", "user-1", "session-1")
-            .await
-            .expect("run start");
-        let guard = engine
-            .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "run-1".to_string(),
-                execution.owner_generation,
-                test_confirmed_execution_authority(&engine),
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(tokio_util::sync::CancellationToken::new()),
-            )
-            .expect("heartbeat-enabled store");
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
-                UserIntentProvider::authorize_provider_boundary(
-                    &engine,
-                    "user-1",
-                    "session-1",
-                    "run-1",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
-                )
-                .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        drop(guard);
-        let error = authorization
-            .await
-            .expect("authorization task")
-            .expect_err("stopped heartbeat must fence provider authorization");
-        assert!(error.contains("no longer active"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn each_provider_boundary_attempt_receives_an_independent_thirty_second_budget() {
-        let store = Arc::new(
-            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
-                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
-                .with_provider_authorization_delay(Duration::from_secs(31)),
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120)),
         );
         let engine = RunEngine::new(store.clone());
-        let execution = engine
-            .start_run("provider-timeout", "user-1", "session-1")
-            .await
-            .expect("run start");
         let guard = engine
             .start_owner_lease_heartbeat(
-                "user-1".to_string(),
-                "session-1".to_string(),
-                "provider-timeout".to_string(),
-                execution.owner_generation,
+                "user-1".into(),
+                "session-1".into(),
+                "run-1".into(),
+                7,
                 test_confirmed_execution_authority(&engine),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(tokio_util::sync::CancellationToken::new()),
             )
-            .expect("heartbeat-enabled store");
-        let authorization = tokio::spawn({
-            let engine = engine.clone();
-            async move {
-                UserIntentProvider::authorize_provider_boundary(
-                    &engine,
-                    "user-1",
-                    "session-1",
-                    "provider-timeout",
-                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
-                        execution.owner_generation,
-                    ),
-                )
-                .await
-            }
-        });
-
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 1);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(store.provider_authorizations(), 2);
-        assert!(!authorization.is_finished());
-
-        tokio::time::advance(Duration::from_secs(29)).await;
-        tokio::task::yield_now().await;
-        assert!(!authorization.is_finished());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let error = authorization
+            .unwrap();
+        let authority = engine
+            .owner_lease_authority("user-1", "session-1", "run-1", 7)
+            .unwrap();
+        authority
+            .state
+            .send_modify(|state| state.deadline = tokio::time::Instant::now());
+        assert!(
+            UserIntentProvider::authorize_provider_boundary(
+                &engine,
+                "user-1",
+                "session-1",
+                "run-1",
+                UserIntentAdmissionAuthority::DurableOwnerGeneration(7),
+            )
             .await
-            .expect("authorization task")
-            .expect_err("both bounded attempts must time out");
-        assert!(error.contains("failed after 2 attempts"));
+            .unwrap_err()
+            .contains("expired")
+        );
+        assert_eq!(store.provider_authorizations(), 0);
         drop(guard);
     }
 
@@ -6036,7 +5658,7 @@ mod tests {
         let lease_lost = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
         let engine = RunEngine::new(store.clone());
-        let guard = engine
+        let mut guard = engine
             .start_owner_lease_heartbeat(
                 "user-1".to_string(),
                 "session-1".to_string(),
@@ -6062,14 +5684,15 @@ mod tests {
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
         assert_eq!(store.lease_releases(), 0, "terminal is not executor exit");
-        drop(guard);
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            if store.lease_releases() > 0 {
-                break;
-            }
-        }
-        assert_eq!(store.lease_releases(), 1);
+        guard.stop_tx.take().unwrap().send(()).unwrap();
+        (&mut guard._join)
+            .await
+            .expect("retired heartbeat must stop without polling a completed receiver");
+        assert_eq!(
+            store.lease_releases(),
+            0,
+            "terminal receipt already retired durable ownership"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6252,7 +5875,6 @@ mod tests {
             matches!(outcome, Ok(TerminalTransitionOutcome::Committed(_))),
             "{outcome:?}"
         );
-        assert_eq!(store.projection_repairs.load(Ordering::SeqCst), 1);
         tokio::task::yield_now().await;
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
@@ -6320,7 +5942,6 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
-        assert_eq!(store.projection_repairs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -7195,16 +6816,12 @@ mod tests {
         control_delta_index_corruption: Option<(usize, Option<serde_json::Value>)>,
         recovery_claim_failures: AtomicUsize,
         attempts: AtomicUsize,
-        projection_repairs: AtomicUsize,
         waiting_queries: AtomicUsize,
         recovery_claims: AtomicUsize,
         lease_renewal_interval: Option<Duration>,
         lease_duration: Option<Duration>,
         lease_renewal_behavior: LeaseRenewalBehavior,
         lease_release_behavior: LeaseReleaseBehavior,
-        provider_authorization_first_delay: Option<Duration>,
-        provider_authorization_delay: Option<Duration>,
-        provider_authorization_renews_lease: bool,
         terminal_transition_delay: Option<Duration>,
         provider_authorizations: AtomicUsize,
         lease_renewals: AtomicUsize,
@@ -7247,16 +6864,12 @@ mod tests {
                 control_delta_index_corruption: None,
                 recovery_claim_failures: AtomicUsize::new(0),
                 attempts: AtomicUsize::new(0),
-                projection_repairs: AtomicUsize::new(0),
                 waiting_queries: AtomicUsize::new(0),
                 recovery_claims: AtomicUsize::new(0),
                 lease_renewal_interval: None,
                 lease_duration: None,
                 lease_renewal_behavior: LeaseRenewalBehavior::Renew,
                 lease_release_behavior: LeaseReleaseBehavior::Succeed,
-                provider_authorization_first_delay: None,
-                provider_authorization_delay: None,
-                provider_authorization_renews_lease: true,
                 terminal_transition_delay: None,
                 provider_authorizations: AtomicUsize::new(0),
                 lease_renewals: AtomicUsize::new(0),
@@ -7317,21 +6930,6 @@ mod tests {
             self
         }
 
-        fn with_provider_authorization_delay(mut self, delay: Duration) -> Self {
-            self.provider_authorization_delay = Some(delay);
-            self
-        }
-
-        fn with_first_provider_authorization_delay(mut self, delay: Duration) -> Self {
-            self.provider_authorization_first_delay = Some(delay);
-            self
-        }
-
-        fn with_provider_authorization_live_reread(mut self) -> Self {
-            self.provider_authorization_renews_lease = false;
-            self
-        }
-
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
         }
@@ -7375,16 +6973,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStateStore for FlakyBatchTransitionStore {
-        async fn repair_terminal_projection_after_receipt(
-            &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-        ) -> Result<(), String> {
-            self.projection_repairs.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
         async fn reconcile_execution_handoff(
             &self,
             claim: &astra_services::runs::RecoveryClaim,
@@ -7397,6 +6985,7 @@ mod tests {
             record: DurableRunRecord,
         ) -> Result<RunExecutionAuthority, String> {
             let authority = RunExecutionAuthority {
+                opening_control_tail: None,
                 owner_generation: record.run_generation,
                 owner_lease_expires_at: self
                     .owner_lease_duration()
@@ -7742,25 +7331,6 @@ mod tests {
                 .await
         }
 
-        async fn load_run_projection(
-            &self,
-            user_id: &str,
-            run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            self.inner.load_run_projection(user_id, run_id).await
-        }
-
-        async fn rebuild_run_projection(
-            &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            self.inner
-                .rebuild_run_projection(user_id, expected_session_id, run_id)
-                .await
-        }
-
         async fn append_events_batch(
             &self,
             user_id: &str,
@@ -7877,25 +7447,8 @@ mod tests {
             &self,
             request: astra_services::runs::RunExecutionBoundaryAuthorizationRequest<'_>,
         ) -> Result<astra_services::runs::RunExecutionBoundaryAuthorization, String> {
-            let attempt = self.provider_authorizations.fetch_add(1, Ordering::SeqCst);
-            let delay = if attempt == 0 {
-                self.provider_authorization_first_delay
-                    .or(self.provider_authorization_delay)
-            } else {
-                self.provider_authorization_delay
-            };
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
-            let outcome = self.inner.authorize_execution_boundary(request).await?;
-            Ok(match outcome {
-                astra_services::runs::RunExecutionBoundaryAuthorization::Authorized { .. } => {
-                    astra_services::runs::RunExecutionBoundaryAuthorization::Authorized {
-                        lease_renewed: self.provider_authorization_renews_lease,
-                    }
-                }
-                outcome => outcome,
-            })
+            self.provider_authorizations.fetch_add(1, Ordering::SeqCst);
+            self.inner.authorize_execution_boundary(request).await
         }
 
         async fn release_owner_lease(
@@ -7965,15 +7518,29 @@ mod tests {
             RequestedTurnInteractionMode::Headless
         );
 
-        run.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("interaction_mode");
+        let mut presentation_only = run.clone();
+        presentation_only.events[0]["data"]["interaction_mode"] = serde_json::json!("unknown");
+        assert_eq!(
+            durable_run_effective_interaction_mode(&presentation_only).unwrap(),
+            RequestedTurnInteractionMode::Headless,
+            "delivery projection cannot replace immutable admission authority"
+        );
+
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("interaction_mode");
+        });
         assert!(durable_run_effective_interaction_mode(&run).is_err());
 
-        run.events[0]["data"]["interaction_mode"] = serde_json::json!("unknown");
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["interaction_mode"] = serde_json::json!("unknown");
+        });
         assert!(durable_run_effective_interaction_mode(&run).is_err());
-        run.events[0]["data"]["interaction_mode"] = serde_json::json!("headless");
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["interaction_mode"] = serde_json::json!("headless");
+        });
         run.events.push(run.events[0].clone());
         assert!(durable_run_effective_interaction_mode(&run).is_err());
     }
@@ -8003,6 +7570,56 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
         assert_eq!(run.events[0]["data"]["skill_auto_route_policy"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn opening_batch_contains_the_known_execution_contract_once() {
+        let engine = test_engine();
+        let binding = crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+            crate::server::tool_transport::WorkspaceBinding::none(),
+            crate::server::tool_transport::ExecutorBinding::server_control_plane(),
+        );
+        let checks = astra_turn_types::StopHookObligations {
+            declarations: Default::default(),
+            phase: astra_turn_types::CompletionCheckPhase::Stop,
+        };
+        let context = RunStartContext {
+            initial_execution_contract: Some((binding.clone(), checks.clone())),
+            ..Default::default()
+        };
+        engine
+            .start_run_with_context("known-binding", "user-1", "sess-1", context.clone())
+            .await
+            .unwrap();
+        let run = engine
+            .load_run("user-1", "known-binding")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.events.len(),
+            3,
+            "one Run opening plus the exact workspace/executor pair"
+        );
+        assert_eq!(
+            super::super::binding_resolution::durable_run_execution_contract(&run).unwrap(),
+            (binding, checks)
+        );
+        let claim = engine
+            .claim_run_with_context("known-binding", "user-1", "sess-1", Some("sess-1"), context)
+            .await
+            .unwrap();
+        assert!(matches!(claim, DurableRunStartClaim::Existing { .. }));
+        assert_eq!(
+            engine
+                .load_run("user-1", "known-binding")
+                .await
+                .unwrap()
+                .unwrap()
+                .events,
+            run.events,
+            "an exact retry must not append a second binding pair"
+        );
     }
 
     #[tokio::test]
@@ -8084,18 +7701,24 @@ mod tests {
             );
             assert!(durable_run_delegation_authority(&child, "other-owner").is_err());
             let mut invalid = child.clone();
-            invalid.events[0]["data"]
-                .as_object_mut()
-                .unwrap()
-                .remove("profile_authority");
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("profile_authority");
+            });
             assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             invalid = child.clone();
-            invalid.events[0]["data"]["profile_authority"] =
-                serde_json::json!({"kind":"ordinary_root"});
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]["profile_authority"] =
+                    serde_json::json!({"kind":"ordinary_root"});
+            });
             assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             invalid = child.clone();
-            invalid.events[0]["data"]["profile_authority"] =
-                serde_json::json!({"kind":"non_delegating", "authority":{"kind":"unknown"}});
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"][0]["data"]["profile_authority"] =
+                    serde_json::json!({"kind":"non_delegating", "authority":{"kind":"unknown"}});
+            });
             assert!(durable_run_delegation_authority(&invalid, "user-1").is_err());
             if authority == DelegationAuthority::Forbidden {
                 invalid = child;
@@ -8134,42 +7757,58 @@ mod tests {
             .unwrap();
         assert_eq!(durable_run_generation_controls(&run).unwrap(), controls);
 
-        let valid_start = run.events[0].clone();
+        let valid_start = run.opening.as_ref().unwrap().events()[0].clone();
         run.events.push(valid_start.clone());
         assert!(durable_run_generation_controls(&run).is_err());
         run.events.pop();
 
-        run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "off"},
-            "preserve_thinking": true
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"] = serde_json::json!({
+                "thinking": {"mode": "off"},
+                "preserve_thinking": true
+            });
         });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0] = valid_start.clone();
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0] = valid_start.clone();
+        });
 
-        run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "off"},
-            "first_output_max_tokens": null
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"] = serde_json::json!({
+                "thinking": {"mode": "off"},
+                "first_output_max_tokens": null
+            });
         });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0] = valid_start;
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0] = valid_start;
+        });
 
-        run.events[0]["data"]["generation_controls"]["first_output_max_tokens"] =
-            serde_json::json!(0);
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"]["first_output_max_tokens"] =
+                serde_json::json!(0);
+        });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0]["data"]["generation_controls"] = serde_json::json!({
-            "thinking": {"mode": "enabled", "budget_tokens": 4096},
-            "first_output_max_tokens": 4096,
-            "preserve_thinking": true
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"] = serde_json::json!({
+                "thinking": {"mode": "enabled", "budget_tokens": 4096},
+                "first_output_max_tokens": 4096,
+                "preserve_thinking": true
+            });
         });
         assert!(durable_run_generation_controls(&run).is_err());
 
-        run.events[0]["data"]["generation_controls"]["thinking"] =
-            serde_json::json!({"mode": "unknown"});
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]["generation_controls"]["thinking"] =
+                serde_json::json!({"mode": "unknown"});
+        });
         assert!(durable_run_generation_controls(&run).is_err());
-        run.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("generation_controls");
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("generation_controls");
+        });
         assert!(durable_run_generation_controls(&run).is_err());
     }
 
@@ -8201,13 +7840,17 @@ mod tests {
             Some(policy)
         );
 
-        let valid_start = run.events[0].clone();
-        run.events[0]["data"]
-            .as_object_mut()
-            .unwrap()
-            .remove("requested_model_policy");
+        let valid_start = run.opening.as_ref().unwrap().events()[0].clone();
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0]["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("requested_model_policy");
+        });
         assert!(durable_run_requested_model_policy(&run).is_err());
-        run.events[0] = valid_start.clone();
+        crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
+            opening["events"][0] = valid_start.clone();
+        });
         run.events.push(valid_start);
         assert!(durable_run_requested_model_policy(&run).is_err());
     }
@@ -8476,7 +8119,10 @@ mod tests {
             vec![child.events[0].clone(), child.events[0].clone()],
         ] {
             let mut invalid = child.clone();
-            invalid.events = events;
+            invalid.events = events.clone();
+            crate::server::run::mutate_run_opening_fixture(&mut invalid, |opening| {
+                opening["events"] = serde_json::to_value(events).unwrap();
+            });
             assert!(invalid.execution_authentication().is_err());
             assert!(invalid.execution_restrictions().is_err());
             assert!(invalid.admission_source().is_err());
@@ -9074,7 +8720,7 @@ mod tests {
             completion_checks: None,
             model_catalog_reader: None,
             message: "hello".to_string(),
-            conversation_authority: None,
+
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
@@ -9675,7 +9321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_projection_tracks_latest_event_usage_and_checkpoint() {
+    async fn canonical_run_tracks_latest_event_usage_and_checkpoint() {
         let engine = test_engine();
         let authority = engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
@@ -9724,36 +9370,31 @@ mod tests {
         );
 
         let projection = engine
-            .load_run_projection("user-1", "run-1")
+            .load_run("user-1", "run-1")
             .await
             .unwrap()
             .expect("projection should exist");
         assert_eq!(projection.status, "waiting");
         assert_eq!(projection.waiting_for.as_deref(), Some("user_input"));
-        assert_eq!(projection.projection_event_idx, 1);
+        assert_eq!(projection.last_event_idx, 1);
         assert_eq!(
-            projection.latest_event_type.as_deref(),
+            projection
+                .events
+                .last()
+                .map(astra_services::runs::extract_event_type)
+                .as_deref(),
             Some("tool_call_start")
         );
-        assert_eq!(projection.latest_checkpoint_kind.as_deref(), Some("resume"));
-        assert_eq!(
-            projection.latest_checkpoint_version.as_deref(),
-            Some("checkpoint_v2")
-        );
+        let checkpoint = engine
+            .load_latest_checkpoint("user-1", "run-1", None)
+            .await
+            .unwrap()
+            .expect("canonical checkpoint");
+        assert_eq!(checkpoint.checkpoint_kind, "resume");
+        assert_eq!(checkpoint.checkpoint_version, "checkpoint_v2");
         assert_eq!(projection.total_prompt_tokens, 11);
         assert_eq!(projection.total_completion_tokens, 7);
         assert_eq!(projection.total_tool_calls, 3);
-        assert!(
-            !projection.projection_hash.is_empty(),
-            "projection hash should be stable and non-empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_run_projection_missing_run_returns_none() {
-        let engine = test_engine();
-        let projection = engine.load_run_projection("user-1", "nope").await.unwrap();
-        assert!(projection.is_none());
     }
 
     #[tokio::test]
@@ -11263,7 +10904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fenced_pre_cutoff_intent_is_polled_applied_and_reopened() {
+    async fn accepted_guidance_is_polled_applied_and_followed_by_later_guidance() {
         let engine = test_engine();
         engine
             .start_run("run-fence-drain", "user-1", "sess-fence-drain")
@@ -11293,15 +10934,6 @@ mod tests {
             AtomicRunGuidanceAdmission::Committed { event_index: 1 }
         );
 
-        engine
-            .fence_user_intent_submissions(
-                "user-1",
-                "sess-fence-drain",
-                "run-fence-drain",
-                UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-            )
-            .await
-            .unwrap();
         let poll = engine
             .poll_user_intents("user-1", "run-fence-drain", 0)
             .await;
@@ -11326,15 +10958,6 @@ mod tests {
                 .unwrap(),
             UserIntentApplyAck::Applied
         );
-        engine
-            .reopen_user_intent_submissions(
-                "user-1",
-                "sess-fence-drain",
-                "run-fence-drain",
-                UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
-            )
-            .await
-            .unwrap();
 
         let after_reopen = serde_json::json!({
             "event_type": "user_intent",
@@ -11373,13 +10996,11 @@ mod tests {
             vec![
                 "run_started",
                 "user_intent",
-                "user_intent_settlement_fenced",
                 "user_intent_applied",
-                "user_intent_admission_reopened",
                 "user_intent",
             ]
         );
-        assert_eq!(run.events[2]["data"]["after_event_index"], 1);
+        assert_eq!(run.events[2]["event_type"], "user_intent_applied");
     }
 
     #[tokio::test]

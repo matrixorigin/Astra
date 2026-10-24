@@ -119,9 +119,29 @@ pub(super) async fn change_branch_retention(
     change: WorkBranchRetentionChange,
 ) -> Result<WorkBranchRetentionReceipt, WorkRepositoryError> {
     let change_payload_hash = payload_hash(&change)?;
+    // Discover only the immutable branch Session identity before taking locks.
+    // Execution admission orders lifecycle -> Session -> Work, so maintenance
+    // must take the same locks before its Work/branch mutation.
+    let session_id: String = sqlx::query_scalar(
+        "SELECT session_id FROM work_branches WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+    )
+    .bind(change.owner_id.as_str())
+    .bind(change.work_id.as_str())
+    .bind(change.branch_id.as_str())
+    .fetch_optional(repository.pool.get())
+    .await
+    .map_err(|source| WorkRepositoryError::persistence("find retention Session", source))?
+    .ok_or(WorkRepositoryError::NotFound)?;
     let mut transaction = repository.pool.get().begin().await.map_err(|source| {
         WorkRepositoryError::persistence("begin branch retention transaction", source)
     })?;
+    crate::storage::admit_session_execution_write(
+        &mut transaction,
+        &session_id,
+        change.owner_id.as_str(),
+    )
+    .await
+    .map_err(|source| WorkRepositoryError::persistence("fence branch retention Session", source))?;
     let row = query(
         "SELECT w.work_revision, w.delivery_branch_id, w.archived_at AS work_archived_at,
                 b.branch_revision, b.session_id, b.archived_at AS branch_archived_at,
@@ -138,6 +158,15 @@ pub(super) async fn change_branch_retention(
     .await
     .map_err(|source| WorkRepositoryError::persistence("lock branch retention basis", source))?
     .ok_or(WorkRepositoryError::NotFound)?;
+    let locked_session: String = row
+        .try_get("session_id")
+        .map_err(|source| WorkRepositoryError::corrupt("branch retention Session", source))?;
+    if locked_session != session_id {
+        return Err(WorkRepositoryError::corrupt(
+            "branch retention Session",
+            std::io::Error::other("immutable branch Session changed"),
+        ));
+    }
     if let Some(receipt) = replay(&mut transaction, &change, &change_payload_hash).await? {
         transaction.commit().await.map_err(|source| {
             WorkRepositoryError::persistence("commit branch retention replay", source)
@@ -191,20 +220,18 @@ pub(super) async fn change_branch_retention(
         let session_id = row
             .try_get::<String, _>("session_id")
             .map_err(|source| WorkRepositoryError::corrupt("branch retention basis", source))?;
-        let has_active_run: bool = query(
-            "SELECT EXISTS(
-                SELECT 1 FROM agent_session_execution_slots
-                WHERE user_id = ? AND session_id = ? LIMIT 1
-             ) AS active",
+        if !crate::storage::session_execution_activity(
+            &mut transaction,
+            change.owner_id.as_str(),
+            &session_id,
+            None,
         )
-        .bind(change.owner_id.as_str())
-        .bind(session_id)
-        .fetch_one(&mut *transaction)
         .await
-        .map_err(|source| WorkRepositoryError::persistence("check active branch run", source))?
-        .try_get("active")
-        .map_err(|source| WorkRepositoryError::corrupt("active branch run", source))?;
-        if has_active_run {
+        .map_err(|source| {
+            WorkRepositoryError::persistence("check active branch execution", source)
+        })?
+        .is_idle()
+        {
             return Err(WorkRepositoryError::BranchActive);
         }
     }

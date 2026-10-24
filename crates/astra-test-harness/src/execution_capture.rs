@@ -67,7 +67,6 @@ pub struct VerifiedChildEvidence<'a> {
 pub(crate) enum ChildProofReason {
     ChildCountMismatch,
     ChildNotCompleted,
-    ExecutionIdentityMismatch,
     ModelMismatch,
     FanoutStartMissing,
     FanoutStartRepeated,
@@ -112,7 +111,6 @@ pub(crate) enum ChildProofReason {
     LogicalRoundsUnavailable,
     ChildResultUnavailable,
     AdoptionEvidenceUnavailable,
-    PhysicalExecutionUnavailable,
     ResultWindowUnavailable,
     ResultWindowIdentityConflict,
     ResultWindowDigestConflict,
@@ -629,8 +627,8 @@ impl SessionExecutionCapture {
     }
 
     /// Positive evidence may survive partial reflection. A truncated run tree
-    /// cannot establish the required direct-child cardinality; missing request
-    /// groups or boundary facts cannot establish execution or adoption.
+    /// cannot establish the required direct-child cardinality; missing terminal
+    /// results or boundary facts cannot establish completion or adoption.
     pub(crate) fn verified_children<'a>(
         &'a self,
         root: &str,
@@ -670,33 +668,6 @@ impl SessionExecutionCapture {
         {
             return Err(ChildProofFailure::contradicted(
                 ChildProofReason::ChildNotCompleted,
-            ));
-        }
-        if self
-            .reflection
-            .model_requests
-            .terminal
-            .as_ref()
-            .is_some_and(|summary| {
-                summary.groups.iter().any(|group| {
-                    children.iter().any(|child| {
-                        group.run_id.as_deref() == Some(child.run_id.as_str())
-                            && (group
-                                .parent_run_id
-                                .as_deref()
-                                .is_some_and(|parent| parent != root)
-                                || group.agent_id.as_deref().is_some_and(|agent| {
-                                    child
-                                        .agent_id
-                                        .as_deref()
-                                        .is_some_and(|actual| actual != agent)
-                                }))
-                    })
-                })
-            })
-        {
-            return Err(ChildProofFailure::contradicted(
-                ChildProofReason::ExecutionIdentityMismatch,
             ));
         }
         if fanout_group.is_none() {
@@ -1175,7 +1146,7 @@ impl SessionExecutionCapture {
                     ChildProofReason::ResultDigestMismatch,
                 ));
             }
-            match self.child_adoption_time(root, child, content, &expectation.model, &facts) {
+            match self.child_adoption_time(root, child, content, &facts) {
                 Ok(time) => {
                     latest_adoption = Some(
                         latest_adoption
@@ -1434,7 +1405,6 @@ impl SessionExecutionCapture {
         root_id: &str,
         child: &astra_server_types::SessionRunNode,
         content: &str,
-        model: &str,
         facts: &[&Value],
     ) -> Result<chrono::NaiveDateTime, ChildProofFailure> {
         let (Some(agent), Some(offering)) = (
@@ -1460,35 +1430,11 @@ impl SessionExecutionCapture {
                 "child agent or offering identity unavailable",
             ));
         }
-        let summary = self
-            .reflection
-            .model_requests
-            .terminal
-            .as_ref()
-            .ok_or_else(|| {
-                ChildProofFailure::unavailable(
-                    ChildProofReason::PhysicalExecutionUnavailable,
-                    "child physical execution unavailable",
-                )
-            })?;
-        let physical = matches!(
-            self.reflection.model_requests.coverage,
-            astra_services::reflect::ModelRequestCaptureCoverage::WindowObserved
-                | astra_services::reflect::ModelRequestCaptureCoverage::WindowLimitReached
-        ) && summary.conflicting_requests == 0
-            && summary.groups.iter().any(|group| {
-                group.run_id.as_deref() == Some(child.run_id.as_str())
-                    && group.offering_id == offering
-                    && group.model == model
-                    && group.terminal_statuses.succeeded > 0
-                    && group.provider_response_id_observations > 0
-            });
-        if !physical {
-            return Err(ChildProofFailure::unavailable(
-                ChildProofReason::PhysicalExecutionUnavailable,
-                "child physical execution unavailable",
-            ));
-        }
+        // Completion and model identity come from the validated Run tree;
+        // result content comes from its terminal transcript. Adoption is a
+        // separate parent-owned fact, bound below to that exact content.
+        // Provider request diagnostics are not execution authority and may be
+        // absent for Run-owned inference.
         let mut windows = Vec::new();
         for fact in facts.iter().filter(|fact| {
             fact["kind"] == "agent_dependency_boundary"
@@ -1760,7 +1706,6 @@ pub(crate) mod tests {
         );
         (!results[0].passed).then(|| crate::classify::classify(&outcome, &results))
     }
-    use astra_services::reflect::{ModelRequestCapture, ModelRequestGroup, ModelRequestSummary};
 
     /// Consumer fixture using the published Server wire shape. These tests
     /// prove oracle rejection, not production emission or live task quality.
@@ -1786,27 +1731,12 @@ pub(crate) mod tests {
                 "created_at": "2026-10-07T00:00:00Z", "updated_at": "2026-10-07T00:00:03Z",
             })
         };
-        let mut group = ModelRequestGroup {
-            run_id: Some("child".into()),
-            parent_run_id: Some("root".into()),
-            agent_id: Some("member".into()),
-            offering_id: "offer".into(),
-            model: "test-model".into(),
-            terminal_requests: 1,
-            provider_response_id_observations: 1,
-            ..Default::default()
-        };
-        group.terminal_statuses.succeeded = 1;
         let reflection = serde_json::json!({
             "schema_version": 2, "tool": "reflect", "session_id": "session",
             "analysis_view": "execution_trace", "topic": "execution", "facet": "trace",
             "depth": "forensic", "horizon": "session", "source_policy": "local_first",
             "include_context": false, "data_coverage": {"source":"server", "events":3, "decisions":0},
-            "model_requests": ModelRequestCapture {
-                coverage: astra_services::reflect::ModelRequestCaptureCoverage::WindowObserved,
-                terminal: Some(ModelRequestSummary { terminal_requests:1, groups:vec![group], ..Default::default() }),
-                ..Default::default()
-            },
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "graph_slice": {"nodes":[{
                 "ref_id":"spine", "layer":"runtime", "kind":"event", "label":"execution_spine",
                 "metadata":{"execution_spine":{"coverage":"partial", "truncated":true, "omitted_facts":3,
@@ -1981,12 +1911,6 @@ pub(crate) mod tests {
         sibling_terminal.source_event_id = Some("sibling-terminal".into());
         sibling_terminal.content = "second-value".into();
         page.items.push(sibling_terminal);
-        let summary = capture.reflection.model_requests.terminal.as_mut().unwrap();
-        let mut physical = summary.groups[0].clone();
-        physical.run_id = Some("sibling".into());
-        physical.agent_id = Some("sibling-agent".into());
-        summary.groups.push(physical);
-        summary.terminal_requests += 1;
         let second = serde_json::json!({
             "kind":"agent_dependency_boundary", "run_id":"root", "parent_run_id":"root",
             "outcome":"results_adopted", "created_at":"2026-10-07T00:00:01.500000",
@@ -2249,19 +2173,9 @@ pub(crate) mod tests {
             ),
             Ok(false)
         );
-        for fault in ["late", "physical", "digest", "parent"] {
+        for fault in ["late", "digest", "parent"] {
             let mut altered = capture.clone();
             match fault {
-                "physical" => {
-                    altered
-                        .reflection
-                        .model_requests
-                        .terminal
-                        .as_mut()
-                        .unwrap()
-                        .groups
-                        .pop();
-                }
                 "parent" => altered.run_tree.runs[2].parent_run_id = Some("child".into()),
                 "late" | "digest" => {
                     let fact = &mut altered.reflection.graph_slice.nodes[0]
@@ -2361,14 +2275,6 @@ pub(crate) mod tests {
         }
         let mut natural = capture.clone();
         natural.run_tree.runs[2].runtime.model_name = Some("other-model".into());
-        natural
-            .reflection
-            .model_requests
-            .terminal
-            .as_mut()
-            .unwrap()
-            .groups[1]
-            .model = "other-model".into();
         let natural_expected = [
             expectation("observed-value", "test-model", None),
             expectation("second-value", "other-model", None),
@@ -2581,6 +2487,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn child_adoption_uses_run_and_result_custody_without_request_diagnostics() {
+        let mut observed = capture();
+        observed.reflection.model_requests = Default::default();
+        let expected = [expectation("observed-value", "test-model", None)];
+        assert_eq!(observed.proves_children("root", &expected, None), Ok(true));
+        observed.run_tree.runs[1].runtime.model_name = Some("wrong-model".into());
+        assert_eq!(observed.proves_children("root", &expected, None), Ok(false));
+    }
+
+    #[test]
     fn child_custody_classifies_observed_contradictions_before_missing_evidence() {
         use crate::classify::FailureClass::{
             BehaviorContractViolation, InfraVerificationUnavailable,
@@ -2589,10 +2505,10 @@ pub(crate) mod tests {
         for (fault, classification) in [
             ("text", BehaviorContractViolation),
             ("missing-text", InfraVerificationUnavailable),
-            ("physical-parent", BehaviorContractViolation),
-            ("physical-agent", BehaviorContractViolation),
-            ("mixed-physical", BehaviorContractViolation),
-            ("missing-physical", InfraVerificationUnavailable),
+            ("spawn-parent", BehaviorContractViolation),
+            ("spawn-agent", BehaviorContractViolation),
+            ("not-completed", BehaviorContractViolation),
+            ("missing-adoption", InfraVerificationUnavailable),
         ] {
             let mut altered = capture();
             match fault {
@@ -2601,34 +2517,30 @@ pub(crate) mod tests {
                         "wrong actual terminal".into()
                 }
                 "missing-text" => altered.transcript = None,
-                "physical-parent" => {
-                    altered
-                        .reflection
-                        .model_requests
-                        .terminal
+                "spawn-parent" | "spawn-agent" => {
+                    let fact = &mut altered.reflection.graph_slice.nodes[0]
+                        .metadata
                         .as_mut()
-                        .unwrap()
-                        .groups[0]
-                        .parent_run_id = Some("wrong-parent".into())
+                        .unwrap()["execution_spine"]["facts"][0];
+                    let field = if fault == "spawn-parent" {
+                        "parent_run_id"
+                    } else {
+                        "agent_id"
+                    };
+                    fact[field] = "foreign".into();
                 }
-                "physical-agent" => {
-                    altered
-                        .reflection
-                        .model_requests
-                        .terminal
+                "not-completed" => {
+                    altered.run_tree.runs[1].status = SessionRunLifecycleStatus::Failed
+                }
+                "missing-adoption" => {
+                    altered.reflection.graph_slice.nodes[0]
+                        .metadata
                         .as_mut()
+                        .unwrap()["execution_spine"]["facts"]
+                        .as_array_mut()
                         .unwrap()
-                        .groups[0]
-                        .agent_id = Some("wrong-agent".into())
+                        .remove(1);
                 }
-                "mixed-physical" => {
-                    let summary = altered.reflection.model_requests.terminal.as_mut().unwrap();
-                    let mut wrong = summary.groups[0].clone();
-                    wrong.parent_run_id = Some("wrong-parent".into());
-                    summary.groups.push(wrong);
-                    summary.terminal_requests += 1;
-                }
-                "missing-physical" => altered.reflection.model_requests.terminal = None,
                 _ => unreachable!(),
             }
             assert_eq!(
@@ -3232,21 +3144,6 @@ pub(crate) mod tests {
         );
         assert!(!original.awaiting_completion_evidence(Some("root")));
         let mut joined = original.clone();
-        let group = &mut joined
-            .reflection
-            .model_requests
-            .terminal
-            .as_mut()
-            .unwrap()
-            .groups[0];
-        group.parent_run_id = None;
-        group.agent_id = None;
-        assert!(singleton_proven(
-            &joined,
-            Some("root"),
-            "observed-value",
-            "test-model"
-        ));
         joined.reflection.graph_slice.nodes[0]
             .metadata
             .as_mut()
@@ -3292,29 +3189,14 @@ pub(crate) mod tests {
                 serde_json::json!("foreign"),
             ),
             ("/run_tree/runs/1/status", serde_json::json!("paused")),
+            ("/run_tree/runs/1/agent_id", serde_json::json!("foreign")),
             (
-                "/reflection/model_requests/coverage",
-                serde_json::json!("source_unavailable"),
-            ),
-            (
-                "/reflection/model_requests/terminal/groups/0/parent_run_id",
+                "/run_tree/runs/1/runtime/model_name",
                 serde_json::json!("foreign"),
             ),
             (
-                "/reflection/model_requests/terminal/groups/0/agent_id",
-                serde_json::json!("foreign"),
-            ),
-            (
-                "/reflection/model_requests/terminal/groups/0/offering_id",
-                serde_json::json!("foreign"),
-            ),
-            (
-                "/reflection/model_requests/terminal/groups/0/provider_response_id_observations",
-                serde_json::json!(0),
-            ),
-            (
-                "/reflection/model_requests/terminal/groups/0/terminal_statuses/succeeded",
-                serde_json::json!(0),
+                "/run_tree/runs/1/runtime/offering_id",
+                serde_json::Value::Null,
             ),
             (
                 "/reflection/graph_slice/nodes/0/metadata/execution_spine/facts/0/parent_run_id",

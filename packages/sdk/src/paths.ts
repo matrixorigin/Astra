@@ -567,9 +567,7 @@ export function chatRunProjectionPath(runId: string): string {
   return `/chat/runs/${encodeURIComponent(runId)}/projection`;
 }
 
-export function chatRunProjectionRepairPath(runId: string): string {
-  return `/chat/runs/${encodeURIComponent(runId)}/projection/repair`;
-}
+
 
 export function chatRunInputPath(runId: string): string {
   return `/chat/runs/${encodeURIComponent(runId)}/input`;

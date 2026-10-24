@@ -625,11 +625,6 @@ mod tests {
                 Some("finalization_unavailable"),
             ),
             (
-                "physical",
-                "unavailable",
-                Some("physical_execution_unavailable"),
-            ),
-            (
                 "window-identity",
                 "unavailable",
                 Some("result_window_identity_conflict"),
@@ -738,9 +733,6 @@ mod tests {
                     args["group_id"] = "private-sentinel".into();
                     capture["transcript"]["items"][0]["tool_calls"][0]["arguments"] =
                         args.to_string().into();
-                }
-                "physical" => {
-                    capture["reflection"]["model_requests"]["terminal"]["groups"] = json!([])
                 }
                 "window-identity" | "window-digest" | "window-invalid" | "window-shape" => {
                     let entry = &mut capture.pointer_mut(facts).unwrap()[1]["children"][0];

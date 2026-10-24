@@ -236,7 +236,6 @@ impl RemoteTurnState {
             session_id,
             self.session_turn.max(1),
             checkpoint,
-            None,
         ) {
             self.stall.last_heavy_checkpoint = Some(checkpoint);
         }
@@ -702,7 +701,6 @@ async fn finalize_remote_trace(state: &mut RemoteTurnState) {
             first_budget_pressure: &mut state.telemetry.first_budget_pressure,
             pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
             observability_session: state.telemetry.observability_session.clone(),
-            persistence: None,
         })
         .await;
     }

@@ -866,9 +866,6 @@ impl ThinClient {
             }
             reason = match value.get("execution_blocker").and_then(Value::as_str) {
                 Some("execution_slot" | "active_run") => "an execution is still stopping",
-                Some("settlement_pending") => {
-                    "execution stopped but its durable settlement is incomplete"
-                }
                 Some("writer_or_reservation") => {
                     "a conversation write or turn admission is still in progress"
                 }

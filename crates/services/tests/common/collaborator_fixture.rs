@@ -26,6 +26,10 @@ pub(crate) fn physical_workspace_id() -> String {
 
 pub(crate) fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: Uuid::new_v4().to_string(),
         user_id: user_id.into(),
         session_id: session_id.into(),

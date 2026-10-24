@@ -295,6 +295,20 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 self.assertFalse(summary["success"])
                 self.assertNotIn("private-sentinel", (root / "summary.json").read_text())
 
+    def test_preflight_failure_without_case_progress_is_not_a_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "execution.json").write_text(json.dumps({"exit_code": 1, "termination": "finished"}))
+            (root / "report.preflight.json").write_text(json.dumps({"status": "failed", "failure": {
+                "stage": "execution", "final_state": "interrupted", "interruption_kind": "provider_deadline"}}))
+            code, summary = self.publish(root, "failure")
+            self.assertEqual(code, 1)
+            self.assertFalse(summary["complete"])
+            self.assertFalse(summary["success"])
+            self.assertIsNone(summary["counts"]["planned"])
+            self.assertEqual(summary["counts"]["completed"], 0)
+            self.assertEqual(summary["incomplete_reason"], "no_case_progress")
+
     def test_missing_terminal_truncation_gaps_and_malformed_records_keep_valid_prefix(self):
         data = events()
         end = next(i for i, e in enumerate(data) if e["type"] == "case_completed") + 1

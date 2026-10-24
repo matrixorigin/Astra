@@ -195,19 +195,11 @@ impl CapacityInput {
         }
     }
 
-    /// Return the durable admission budget that backs one deployment.
-    ///
-    /// `ASTRA_RUN_CONCURRENCY_LIMIT` is the capacity of one server process,
-    /// while `ASTRA_CAPACITY_POD_COUNT` describes how many equivalent server
-    /// processes share the same durable admission domain.  Keeping the
-    /// provider-slot budget derived from those same inputs prevents a local
-    /// semaphore from advertising capacity that the cross-pod admission gate
-    /// will immediately reject.
-    pub(crate) fn distributed_admission_limits(&self) -> astra_services::WeightedAdmissionLimits {
-        let global_provider_slots = self.pod_count.saturating_mul(self.run_slots_per_pod).max(1);
+    /// Capacity belongs to this process; adding pods must not enlarge a local permit.
+    pub(crate) fn process_admission_limits(&self) -> astra_services::WeightedAdmissionLimits {
+        let global_provider_slots = self.run_slots_per_pod.max(1);
         let per_owner_provider_slots = self
-            .pod_count
-            .saturating_mul(self.run_slots_per_pod)
+            .run_slots_per_pod
             .saturating_mul(4)
             .saturating_div(5)
             .max(1)
@@ -539,16 +531,23 @@ mod tests {
     }
 
     #[test]
-    fn distributed_admission_follows_per_pod_and_pod_count_capacity() {
+    fn process_admission_is_independent_of_pod_count() {
         let limits = CapacityInput {
             pod_count: 3,
             run_slots_per_pod: 100,
             ..input()
         }
-        .distributed_admission_limits();
+        .process_admission_limits();
 
-        assert_eq!(limits.global.provider_slots, 300);
-        assert_eq!(limits.per_owner.provider_slots, 240);
+        assert_eq!(limits.global.provider_slots, 100);
+        assert_eq!(limits.per_owner.provider_slots, 80);
+        let single_pod = CapacityInput {
+            pod_count: 1,
+            run_slots_per_pod: 100,
+            ..input()
+        }
+        .process_admission_limits();
+        assert_eq!(limits, single_pod);
         assert!(limits.per_owner.provider_slots < limits.global.provider_slots);
     }
 

@@ -295,14 +295,6 @@ fn session_schema_requires_current_action_fields_and_current_action_set() {
         conditional_required_for(sess, "config"),
         vec!["path".to_string(), "value".to_string()]
     );
-    assert_eq!(
-        conditional_required_for(sess, "history_search"),
-        vec!["pattern".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(sess, "history_around"),
-        vec!["item_seq".to_string()]
-    );
     let mut actions = sess["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
         .expect("session action enum")
@@ -312,13 +304,7 @@ fn session_schema_requires_current_action_fields_and_current_action_set() {
     actions.sort_unstable();
     assert_eq!(
         actions,
-        [
-            "config",
-            "history_around",
-            "history_page",
-            "history_search",
-            "sleep",
-        ],
+        ["config", "sleep"],
         "session action surface must stay narrow and current"
     );
 }

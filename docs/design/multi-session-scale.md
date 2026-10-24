@@ -1,7 +1,7 @@
 # Multi-session and multi-server scale
 
 > Status: staged implementation contract.
-> Last updated: 2026-09-27.
+> Last updated: 2026-10-24.
 
 This document owns the capacity and availability contract for deployments with
 many users, many sessions, and more than one Astra Server. It describes the
@@ -31,30 +31,16 @@ Each deployment declares one capacity snapshot:
 | Layer | Scope | Meaning |
 | --- | --- | --- |
 | Run slots | one server process | Maximum agentic loop tasks executing on that process. |
-| Cluster run slots | all server processes sharing the database | Maximum outstanding canonical turn reservations. |
-| Owner share | one user across the deployment | Fair-share ceiling for canonical turn reservations. |
+| Cluster run slots | deployment planning | Sum of process limits; no exact database quota. |
+| Owner share | one user on one process | Hard ceiling within the process admission budget. |
 | Database pool | one process and the database cluster | Connections available to admission, leases, durable events, Edge relay, and reads. |
 | Provider budget | external provider | RPM/TPM and actual provider concurrency. |
 
-`ASTRA_RUN_CONCURRENCY_LIMIT` controls per-process run slots. The cluster
-budget is derived from that limit and `ASTRA_CAPACITY_POD_COUNT`, unless an
-operator supplies a deployment-specific capacity policy. The durable weighted
-admission gate stores a hash of the complete weighted budget. A pod with a
-different budget fails closed while reservations are active; this prevents a
-rolling deployment from silently changing the meaning of an existing global
-limit.
-
-The hash check is part of the current admission protocol. Every server sharing
-the durable scope must use the same protocol and declared snapshot. A new
-scope initializes its hash on the first reservation; an uninitialized hash is
-never adopted while reservations are active. A changed budget rotates only
-after the active reservations have drained, so a rollout must keep one
-capacity snapshot across all participating servers.
-
-Only the provider-slot dimension scales with the declared pod count. Resident
-memory, context, CPU, and I/O budgets describe the shared deployment budget and
-must not be multiplied merely because more pods were added. Provider capacity
-evidence and database capacity are rollout inputs, not optimistic defaults.
+`ASTRA_RUN_CONCURRENCY_LIMIT` controls per-process run slots. Cluster estimates
+multiply by `ASTRA_CAPACITY_POD_COUNT` for planning only. Admission does not
+store a deployment budget, reserve database credits or coordinate budget hashes
+across pods. Each process enforces its own resource and owner ceilings; routing,
+provider capacity and database capacity determine effective deployment capacity.
 
 ## Horizontal scaling invariant
 
@@ -231,73 +217,25 @@ oldest-backlog age; owner progress; pool-acquire latency; and end-to-end
 ingestion p50/p95/p99. Multi-process or cluster claims require the same evidence
 at that deployment scope.
 
-## Durable admission partitions
+## Process capacity
 
-The existing database controller uses 16 fixed owner partitions, encoded in the
-existing scope key as `canonical_turn_v2_00` through `canonical_turn_v2_15`.
-SHA-256 of the exact owner ID bytes selects the partition; all domains and
-sessions of that owner use it on every pod. Partition identity is not a pod
-assignment or a new routing service. The three admission tables and their
-existing compound keys remain the only authority.
+Each server owns a process-local weighted admission controller. A turn holds
+one RAII permit for resident bytes, context tokens, provider slots, CPU work
+and canonical I/O. Owner ceilings leave room for other tenants. Admission
+rejects excess work before provider dispatch; cancellation and execution drain
+release the permit. There are no database reservations, gate rows, expiry
+repairs, credit transfers or per-turn accounting transactions.
 
-Each gate stores a five-resource allocation, exact charged usage, configuration
-hash and conservative expiry frontier. Allocations sum componentwise to the
-configured global budget, charged usage cannot exceed its partition allocation,
-and each domain/owner retains its original share limit. Initial allocations
-split each resource by quotient and remainder. Credits are durable: a pod crash
-does not destroy or reissue them.
-
-Ordinary reserve, renewal and release acquire only their owner partition gate.
-A local semaphore per partition queues requests before pool checkout. A missing
-configuration or allocation miss releases that transaction and local permit.
-One local refill semaphore then coalesces credit/configuration work before any
-checkout. A credit miss reads its fresh snapshot only after this queue; a
-configuration miss instead rechecks the owner without a probe. A valid snapshot
-may suggest the target and donors sufficient for the deficit. The controller
-locks only these database gates in ascending order and revalidates real credit.
-A stale suggestion ends its transaction before one full-inventory attempt,
-retaining only the refill semaphore. Refills do not acquire owner-local permits
-or spend capacity from local state. Every attempt uses the
-same transaction implementation, repairs due/dirty partitions and checks exact
-replay and owner/global limits.
-It transfers only unused donor credit and grants atomically. Per deficient
-resource, the transfer targets the greater of the exact deficit and one
-sixteenth of global capacity, capped by available donor credit. Fragmentation
-must not cause a false global-exhaustion decision. No background refill,
-per-pod lease, local capacity cache or singleton fallback exists.
-
-Before local escalation, a credit miss may be rejected by one fresh read-only
-transaction. Its single SQL snapshot must simultaneously prove all 16 gates
-configured, clean, conserved and not due for expiry, and the exact logical
-idempotency identity absent. It may reject or suggest donor locks, never grant
-or transfer credit; the ordered locking protocol remains authoritative. No old locking
-snapshot, separate identity read, cached result or additional pool checkout
-while retaining the original transaction can substitute for this proof.
-
-Configuration initializes or rotates only while no reservation remains across
-the locked partitions. All configuration fingerprints include the partition
-contract. Repair and session deletion affect only the owner's partition;
-multi-gate transactions always acquire gates before reservation/owner rows.
-Renew/replay/TTL decisions sample database time after the final lock, inside the
-original deadline and cancellation-safe transaction. Release needs no clock.
-Exact logical identities and generation UUIDs fence stale renewals and releases.
-
-A future expiry frontier avoids a reservation scan. Due/dirty repair rebuilds
-only the locked partition and parses wide decimal sums without signed overflow.
-Successful cleanup commits even when admission is rejected. Replays remain
-valid at full capacity without a provisional INSERT; changed work is a mismatch.
-
-This removes the common row from the steady-state path, not all contention.
-Same-owner/hash-collision traffic still serializes. Initialization and stale
-donor fallback briefly coordinate all partitions. Physical gate count is fixed at 16; active
-reservation count remains bounded by the configured provider-slot budget.
-Performance claims require matched multi-process measurements; pool count is
-not pod count, and admission throughput is not complete-agent throughput.
+`ASTRA_RUN_CONCURRENCY_LIMIT` controls this process's provider slots.
+`ASTRA_CAPACITY_POD_COUNT` is a planning input only: adding pods does not enlarge
+a single process's capacity. Aggregate cluster capacity depends on placement
+and routing; an exact global weighted quota is no longer a product guarantee.
+Billing and durable Run/effect ownership remain separate contracts.
 
 ## Required scenarios
 
-The capacity harness must cover at least 1, 2, and 4 server processes and 1000
-sessions owned by 100 users across idle, short-turn, long-context, and
-slow-tool workloads. It must assert that the durable reservation total never
-exceeds the configured cluster budget, owner share is respected, cancellation
-returns capacity, and killing an owner pod does not duplicate a tool or turn.
+Exercise idle, short-turn, long-context and slow-tool workloads with competing
+owners. Assert local capacity and owner ceilings, cancellation returning
+capacity, and one owner unable to monopolize the process. Multi-process tests
+must check that each process enforces its own limit and that killing a process
+does not duplicate a durable effect or grant a second live Run owner.

@@ -112,14 +112,9 @@ matrix_test! {
     journey_tasks_runs::run_orphan_cancel_claim_race_http
 }
 matrix_test! {
-    e2e_matrix_paused_accounting_generation_fence_http, 2,
-    "live MatrixOne + mock LLM; paused accounting generation fence",
-    journey_tasks_runs::run_paused_accounting_generation_fence_http
-}
-matrix_test! {
-    e2e_matrix_live_pause_wins_post_loop_settlement_accounting, 4,
-    "live MatrixOne + mock LLM; pause wins the post-loop settlement race",
-    journey_tasks_runs::run_live_pause_wins_post_loop_settlement_accounting
+    e2e_matrix_live_resume_commits_through_the_current_owner, 4,
+    "live MatrixOne + mock LLM; live resume completes through the owner terminal transaction",
+    journey_tasks_runs::run_live_resume_commits_through_the_current_owner
 }
 matrix_test! {
     e2e_matrix_session_cancel_delete, 2,

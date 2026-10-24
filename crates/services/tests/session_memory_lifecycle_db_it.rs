@@ -743,7 +743,7 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
         // while the canonical turn is still reserved and the handoff was lost.
         release_slot().await;
         let slots: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
         )
         .bind(&user)
         .bind(&session)

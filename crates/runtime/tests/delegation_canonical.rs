@@ -349,14 +349,10 @@ async fn exercise_delegation_lifecycle(engine: &RunEngine, user: &str, session: 
         assert_eq!(control.status, run.status);
         assert_eq!(control.ancestor_path, run.ancestor_path);
         assert_eq!(control.run_generation, run.run_generation);
-        let display = engine
-            .load_run_projection(user, run_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let display = engine.load_run(user, run_id).await.unwrap().unwrap();
         assert_eq!(display.status, run.status);
         assert_eq!(display.error_message, run.error_message);
-        assert_eq!(display.projection_event_idx, run.last_event_idx);
+        assert_eq!(display.last_event_idx, run.last_event_idx);
     }
     let listed = engine.list_session_runs(user, session, 10).await.unwrap();
     assert!(!listed.truncated);

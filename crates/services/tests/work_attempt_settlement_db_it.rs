@@ -810,6 +810,10 @@ fn item_run(
         WorkItemAttemptId::parse(run_id).expect("attempt id"),
     ));
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: run_id.into(),
         user_id: owner_id.into(),
         session_id: session_id.into(),

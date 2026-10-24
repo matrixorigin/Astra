@@ -41,6 +41,32 @@ can reject invalid or revoked sessions earlier with 401. Older servers without
 these codes retain generic CLI permission hints; detail text is not parsed to
 infer an authorization category.
 
+## Ordinary request authentication cache
+
+The authentication service verifies each local access JWT's signature, type,
+subject, session, origin and expiry before consulting its process-local cache.
+A miss reads account activity, refresh-session expiry and issuer binding in one
+SQL snapshot. A successful observation can be reused for at most 30 seconds,
+bounded further by token/session expiry and the Memoria access-token lifetime.
+Hits do not extend freshness. Ordinary local authentication therefore uses one
+cold statement and no SQL on a cache hit; Memoria misses additionally resolve
+the current connection credential. No bearer, password hash or memory credential
+is retained in the cache.
+
+The cache is shared by service clones and bounded to 1,024 entries, 4 MiB of
+accounted storage and 16 KiB per entry. Reconfiguring a service's pool, issuer or
+encryptor starts a new namespace. Logout, disconnect and Memoria binding changes
+invalidate local observations and fence in-flight fills, including uncertain
+commits. Other processes and out-of-band account/session mutations can take up
+to 30 seconds to affect ordinary request admission. Expired observations require
+a successful fresh lookup; database errors do not enable stale fallback.
+
+This cache observes identity, not operation permissions. Memory operations
+continue resolving scoped credentials through the canonical credential resolver;
+provider-request replay checks, sensitive reauthentication and execution-handoff
+reauthorization retain their own fresh authority checks. Already admitted work
+continues under its existing execution/cancellation authority.
+
 ## Atomic binding and sessions
 
 Login verifies the key, takes the canonical account lock, rechecks the key after waiting, and commits identity, encrypted binding and refresh session together. Concurrent first logins resolve one account. A deterministic credential token primary key identifies one binding per provider/account; replacements remove superseded ciphertext in the same transaction. The verified key ID identifies the upstream key generation. Astra also persists a local connection lifecycle nonce in credential metadata: ordinary login with the same active binding preserves it; key replacement or reconnect after disconnect generates a new nonce, even when the upstream key ID is unchanged. Failed issuance rolls back every login-owned row.

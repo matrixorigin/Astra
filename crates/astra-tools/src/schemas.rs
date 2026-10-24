@@ -2292,32 +2292,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools, when visible in the current tool surface, for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), context compression (`compress_context`), plan lifecycle (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
+                "description": "Session controls. Actions: config(path+value), sleep. Use dedicated tools, when visible in the current tool surface, for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), context compression (`compress_context`), plan lifecycle (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","sleep","history_page","history_search","history_around"]},
+                        "action": {"type": "string", "enum": ["config","sleep"]},
                         "path": {"type": "string", "description": "Config path for action=config."},
                         "value": {"type": "number", "description": "Numeric config value. Count paths require an integer; compression threshold accepts a fractional number."},
                         "force": {"type": "boolean", "description": "Override config drift/mutation governor for action=config."},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
-                        "reason": {"type": "string", "description": "Reason (sleep)"},
-                        "pattern": {"type": "string", "description": "history_search search text: compact topic, phrase, filename, error text, decision, or Chinese/English keyword."},
-                        "before_seq": {"type": "integer", "description": "history_page/history_search cursor: return transcript rows older than this item_seq."},
-                        "after_seq": {"type": "integer", "description": "history_page/history_search cursor: return transcript rows newer than this item_seq."},
-                        "item_seq": {"type": "integer", "description": "history_around anchor returned by history_page/history_search."},
-                        "radius": {"type": "integer", "description": "history_around rows before and after item_seq, 0-10, default 3."},
-                        "limit": {"type": "integer", "description": "history_page/history_search row/result limit. history_page: 1-50 default 20; history_search: 1-20 default 8."},
-                        "scan_limit": {"type": "integer", "description": "history_search recent transcript scan limit, 50-1000, default 400."},
-                        "order": {"type": "string", "enum": ["asc","desc"], "description": "history_page output order. asc reads a recovered range chronologically; desc browses backward from newest."},
-                        "role": {"type": "string", "enum": ["all","user","assistant","system"], "description": "Optional history role filter. Default all."}
+                        "reason": {"type": "string", "description": "Reason (sleep)"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
-                        "config": ["path", "value"],
-                        "history_search": ["pattern"],
-                        "history_around": ["item_seq"]
+                        "config": ["path", "value"]
                     }
                 }
             }

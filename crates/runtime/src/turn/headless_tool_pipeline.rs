@@ -869,6 +869,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         idem_key: Option<&IdempotencyKey>,
     ) {
         let tool_idem_key = idem_key
+            .filter(|_| self.ctx.runtime_tool_executor.is_none())
             .filter(|_| READ_ONLY_TOOLS.contains(&execution.name.as_str()))
             .map(IdempotencyKey::cache_key);
         let args_preview = safe_args_preview(&execution.name, &execution.args);
@@ -1151,7 +1152,7 @@ mod tests {
         harness.edge_tool_round.clear();
     }
 
-    async fn short_circuit_cached_read_file(
+    async fn execute_read_with_stale_cache(
         harness: &mut PipelineHarness,
         turn_index: usize,
         call_id: &str,
@@ -1159,20 +1160,23 @@ mod tests {
     ) {
         harness.valid_tool_names.insert("read_file".to_string());
         configure_server_read_file(harness, call_id, path);
-        seed_cached_read_file(harness, call_id, path, &format!("cached {path}"));
-
+        seed_cached_read_file(harness, call_id, path, "obsolete cached content");
         harness.call_counts.clear();
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(path), format!("fresh {path}")).unwrap();
         let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
         let mut pipeline = harness.pipeline_with_server_executor(turn_index, Some(&executor));
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("cached read_file must still pass validation"),
-        };
-        assert!(matches!(
-            pipeline.permit_execution(validated).await,
-            HeadlessPipelineStage::ShortCircuit
-        ));
+        assert!(pipeline.run_slot_with_control(0).await);
+        let record = pipeline.ctx.tool_call_records.last().unwrap();
+        assert!(record.was_executed());
+        assert!(record.execution_completion.is_none());
+        assert!(
+            record
+                .result_full
+                .as_ref()
+                .unwrap()
+                .contains(&format!("fresh {path}"))
+        );
     }
 
     fn begin_recorded_turn(harness: &mut PipelineHarness, tool_count: usize) {
@@ -1243,6 +1247,14 @@ mod tests {
             crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(workspace),
             crate::server::tool_execution_binding::ExecutorBinding::server_local(),
         );
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "read_file".into(),
+            crate::server::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                "read_file",
+                "server-sandbox",
+                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal,
+            ),
+        )]));
         executor.enable_durable_invocations();
         executor
     }
@@ -1580,13 +1592,18 @@ mod tests {
             &result.result.output,
         );
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("unused.txt"),
+            "current readonly result",
+        )
+        .unwrap();
         let executor = server_executor_for_test_workspace(workspace.path(), &cached.session_id);
         let mut pipeline = cached.pipeline_with_server_executor(0, Some(&executor));
         assert!(pipeline.run_slot_with_control(0).await);
         assert!(pipeline.into_round_outcome().accepted_sends.is_empty());
         assert_eq!(
             cached.tool_call_records.last().unwrap().disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Reused)
+            Some(astra_services::session_journal::ToolCallDisposition::Executed)
         );
     }
 
@@ -2377,7 +2394,7 @@ mod tests {
     async fn production_dispatch_control_stops_serial_provider_execution_and_later_claims() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
-        harness.valid_tool_names.insert("read_file".to_string());
+        harness.valid_tool_names.insert("write_file".to_string());
         harness.tool_calls = [
             ("call-a", "a.txt"),
             ("call-b", "b.txt"),
@@ -2389,8 +2406,8 @@ mod tests {
                 "id": id,
                 "type": "function",
                 "function": {
-                    "name": "read_file",
-                    "arguments": serde_json::to_string(&json!({"path": path})).unwrap(),
+                    "name": "write_file",
+                    "arguments": serde_json::to_string(&json!({"path": path, "content": format!("written {path}")})).unwrap(),
                 }
             })
         })
@@ -2398,17 +2415,6 @@ mod tests {
         begin_recorded_turn(&mut harness, 3);
 
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("a.txt"), "provider-effect-a").unwrap();
-        std::fs::write(
-            workspace.path().join("b.txt"),
-            "provider-effect-b-must-not-run",
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.path().join("c.txt"),
-            "provider-effect-c-must-not-run",
-        )
-        .unwrap();
         let mut executor =
             server_executor_for_test_workspace(workspace.path(), harness.session_id.as_str());
         executor.enable_durable_invocations();
@@ -2437,16 +2443,12 @@ mod tests {
             assert!(pipeline.action_fence_error().is_some());
         }
 
-        let visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
-        assert!(visible.contains("provider-effect-a"), "{visible}");
-        assert!(
-            !visible.contains("provider-effect-b-must-not-run"),
-            "{visible}"
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+            "written a.txt\n"
         );
-        assert!(
-            !visible.contains("provider-effect-c-must-not-run"),
-            "{visible}"
-        );
+        assert!(!workspace.path().join("b.txt").exists());
+        assert!(!workspace.path().join("c.txt").exists());
         assert_eq!(
             harness.tool_call_records.len(),
             2,
@@ -2688,7 +2690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_read_invocation_observes_external_workspace_changes() {
+    async fn repeated_server_reads_observe_current_workspace_contents() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("read_file".to_string());
         let workspace = tempfile::tempdir().unwrap();
@@ -2721,11 +2723,8 @@ mod tests {
                 .to_string()
                 .contains("V1 first observation")
         );
-        assert_eq!(
-            harness.tool_call_records[1].disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Reused),
-            "a completed invocation retry should replay its own confirmed result"
-        );
+        assert!(harness.tool_call_records[1].was_executed());
+        assert!(harness.tool_call_records[1].execution_completion.is_none());
 
         std::fs::write(&path, "V2 externally updated observation").unwrap();
         configure_server_read_file(&mut harness, "call-read-v2", "shared.txt");
@@ -2757,13 +2756,37 @@ mod tests {
         assert!(
             harness.tool_results[3]
                 .to_string()
-                .contains("V1 first observation")
+                .contains("V2 externally updated observation")
         );
-        assert_eq!(
-            harness.tool_call_records[3].disposition,
-            Some(astra_services::session_journal::ToolCallDisposition::Reused),
-            "a retry after an external edit must remain bound to its original outcome"
+        assert!(harness.tool_call_records[3].was_executed());
+        assert!(harness.tool_call_records[3].execution_completion.is_none());
+        assert!(
+            harness
+                .idempotency_cache
+                .check(&read_cache_key_for_invocation(
+                    &harness,
+                    "call-read-v1",
+                    "shared.txt"
+                ))
+                .is_none()
         );
+
+        // Reusing a public call ID with a different read is another observation,
+        // not a durable identity reservation or an old result replay.
+        std::fs::write(workspace.path().join("other.txt"), "different current file").unwrap();
+        configure_server_read_file(&mut harness, "call-read-v1", "other.txt");
+        begin_recorded_turn(&mut harness, 1);
+        harness.call_counts.clear();
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(4, Some(&executor));
+            assert!(pipeline.run_slot_with_control(0).await);
+        }
+        assert!(
+            harness.tool_results[4]
+                .to_string()
+                .contains("different current file")
+        );
+        assert!(harness.tool_call_records[4].was_executed());
     }
 
     #[tokio::test]
@@ -2923,77 +2946,6 @@ mod tests {
         assert_eq!(
             record.effective_disposition(),
             astra_services::session_journal::ToolCallDisposition::Suppressed
-        );
-    }
-
-    #[tokio::test]
-    async fn same_invocation_replay_records_explicit_trace_payload() {
-        let mut harness = PipelineHarness::new();
-        begin_recorded_turn(&mut harness, 1);
-
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-1", "a.txt").await;
-
-        let tool_events = tool_trace_events(&harness);
-        assert_eq!(
-            tool_events.len(),
-            2,
-            "same-invocation replay should emit started+completed trace events"
-        );
-        assert!(matches!(
-            tool_events[0].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
-        ));
-        let started_payload = tool_events[0].1.as_ref().expect("started payload");
-        assert_eq!(
-            started_payload.get("tool_name").and_then(Value::as_str),
-            Some("read_file")
-        );
-        assert_eq!(
-            started_payload.get("call_id").and_then(Value::as_str),
-            Some("call-read-a-1")
-        );
-        assert!(
-            started_payload
-                .get("args_preview")
-                .and_then(Value::as_str)
-                .is_some_and(|preview| preview.contains("a.txt")),
-            "started trace should include args preview, got: {started_payload:?}"
-        );
-
-        assert!(matches!(
-            tool_events[1].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
-        ));
-        let completed_payload = tool_events[1].1.as_ref().expect("completed payload");
-        assert_eq!(
-            completed_payload.get("reason").and_then(Value::as_str),
-            Some("cached_same_invocation")
-        );
-        assert_eq!(
-            completed_payload.get("cached").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            completed_payload.get("is_error").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            completed_payload.get("call_id").and_then(Value::as_str),
-            Some("call-read-a-1")
-        );
-        assert!(
-            completed_payload
-                .get("args_preview")
-                .and_then(Value::as_str)
-                .is_some_and(|preview| preview.contains("a.txt")),
-            "completed trace should include args preview, got: {completed_payload:?}"
-        );
-        assert!(
-            completed_payload
-                .get("output")
-                .and_then(Value::as_str)
-                .is_some_and(|output| output.contains("cached a.txt")),
-            "completed cache-hit trace should carry cached output, got: {completed_payload:?}"
         );
     }
 
@@ -4131,9 +4083,14 @@ mod tests {
                 context_signature: key.context_signature.clone(),
             },
         );
-        let workspace = tempfile::tempdir().unwrap();
-        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
-        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&executor));
+        let session_id = harness.session_id.clone();
+        let run_id = harness.run_id.clone();
+        let chain_id = harness.turn_chain_id.clone();
+        let mut pipeline = harness.pipeline_with_server_executor(1, None);
+        pipeline.ctx.current_user_id = Some("test-user");
+        pipeline.ctx.current_session_id = Some(&session_id);
+        pipeline.ctx.current_run_id = Some(&run_id);
+        pipeline.ctx.current_turn_chain_id = Some(&chain_id);
         let validated = match pipeline.validate_slot(0) {
             HeadlessPipelineStage::Continue(validated) => validated,
             _ => panic!("catalog replay must pass validation"),
@@ -4181,11 +4138,17 @@ mod tests {
     #[tokio::test]
     async fn durable_completion_waits_for_post_tool_governance_and_redaction() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("read_file".to_string());
-        configure_server_read_file(&mut harness, "call-governed", "governed.txt");
+        harness.valid_tool_names.insert("write_file".to_string());
+        harness.edge_tool_round.clear();
+        harness.tool_calls = vec![json!({
+            "id":"call-governed", "type":"function",
+            "function":{"name":"write_file","arguments":serde_json::to_string(&json!({
+                "path":"governed.txt","content":"written once\n"
+            })).unwrap()}
+        })];
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
-            matcher: "read_file".into(),
+            matcher: "write_file".into(),
             action: HookAction::Shell {
                 command: r#"echo '{"output":"hooked AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}'"#
                     .into(),
@@ -4197,11 +4160,6 @@ mod tests {
             priority: 0,
         }]);
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(
-            workspace.path().join("governed.txt"),
-            "raw provider AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF",
-        )
-        .unwrap();
         let mut executor =
             server_executor_for_test_workspace(workspace.path(), harness.session_id.as_str());
         executor.enable_durable_invocations();
@@ -4213,17 +4171,14 @@ mod tests {
             "call-governed",
         )
         .unwrap();
-        let governed_cache_key =
-            read_cache_key_for_invocation(&harness, "call-governed", "governed.txt");
-
         let mut pipeline = harness.durable_pipeline_with_server_executor(&executor);
         let validated = match pipeline.validate_slot(0) {
             HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("expected validated durable read"),
+            _ => panic!("expected validated durable write"),
         };
         let permitted = match pipeline.permit_execution(validated).await {
             HeadlessPipelineStage::Continue(permitted) => permitted,
-            _ => panic!("expected permitted durable read"),
+            _ => panic!("expected permitted durable write"),
         };
         let executed = pipeline.execute_execution(permitted).await;
         assert!(executed.execution.pending_runtime_completion.is_some());
@@ -4285,24 +4240,21 @@ mod tests {
                 .is_none_or(|value| !value.contains("AKIA1234567890ABCDEF"))
         );
         assert_eq!(record.invocation_identity.as_ref(), Some(&identity));
-        let cached = pipeline
-            .ctx
-            .idempotency_cache
-            .check(&governed_cache_key)
-            .expect("successful read should populate the observation cache");
-        assert!(cached.output.contains("[REDACTED:"), "{}", cached.output);
-        assert!(!cached.output.contains("AKIA1234567890ABCDEF"));
         drop(pipeline);
 
-        // Rebuild the pipeline without its local observation cache. The same
-        // durable identity must replay, even after the provider file is gone.
+        // The ledger replays a confirmed effect without executing it again.
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("governed.txt")).unwrap(),
+            "written once\n"
+        );
         std::fs::remove_file(workspace.path().join("governed.txt")).unwrap();
         let mut replay_harness = PipelineHarness::new();
-        replay_harness.valid_tool_names.insert("read_file".into());
-        configure_server_read_file(&mut replay_harness, "call-governed", "governed.txt");
+        replay_harness.valid_tool_names.insert("write_file".into());
+        replay_harness.edge_tool_round.clear();
+        replay_harness.tool_calls = harness.tool_calls.clone();
         replay_harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
-            matcher: "read_file".into(),
+            matcher: "write_file".into(),
             action: HookAction::Shell {
                 command: r#"echo '{"output":"new replay presentation"}'"#.into(),
             },
@@ -4340,6 +4292,10 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("new replay presentation")
+        );
+        assert!(
+            !workspace.path().join("governed.txt").exists(),
+            "replay must not repeat the write"
         );
         let unchanged = executor
             .durable_invocation_record_for_test(&identity)
@@ -4394,14 +4350,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_post_tool_hook_transforms_same_invocation_replay() {
+    async fn server_read_ignores_stale_cache_and_applies_current_post_tool_governance() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("read_file".to_string());
         harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
             event: ToolEventKind::PostToolUse,
             matcher: "read_file".into(),
             action: HookAction::Shell {
-                command: r#"echo '{"output":"currently transformed cached result"}'"#.into(),
+                command: r#"echo '{"output":"currently transformed AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}'"#.into(),
             },
             timeout_secs: 5,
             is_async: false,
@@ -4418,23 +4374,25 @@ mod tests {
         );
 
         let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("cached.txt"),
+            "fresh raw provider observation",
+        )
+        .unwrap();
         let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
         let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("cache presence must not replace validation"),
-        };
-        assert!(matches!(
-            pipeline.permit_execution(validated).await,
-            HeadlessPipelineStage::ShortCircuit
-        ));
+        assert!(pipeline.run_slot_with_control(0).await);
         drop(pipeline);
 
         let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
-        assert!(model_visible.contains("currently transformed cached result"));
+        assert!(model_visible.contains("currently transformed"));
+        assert!(model_visible.contains("[REDACTED:"));
+        assert!(!model_visible.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(harness.tool_call_records[0].was_executed());
+        assert!(harness.tool_call_records[0].execution_completion.is_none());
         assert!(
             !model_visible.contains("raw-cached-observation-that-must-be-transformed"),
-            "the current PostTool hook must govern reused output: {model_visible}"
+            "the current PostTool hook must govern fresh output: {model_visible}"
         );
         assert_eq!(
             harness
@@ -4446,7 +4404,7 @@ mod tests {
                 ))
                 .map(|cached| cached.output.as_str()),
             Some("raw-cached-observation-that-must-be-transformed"),
-            "per-invocation hook transforms must not mutate the observation cache"
+            "Server observations must neither replay nor fill the generic cache"
         );
     }
 
@@ -4487,22 +4445,15 @@ mod tests {
         assert!(!executed.is_err);
         assert!(executed.execution.pending_runtime_completion.is_some());
         pipeline.record_execution(executed).await;
-        let completed = executor
-            .durable_invocation_record_for_test(&identity)
-            .await
-            .unwrap();
-        assert_eq!(
-            completed.state,
-            astra_turn_types::ToolInvocationState::Succeeded
-        );
-        let outcome = completed.outcome.unwrap();
         assert!(
-            !serde_json::to_string(outcome.result())
-                .unwrap()
-                .contains("HOOK-BEGIN")
+            executor
+                .durable_invocation_record_for_test(&identity)
+                .await
+                .is_none()
         );
         let record = pipeline.ctx.tool_call_records.last().unwrap();
         assert!(record.ok);
+        assert!(record.execution_completion.is_none());
         let original = record.result_full.as_deref().unwrap();
         assert!(original.contains("RESULT-ONLY"));
         assert!(!original.contains("HOOK-BEGIN"));
@@ -4597,8 +4548,11 @@ mod tests {
                     "call-read-context",
                     "context.txt",
                 ))
-                .expect("fresh provider observation must replace the old cache entry");
-            assert!(cached.output.contains("fresh provider observation"));
+                .expect("Server execution leaves the obsolete cache entry untouched");
+            assert_eq!(
+                cached.output,
+                "stale-cache-that-context-sensitive-calls-must-not-reuse"
+            );
             assert!(!cached.output.contains("current policy context"));
         }
     }
@@ -6540,12 +6494,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_hits_on_different_read_file_signatures_do_not_trigger_guard() {
+    async fn fresh_reads_on_different_file_signatures_do_not_trigger_guard() {
         let mut harness = PipelineHarness::new();
 
-        short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-b-1", "b.txt").await;
-        short_circuit_cached_read_file(&mut harness, 2, "call-read-c-1", "c.txt").await;
+        execute_read_with_stale_cache(&mut harness, 0, "call-read-a-1", "a.txt").await;
+        execute_read_with_stale_cache(&mut harness, 1, "call-read-b-1", "b.txt").await;
+        execute_read_with_stale_cache(&mut harness, 2, "call-read-c-1", "c.txt").await;
 
         let verdict = harness.turn_guard.evaluate();
         assert!(
@@ -6557,7 +6511,7 @@ mod tests {
                 .injections
                 .iter()
                 .all(|msg| !msg.contains("Duplicate calls detected")),
-            "distinct cached signatures should not look like duplicate waste"
+            "distinct read signatures should not look like duplicate waste"
         );
     }
 
@@ -7125,38 +7079,6 @@ mod tests {
             "{visible}"
         );
         assert!(!visible.contains("retry_deferred"), "{visible}");
-    }
-
-    #[tokio::test]
-    async fn repeated_same_invocation_replays_preserve_the_original_result() {
-        let mut harness = PipelineHarness::new();
-
-        short_circuit_cached_read_file(&mut harness, 0, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 1, "call-read-a-1", "a.txt").await;
-        short_circuit_cached_read_file(&mut harness, 2, "call-read-a-1", "a.txt").await;
-
-        assert!(
-            harness.tool_results[2].to_string().contains("cached a.txt"),
-            "every replay of one completed invocation must return its original result, got: {:?}",
-            harness.tool_results
-        );
-        let tool_events = tool_trace_events(&harness);
-        let replayed = tool_events
-            .iter()
-            .find(|(_, payload)| {
-                payload.as_ref().is_some_and(|payload| {
-                    payload.get("reason").and_then(Value::as_str) == Some("cached_same_invocation")
-                })
-            })
-            .expect("expected same-invocation replay trace");
-        assert_eq!(
-            replayed
-                .1
-                .as_ref()
-                .and_then(|payload| payload.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
     }
 
     #[test]

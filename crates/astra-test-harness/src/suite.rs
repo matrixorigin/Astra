@@ -1034,21 +1034,16 @@ impl<'a> SuiteRunner<'a> {
         }
         let health_gate_required = self.runner_cfg.require_session_subsystem_health
             || (self.runner_cfg.require_memoria_subsystem_health && case.requires_memoria());
-        let health_gate_already_present = if self.runner_cfg.require_session_subsystem_health {
-            crate::criteria::has_unconditional_session_subsystem_health(&criteria)
-        } else {
-            crate::criteria::has_unconditional_memoria_subsystem_health(&criteria)
-        };
+        let health_gate_already_present =
+            crate::criteria::has_unconditional_session_subsystem_health(&criteria);
         if health_gate_required && !health_gate_already_present {
             criteria.push(Criterion::SessionSubsystemHealthy {
-                settled_subsystem: Some("post_loop_memory".into()),
+                settled_subsystem: None,
             });
         }
-        let settled_subsystem = if self.runner_cfg.require_session_subsystem_health {
-            crate::criteria::unconditional_settled_subsystem(&criteria)
-        } else {
-            crate::criteria::unconditional_memoria_settled_subsystem(&criteria)
-        };
+        // Wait only for a subsystem the case explicitly exercised. Ordinary
+        // turns no longer schedule background memory extraction.
+        let settled_subsystem = crate::criteria::unconditional_settled_subsystem(&criteria);
 
         let cleanup_enabled = !local_rejection
             && self.runner_cfg.cleanup_created_sessions
@@ -2779,7 +2774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_memoria_health_without_target_keeps_post_loop_barrier() {
+    async fn ordinary_turn_health_does_not_require_retired_memory_settlement() {
         let exec = FakeExecutor::new();
         exec.seed("nested-memory-no-target", "m", outcome_ok("m", "done", &[]));
         let turn = crate::session_capture::JournalEvent {
@@ -2857,20 +2852,20 @@ mod tests {
         );
 
         let report = runner.run_all(&[case]).await;
-        assert_eq!(report.passed(), 0);
-        assert!(loader.calls.load(Ordering::Relaxed) >= 2);
-        assert!(report.runs[0].criteria.iter().any(|result| {
-            matches!(
+        assert_eq!(report.passed(), 1);
+        assert_eq!(loader.calls.load(Ordering::Relaxed), 1);
+        assert!(report.runs[0].criteria.iter().all(|result| {
+            !matches!(
                 result.criterion,
                 Criterion::SessionSubsystemHealthy {
-                    settled_subsystem: Some(ref subsystem)
-                } if subsystem == "post_loop_memory"
-            ) && !result.passed
+                    settled_subsystem: Some(_)
+                }
+            )
         }));
     }
 
     #[tokio::test]
-    async fn nested_memoria_health_never_settling_cannot_pass() {
+    async fn explicit_async_health_never_settling_cannot_pass() {
         let exec = FakeExecutor::new();
         exec.seed(
             "nested-memory-never-settles",
@@ -2920,7 +2915,7 @@ mod tests {
             "nested-memory-never-settles",
             vec![Criterion::AllOf {
                 criteria: vec![Criterion::SessionSubsystemHealthy {
-                    settled_subsystem: None,
+                    settled_subsystem: Some("explicit_async_task".into()),
                 }],
             }],
         );
@@ -2929,12 +2924,7 @@ mod tests {
         assert_eq!(report.passed(), 0);
         assert!(loader.calls.load(Ordering::Relaxed) >= 2);
         assert!(report.runs[0].criteria.iter().any(|result| {
-            matches!(
-                result.criterion,
-                Criterion::SessionSubsystemHealthy {
-                    settled_subsystem: Some(ref subsystem)
-                } if subsystem == "post_loop_memory"
-            ) && !result.passed
+            matches!(result.criterion, Criterion::AllOf { .. }) && !result.passed
         }));
     }
 

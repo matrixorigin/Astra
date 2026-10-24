@@ -1196,10 +1196,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let mut advisories = astra_turn_core::tool::result::advisory::advisories(
                 execution.tool_result_fields.as_ref(),
             );
-            // Only the same Server invocation may reuse its result. Edge
-            // observations and calls without a complete identity remain
-            // useful semantic evidence but cannot become replay state.
-            let replay_key = if execution.is_edge_tool {
+            // Server reads traverse current routing, permissions and hooks.
+            // Keep semantic hints, not a second source of replay authority.
+            let replay_key = if self.ctx.runtime_tool_executor.is_some() || execution.is_edge_tool {
                 None
             } else {
                 idem_key.as_ref()

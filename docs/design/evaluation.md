@@ -113,3 +113,10 @@ conflicting or incorrectly scoped evaluation is a protocol error.
 The CLI sidecar journal adds only its existing projection ID/index for retry
 reconciliation. The Server timestamp, canonical turn, producer scope and
 evaluation metadata remain unchanged; projection retries never re-evaluate.
+
+Child-result adoption checks use the canonical Run tree for completion, model
+identity and parentage, terminal transcript content for the actual result, and
+parent-owned adoption facts for content digests, complete result windows and
+adoption-before-finalization ordering. Provider request diagnostics are optional
+observations, not an additional execution authority or prerequisite for adoption
+verification. Missing canonical result or adoption evidence still fails closed.

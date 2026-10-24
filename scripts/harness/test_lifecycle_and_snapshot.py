@@ -221,12 +221,14 @@ time.sleep(60)
         )
         try:
             wait_for(
-                lambda: (root / "guardian.pid").is_file(),
+                lambda: (root / "guardian.pid").is_file()
+                and (root / "guardian.pid").read_text().strip().isdigit(),
                 process=process,
                 label="guardian.pid",
             )
             wait_for(
-                lambda: (root / "detached.pid").is_file(),
+                lambda: (root / "detached.pid").is_file()
+                and (root / "detached.pid").read_text().strip().isdigit(),
                 process=process,
                 label="detached.pid",
             )
@@ -968,7 +970,6 @@ time.sleep(30)
         self.assertIn("ASTRA_HARNESS_SNAPSHOT_ROOT_FD", source)
         self.assertIn("crates/runtime/src/server/sweeper_lease.rs", source)
         self.assertIn("crates/runtime/src/server/tool_invocation_compactor.rs", source)
-        self.assertIn("crates/services/src/weighted_admission.rs", source)
         self.assertIn(
             "crates/services/src/work/establishment_operation.rs", source
         )

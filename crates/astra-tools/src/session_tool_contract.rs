@@ -5,24 +5,13 @@ use serde_json::Value;
 /// Keep this list in schema order. Plan lifecycle, rollback, compression, and
 /// user prompts are top-level tools when their providers expose them; they are
 /// not hidden `session` sub-actions.
-pub const SESSION_ACTIONS: &[&str] = &[
-    "config",
-    "sleep",
-    "history_page",
-    "history_search",
-    "history_around",
-];
-
-pub const SESSION_ACTIONS_DISPLAY: &str =
-    "config, sleep, history_page, history_search, history_around";
+pub const SESSION_ACTIONS: &[&str] = &["config", "sleep"];
+pub const SESSION_ACTIONS_DISPLAY: &str = "config, sleep";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     Config,
     Sleep,
-    HistoryPage,
-    HistorySearch,
-    HistoryAround,
 }
 
 impl SessionAction {
@@ -30,9 +19,6 @@ impl SessionAction {
         match self {
             Self::Config => "config",
             Self::Sleep => "sleep",
-            Self::HistoryPage => "history_page",
-            Self::HistorySearch => "history_search",
-            Self::HistoryAround => "history_around",
         }
     }
 }
@@ -66,9 +52,6 @@ pub fn session_action_from_args(args: &Value) -> Result<SessionAction, String> {
         Some(Value::String(action)) if !action.trim().is_empty() => match action.as_str() {
             "config" => Ok(SessionAction::Config),
             "sleep" => Ok(SessionAction::Sleep),
-            "history_page" => Ok(SessionAction::HistoryPage),
-            "history_search" => Ok(SessionAction::HistorySearch),
-            "history_around" => Ok(SessionAction::HistoryAround),
             other => Err(session_unknown_action_message(other)),
         },
         Some(Value::String(_)) | None => Err(session_missing_action_message()),
@@ -83,26 +66,20 @@ mod tests {
 
     #[test]
     fn action_contract_is_schema_surface_only() {
-        assert_eq!(
-            SESSION_ACTIONS,
-            &[
-                "config",
-                "sleep",
-                "history_page",
-                "history_search",
-                "history_around"
-            ]
-        );
         for hidden_action in [
             "enter_plan",
             "exit_plan",
             "rollback",
             "compress",
             "ask_user",
+            "history_page",
+            "history_search",
+            "history_around",
         ] {
+            assert!(session_action_from_args(&json!({"action": hidden_action})).is_err());
             assert!(
                 !SESSION_ACTIONS.contains(&hidden_action),
-                "{hidden_action} must remain a top-level tool/provider decision, not a session sub-action"
+                "{hidden_action} must not be exposed as a session sub-action"
             );
         }
         let parsed_actions = SESSION_ACTIONS

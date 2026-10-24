@@ -54,10 +54,6 @@ pub struct RuntimeMaintenanceSweepResult {
     pub orphaned_forks_collected: u64,
     /// Unpinned manifest nodes whose owner session no longer exists.
     pub orphaned_manifests_collected: u64,
-    /// Segment references whose manifest node no longer exists.
-    pub orphaned_manifest_references_collected: u64,
-    /// Owner-deduplicated segment payloads with no remaining reference.
-    pub unreferenced_segments_collected: u64,
     /// Terminal branch-control operation receipts removed after retention.
     pub work_branch_control_operations_expired: u64,
     /// Terminal or abandoned branch-creation operation receipts removed after
@@ -173,20 +169,6 @@ pub async fn maintain_runtime_storage(
                 .collect_unpinned_orphan_manifests(policy.batch_limit)
                 .await,
         );
-        result.orphaned_manifest_references_collected = record_runtime_storage_maintenance(
-            &mut result.cleanup_errors,
-            "collect_orphaned_manifest_segment_references",
-            coordinator
-                .collect_orphaned_manifest_segment_references(policy.batch_limit)
-                .await,
-        );
-        result.unreferenced_segments_collected = record_runtime_storage_maintenance(
-            &mut result.cleanup_errors,
-            "collect_unreferenced_conversation_segments",
-            coordinator
-                .collect_unreferenced_conversation_segments(policy.batch_limit)
-                .await,
-        );
     }
     result
 }
@@ -202,8 +184,6 @@ impl RuntimeMaintenanceSweepResult {
             .saturating_add(self.expired_fork_pins_released)
             .saturating_add(self.orphaned_forks_collected)
             .saturating_add(self.orphaned_manifests_collected)
-            .saturating_add(self.orphaned_manifest_references_collected)
-            .saturating_add(self.unreferenced_segments_collected)
             .saturating_add(self.work_branch_control_operations_expired)
             .saturating_add(self.work_branch_creation_operations_expired)
             .saturating_add(self.expired_session_attachments_deleted)

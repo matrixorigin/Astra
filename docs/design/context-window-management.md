@@ -105,7 +105,8 @@ contract, not a guarantee of a model's semantic fidelity.
 
 Successful request-time summaries also become the loop's canonical working set
 when the summary plus bounded history saves estimated tokens. The existing
-rewrite proof and canonical WAL/terminal commit own this transition; no separate
+rewrite proof and existing Run checkpoint or terminal Context commit own this
+transition; no separate
 summary cache, memory write or checkpoint table is involved. Later pipeline and
 pre-turn pressure measurements therefore see the accepted representation plus
 newly appended history, rather than repeatedly summarizing the original input.

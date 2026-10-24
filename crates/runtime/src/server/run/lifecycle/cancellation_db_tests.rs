@@ -45,7 +45,7 @@ struct CancellationFixture {
     coordinator: DatabaseSessionContextCoordinator,
     key: SessionKeyV1,
     run_id: String,
-    writer: ConversationWriterLeaseV1,
+    writer: Option<ConversationWriterLeaseV1>,
     binding: SessionExecutionBindingV1,
 }
 
@@ -76,33 +76,33 @@ impl CancellationFixture {
             .load_or_initialize_execution_binding(&key, &binding)
             .await
             .unwrap();
-        let actor_id = if external_writer {
-            "external-controller".to_owned()
-        } else {
-            format!("server-run:{run_id}")
-        };
-        let actor = ActorContextV1::owner_user(
-            &key.owner_user_id,
-            actor_id,
-            ActorKindV1::Server,
-            SessionSurfaceV1::Server,
-            None,
-            AuthorityEpochsV1::default(),
-        );
-        let authority = coordinator
-            .acquire_writer_and_reserve_turn(
-                &key,
+        let writer = if external_writer {
+            let actor = ActorContextV1::owner_user(
+                &key.owner_user_id,
+                "external-controller",
+                ActorKindV1::Server,
+                SessionSurfaceV1::Server,
                 None,
-                &actor,
-                Duration::from_secs(900),
-                &format!("server-run:{run_id}:writer"),
-                &format!("server-run:{run_id}:turn"),
-                Some(1),
-            )
-            .await
-            .unwrap();
-        let AcquireWriterAndReserveTurnOutcome::Ready { lease: writer, .. } = authority else {
-            panic!("writer admission failed: {authority:?}")
+                AuthorityEpochsV1::default(),
+            );
+            let authority = coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    None,
+                    &actor,
+                    Duration::from_secs(900),
+                    "external-writer",
+                    "external-turn",
+                    Some(1),
+                )
+                .await
+                .unwrap();
+            let AcquireWriterAndReserveTurnOutcome::Ready { lease, .. } = authority else {
+                panic!("writer admission failed")
+            };
+            Some(lease)
+        } else {
+            None
         };
         let service = db_backed_test_service(&pool, "cancel-session-fixture");
         if start_run {
@@ -202,7 +202,7 @@ impl CancellationFixture {
 
 #[tokio::test]
 #[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn db_cancel_session_orphan_releases_exact_writer_prepared_tool_and_checkout() {
+async fn db_cancel_session_orphan_rejects_prepared_tool_without_controller_writer() {
     let fixture = CancellationFixture::new(false, true).await;
     let history = json!({"event_type":"fixture_history", "data":{"text":"keep this conversation"}});
     fixture
@@ -350,245 +350,9 @@ async fn db_cancel_session_retains_unknown_tool_external_writer_and_preadmission
                     .load_active_writer(&fixture.key)
                     .await
                     .unwrap(),
-                Some(fixture.writer.clone())
+                fixture.writer.clone()
             );
         }
-        fixture.cleanup().await;
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn db_cancel_session_writer_release_rechecks_generation_and_new_lease() {
-    let fixture = CancellationFixture::new(false, true).await;
-    fixture.orphan().await;
-    let control = fixture
-        .service
-        .run_engine
-        .load_run_control(&fixture.key.owner_user_id, &fixture.run_id)
-        .await
-        .unwrap()
-        .unwrap();
-    ok(fixture
-        .service
-        .cancel_run(fixture.run_id.clone(), fixture.key.owner_user_id.clone())
-        .await);
-    sqlx::query("UPDATE agent_runs SET run_generation = run_generation + 1 WHERE user_id = ? AND run_id = ?")
-        .bind(&fixture.key.owner_user_id).bind(&fixture.run_id).execute(fixture.pool.get()).await.unwrap();
-    assert!(
-        !fixture
-            .coordinator
-            .release_terminal_execution_writer(
-                &fixture.writer,
-                &fixture.run_id,
-                control.run_generation
-            )
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        fixture
-            .coordinator
-            .load_active_writer(&fixture.key)
-            .await
-            .unwrap(),
-        Some(fixture.writer.clone())
-    );
-    fixture
-        .coordinator
-        .release_writer(&fixture.writer)
-        .await
-        .unwrap();
-    let actor = ActorContextV1::owner_user(
-        &fixture.key.owner_user_id,
-        "new-controller",
-        ActorKindV1::Server,
-        SessionSurfaceV1::Server,
-        None,
-        AuthorityEpochsV1::default(),
-    );
-    let new_authority = fixture
-        .coordinator
-        .acquire_writer_and_reserve_turn(
-            &fixture.key,
-            None,
-            &actor,
-            Duration::from_secs(900),
-            "new-writer",
-            "new-turn",
-            Some(1),
-        )
-        .await
-        .unwrap();
-    let AcquireWriterAndReserveTurnOutcome::Ready {
-        lease: new_writer, ..
-    } = new_authority
-    else {
-        panic!("new writer failed")
-    };
-    assert!(
-        !fixture
-            .coordinator
-            .release_terminal_execution_writer(
-                &fixture.writer,
-                &fixture.run_id,
-                control.run_generation + 1
-            )
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        fixture
-            .coordinator
-            .load_active_writer(&fixture.key)
-            .await
-            .unwrap(),
-        Some(new_writer)
-    );
-    fixture.cleanup().await;
-}
-
-#[tokio::test]
-#[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
-    use astra_services::session_context_coordinator::SessionExecutionBlocker;
-    for closure in ["finished", "accounting"] {
-        let fixture = CancellationFixture::new(false, true).await;
-        fixture.orphan().await;
-        let generation = fixture
-            .service
-            .run_engine
-            .load_run_control(&fixture.key.owner_user_id, &fixture.run_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .run_generation;
-        let started = AgenticRunLifecycleService::settlement_started_event(generation);
-        fixture
-            .service
-            .run_engine
-            .append_event(
-                &fixture.key.owner_user_id,
-                &fixture.key.session_id,
-                &fixture.run_id,
-                started,
-            )
-            .await
-            .unwrap();
-        ok(fixture
-            .service
-            .cancel_run(fixture.run_id.clone(), fixture.key.owner_user_id.clone())
-            .await);
-        // Another generation's closed fence must not close the current one.
-        let other_generation = generation + 1;
-        for event in [
-            AgenticRunLifecycleService::settlement_started_event(other_generation),
-            AgenticRunLifecycleService::settlement_finished_event(other_generation),
-        ] {
-            fixture
-                .service
-                .run_engine
-                .append_event(
-                    &fixture.key.owner_user_id,
-                    &fixture.key.session_id,
-                    &fixture.run_id,
-                    event,
-                )
-                .await
-                .unwrap();
-        }
-        let peer = db_backed_test_service(&fixture.pool, "cancel-session-other-pod");
-        for _ in 0..2 {
-            let pending = ok(peer
-                .cancel_session_runs(
-                    fixture.key.session_id.clone(),
-                    fixture.key.owner_user_id.clone(),
-                )
-                .await);
-            assert!(!pending.execution_settled, "{pending:?}");
-            assert_eq!(
-                pending.execution_blocker,
-                Some(SessionExecutionBlocker::SettlementPending)
-            );
-            assert_eq!(pending.runs.len(), 1);
-            assert!(!pending.runs[0].execution_settled);
-            assert_eq!(
-                fixture
-                    .coordinator
-                    .load_active_writer(&fixture.key)
-                    .await
-                    .unwrap(),
-                Some(fixture.writer.clone())
-            );
-        }
-        assert!(
-            !fixture
-                .coordinator
-                .release_terminal_execution_writer(&fixture.writer, &fixture.run_id, generation)
-                .await
-                .unwrap()
-        );
-        // The fence must block checkout independently of any writer or lease.
-        fixture
-            .coordinator
-            .release_writer(&fixture.writer)
-            .await
-            .unwrap();
-        assert_eq!(
-            fixture
-                .coordinator
-                .execution_reuse_blocker(&fixture.key)
-                .await
-                .unwrap(),
-            Some(SessionExecutionBlocker::SettlementPending)
-        );
-        let event = if closure == "finished" {
-            AgenticRunLifecycleService::settlement_finished_event(generation)
-        } else {
-            json!({"event_type":"run_accounting_finalized", "idempotency_key":format!("run-accounting-finalized:{generation}"), "data":{}})
-        };
-        fixture
-            .service
-            .run_engine
-            .append_event(
-                &fixture.key.owner_user_id,
-                &fixture.key.session_id,
-                &fixture.run_id,
-                event,
-            )
-            .await
-            .unwrap();
-        assert!(
-            ok(peer
-                .cancel_session_runs(
-                    fixture.key.session_id.clone(),
-                    fixture.key.owner_user_id.clone()
-                )
-                .await)
-            .execution_settled
-        );
-        // An old generation's open fence is not debt of the current executor.
-        sqlx::query("UPDATE agent_runs SET run_generation = run_generation + 11 WHERE user_id = ? AND run_id = ?")
-            .bind(&fixture.key.owner_user_id).bind(&fixture.run_id).execute(fixture.pool.get()).await.unwrap();
-        fixture
-            .service
-            .run_engine
-            .append_event(
-                &fixture.key.owner_user_id,
-                &fixture.key.session_id,
-                &fixture.run_id,
-                AgenticRunLifecycleService::settlement_started_event(generation + 10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            fixture
-                .coordinator
-                .execution_reuse_blocker(&fixture.key)
-                .await
-                .unwrap(),
-            None
-        );
         fixture.cleanup().await;
     }
 }

@@ -452,7 +452,6 @@ pub(crate) fn compact_history_for_wire_budget(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeAuthorityKind {
     EdgeRequiredContext,
-    AuthorizedModelCatalog,
     CompactedConversationSummary,
     ActiveWorkAttemptStart,
     PendingWorkGraphMutations,
@@ -490,7 +489,6 @@ impl RuntimeAuthorityKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::EdgeRequiredContext => "edge_required_context",
-            Self::AuthorizedModelCatalog => "authorized_model_catalog",
             Self::CompactedConversationSummary => "compacted_conversation_summary",
             Self::ActiveWorkAttemptStart => "active_work_attempt_start",
             Self::PendingWorkGraphMutations => "pending_work_graph_mutations",

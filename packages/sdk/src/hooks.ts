@@ -878,6 +878,15 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
       case "run_finished":
       case "run_cancelled":
+        // Run completion never substitutes for a tool's own result. Live-only
+        // cards can be absent from cold replay; discard unresolved presentation.
+        for (const [callId, tool] of toolCallMapRef.current) {
+          if (tool.status === "running") toolCallMapRef.current.delete(callId);
+        }
+        dispatch({
+          type: "SET_TOOL_CALLS",
+          toolCalls: Array.from(toolCallMapRef.current.values()),
+        });
         applyRunExecutionBoundary();
         dispatch({ type: "SET_STREAMING", isStreaming: false });
         dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });

@@ -315,3 +315,21 @@ registered Offering, including the TypeSafe System One adapter. Offering credent
 remain encrypted and server-owned. This binding never selects a memory extraction
 model or changes agent/tool policy. See [the pilot guide](../guides/memory-judgment-pilot.md)
 for configuration, fallback and validation limitations.
+
+## Live observations and durable effects
+
+Canonical `ToolSpec` declares whether a built-in operation is a replay-safe Run
+observation. The effect and requirement contract must also prove read-only
+execution. `ToolEffect::none()` alone grants nothing: spawning, Work transitions,
+interactions and other controls still need their existing durable receipts.
+Unknown and provider-authored operations, including Runner delivery, retain the
+durable preparation, dispatch and outcome/uncertainty boundary.
+
+Server observations traverse current routing, permissions, cancellation and
+output governance on every execution. The shared loop retains tool records and
+semantic hints. Repeated readonly calls may execute again, including after
+recovery; no extra result cache, read-identity reservation, tombstone or
+exact-once promise is introduced. Server invocation replay does not short-circuit
+through the generic loop cache. Explicit effect replay and uncertain recovery
+remain with the durable ledger; observation records cannot prove effect
+settlement or recoverable execution completion.

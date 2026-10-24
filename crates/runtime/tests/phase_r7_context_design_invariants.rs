@@ -39,7 +39,7 @@ fn tool_cache_control_count(tools: &[Value]) -> usize {
 #[serial_test::serial(prompt_cache_env)]
 async fn cache_breakpoint_persists_turn_over_turn() {
     use astra_runtime::server::provider_test_support::{
-        InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
         bind_server_workspace, loop_state, server_host_builder,
     };
     use astra_runtime::server::tool_transport::{
@@ -55,7 +55,7 @@ async fn cache_breakpoint_persists_turn_over_turn() {
     .await;
     let workspace = tempfile::TempDir::new().unwrap();
     let session = format!("cache-turns-{}", uuid::Uuid::new_v4());
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let mut host = server_host_builder(
         &gateway,
         &ledger,

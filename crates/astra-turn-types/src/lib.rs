@@ -12,6 +12,7 @@ pub use context_history_artifact::{
 pub use skill_catalog_identity::SkillCatalogIdentity;
 
 mod agent_communication;
+pub mod agent_tool_contract;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod artifact_publication;
@@ -26,6 +27,8 @@ pub use judgment::{
 };
 mod strict_json;
 pub use strict_json::parse_unique_json;
+mod canonical_transcript;
+pub use canonical_transcript::{transcript_content_hash, transcript_payload_identity};
 mod canonical_token_usage;
 mod canonical_tool_pairing;
 pub use canonical_token_usage::CanonicalTokenUsage;
@@ -72,6 +75,7 @@ pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
+pub mod tool_ledger_receipt;
 mod turn_provenance;
 mod user_intent;
 mod verification_frontier;

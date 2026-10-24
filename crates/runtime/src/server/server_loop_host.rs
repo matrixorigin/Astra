@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 mod model_routing;
 
 use crate::orchestration::{AgentProgressEvent, CancellationOrigin, ProgressEventType};
-use crate::server::run::lifecycle::run_state::TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD;
+use crate::server::run::lifecycle::run_state::TOOL_TERMINAL_LIVE_EMITTED_FIELD;
 use crate::server::tool_admission::{
     ToolAdmissionContext, has_explicit_runtime_executor_provider,
     resolve_tool_admission_for_binding_with_context,
@@ -64,10 +64,10 @@ use crate::turn::agentic_loop::host::{
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
-    call_llm_and_collect_with_stream_callback, provider_supports_no_tool_choice,
-    sleep_ms_or_llm_cancel,
+    call_prepared_llm_and_collect_with_stream_callback, prepare_streaming_call,
+    provider_supports_no_tool_choice, sleep_ms_or_llm_cancel,
 };
-use crate::turn::llm::summary_client::{DurableSummaryAttemptAllocator, RuntimeSummaryClient};
+use crate::turn::llm::summary_client::RuntimeSummaryClient;
 use crate::turn::model_cooldown::rate_limit_cooldown;
 use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
@@ -1281,7 +1281,7 @@ enum AuxiliaryLlmPolicy {
     CapacityAware,
     Always,
     Disabled,
-    /// Explicit low-latency opt-out: only typed effect/topology boundaries
+    /// Default: only typed effect/topology boundaries
     /// trigger Work admission; ordinary text stays on the primary request.
     BoundaryOnly,
 }
@@ -1292,7 +1292,7 @@ impl AuxiliaryLlmPolicy {
             .ok()
             .as_deref()
             .map(parse_auxiliary_llm_policy)
-            .unwrap_or(Self::CapacityAware)
+            .unwrap_or(Self::BoundaryOnly)
     }
 
     fn as_label(self) -> &'static str {
@@ -1311,11 +1311,9 @@ fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
         "disabled" | "disable" | "off" | "false" | "0" => AuxiliaryLlmPolicy::Disabled,
         "capacity_aware" | "capacity-aware" | "auto" => AuxiliaryLlmPolicy::CapacityAware,
         "boundary_only" | "boundary-only" => AuxiliaryLlmPolicy::BoundaryOnly,
-        // Empty and unknown values must not silently disable the semantic
-        // Work classifier. Fail safe to the adaptive product default so a
-        // typo cannot turn a durable user request into an untracked turn.
-        "" => AuxiliaryLlmPolicy::CapacityAware,
-        _ => AuxiliaryLlmPolicy::CapacityAware,
+        // Keep required Work classification at real boundaries without
+        // enabling unrelated optional inference for an unset or mistyped value.
+        _ => AuxiliaryLlmPolicy::BoundaryOnly,
     }
 }
 
@@ -1342,12 +1340,12 @@ fn auxiliary_llm_policy_label() -> &'static str {
     AuxiliaryLlmPolicy::from_env().as_label()
 }
 
-/// Work admission is the semantic lifecycle classifier. The capacity-aware
+/// Work admission is the semantic lifecycle classifier. The boundary-only
 /// default spends a bounded decision at an existing typed effect/topology
 /// boundary, where the result has an immediate admission consumer. It does
 /// not speculate beside an ordinary unbound primary turn. `always` is the
-/// explicit high-frequency mode for deployments that want that speculation;
-/// `boundary_only` additionally suppresses unrelated optional auxiliaries.
+/// explicit high-frequency mode for deployments that want that speculation.
+/// `capacity_aware` opts into unrelated optional auxiliaries when capacity permits.
 /// A provider `start_work` carrier is a typed payload; any available decision
 /// is settled before canonical admission. With no configured judge or no
 /// usable result, normal typed admission remains.
@@ -1399,30 +1397,27 @@ fn llm_main_attempt_label(attempt_in_round: u32) -> &'static str {
     }
 }
 
-fn reconcile_durable_logical_attempt(
-    requested_attempt: u32,
-    admitted_attempt: u32,
-) -> Result<u32, astra_core::ClassifiedError> {
-    if admitted_attempt == requested_attempt
-        || requested_attempt.checked_add(1) == Some(admitted_attempt)
-    {
-        return Ok(admitted_attempt);
+/// Validate and attribute child model calls without creating a durable request.
+fn agent_inference_operation_id(
+    state: &AgenticLoopState,
+) -> Result<String, astra_core::ClassifiedError> {
+    match (
+        state.inference_purpose,
+        state.canonical_turn_chain_id.as_deref(),
+    ) {
+        (astra_turn_types::InferencePurpose::SubAgent, Some(chain))
+            if !chain.is_empty() && chain.trim() == chain =>
+        {
+            Ok(scoped_inference_operation_id("agent_turn", chain))
+        }
+        (astra_turn_types::InferencePurpose::SubAgent, Some(_)) => {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "subagent inference has an invalid canonical child turn identity",
+            ))
+        }
+        _ => Ok("agent_turn".into()),
     }
-    Err(astra_core::ClassifiedError::new(
-        astra_core::ErrorKind::ContractViolation,
-        format!(
-            "durable inference admission returned logical_attempt={admitted_attempt} for requested logical_attempt={requested_attempt}"
-        ),
-    )
-    .with_details_json(
-        json!({
-            "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
-            "stage": "logical_invocation_admission_retry_identity",
-            "requested_logical_attempt": requested_attempt,
-            "admitted_logical_attempt": admitted_attempt,
-        })
-        .to_string(),
-    ))
 }
 
 /// Identity for the next logical provider request in this agent turn.
@@ -1844,7 +1839,7 @@ fn record_full_llm_request_event(
     tools: &[Value],
     max_output_tokens: Option<usize>,
     prompt_request_plan: &astra_services::PromptRequestPlan,
-    provider_attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
+    provider_attempts: &[crate::turn::llm::client::ProviderAttemptObservation],
 ) {
     if session_id.is_empty() || !full_llm_capture {
         return;
@@ -1913,7 +1908,7 @@ fn record_full_llm_request_event(
 
 fn record_provider_attempt_cache_observations(
     state: &mut AgenticLoopState,
-    attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
+    attempts: &[crate::turn::llm::client::ProviderAttemptObservation],
 ) {
     let Some(pipeline_session) = state.pipeline_session.as_mut() else {
         return;
@@ -3152,217 +3147,48 @@ fn resolve_llm_model_for_turn(
     })
 }
 
-#[derive(Debug)]
-struct ProviderCanonicalHydrationOutcome {
-    reconciled_transitions: usize,
-    head: Option<crate::turn::agentic_loop::host::ProviderCanonicalWalHead>,
-    replacement: Option<astra_turn_types::ProviderCanonicalTransitionV2>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProviderCanonicalWalLimits {
-    max_entries: u32,
-    max_bytes: u64,
-}
-
-impl ProviderCanonicalWalLimits {
-    const PRODUCTION: Self = Self {
-        max_entries: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
-        max_bytes: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES,
-    };
-}
-
-#[derive(Debug)]
-struct ProviderCanonicalWalPlan {
-    transition: astra_turn_types::ProviderCanonicalTransitionV2,
-    head: crate::turn::agentic_loop::host::ProviderCanonicalWalHead,
-}
-
-/// Plan one durable provider-owned transition from the current atomic WAL
-/// head. Normal rounds hash and persist only the delta since the prior head.
-/// A bounded, lossless checkpoint is emitted before the service-side hard
-/// limit is reached; canonical replacement remains a separate operation that
-/// requires explicit rewrite authority.
-fn plan_provider_canonical_wal_transition(
+/// Build the self-contained canonical continuation saved at a real handoff.
+/// Normal provider rounds have no durable WAL head or chain to maintain.
+fn build_handoff_continuation(
     durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
-    head: Option<&crate::turn::agentic_loop::host::ProviderCanonicalWalHead>,
     predecessor_messages: &[Value],
-    appended_messages: Vec<Value>,
     replacement_authorization: Option<
         &crate::turn::canonical_commit::ProviderWalReplacementAuthorization,
     >,
-    limits: ProviderCanonicalWalLimits,
-) -> Result<ProviderCanonicalWalPlan, astra_turn_types::ProviderCanonicalTransitionError> {
-    let durable_appended =
-        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(appended_messages);
-
-    let mut transition = if let Some(authorization) = replacement_authorization {
-        let durable_predecessor =
-            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-                durable_base,
-                predecessor_messages,
-            );
+) -> Result<
+    astra_turn_types::ProviderCanonicalTransitionV2,
+    astra_turn_types::ProviderCanonicalTransitionError,
+> {
+    let durable_predecessor =
+        crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+            durable_base,
+            predecessor_messages,
+        );
+    let transition = if let Some(authorization) = replacement_authorization {
         let transition =
             astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                head.map(|head| head.transition_id.clone()),
+                None,
                 durable_base.clone(),
                 authorization.generation,
                 &durable_predecessor,
-                durable_appended.clone(),
+                Vec::new(),
             )?;
         if transition.predecessor != authorization.durable_predecessor {
             return Err(astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch);
         }
         transition
-    } else if let Some(head) = head {
-        let parent_count = usize::try_from(head.result.message_count).map_err(|_| {
-            astra_turn_types::ProviderCanonicalTransitionError::MessageCountOverflow
-        })?;
-        if predecessor_messages.len() < parent_count {
-            return Err(
-                astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
-            );
-        }
-        let recovery_delta = astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
-            predecessor_messages[parent_count..].to_vec(),
-        );
-        astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
-            head.transition_id.clone(),
-            head.result.clone(),
-            durable_base.clone(),
-            recovery_delta,
-            durable_appended.clone(),
-        )?
     } else {
-        let durable_predecessor =
-            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-                durable_base,
-                predecessor_messages,
-            );
         astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &durable_predecessor,
-            durable_appended.clone(),
+            Vec::new(),
         )?
     };
-
-    if replacement_authorization.is_none()
-        && head.is_some_and(|head| {
-            head.would_exceed_with_limits(&transition, limits.max_entries, limits.max_bytes)
-                .unwrap_or(true)
-        })
-    {
-        let head = head.expect("the capacity predicate requires a WAL head");
-        let durable_predecessor =
-            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
-                durable_base,
-                predecessor_messages,
-            );
-        transition = astra_turn_types::ProviderCanonicalTransitionV2::new_checkpoint_from_parent(
-            head.transition_id.clone(),
-            head.result.clone(),
-            durable_base.clone(),
-            &durable_predecessor,
-            durable_appended,
-        )?;
-    }
-
-    let planned_head = match head {
-        Some(head) => head.advanced(&transition)?,
-        None => crate::turn::agentic_loop::host::ProviderCanonicalWalHead::from_chain(
-            std::slice::from_ref(&transition),
-        )?
-        .expect("a one-entry transition chain always has a head"),
-    };
-    if planned_head.chain_length > limits.max_entries {
-        return Err(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries);
-    }
-    if planned_head.chain_payload_bytes > limits.max_bytes {
+    if transition.durable_payload_bytes()? > astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES {
         return Err(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes);
     }
-    Ok(ProviderCanonicalWalPlan {
-        transition,
-        head: planned_head,
-    })
-}
-
-fn apply_provider_canonical_transition_receipts(
-    messages: &mut Vec<Value>,
-    receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
-) -> Result<ProviderCanonicalHydrationOutcome, astra_core::ClassifiedError> {
-    if receipts.is_empty() {
-        return Ok(ProviderCanonicalHydrationOutcome {
-            reconciled_transitions: 0,
-            head: None,
-            replacement: None,
-        });
-    }
-    if receipts.len() != 1 || receipts[0].transitions.is_empty() {
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            "provider canonical WAL loader returned an invalid turn chain",
-        ));
-    }
-    let transitions = receipts
-        .into_iter()
-        .next()
-        .map(|receipt| receipt.transitions)
-        .expect("the turn receipt cardinality was checked above");
-    let replacement = transitions
-        .first()
-        .filter(|transition| {
-            transition.recovery_mode
-                == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
-        })
-        .cloned();
-    astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(&transitions, messages)
-        .map_err(|error| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContractViolation,
-                format!("reconcile provider canonical transition WAL chain: {error}"),
-            )
-        })?;
-    let head = crate::turn::agentic_loop::host::ProviderCanonicalWalHead::from_chain(&transitions)
-        .map_err(|error| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContractViolation,
-                format!("reconstruct provider canonical WAL head: {error}"),
-            )
-        })?;
-    Ok(ProviderCanonicalHydrationOutcome {
-        reconciled_transitions: transitions.len(),
-        head,
-        replacement,
-    })
-}
-
-fn hydrate_provider_canonical_transition_receipts(
-    messages: &mut Vec<Value>,
-    durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
-    receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
-) -> Result<ProviderCanonicalHydrationOutcome, astra_core::ClassifiedError> {
-    let durable_count = usize::try_from(durable_base.canonical.message_count).map_err(|_| {
-        astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            "provider canonical WAL durable-base count overflow",
-        )
-    })?;
-    if messages.len() < durable_count
-        || astra_turn_types::canonical_conversation_root(&messages[..durable_count])
-            != durable_base.canonical.root_hash
-    {
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            "provider canonical WAL durable base is absent from restored history",
-        ));
-    }
-    let fresh_suffix = messages[durable_count..].to_vec();
-    let mut recovered = messages[..durable_count].to_vec();
-    let outcome = apply_provider_canonical_transition_receipts(&mut recovered, receipts)?;
-    recovered.extend(fresh_suffix);
-    *messages = recovered;
-    Ok(outcome)
+    Ok(transition)
 }
 
 /// Server-side host for the runtime agentic loop.
@@ -3641,8 +3467,9 @@ pub struct ServerAgenticLoopHost {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
-    inference_ledger_persistence:
-        Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     inference_owner_pod_id: Option<String>,
@@ -3660,16 +3487,8 @@ pub struct ServerAgenticLoopHost {
     /// One-turn, in-memory repair evidence for a fused delegation scope.
     /// Reuse is allowed only when the complete source and slot inputs match;
     /// a new batch establishes its own scope.
-    /// One monotonic auxiliary-inference identity namespace for this host.
-    /// Independently reconstructed summary clients must never restart at zero
-    /// for the same durable run scope.
-    summary_attempt_allocator: DurableSummaryAttemptAllocator,
     /// Monotonic wall-clock authority for this process-local run host.
     execution_time_budget: Option<ExecutionDeadlineAuthority>,
-    /// Recovery gate for provider-attempt-owned canonical append WAL. It is
-    /// opened exactly once, after session history restoration and before any
-    /// real provider dispatch owned by this host.
-    canonical_transition_hydrated: bool,
 
     // ── Context ──
     /// Final prompt-visible tool schemas after provider declaration, binding,
@@ -4011,8 +3830,7 @@ pub struct ServerAgenticLoopHost {
 struct ExecutionHandoffContext {
     requested: tokio_util::sync::CancellationToken,
     engine: crate::server::run::engine::RunEngine,
-    reservation: astra_turn_types::TurnReservationV1,
-    original_user_message: String,
+    authority: astra_services::session_context_coordinator::RunContextAuthority,
 }
 
 /// Unfinished-turn continuation, not a committed session cursor or authority.
@@ -4270,8 +4088,6 @@ pub(crate) fn authenticated_edge_provider_tool_schemas(
 pub(crate) struct RuntimeExecutionHandoff {
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub(crate) authenticated_edge_discovery: Option<AuthenticatedEdgeDiscovery>,
-    // Audit input is immutable; original_facts.message may reflect steering.
-    pub(crate) original_user_message: String,
     // Original composed model inputs, not credentials or execution grants.
     // Restore must independently authorize capabilities before reusing these
     // contracts. The enclosing checkpoint's byte limit bounds their retention.
@@ -4304,7 +4120,7 @@ pub(crate) struct RuntimeExecutionHandoff {
     pub(crate) verification: astra_turn_types::VerificationHandoff,
     pub(crate) heavy: astra_pipeline::step_protocol::HeavyCheckpoint,
     pub(crate) recorder: astra_pipeline::step_recorder::SettledRecorderContinuation,
-    pub(crate) reservation: astra_turn_types::TurnReservationV1,
+    pub(crate) context_authority: astra_services::session_context_coordinator::RunContextAuthority,
     pub(crate) continuation: astra_turn_types::ProviderCanonicalTransitionV2,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub(crate) execution_deadline: Option<astra_services::runs::ExecutionDeadlineSnapshot>,
@@ -4332,7 +4148,7 @@ impl RuntimeExecutionHandoff {
             || checkpoint.run_id != receipt.run_id
             || checkpoint.user_id != receipt.source.key.owner_user_id
             || checkpoint.session_id != receipt.source.key.session_id
-            || receipt.turn_reservation.key != receipt.source.key
+            || receipt.authority.key != receipt.source.key
             || receipt.run_generation <= receipt.producer_generation
         {
             return Err(invalid(
@@ -4349,9 +4165,8 @@ impl RuntimeExecutionHandoff {
         .map_err(|_| invalid("adopted execution checkpoint is malformed"))?;
         if producer_run_id != receipt.run_id
             || producer_owner_generation != receipt.producer_generation
-            || payload.reservation != receipt.source
-            || payload.original_facts.session_turn != receipt.source.reserved_turn
-            || payload.original_facts.canonical_turn_started_at.is_none()
+            || payload.context_authority != receipt.source
+            || payload.original_facts.session_turn != receipt.source.turn
         {
             return Err(invalid(
                 "execution facts do not belong to the adopted producer",
@@ -4450,7 +4265,7 @@ impl ServerAgenticLoopHost {
         self.always_load_tool_names = handoff.always_load_tool_names.iter().cloned().collect();
     }
 
-    pub(crate) async fn restore_handoff_wal(
+    pub(crate) async fn restore_handoff_continuation(
         &mut self,
         state: &mut AgenticLoopState,
         handoff: &RuntimeExecutionHandoff,
@@ -4459,29 +4274,14 @@ impl ServerAgenticLoopHost {
         let invalid = |detail: String| {
             astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, detail)
         };
-        let pool = self
-            .shared_pool
-            .as_ref()
-            .ok_or_else(|| invalid("handoff has no durable WAL owner".into()))?;
-        let receipts = astra_services::load_inference_canonical_transitions_for_session(
-            pool,
-            &self.user_id,
-            &self.session_id,
-            state.session_turn,
-        )
-        .await
-        .map_err(|error| invalid(format!("load handoff WAL: {error}")))?;
-        let mut recovered = durable_prefix.to_vec();
-        let outcome = apply_provider_canonical_transition_receipts(&mut recovered, receipts)?;
-        if outcome.head.as_ref().map(|head| &head.transition_id)
-            != handoff.continuation.parent_transition_id.as_ref()
-            || outcome.head.as_ref().map(|head| &head.result)
-                != handoff.continuation.parent_result.as_ref()
+        if handoff.continuation.parent_transition_id.is_some()
+            || handoff.continuation.parent_result.is_some()
         {
             return Err(invalid(
-                "handoff no longer matches the durable provider frontier".into(),
+                "in-flight model recovery is unavailable; start a new turn".into(),
             ));
         }
+        let mut recovered = durable_prefix.to_vec();
         handoff
             .continuation
             .apply_to(&mut recovered)
@@ -4495,22 +4295,18 @@ impl ServerAgenticLoopHost {
             ));
         }
         state.provider_canonical_wal_base = Some(handoff.continuation.durable_base.clone());
-        state.provider_canonical_wal_head = outcome.head;
         let replacement = if handoff.continuation.recovery_mode
             == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
         {
             Some(&handoff.continuation)
         } else {
-            outcome.replacement.as_ref()
+            None
         };
         if let Some(replacement) = replacement {
             state
                 .recover_provider_canonical_replacement(replacement, &recovered)
                 .map_err(invalid)?;
         }
-        // The loop's normal hydration hook must not treat the already restored
-        // suffix as a new user request and append it a second time.
-        self.canonical_transition_hydrated = true;
         Ok(())
     }
 }
@@ -4529,12 +4325,6 @@ fn validate_handoff_heavy(
         unreachable!("constructed a heavy checkpoint above");
     };
     Ok(*heavy)
-}
-
-struct PromptMemoryRecall {
-    entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
-    outcome: astra_turn_types::MemoryRetrievalOutcome,
-    fetch_ms: u64,
 }
 
 #[derive(Clone)]
@@ -5485,8 +5275,9 @@ pub struct ServerAgenticLoopHostBuilder {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
-    inference_ledger_persistence:
-        Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     inference_owner_pod_id: Option<String>,
@@ -5581,7 +5372,8 @@ impl ServerAgenticLoopHostBuilder {
             matrixone,
             encryptor,
             shared_pool: None,
-            inference_ledger_persistence: None,
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            provider_observations: None,
             model_override: None,
             admitted_model_execution: None,
             inference_owner_pod_id: None,
@@ -5652,22 +5444,14 @@ impl ServerAgenticLoopHostBuilder {
     }
 
     #[cfg(any(test, feature = "e2e-hooks"))]
-    pub(crate) fn with_test_inference_ledger(
+    pub fn with_provider_observations(
         mut self,
-        persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
+        observations: crate::server::provider_test_support::ProviderObservationsFixture,
     ) -> Self {
-        self.inference_ledger_persistence = Some(Arc::new(persistence));
+        self.provider_observations = Some(observations);
         self.inference_owner_pod_id
             .get_or_insert_with(|| "test-inference-owner".to_string());
         self
-    }
-
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_e2e_inference_ledger(
-        self,
-        fixture: &super::provider_test_support::InferenceLedgerFixture,
-    ) -> Self {
-        self.with_test_inference_ledger(fixture.persistence.clone())
     }
 
     /// Inject a pre-computed system-prompt section that reminds the LLM a
@@ -6192,7 +5976,8 @@ impl ServerAgenticLoopHostBuilder {
             matrixone: self.matrixone,
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
-            inference_ledger_persistence: self.inference_ledger_persistence,
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            provider_observations: self.provider_observations,
             model_override: self.model_override,
             preserve_thinking: self.preserve_thinking,
             initial_output_limit: self.initial_output_limit,
@@ -6203,9 +5988,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_llm_config: None,
             resolved_llm_config_at: None,
             judgment_route_cache: None,
-            summary_attempt_allocator: DurableSummaryAttemptAllocator::default(),
             execution_time_budget: self.execution_time_budget,
-            canonical_transition_hydrated: false,
             tool_schemas,
             admission_tool_schemas,
             runtime_provider_policy_index: Arc::new(std::sync::RwLock::new(Default::default())),
@@ -7201,40 +6984,6 @@ impl ServerAgenticLoopHost {
             .ok()
     }
 
-    pub(crate) async fn model_catalog_context(&self) -> Option<Value> {
-        use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page, unavailable_page};
-        let reader = self.model_catalog_reader.as_ref()?;
-        let mut page = match reader.read_snapshot().await {
-            Ok(items) => catalog_page(items, &ModelCatalogRequest::default(), reader.scope())
-                .unwrap_or_else(|error| unavailable_page(error, reader.scope())),
-            Err((status, _)) => unavailable_page(
-                super::tool_model_catalog::catalog_read_error(status),
-                reader.scope(),
-            ),
-        };
-        // A changing wall clock is not a new catalog generation. Keep the
-        // request/descendant observation byte-stable outside the system prefix.
-        page.observed_at = None;
-        let child_model_selection_allowed =
-            crate::server::run::lifecycle::ensure_child_model_selection_scope(
-                Some(reader),
-                self.provider_scope_bound,
-            )
-            .is_ok();
-        // This is an observation, not a second model-selection instruction.
-        // Execution-vs-content interpretation belongs to the tool contract.
-        let context = json!({
-            "catalog": page,
-            "child_model_selection_allowed": child_model_selection_allowed,
-        })
-        .to_string();
-        crate::turn::wire_assembly::required_runtime_preamble_message(
-            &context,
-            crate::turn::wire_assembly::RuntimeAuthorityKind::AuthorizedModelCatalog,
-            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-        )
-    }
-
     async fn judge_delegation_scope_binding(
         &mut self,
         state: &mut AgenticLoopState,
@@ -7492,14 +7241,12 @@ impl ServerAgenticLoopHost {
         &mut self,
         requested: tokio_util::sync::CancellationToken,
         engine: crate::server::run::engine::RunEngine,
-        reservation: astra_turn_types::TurnReservationV1,
-        original_user_message: String,
+        authority: astra_services::session_context_coordinator::RunContextAuthority,
     ) {
         self.execution_handoff = Some(ExecutionHandoffContext {
             requested,
             engine,
-            reservation,
-            original_user_message,
+            authority,
         });
     }
 
@@ -7919,16 +7666,6 @@ impl ServerAgenticLoopHost {
             ToolTransportKind::EdgeWs => astra_services::ModelRequestTopology::EdgeServer,
             _ => astra_services::ModelRequestTopology::ServerOnly,
         }
-    }
-
-    fn model_request_context_seed(
-        &self,
-        trace: Option<&Value>,
-    ) -> astra_services::ModelRequestContextSeed {
-        crate::turn::llm::context::model_request_context_seed_from_manifest(
-            self.model_request_topology(),
-            trace,
-        )
     }
 
     /// Project a cached admission only onto provider calls that it can prove
@@ -10754,6 +10491,12 @@ impl ServerAgenticLoopHost {
         Ok(())
     }
 
+    /// Fresh ordinary chat has no admitted Work operation to recover. The
+    /// explicit Work and checkpoint paths keep their existing durable recovery.
+    pub(crate) fn skip_implicit_work_recovery(&mut self) {
+        self.work_establishment_hydrated = true;
+    }
+
     /// Rehydrate a pending lifecycle carrier that was durably admitted by a
     /// previous process. Recovery is exact to the persisted turn-chain
     /// envelope; a different user turn cannot consume an old operation merely
@@ -11610,6 +11353,19 @@ impl ServerAgenticLoopHost {
     }
 
     async fn revalidate_catalog_execution(&mut self) -> Result<(), String> {
+        // Admission already resolved and authorized this exact execution. Reuse
+        // that bounded grant across model/tool rounds instead of querying and
+        // invalidating the route cache before every lookup. The timestamp is
+        // admission-owned: resolving a cached config cannot extend its life.
+        if self
+            .admitted_model_execution
+            .as_ref()
+            .is_some_and(|execution| {
+                execution.admitted_at.elapsed() < RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+            })
+        {
+            return Ok(());
+        }
         if let Some(execution) = self.revalidate_auto_execution().await? {
             self.admitted_model_execution = Some(execution);
             self.clear_resolved_llm_config();
@@ -11807,7 +11563,7 @@ impl ServerAgenticLoopHost {
             return Err(JudgmentClientUnavailable::OutputBudget);
         }
         let client = self
-            .durable_summary_client_for_execution(
+            .summary_client_for_execution(
                 &route.config,
                 max_output_tokens,
                 state,
@@ -11848,7 +11604,7 @@ impl ServerAgenticLoopHost {
         }
         if let Some(config) = self.resolved_llm_config.as_ref() {
             return self
-                .durable_summary_client(config, max_output_tokens, state, operation_id)
+                .summary_client(config, max_output_tokens, state, operation_id)
                 .map(|client| Box::new(client) as Box<_>);
         }
 
@@ -11864,7 +11620,7 @@ impl ServerAgenticLoopHost {
             }
         };
         self.remember_resolved_llm_config(&llm_cfg);
-        self.durable_summary_client(&llm_cfg, max_output_tokens, state, operation_id)
+        self.summary_client(&llm_cfg, max_output_tokens, state, operation_id)
             .map(|client| Box::new(client) as Box<_>)
     }
 
@@ -11880,19 +11636,19 @@ impl ServerAgenticLoopHost {
             return Some(client);
         }
         Some(Box::new(
-            self.durable_summary_client(config, 4096, state, "pre_turn_compaction")?
+            self.summary_client(config, 4096, state, "pre_turn_compaction")?
                 .with_prompt_cache_context(tools, cache_capability),
         ))
     }
 
-    fn durable_summary_client(
+    fn summary_client(
         &self,
         config: &ResolvedTurnLlmConfig,
         max_output_tokens: usize,
         state: &AgenticLoopState,
         operation_id: &str,
     ) -> Option<RuntimeSummaryClient> {
-        self.durable_summary_client_for_execution(
+        self.summary_client_for_execution(
             config,
             max_output_tokens,
             state,
@@ -11901,7 +11657,7 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    fn durable_summary_client_for_execution(
+    fn summary_client_for_execution(
         &self,
         config: &ResolvedTurnLlmConfig,
         max_output_tokens: usize,
@@ -11916,94 +11672,33 @@ impl ServerAgenticLoopHost {
                     target: "astra::inference",
                     operation_id,
                     error = %error,
-                    "auxiliary inference skipped because durable run authority is unavailable"
+                    "auxiliary inference skipped because Run authority is unavailable"
                 );
                 return None;
             }
         };
-        let ledger = match self.inference_ledger_for_execution(authority, execution) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra::inference",
-                    operation_id,
-                    error = %error,
-                    "auxiliary inference skipped because durable admission material is unavailable"
-                );
-                return None;
-            }
-        };
-        // Auxiliary inference is causal to one durable run whenever the
-        // lifecycle has established that identity.  A session-only scope
-        // makes every retry of the same visible turn collide with the first
-        // judge invocation (the idempotency key intentionally includes the
-        // scope), which turns a successful prior judge into a misleading
-        // `already exists with status succeeded` transport failure.  Keep the
-        // session scope only for isolated/unit callers that have no run yet.
-        let scope = match state
-            .current_run_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|run_id| !run_id.is_empty())
-        {
-            Some(run_id) => astra_turn_types::InferenceInvocationScope::Run {
-                session_id: self.session_id.clone(),
-                run_id: run_id.to_string(),
-                turn: state.session_turn,
-                round: state.llm_rounds_completed,
-                operation_id: operation_id.to_string(),
-                logical_attempt: 0,
-            },
-            None => astra_turn_types::InferenceInvocationScope::Session {
-                session_id: self.session_id.clone(),
-                turn: state.session_turn,
-                round: state.llm_rounds_completed,
-                operation_id: operation_id.to_string(),
-                logical_attempt: 0,
-            },
-        };
-        Some(RuntimeSummaryClient::new_with_attempt_allocator(
-            config.execution_route(),
-            max_output_tokens,
-            ledger,
-            scope,
-            self.summary_attempt_allocator.clone(),
-        ))
-    }
-
-    fn required_inference_ledger(
-        &self,
-        run_authority: Option<crate::turn::llm::durable::DurableInferenceRunAuthority>,
-    ) -> Result<crate::turn::llm::durable::DurableInferenceLedger, astra_core::ClassifiedError>
-    {
-        self.inference_ledger_for_execution(run_authority, self.admitted_model_execution.as_ref())
-    }
-
-    fn inference_ledger_for_execution(
-        &self,
-        run_authority: Option<crate::turn::llm::durable::DurableInferenceRunAuthority>,
-        execution: Option<&astra_services::AdmittedModelExecution>,
-    ) -> Result<crate::turn::llm::durable::DurableInferenceLedger, astra_core::ClassifiedError>
-    {
-        let ledger = match self.inference_ledger_persistence.as_ref() {
-            Some(persistence) => {
-                crate::turn::llm::durable::DurableInferenceLedger::required_with_persistence(
-                    self.shared_pool.as_ref(),
-                    execution,
-                    &self.user_id,
-                    Some(persistence.clone()),
-                )
-            }
-            None => crate::turn::llm::durable::DurableInferenceLedger::required(
-                self.shared_pool.as_ref(),
-                execution,
-                &self.user_id,
+        let authority = authority?;
+        // Route and credential placement remain the admitted Offering's
+        // contract. Request-local execution does not grant model access.
+        execution?;
+        let client =
+            RuntimeSummaryClient::new(config.execution_route(), max_output_tokens, authority);
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        let client = match self.provider_observations.clone() {
+            Some(observations) => client.with_observations(
+                observations,
+                astra_turn_types::InferenceInvocationScope::Run {
+                    session_id: self.session_id.clone(),
+                    run_id: state.current_run_id.clone()?,
+                    turn: state.session_turn,
+                    round: state.llm_rounds_completed,
+                    operation_id: operation_id.into(),
+                    logical_attempt: 0,
+                },
             ),
-        }?;
-        Ok(match run_authority {
-            Some(authority) => ledger.with_run_authority(authority),
-            None => ledger,
-        })
+            None => client,
+        };
+        Some(client)
     }
 
     fn inference_run_authority(
@@ -13108,9 +12803,9 @@ impl ServerAgenticLoopHost {
         self.start_explain_analyze_tool_call(&event);
         self.finish_explain_analyze_tool_call(&event);
         if let Some(object) = event.as_object_mut() {
-            // Settlement authority is lifecycle-owned. Never trust or expose
-            // a producer-supplied copy of its private durable watermark.
-            object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+            // Live delivery accounting is lifecycle-owned. Never trust or
+            // expose a producer-supplied private delivery watermark.
+            object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
         }
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
@@ -17559,122 +17254,6 @@ impl ServerAgenticLoopHost {
         visible
     }
 
-    /// Recall owner-scoped memory for this turn's context pipeline.
-    async fn prompt_memory_entries_for_turn(
-        &mut self,
-        session_turn: u32,
-        user_content: &str,
-    ) -> PromptMemoryRecall {
-        let started = Instant::now();
-        let (entries, outcome) = if let Some(client) = self.memoria_client.as_deref() {
-            let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(5);
-            let (prefetched, session_start) = tokio::join!(
-                crate::turn::memory_prefetch::prefetch_memories_with_client(
-                    client,
-                    user_content,
-                    &self.user_id,
-                    &self.session_id,
-                    top_k,
-                ),
-                async {
-                    if session_turn <= 1 {
-                        crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
-                            client,
-                            &self.user_id,
-                            &self.session_id,
-                        )
-                        .await
-                    } else {
-                        crate::turn::memory_prefetch::SessionStartPrefetchResult::default()
-                    }
-                }
-            );
-            let outcome = prefetched.outcome.combine(session_start.outcome);
-            let mut entries = session_start.entries;
-            entries.extend(prefetched.entries);
-            (
-                crate::turn::memory_prefetch::admit_prompt_memory_entries(
-                    &self.session_id,
-                    entries,
-                ),
-                outcome,
-            )
-        } else {
-            (
-                Vec::new(),
-                astra_turn_types::MemoryRetrievalOutcome::NotAttempted,
-            )
-        };
-        let fetch_ms = started.elapsed().as_millis() as u64;
-        PromptMemoryRecall {
-            entries,
-            outcome,
-            fetch_ms,
-        }
-    }
-
-    /// Resolve the two independent memory inputs consumed by the context
-    /// pipeline without making their latencies additive. Both futures remain
-    /// scoped to this provider request (no detached work), and the existing
-    /// owner/session-bound Memoria port remains the only retrieval authority.
-    async fn memory_context_for_turn(
-        &mut self,
-        session_turn: u32,
-        user_content: &str,
-        memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
-    ) -> (
-        PromptMemoryRecall,
-        Option<astra_turn_core::context_sources::MemoryEntry>,
-    ) {
-        let memoria_client = self.memoria_client.clone();
-        let session_id = self.session_id.clone();
-        let prompt_recall = self.prompt_memory_entries_for_turn(session_turn, user_content);
-        let session_memory = async move {
-            if let Some(service) = memory_extraction_service {
-                service
-                    .current_session_memory_entry_for_pipeline_with_deadline(
-                        &session_id,
-                        crate::turn::memory_prefetch::INTERACTIVE_MEMORY_READ_DEADLINE,
-                    )
-                    .await
-            } else if let Some(client) = memoria_client.as_deref() {
-                let loaded = crate::session_memory::runner::load_current_session_memory_preferring_local_with_deadline(
-                    client,
-                    &session_id,
-                    crate::turn::memory_prefetch::INTERACTIVE_MEMORY_READ_DEADLINE,
-                )
-                .await;
-                loaded.as_ref().and_then(|loaded| {
-                    crate::turn::wire_assembly::session_memory_entry_for_user_turn(
-                        Some(&loaded.content),
-                        loaded.updated_turn,
-                    )
-                })
-            } else {
-                None
-            }
-        };
-
-        tokio::join!(prompt_recall, session_memory)
-    }
-
-    fn record_prompt_memory_trace(state: &AgenticLoopState, recall: &PromptMemoryRecall) {
-        if !recall.outcome.was_attempted() {
-            return;
-        }
-        if let Some(collector) = state.telemetry.turn_trace_collector.as_ref() {
-            collector.record_prompt_memory_retrieval(
-                "prompt_memory_recall",
-                recall.outcome,
-                &recall.entries,
-                recall.fetch_ms,
-            );
-        }
-    }
-
     #[cfg(test)]
     fn run_turn_pipeline(
         &mut self,
@@ -17818,7 +17397,7 @@ impl ServerAgenticLoopHost {
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
-        let summary_client = self.durable_summary_client(
+        let summary_client = self.summary_client(
             llm_cfg,
             compact_config.summary_token_budget,
             state,
@@ -18175,82 +17754,6 @@ impl ServerAgenticLoopHost {
 
             error_kind: None,
         }))
-    }
-
-    async fn hydrate_provider_canonical_transitions(
-        &mut self,
-        state: &mut AgenticLoopState,
-    ) -> Result<(), astra_core::ClassifiedError> {
-        if self.canonical_transition_hydrated {
-            return Ok(());
-        }
-        if !state.owns_provider_canonical_transition_wal() {
-            // A subagent can share the parent's durable run/session scope for
-            // evidence custody while owning an independent prompt history.
-            // It must neither consume nor publish root canonical WAL rows.
-            self.canonical_transition_hydrated = true;
-            return Ok(());
-        }
-        let Some(pool) = self.shared_pool.as_ref() else {
-            // A host without the durable inference ledger cannot have
-            // attempt-owned canonical WAL rows to recover.
-            self.canonical_transition_hydrated = true;
-            return Ok(());
-        };
-        let receipts = astra_services::load_inference_canonical_transitions_for_session(
-            pool,
-            &self.user_id,
-            &self.session_id,
-            state.session_turn,
-        )
-        .await
-        .map_err(|error| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::DatabaseError,
-                format!("load provider canonical transition WAL: {error}"),
-            )
-        })?;
-
-        // A crashed reservation is reissued at the same reserved turn because
-        // only canonical commit advances the coordinator head. The admitted
-        // durable-base count is therefore the ownership boundary: detach the
-        // fresh request suffix, replay only on H, then restore that suffix.
-        // Comparing values cannot distinguish repeated input such as two
-        // identical `continue` messages across the crash boundary.
-        let durable_base = state.provider_canonical_wal_base.clone().ok_or_else(|| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContractViolation,
-                "provider canonical WAL hydration has no admitted durable base",
-            )
-        })?;
-        let mut recovered = state.messages.clone();
-        let outcome = hydrate_provider_canonical_transition_receipts(
-            &mut recovered,
-            &durable_base,
-            receipts,
-        )?;
-        if let Some(replacement) = outcome.replacement.as_ref() {
-            state
-                .recover_provider_canonical_replacement(replacement, &recovered)
-                .map_err(|error| {
-                    astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        format!("recover provider canonical rewrite proof: {error}"),
-                    )
-                })?;
-        }
-        state.provider_canonical_wal_head = outcome.head.clone();
-        tracing::debug!(
-            target: "astra_runtime::canonical_wal",
-            session_id = %self.session_id,
-            turn = state.session_turn,
-            reconciled_transitions = outcome.reconciled_transitions,
-            replacement = outcome.replacement.is_some(),
-            "hydrated provider canonical transition WAL"
-        );
-        state.messages = recovered;
-        self.canonical_transition_hydrated = true;
-        Ok(())
     }
 
     fn build_explain_analyze_auxiliary_details(
@@ -19030,9 +18533,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let Some(base) = state.provider_canonical_wal_base.as_ref() else {
             return Ok(false);
         };
-        if context.reservation.key.owner_user_id != self.user_id
-            || context.reservation.key.session_id != self.session_id
-            || context.reservation.reserved_turn != state.session_turn
+        if context.authority.key.owner_user_id != self.user_id
+            || context.authority.key.session_id != self.session_id
+            || context.authority.turn != state.session_turn
+            || context.authority.run_id != run_id
+            || context.authority.generation != generation
             || heavy.run_execution_budget.is_none()
             || heavy.run_execution_control.is_none()
             || heavy.run_execution_budget != state.run_execution_budget_snapshot()
@@ -19058,15 +18563,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         let authorization =
             state.provider_canonical_replacement_authorization(base, &state.messages);
-        let plan = plan_provider_canonical_wal_transition(
-            base,
-            state.provider_canonical_wal_head.as_ref(),
-            &state.messages,
-            Vec::new(),
-            authorization.as_ref(),
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .map_err(|error| classify(error.to_string()))?;
+        let plan = build_handoff_continuation(base, &state.messages, authorization.as_ref())
+            .map_err(|error| classify(error.to_string()))?;
         let durable = crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
             base,
             &heavy.messages,
@@ -19074,7 +18572,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let identity =
             astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&durable)
                 .map_err(|error| classify(error.to_string()))?;
-        if identity != plan.transition.result {
+        if identity != plan.result {
             return Err(classify(
                 "handoff snapshot and canonical continuation differ".to_string(),
             ));
@@ -19136,7 +18634,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             producer_owner_generation: generation,
             heavy: RuntimeExecutionHandoff {
                 authenticated_edge_discovery: self.authenticated_edge_discovery.clone(),
-                original_user_message: context.original_user_message.clone(),
                 edge_profile: self.edge_profile.clone(),
                 edge_provider_tool_schemas: self.edge_provider_tool_schemas.clone(),
                 tool_schemas: self.tool_schemas.clone(),
@@ -19194,8 +18691,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 recorder: state.step_recorder.capture_settled_continuation(&heavy.light)
                     .map_err(|error| classify(error.to_string()))?,
                 heavy,
-                reservation: context.reservation.clone(),
-                continuation: plan.transition,
+                context_authority: context.authority.clone(),
+                continuation: plan,
                 execution_deadline: self.execution_time_budget.map(|deadline| deadline.snapshot()),
             },
         };
@@ -19748,10 +19245,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true
     }
 
-    fn owns_post_loop_memory_settlement(&self) -> bool {
-        true
-    }
-
     async fn judge_turn_intent(
         &mut self,
         state: &AgenticLoopState,
@@ -20154,13 +19647,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
     }
 
-    async fn hydrate_restored_history(
-        &mut self,
-        state: &mut AgenticLoopState,
-    ) -> Result<(), astra_core::ClassifiedError> {
-        self.hydrate_provider_canonical_transitions(state).await
-    }
-
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -20403,23 +19889,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let context_assembly_node_id =
             self.start_explain_analyze_context_assembly(state, Instant::now());
-        let model_catalog_context = self.model_catalog_context().await;
-        let (prompt_memory_recall, initial_session_memory_entry) = self
-            .memory_context_for_turn(
-                state.session_turn,
-                &user_content,
-                state.memory_extraction_service.clone(),
-            )
-            .await;
-        Self::record_prompt_memory_trace(state, &prompt_memory_recall);
-        let memoria_prefetch_entries = prompt_memory_recall.entries;
-        tracing::debug!(
-            target: "astra_runtime::server_loop",
-            session_id = %self.session_id,
-            turn = state.session_turn,
-            has_session_memory = initial_session_memory_entry.is_some(),
-            "turn pipeline: session memory loaded"
-        );
         let turn_pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             context_tool_surface,
@@ -20428,8 +19897,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             llm_cfg.context_window,
             llm_cfg.max_completion_tokens,
             llm_cfg.cache_capability,
-            initial_session_memory_entry.clone(),
-            &memoria_prefetch_entries,
+            None,
+            &[],
             &user_content,
         ) {
             Ok(outcome) => outcome,
@@ -20466,9 +19935,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut final_context_assembly = initial_context_assembly;
         let mut final_system_messages = system_messages;
         let mut final_volatile_preamble = volatile_preamble;
-        if let Some(context) = model_catalog_context.as_ref() {
-            final_volatile_preamble.push(context.clone());
-        }
         let mut final_system_prompt_breakdown = system_prompt_breakdown;
         let mut final_pipeline_tool_schemas = pipeline_tool_schemas;
         let mut final_manifest_trace = manifest_trace;
@@ -20530,9 +19996,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let rerun = match crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
             compact_result.session_memory_context.as_deref(),
-            initial_session_memory_entry.as_ref(),
             None,
-            &memoria_prefetch_entries,
+            None,
+            &[],
             &compact_result.retrieved_memory_entries,
             |session_memory_entry, memory_entries| {
                 self.run_turn_pipeline_with_model_limits_and_session_memory(
@@ -20581,9 +20047,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
-            if let Some(context) = model_catalog_context {
-                final_volatile_preamble.push(context);
-            }
             final_system_prompt_breakdown = rerun.breakdown;
             final_pipeline_tool_schemas = rerun.tool_schemas;
             final_manifest_trace = rerun.manifest_trace;
@@ -20678,7 +20141,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Canonical messages appended by the wire assembler are staged from
         // this exact prefix. A matching WAL transition is bound to provider
         // attempt admission before HTTP is authorized.
-        let mut durable_canonical_cursor = state.messages.len();
         let (llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
             .assemble_llm_messages_with_final_budget(
                 final_system_messages,
@@ -21074,54 +20536,48 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
             };
-            let durable_ledger = match self.required_inference_ledger(Some(run_authority)) {
-                Ok(ledger) => ledger,
-                Err(error) => {
-                    self.complete_request_preparation_phase_with_context(
-                        state,
-                        request_attempt_started_at,
-                        attempt_in_round,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Failed,
-                        attempt_context_metrics.clone(),
-                    );
-                    return Err(error);
-                }
+            if self.admitted_model_execution.is_none() {
+                return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation,
+                    "model dispatch has no admitted Offering material"));
+            }
+            let operation_id = agent_inference_operation_id(state)?;
+            let provider_observer = crate::turn::llm::run_scoped::RunScopedProviderObserver::new(run_authority);
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            let provider_observer = match self.provider_observations.clone() {
+                Some(observations) => provider_observer.with_observations(observations,
+                    astra_turn_types::InferenceInvocationScope::Run {
+                        session_id: self.session_id.clone(),
+                        run_id: state.current_run_id.clone().expect("Run authority checked above"),
+                        turn: state.session_turn,
+                        round: next_provider_request_round(state),
+                        operation_id: operation_id.clone(), logical_attempt: attempt_in_round,
+                    }),
+                None => provider_observer,
             };
-            let run_id = match state.current_run_id.clone() {
-                Some(run_id) => run_id,
-                None => {
-                    let error = astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        "durable inference admission failed: Server execution has no durable run identity",
-                    );
-                    self.complete_request_preparation_phase_with_context(
-                        state,
-                        request_attempt_started_at,
-                        attempt_in_round,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Failed,
-                        attempt_context_metrics.clone(),
-                    );
-                    return Err(error);
-                }
-            };
-            let request_context =
-                self.model_request_context_seed(state.last_llm_context_manifest_trace.as_ref());
-            let requested_logical_attempt = attempt_in_round;
-            let operation_id = match (
-                state.inference_purpose, state.canonical_turn_chain_id.as_deref(),
+            tracing::debug!(operation_id, "dispatching Run-owned model request");
+            let logical_request_id = uuid::Uuid::new_v4().to_string();
+            // The final helper already projected and, for append-only
+            // providers, durably staged the execution deadline.  Keep this
+            // exact vector immutable through provider dispatch; only the
+            // timeout is sampled at the dispatch boundary.
+            let attempt_llm_messages_owned = llm_messages.clone();
+            let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
+            let execution_route = llm_cfg.execution_route();
+            let prepared_call = match prepare_streaming_call(
+                LlmCall {
+                    purpose: state.inference_purpose,
+                    messages: attempt_llm_messages,
+                    tools: &final_tools,
+                    cache_capability: Some(cache_cap),
+                    route: execution_route.borrowed(),
+                    max_output_tokens: Some(effective_max_output),
+                    temperature: None,
+                    thinking: &primary_thinking,
+                },
+                if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
             ) {
-                (astra_turn_types::InferencePurpose::SubAgent, Some(chain))
-                    if !chain.is_empty() && chain.trim() == chain =>
-                {
-                    scoped_inference_operation_id("agent_turn", chain)
-                }
-                (astra_turn_types::InferencePurpose::SubAgent, Some(_)) => {
-                    let error = astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        "subagent inference has an invalid canonical child turn identity",
-                    );
+                Ok(prepared) => prepared,
+                Err(error) => {
                     self.complete_request_preparation_phase_with_context(
                         state, request_attempt_started_at, attempt_in_round,
                         &mut request_preparation_recorded_attempts,
@@ -21129,72 +20585,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     );
                     return Err(error);
                 }
-                // Delegated children have their own durable run identity;
-                // skill forks share the parent run and supply a child chain.
-                (astra_turn_types::InferencePurpose::SubAgent, None) => "agent_turn".to_string(),
-                _ => "agent_turn".to_string(),
             };
-            let durable_invocation = match durable_ledger
-                .admit_with_request_context(
-                    astra_turn_types::InferenceInvocationScope::Run {
-                        session_id: self.session_id.clone(),
-                        run_id,
-                        turn: state.session_turn,
-                        round: prompt_round,
-                        operation_id,
-                        logical_attempt: attempt_in_round,
-                    },
-                    state.inference_purpose,
-                    &llm_cfg.model_name,
-                    llm_cfg
-                        .wire_model_name
-                        .as_deref()
-                        .unwrap_or(&llm_cfg.model_name),
-                    &llm_cfg.provider,
-                    request_context,
-                )
-                .await
-            {
-                Ok(invocation) => invocation,
-                Err(failure) => {
-                    attempt_in_round = failure.logical_attempt;
-                    self.complete_request_preparation_phase_with_context(
-                        state,
-                        request_attempt_started_at,
-                        attempt_in_round,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Failed,
-                        attempt_context_metrics.clone(),
-                    );
-                    return Err(failure.error);
-                }
-            };
-            attempt_in_round = match reconcile_durable_logical_attempt(
-                requested_logical_attempt,
-                durable_invocation.logical_attempt(),
-            ) {
-                Ok(admitted_attempt) => admitted_attempt,
-                Err(error) => {
-                    self.complete_request_preparation_phase_with_context(
-                        state,
-                        request_attempt_started_at,
-                        requested_logical_attempt,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Failed,
-                        attempt_context_metrics.clone(),
-                    );
-                    durable_invocation.finish_error(&error).await?;
-                    return Err(error);
-                }
-            };
-            if attempt_in_round != requested_logical_attempt {
-                tracing::info!(
-                    stage = "logical_invocation_admission_retry_identity",
-                    requested_logical_attempt,
-                    admitted_logical_attempt = attempt_in_round,
-                    "host advanced to the authoritative recovered inference identity"
-                );
-            }
             // All admission and optional projection awaits are complete. Sample one second-granular
             // dispatch budget and derive both the model-visible authority and
             // the hard client timeout from it. No await is allowed between
@@ -21214,139 +20605,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         TurnPhaseOutcome::Failed,
                         attempt_context_metrics.clone(),
                     );
-                    durable_invocation.finish_error(&error).await?;
                     return Err(error);
                 }
             };
-            // The final helper already projected and, for append-only
-            // providers, durably staged the execution deadline.  Keep this
-            // exact vector immutable through provider dispatch; only the
-            // timeout is sampled at the dispatch boundary.
-            let attempt_llm_messages_owned = llm_messages.clone();
-            let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
-            let (provider_canonical_transitions, provider_canonical_planned_head) = if state
-                .owns_provider_canonical_transition_wal()
-                && matches!(
-                    cache_cap.volatile_placement,
-                    astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
-                ) {
-                if durable_canonical_cursor > state.messages.len() {
-                    let error = astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        "provider canonical transition cursor exceeds canonical history",
-                    );
-                    self.complete_request_preparation_phase_with_context(
-                        state,
-                        request_attempt_started_at,
-                        attempt_in_round,
-                        &mut request_preparation_recorded_attempts,
-                        TurnPhaseOutcome::Failed,
-                        attempt_context_metrics.clone(),
-                    );
-                    durable_invocation.finish_error(&error).await?;
-                    return Err(error);
-                }
-                let appended = state.messages[durable_canonical_cursor..].to_vec();
-                {
-                    if !crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
-                        attempt_llm_messages,
-                        &state.messages,
-                        durable_canonical_cursor,
-                    ) {
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "provider request does not preserve its staged canonical append suffix",
-                        );
-                        self.complete_request_preparation_phase_with_context(
-                            state,
-                            request_attempt_started_at,
-                            attempt_in_round,
-                            &mut request_preparation_recorded_attempts,
-                            TurnPhaseOutcome::Failed,
-                            attempt_context_metrics.clone(),
-                        );
-                        durable_invocation.finish_error(&error).await?;
-                        return Err(error);
-                    }
-                    let Some(durable_base) = state.provider_canonical_wal_base.clone() else {
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "provider canonical transition has no admitted durable base",
-                        );
-                        self.complete_request_preparation_phase_with_context(
-                            state,
-                            request_attempt_started_at,
-                            attempt_in_round,
-                            &mut request_preparation_recorded_attempts,
-                            TurnPhaseOutcome::Failed,
-                            attempt_context_metrics.clone(),
-                        );
-                        durable_invocation.finish_error(&error).await?;
-                        return Err(error);
-                    };
-                    let predecessor_messages = &state.messages[..durable_canonical_cursor];
-                    let replacement_authorization = state
-                        .provider_canonical_replacement_authorization(
-                            &durable_base,
-                            predecessor_messages,
-                        );
-                    let plan = match plan_provider_canonical_wal_transition(
-                        &durable_base,
-                        state.provider_canonical_wal_head.as_ref(),
-                        predecessor_messages,
-                        appended,
-                        replacement_authorization.as_ref(),
-                        ProviderCanonicalWalLimits::PRODUCTION,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(source) => {
-                            let error = astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::ContractViolation,
-                                format!(
-                                    "failed to plan a bounded provider canonical transition: {source}"
-                                ),
-                            );
-                            self.complete_request_preparation_phase_with_context(
-                                state,
-                                request_attempt_started_at,
-                                attempt_in_round,
-                                &mut request_preparation_recorded_attempts,
-                                TurnPhaseOutcome::Failed,
-                                attempt_context_metrics.clone(),
-                            );
-                            durable_invocation.finish_error(&error).await?;
-                            return Err(error);
-                        }
-                    };
-                    (vec![plan.transition], Some(plan.head))
-                }
-            } else {
-                (Vec::new(), None)
-            };
-            let provider_canonical_transition_id = provider_canonical_transitions
-                .first()
-                .map(|transition| transition.transition_id.clone());
-            let provider_canonical_replacement = provider_canonical_transitions
-                .first()
-                .filter(|transition| {
-                    transition.recovery_mode
-                        == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
-                })
-                .cloned();
-            if let Err(error) = durable_invocation
-                .bind_provider_canonical_transitions(provider_canonical_transitions)
-            {
-                self.complete_request_preparation_phase_with_context(
-                    state,
-                    request_attempt_started_at,
-                    attempt_in_round,
-                    &mut request_preparation_recorded_attempts,
-                    TurnPhaseOutcome::Failed,
-                    attempt_context_metrics.clone(),
-                );
-                durable_invocation.finish_error(&error).await?;
-                return Err(error);
-            }
             // Attempt-keyed prompt truth is created only after durable
             // admission chooses the authoritative logical identity. The
             // cancelled N recovery fact must never own the request artifact
@@ -21384,7 +20645,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         // attempt. If attempt-keyed artifact planning fails
                         // before provider I/O, terminalize that exact identity
                         // instead of leaving an admitted orphan.
-                        durable_invocation.finish_error(&error).await?;
                         return Err(error);
                     }
                 };
@@ -21397,7 +20657,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             state
                 .step_recorder
-                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose, durable_invocation.invocation_id(), attempt_in_round);
+                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose, &logical_request_id, attempt_in_round);
             if attempt_in_round > 0 {
                 state.current_model_item_id = Some(uuid::Uuid::new_v4().to_string());
                 self.current_model_item_id = state.current_model_item_id.clone();
@@ -21432,7 +20692,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .node_id
             });
             let explain_provider_attempt_observer = ExplainAnalyzeProviderAttemptObserver::new(
-                durable_invocation.attempt_observer(),
+                &provider_observer,
                 explain_analyze_context,
                 self.event_tx.clone(),
                 model_round_node_id,
@@ -21617,24 +20877,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                         }
                     };
-                    let execution_route = llm_cfg.execution_route();
-                    let call = LlmCall {
-                        purpose: state.inference_purpose,
-                        messages: attempt_llm_messages,
-                        tools: &final_tools,
-                        cache_capability: Some(cache_cap),
-                        route: execution_route.borrowed(),
-                        max_output_tokens: Some(effective_max_output),
-                        temperature: None,
-                        thinking: &primary_thinking,
-                    };
                     let llm_cancel = llm_cancel_for_state(state);
-                    call_llm_and_collect_with_stream_callback(
-                        call,
+                    call_prepared_llm_and_collect_with_stream_callback(
+                        prepared_call,
                         llm_cancel,
                         Some(&mut on_stream_update),
                         Some(&explain_provider_attempt_observer),
-                        if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
                         dispatch_budget.client_timeout,
                     ).await.map_err(|error| dispatch_budget.classify_deadline(error))
                 };
@@ -21676,7 +20924,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 provider_result
             };
             let llm_round_latency_ms = llm_round_start.elapsed().as_millis() as u64;
-            let provider_attempts = durable_invocation.provider_attempt_facts().await;
+            let provider_attempts = provider_observer.facts();
             let mut qualified_invocation_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
             // The invocation's final facts are read once after its call has
             // stopped. Each request key is unique in its existing owner map.
@@ -21712,7 +20960,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Err(error) => state.step_recorder.fail_llm_round(
                     &llm_cfg.model_name, state.inference_purpose, error,
                     llm_round_latency_ms,
-                    durable_invocation.provider_dispatch_started(),
+                    provider_observer.dispatched(),
                 ),
             }
             if state.messaging.progress_emitter.is_none() {
@@ -21727,51 +20975,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             self.publish_explain_analyze_provider_attempt_spans(
                 explain_provider_attempt_observer.drain_spans(),
             );
-            match (
-                durable_invocation.admitted_canonical_transition_id(),
-                provider_canonical_planned_head,
-            ) {
-                (Some(admitted_transition_id), Some(planned_head))
-                    if provider_canonical_transition_id.as_deref()
-                        == Some(admitted_transition_id.as_str())
-                        && planned_head.transition_id == admitted_transition_id =>
-                {
-                    if let Some(replacement) = provider_canonical_replacement.as_ref()
-                        && let Err(source) =
-                            state.acknowledge_provider_canonical_replacement(replacement)
-                    {
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            format!(
-                                "failed to consume provider canonical replacement authority: {source}"
-                            ),
-                        );
-                        durable_invocation.finish_error(&error).await?;
-                        return Err(error);
-                    }
-                    state.provider_canonical_wal_head = Some(planned_head);
-                }
-                (None, Some(_)) if r.is_err() => {
-                    // Admission failures carry the authoritative database or
-                    // contract error through `provider_result`; do not replace
-                    // it with a secondary missing-head diagnostic.
-                }
-                (None, None) => {}
-                _ => {
-                    let error = astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        "durable provider admission did not preserve the planned canonical WAL head",
-                    );
-                    durable_invocation.finish_error(&error).await?;
-                    return Err(error);
-                }
-            }
             record_provider_attempt_cache_observations(state, &provider_attempts);
-            if durable_invocation.provider_dispatch_started() {
+            if provider_observer.dispatched() {
                 if safe_provider_recovery {
                     state.provider_adaptation.safe_recovery_pending = false;
                 }
-                durable_canonical_cursor = state.messages.len();
                 record_full_llm_request_event(
                     state,
                     self.full_llm_capture,
@@ -21877,7 +21085,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "context_window_error",
                         llm_capture_error_response(e),
                     );
-                    durable_invocation.finish_error(e).await?;
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -21970,7 +21177,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "error",
                         llm_capture_error_response(&e),
                     );
-                    durable_invocation.finish_error(&e).await?;
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -22099,7 +21305,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "usage": r.usage.clone(),
                     }),
                 );
-                durable_invocation.finish_result(&r).await?;
                 crate::llm_provider_admission::record_llm_provider_admission_calibration(
                     admission_estimated_tokens as u64,
                     &r.usage,
@@ -22802,7 +22007,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .iter()
             .map(|result| result.request_id.as_str())
             .collect::<std::collections::HashSet<_>>();
-        let pre_execution_rejections = invocations
+        let mut pre_execution_rejections = invocations
             .iter()
             .filter_map(|invocation| {
                 let result = blocked.iter().find(|result| {
@@ -22840,7 +22045,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 })
             })
             .collect::<Vec<_>>();
-        let executable = tool_calls
+        let mut executable = tool_calls
             .iter()
             .filter(|call| {
                 !call
@@ -22850,6 +22055,41 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let inbox_calls = invocations
+            .iter()
+            .filter(|invocation| {
+                !invocation
+                    .provider_call_id()
+                    .is_some_and(|id| blocked_ids.contains(id))
+                    && state
+                        .runtime_tool_executor
+                        .as_ref()
+                        .is_some_and(|executor| {
+                            executor.invocation_requires_receive_inbox(invocation)
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !inbox_calls.is_empty()
+            && let Err(error) = state.messaging.ensure_mailbox().await
+        {
+            let rejected_ids = inbox_calls
+                .iter()
+                .filter_map(|call| call.provider_call_id())
+                .collect::<std::collections::HashSet<_>>();
+            executable.retain(|call| {
+                !call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| rejected_ids.contains(id))
+            });
+            pre_execution_rejections.extend(inbox_calls.into_iter().map(|invocation| {
+                    crate::turn::agentic_loop::host::RejectedToolCall {
+                        invocation,
+                        result: json!({"status":"failed","error_kind":"mailbox_unavailable", "error":error, "advisory":{"executed":false}}).to_string(),
+                    }
+                }));
+        }
         let mut result = self.handle_admitted_tool_calls(state, &executable).await;
         result
             .pre_execution_rejections
@@ -24038,10 +23278,81 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn test_inference_ledger_preserves_execution_owner_in_both_builder_orders() {
+    async fn ordinary_model_rounds_do_not_contact_bound_memory() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
-            server_host_builder,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
+        };
+        struct UnexpectedMemory;
+        #[async_trait::async_trait]
+        impl astra_memoria::MemoriaPort for UnexpectedMemory {
+            async fn admits_operation(&self, _: bool) -> Result<bool, String> {
+                panic!("ordinary rounds must not resolve memory credentials")
+            }
+            async fn retrieve_ext(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                _: bool,
+            ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError>
+            {
+                panic!("ordinary rounds must not retrieve implicit memory")
+            }
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                panic!("ordinary rounds must not extract memory")
+            }
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                panic!("ordinary rounds must not purge memory")
+            }
+        }
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "ordinary memory-independent replies",
+            |request| request.body["model"] == "ordinary-model",
+            (0..2).map(|_| ProviderResponse::OpenAi(json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "Done."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            }))).collect(),
+        )]).await;
+        let observations = ProviderObservationsFixture::default();
+        let mut host = server_host_builder(
+            &gateway,
+            &observations,
+            "ordinary-session",
+            "openai",
+            "ordinary-model",
+            None,
+        )
+        .with_memoria_client(Some(Arc::new(UnexpectedMemory)))
+        .build();
+        let mut state = loop_state("ordinary-session", Vec::new(), "A simple conversation.");
+        host.prepare_model_selection(&mut state).await.unwrap();
+        for round in 0..2 {
+            state.current_round_index = round;
+            let result = host
+                .execute_turn(&mut state)
+                .await
+                .expect("memory is not required to chat");
+            assert_eq!(result.accum.full_text, "Done.");
+            state.commit_volatile_attempt_lease();
+        }
+        assert_eq!(gateway.requests.lock().await.len(), 2);
+        observations.assert_quiescent();
+        gateway.assert_complete();
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn provider_observations_preserves_execution_owner_in_both_builder_orders() {
+        use crate::server::provider_test_support::{
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
         };
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
             "actual root owner requests", |request| request.path == "/v1/chat/completions"
@@ -24086,17 +23397,17 @@ mod tests {
             state
                 .user_intents
                 .commit_observed_cursor(usize::try_from(record.last_event_idx).unwrap());
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let builder =
                 server_host_builder(&gateway, &ledger, &session, "openai", "owner-model", None);
             let mut host = if ledger_first {
                 builder
-                    .with_test_inference_ledger(ledger.persistence.clone())
+                    .with_provider_observations(ledger.clone())
                     .with_inference_owner_pod_id(Some(owner.clone()))
             } else {
                 builder
                     .with_inference_owner_pod_id(Some(owner.clone()))
-                    .with_test_inference_ledger(ledger.persistence.clone())
+                    .with_provider_observations(ledger.clone())
             }
             .build();
             host.prepare_model_selection(&mut state).await.unwrap();
@@ -24119,7 +23430,7 @@ mod tests {
                 state.restore_volatile_attempt_lease();
             }
             assert_eq!(gateway.requests.lock().await.len(), request_count);
-            assert!(ledger.admissions().is_empty());
+            assert!(ledger.requests().is_empty());
             assert_eq!(ledger.attempt_count(), 0);
             state.inference_purpose = astra_turn_types::InferencePurpose::PrimaryAgent;
             state.canonical_turn_chain_id = None;
@@ -24131,7 +23442,7 @@ mod tests {
             assert_eq!(state.final_text, "The explanation is complete.");
             assert_eq!(ledger.attempt_count(), 1);
             ledger.assert_quiescent();
-            let admissions = ledger.admissions();
+            let admissions = ledger.requests();
             assert_eq!(admissions.len(), 1);
             let (scope, authority) = &admissions[0];
             assert_eq!(scope.run_id(), Some(run.as_str()));
@@ -25138,34 +24449,6 @@ mod tests {
         assert_eq!(request["args"], bash_args);
     }
 
-    #[test]
-    fn durable_admission_retry_identity_advances_host_attempt_monotonically() {
-        assert_eq!(
-            reconcile_durable_logical_attempt(0, 0).expect("ordinary admission"),
-            0
-        );
-        assert_eq!(
-            reconcile_durable_logical_attempt(0, 1).expect("one recovered admission"),
-            1
-        );
-        assert_eq!(
-            reconcile_durable_logical_attempt(1, 2).expect("retry after recovered admission"),
-            2
-        );
-    }
-
-    #[test]
-    fn durable_admission_retry_identity_rejects_reuse_or_unbounded_jump() {
-        for (requested, admitted) in [(1, 0), (0, 2), (u32::MAX, 0)] {
-            let error = reconcile_durable_logical_attempt(requested, admitted)
-                .expect_err("authority must advance by at most one exact identity");
-            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-            assert!(error.details_json.as_deref().is_some_and(|details| {
-                details.contains("logical_invocation_admission_retry_identity")
-            }));
-        }
-    }
-
     async fn test_edge_action_context(user_id: &str, run_id: &str) -> EdgeActionAdmissionContext {
         let engine = crate::server::run::engine::RunEngine::new(Arc::new(
             astra_services::runs::InMemoryRunStateStore::new(),
@@ -25195,8 +24478,8 @@ mod tests {
         let _journal = astra_services::session_journal::JournalDirGuard::new(journal.path());
         use astra_services::runs::RunStateStore;
         use astra_services::session_context_coordinator::{
-            AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
-            ResumedExecutionTurnRequest, SessionContextCoordinator,
+            DatabaseSessionContextCoordinator, ResumedExecutionTurnRequest,
+            SessionContextCoordinator,
         };
         use sqlx::Row;
         assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
@@ -25331,45 +24614,63 @@ mod tests {
                 .with_owner_pod_id("replay-test-owner"),
         );
         let engine = crate::server::run::engine::RunEngine::new(store.clone());
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        struct OpeningParticipant {
+            coordinator: DatabaseSessionContextCoordinator,
+            key: astra_turn_types::SessionKeyV1,
+            authority: Option<astra_services::session_context_coordinator::RunContextAuthority>,
+        }
+        #[async_trait::async_trait]
+        impl astra_services::runs::RunStartTransactionParticipant for OpeningParticipant {
+            async fn stage(
+                &mut self,
+                tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+                admission: &astra_services::runs::RunMutationAdmission,
+                opening: Option<&mut astra_services::runs::DurableRunOpening>,
+            ) -> Result<(), String> {
+                let authority = self
+                    .coordinator
+                    .capture_run_opening_in_transaction(
+                        tx,
+                        admission,
+                        &self.key,
+                        "replay-run",
+                        admission.generation(),
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let opening = opening.ok_or("missing Run opening")?;
+                opening.bind_input("\n  inspect result\t\n".into())?;
+                opening.bind_context_authority(authority.clone(), "\n  inspect result\t\n")?;
+                self.authority = Some(authority);
+                Ok(())
+            }
+        }
+        let mut participant = OpeningParticipant {
+            coordinator: coordinator.clone(),
+            key: astra_turn_types::SessionKeyV1::owner_session("server", &user, session, "main"),
+            authority: None,
+        };
         engine
-            .start_run_with_context(
+            .admit_run_with_context(
                 run_id,
                 &user,
                 session,
+                Some(session),
                 crate::server::run::engine::RunStartContext {
                     execution_authentication: Some(execution_authentication.clone()),
                     ..Default::default()
                 },
+                false,
+                &mut participant,
             )
             .await
             .unwrap();
-        let original_admission =
-            store.load_run(&user, run_id).await.unwrap().unwrap().events[0].clone();
-        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-        let key = astra_turn_types::SessionKeyV1::owner_session("server", &user, session, "main");
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            &user,
-            "replay-writer",
-            astra_turn_types::ActorKindV1::Cli,
-            astra_turn_types::SessionSurfaceV1::Cli,
-            None,
-            astra_turn_types::AuthorityEpochsV1::default(),
-        );
-        let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = coordinator
-            .acquire_writer_and_reserve_turn(
-                &key,
-                None,
-                &actor,
-                Duration::from_secs(60),
-                "writer",
-                "turn",
-                None,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("original turn admission failed")
-        };
+        let source = participant.authority.unwrap();
+        let opened = store.load_run(&user, run_id).await.unwrap().unwrap();
+        let opening_hash = opened.opening_hash.as_deref().unwrap();
+        let original_admission = opened.events[0].clone();
         let original_profile = Map::from_iter([(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS.into(),
             json!(["Original native runtime instructions"]),
@@ -25397,7 +24698,7 @@ mod tests {
         );
         state.current_run_owner_generation = Some(0);
         state.canonical_turn_chain_id = Some("replay-chain".into());
-        state.session_turn = reservation.reserved_turn;
+        state.session_turn = source.turn;
         state.total_prompt = 123;
         state
             .skills
@@ -25409,18 +24710,16 @@ mod tests {
         state.step_recorder = astra_pipeline::step_recorder::StepRecorder::with_persistence_for_run(
             &user, session, run_id, run_id,
         );
-        state.step_recorder.begin_turn(reservation.reserved_turn);
+        state.step_recorder.begin_turn(source.turn);
         // Tool-free rounds still advance the journal; the last tool record
         // cannot reconstruct this cursor.
         state.turn_event_buffer = Some(
             astra_services::session_journal::TurnEventBuffer::begin_turn_with_round(
                 Some(session),
-                reservation.reserved_turn,
+                source.turn,
                 7,
             ),
         );
-        let original_turn_started_at = state.turn_event_buffer.as_ref().unwrap().turn_started_at();
-        state.canonical_turn_started_at = std::sync::OnceLock::from(original_turn_started_at);
         state.initialize_provider_canonical_wal_base(&[]);
         state.message = "subsequent steering guidance".into();
         state.messages = vec![
@@ -25435,8 +24734,7 @@ mod tests {
                 wake
             },
             engine.clone(),
-            reservation.clone(),
-            "\n  inspect result\t\n".into(),
+            source.clone(),
         );
         let heavy =
             crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
@@ -25447,7 +24745,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        coordinator.release_writer(&lease).await.unwrap();
         let first_claim = store
             .claim_recoverable_active_runs(1)
             .await
@@ -25475,8 +24772,7 @@ mod tests {
             .await
             .unwrap();
             let slot: Option<String> = sqlx::query_scalar(
-                "SELECT run_id FROM agent_session_execution_slots
-                 WHERE user_id = ? AND session_id = ?",
+                "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&user)
             .bind(session)
@@ -25491,10 +24787,9 @@ mod tests {
             run_id,
             expected_owner_generation: generation,
             checkpoint_id: &checkpoint.checkpoint_id,
-            source: &reservation,
-            actor: &actor,
+            source: &source,
+            opening_hash,
             owner_pod_id: owner,
-            ttl: Duration::from_secs(60),
         };
         // Rejection must preserve durable custody and canonical turn authority.
         sqlx::query("UPDATE agent_runs SET owner_pod_id = 'live-owner', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
@@ -25590,6 +24885,15 @@ mod tests {
         sqlx::query("UPDATE agent_run_events SET payload_json = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
             .bind(tail).bind(&user).bind(run_id).bind(tail_index).execute(pool.get()).await.unwrap();
         for generation in 2..=4 {
+            let admission_view = store
+                .load_run_admission(&user, run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let reauthorized =
+                astra_services::AuthService::reauthorize_execution_handoff(&auth, &admission_view)
+                    .await
+                    .expect("fresh original-session authorization must precede Run activation");
             let (first, second) = tokio::join!(
                 coordinator
                     .resume_execution_turn(resume_request(generation - 1, "replay-test-owner-a")),
@@ -25625,19 +24929,11 @@ mod tests {
                 // A committed custody proof is not permission to dispatch an
                 // incomplete runtime checkpoint. Test missing and explicit-null
                 // original inputs through the actual adoption boundary.
-                for (field, missing) in [
-                    ("canonical_turn_started_at", true),
-                    ("canonical_turn_started_at", false),
-                    ("original_user_message", true),
-                    ("original_user_message", false),
-                ] {
+                for missing in [true, false] {
+                    let field = "edge_profile";
                     let mut malformed: Value =
                         serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
-                    let facts = if field == "original_user_message" {
-                        &mut malformed["heavy"]
-                    } else {
-                        &mut malformed["heavy"]["original_facts"]
-                    };
+                    let facts = &mut malformed["heavy"];
                     if missing {
                         facts.as_object_mut().unwrap().remove(field);
                     } else {
@@ -25679,17 +24975,23 @@ mod tests {
                     aliases: Vec::new(),
                 }]
             );
-            assert_eq!(recovered.reservation, reservation);
-            assert_eq!(recovered.original_user_message, "\n  inspect result\t\n");
+            assert_eq!(recovered.context_authority, source);
+            assert_eq!(
+                adopted
+                    .run()
+                    .opening
+                    .as_ref()
+                    .unwrap()
+                    .input()
+                    .unwrap()
+                    .original_input,
+                "\n  inspect result\t\n"
+            );
             assert_eq!(
                 recovered.original_facts.message,
                 "subsequent steering guidance"
             );
             assert_eq!(recovered.journal_next_round, Some(7));
-            assert_eq!(
-                recovered.original_facts.canonical_turn_started_at,
-                Some(original_turn_started_at)
-            );
             assert_eq!(
                 adopted.checkpoint().checkpoint_json.as_str(),
                 checkpoint.checkpoint_json.as_str()
@@ -25702,11 +25004,11 @@ mod tests {
                     .unwrap(),
                 checkpoint
             );
-            assert!(adopted.receipt().writer_lease.writer_epoch > lease.writer_epoch);
-            let reauthorized =
-                astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                    .await
-                    .expect("the live original session may reauthorize the adopted proof");
+            assert_eq!(
+                adopted.receipt().authority.writer_epoch,
+                source.writer_epoch
+            );
+            assert_eq!(adopted.receipt().authority.generation, generation);
             assert_eq!(reauthorized.user.user_id, user);
             assert_eq!(
                 reauthorized.session_id.as_deref(),
@@ -25722,12 +25024,12 @@ mod tests {
                     .execute(pool.get())
                     .await
                     .unwrap();
-                let (status, _) =
-                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                        .await
-                        .expect_err(
-                            "a changed provider origin cannot downgrade to local authority",
-                        );
+                let (status, _) = astra_services::AuthService::reauthorize_execution_handoff(
+                    &auth,
+                    &admission_view,
+                )
+                .await
+                .expect_err("a changed provider origin cannot downgrade to local authority");
                 assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
                 sqlx::query("DELETE FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = 'memoria:changed-origin'")
                     .bind(&user)
@@ -25739,10 +25041,12 @@ mod tests {
                     .execute(pool.get())
                     .await
                     .unwrap();
-                let (status, _) =
-                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                        .await
-                        .expect_err("an inactive account cannot continue an adopted run");
+                let (status, _) = astra_services::AuthService::reauthorize_execution_handoff(
+                    &auth,
+                    &admission_view,
+                )
+                .await
+                .expect_err("an inactive account cannot continue an adopted run");
                 assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
                 sqlx::query("UPDATE auth_users SET is_active = 1 WHERE user_id = ?")
                     .bind(&user)
@@ -25784,16 +25088,14 @@ mod tests {
                     replacement_principal.session_id.as_deref(),
                     Some(auth_session_id.as_str())
                 );
-                let (status, _) =
-                    astra_services::AuthService::reauthorize_execution_handoff(&auth, &adopted)
-                        .await
-                        .expect_err("a new login must not replace the revoked original session");
+                let (status, _) = astra_services::AuthService::reauthorize_execution_handoff(
+                    &auth,
+                    &admission_view,
+                )
+                .await
+                .expect_err("a new login must not replace the revoked original session");
                 assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
             }
-            coordinator
-                .release_writer(&adopted.receipt().writer_lease)
-                .await
-                .unwrap();
             if generation < 4 {
                 assert!(
                     engine
@@ -25944,22 +25246,21 @@ mod tests {
                     &[],
                 );
             }
-            let reservation = astra_turn_types::TurnReservationV1 {
-                schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
-                reservation_id: "handoff-reservation".into(),
+            let authority = astra_services::session_context_coordinator::RunContextAuthority {
                 key: astra_turn_types::SessionKeyV1::owner_session(
-                    "test",
+                    "server",
                     "handoff-user",
                     "handoff-session",
                     "main",
                 ),
-                lease_id: "handoff-lease".into(),
-                writer_epoch: 1,
-                expected_cursor: None,
-                reserved_turn: 1,
-                created_at_unix_ms: 0,
-                expires_at_unix_ms: 1,
-                idempotency_key: "handoff-reservation".into(),
+                run_id: "handoff-run".into(),
+                generation: 0,
+                row_exists: false,
+                base_head: None,
+                turn: 1,
+                writer_epoch: 0,
+                authority_epochs: Default::default(),
+                binding: astra_services::session_context_coordinator::RunContextBinding::Absent,
             };
             host.bind_execution_handoff(
                 {
@@ -25968,8 +25269,7 @@ mod tests {
                     wake
                 },
                 engine.clone(),
-                reservation.clone(),
-                state.message.clone(),
+                authority.clone(),
             );
             let heavy =
                 crate::turn::agentic_loop::finalization::build_current_heavy_checkpoint(&mut state)
@@ -29769,400 +29069,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct ServerOnlyPromptMemory {
-        calls: std::sync::atomic::AtomicUsize,
-        authority_calls: std::sync::atomic::AtomicUsize,
-        denied: std::sync::atomic::AtomicBool,
-        admission_failed: std::sync::atomic::AtomicBool,
-        admission_stalled: std::sync::atomic::AtomicBool,
-        revision: std::sync::atomic::AtomicUsize,
-        scopes: std::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::turn::cloud::memoria_compact::MemoriaPort for ServerOnlyPromptMemory {
-        async fn admits_operation(&self, write: bool) -> Result<bool, String> {
-            assert!(write, "read admission belongs to the operation");
-            if self.admission_stalled.load(Ordering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
-            if self.admission_failed.load(Ordering::SeqCst) {
-                return Err("test authority unavailable".into());
-            }
-            Ok(!self.denied.load(Ordering::SeqCst))
-        }
-
-        async fn retrieve_for_prompt(
-            &self,
-            _query: &str,
-            user_id: &str,
-            session_id: &str,
-            _top_k: usize,
-        ) -> Result<
-            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
-            astra_memoria::MemoriaOperationError,
-        > {
-            self.authority_calls.fetch_add(1, Ordering::SeqCst);
-            if self.admission_stalled.load(Ordering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
-            if self.admission_failed.load(Ordering::SeqCst) {
-                return Err(astra_memoria::MemoriaOperationError::AuthorityUnavailable(
-                    "test authority unavailable".into(),
-                ));
-            }
-            if self.denied.load(Ordering::SeqCst) {
-                return Err(astra_memoria::MemoriaOperationError::Disabled(
-                    "disabled".into(),
-                ));
-            }
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.scopes
-                .lock()
-                .expect("scopes")
-                .push((user_id.to_string(), session_id.to_string()));
-            Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
-                memory_id: format!("server-memory-{}", self.revision.load(Ordering::SeqCst) + 1),
-                content: astra_prompts::memory_proto::MemoryEntry::new(
-                    astra_prompts::memory_proto::NS_KNOWLEDGE,
-                    astra_prompts::memory_proto::ST_ACTIVE,
-                    "Server-only recall uses the same typed dynamic memory lane",
-                )
-                .encode(),
-                memory_type: "semantic".into(),
-                retrieval_score: Some(0.9),
-                ..Default::default()
-            }])
-        }
-
-        async fn retrieve_ext(
-            &self,
-            _query: &str,
-            _session_id: Option<&str>,
-            _top_k: usize,
-            _filter_session: bool,
-        ) -> Result<
-            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
-            astra_memoria::MemoriaOperationError,
-        > {
-            panic!("server prompt recall must use retrieve_for_prompt")
-        }
-
-        async fn store(
-            &self,
-            _content: &str,
-            _memory_type: &str,
-            _session_id: Option<&str>,
-            _trust_tier: Option<&str>,
-        ) -> Result<String, String> {
-            Ok(String::new())
-        }
-
-        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
-            Ok(0)
-        }
-    }
-
-    struct CoordinatedMemoryReads {
-        started: std::sync::atomic::AtomicUsize,
-        prompt_calls: std::sync::atomic::AtomicUsize,
-        session_calls: std::sync::atomic::AtomicUsize,
-        started_changed: tokio::sync::Notify,
-        release: tokio::sync::Semaphore,
-    }
-
-    impl Default for CoordinatedMemoryReads {
-        fn default() -> Self {
-            Self {
-                started: std::sync::atomic::AtomicUsize::new(0),
-                prompt_calls: std::sync::atomic::AtomicUsize::new(0),
-                session_calls: std::sync::atomic::AtomicUsize::new(0),
-                started_changed: tokio::sync::Notify::new(),
-                release: tokio::sync::Semaphore::new(0),
-            }
-        }
-    }
-
-    impl CoordinatedMemoryReads {
-        async fn wait_for_release(&self) {
-            self.started.fetch_add(1, Ordering::SeqCst);
-            self.started_changed.notify_waiters();
-            self.release
-                .acquire()
-                .await
-                .expect("test semaphore remains open")
-                .forget();
-        }
-
-        async fn wait_until_started(&self, expected: usize) {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    let changed = self.started_changed.notified();
-                    if self.started.load(Ordering::SeqCst) >= expected {
-                        break;
-                    }
-                    changed.await;
-                }
-            })
-            .await
-            .expect("independent memory reads should start concurrently");
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::turn::cloud::memoria_compact::MemoriaPort for CoordinatedMemoryReads {
-        async fn retrieve_for_prompt(
-            &self,
-            _query: &str,
-            _user_id: &str,
-            session_id: &str,
-            _top_k: usize,
-        ) -> Result<
-            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
-            astra_memoria::MemoriaOperationError,
-        > {
-            self.prompt_calls.fetch_add(1, Ordering::SeqCst);
-            self.wait_for_release().await;
-            Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
-                memory_id: "parallel-recall".into(),
-                content: astra_prompts::memory_proto::MemoryEntry::new(
-                    astra_prompts::memory_proto::NS_KNOWLEDGE,
-                    astra_prompts::memory_proto::ST_ACTIVE,
-                    "Independent memory inputs are prepared concurrently",
-                )
-                .encode(),
-                memory_type: "semantic".into(),
-                retrieval_score: Some(0.9),
-                session_id: Some(session_id.to_string()),
-                ..Default::default()
-            }])
-        }
-
-        async fn retrieve_ext(
-            &self,
-            _query: &str,
-            _session_id: Option<&str>,
-            _top_k: usize,
-            _filter_session: bool,
-        ) -> Result<
-            Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>,
-            astra_memoria::MemoriaOperationError,
-        > {
-            self.session_calls.fetch_add(1, Ordering::SeqCst);
-            self.wait_for_release().await;
-            Ok(Vec::new())
-        }
-
-        async fn store(
-            &self,
-            _content: &str,
-            _memory_type: &str,
-            _session_id: Option<&str>,
-            _trust_tier: Option<&str>,
-        ) -> Result<String, String> {
-            Ok(String::new())
-        }
-
-        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
-            Ok(0)
-        }
-    }
-
-    #[tokio::test]
-    async fn server_only_prompt_recall_reauthorizes_each_request_without_hiding_candidates() {
-        let provider = Arc::new(ServerOnlyPromptMemory::default());
-        let mut host = test_host_builder("server-user", "server-session")
-            .with_memoria_client(Some(
-                Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
-            ))
-            .build();
-        assert!(host.edge_profile.is_empty());
-
-        let first = host
-            .prompt_memory_entries_for_turn(2, "review astra memory #42")
-            .await;
-        let same_turn = host
-            .prompt_memory_entries_for_turn(2, "review astra memory #42")
-            .await;
-        assert_eq!(first.entries, same_turn.entries);
-        assert_eq!(
-            first.outcome,
-            astra_turn_types::MemoryRetrievalOutcome::Complete
-        );
-        assert_eq!(first.entries.len(), 1);
-        assert_eq!(
-            first.entries[0].memory_id.as_deref(),
-            Some("server-memory-1")
-        );
-        assert_eq!(
-            provider.calls.load(Ordering::SeqCst),
-            2,
-            "each provider request retrieves under current authority"
-        );
-
-        let next_turn = host
-            .prompt_memory_entries_for_turn(3, "review astra memory #42")
-            .await;
-        assert_eq!(next_turn.entries.len(), 1);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
-        assert!(
-            provider
-                .scopes
-                .lock()
-                .expect("scopes")
-                .iter()
-                .all(|(user, session)| user == "server-user" && session == "server-session")
-        );
-    }
-
-    #[tokio::test]
-    async fn prompt_recall_cache_does_not_republish_after_consent_revocation() {
-        let provider = Arc::new(ServerOnlyPromptMemory::default());
-        let mut host = test_host_builder("revocation-user", "revocation-session")
-            .with_memoria_client(Some(
-                Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
-            ))
-            .build();
-
-        let first = host.prompt_memory_entries_for_turn(2, "same request").await;
-        assert_eq!(first.entries.len(), 1);
-        provider.denied.store(true, Ordering::SeqCst);
-
-        let revoked = host.prompt_memory_entries_for_turn(2, "same request").await;
-        assert!(
-            revoked.entries.is_empty(),
-            "a matching turn and query must not authorize replay of revoked memory"
-        );
-        assert_eq!(
-            revoked.outcome,
-            astra_turn_types::MemoryRetrievalOutcome::NotAttempted
-        );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-
-        provider.revision.store(1, Ordering::SeqCst);
-        assert_eq!(provider.authority_calls.load(Ordering::SeqCst), 2);
-        provider.denied.store(false, Ordering::SeqCst);
-        let reconnected = host.prompt_memory_entries_for_turn(2, "same request").await;
-        assert_eq!(reconnected.entries.len(), 1);
-        assert_eq!(
-            reconnected.entries[0].memory_id.as_deref(),
-            Some("server-memory-2"),
-            "reconnection must retrieve current candidates, not restore the old snapshot"
-        );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn prompt_recall_authority_failure_never_restores_previous_candidates() {
-        for stalled in [false, true] {
-            let provider = Arc::new(ServerOnlyPromptMemory::default());
-            let mut host = test_host_builder("failure-user", "failure-session")
-                .with_memoria_client(Some(Arc::clone(&provider)
-                    as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>))
-                .build();
-            let first = host.prompt_memory_entries_for_turn(2, "same request").await;
-            assert_eq!(first.entries.len(), 1);
-            provider.admission_failed.store(!stalled, Ordering::SeqCst);
-            provider.admission_stalled.store(stalled, Ordering::SeqCst);
-
-            let unavailable = tokio::time::timeout(
-                Duration::from_secs(2),
-                host.prompt_memory_entries_for_turn(2, "same request"),
-            )
-            .await
-            .expect("authorization remains inside the bounded recall deadline");
-            assert!(unavailable.entries.is_empty());
-            assert_eq!(
-                unavailable.outcome,
-                astra_turn_types::MemoryRetrievalOutcome::Unavailable
-            );
-            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(provider.authority_calls.load(Ordering::SeqCst), 2);
-        }
-    }
-
-    #[tokio::test]
-    async fn prompt_recall_and_session_memory_are_prepared_concurrently() {
-        let provider = Arc::new(CoordinatedMemoryReads::default());
-        let host = test_host_builder("parallel-user", "parallel-session")
-            .with_memoria_client(Some(
-                Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
-            ))
-            .build();
-
-        let task = tokio::spawn(async move {
-            let mut host = host;
-            let context = host
-                .memory_context_for_turn(2, "review astra memory #42", None)
-                .await;
-            (host, context)
-        });
-
-        // The prompt path issues one full-message semantic query. The session
-        // snapshot is a second, independent query. Seeing both blocked at the
-        // same release boundary proves neither lane waits for the other; the
-        // removed ASCII keyword-query lane must not return as hidden load.
-        provider.wait_until_started(2).await;
-        assert_eq!(provider.prompt_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.session_calls.load(Ordering::SeqCst), 1);
-        provider.release.add_permits(2);
-
-        let (_host, (prompt_recall, session_entry)) = task.await.expect("memory context task");
-        assert_eq!(prompt_recall.entries.len(), 1);
-        assert_eq!(
-            prompt_recall.outcome,
-            astra_turn_types::MemoryRetrievalOutcome::Complete
-        );
-        assert_eq!(
-            prompt_recall.entries[0].memory_id.as_deref(),
-            Some("parallel-recall")
-        );
-        assert!(session_entry.is_none());
-    }
-
-    #[test]
-    fn server_prompt_recall_projects_typed_outcome_and_backend_identity() {
-        let mut state = create_test_state();
-        state.telemetry.turn_trace_collector =
-            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
-                "turn-memory-trace",
-                "session-memory-trace",
-            ));
-        let recall = PromptMemoryRecall {
-            entries: vec![
-                astra_turn_core::context_sources::MemoryEntry::scored(
-                    "typed memory evidence",
-                    0.91,
-                )
-                .with_memory_identity("backend-memory-42", "semantic")
-                .with_source("memoria.prefetch"),
-            ],
-            outcome: astra_turn_types::MemoryRetrievalOutcome::Partial,
-            fetch_ms: 37,
-        };
-
-        ServerAgenticLoopHost::record_prompt_memory_trace(&state, &recall);
-
-        let trace = state
-            .telemetry
-            .turn_trace_collector
-            .as_ref()
-            .expect("collector")
-            .finalize();
-        assert_eq!(
-            trace.memory.outcome,
-            astra_turn_types::MemoryRetrievalOutcome::Partial
-        );
-        assert_eq!(trace.memory.retrieval_latency_ms, 37);
-        assert_eq!(trace.memory.query, "prompt_memory_recall");
-        assert_eq!(trace.memory.memories_selected.len(), 1);
-        assert_eq!(
-            trace.memory.memories_selected[0].memory_id,
-            "backend-memory-42"
-        );
-    }
-
     fn test_dispatch_identity(
         user_id: &str,
         session_id: &str,
@@ -33648,56 +32554,6 @@ mod tests {
     }
 
     #[test]
-    fn model_request_topology_follows_the_authoritative_execution_binding() {
-        let server = test_host_builder("u-server-topology", "s-server-topology")
-            .with_execution_binding_snapshot(
-                crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
-                    crate::server::tool_transport::WorkspaceBinding::server_sandbox(
-                        "/tmp/astra-server-topology",
-                    ),
-                    crate::server::tool_transport::ExecutorBinding::server_local(),
-                ),
-            )
-            .build();
-        assert_eq!(
-            server.model_request_topology(),
-            astra_services::ModelRequestTopology::ServerOnly
-        );
-        let server_context = server.model_request_context_seed(None);
-        assert_eq!(server_context.topology, server.model_request_topology());
-        assert_eq!(server_context.interaction_owner, "server");
-        assert_eq!(server_context.loop_owner, "server");
-
-        let edge = test_host_builder("u-edge-topology", "s-edge-topology")
-            .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
-            .build();
-        assert_eq!(
-            edge.model_request_topology(),
-            astra_services::ModelRequestTopology::CliServer
-        );
-        let cli_context = edge.model_request_context_seed(None);
-        assert_eq!(cli_context.topology, edge.model_request_topology());
-        assert_eq!(cli_context.interaction_owner, "cli");
-        assert_eq!(cli_context.loop_owner, "server");
-
-        let external_edge =
-            test_host_builder("u-external-edge-topology", "s-external-edge-topology")
-                .with_execution_binding_snapshot(edge_runtime_snapshot())
-                .build();
-        assert_eq!(
-            external_edge.model_request_topology(),
-            astra_services::ModelRequestTopology::EdgeServer
-        );
-        let edge_context = external_edge.model_request_context_seed(None);
-        assert_eq!(
-            edge_context.topology,
-            external_edge.model_request_topology()
-        );
-        assert_eq!(edge_context.interaction_owner, "edge");
-        assert_eq!(edge_context.loop_owner, "server");
-    }
-
-    #[test]
     fn connected_cli_and_inherited_child_share_an_executable_workspace_surface() {
         let root = test_host_builder("u-cli-root", "s-cli-root")
             .with_edge_tools(sample_edge_tools())
@@ -34681,8 +33537,8 @@ mod tests {
             .with_server_service_tool_catalog_enabled(false)
             .with_static_tool_catalog_admissible(false)
             .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
-            .with_test_inference_ledger(
-                crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
             )
             .with_admitted_model_execution(Some(AdmittedModelExecution::from_endpoint(
                 "source-offer".into(),
@@ -34827,29 +33683,36 @@ mod tests {
                         .any(|message| message.to_string().contains("account-read-complete"))
                 );
             }
-            let identities = state
+            let records = state
                 .stall
                 .tool_call_records
                 .iter()
-                .filter_map(|record| record.invocation_identity.as_ref())
+                .filter(|record| record.invocation_identity.is_some())
                 .collect::<Vec<_>>();
-            assert_eq!(identities.len(), if skill { 1 } else { 3 });
-            for identity in identities {
+            assert_eq!(records.len(), if skill { 1 } else { 3 });
+            for call in records {
+                let identity = call.invocation_identity.as_ref().unwrap();
                 assert_eq!(identity.user_id, fixture.scope.user_id);
                 assert_eq!(identity.session_id, fixture.scope.session_id);
                 assert_eq!(identity.run_id, fixture.scope.run_id);
                 assert_eq!(identity.turn_chain_id, "source-turn");
-                let record = ledger
-                    .get(identity)
-                    .await
-                    .unwrap()
-                    .expect("canonical invocation receipt");
-                assert_eq!(
-                    record.state,
-                    astra_turn_types::ToolInvocationState::Succeeded,
-                    "{record:?}"
-                );
-                assert_eq!(record.attempt_count, 1);
+                let receipt = ledger.get(identity).await.unwrap();
+                if call.name == "tool_search" {
+                    assert!(receipt.is_none(), "discovery has no durable effect receipt");
+                    assert!(call.execution_completion.is_none());
+                    assert_eq!(
+                        call.work_attribution,
+                        Some(astra_services::runs::WorkInvocationAttribution::Control)
+                    );
+                } else {
+                    let record = receipt.expect("canonical effect invocation receipt");
+                    assert_eq!(
+                        record.state,
+                        astra_turn_types::ToolInvocationState::Succeeded,
+                        "{record:?}"
+                    );
+                    assert_eq!(record.attempt_count, 1);
+                }
             }
             if !skill {
                 let activation = state
@@ -36746,195 +35609,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_admission_matches_staged_authority_through_the_wire_projection() {
-        let mut state = create_test_state();
-        state.messages = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_canonical_cursor = state.messages.len();
-        let settlement =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "synthesize the completed work",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::FinalWorkSynthesis,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        state
-            .extend_append_only_runtime_messages([settlement])
-            .expect("wire assembly stages typed canonical authority");
-
-        let capability = append_only_test_cache_capability();
-        let mut attempt_messages =
-            crate::turn::llm::client::consolidate_system_messages_for_provider(
-                &state.messages,
-                "openai",
-                Some(capability),
-            );
-        let dispatch_budget =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "finish before the admitted deadline",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        attempt_messages.push(dispatch_budget.clone());
-
-        let mut canonical_appended = state.messages[durable_canonical_cursor..].to_vec();
-        canonical_appended.push(dispatch_budget);
-        assert!(!attempt_messages.ends_with(&canonical_appended));
-        assert!(
-            crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
-                &attempt_messages,
-                &canonical_appended,
-                0,
-            )
-        );
-    }
-
-    #[test]
-    fn provider_wal_planner_persists_only_the_delta_after_its_atomic_head() {
-        let durable = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = |text| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority("first")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-        let mut predecessor = durable;
-        predecessor.extend(first.transition.appended_messages.iter().cloned());
-        let provider_response = json!({"role": "assistant", "content": "intermediate"});
-        predecessor.push(provider_response.clone());
-
-        let second = plan_provider_canonical_wal_transition(
-            &durable_base,
-            Some(&first.head),
-            &predecessor,
-            vec![authority("second")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-
-        assert_eq!(
-            second.transition.recovery_mode,
-            astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
-        );
-        assert_eq!(second.transition.recovery_messages, vec![provider_response]);
-        assert_eq!(second.head.chain_length, 2);
-        assert_eq!(second.head.result, second.transition.result);
-    }
-
-    #[test]
-    fn provider_wal_planner_rolls_up_before_the_hard_entry_limit() {
-        let durable = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = |text| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority("first")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-        let mut predecessor = durable.clone();
-        predecessor.extend(first.transition.appended_messages.iter().cloned());
-        predecessor.push(json!({"role": "assistant", "content": "intermediate"}));
-
-        let checkpoint = plan_provider_canonical_wal_transition(
-            &durable_base,
-            Some(&first.head),
-            &predecessor,
-            vec![authority("second")],
-            None,
-            ProviderCanonicalWalLimits {
-                max_entries: 1,
-                max_bytes: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            checkpoint.transition.recovery_mode,
-            astra_turn_types::ProviderCanonicalRecoveryModeV2::CheckpointFromParent
-        );
-        assert_eq!(checkpoint.head.chain_length, 1);
-        assert_eq!(
-            checkpoint.transition.replacement_compaction_generation,
-            None
-        );
-
-        let mut recovered = durable;
-        astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(
-            std::slice::from_ref(&checkpoint.transition),
-            &mut recovered,
-        )
-        .unwrap();
-        predecessor.extend(checkpoint.transition.appended_messages.iter().cloned());
-        assert_eq!(recovered, predecessor);
-    }
-
-    #[test]
-    fn provider_wal_planner_rejects_history_shorter_than_its_durable_head() {
-        let durable = vec![json!({"role": "user", "content": "do the work"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-            "first",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-        )
-        .unwrap()
-        .unwrap();
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-
-        assert_eq!(
-            plan_provider_canonical_wal_transition(
-                &durable_base,
-                Some(&first.head),
-                &[],
-                Vec::new(),
-                None,
-                ProviderCanonicalWalLimits::PRODUCTION,
-            )
-            .unwrap_err(),
-            astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor
-        );
-    }
-
-    #[test]
-    fn provider_wal_planner_binds_rewrite_authority_to_the_exact_durable_snapshot() {
+    fn handoff_continuation_binds_rewrite_authority_to_the_exact_durable_snapshot() {
         let base_secret = "hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
         let suffix_secret = "hf_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
         let durable = vec![json!({
@@ -36962,31 +35637,21 @@ mod tests {
             .provider_wal_replacement_authorization(&durable_base, &rewritten)
             .expect("the admitted rewrite has exact replacement authority");
 
-        let plan = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &rewritten,
-            Vec::new(),
-            Some(&authorization),
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
+        let plan =
+            build_handoff_continuation(&durable_base, &rewritten, Some(&authorization)).unwrap();
         assert_eq!(
-            plan.transition.recovery_mode,
+            plan.recovery_mode,
             astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
         );
-        assert_eq!(
-            plan.transition.predecessor,
-            authorization.durable_predecessor
-        );
+        assert_eq!(plan.predecessor, authorization.durable_predecessor);
         assert!(
-            serde_json::to_string(&plan.transition.recovery_messages)
+            serde_json::to_string(&plan.recovery_messages)
                 .unwrap()
                 .contains(base_secret),
             "an already-persisted WAL base must remain byte-identical"
         );
         assert!(
-            !serde_json::to_string(&plan.transition.recovery_messages)
+            !serde_json::to_string(&plan.recovery_messages)
                 .unwrap()
                 .contains(suffix_secret),
             "the not-yet-persisted suffix must be sanitized"
@@ -36996,256 +35661,8 @@ mod tests {
         tampered.durable_predecessor =
             astra_turn_types::ProviderCanonicalHistoryIdentityV2::empty();
         assert_eq!(
-            plan_provider_canonical_wal_transition(
-                &durable_base,
-                None,
-                &rewritten,
-                Vec::new(),
-                Some(&tampered),
-                ProviderCanonicalWalLimits::PRODUCTION,
-            )
-            .unwrap_err(),
+            build_handoff_continuation(&durable_base, &rewritten, Some(&tampered)).unwrap_err(),
             astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch
-        );
-    }
-
-    #[test]
-    fn crash_hydration_preserves_the_openai_cache_visible_prompt() {
-        let durable = vec![
-            json!({"role": "system", "content": "stable enterprise policy"}),
-            json!({"role": "user", "content": "do the work"}),
-        ];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let authority = |text| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let first = plan_provider_canonical_wal_transition(
-            &durable_base,
-            None,
-            &durable,
-            vec![authority("first")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-        let mut uninterrupted = durable.clone();
-        uninterrupted.extend(first.transition.appended_messages.iter().cloned());
-        uninterrupted.push(json!({"role": "assistant", "content": "intermediate"}));
-        let second = plan_provider_canonical_wal_transition(
-            &durable_base,
-            Some(&first.head),
-            &uninterrupted,
-            vec![authority("second")],
-            None,
-            ProviderCanonicalWalLimits::PRODUCTION,
-        )
-        .unwrap();
-        uninterrupted.extend(second.transition.appended_messages.iter().cloned());
-        let fresh = json!({"role": "user", "content": "fresh follow-up"});
-        uninterrupted.push(fresh.clone());
-
-        let mut recovered = durable;
-        recovered.push(fresh);
-        hydrate_provider_canonical_transition_receipts(
-            &mut recovered,
-            &durable_base,
-            vec![astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 1,
-                logical_attempt: 0,
-                physical_attempt: 0,
-                transitions: vec![first.transition, second.transition],
-            }],
-        )
-        .unwrap();
-
-        let capability = append_only_test_cache_capability();
-        let uninterrupted_wire = crate::turn::llm::client::consolidate_system_messages_for_provider(
-            &uninterrupted,
-            "openai",
-            Some(capability),
-        );
-        let recovered_wire = crate::turn::llm::client::consolidate_system_messages_for_provider(
-            &recovered,
-            "openai",
-            Some(capability),
-        );
-        assert_eq!(recovered, uninterrupted);
-        assert_eq!(recovered_wire, uninterrupted_wire);
-        assert!(
-            !serde_json::to_string(&recovered_wire)
-                .unwrap()
-                .contains("cache_control")
-        );
-    }
-
-    #[test]
-    fn provider_transition_wal_hydrates_ordered_pairs_once_before_fresh_user_suffix() {
-        let durable_head = vec![
-            json!({"role": "user", "content": "older request"}),
-            json!({"role": "assistant", "content": "older answer"}),
-        ];
-        let mut base = durable_head.clone();
-        base.push(json!({"role": "user", "content": "do the work"}));
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
-        let first_authority =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                "opaque first authority",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap();
-        let first = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-            None,
-            durable_base.clone(),
-            &base,
-            vec![first_authority.clone()],
-        )
-        .unwrap();
-        let mut after_first = base.clone();
-        after_first.push(first_authority.clone());
-        let first_provider_response =
-            json!({"role": "assistant", "content": "first provider response"});
-        after_first.push(first_provider_response.clone());
-        let assistant = json!({"role": "assistant", "content": "partial result"});
-        let retry_authority =
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                output_cap_continuation_prompt(),
-                crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
-                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-            )
-            .unwrap()
-            .unwrap();
-        let second = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
-            first.transition_id.clone(),
-            first.result.clone(),
-            durable_base.clone(),
-            vec![first_provider_response.clone()],
-            vec![assistant.clone(), retry_authority.clone()],
-        )
-        .unwrap();
-        let receipt =
-            |physical_attempt, transitions| astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 0,
-                logical_attempt: 0,
-                physical_attempt,
-                transitions,
-            };
-        let fresh_user = json!({"role": "user", "content": "fresh follow-up"});
-        let mut restored = durable_head;
-        restored.push(fresh_user.clone());
-        let outcome = hydrate_provider_canonical_transition_receipts(
-            &mut restored,
-            &durable_base,
-            vec![receipt(1, vec![first, second.clone()])],
-        )
-        .unwrap();
-
-        assert_eq!(outcome.reconciled_transitions, 2);
-        assert_eq!(
-            outcome
-                .head
-                .as_ref()
-                .map(|head| head.transition_id.as_str()),
-            Some(second.transition_id.as_str())
-        );
-        assert_eq!(restored[2], base[2]);
-        assert_eq!(restored[3], first_authority);
-        assert_eq!(restored[4], first_provider_response);
-        assert_eq!(restored[5], assistant);
-        assert_eq!(restored[6], retry_authority);
-        assert_eq!(restored[7], fresh_user);
-    }
-
-    #[test]
-    fn provider_transition_wal_uses_the_durable_boundary_for_repeated_fresh_input() {
-        let durable_head = vec![json!({"role": "assistant", "content": "ready"})];
-        let repeated = json!({"role": "user", "content": "continue"});
-        let mut predecessor = durable_head.clone();
-        predecessor.push(repeated.clone());
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
-        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-            "continue safely",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-        )
-        .unwrap()
-        .unwrap();
-        let transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-            None,
-            durable_base.clone(),
-            &predecessor,
-            vec![authority.clone()],
-        )
-        .unwrap();
-        let mut restored = durable_head;
-        restored.push(repeated.clone());
-        hydrate_provider_canonical_transition_receipts(
-            &mut restored,
-            &durable_base,
-            vec![astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 0,
-                logical_attempt: 0,
-                physical_attempt: 0,
-                transitions: vec![transition],
-            }],
-        )
-        .unwrap();
-
-        assert_eq!(restored[1], repeated);
-        assert_eq!(restored[2], authority);
-        assert_eq!(restored[3], repeated);
-    }
-
-    #[test]
-    fn provider_transition_wal_recovers_a_request_with_zero_runtime_frames() {
-        let durable_head = vec![json!({"role": "assistant", "content": "ready"})];
-        let old_user = json!({"role": "user", "content": "old request"});
-        let mut predecessor = durable_head.clone();
-        predecessor.push(old_user.clone());
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
-        let transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-            None,
-            durable_base.clone(),
-            &predecessor,
-            Vec::new(),
-        )
-        .unwrap();
-        let fresh = json!({"role": "user", "content": "hi"});
-        let mut restored = durable_head;
-        restored.push(fresh.clone());
-        hydrate_provider_canonical_transition_receipts(
-            &mut restored,
-            &durable_base,
-            vec![astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 0,
-                logical_attempt: 0,
-                physical_attempt: 0,
-                transitions: vec![transition],
-            }],
-        )
-        .unwrap();
-        assert_eq!(
-            restored,
-            vec![
-                json!({"role": "assistant", "content": "ready"}),
-                old_user,
-                fresh
-            ]
         );
     }
 
@@ -37276,227 +35693,6 @@ mod tests {
         assert_eq!(durable[0], durable_head[0]);
         assert!(serde_json::to_string(&snapshot).unwrap().contains(secret));
         assert!(!serde_json::to_string(&durable).unwrap().contains(secret));
-    }
-
-    #[test]
-    fn provider_transition_wal_collapses_post_compaction_and_second_rewrite_lineage() {
-        let durable_head = vec![
-            json!({"role": "user", "content": "old goal"}),
-            json!({"role": "assistant", "content": "old answer"}),
-        ];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
-        let authority = |text, kind| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                kind,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let old_user = json!({"role": "user", "content": "work"});
-        let mut pre_rewrite = durable_head.clone();
-        pre_rewrite.push(old_user);
-        let first_authority = authority(
-            "first",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-        );
-        let append = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-            None,
-            durable_base.clone(),
-            &pre_rewrite,
-            vec![first_authority.clone()],
-        )
-        .unwrap();
-        let summary = json!({"role": "system", "content": "summary one"});
-        let second_authority = authority(
-            "second",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
-        );
-        let first_replacement =
-            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                Some(append.transition_id.clone()),
-                durable_base.clone(),
-                1,
-                std::slice::from_ref(&summary),
-                vec![second_authority.clone()],
-            )
-            .unwrap();
-
-        let ordinary_response = json!({"role": "assistant", "content": "intermediate"});
-        let third_authority = authority(
-            "third",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::OutputCapContinuation,
-        );
-        let post_compaction_predecessor = vec![
-            summary.clone(),
-            second_authority.clone(),
-            ordinary_response.clone(),
-        ];
-        let ordinary_post_compaction =
-            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                Some(first_replacement.transition_id.clone()),
-                durable_base.clone(),
-                1,
-                &post_compaction_predecessor,
-                vec![third_authority.clone()],
-            )
-            .unwrap();
-
-        let summary_two = json!({"role": "system", "content": "summary two"});
-        let final_authority = authority(
-            "final",
-            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-        );
-        let second_replacement =
-            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                Some(ordinary_post_compaction.transition_id.clone()),
-                durable_base.clone(),
-                1,
-                std::slice::from_ref(&summary_two),
-                vec![final_authority.clone()],
-            )
-            .unwrap();
-        let receipt =
-            |physical_attempt, transitions| astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 0,
-                logical_attempt: 0,
-                physical_attempt,
-                transitions,
-            };
-
-        let fresh = json!({"role": "user", "content": "fresh"});
-        let mut after_one_rewrite = durable_head.clone();
-        after_one_rewrite.push(fresh.clone());
-        let one_rewrite = hydrate_provider_canonical_transition_receipts(
-            &mut after_one_rewrite,
-            &durable_base,
-            vec![receipt(2, vec![ordinary_post_compaction.clone()])],
-        )
-        .unwrap();
-        assert_eq!(one_rewrite.reconciled_transitions, 1);
-        assert_eq!(
-            one_rewrite.replacement,
-            Some(ordinary_post_compaction.clone())
-        );
-        assert_eq!(after_one_rewrite[0], summary);
-        assert_eq!(after_one_rewrite[1], second_authority);
-        assert_eq!(after_one_rewrite[2], ordinary_response);
-        assert_eq!(after_one_rewrite[3], third_authority);
-        assert_eq!(after_one_rewrite[4], fresh);
-
-        let mut after_second_rewrite = durable_head;
-        after_second_rewrite.push(fresh.clone());
-        let two_rewrites = hydrate_provider_canonical_transition_receipts(
-            &mut after_second_rewrite,
-            &durable_base,
-            vec![receipt(3, vec![second_replacement.clone()])],
-        )
-        .unwrap();
-        assert_eq!(two_rewrites.reconciled_transitions, 1);
-        assert_eq!(two_rewrites.replacement, Some(second_replacement));
-        assert_eq!(
-            after_second_rewrite,
-            vec![summary_two, final_authority, fresh]
-        );
-    }
-
-    #[test]
-    fn provider_transition_wal_rejects_a_forked_predecessor() {
-        let base = vec![json!({"role": "user", "content": "do the work"})];
-        let authority = |text, kind| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                kind,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let left = astra_turn_types::ProviderCanonicalTransitionV2::new(
-            None,
-            &base,
-            vec![authority(
-                "left",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-            )],
-        )
-        .unwrap();
-        let right = astra_turn_types::ProviderCanonicalTransitionV2::new(
-            None,
-            &base,
-            vec![authority(
-                "right",
-                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
-            )],
-        )
-        .unwrap();
-        let mut restored = base;
-        let before = restored.clone();
-        let error = apply_provider_canonical_transition_receipts(
-            &mut restored,
-            vec![astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 0,
-                logical_attempt: 0,
-                physical_attempt: 0,
-                transitions: vec![left, right],
-            }],
-        )
-        .unwrap_err();
-        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-        assert_eq!(restored, before);
-    }
-
-    #[test]
-    fn provider_transition_wal_rejects_disconnected_valid_branches_atomically() {
-        let base = vec![json!({"role": "assistant", "content": "ready"})];
-        let durable_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&base).unwrap();
-        let authority = |text| {
-            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
-                text,
-                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let mut left_predecessor = base.clone();
-        left_predecessor.push(json!({"role": "user", "content": "left"}));
-        let left = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-            None,
-            durable_base.clone(),
-            &left_predecessor,
-            vec![authority("left")],
-        )
-        .unwrap();
-        let mut right_predecessor = base.clone();
-        right_predecessor.push(json!({"role": "user", "content": "right"}));
-        let right = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-            None,
-            durable_base,
-            &right_predecessor,
-            vec![authority("right")],
-        )
-        .unwrap();
-        let mut restored = base;
-        let before = restored.clone();
-        let error = apply_provider_canonical_transition_receipts(
-            &mut restored,
-            vec![astra_services::InferenceCanonicalTransitionReceipt {
-                turn: 1,
-                round: 0,
-                logical_attempt: 0,
-                physical_attempt: 0,
-                transitions: vec![left, right],
-            }],
-        )
-        .unwrap_err();
-        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-        assert_eq!(restored, before);
     }
 
     #[test]
@@ -38845,16 +37041,13 @@ mod tests {
                                 &state.messages,
                             )
                             .unwrap();
-                        let plan = plan_provider_canonical_wal_transition(
+                        let plan = build_handoff_continuation(
                             durable_base,
-                            None,
                             &state.messages,
-                            Vec::new(),
                             Some(&authorization),
-                            ProviderCanonicalWalLimits::PRODUCTION,
                         )
                         .unwrap();
-                        assert!(plan.transition.replacement_compaction_generation.is_some());
+                        assert!(plan.replacement_compaction_generation.is_some());
                         assert!(result.boundary.is_some());
                         assert_eq!(state.last_request_message_count, Some(state.messages.len()));
                         assert!(
@@ -39091,143 +37284,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_compaction_without_rewrite_authority_preserves_provider_wal() {
+    async fn request_compaction_without_rewrite_authority_preserves_handoff_history() {
         for stale_proof in [false, true] {
-            for prior_wal in [true, false] {
-                let memory = Arc::new(CompactionMemoryFixture::default());
-                let mut host = test_host_builder("first-turn-owner", "first-turn-session")
-                    .with_memoria_client(Some(memory))
-                    .build();
-                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-                host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
-                    requests: requests.clone(),
-                }));
-                let mut state = create_test_state();
-                state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
-                // A first canonical admission can contain populated request
-                // history, without a previously persisted summary or head.
-                state.messages.remove(0);
-                state.messages[1]["content"] = json!(CONTINUITY_FACT);
-                let original = state.messages.clone();
-                let durable = if stale_proof {
-                    original[..2].to_vec()
-                } else {
-                    Vec::new()
-                };
-                state.initialize_provider_canonical_wal_base(&durable);
-                if stale_proof {
-                    let mut foreign = durable.clone();
-                    foreign[0]["content"] = json!("different admitted prefix");
-                    state.initialize_canonical_rewrite_proof(
-                        &foreign,
-                        &astra_turn_types::canonical_conversation_root(&foreign),
-                        0,
-                    );
-                    assert!(state.begin_canonical_rewrite().is_some());
-                } else {
-                    assert!(state.begin_canonical_rewrite().is_none());
-                    assert_eq!(
-                        state
-                            .provider_canonical_wal_base
-                            .as_ref()
-                            .unwrap()
-                            .canonical
-                            .message_count,
-                        0,
-                    );
-                }
-                let durable_base = state.provider_canonical_wal_base.clone().unwrap();
-                if prior_wal {
-                    // An earlier provider attempt has already admitted this
-                    // prefix during the first canonical turn. New history
-                    // follows it, before request preparation compacts again.
-                    let first = plan_provider_canonical_wal_transition(
-                        &durable_base,
-                        None,
-                        &original[..original.len() - 2],
-                        Vec::new(),
-                        None,
-                        ProviderCanonicalWalLimits::PRODUCTION,
-                    )
-                    .unwrap();
-                    state.provider_canonical_wal_head = Some(first.head);
-                }
-                let original_head = state.provider_canonical_wal_head.clone();
-                state.last_request_message_count = Some(original.len());
-                let config = compaction_reuse_config(true);
-                let result = host
-                    .compact_messages_via_memoria(
-                        &mut state,
-                        &original,
-                        &[],
-                        &[],
-                        CompactionTier::AggressivePrune,
-                        &config,
-                    )
-                    .await;
-
-                // This is the planner used by execute_turn before provider
-                // dispatch. Installing an unauthorized shorter history used
-                // to fail here with MissingLinkedPredecessor.
-                let next = plan_provider_canonical_wal_transition(
-                    &durable_base,
-                    state.provider_canonical_wal_head.as_ref(),
-                    &state.messages,
-                    Vec::new(),
-                    None,
-                    ProviderCanonicalWalLimits::PRODUCTION,
-                )
-                .expect("request-local fallback must preserve the linked provider predecessor");
-                assert!(next.transition.replacement_compaction_generation.is_none());
-                assert_eq!(state.messages, original);
-                assert_eq!(state.last_request_message_count, Some(original.len()));
+            let memory = Arc::new(CompactionMemoryFixture::default());
+            let mut host = test_host_builder("first-turn-owner", "first-turn-session")
+                .with_memoria_client(Some(memory))
+                .build();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+                requests: requests.clone(),
+            }));
+            let mut state = create_test_state();
+            state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+            // A first canonical admission can contain populated request
+            // history, without a previously persisted summary or head.
+            state.messages.remove(0);
+            state.messages[1]["content"] = json!(CONTINUITY_FACT);
+            let original = state.messages.clone();
+            let durable = if stale_proof {
+                original[..2].to_vec()
+            } else {
+                Vec::new()
+            };
+            state.initialize_provider_canonical_wal_base(&durable);
+            if stale_proof {
+                let mut foreign = durable.clone();
+                foreign[0]["content"] = json!("different admitted prefix");
+                state.initialize_canonical_rewrite_proof(
+                    &foreign,
+                    &astra_turn_types::canonical_conversation_root(&foreign),
+                    0,
+                );
+                assert!(state.begin_canonical_rewrite().is_some());
+            } else {
+                assert!(state.begin_canonical_rewrite().is_none());
                 assert_eq!(
                     state
-                        .provider_canonical_wal_head
+                        .provider_canonical_wal_base
                         .as_ref()
-                        .map(|head| &head.transition_id),
-                    original_head.as_ref().map(|head| &head.transition_id),
-                );
-                assert_eq!(
-                    state
-                        .provider_canonical_wal_head
-                        .as_ref()
-                        .map(|head| &head.result),
-                    original_head.as_ref().map(|head| &head.result),
-                );
-                assert_eq!(requests.lock().unwrap().len(), 1);
-                assert!(result.boundary.is_some());
-                assert!(result.messages.len() < original.len());
-                assert!(
-                    result
-                        .history_summary
-                        .as_deref()
                         .unwrap()
-                        .contains(CONTINUITY_FACT)
+                        .canonical
+                        .message_count,
+                    0,
                 );
-                assert!(
-                    crate::turn::cloud::compaction::prepare_request_summary(
-                        &original, &original, &result,
-                    )
-                    .is_some(),
-                    "the fixture must offer a useful candidate that lacks rewrite authority",
-                );
-                let mut terminal = state.messages.clone();
-                terminal.push(
-                    json!({"role":"assistant", "content":"completed with request-local context"}),
-                );
-                let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
-                    &durable,
-                    stale_proof,
-                    &terminal,
-                    state.canonical_rewrite_proof(),
-                    false,
-                )
-                .unwrap()
-                .unwrap();
-                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-                astra_turn_types::validate_canonical_tool_pairing(&terminal).unwrap();
             }
+            let durable_base = state.provider_canonical_wal_base.clone().unwrap();
+            state.last_request_message_count = Some(original.len());
+            let config = compaction_reuse_config(true);
+            let result = host
+                .compact_messages_via_memoria(
+                    &mut state,
+                    &original,
+                    &[],
+                    &[],
+                    CompactionTier::AggressivePrune,
+                    &config,
+                )
+                .await;
+
+            // Request-local compaction must preserve the canonical history
+            // that a later handoff or terminal Context commit will consume.
+            let next = build_handoff_continuation(&durable_base, &state.messages, None)
+                .expect("request-local fallback must preserve the handoff predecessor");
+            assert!(next.replacement_compaction_generation.is_none());
+            assert_eq!(state.messages, original);
+            assert_eq!(state.last_request_message_count, Some(original.len()));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(result.boundary.is_some());
+            assert!(result.messages.len() < original.len());
+            assert!(
+                result
+                    .history_summary
+                    .as_deref()
+                    .unwrap()
+                    .contains(CONTINUITY_FACT)
+            );
+            assert!(
+                crate::turn::cloud::compaction::prepare_request_summary(
+                    &original, &original, &result,
+                )
+                .is_some(),
+                "the fixture must offer a useful candidate that lacks rewrite authority",
+            );
+            let mut terminal = state.messages.clone();
+            terminal.push(
+                json!({"role":"assistant", "content":"completed with request-local context"}),
+            );
+            let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+                &durable,
+                stale_proof,
+                &terminal,
+                state.canonical_rewrite_proof(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+            astra_turn_types::validate_canonical_tool_pairing(&terminal).unwrap();
         }
     }
 
@@ -46414,8 +44567,8 @@ mod tests {
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 true, false,
             ))
-            .with_test_inference_ledger(
-                crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
+            .with_provider_observations(
+                crate::server::provider_test_support::ProviderObservationsFixture::default(),
             )
             .with_test_judgment_clients([
                 Box::new(classification_client)
@@ -46668,7 +44821,8 @@ mod tests {
     async fn required_unbound_work_retries_text_only_provider_once_without_named_tool_choice() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-establishment-retry";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let response = json!({
             "choices": [{
                 "message": {"content": "I will answer without creating Work."},
@@ -46690,7 +44844,7 @@ mod tests {
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 true, false,
             ))
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -47489,7 +45643,7 @@ mod tests {
         ]).await;
         let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let requests = provider.requests.clone();
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
         let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
             astra_services::runs::InMemoryRunStateStore::new(),
         ));
@@ -47507,7 +45661,7 @@ mod tests {
         .with_explain_analyze_requested(false)
         .with_execution_binding_snapshot(crate::server::tool_transport::ExecutionBindingSnapshot::inferred(crate::server::tool_transport::WorkspaceBinding::server_sandbox(workspace.path()), crate::server::tool_transport::ExecutorBinding::server_local()))
         .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
-        .with_test_inference_ledger(inference_ledger.clone())
+        .with_provider_observations(inference_ledger.clone())
         .with_admitted_model_execution(Some(admitted_execution(gateway_url.clone())))
         .build();
         let mut first_state = create_durable_execution_test_state(SESSION_ID);
@@ -47689,7 +45843,7 @@ mod tests {
         .with_explain_analyze_requested(false)
         .with_execution_binding_snapshot(crate::server::tool_transport::ExecutionBindingSnapshot::inferred(crate::server::tool_transport::WorkspaceBinding::server_sandbox(workspace.path()), crate::server::tool_transport::ExecutorBinding::server_local()))
         .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
-        .with_test_inference_ledger(inference_ledger.clone())
+        .with_provider_observations(inference_ledger.clone())
         .with_admitted_model_execution(Some(admitted_execution(gateway_url)))
         .build();
         tokio::time::timeout(
@@ -50203,14 +48357,14 @@ mod tests {
     #[tokio::test]
     async fn provider_usage_is_counted_once_by_the_agentic_loop() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
-            server_host_builder,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
         };
         let gateway = ProviderGateway::start(vec![ProviderScript::new("usage measured once", |request| request.path == "/v1/chat/completions" && request.body["model"] == "usage-model", vec![ProviderResponse::OpenAi(json!({
             "id":"usage-response", "model":"usage-model", "choices":[{"index":0,"message":{"role":"assistant","content":"usage accounted once"},"finish_reason":"stop"}],
             "usage":{"prompt_tokens":606,"completion_tokens":404,"total_tokens":1010,"prompt_tokens_details":{"cached_tokens":202,"cache_creation_input_tokens":303}}
         }))])]).await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = "session-native-usage";
         let mut host =
             server_host_builder(&gateway, &ledger, session, "openai", "usage-model", None).build();
@@ -50254,14 +48408,14 @@ mod tests {
     #[tokio::test]
     async fn server_host_strict_admission_blocks_every_pre_execution_side_effect() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
-            server_host_builder,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
         };
         let gateway = ProviderGateway::start(vec![ProviderScript::new("invalid arguments then recovery", |request| request.path == "/v1/chat/completions" && request.body["model"] == "strict-model", vec![
             ProviderResponse::OpenAi(json!({"id":"invalid-response","model":"strict-model","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"truncated","type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo incomplete"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
             ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"strict-model","choices":[{"index":0,"message":{"role":"assistant","content":"Recovered after strict admission."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
         ])]).await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = "session-native-strict-admission";
         let mut host =
             server_host_builder(&gateway, &ledger, session, "openai", "strict-model", None)
@@ -50531,7 +48685,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live MatrixOne: run with ASTRA_TEST_DB_IT=1"]
     #[serial_test::serial]
-    async fn catalog_execution_refreshes_route_material_before_each_provider_request() {
+    async fn catalog_execution_reuses_bounded_grant_and_refreshes_expired_material() {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
             Ok("1"),
@@ -50614,10 +48768,17 @@ mod tests {
         .await
         .expect("rotate catalog Offering");
 
+        let cached = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("the admitted route remains valid within its bounded grant");
+        assert_eq!(cached.api_key, "initial-secret");
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
         let second = host
             .resolve_llm_config_for_state(&state)
             .await
-            .expect("second request material");
+            .expect("expired admission refreshes request material");
         assert_eq!(second.api_key, "rotated-secret");
         assert_eq!(second.base_url, "https://provider-b.example/v1");
 
@@ -50627,6 +48788,8 @@ mod tests {
             .execute(pool)
             .await
             .expect("change the selected Offering's upstream model");
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
         let drift_result = host.resolve_llm_config_for_state(&state).await;
 
         sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
@@ -50642,6 +48805,8 @@ mod tests {
             .execute(pool)
             .await
             .expect("disable catalog Offering");
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
         let inactive_result = host.resolve_llm_config_for_state(&state).await;
 
         sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
@@ -50656,8 +48821,8 @@ mod tests {
         assert!(drift.contains("changed provider/model identity"), "{drift}");
         let restored = restored_result.expect("restored selected model remains executable");
         assert_eq!(restored.api_key, "rotated-secret");
-        let inactive =
-            inactive_result.expect_err("revoked Offering must block the next provider request");
+        let inactive = inactive_result
+            .expect_err("revoked Offering must block after the admission grant expires");
         assert!(
             inactive.contains("[model_offering_not_found]")
                 || inactive.contains("[model_offering_unavailable]"),
@@ -50714,6 +48879,33 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer forwarded-token")
         );
+    }
+
+    #[tokio::test]
+    async fn resolving_cached_model_config_does_not_extend_its_admission() {
+        let state = create_test_state();
+        let mut host = test_host_builder("user-model-cache", "session-model-cache")
+            .with_model(Some("gpt-5-mini".to_string()))
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                "http://catalog/api/v1/chat/completions",
+                None,
+            )))
+            .build();
+        let admitted_at = host
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.admitted_at);
+        for _ in 0..3 {
+            host.resolve_llm_config_for_state(&state)
+                .await
+                .expect("admitted model");
+            assert_eq!(
+                host.admitted_model_execution
+                    .as_ref()
+                    .map(|execution| execution.admitted_at),
+                admitted_at
+            );
+        }
     }
 
     #[tokio::test]
@@ -50846,6 +49038,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn constructing_a_host_cannot_refresh_an_expired_catalog_admission() {
+        let mut execution = server_gateway_execution();
+        execution.admitted_at = Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
+        let admitted_at = execution.admitted_at;
+        let mut host = test_host_builder("owner", "session")
+            .with_model_service(Some(Arc::new(GenesisReadinessCatalog {
+                ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            })))
+            .with_admitted_model_execution(Some(execution.clone()))
+            .build();
+        assert_eq!(
+            host.admitted_model_execution.as_ref().unwrap().admitted_at,
+            admitted_at
+        );
+        let error = host
+            .resolve_llm_config_for_state(&create_test_state())
+            .await
+            .expect_err("an expired source grant must revalidate even in a new host");
+        let failure = model_resolution_failure(&error);
+        assert_eq!(failure.kind, astra_core::ErrorKind::ServerError);
+        assert!(
+            failure.message.contains("[genesis_not_ready]"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[tokio::test]
     async fn later_round_revalidation_keeps_genesis_dependency_classification() {
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut host = test_host_builder("user-genesis", "session-genesis")
@@ -50859,9 +49079,14 @@ mod tests {
             .await
             .expect("first round admits the selected Offering");
 
-        // A later round (for example after a tool result) revalidates the
-        // same Offering while Genesis is not ready.
+        // An admitted round survives a transient catalog outage. A later
+        // expired grant must retain the canonical Genesis failure class.
         ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        host.resolve_llm_config_for_state(&state)
+            .await
+            .expect("the bounded grant remains usable");
+        host.admitted_model_execution.as_mut().unwrap().admitted_at =
+            Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1);
         let error = host
             .resolve_llm_config_for_state(&state)
             .await
@@ -50880,8 +49105,8 @@ mod tests {
     #[tokio::test]
     async fn idless_terminal_handoff_is_rejected_before_control_or_delivery() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
-            server_host_builder,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
         };
         let public_name = "mcp__provider__runtime_control";
         let gateway = ProviderGateway::start(vec![ProviderScript::new("declared idless control", |request| request.path == "/v1/chat/completions" && request.body["model"] == "native-terminal-model", vec![ProviderResponse::OpenAi(json!({
@@ -50889,7 +49114,7 @@ mod tests {
             "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"mcp__provider__runtime_control","arguments":"{\"action\":\"revise_current_agent\"}"}}]},"finish_reason":"tool_calls"}],
             "usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}
         }))])]).await;
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
         let session = "session-native-idless-control";
         let mut host = server_host_builder(
             &gateway,
@@ -50968,7 +49193,8 @@ mod tests {
     async fn text_first_control_window_streams_before_provider_completion() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-stream-window";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let initial_events = vec![
             json!({"choices":[{"delta":{"reasoning_content":"private preface"}}]}),
             json!({"choices":[{"delta":{"content":"visible first"}}]}),
@@ -51017,7 +49243,7 @@ mod tests {
         let mut host = test_host_builder("user-stream-window", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         host.install_runtime_tool_schemas(
@@ -51090,7 +49316,8 @@ mod tests {
     async fn missing_judgment_offering_keeps_primary_text_streaming() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-no-judgment-stream";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let initial_events = vec![json!({"choices":[{"delta":{"content":"visible first"}}]})];
         let final_events = vec![
             json!({"choices":[{"delta":{"content":" tail"}}]}),
@@ -51119,7 +49346,7 @@ mod tests {
         .await;
         let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host = test_host_builder("user-no-judgment-stream", session_id.to_string())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -51153,7 +49380,7 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn user_observation_reaches_provider_context_once_without_creating_work() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, loop_state, server_host_builder,
+            ProviderObservationsFixture, loop_state, server_host_builder,
         };
         let _policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
         let _mode = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
@@ -51242,7 +49469,7 @@ mod tests {
                     request.questions.len() == 23
                 }, if work_boundary { vec![ProviderResponse::OpenAi(json!({"model":"observer-model","choices":[{"index":0,"message":{"role":"assistant","content":discrete_classification_response(false)},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}))] } else { vec![] }),
             ]).await;
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let session = "source-bound-user-observation";
             let mut host =
                 server_host_builder(&provider, &ledger, session, "openai", "primary-model", None)
@@ -51426,9 +49653,10 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn user_observation_respects_optional_auxiliary_capacity_policy() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, loop_state, server_host_builder,
+            ProviderObservationsFixture, loop_state, server_host_builder,
         };
         for (policy, admission_mode) in [
+            ("", "disabled"),
             ("boundary_only", "disabled"),
             ("capacity_aware", "db_fixed_window"),
             ("disabled", "disabled"),
@@ -51441,7 +49669,7 @@ mod tests {
                 |wire| wire.path == "/v1/chat/completions" && wire.body["model"] == "primary-model",
                 vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}))].into_iter().filter(|_| admission_mode == "disabled").collect(),
             )]).await;
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let session = "capacity-gated-observation";
             let mut host =
                 server_host_builder(&provider, &ledger, session, "openai", "primary-model", None)
@@ -51509,7 +49737,8 @@ mod tests {
     async fn settled_work_admission_keeps_reasoning_preview_live() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-admission-reasoning";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let initial_events =
             vec![json!({"choices":[{"delta":{"reasoning_content":"live work analysis"}}]})];
         let final_events = vec![
@@ -51551,7 +49780,7 @@ mod tests {
         .await;
         let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host = test_host_builder("user-work-preview", session_id.to_string())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         host.pending_work_admission_judge = Some(pending_work_admission_judge_for_test(
@@ -51604,7 +49833,8 @@ mod tests {
     async fn failed_explicit_work_does_not_stream_provisional_text_before_retry() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-explicit-work-stream-failure";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let initial_events = vec![json!({
             "choices": [{"delta": {"content": "must stay buffered"}}]
         })];
@@ -51631,7 +49861,7 @@ mod tests {
         let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host =
             test_host_builder("user-explicit-work-stream-failure", session_id.to_string())
-                .with_test_inference_ledger(inference_ledger.clone())
+                .with_provider_observations(inference_ledger.clone())
                 .with_admitted_model_execution(Some(test_gateway_execution(
                     gateway_url,
                     Some(3000),
@@ -51700,7 +49930,8 @@ mod tests {
     async fn pending_completion_action_does_not_stream_provisional_success() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-pending-completion-stream";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let initial_events =
             vec![json!({"choices": [{"delta": {"content": "Fixed and verified."}}]})];
         let final_events = vec![json!({
@@ -51725,7 +49956,7 @@ mod tests {
         .await;
         let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host = test_host_builder("user-pending-completion-stream", session_id.to_string())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -51764,7 +49995,8 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
         let session_id = "session-tool-window";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let ordinary_tool = "mcp__provider__status";
         let terminal_tool = "mcp__provider__runtime_control";
         let initial_events = vec![
@@ -51820,7 +50052,7 @@ mod tests {
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         host.install_runtime_tool_schemas_with_native_ids(
@@ -51926,7 +50158,7 @@ mod tests {
         let mut host = test_host_builder("identity-owner", "identity-session")
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_inference_ledger(Default::default())
+            .with_provider_observations(Default::default())
             .with_admitted_model_execution(Some(test_gateway_execution(
                 format!("{}/v1/chat/completions", provider.base_url),
                 Some(2000),
@@ -52028,7 +50260,8 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
         let session_id = "session-terminal-stream";
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let terminal_tool = "mcp__provider__arbitrary_control_name";
         let initial_events = vec![
             json!({"choices":[{"delta":{"reasoning_content":"private handoff reasoning"}}]}),
@@ -52085,7 +50318,7 @@ mod tests {
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
         host.install_runtime_tool_schemas_with_native_ids(
@@ -52153,7 +50386,8 @@ mod tests {
     async fn execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled()
     {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000126";
@@ -52180,7 +50414,7 @@ mod tests {
         let mut host = test_host_builder("user-journal", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_full_llm_capture(true)
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
             .build();
@@ -52413,7 +50647,8 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         // Collapse llm_client's 1s/2s/4s exponential backoff so the retry
         // loop behind a 500 upstream completes in tens of ms instead of 7s.
         let _backoff = crate::turn::llm::client::set_test_retry_backoff_ms(0);
@@ -52438,7 +50673,7 @@ mod tests {
         let mut host = test_host_builder("user-journal", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_full_llm_capture(true)
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
             .build();
@@ -52660,7 +50895,8 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_does_not_persist_full_journal_events_when_session_capture_disabled() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
-        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let inference_ledger =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000128";
@@ -52687,7 +50923,7 @@ mod tests {
         let mut host = test_host_builder("user-journal", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_test_inference_ledger(inference_ledger.clone())
+            .with_provider_observations(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
             .build();
         let mut state = create_durable_execution_test_state(session_id);
@@ -52741,7 +50977,7 @@ mod tests {
     #[tokio::test]
     async fn unadmitted_request_preserves_one_shot_provider_constraint() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderScript, loop_state,
+            ProviderGateway, ProviderObservationsFixture, ProviderScript, loop_state,
             server_host_builder,
         };
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
@@ -52750,7 +50986,7 @@ mod tests {
             Vec::new(),
         )])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = "session-unadmitted-one-shot";
         let mut host =
             server_host_builder(&gateway, &ledger, session, "openai", "fixture-model", None)
@@ -52763,7 +50999,7 @@ mod tests {
         assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
         assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(gateway.requests.lock().await.is_empty());
-        assert!(ledger.admissions().is_empty());
+        assert!(ledger.requests().is_empty());
         ledger.assert_quiescent();
         gateway.assert_complete();
     }
@@ -52772,15 +51008,15 @@ mod tests {
     #[tokio::test]
     async fn provider_eof_preserves_partial_text_and_measured_usage() {
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
-            server_host_builder,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
         };
         let gateway = ProviderGateway::start(vec![ProviderScript::new("partial response without terminal", |request| request.path == "/v1/chat/completions" && request.body["model"] == "partial-model", vec![ProviderResponse::Stream {
             content_type: "text/event-stream",
             chunks: vec![format!("data: {}\n\n", json!({"id":"partial-response","model":"partial-model","choices":[{"index":0,"delta":{"content":"half answer"}}],"usage":{"prompt_tokens":17,"completion_tokens":3,"total_tokens":20}})).into_bytes()],
             release_before_chunk: None,
         }])]).await;
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
         let session = "session-native-partial-eof";
         let mut host = server_host_builder(
             &gateway,
@@ -52840,7 +51076,7 @@ mod tests {
         .await;
         let url = format!("{}/v1/chat/completions", provider.base_url);
         let requests = provider.requests.clone();
-        let state = create_test_state();
+        let state = create_durable_execution_test_state("selector-session");
         for (cap, expected) in [(Some(128), 128), (Some(8192), 4096), (None, 4096)] {
             let mut execution = test_gateway_execution(url.clone(), Some(3000));
             execution.max_completion_tokens = cap;
@@ -52850,7 +51086,7 @@ mod tests {
             config.max_completion_tokens = cap;
             let route = ResolvedJudgmentRoute { config, execution };
             let mut host = test_host_builder("selector-user", "selector-session")
-                .with_test_inference_ledger(Default::default())
+                .with_provider_observations(Default::default())
                 .build();
             // Other judgments retain their strict minimum-output contract.
             if cap == Some(128) {
@@ -52890,7 +51126,7 @@ mod tests {
         let provider = ProviderGateway::start(vec![ProviderScript::new(
             "delegation_selector_fallback_shares_retry_bound",
             |request| request.path == "/v1/chat/completions",
-            (0..3)
+            (0..2)
                 .map(|_| ProviderResponse::Json {
                     status: axum::http::StatusCode::BAD_REQUEST,
                     body: response.clone(),
@@ -52914,7 +51150,7 @@ mod tests {
                 ))
             };
             let mut host = test_host_builder("selector-user", "selector-session")
-                .with_test_inference_ledger(Default::default())
+                .with_provider_observations(Default::default())
                 .with_test_judgment_clients([Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([primary])),
                 }) as Box<dyn SummaryLlmClient>])
@@ -52925,7 +51161,7 @@ mod tests {
             }
             let result = host
                 .call_delegation_judgment(
-                    &create_test_state(),
+                    &create_durable_execution_test_state("selector-session"),
                     "selector",
                     "delegation_candidate_assessment",
                     128,
@@ -52940,8 +51176,8 @@ mod tests {
                 if partial_budget { 1 } else { 2 }
             );
         }
-        // HTTP 400 is permanent: one physical configured request per case.
-        assert_eq!(requests.lock().await.len(), 3);
+        // HTTP 400 is permanent; an expired Run deadline prevents the third dispatch.
+        assert_eq!(requests.lock().await.len(), 2);
         provider.assert_complete();
     }
 
@@ -52961,7 +51197,7 @@ mod tests {
             State(capture): State<Arc<RequestCapture>>,
             headers: axum::http::HeaderMap,
             request: axum::extract::Request,
-        ) -> axum::Json<Value> {
+        ) -> axum::response::Response {
             *capture.path.lock().await = Some(request.uri().path().to_string());
             *capture.authorization.lock().await = headers
                 .get("authorization")
@@ -52971,15 +51207,18 @@ mod tests {
                 .get("x-workspace-id")
                 .and_then(|value| value.to_str().ok())
                 .map(String::from);
-            axum::Json(json!({
-                "choices": [
-                    {
-                        "message": { "content": "gateway summary" },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-            }))
+            crate::server::provider_test_support::openai_response(
+                json!({
+                    "choices": [
+                        {
+                            "message": { "content": "gateway summary" },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }),
+                true,
+            )
         }
 
         let capture = Arc::new(RequestCapture::default());
@@ -52999,7 +51238,7 @@ mod tests {
         let mut forwarded = HashMap::new();
         forwarded.insert("authorization".to_string(), "Bearer moi-token".to_string());
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
-        let client = RuntimeSummaryClient::new_direct_for_test(
+        let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,
@@ -53016,6 +51255,14 @@ mod tests {
                 request_timeout: Some(Duration::from_secs(2)),
             },
             128,
+            crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+                0,
+                "test-owner",
+                0,
+                None,
+                None,
+                None,
+            ),
         );
 
         let response = client
@@ -53124,7 +51371,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_skips_gateway_when_provider_admission_is_enabled() {
-        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "capacity_aware");
         let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
         let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
@@ -53742,25 +51989,19 @@ mod tests {
     }
 
     #[test]
-    fn producer_cannot_spoof_tool_terminal_durable_watermark() {
+    fn producer_cannot_spoof_tool_terminal_live_watermark() {
         let mut host = test_host_builder("user1", "sess1").build();
         host.emit_progress_event(json!({
             "type": "tool_call_end",
             "call_id": "call-spoofed",
             "status": "completed",
-            "_astra_tool_terminal_durably_fanned_out": true,
+            "_astra_tool_terminal_live_emitted": true,
         }));
 
         let retained = host.emitted_events.last().expect("retained terminal");
+        assert!(retained.get(TOOL_TERMINAL_LIVE_EMITTED_FIELD).is_none());
         assert!(
-            retained
-                .get(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD)
-                .is_none()
-        );
-        assert!(
-            crate::server::run::lifecycle::run_state::tool_terminal_requires_settlement_repair(
-                retained
-            )
+            crate::server::run::lifecycle::run_state::tool_terminal_requires_live_repair(retained)
         );
     }
 
@@ -54986,10 +53227,12 @@ mod tests {
                 parse_auxiliary_llm_policy("boundary_only"),
                 AuxiliaryLlmPolicy::BoundaryOnly
             );
-            assert_eq!(
-                parse_auxiliary_llm_policy("surprise"),
-                AuxiliaryLlmPolicy::CapacityAware
-            );
+            for value in ["", "  ", "surprise"] {
+                assert_eq!(
+                    parse_auxiliary_llm_policy(value),
+                    AuxiliaryLlmPolicy::BoundaryOnly
+                );
+            }
         }
 
         #[test]
@@ -55000,7 +53243,11 @@ mod tests {
 
             assert_eq!(
                 AuxiliaryLlmPolicy::from_env(),
-                AuxiliaryLlmPolicy::CapacityAware
+                AuxiliaryLlmPolicy::BoundaryOnly
+            );
+            assert_eq!(
+                should_skip_auxiliary_llm_for_capacity(),
+                Some("boundary_only")
             );
             assert_eq!(
                 should_skip_work_admission_judge(false, false),
@@ -55325,7 +53572,8 @@ mod tests {
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
         async fn builtin_work_admission_records_assessment_through_turn_entrypoint() {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-            let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+            let ledger =
+                crate::server::provider_test_support::ProviderObservationsFixture::default();
             let assessment = json!({"satisfaction":"dissatisfied","satisfaction_confidence":"high","feedback_relation":"previous_response","difficulty":"easy","difficulty_confidence":"high"});
             let mut response: Value =
                 serde_json::from_str(&classification_response(false)).unwrap();
@@ -55343,7 +53591,7 @@ mod tests {
             };
             let mut host = test_host_builder("u-observation", "s-observation")
                 .with_work_planning_bound(true)
-                .with_test_inference_ledger(ledger.clone())
+                .with_provider_observations(ledger.clone())
                 .with_test_judgment_clients([
                     Box::new(classification_client)
                         as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
@@ -55590,7 +53838,7 @@ mod tests {
             let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
             let inference_ledger =
-                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+                crate::server::provider_test_support::ProviderObservationsFixture::default();
             let request_count = Arc::new(AtomicUsize::new(0));
             let request_count_for_handler = request_count.clone();
             let app = Router::new().route(
@@ -55627,7 +53875,7 @@ mod tests {
                 .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                     true, false,
                 ))
-                .with_test_inference_ledger(inference_ledger)
+                .with_provider_observations(inference_ledger)
                 .with_admitted_model_execution(Some(test_gateway_execution(
                     format!("http://{addr}/gateway/chat/completions"),
                     Some(2_000),
@@ -55686,7 +53934,7 @@ mod tests {
                 }]
             });
             use crate::server::provider_test_support::{
-                InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+                ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
                 loop_state, server_host_builder,
             };
             let instruction = "prepare a typed non-authoritative plan proposal";
@@ -55694,7 +53942,7 @@ mod tests {
                 ProviderScript::new("classification only", |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini", vec![ProviderResponse::OpenAi(json!({"id":"classification-response","model":"gpt-5-mini","choices":[{"index":0,"message":{"role":"assistant","content":discrete_classification_response(false)},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}))]),
                 ProviderScript::new("read-only primary proposal", |request| request.path == "/v1/chat/completions" && request.body["model"] == "plan-primary-model", vec![ProviderResponse::OpenAi(json!({"id":"proposal-response","model":"plan-primary-model","choices":[{"index":0,"message":{"role":"assistant","content":proposal.to_string()},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18}}))]),
             ]).await;
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let session = "session-native-read-only-proposal";
             let mut host = server_host_builder(
                 &gateway,

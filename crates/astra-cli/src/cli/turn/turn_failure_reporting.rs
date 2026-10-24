@@ -72,6 +72,17 @@ pub(crate) fn report_admission_rejection(
 ) {
     let draft_restored =
         !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
+    if failure.partial.error_code.as_deref() == Some("session_unavailable") {
+        let mut message = String::from("Session is unavailable\n");
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        }
+        message.push_str(
+            "  Choose an available session, then send your message again.\n  No model or tool ran.",
+        );
+        ui.show_error(&message);
+        return;
+    }
     let metadata = failure.partial.error_metadata.as_ref();
     if matches!(
         failure.partial.error_code.as_deref(),
@@ -972,7 +983,35 @@ mod tests {
     }
 
     #[test]
-    fn occupied_execution_slot_has_the_same_explicit_recovery_as_writer_conflict() {
+    fn unavailable_session_rejection_restores_the_draft_with_appropriate_recovery() {
+        let mut state = SessionState {
+            session_id: Some("unavailable-session".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "Session unavailable".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_unavailable".into()),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        report_admission_rejection(&mut state, "my unsent message", &failure, &mut ui);
+        assert_eq!(ui.restored_inputs, vec!["my unsent message"]);
+        assert_eq!(state.session_id.as_deref(), Some("unavailable-session"));
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Session is unavailable"));
+        assert!(shown.contains("Choose an available session"));
+        assert!(shown.contains("No model or tool ran"));
+        assert!(
+            !shown.contains("busy") && !shown.contains("session cancel"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn occupied_execution_has_the_same_explicit_recovery_as_writer_conflict() {
         let mut state = SessionState {
             session_id: Some("session-blocked".into()),
             ..Default::default()

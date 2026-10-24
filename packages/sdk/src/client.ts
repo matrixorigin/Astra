@@ -28,7 +28,6 @@ import type {
   RunListCursor,
   RunListParams,
   RunListResponse,
-  RunProjectionRepairResponse,
   RunProjectionResponse,
   RunStatus,
   RuntimeChatResponse,
@@ -174,7 +173,6 @@ import {
   chatRunPath,
   chatRunPausePath,
   chatRunProjectionPath,
-  chatRunProjectionRepairPath,
   chatRunResumePath,
   chatRunStreamPath,
   chatSessionDecisionTracePath,
@@ -3080,7 +3078,7 @@ export class AstraClient {
   }
 
   /**
-   * Fetch the bounded durable projection for a run without attaching to its
+   * Fetch the bounded canonical snapshot for a run without attaching to its
    * live SSE stream.
    */
   async getRunProjection(
@@ -3097,22 +3095,7 @@ export class AstraClient {
     );
   }
 
-  /**
-   * Rebuild the durable projection for a run from authoritative facts.
-   */
-  async repairRunProjection(
-    runId: string,
-    opts?: { recentLimit?: number },
-  ): Promise<RunProjectionRepairResponse> {
-    const q = buildQueryString({
-      ...(opts?.recentLimit !== undefined
-        ? { recent_limit: opts.recentLimit }
-        : {}),
-    });
-    return this.post<RunProjectionRepairResponse>(
-      `${chatRunProjectionRepairPath(runId)}${q}`,
-    );
-  }
+
 
   /** `GET /runs` — list durable runs for the current user. */
   async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {

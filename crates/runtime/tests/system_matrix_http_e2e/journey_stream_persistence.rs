@@ -978,36 +978,6 @@ async fn assert_concurrent_fanout_durability(
     );
 }
 
-/// Poll until `agent_events` has at least `min_count` rows for the session.
-async fn wait_for_agent_events_count(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    session_id: &str,
-    min_count: i64,
-    timeout: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-        if n >= min_count {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timeout ({timeout:?}) waiting for >= {min_count} agent_events for user_id={user_id} session_id={session_id} (got {n})"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
 /// Starting another in-process app must not interpret an already-live Matrix
 /// fixture as interrupted state. The second bootstrap crosses the same stale
 /// cleanup path used after developer interrupts, then the first app proves its
@@ -1865,20 +1835,6 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
         semantically_blank, 0,
         "an assistant transcript row must contain text or structured tool calls"
     );
-    assert!(
-        assistant_rows.iter().any(|row| {
-            row.get::<String, _>("content").trim().is_empty()
-                && row
-                    .get::<Option<String>, _>("payload_json")
-                    .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
-                    .and_then(|payload| payload["tool_calls"].as_array().cloned())
-                    .is_some_and(|tool_calls| {
-                        tool_calls.len() == 1
-                            && tool_calls[0]["name"].as_str() == Some("agent_fanout")
-                    })
-        }),
-        "the tool-only root boundary must retain its typed fanout call instead of a semantically empty row"
-    );
     let (transcript_status, transcript) = get_json(
         app,
         &format!("/sessions/{session_id}/transcript?scope=root_conversation&limit=20"),
@@ -1891,19 +1847,15 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
         StatusCode::OK,
         "root transcript: {transcript}"
     );
+    let items = transcript["items"]
+        .as_array()
+        .expect("canonical transcript items");
     assert!(
-        transcript["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|item| {
-                item["role"].as_str() == Some("assistant")
-                    && item["content"].as_str() == Some("")
-                    && item["tool_calls"].as_array().is_some_and(|calls| {
-                        calls.len() == 1 && calls[0]["name"].as_str() == Some("agent_fanout")
-                    })
-            }),
-        "the downstream transcript API must expose the typed fanout call: {transcript}"
+        items.iter().any(|item| {
+            item["role"].as_str() == Some("assistant")
+                && item["content"].as_str() == Some(final_reply)
+        }),
+        "the downstream transcript API must retain the final answer: {transcript}"
     );
     let orphan_transcript_runs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_transcript_items AS transcript \
@@ -3307,6 +3259,7 @@ pub async fn run_stream_context_trace_persistence() {
                     "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0} }}))])]).await;
     let payload = json!({
         "message": "context trace persistence test",
+        "explain": true,
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
@@ -3322,90 +3275,17 @@ pub async fn run_stream_context_trace_persistence() {
         &body[..body.len().min(300)]
     );
 
-    // Wait for events to be persisted (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(
+    super::harness::wait_for_agent_event_types(
         pool,
         user_id,
         &session_id,
-        3,
+        &["context_trace_signal"],
         std::time::Duration::from_secs(15),
     )
     .await;
-
-    let recs = sqlx::query(
-        "SELECT event_id, event_type, content, causal_chain_id, agent_id, \
-                llm_model_used, CAST(token_usage AS CHAR) AS token_usage, parent_event_id \
-         FROM agent_events WHERE user_id = ? AND session_id = ? ORDER BY created_at ASC",
-    )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_all(pool)
-    .await
-    .expect("select agent_events");
-
-    assert!(
-        recs.len() >= 3,
-        "should have at least 3 agent_events rows (user_query + llm_response + context_trace_signal), got {}",
-        recs.len()
-    );
-
-    // ── Verify user_query event ──
-    let user_query = recs
-        .iter()
-        .find(|r| r.try_get::<String, _>("event_type").ok().as_deref() == Some("user_query"));
-    assert!(
-        user_query.is_some(),
-        "should have a user_query event. Found types: {:?}",
-        recs.iter()
-            .filter_map(|r| r.try_get::<String, _>("event_type").ok())
-            .collect::<Vec<_>>()
-    );
-    let uq = user_query.unwrap();
-    let uq_content = uq.try_get::<String, _>("content").unwrap_or_default();
-    assert!(
-        uq_content.contains("context trace persistence test"),
-        "user_query content should contain the original message, got: {uq_content}"
-    );
-    let uq_event_id = uq.try_get::<String, _>("event_id").unwrap_or_default();
-    assert!(
-        !uq_event_id.is_empty(),
-        "user_query should have an event_id"
-    );
-    let uq_chain_id = uq
-        .try_get::<Option<String>, _>("causal_chain_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    assert!(
-        uq_chain_id.contains("server-loop"),
-        "user_query causal_chain_id should contain 'server-loop', got: {uq_chain_id}"
-    );
-
-    // ── Verify llm_response event ──
-    let llm_response = recs
-        .iter()
-        .find(|r| r.try_get::<String, _>("event_type").ok().as_deref() == Some("llm_response"));
-    assert!(
-        llm_response.is_some(),
-        "should have an llm_response event. Found types: {:?}",
-        recs.iter()
-            .filter_map(|r| r.try_get::<String, _>("event_type").ok())
-            .collect::<Vec<_>>()
-    );
-    let lr = llm_response.unwrap();
-    let lr_content = lr.try_get::<String, _>("content").unwrap_or_default();
-    assert!(
-        lr_content.contains("Context trace reply."),
-        "llm_response content should contain LLM text, got: {lr_content}"
-    );
-    let usage: Value = serde_json::from_str(
-        &lr.try_get::<String, _>("token_usage")
-            .expect("canonical usage"),
-    )
-    .expect("usage JSON");
-    assert_eq!(usage["input_tokens"], 100);
-    assert_eq!(usage["output_tokens"], 50);
-
+    let trace: (String,) = sqlx::query_as("SELECT causal_chain_id FROM agent_events WHERE user_id=? AND session_id=? AND event_type='context_trace_signal' LIMIT 1")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert!(trace.0.contains("context-trace"));
     let (restore_status, restored) = post_json(
         app,
         &format!("/sessions/{session_id}/resume"),
@@ -3436,54 +3316,12 @@ pub async fn run_stream_context_trace_persistence() {
         .expect("ordinary answer projection count");
         assert_eq!(count, 0, "ordinary answer must not create {table}");
     }
-    let lr_chain_id = lr
-        .try_get::<Option<String>, _>("causal_chain_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    assert_eq!(
-        uq_chain_id, lr_chain_id,
-        "user_query and llm_response should share the same causal_chain_id"
-    );
-    // llm_response should have parent_event_id pointing to user_query.
-    let lr_parent = lr
-        .try_get::<Option<String>, _>("parent_event_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    assert_eq!(
-        lr_parent, uq_event_id,
-        "llm_response parent_event_id should be user_query event_id"
-    );
-
-    // ── Verify context_trace_signal event ──
-    let trace_signal = recs.iter().find(|r| {
-        r.try_get::<String, _>("event_type").ok().as_deref() == Some("context_trace_signal")
-    });
-    assert!(
-        trace_signal.is_some(),
-        "should have a context_trace_signal event. Found types: {:?}",
-        recs.iter()
-            .filter_map(|r| r.try_get::<String, _>("event_type").ok())
-            .collect::<Vec<_>>()
-    );
-    let trace = trace_signal.unwrap();
-    let trace_chain_id = trace
-        .try_get::<Option<String>, _>("causal_chain_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    assert!(
-        trace_chain_id.contains("context-trace"),
-        "context_trace_signal causal_chain_id should contain 'context-trace', got: {trace_chain_id}"
-    );
-
     // ── Cleanup ──
     cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.close().await;
 }
 
-/// B3: Multiple stream_chat calls to same session → core events + context traces per turn.
+/// Ordinary turns persist refreshed history, provider context and session recency without diagnostics.
 pub async fn run_stream_multi_turn_persistence() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -3502,6 +3340,17 @@ pub async fn run_stream_multi_turn_persistence() {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
+    sqlx::query("UPDATE agent_sessions SET created_at='2020-01-01', updated_at='2020-01-01' WHERE user_id=? AND session_id=?")
+        .bind(user_id).bind(&session_id).execute(pool).await.unwrap();
+    let (competitor_status, competitor) = post_json(
+        app,
+        "/sessions",
+        Some(auth.as_str()),
+        json!({"title":"newer untouched session"}),
+    )
+    .await;
+    assert_eq!(competitor_status, StatusCode::CREATED);
+    let competitor_id = competitor["session_id"].as_str().unwrap().to_string();
     // ── Turn 1 ──
     let fixture_model = format!("mock-{}", ctx.suffix);
     ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_multi_turn_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="multi-turn message one")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response one.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
@@ -3522,43 +3371,47 @@ pub async fn run_stream_multi_turn_persistence() {
         &body1[..body1.len().min(200)]
     );
 
-    // Wait for Turn 1 events (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(
-        pool,
-        user_id,
-        &session_id,
-        3,
-        std::time::Duration::from_secs(15),
+    let (list_status, listed) = get_json(app, "/sessions?limit=1", Some(auth.as_str()), &[]).await;
+    assert_eq!(list_status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["sessions"][0]["session_id"], session_id);
+    let (detail_status, detail) = get_json(
+        app,
+        &format!("/sessions/{session_id}"),
+        Some(auth.as_str()),
+        &[],
     )
     .await;
-
-    let count_after_turn1: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    assert!(
-        count_after_turn1 >= 3,
-        "turn 1 should have >= 3 events (user_query + llm_response + context_trace_signal), got {count_after_turn1}"
+    assert_eq!(detail_status, StatusCode::OK, "{detail}");
+    assert_eq!(listed["sessions"][0]["updated_at"], detail["updated_at"]);
+    let (resume_list_status, resume_list) =
+        get_json(app, "/sessions/resumable?limit=1", Some(auth.as_str()), &[]).await;
+    assert_eq!(resume_list_status, StatusCode::OK, "{resume_list}");
+    assert_eq!(resume_list["sessions"][0]["session_id"], session_id);
+    let stored: String=sqlx::query_scalar("SELECT DATE_FORMAT(updated_at,'%Y-%m-%dT%H:%i:%s') FROM agent_sessions WHERE user_id=? AND session_id=?")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        stored, "2020-01-01T00:00:00",
+        "ordinary conversation recency requires no metadata repair"
     );
-
-    // Verify turn 1 has user_query with the right content.
-    let uq1_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
+    let (restored_status, restored) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume"),
+        Some(auth.as_str()),
+        json!({}),
     )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    assert_eq!(uq1_count, 1, "after turn 1: exactly 1 user_query event");
-
+    .await;
+    assert_eq!(restored_status, StatusCode::OK);
+    let restored: astra_services::session_restore::RestoredSession =
+        serde_json::from_value(restored).unwrap();
+    assert!(
+        restored
+            .resume_messages()
+            .iter()
+            .any(|message| message["role"] == "assistant" && message["content"] == "Response one.")
+    );
     // ── Turn 2 ──
     let fixture_model = format!("mock-{}", ctx.suffix);
-    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_multi_turn_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="multi-turn message two")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response two.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_multi_turn_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && astra_turn_core::prompt_facing::extract_text_content(message).as_deref()==Some("multi-turn message two")) && messages.iter().any(|message| message["role"]=="assistant" && astra_turn_core::prompt_facing::extract_text_content(message).as_deref()==Some("Response one."))),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response two.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload2 = json!({
         "message": "multi-turn message two",
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
@@ -3576,83 +3429,55 @@ pub async fn run_stream_multi_turn_persistence() {
         &body2[..body2.len().min(200)]
     );
 
-    // Wait for Turn 2 events (3 more events).
-    wait_for_agent_events_count(
-        pool,
-        user_id,
-        &session_id,
-        count_after_turn1 + 3,
-        std::time::Duration::from_secs(15),
+    assert!(
+        body2.contains("Response two."),
+        "second turn must actually complete: {body2}"
+    );
+    // Draining closes execution admission; only do it after the final turn.
+    assert!(
+        ctx.app_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
+    let (history_status, history) = get_json(
+        app,
+        &format!("/sessions/{session_id}/transcript?scope=root_conversation&limit=20"),
+        Some(auth.as_str()),
+        &[],
     )
     .await;
-
-    let count_after_turn2: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    assert!(
-        count_after_turn2 >= count_after_turn1 + 3,
-        "turn 2 should add >= 3 events: after_turn1={count_after_turn1}, after_turn2={count_after_turn2}"
-    );
-
-    // ── Verify event types across both turns ──
-    let uq_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'user_query'",
-    )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    assert_eq!(
-        uq_count, 2,
-        "should have 2 user_query events (one per turn)"
-    );
-
-    let lr_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'llm_response'",
-    )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-    assert_eq!(
-        lr_count, 2,
-        "should have 2 llm_response events (one per turn)"
-    );
-
-    // Verify multiple causal_chain_ids — each turn's core events get a server-loop chain,
-    // and each turn's context_trace gets a context-trace chain.
-    let chains: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT causal_chain_id FROM agent_events \
-         WHERE user_id = ? AND session_id = ? AND causal_chain_id IS NOT NULL",
-    )
-    .bind(user_id)
-    .bind(&session_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let server_loop_chains = chains.iter().filter(|c| c.contains("server-loop")).count();
-    let ctx_trace_chains = chains
+    assert_eq!(history_status, StatusCode::OK, "{history}");
+    let actual = history["items"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|c| c.contains("context-trace"))
-        .count();
-    assert!(
-        server_loop_chains >= 2,
-        "should have >= 2 server-loop causal chains (one per turn), got {server_loop_chains} in {:?}",
-        chains
+        .map(|item| {
+            (
+                item["role"].as_str().unwrap(),
+                item["content"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("user", "multi-turn message one"),
+            ("assistant", "Response one."),
+            ("user", "multi-turn message two"),
+            ("assistant", "Response two.")
+        ]
     );
-    assert!(
-        ctx_trace_chains >= 2,
-        "should have >= 2 context-trace causal chains (one per turn), got {ctx_trace_chains} in {:?}",
-        chains
+    let diagnostic_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id=? AND session_id=?")
+            .bind(user_id)
+            .bind(&session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        diagnostic_rows, 0,
+        "durable conversation must not depend on diagnostics"
     );
-
     // Both runs should be queryable.
     let si1 = sse_first_data_json_with_type(&body1, "session_info");
     let si2 = sse_first_data_json_with_type(&body2, "session_info");
@@ -3688,5 +3513,6 @@ pub async fn run_stream_multi_turn_persistence() {
 
     // ── Cleanup ──
     cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, user_id, &competitor_id).await;
     ctx.close().await;
 }

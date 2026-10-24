@@ -148,8 +148,8 @@ impl Drop for OuterSkillDispatchGuard {
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
     #[cfg(any(test, feature = "e2e-hooks"))]
-    pub(crate) test_inference_ledger:
-        Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
+    pub(crate) provider_observations:
+        Option<crate::server::provider_test_support::ProviderObservationsFixture>,
     model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
@@ -291,7 +291,7 @@ impl ServerSkillSubRunExecutor {
     ) -> Self {
         Self {
             #[cfg(any(test, feature = "e2e-hooks"))]
-            test_inference_ledger: None,
+            provider_observations: None,
             model_service: None,
             model_catalog_reader: None,
             matrixone,
@@ -1041,8 +1041,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         .with_interaction_mode(Some(self.interaction_mode));
 
         #[cfg(any(test, feature = "e2e-hooks"))]
-        if let Some(ledger) = self.test_inference_ledger.as_ref() {
-            builder = builder.with_test_inference_ledger(ledger.clone());
+        if let Some(ledger) = self.provider_observations.as_ref() {
+            builder = builder.with_provider_observations(ledger.clone());
         }
         if let Some(snapshot) = &self.execution_binding_snapshot {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
@@ -1362,7 +1362,7 @@ mod tests {
             SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
         };
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
         };
         const SECRET: &str = "FIRST_FORK_ONLY_FILE_EVIDENCE";
         const TASK: &str = "Explain the supplied facts without making changes.";
@@ -1426,7 +1426,7 @@ mod tests {
                 engine.clone(),
             )
             .unwrap();
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
         let mut executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -1475,7 +1475,7 @@ mod tests {
             "fork-parent-owner".into(),
             invocation_ledger,
         );
-        executor.test_inference_ledger = Some(inference.persistence.clone());
+        executor.provider_observations = Some(inference.clone());
         for (invocation, chain, reason) in [
             (
                 None,
@@ -1537,7 +1537,7 @@ mod tests {
         assert!(error.contains("frozen parent completion contract"));
         executor.completion_checks = frozen;
         assert!(gateway.requests.lock().await.is_empty());
-        assert!(inference.admissions().is_empty());
+        assert!(inference.requests().is_empty());
         assert_eq!(inference.attempt_count(), 0);
         let mut expected_epochs = std::collections::HashSet::new();
         for (name, invocation) in [
@@ -1594,7 +1594,7 @@ mod tests {
         gateway.assert_complete();
         inference.assert_quiescent();
         assert_eq!(inference.attempt_count(), 4);
-        let admissions = inference.admissions();
+        let admissions = inference.requests();
         assert_eq!(admissions.len(), 4);
         let operations: std::collections::HashSet<_> = admissions
             .iter()
@@ -1692,7 +1692,7 @@ mod tests {
             SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
         };
         use crate::server::provider_test_support::{
-            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
         };
 
         let workspace = tempfile::TempDir::new().unwrap();
@@ -1755,7 +1755,7 @@ mod tests {
                 engine.clone(),
             )
             .unwrap();
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
 
         // Model the real root restore path: session-only state is restored on
         // the root owner, then projected through the existing child boundary.
@@ -1809,7 +1809,7 @@ mod tests {
             "permission-parent-owner".into(),
             invocation_ledger,
         );
-        executor.test_inference_ledger = Some(inference.persistence.clone());
+        executor.provider_observations = Some(inference.clone());
 
         let allowed_tools = vec!["write_file".to_string()];
         let result = executor

@@ -251,6 +251,10 @@ async fn insert_state_item(
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: run_id.to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
@@ -813,8 +817,6 @@ async fn cleanup_device_owner_fixture(pool: &SharedPool, user_id: &str, session_
 
 async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
-        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
-        "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",

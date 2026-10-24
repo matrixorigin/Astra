@@ -288,24 +288,6 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
                 _ => format!("Sleeping: {duration_ms}ms"),
             }
         }
-        "history_page" => {
-            let cursor = args
-                .get("before_seq")
-                .or_else(|| args.get("after_seq"))
-                .and_then(Value::as_i64);
-            match cursor {
-                Some(seq) => format!("Session history page near item {seq}"),
-                None => "Session history page".to_string(),
-            }
-        }
-        "history_search" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            format!("Searching session history: \"{}\"", trunc(pattern, 18))
-        }
-        "history_around" => {
-            let item_seq = args.get("item_seq").and_then(Value::as_i64).unwrap_or(0);
-            format!("Session history around item {item_seq}")
-        }
         _ => format!("Session: {action}"),
     }
 }
@@ -983,35 +965,6 @@ mod tests {
     }
 
     // ─── Schema-canonical field names ──────────────────────────────────
-
-    #[test]
-    fn session_history_actions_render() {
-        assert_eq!(
-            p("session", json!({"action": "history_page"})),
-            "Session history page"
-        );
-        assert_eq!(
-            p(
-                "session",
-                json!({"action": "history_page", "before_seq": 42})
-            ),
-            "Session history page near item 42"
-        );
-        assert_eq!(
-            p(
-                "session",
-                json!({"action": "history_search", "pattern": "failed build"})
-            ),
-            r#"Searching session history: "failed build""#
-        );
-        assert_eq!(
-            p(
-                "session",
-                json!({"action": "history_around", "item_seq": 17})
-            ),
-            "Session history around item 17"
-        );
-    }
 
     #[test]
     fn run_script_shows_first_line() {

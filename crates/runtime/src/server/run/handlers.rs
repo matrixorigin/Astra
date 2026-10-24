@@ -344,9 +344,6 @@ pub(crate) struct RunProjectionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     pub run_event_high_watermark: i64,
-    pub projection_event_idx: i64,
-    pub projection_updated_at: String,
-    pub projection_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_event_type: Option<String>,
     pub total_prompt_tokens: u64,
@@ -356,12 +353,6 @@ pub(crate) struct RunProjectionResponse {
     pub latest_checkpoint: Option<RunProjectionCheckpointResponse>,
     pub observability: RunProjectionObservabilityResponse,
     pub recent_events: Vec<serde_json::Value>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct RunProjectionRepairResponse {
-    pub repaired: bool,
-    pub projection: RunProjectionResponse,
 }
 
 #[derive(serde::Serialize)]
@@ -375,9 +366,7 @@ pub(crate) struct PromptRequestObservabilityResponse {
 
 #[derive(serde::Serialize)]
 pub(crate) struct RunProjectionObservabilityResponse {
-    pub has_durable_projection: bool,
     pub observability_available: bool,
-    pub projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
@@ -398,9 +387,6 @@ impl RunProjectionResponse {
             executor: value.executor,
             transport: value.transport,
             run_event_high_watermark: value.run_event_high_watermark,
-            projection_event_idx: value.projection_event_idx,
-            projection_updated_at: value.projection_updated_at,
-            projection_hash: value.projection_hash,
             latest_event_type: value.latest_event_type,
             total_prompt_tokens: value.total_prompt_tokens,
             total_completion_tokens: value.total_completion_tokens,
@@ -438,25 +424,6 @@ pub(crate) async fn get_run_projection_handler(
     ))
 }
 
-pub(crate) async fn repair_run_projection_handler(
-    State(state): State<AppState>,
-    Path(run_id): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<RunProjectionQuery>,
-) -> Result<Json<RunProjectionRepairResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let user_id = user.user_id.clone();
-    let projection = state
-        .execution
-        .run_lifecycle_service
-        .repair_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
-        .await?;
-    Ok(Json(RunProjectionRepairResponse {
-        repaired: true,
-        projection: build_run_projection_response(&state, &user_id, &run_id, projection).await?,
-    }))
-}
-
 async fn build_run_projection_response(
     state: &AppState,
     user_id: &str,
@@ -465,17 +432,12 @@ async fn build_run_projection_response(
 ) -> Result<RunProjectionResponse, (StatusCode, Json<ErrorResponse>)> {
     projection.recent_events =
         transform_stream_run_events_for_client(run_id, projection.recent_events);
-    let projection_lag_events =
-        (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
     let (observability_available, prompt_request_count, latest_prompt_request) =
         load_run_prompt_observability(state, user_id, run_id).await?;
-    let has_durable_projection = projection.has_durable_projection;
     Ok(RunProjectionResponse::new(
         projection,
         RunProjectionObservabilityResponse {
-            has_durable_projection,
             observability_available,
-            projection_lag_events,
             prompt_request_count,
             latest_prompt_request,
         },
@@ -1084,7 +1046,6 @@ mod tests {
 
     async fn cleanup_run_http_fixture(pool: &astra_core::SharedPool, user_id: &str, run_id: &str) {
         for sql in [
-            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -2345,14 +2306,8 @@ mod tests {
             json.pointer("/latest_checkpoint/checkpoint_version"),
             Some(&json!("checkpoint_v3"))
         );
-        assert_eq!(
-            json.pointer("/observability/projection_lag_events"),
-            Some(&json!(0))
-        );
-        assert_eq!(
-            json.pointer("/observability/has_durable_projection"),
-            Some(&json!(true))
-        );
+        assert_eq!(json.pointer("/observability/projection_lag_events"), None);
+        assert_eq!(json.pointer("/observability/has_durable_projection"), None);
         assert_eq!(
             json.pointer("/observability/observability_available"),
             Some(&json!(false))
@@ -2393,254 +2348,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_run_projection_http_rebuilds_and_returns_projection() {
-        use crate::server::run::engine::RunEngine;
-        use crate::server::run::lifecycle::AgenticRunLifecycleService;
-        use astra_services::runs::InMemoryRunStateStore;
-
-        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        let authority = engine
-            .start_run("run-projection-repair-http", "u1", "session-projection")
-            .await
-            .expect("start durable run");
-        engine
-            .transition_status_with_events_if_current_owner(
-                "u1",
-                "session-projection",
-                "run-projection-repair-http",
-                &[astra_core::STATUS_RUNNING],
-                authority.owner_generation,
-                astra_core::STATUS_FAILED,
-                None,
-                Some("boom"),
-                &[
-                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
-                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
-                ],
-            )
-            .await
-            .expect("persist terminal transition");
-
-        let lifecycle = AgenticRunLifecycleService::new(
-            test_matrixone(),
-            Arc::new(
-                crate::FernetTokenEncryptor::new("0123456789abcdef")
-                    .expect("test encryptor should initialize"),
-            ),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        );
-
+    async fn retired_display_repair_route_returns_not_found() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
+                .with_auth_service(Arc::new(StubAuthService)),
         );
-
-        let resp = app
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/chat/runs/run-projection-repair-http/projection/repair?recent_limit=2")
+                    .uri("/chat/runs/retired-display/projection/repair")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
-                    .expect("request should build"),
+                    .unwrap(),
             )
             .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("repair response should be valid json");
-        assert_eq!(json.get("repaired"), Some(&json!(true)));
-        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
-        assert_eq!(
-            json.pointer("/projection/latest_event_type"),
-            Some(&json!("run_finished"))
-        );
-        assert_eq!(
-            json.pointer("/projection/observability/projection_lag_events"),
-            Some(&json!(0))
-        );
-        assert_eq!(
-            json.pointer("/projection/observability/has_durable_projection"),
-            Some(&json!(true))
-        );
-        let recent_events = json
-            .pointer("/projection/recent_events")
-            .and_then(serde_json::Value::as_array)
-            .expect("recent events should be present");
-        assert_eq!(recent_events.len(), 2);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn repair_run_projection_http_repairs_real_database_projection() {
-        use crate::server::run::engine::RunEngine;
-        use crate::server::run::lifecycle::AgenticRunLifecycleService;
-        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
-        use sqlx::Row;
-        use uuid::Uuid;
-
-        let shared_pool = setup_http_run_db_it().await;
-        let settings = shared_pool.settings().clone();
-        let user_id = "u1";
-        let run_id = format!("run-http-it-{}", Uuid::new_v4());
-        let session_id = format!("session-http-it-{}", Uuid::new_v4());
-        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
-        crate::server::run::insert_active_run_session_fixture(&shared_pool, user_id, &session_id)
-            .await;
-
-        let store: Arc<dyn RunStateStore> = Arc::new(
-            DatabaseRunStateStore::new(shared_pool.clone())
-                .with_owner_pod_id("projection-repair-http-it-pod"),
-        );
-        let engine = RunEngine::new(store);
-        let authority = engine
-            .start_run(&run_id, user_id, &session_id)
-            .await
-            .expect("start durable DB run");
-        let checkpoint_saved = engine
-            .persist_checkpoint(
-                user_id,
-                &session_id,
-                &run_id,
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"http-repair-it"}"#,
-            )
-            .await
-            .expect("save checkpoint before terminal transition");
-        assert!(checkpoint_saved);
-        let transitioned = engine
-            .transition_status_with_events_if_current_owner(
-                user_id,
-                &session_id,
-                &run_id,
-                &[astra_core::STATUS_RUNNING],
-                authority.owner_generation,
-                astra_core::STATUS_FAILED,
-                None,
-                Some("boom"),
-                &[
-                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
-                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
-                ],
-            )
-            .await
-            .expect("persist terminal transition");
-        assert!(transitioned);
-
-        sqlx::query(
-            "UPDATE run_display_projections
-             SET status = 'running',
-                 error_message = NULL,
-                 projection_event_idx = -1,
-                 latest_event_type = 'stale_event',
-                 latest_checkpoint_id = NULL,
-                 latest_checkpoint_kind = NULL,
-                 latest_checkpoint_version = NULL
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(&run_id)
-        .execute(shared_pool.get())
-        .await
-        .expect("corrupt projection");
-
-        let lifecycle = AgenticRunLifecycleService::new(
-            settings,
-            Arc::new(
-                crate::FernetTokenEncryptor::new("0123456789abcdef")
-                    .expect("test encryptor should initialize"),
-            ),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        );
-
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_shared_pool(shared_pool.clone())
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "/chat/runs/{run_id}/projection/repair?recent_limit=2"
-                    ))
-                    .header("authorization", "Bearer good-token")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("repair response should be valid json");
-        assert_eq!(json.get("repaired"), Some(&json!(true)));
-        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
-        assert_eq!(
-            json.pointer("/projection/error_message"),
-            Some(&json!("boom"))
-        );
-        assert_eq!(
-            json.pointer("/projection/latest_event_type"),
-            Some(&json!("run_finished"))
-        );
-        assert_eq!(
-            json.pointer("/projection/latest_checkpoint/checkpoint_version"),
-            Some(&json!("checkpoint_v2"))
-        );
-        assert_eq!(
-            json.pointer("/projection/observability/projection_lag_events"),
-            Some(&json!(0))
-        );
-        let recent_events = json
-            .pointer("/projection/recent_events")
-            .and_then(serde_json::Value::as_array)
-            .expect("recent events should be present");
-        assert_eq!(recent_events.len(), 2);
-
-        let row = sqlx::query(
-            "SELECT status, error_message, projection_event_idx, latest_event_type,
-                    latest_checkpoint_version
-             FROM run_display_projections
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(&run_id)
-        .fetch_one(shared_pool.get())
-        .await
-        .expect("load repaired projection row");
-        let db_status: String = row.try_get("status").expect("status");
-        let db_error: Option<String> = row.try_get("error_message").expect("error_message");
-        let db_event_idx: i64 = row
-            .try_get("projection_event_idx")
-            .expect("projection_event_idx");
-        let db_latest_event: Option<String> =
-            row.try_get("latest_event_type").expect("latest_event_type");
-        let db_checkpoint_version: Option<String> = row
-            .try_get("latest_checkpoint_version")
-            .expect("latest_checkpoint_version");
-        assert_eq!(db_status, astra_core::STATUS_FAILED);
-        assert_eq!(db_error.as_deref(), Some("boom"));
-        // `RunEngine::start_run` persists `run_started` at index 0; the
-        // terminal batch then writes `run_error` and `run_finished`.
-        assert_eq!(db_event_idx, 2);
-        assert_eq!(db_latest_event.as_deref(), Some("run_finished"));
-        assert_eq!(db_checkpoint_version.as_deref(), Some("checkpoint_v2"));
-
-        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
-        crate::server::run::cleanup_run_session_fixture(&shared_pool, user_id, &session_id).await;
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2675,48 +2399,6 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/chat/runs/run-foreign/projection")
-                    .header("authorization", "Bearer good-token")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn repair_run_projection_http_hides_foreign_run() {
-        use crate::server::run::engine::RunEngine;
-        use crate::server::run::lifecycle::AgenticRunLifecycleService;
-        use astra_services::runs::InMemoryRunStateStore;
-
-        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
-            .start_run("run-foreign-repair", "u2", "session-foreign")
-            .await
-            .expect("start durable run");
-        let lifecycle = AgenticRunLifecycleService::new(
-            test_matrixone(),
-            Arc::new(
-                crate::FernetTokenEncryptor::new("0123456789abcdef")
-                    .expect("test encryptor should initialize"),
-            ),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        );
-
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/runs/run-foreign-repair/projection/repair")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
                     .expect("request should build"),

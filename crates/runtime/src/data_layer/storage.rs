@@ -7,7 +7,8 @@ use astra_core::canonical_names::{metadata_duration_ms, metadata_tool_name};
 use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_services::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
+    all_agent_event_rows_were_inserted, canonical_observation_payload_hash, classify_capture,
+    record_observation_collisions,
 };
 use astra_turn_core::contracts::{TurnAuxiliaryEventRecord, TurnSkillSelectionRecord};
 use astra_turn_core::trace_event::TraceEvent;
@@ -389,7 +390,7 @@ pub(crate) async fn insert_trace_events(
             .iter()
             .flat_map(|index| values[*index].nullable_shape(&events[*index])),
     ));
-    insert.build().execute(&mut **tx).await?;
+    let inserted_rows = insert.build().execute(&mut **tx).await?.rows_affected();
 
     let attempts = events
         .iter()
@@ -401,13 +402,24 @@ pub(crate) async fn insert_trace_events(
             payload_hash: &values.payload_hash,
         })
         .collect::<Vec<_>>();
-    let outcomes = classify_agent_event_capture_attempts(
-        tx,
-        &attempts,
-        &ingestion_write_id,
-        TRACE_EVENT_COLLISION_SOURCE,
-    )
-    .await?;
+    let outcomes = if !first.user_id.is_empty()
+        && first.user_id.len() <= 128
+        && !first.session_id.is_empty()
+        && first.session_id.len() <= 128
+        && all_agent_event_rows_were_inserted(
+            inserted_rows,
+            events.iter().map(|event| event.event_id.as_str()),
+        ) {
+        vec![DurableCaptureOutcome::Inserted; events.len()]
+    } else {
+        classify_agent_event_capture_attempts(
+            tx,
+            &attempts,
+            &ingestion_write_id,
+            TRACE_EVENT_COLLISION_SOURCE,
+        )
+        .await?
+    };
     let inserted_indices = outcomes
         .iter()
         .enumerate()

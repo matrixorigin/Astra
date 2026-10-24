@@ -1377,9 +1377,6 @@ export type RunProjectionResponse = {
   transport?: string | null;
   fallback_policy?: string | null;
   run_event_high_watermark: number;
-  projection_event_idx: number;
-  projection_updated_at: string;
-  projection_hash: string;
   latest_event_type?: string | null;
   total_prompt_tokens: number;
   total_completion_tokens: number;
@@ -1392,9 +1389,7 @@ export type RunProjectionResponse = {
     created_at: string;
   } | null;
   observability: {
-    has_durable_projection: boolean;
     observability_available: boolean;
-    projection_lag_events: number;
     prompt_request_count: number;
     latest_prompt_request?: {
       request_id: string;
@@ -1407,10 +1402,7 @@ export type RunProjectionResponse = {
   recent_events: Array<StreamEvent | Record<string, unknown>>;
 };
 
-export type RunProjectionRepairResponse = {
-  repaired: boolean;
-  projection: RunProjectionResponse;
-};
+
 
 export type RunInputRequestBody = {
   idempotencyKey: string;

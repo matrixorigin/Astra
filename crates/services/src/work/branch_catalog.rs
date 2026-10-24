@@ -66,7 +66,7 @@ pub struct WorkBranchCatalog {
 }
 
 /// Point-in-time, owner-scoped runtime status for one active branch. This is a
-/// read projection of the existing Session execution slot and durable root
+/// read projection of the existing Session active root projection and durable root
 /// Run; it does not create or acquire controller authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkBranchActivityObservation {
@@ -240,7 +240,7 @@ impl DatabaseWorkBranchCatalogService {
     ) -> Result<WorkBranchActivityObservation, WorkBranchCatalogError> {
         let row = sqlx::query(
             "SELECT b.branch_revision, b.session_id AS branch_session_id,
-                    slot.run_id AS active_run_id,
+                    active.run_id AS active_run_id,
                     active.status AS active_run_status,
                     active.waiting_for AS active_run_waiting_for,
                     active.session_id AS active_run_session_id,
@@ -251,11 +251,13 @@ impl DatabaseWorkBranchCatalogService {
              JOIN work_branches b
                ON b.owner_id = w.owner_id AND b.work_id = w.work_id
               AND b.archived_at IS NULL
-             LEFT JOIN agent_session_execution_slots slot
-               ON slot.user_id = w.owner_id AND slot.session_id = b.session_id
              LEFT JOIN agent_runs active
-               ON active.user_id = slot.user_id AND active.run_id = slot.run_id
-             WHERE w.owner_id = ? AND w.work_id = ? AND w.archived_at IS NULL
+           ON active.user_id = w.owner_id AND active.session_id = b.session_id
+          AND active.parent_run_id IS NULL AND active.retry_of IS NULL
+          AND active.delegation_id IS NULL AND active.agent_id IS NULL
+          AND (active.status IN ('running', 'waiting')
+               OR (active.status = 'paused' AND active.waiting_for IS NOT NULL))
+         WHERE w.owner_id = ? AND w.work_id = ? AND w.archived_at IS NULL
                AND b.branch_id = ?
              LIMIT 1",
         )
@@ -273,7 +275,7 @@ impl DatabaseWorkBranchCatalogService {
                 let active_run_status =
                     optional_text(&row, "active_run_status")?.ok_or_else(|| {
                         WorkBranchCatalogError::NeedsRepair(
-                            "branch execution slot references a missing Run".into(),
+                            "active root projection references a missing Run".into(),
                         )
                     })?;
                 if optional_text(&row, "active_run_session_id")?.as_deref()
@@ -285,7 +287,7 @@ impl DatabaseWorkBranchCatalogService {
                     || optional_text(&row, "active_run_parent_id")?.is_some()
                 {
                     return Err(WorkBranchCatalogError::NeedsRepair(
-                        "execution slot does not reference this branch's root Run".into(),
+                        "active root projection does not reference this branch's root Run".into(),
                     ));
                 }
                 activity_from_durable_run_status(
@@ -294,7 +296,7 @@ impl DatabaseWorkBranchCatalogService {
                 )
                 .ok_or_else(|| {
                     WorkBranchCatalogError::NeedsRepair(
-                        "execution slot and durable Run status disagree".into(),
+                        "active root projection and durable Run status disagree".into(),
                     )
                 })?
             }

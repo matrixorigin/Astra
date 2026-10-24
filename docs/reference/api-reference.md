@@ -412,3 +412,12 @@ use `/live` and `/ready` for orchestrator probes.
 | 404 | Resource not found |
 | 429 | Rate limited (60 req/min) |
 | 500 | Server error |
+
+### Server chat execution authority
+
+`POST /chat` and `POST /chat/stream` own their Server execution. The request
+field `conversation_authority` is unsupported and rejected as
+`chat_request_invalid`, including when its value is `null`, before Session or
+Run admission. A caller must finish or release an outstanding standalone
+Controller writer before starting Server chat. Session/Work Controller APIs
+and their signed execution grants remain separate supported contracts.

@@ -2495,17 +2495,6 @@ mod tests {
         .execute(pool.get())
         .await
         .expect("active run authority");
-        sqlx::query(
-            "INSERT INTO agent_session_execution_slots
-             (user_id, session_id, run_id, acquired_at, updated_at)
-             VALUES (?, ?, ?, NOW(6), NOW(6))",
-        )
-        .bind(owner.as_str())
-        .bind(session.as_str())
-        .bind(run_id)
-        .execute(pool.get())
-        .await
-        .expect("session execution slot");
     }
 
     fn replacement_start_work_args(goal: &str) -> Value {

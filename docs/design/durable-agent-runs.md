@@ -132,7 +132,7 @@ or evidence that same-run recovery is implemented.
   typed authority and settlement flow, never a status-only write.
 - Lease expiry enables recovery.
 - Fresh creation returns one process-local receipt for the owner generation
-  and initial lease committed with the run, session slot and opening events.
+  and initial lease committed with the Run and immutable opening.
   Initial activation consumes that receipt instead of renewing through another
   pooled connection, whose MatrixOne CN snapshot may predate the creation.
   Its monotonic lease bound starts before the creation operation, including
@@ -176,10 +176,16 @@ or evidence that same-run recovery is implemented.
   post-commit timeout refreshes the display projection on that exceptional
   path; ordinary commits do not add a second refresh.
 - Recovery must avoid double execution of non-idempotent actions.
-- Session execution slots prevent conflicting root runs when required by product semantics.
+- Independent execution admission uses lifecycle fence -> owned Session ->
+  actual Run/custody mutations. Blocking Run status, any live execution lease
+  (including a terminal executor still exiting), and prepared/dispatched/unknown
+  tool custody prevent conflicting admission, Controller reuse and destructive
+  maintenance. There is no derived execution-slot table or reclamation clock.
+  Expired running records wait for canonical recovery rather than allowing a
+  fresh Run to hide unsettled execution.
 - Recovery discovery is only a candidate list. A claim returns the new run
   snapshot and the previous generation observed under the write lock. Database
-  claims keep canonical session/slot/run locks through batch update, frontier
+  claims keep canonical lifecycle/Session/Run locks through batch update, frontier
   readback and commit; neither a pod identifier nor a lease timestamp identifies
   the winning invocation. Collision retries exclude identities already examined
   by that invocation. Generation exhaustion must not partially update a batch.
@@ -246,7 +252,7 @@ Resume should validate:
 - pending side-effect safety;
 - user intent.
 
-Buffered completion may finalize without resuming execution when the answer is already durable.
+A buffered answer does not authorize completion. Resume uses current authorization, custody, execution-slot and Context guards; only the execution owner can commit a terminal outcome.
 
 ### Process restart is not a new user turn
 
@@ -359,20 +365,28 @@ by that wake; its existing settlement completes before the next handoff boundary
 This improves checkpoint capture during shutdown, not durable parking or restart
 execution admission.
 
-The handoff's runtime payload pairs the heavy snapshot with the original turn
-reservation and a canonical WAL continuation transition. The existing transition
-already identifies its committed base and parent result; these are not duplicated
-in another log. Its pending suffix includes the last settled tool results. Writing
-this payload neither invents an inference attempt nor commits a completed user
-turn. In particular, an absent committed conversation cursor must not be replaced
-with a fabricated cursor. The payload retains the existing WAL continuation
-and heavy snapshot for checkpoint custody. The old reservation is identity
-evidence, not renewed authority. Explicit same-run resume obtains a renewed
-writer/reservation pair and checkpoint custody in one coordinator transaction
-before reconstructing execution through the existing background loop.
-The payload preserves the raw submitted user text and original audit timestamp,
-separately from the loop's current input, which steering may replace. Restoration
-must not reconstruct either immutable audit fact from the mutable prompt state.
+The handoff's runtime payload pairs the heavy snapshot with its concrete
+Run-owned Context snapshot and a verified continuation delta. The delta binds
+the admitted durable prefix to the last settled tool boundary inside that same
+checkpoint. In-flight parent transitions are rejected; this is settled
+continuation, not recovery of an unfinished model request. Writing the checkpoint neither invents an inference attempt nor
+commits a completed user turn. An absent conversation cursor remains absent.
+
+Before claiming custody, explicit same-run resume freshly authenticates the
+original session and admits the exact original model identity from a canonical
+store-created admission view. It preserves the original continuation ceiling;
+a new login is not a substitute. The existing coordinator transaction then
+claims Run generation, owner lease and checkpoint custody, and
+verifies the immutable opening hash and Context base. It issues no Controller
+writer lease, turn reservation, operation receipt or authority audit event.
+Exact retry requires the same custody frontier and current live owner.
+A Controller intervention changing the admitted base fences the old execution
+even after that Controller releases its lease.
+
+The immutable Run opening owns the raw submitted user text. The handoff retains
+the loop's current input, which steering may replace, without another audit-input
+copy. Restore reads the original text from that verified opening. The payload
+has no compatibility path for retired Controller reservations or duplicate input.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
@@ -421,7 +435,7 @@ effects and preserves compression tracking; every new host still installs its
 local skill schema. Terminal returns reset the entry for a subsequent user turn;
 a frozen handoff does not return.
 This does not authorize a preamble checkpoint with no current step or with a step
-left over from another logical turn; actual recovery must verify the reservation
+left over from another logical turn; actual recovery must verify the Run-owned Context snapshot
 and frontier together.
 
 Pending runtime context retains its original order, payload and round, excluding
@@ -583,3 +597,56 @@ and does not claim recovery of volatile in-process envelopes after process loss.
   most one executor; deferred activation and blocking waits do not auto-start.
 - Native client release targets acquire, conflict, release, and reacquire the
   session execution authority before they are packaged.
+
+### Tool output ownership
+
+Ordinary tool batches no longer populate separate `session_tool_outputs` and
+`session_tool_output_batches` tables. Those write-only mirrors and their preview
+mapping registry are retired. The shared loop retains governed observations for
+the model and canonical transcript; durable invocation receipts retain actual
+effect outcomes and uncertainty. Explicit large artifacts continue to use the
+existing owner-checked artifact store and its reference/retention lifecycle.
+There is no second per-batch payload transaction or synthetic `tool_output://`
+artifact scheme.
+
+Bindings known before provisioning are included in the Run opening event batch,
+alongside the original admission event. The loop uses those same prepared facts;
+it does not open a second transaction to append an unchanged workspace/executor
+pair. Capacity that must be provisioned after claiming the Run publishes its
+binding only after that provisioning succeeds. Run identity conflicts are
+resolved by the unique insert and existing exact-replay path, rather than an
+additional existence query before every creation.
+
+An atomic root terminal binds raw transcript rows to the Context cursor in that
+same transaction. Raw history keeps the original messages independently of
+Context compaction. The successful terminal does not subsequently reconstruct
+or certify the conversation from diagnostic events or a transcript projection
+head. Reasoning and interaction diagnostics remain available through their
+own event/trace surface rather than an extra copy in ordinary root history.
+
+### Tool progress and outcome storage
+
+Tool starts, routing and transport progress are live presentation. They do not
+open Run event transactions. The process-local replay buffer retains bounded
+outcomes for attached observers; another process may lag during execution.
+Generic tool cards, output previews and artifact-card reconstruction are not
+promised by cold Run replay. Missing optional cards must not delay completion
+or imply tool success; Web and SDK remove cards that have no own ending when
+the Run closes. Live endings retain bounded delivery and duplicate suppression.
+A private live watermark is never stored, exposed, or accepted as effect
+settlement evidence. Governed results and uncertainty stay in the invocation
+ledger/archive; canonical Context retains structured tool messages for model
+continuation. Approval and authenticated Runner evidence keep their existing
+owners. Tool names, provider output and an absent ledger entry never establish
+that an execution is readonly.
+
+Root runs persist optional model-round diagnostic traces only when the existing
+`explain` request is enabled. Resumed roots retain that original choice. Ordinary
+conversation still has canonical Run, Context and effect evidence, plus local
+best-effort observability; it does not enqueue database diagnostic writes after
+HTTP completion. The final flusher uses the same admitted diagnostic choice.
+
+Handoff captures one self-contained canonical continuation from the admitted
+Context base. Normal model rounds maintain no runtime WAL head, linked chain or
+rollup state. Existing credential redaction, rewrite authorization, snapshot
+identity and payload bounds still apply at checkpoint creation.

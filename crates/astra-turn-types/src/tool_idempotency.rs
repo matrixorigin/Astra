@@ -34,6 +34,14 @@ impl ToolIdempotency {
 /// Pass `args = None` when args are unavailable (e.g. static schema audits);
 /// action-sensitive tools then return the conservative `NonIdempotent`.
 pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolIdempotency {
+    if args.is_some_and(|args| {
+        crate::agent_tool_contract::agent_invocation_semantics(tool_name, args)
+            .ok()
+            .flatten()
+            .is_some_and(|semantics| semantics.run_observation)
+    }) {
+        return ToolIdempotency::PureRead;
+    }
     match tool_name {
         // ── Consolidated `memory` tool: branch on the `action` field. ──
         //
@@ -80,9 +88,6 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "memory_search"
         | "memory_retrieve"
         | "memory_profile"
-        | "session_history_page"
-        | "session_history_search"
-        | "session_history_around"
         | "inspect_work_plan"
         | "inspect_work_criteria"
         | "mo_query"

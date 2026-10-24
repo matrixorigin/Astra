@@ -117,7 +117,6 @@ criteria:
     min: 0
     max: 0
   - type: session_subsystem_healthy
-    settled_subsystem: post_loop_memory
   - type: tools_count_between
     min: 1
     max: 12

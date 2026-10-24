@@ -10,7 +10,7 @@ mod isolated_database;
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore, ToolOutputBatchItem,
+    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, mysql::MySqlConnection};
@@ -64,6 +64,10 @@ fn make_idempotent_event(
 
 fn durable_run_record(run_id: String, user_id: String, session_id: String) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id,
         user_id,
         session_id,
@@ -689,10 +693,7 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
+
     let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .execute(_pool.get())
@@ -820,9 +821,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
     assert_eq!(index, baseline_index + 3);
     for table in [
         "agent_run_events",
-        "run_display_projections",
         "agent_runs",
-        "agent_session_execution_slots",
         "agent_session_lifecycle_fences",
         "agent_sessions",
     ] {
@@ -1006,10 +1005,7 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .bind(&run_id)
         .execute(_pool.get())
         .await;
-    let _ = sqlx::query("DELETE FROM run_display_projections WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
+
     let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
         .execute(_pool.get())
@@ -1096,7 +1092,6 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
     for run_id in [run_id.as_str(), malformed_run_id.as_str()] {
         for statement in [
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
-            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
             let _ = sqlx::query(statement)
@@ -1106,337 +1101,6 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
                 .await;
         }
     }
-}
-
-/// Owner isolation: dirty tool output rows for another user/session with the
-/// same batch/output identity must not block or contaminate the owner batch.
-#[tokio::test]
-#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn tool_output_batches_isolate_identity_by_owner_session() {
-    let (_pool, store) = setup().await;
-    let owner_user_id = format!("tool-owner-{}", uuid::Uuid::new_v4());
-    let foreign_user_id = format!("tool-foreign-{}", uuid::Uuid::new_v4());
-    let owner_session_id = format!("tool-owner-session-{}", uuid::Uuid::new_v4());
-    let foreign_session_id = format!("tool-foreign-session-{}", uuid::Uuid::new_v4());
-    let run_id = format!("tool-run-{}", uuid::Uuid::new_v4());
-    let foreign_run_id = format!("tool-foreign-run-{}", uuid::Uuid::new_v4());
-    let batch_id = format!("batch-{}", uuid::Uuid::new_v4());
-    let output_id = format!("output-{}", uuid::Uuid::new_v4());
-    let missing_tool_name = format!("missing-tool-{}", uuid::Uuid::new_v4());
-
-    insert_run_fixture(
-        &_pool,
-        store.as_ref(),
-        durable_run_record(
-            run_id.clone(),
-            owner_user_id.clone(),
-            owner_session_id.clone(),
-        ),
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO session_tool_output_batches
-         (batch_id, session_id, run_id, user_id, output_count, payload_bytes, status, created_at)
-         VALUES (?, ?, ?, ?, 1, 17, 'committed', NOW(6))",
-    )
-    .bind(&batch_id)
-    .bind(&foreign_session_id)
-    .bind(&foreign_run_id)
-    .bind(&foreign_user_id)
-    .execute(_pool.get())
-    .await
-    .expect("insert foreign dirty batch");
-    sqlx::query(
-        "INSERT INTO session_tool_outputs
-         (output_id, batch_id, session_id, run_id, user_id, output_idx, parent_output_id,
-          tool_call_id, tool_name, output_json, payload_bytes, preview_text, preview_status,
-          artifact_ref, content_hash, normalize_version, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, NULL, 'foreign-call', 'bash', ?, 17, 'foreign',
-                 'template', NULL, 'foreign-hash', 'raw_v1', NOW(6))",
-    )
-    .bind(&output_id)
-    .bind(&batch_id)
-    .bind(&foreign_session_id)
-    .bind(&foreign_run_id)
-    .bind(&foreign_user_id)
-    .bind(r#"{"source":"foreign_row"}"#)
-    .execute(_pool.get())
-    .await
-    .expect("insert foreign dirty output");
-
-    store
-        .insert_tool_output_batch(
-            &batch_id,
-            &owner_session_id,
-            &run_id,
-            &owner_user_id,
-            &[ToolOutputBatchItem {
-                output_id: output_id.clone(),
-                tool_call_id: Some("owner-call".into()),
-                tool_name: missing_tool_name.clone(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    "owner_row",
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            }],
-        )
-        .await
-        .expect("owner tool output batch insert");
-
-    let same_batch_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM session_tool_output_batches WHERE batch_id = ?")
-            .bind(&batch_id)
-            .fetch_one(_pool.get())
-            .await
-            .unwrap();
-    assert_eq!(
-        same_batch_count, 2,
-        "batch identity must include owner/session"
-    );
-
-    let same_output_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_tool_outputs WHERE batch_id = ? AND output_idx = 0",
-    )
-    .bind(&batch_id)
-    .fetch_one(_pool.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        same_output_count, 2,
-        "output batch ordering must include owner/session"
-    );
-
-    let owner_payload: String = sqlx::query_scalar(
-        "SELECT output_json FROM session_tool_outputs
-         WHERE user_id = ? AND session_id = ? AND output_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_session_id)
-    .bind(&output_id)
-    .fetch_one(_pool.get())
-    .await
-    .unwrap();
-    assert!(
-        owner_payload.contains("owner_row"),
-        "owner output payload must not be overwritten by foreign row: {owner_payload}"
-    );
-
-    let owner_event_count: i64 = sqlx::query_scalar(
-        "SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&owner_session_id)
-    .bind(&owner_user_id)
-    .fetch_one(_pool.get())
-    .await
-    .expect("load owner event_count");
-    assert_eq!(
-        owner_event_count, 0,
-        "fallback persistence must not change session event_count"
-    );
-
-    let missing_event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events
-         WHERE session_id = ? AND user_id = ? AND event_type = 'preview_template_missing'
-           AND meta_tool_name = ?",
-    )
-    .bind(&owner_session_id)
-    .bind(&owner_user_id)
-    .bind(&missing_tool_name)
-    .fetch_one(_pool.get())
-    .await
-    .expect("count owner preview-template diagnostic events");
-    assert_eq!(missing_event_count, 0);
-
-    let _ = sqlx::query("DELETE FROM session_tool_outputs WHERE batch_id = ?")
-        .bind(&batch_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM session_tool_output_batches WHERE batch_id = ?")
-        .bind(&batch_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query(
-        "DELETE FROM agent_events
-         WHERE (session_id = ? AND user_id = ?)
-            OR (session_id = ? AND user_id = ?)",
-    )
-    .bind(&owner_session_id)
-    .bind(&owner_user_id)
-    .bind(&foreign_session_id)
-    .bind(&foreign_user_id)
-    .execute(_pool.get())
-    .await;
-    let _ = sqlx::query("DELETE FROM agent_runs WHERE run_id = ?")
-        .bind(&run_id)
-        .execute(_pool.get())
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-        .bind(&owner_session_id)
-        .bind(&owner_user_id)
-        .execute(_pool.get())
-        .await;
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn tool_output_batches_fence_all_tools_without_session_diagnostic_mutations() {
-    let (pool, store) = setup().await;
-    let user_id = format!("preview-user-{}", uuid::Uuid::new_v4());
-    let session_id = format!("preview-session-{}", uuid::Uuid::new_v4());
-    sqlx::query(
-        "INSERT INTO agent_sessions
-         (user_id, session_id, status, event_count, last_event_id, created_at, updated_at, last_active_at)
-         VALUES (?, ?, 'active', 7, 'prior-event', '2026-01-01', '2026-01-01', '2026-01-01')",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .execute(pool.get()).await.unwrap();
-
-    for state in ["active", "deleting", "pending_delete", "deleted", "missing"] {
-        if state == "deleting" {
-            sqlx::query("UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-        } else if state == "pending_delete" {
-            // An active root must still be rejected by the durable fence.
-            sqlx::query(
-                "UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
-            sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-        } else if state == "deleted" {
-            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id)
-                .bind(&session_id)
-                .execute(pool.get())
-                .await
-                .unwrap();
-            sqlx::query("UPDATE agent_session_lifecycle_fences SET database_deleted_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-                .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
-        } else if state == "missing" {
-            sqlx::query(
-                "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
-        }
-
-        for name in [
-            "read_file",
-            "ask_user",
-            "unknown_preview_tool",
-            "empty_batch",
-        ] {
-            let batch_id = uuid::Uuid::new_v4().to_string();
-            let items = if name == "empty_batch" {
-                vec![]
-            } else {
-                vec![ToolOutputBatchItem {
-                    output_id: uuid::Uuid::new_v4().to_string(),
-                    tool_call_id: None,
-                    tool_name: name.to_string(),
-                    result: astra_turn_types::ToolInvocationResultPayload::new(
-                        "bounded output",
-                        Default::default(),
-                        None,
-                    )
-                    .unwrap(),
-                }]
-            };
-            // Retrying must neither manufacture diagnostic events nor escape admission.
-            for _ in 0..2 {
-                let result = store
-                    .insert_tool_output_batch(
-                        &batch_id,
-                        &session_id,
-                        "preview-run",
-                        &user_id,
-                        &items,
-                    )
-                    .await;
-                if state == "active" {
-                    result.unwrap();
-                } else {
-                    assert!(
-                        matches!(
-                            result,
-                            Err(astra_services::runs::DatabaseRunStateStoreError::Database {
-                                operation: "admit_tool_output_batch",
-                                source: sqlx::Error::RowNotFound,
-                                ..
-                            })
-                        ),
-                        "{state}/{name}: {result:?}"
-                    );
-                }
-            }
-            for table in ["session_tool_output_batches", "session_tool_outputs"] {
-                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?")))
-                    .bind(&user_id).bind(&session_id).bind(&batch_id).fetch_one(pool.get()).await.unwrap();
-                let expected = if state == "active"
-                    && (table == "session_tool_output_batches" || !items.is_empty())
-                {
-                    1
-                } else {
-                    0
-                };
-                assert_eq!(count, expected, "{state}/{name}/{table}");
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "DELETE FROM {table} WHERE user_id = ? AND session_id = ? AND batch_id = ?"
-                )))
-                .bind(&user_id)
-                .bind(&session_id)
-                .bind(&batch_id)
-                .execute(pool.get())
-                .await
-                .unwrap();
-            }
-        }
-        let events: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(events, 0);
-        if state == "active" {
-            let unchanged: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?
-                 AND event_count = 7 AND last_event_id = 'prior-event'
-                 AND updated_at = '2026-01-01' AND last_active_at = '2026-01-01'",
-            )
-            .bind(&user_id)
-            .bind(&session_id)
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
-            assert_eq!(
-                unchanged, 1,
-                "preview persistence cannot mutate session diagnostics or activity"
-            );
-        }
-    }
-    let roots: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(roots, 0, "output writes must not lazily recreate a session");
 }
 
 /// Batch write: single-event append_event uses batch path and works.
@@ -1684,8 +1348,7 @@ async fn concurrent_run_inserts_share_one_session_slot() {
     );
 
     let slot_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ?",
+        "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
     )
     .bind(&user_id)
     .bind(&session_id)
@@ -1706,9 +1369,7 @@ async fn concurrent_run_inserts_share_one_session_slot() {
     assert_eq!(fence_count, 1, "the first admission must create one fence");
 
     for table in [
-        "run_display_projections",
         "agent_run_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_session_lifecycle_fences",
         "agent_sessions",
@@ -1817,10 +1478,6 @@ async fn session_deletion_competes_safely_with_run_admission() {
             "agent_run_events",
             "user_id = ? AND session_id = ? AND run_id = ?",
         ),
-        (
-            "run_display_projections",
-            "user_id = ? AND session_id = ? AND run_id = ?",
-        ),
     ] {
         let statement = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
@@ -1842,10 +1499,7 @@ async fn session_deletion_competes_safely_with_run_admission() {
     .expect("count deleted session root");
     assert_eq!(session_count, 0, "session deletion must remove the root");
 
-    for table in [
-        "agent_session_execution_slots",
-        "agent_session_lifecycle_fences",
-    ] {
+    for table in ["agent_session_lifecycle_fences"] {
         let statement = format!("DELETE FROM {table} WHERE user_id = ? AND session_id = ?");
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(&user_id)
@@ -2548,8 +2202,6 @@ async fn batched_probe_conflicts_collation_and_overlapping_writers_preserve_atom
     }
     for table in [
         "agent_run_events",
-        "run_display_projections",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
         "agent_session_lifecycle_fences",

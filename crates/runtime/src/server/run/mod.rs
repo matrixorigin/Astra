@@ -36,3 +36,15 @@ pub(crate) async fn cleanup_run_session_fixture(
         .await
         .expect("cleanup run test session fixture");
 }
+
+/// Corrupt serialized admission in negative tests without exposing a mutable
+/// production opening API. Delivery events remain a separate projection.
+#[cfg(test)]
+pub(crate) fn mutate_run_opening_fixture(
+    run: &mut astra_services::runs::DurableRunRecord,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut opening = serde_json::to_value(run.opening.as_ref().unwrap()).unwrap();
+    mutate(&mut opening);
+    run.opening = Some(serde_json::from_value(opening).unwrap());
+}

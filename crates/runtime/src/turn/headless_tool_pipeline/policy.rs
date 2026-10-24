@@ -723,7 +723,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         execution: &HeadlessResolvedExecution,
         idem_key: Option<&IdempotencyKey>,
     ) -> bool {
-        if execution.is_edge_tool || !READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+        if self.ctx.runtime_tool_executor.is_some()
+            || execution.is_edge_tool
+            || !READ_ONLY_TOOLS.contains(&execution.name.as_str())
+        {
             return false;
         }
         let Some(idem_key) = idem_key else {
@@ -767,7 +770,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             if catalog_replay {
                 return false;
             }
-            cached.output = modified;
+            cached.output =
+                astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&modified).content;
         }
         if !self.ctx.quiet {
             self.ctx.term.emit_line(

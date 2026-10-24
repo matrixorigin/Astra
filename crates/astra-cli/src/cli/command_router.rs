@@ -1424,7 +1424,7 @@ mod token_refresh_error_tests {
                     "/chat/runs/root/projection",
                     serde_json::json!({
                         "run_id":projection_run, "session_id":projection_session,
-                        "run_event_high_watermark":7, "projection_event_idx":7,
+                        "run_event_high_watermark":7,
                         "recent_events":[{"index":7,"type":"run_finished"}],
                     }),
                     u64::from(!truncated),

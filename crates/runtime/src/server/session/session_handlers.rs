@@ -175,7 +175,6 @@ pub(crate) struct CanonicalHeadObservabilityResponse {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
-    pub active_run_projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
@@ -623,13 +622,8 @@ pub(crate) async fn get_session_state_handler(
     let state_summary = load_state_summary(pool, &session.user_id, &session.session_id).await?;
     let artifact_previews =
         load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
-    let projection_observability = load_session_projection_observability(
-        pool,
-        &session.user_id,
-        &session.session_id,
-        active_run.as_ref(),
-    )
-    .await?;
+    let projection_observability =
+        load_session_projection_observability(pool, &session.user_id, &session.session_id).await?;
     let active_run = active_run.map(|mut run| {
         run.replay_required = run_event_replay_required;
         run.replay_start_event_idx = if run_event_replay_required {
@@ -1024,28 +1018,7 @@ async fn load_session_projection_observability(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
-    active_run: Option<&ActiveRunProjection>,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
-    let active_run_projection_lag_events = if let Some(active_run) = active_run {
-        let row = sqlx::query(
-            "SELECT projection_event_idx
-             FROM run_display_projections
-             WHERE run_id = ? AND user_id = ?",
-        )
-        .bind(&active_run.run_id)
-        .bind(user_id)
-        .fetch_optional(pool.get())
-        .await
-        .map_err(internal_error)?;
-        let projection_event_idx = row
-            .map(|row| session_row_i64(&row, "projection_event_idx"))
-            .transpose()
-            .map_err(internal_error)?
-            .unwrap_or(-1);
-        (active_run.run_event_high_watermark - projection_event_idx).max(0)
-    } else {
-        0
-    };
     let prompt_request_count =
         astra_services::count_prompt_requests_for_session(pool, user_id, session_id)
             .await
@@ -1145,7 +1118,6 @@ async fn load_session_projection_observability(
         .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
-        active_run_projection_lag_events,
         prompt_request_count,
         latest_prompt_request,
         canonical_heads,
@@ -2032,23 +2004,12 @@ fn default_fork_list_limit() -> u32 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionSegmentBatchRequest {
-    pub segment_hashes: Vec<String>,
+    pub manifest_root: String,
 }
 
 #[derive(Serialize)]
 pub(crate) struct SessionSegmentBatchResponse {
     pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionSegmentUploadRequest {
-    pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct SessionSegmentUploadResponse {
-    pub stored_segment_hashes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -2717,53 +2678,13 @@ pub(crate) async fn get_session_segments_handler(
         .as_ref()
         .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
     let segments = coordinator
-        .load_segments(
+        .load_manifest_content(
             &server_session_key(&user.user_id, &session.session_id),
-            &request.segment_hashes,
+            &request.manifest_root,
         )
         .await
         .map_err(session_context_http_error)?;
     Ok(Json(SessionSegmentBatchResponse { segments }))
-}
-
-pub(crate) async fn upload_session_segments_handler(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<SessionSegmentUploadRequest>,
-) -> Result<Json<SessionSegmentUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let session = state
-        .session_service
-        .get_session(session_id, user.user_id.clone())
-        .await?;
-    let pool = state
-        .shared_pool
-        .as_ref()
-        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
-    let _device = verify_device_proof_from_headers(
-        pool,
-        &user.user_id,
-        &session.session_id,
-        &headers,
-        DeviceProofPurpose::Publish,
-    )
-    .await?;
-    let key = server_session_key(&user.user_id, &session.session_id);
-    state
-        .session_context_coordinator
-        .as_ref()
-        .ok_or_else(|| internal_error("session context coordinator is not configured"))?
-        .store_segments(&key, &request.segments)
-        .await
-        .map_err(session_context_http_error)?;
-    Ok(Json(SessionSegmentUploadResponse {
-        stored_segment_hashes: request
-            .segments
-            .into_iter()
-            .map(|segment| segment.segment_hash)
-            .collect(),
-    }))
 }
 
 pub(crate) async fn issue_session_execution_grant_handler(
@@ -2915,10 +2836,14 @@ fn session_context_http_error(
         astra_services::SessionContextCoordinatorError::Invalid(message) => {
             error_response(StatusCode::BAD_REQUEST, message)
         }
+        astra_services::SessionContextCoordinatorError::ResourceLimit(message) => {
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, message)
+        }
         astra_services::SessionContextCoordinatorError::SegmentNotFound => {
             error_response(StatusCode::NOT_FOUND, error.to_string())
         }
         astra_services::SessionContextCoordinatorError::Fenced
+        | astra_services::SessionContextCoordinatorError::ExecutionOccupied(_)
         | astra_services::SessionContextCoordinatorError::SessionLifecycleFenced
         | astra_services::SessionContextCoordinatorError::Expired => {
             error_response(StatusCode::CONFLICT, error.to_string())
@@ -4005,7 +3930,6 @@ mod tests {
             match column {
                 "item_seq" => Ok(7),
                 "last_monotonic_id" => Ok(42),
-                "projection_event_idx" => Ok(8),
                 "total" => Ok(4),
                 "total_estimated_tokens" => Ok(123),
                 "high_watermark" => Ok(11),

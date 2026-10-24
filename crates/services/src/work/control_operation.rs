@@ -293,6 +293,26 @@ impl DatabaseWorkBranchControlService {
         let idempotency_hash = identity_hash(&request.request_id);
         let candidate_operation_id = Uuid::new_v4().to_string();
         let mut tx = self.begin("begin").await?;
+        // Fence the Session before Work/control rows, matching Run admission
+        // and recovery capture. Recheck the branch identity under its lock.
+        let session_hint: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM work_branches WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+        ).bind(request.owner_id.as_str()).bind(request.work_id.as_str())
+            .bind(request.branch_id.as_str()).fetch_optional(&mut *tx).await
+            .map_err(|source| database_error("read control Session", source))?;
+        let execution = if let Some(session_id) = &session_hint {
+            Some(
+                crate::storage::admit_session_execution_write_with_facts(
+                    &mut tx,
+                    session_id,
+                    request.owner_id.as_str(),
+                )
+                .await
+                .map_err(|source| database_error("admit control Session", source))?,
+            )
+        } else {
+            None
+        };
         let admitted = sqlx::query(
             "SELECT operation_id, request_hash, operation_state
              FROM work_branch_control_operations
@@ -376,6 +396,14 @@ impl DatabaseWorkBranchControlService {
 
         lock_active_work(&mut tx, &request.owner_id, &request.work_id).await?;
         let branch = lock_branch(&mut tx, request).await?;
+        let execution = execution
+            .as_ref()
+            .filter(|facts| facts.belongs_to(request.owner_id.as_str(), &branch.session_id))
+            .ok_or_else(|| {
+                WorkBranchControlError::NeedsRepair(
+                    "Work branch Session changed during control admission".into(),
+                )
+            })?;
         let observed_revision = WorkBranchRevision::new(branch.branch_revision).map_err(|_| {
             WorkBranchControlError::NeedsRepair("invalid stored Work branch revision".into())
         })?;
@@ -404,6 +432,7 @@ impl DatabaseWorkBranchControlService {
             match mutate_idle_controller_in_transaction(
                 &mut tx,
                 &key,
+                execution,
                 &request.attachment_id,
                 mutation,
                 Some(&request.expected_basis),

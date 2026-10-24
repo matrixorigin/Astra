@@ -12,8 +12,8 @@ use tower::util::ServiceExt;
 use super::harness::{
     MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
     delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty,
-    post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str, row_get_str,
-    seed_pending_approval, seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
+    post_json, post_json_with_headers, put_json, seed_pending_approval, seeded_model_selection,
+    tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -878,6 +878,7 @@ pub async fn run_product_matrix_full_journey(
         "agent_id": agent_id,
         "session_id": session_id,
         "message": "matrix journey ping",
+        "explain": true,
     "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
@@ -922,80 +923,36 @@ pub async fn run_product_matrix_full_journey(
         pool,
         &user_id,
         &session_id,
-        &["user_query", "llm_response"],
+        &["trace_span"],
         std::time::Duration::from_secs(30),
     )
     .await;
 
-    let recs = sqlx::query(
-        "SELECT event_id, session_id, user_id, event_type, content, parent_event_id, \
-         causal_chain_id, token_input, token_output, token_total, llm_model_used, reasoning_content \
-         FROM agent_events WHERE session_id = ? AND user_id = ? ORDER BY created_at ASC",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_all(pool)
-    .await
-    .expect("select agent_events");
+    let transcript_rows = sqlx::query(
+        "SELECT role, content FROM session_transcript_items WHERE user_id = ? AND session_id = ? ORDER BY item_seq"
+    ).bind(&user_id).bind(&session_id).fetch_all(pool).await.unwrap();
+    for (role, text) in [("user", "matrix journey ping"), ("assistant", LLM_TEXT)] {
+        assert!(
+            transcript_rows
+                .iter()
+                .any(|row| row.get::<String, _>("role") == role
+                    && row.get::<String, _>("content") == text),
+            "canonical history must retain {role} content"
+        );
+    }
 
-    let user_q = recs
-        .iter()
-        .find(|r| {
-            row_get_str(r, "event_type") == "user_query"
-                && row_get_str(r, "content").contains("matrix journey ping")
-        })
-        .expect("user_query event from chat/stream");
-    assert_eq!(row_get_str(user_q, "session_id"), session_id);
-    assert_eq!(row_get_str(user_q, "user_id"), user_id);
-    assert!(!row_get_str(user_q, "event_id").is_empty());
-    let cc = row_get_opt_str(user_q, "causal_chain_id").unwrap_or_default();
-    assert!(
-        !cc.is_empty(),
-        "causal_chain_id should be set on user_query"
-    );
-
-    let llm = recs
-        .iter()
-        .find(|r| {
-            row_get_str(r, "event_type") == "llm_response"
-                && row_get_str(r, "content").contains(LLM_TEXT)
-        })
-        .expect("llm_response from chat/stream with expected assistant text");
-    assert_eq!(row_get_str(llm, "session_id"), session_id);
-    assert_eq!(row_get_str(llm, "user_id"), user_id);
-    let llm_content = row_get_str(llm, "content");
-    assert!(
-        llm_content.contains(LLM_TEXT),
-        "llm_response content: {llm_content}"
-    );
-    let uq_event_id = row_get_str(user_q, "event_id");
+    let run = sqlx::query(
+        "SELECT status, total_prompt_tokens, total_completion_tokens, total_tool_calls, resolved_model_name
+         FROM agent_runs WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL
+         ORDER BY created_at DESC LIMIT 1"
+    ).bind(&user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(run.get::<String, _>("status"), "completed");
+    assert_eq!(run.get::<i64, _>("total_prompt_tokens"), 5);
+    assert_eq!(run.get::<i64, _>("total_completion_tokens"), 15);
+    assert_eq!(run.get::<i64, _>("total_tool_calls"), 0);
     assert_eq!(
-        row_get_opt_str(llm, "parent_event_id").as_deref(),
-        Some(uq_event_id.as_str()),
-        "llm_response should parent to user_query"
-    );
-
-    let llm_round = recs
-        .iter()
-        .find(|r| {
-            row_get_str(r, "event_type") == "llm_round_completed"
-                && row_get_str(r, "event_id").starts_with("trace:round_done:")
-        })
-        .expect("llm_round_completed event from server-owned stream");
-    assert_eq!(row_get_opt_i64(llm_round, "token_input"), Some(5));
-    assert_eq!(row_get_opt_i64(llm_round, "token_output"), Some(15));
-    assert_eq!(row_get_opt_i64(llm_round, "token_total"), Some(20));
-    assert!(
-        row_get_opt_str(llm_round, "llm_model_used")
-            .as_deref()
-            .is_some_and(|model| model.starts_with("mock-")),
-        "server-owned stream should persist the seeded mock model"
-    );
-    assert!(
-        row_get_opt_str(llm, "reasoning_content")
-            .map(|s| s.is_empty())
-            .unwrap_or(true),
-        "reasoning_content should be empty for mock round with reasoning: \"\""
+        run.get::<String, _>("resolved_model_name"),
+        format!("mock-{}", ctx.suffix)
     );
 
     // A session is resumable only after it has a durable conversation
@@ -1073,34 +1030,26 @@ pub async fn run_product_matrix_full_journey(
         "agent_sessions.status after POST .../resume"
     );
 
-    let turn_cnt_row = sqlx::query(
-        "SELECT COUNT(*) AS c FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'user_query'",
+    let (status, turns) = get_json(
+        app,
+        &format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
+        Some(auth_header),
+        &[],
     )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool)
-    .await
-    .expect("turn events count");
-    let n_turns: i64 = turn_cnt_row.try_get("c").unwrap_or(0);
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        n_turns >= 1,
-        "expected >=1 session turn events after chat/stream for audit detail, got {n_turns}"
+        turns["turns"].as_array().unwrap().is_empty(),
+        "Server turns do not synthesize legacy audit roots"
     );
-    let last_turn_n = n_turns as u32;
-    let turn_detail_path = format!("/sessions/{session_id}/audit/turns/{last_turn_n}");
-    let (st_td, td_j) = get_json(app, &turn_detail_path, Some(auth_header), &[]).await;
-    assert_eq!(st_td, StatusCode::OK, "audit turn detail: {td_j}");
-    assert_eq!(
-        td_j["turn"].as_u64(),
-        Some(u64::from(last_turn_n)),
-        "turn detail index: {td_j}"
-    );
-    let ui = td_j["user_input"].as_str().unwrap_or("");
-    assert!(
-        ui.contains("matrix journey ping"),
-        "turn detail user_input should include user prompt: {td_j}"
-    );
+    let (status, _) = get_json(
+        app,
+        &format!("/sessions/{session_id}/audit/turns/1"),
+        Some(auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let tool_turn_sse =
         run_tool_backed_chat_turn(app, ctx, auth_header, &session_id, &agent_id).await;
@@ -1108,80 +1057,38 @@ pub async fn run_product_matrix_full_journey(
         tool_turn_sse.contains("\"type\":\"tool_request\""),
         "tool-backed chat should emit tool_request: {tool_turn_sse}"
     );
-    wait_for_agent_event_types(
-        pool,
-        &user_id,
-        &session_id,
-        &["context_trace_signal"],
-        std::time::Duration::from_secs(30),
-    )
-    .await;
-
-    let trace_row = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if let Some(row) = sqlx::query(
-                "SELECT \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.turn_id')) AS turn_id, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) AS selected_tool, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.surface_scope')) AS surface_scope, \
-                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.tools_available')) AS SIGNED) AS tools_available \
-                 FROM agent_events \
-                 WHERE session_id = ? \
-                   AND user_id = ? \
-                   AND event_type = 'context_trace_signal' \
-                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) IS NOT NULL \
-                 ORDER BY created_at DESC \
-                 LIMIT 1",
-            )
-            .bind(&session_id)
-            .bind(&user_id)
-            .fetch_optional(pool)
-            .await
-            .expect("latest tool-backed context_trace_signal event")
-            {
-                break row;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "timeout waiting for tool-backed context_trace_signal for session_id={session_id}"
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
+    // Check the selected and consumed tool at the provider boundary. The
+    // latest context display is a projection of the final request and need
+    // not retain an earlier request's tool catalog or its ordering.
+    let requests = ctx.native_provider_requests().await;
+    let tool_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "user" && message["content"] == "read README through a tool"
+                })
+            })
+        })
+        .collect();
     assert!(
-        trace_row
-            .try_get::<Option<String>, _>("turn_id")
-            .ok()
-            .flatten()
-            .is_some_and(|turn_id| turn_id.starts_with("turn-")),
-        "context trace event should carry turn_id"
-    );
-    assert_eq!(
-        trace_row
-            .try_get::<Option<String>, _>("selected_tool")
-            .ok()
-            .flatten()
-            .as_deref(),
-        Some("read_file"),
-        "context trace event should persist selected tool"
+        tool_requests.iter().any(
+            |request| request.body["tools"].as_array().is_some_and(|tools| tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file"))
+        )
     );
     assert!(
-        trace_row
-            .try_get::<Option<String>, _>("surface_scope")
-            .ok()
-            .flatten()
-            .is_some_and(|surface_scope| !surface_scope.is_empty()),
-        "context trace event should persist tool surface scope"
-    );
-    assert!(
-        trace_row
-            .try_get::<Option<i64>, _>("tools_available")
-            .ok()
-            .flatten()
-            .is_some_and(|tools_available| tools_available >= 1),
-        "context trace event should persist available tool count"
+        tool_requests
+            .iter()
+            .any(|request| request.body["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("from tool-backed matrix e2e"))
+                })))
     );
 
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;

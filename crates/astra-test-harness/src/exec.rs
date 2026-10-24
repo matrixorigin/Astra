@@ -2170,14 +2170,6 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 run.parent_run_id = Some(root.into());
             }
         }
-        capture
-            .reflection
-            .model_requests
-            .terminal
-            .as_mut()
-            .unwrap()
-            .groups[0]
-            .parent_run_id = Some(root.into());
         for fact in capture.reflection.graph_slice.nodes[0]
             .metadata
             .as_mut()

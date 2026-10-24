@@ -460,9 +460,8 @@ impl DatabaseSessionForkCoordinator {
     }
 
     /// Collect manifest records whose owning session was deleted after every
-    /// fork retention pin was released. Segment payload GC remains a separate
-    /// owner-scoped reachability pass, so this bounded job never scans JSON or
-    /// performs per-segment refcount fanout.
+    /// fork retention pin was released. Node-local payloads are deleted with
+    /// their manifest row, without JSON scans or per-segment refcount fanout.
     pub async fn collect_unpinned_orphan_manifests(
         &self,
         limit: u32,
@@ -522,80 +521,6 @@ impl DatabaseSessionForkCoordinator {
             .await
             .map_err(|source| database_error("commit_collect_orphan_manifests", source))?;
         connection.release();
-        Ok(result.rows_affected())
-    }
-
-    /// Remove normalized segment references after their manifest node is gone.
-    ///
-    /// This runs after manifest collection and is deliberately bounded so one
-    /// tenant's old history cannot monopolize a maintenance sweep.
-    pub async fn collect_orphaned_manifest_segment_references(
-        &self,
-        limit: u32,
-    ) -> Result<u64, SessionForkCoordinatorError> {
-        if limit == 0 || limit > 10_000 {
-            return Err(SessionForkCoordinatorError::Invalid(
-                "cleanup limit must be between 1 and 10000".into(),
-            ));
-        }
-        let result = sqlx::query(
-            "DELETE FROM conversation_manifest_segments
-             WHERE NOT EXISTS (
-                       SELECT 1 FROM conversation_manifest_nodes
-                       WHERE conversation_manifest_nodes.isolation_domain =
-                                 conversation_manifest_segments.isolation_domain
-                         AND conversation_manifest_nodes.owner_user_id =
-                                 conversation_manifest_segments.owner_user_id
-                         AND conversation_manifest_nodes.session_id =
-                                 conversation_manifest_segments.session_id
-                         AND conversation_manifest_nodes.branch_id =
-                                 conversation_manifest_segments.branch_id
-                         AND conversation_manifest_nodes.manifest_root =
-                                 conversation_manifest_segments.manifest_root
-                   )
-             ORDER BY created_at ASC LIMIT ?",
-        )
-        .bind(i64::from(limit))
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| database_error("collect_orphan_manifest_segment_refs", source))?;
-        Ok(result.rows_affected())
-    }
-
-    /// Collect owner-deduplicated segment payloads with no manifest reference.
-    ///
-    /// A staging grace protects uploads that have not reached `commit_turn`
-    /// yet. Committed manifests install their references transactionally, so
-    /// anything older than the grace and still unreferenced is abandoned.
-    pub async fn collect_unreferenced_conversation_segments(
-        &self,
-        limit: u32,
-    ) -> Result<u64, SessionForkCoordinatorError> {
-        const STAGING_GRACE_SECS: i64 = 24 * 60 * 60;
-        if limit == 0 || limit > 10_000 {
-            return Err(SessionForkCoordinatorError::Invalid(
-                "cleanup limit must be between 1 and 10000".into(),
-            ));
-        }
-        let result = sqlx::query(
-            "DELETE FROM conversation_segments
-             WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
-               AND NOT EXISTS (
-                       SELECT 1 FROM conversation_manifest_segments
-                       WHERE conversation_manifest_segments.isolation_domain =
-                                 conversation_segments.isolation_domain
-                         AND conversation_manifest_segments.owner_user_id =
-                                 conversation_segments.owner_user_id
-                         AND conversation_manifest_segments.segment_hash =
-                                 conversation_segments.segment_hash
-                   )
-             ORDER BY created_at ASC LIMIT ?",
-        )
-        .bind(STAGING_GRACE_SECS)
-        .bind(i64::from(limit))
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| database_error("collect_unreferenced_segments", source))?;
         Ok(result.rows_affected())
     }
 
@@ -817,13 +742,28 @@ async fn lock_parent_head(
         "SELECT manifest_json, total_canonical_bytes, total_message_count
          FROM conversation_manifest_nodes
          WHERE isolation_domain = ? AND owner_user_id = ?
-           AND session_id = ? AND branch_id = ? AND manifest_root = ?
+           AND session_id = ? AND branch_id = ?
+           AND compaction_generation = ? AND conversation_seq = ? AND manifest_root = ?
            AND reachable = 1 FOR UPDATE",
     )
     .bind(&request.parent_key.isolation_domain)
     .bind(&request.parent_key.owner_user_id)
     .bind(&request.parent_key.session_id)
     .bind(&request.parent_key.branch_id)
+    .bind(
+        i64::try_from(request.expected_parent_cursor.compaction_generation).map_err(|_| {
+            SessionForkCoordinatorError::Invalid(
+                "fork generation exceeds durable integer range".into(),
+            )
+        })?,
+    )
+    .bind(
+        i64::try_from(request.expected_parent_cursor.conversation_seq).map_err(|_| {
+            SessionForkCoordinatorError::Invalid(
+                "fork sequence exceeds durable integer range".into(),
+            )
+        })?,
+    )
     .bind(&request.expected_parent_cursor.canonical_root_hash)
     .fetch_optional(&mut **tx)
     .await
@@ -1338,6 +1278,29 @@ mod tests {
         .expect("count active retention pin");
         assert_eq!(pin_count, 1);
 
+        let grandchild_key =
+            SessionKeyV1::owner_session("fork-it", &owner, format!("grandchild-{suffix}"), "main");
+        let nested = service
+            .prepare(&PrepareSessionForkV1 {
+                idempotency_key: "nested-before-append".into(),
+                parent_key: child_key.clone(),
+                child_key: grandchild_key.clone(),
+                expected_parent_cursor: activation.child_head.cursor.clone(),
+                dimensions: dimensions(&activation.child_head.cursor),
+                reason: "capture an inherited head without copying its body".into(),
+            })
+            .await
+            .expect("prepare nested inherited head");
+        let nested = service
+            .activate(
+                &child_key,
+                &nested.fork_id,
+                &actor(&owner, "grandchild"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("activate nested inherited head");
+
         let child_reservation = match context
             .reserve_turn(
                 &activation.writer_lease,
@@ -1409,6 +1372,118 @@ mod tests {
         assert_eq!(child_materialized.messages.len(), 6);
         assert_eq!(parent_materialized.messages.len(), 8);
 
+        let appended_grandchild_key = SessionKeyV1::owner_session(
+            "fork-it",
+            &owner,
+            format!("appended-grandchild-{suffix}"),
+            "main",
+        );
+        let appended_nested = service
+            .prepare(&PrepareSessionForkV1 {
+                idempotency_key: "nested-after-append".into(),
+                parent_key: child_key.clone(),
+                child_key: appended_grandchild_key.clone(),
+                expected_parent_cursor: child_cursor.clone(),
+                dimensions: dimensions(&child_cursor),
+                reason: "capture both inherited and child-local nodes".into(),
+            })
+            .await
+            .expect("prepare nested appended head");
+        let appended_nested = service
+            .activate(
+                &child_key,
+                &appended_nested.fork_id,
+                &actor(&owner, "appended-grandchild"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("activate nested appended head");
+        let prefix_content = context
+            .load_manifest_content(&parent_key, &fork_cursor.canonical_root_hash)
+            .await
+            .expect("load original body");
+        let future_root: String = sqlx::query_scalar(
+            "SELECT manifest_root FROM conversation_manifest_nodes
+             WHERE owner_user_id = ? AND session_id = ? AND conversation_seq = 3",
+        )
+        .bind(&owner)
+        .bind(&parent_key.session_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversation_manifest_nodes SET content_json = 'corrupt outside captured prefix'
+             WHERE owner_user_id = ? AND session_id = ? AND manifest_root = ?",
+        ).bind(&owner).bind(&parent_key.session_id).bind(&future_root)
+            .execute(pool.get()).await.unwrap();
+        for (head, expected_count) in [(&nested.child_head, 4), (&appended_nested.child_head, 6)] {
+            assert_eq!(
+                context
+                    .load_manifest_content(&head.key, &fork_cursor.canonical_root_hash)
+                    .await
+                    .expect("nested locator reads ancestor body"),
+                prefix_content
+            );
+            assert!(matches!(
+                context.load_manifest_content(&head.key, &future_root).await,
+                Err(crate::SessionContextCoordinatorError::SegmentNotFound)
+            ));
+            assert_eq!(
+                context
+                    .materialize(head)
+                    .await
+                    .expect("materialize nested fork")
+                    .messages
+                    .len(),
+                expected_count
+            );
+        }
+        assert_eq!(
+            context
+                .load_manifest_content(&appended_grandchild_key, &child_cursor.canonical_root_hash,)
+                .await
+                .expect("load intermediate parent's body")
+                .len(),
+            1
+        );
+
+        // Deleting both ancestors must retain their existing fork records and
+        // pins while live descendants still depend on their captured prefix.
+        context.release_writer(&parent_lease).await.unwrap();
+        context
+            .release_writer(&activation.writer_lease)
+            .await
+            .unwrap();
+        crate::session_lifecycle::hard_delete_session(pool.get(), &parent_key.session_id, &owner)
+            .await
+            .unwrap();
+        crate::session_lifecycle::hard_delete_session(pool.get(), &child_key.session_id, &owner)
+            .await
+            .unwrap();
+        service.collect_orphaned_fork_records(100).await.unwrap();
+        service
+            .collect_unpinned_orphan_manifests(100)
+            .await
+            .unwrap();
+        for (head, expected_count) in [(&nested.child_head, 4), (&appended_nested.child_head, 6)] {
+            assert_eq!(
+                context
+                    .load_manifest_content(&head.key, &fork_cursor.canonical_root_hash)
+                    .await
+                    .expect("retained nested body after ancestor deletion"),
+                prefix_content
+            );
+            assert_eq!(
+                context
+                    .materialize(head)
+                    .await
+                    .expect("retained nested materialization")
+                    .messages
+                    .len(),
+                expected_count
+            );
+        }
+
         let other_owner_key = SessionKeyV1::owner_session(
             "fork-it",
             format!("other-{suffix}"),
@@ -1419,6 +1494,37 @@ mod tests {
             service.load(&other_owner_key, &prepared.fork_id).await,
             Err(SessionForkCoordinatorError::NotFound)
         ));
+        context.release_writer(&nested.writer_lease).await.unwrap();
+        context
+            .release_writer(&appended_nested.writer_lease)
+            .await
+            .unwrap();
+        for key in [&grandchild_key, &appended_grandchild_key] {
+            crate::session_lifecycle::hard_delete_session(pool.get(), &key.session_id, &owner)
+                .await
+                .unwrap();
+        }
+        service.collect_orphaned_fork_records(100).await.unwrap();
+        service
+            .collect_unpinned_orphan_manifests(100)
+            .await
+            .unwrap();
+        for table in [
+            "session_forks",
+            "conversation_manifest_pins",
+            "conversation_manifest_nodes",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE owner_user_id = ?");
+            let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(&owner)
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+            assert_eq!(
+                remaining, 0,
+                "deleted fork lineage must be collectible: {table}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1473,7 +1579,7 @@ mod tests {
             ReserveTurnOutcome::Reserved(reservation) => reservation,
             other => panic!("unexpected large-prefix reservation {other:?}"),
         };
-        let large_content = "abcd".repeat(1024 * 1024);
+        let large_content = "中文🙂".repeat(630_000);
         let cursor = match context
             .commit_turn(
                 &reservation,
@@ -1498,13 +1604,13 @@ mod tests {
             CoordinatorMutationV1::Applied { cursor } => cursor,
             other => panic!("unexpected large-prefix commit {other:?}"),
         };
-        let segments_before: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_segments WHERE owner_user_id = ?",
+        let nodes_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ?",
         )
         .bind(&owner)
         .fetch_one(pool.get())
         .await
-        .expect("count large-prefix segments before fork");
+        .expect("count large-prefix nodes before fork");
         let request = PrepareSessionForkV1 {
             idempotency_key: "large-prefix-prepare".into(),
             parent_key: parent_key.clone(),
@@ -1523,13 +1629,13 @@ mod tests {
             )
             .await
             .expect("activate large fork");
-        let segments_after: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_segments WHERE owner_user_id = ?",
+        let nodes_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id = ?",
         )
         .bind(&owner)
         .fetch_one(pool.get())
         .await
-        .expect("count large-prefix segments after fork");
+        .expect("count large-prefix nodes after fork");
         let manifest_bytes: i64 = sqlx::query_scalar(
             "SELECT OCTET_LENGTH(manifest_json) FROM session_forks
              WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
@@ -1551,6 +1657,22 @@ mod tests {
         .await
         .expect("count child manifest nodes");
 
+        let restored = context
+            .materialize(&activation.child_head)
+            .await
+            .expect("materialize large shared Unicode prefix");
+        let restored_text = restored.messages[0]["content"].as_str().unwrap();
+        assert_eq!(restored_text.len(), 6_300_000);
+        assert_eq!(restored_text, large_content);
+        let located = context
+            .load_manifest_content(&child_key, &cursor.canonical_root_hash)
+            .await
+            .expect("locate full large Unicode body");
+        assert_eq!(
+            located[0].messages[0]["content"].as_str().unwrap(),
+            large_content
+        );
+
         context
             .release_writer(&activation.writer_lease)
             .await
@@ -1566,10 +1688,10 @@ mod tests {
             .await
             .expect("delete scale-test parent session");
 
-        assert_eq!(segments_before, 1);
+        assert_eq!(nodes_before, 1);
         assert_eq!(
-            segments_after, segments_before,
-            "forking a large prefix must not duplicate content-addressed segments"
+            nodes_after, nodes_before,
+            "forking a large prefix must not duplicate node content"
         );
         assert_eq!(
             child_manifest_nodes, 0,

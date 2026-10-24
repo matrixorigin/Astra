@@ -185,9 +185,8 @@ impl RunStatus {
             .any(|(candidate, from, _)| *candidate == action && from == self)
     }
 
-    /// Nominal target state for a valid control. `resume` may still promote a
-    /// buffered completion instead of restarting execution; the lifecycle
-    /// handler owns that exceptional finalization path.
+    /// Nominal target state for a valid control. Completion requires the
+    /// execution owner's terminal transaction, never a cached event.
     pub fn control_action_target(&self, action: RunControlAction) -> Option<Self> {
         Self::CONTROL_TRANSITIONS
             .iter()
@@ -242,30 +241,6 @@ pub fn user_intent_text_len(input: &Value) -> usize {
         .unwrap_or(0)
 }
 
-pub fn is_completed_run_finished_event(event: &Value) -> bool {
-    if !is_run_finished_event(event) {
-        return false;
-    }
-    let data = event.get("data").and_then(Value::as_object);
-    let cancelled = data
-        .and_then(|obj| obj.get("cancelled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let interrupted = data
-        .and_then(|obj| obj.get("interrupted"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    !cancelled && !interrupted
-}
-
-pub fn has_buffered_terminal_completion(events: &[Value]) -> bool {
-    events
-        .iter()
-        .rev()
-        .find(|event| is_run_finished_event(event))
-        .is_some_and(is_completed_run_finished_event)
-}
-
 /// Whether another live process can still observe a durable pause/resume
 /// transition. A stored owner id without an unexpired lease is historical
 /// metadata, not evidence that an executor exists.
@@ -318,29 +293,6 @@ pub fn should_preserve_manual_pause_on_completion(
     *current_status == RunStatus::Paused
         && waiting_for.is_some()
         && *final_status == RunStatus::Completed
-}
-
-pub async fn should_preserve_manual_pause_from_durable(
-    run_engine: &RunEngine,
-    user_id: &str,
-    run_id: &str,
-    final_status: &RunStatus,
-) -> bool {
-    if *final_status != RunStatus::Completed {
-        return false;
-    }
-    match run_engine.load_run(user_id, run_id).await {
-        Ok(Some(run)) => run.status == STATUS_PAUSED && run.waiting_for.is_some(),
-        Ok(None) => false,
-        Err(error) => {
-            tracing::warn!(
-                %run_id,
-                error = %error,
-                "failed to reload durable run while checking late completion pause preservation"
-            );
-            false
-        }
-    }
 }
 
 pub fn merge_run_finished_event_data(target: &mut Value, source: &Value) {
@@ -422,6 +374,12 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
             )
         })
         .cloned()
+        .map(|mut event| {
+            if let Some(object) = event.as_object_mut() {
+                object.remove(TOOL_TERMINAL_LIVE_EMITTED_FIELD);
+            }
+            event
+        })
         .collect()
 }
 
@@ -432,16 +390,15 @@ pub fn streaming_final_event_for_replay(event: &Value) -> bool {
     )
 }
 
-/// Internal settlement fence written only on the retained copy after the
-/// ordered fanout has durably committed the tool terminal. The persisted/wire
-/// copy is clean, so this field never becomes public protocol.
-pub(crate) const TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD: &str =
-    "_astra_tool_terminal_durably_fanned_out";
+/// Process-local delivery watermark on retained copies only. It suppresses
+/// duplicate attached-stream delivery, never authorizes execution or proves
+/// durable effect settlement. Persisted and wire copies must be clean.
+pub(crate) const TOOL_TERMINAL_LIVE_EMITTED_FIELD: &str = "_astra_tool_terminal_live_emitted";
 
-pub fn tool_terminal_requires_settlement_repair(event: &Value) -> bool {
+pub fn tool_terminal_requires_live_repair(event: &Value) -> bool {
     durable_event_type(event) == Some("tool_call_end")
         && event
-            .get(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD)
+            .get(TOOL_TERMINAL_LIVE_EMITTED_FIELD)
             .and_then(Value::as_bool)
             != Some(true)
 }
@@ -451,11 +408,11 @@ pub fn tool_terminal_requires_settlement_repair(event: &Value) -> bool {
 ///
 /// Tool progress is delivered incrementally and may be coalesced when an
 /// observer falls behind. A tool terminal is different from ordinary
-/// progress: settlement repairs it unless the ordered fanout durably committed
-/// it. Replaying a successfully delivered terminal on the same
+/// progress: convergence repairs it unless the ordered fanout emitted it.
+/// Replaying an already emitted terminal on the same
 /// attached stream is not idempotence; it is a duplicate public event.
 pub fn streaming_convergence_event_for_replay(event: &Value) -> bool {
-    streaming_final_event_for_replay(event) || tool_terminal_requires_settlement_repair(event)
+    streaming_final_event_for_replay(event) || tool_terminal_requires_live_repair(event)
 }
 
 pub fn streaming_event_for_persistence(event: &Value) -> bool {
@@ -714,33 +671,23 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
             | "agent_waiting"
             | "agent_cancelled"
             | "agent_interrupted"
-            | "tool_call"
-            | "tool_call_start"
-            | "tool_routing_decision"
-            | "tool_transport_started"
-            | "tool_transport_completed"
-            | "tool_transport_failed"
-            | "tool_call_end"
     )
 }
 
 pub fn push_active_run_live_event(run: &mut RunState, event: Value) {
-    // The process-local replay cache mirrors durable reconnect boundaries.
-    // Transient activity (for example per-round agent progress) is delivered
-    // directly to current observers and must not accumulate here.
-    if !live_delta_event_for_persistence(&event) {
+    // Keep bounded tool outcomes for same-process reconnects. Cross-process
+    // observers obtain those outcomes with the terminal batch; transient tool
+    // progress goes directly to current observers without database writes.
+    fn retained(event: &Value) -> bool {
+        live_delta_event_for_persistence(event)
+            || durable_event_type(event) == Some("tool_call_end")
+    }
+    if !retained(&event) {
         return;
     }
     run.events.push(event);
-    while run
-        .events
-        .iter()
-        .filter(|event| live_delta_event_for_persistence(event))
-        .count()
-        > MAX_ACTIVE_RUN_LIVE_EVENTS
-    {
-        let Some(oldest_live_event) = run.events.iter().position(live_delta_event_for_persistence)
-        else {
+    while run.events.iter().filter(|event| retained(event)).count() > MAX_ACTIVE_RUN_LIVE_EVENTS {
+        let Some(oldest_live_event) = run.events.iter().position(retained) else {
             break;
         };
         run.events.remove(oldest_live_event);
@@ -769,13 +716,10 @@ pub struct RunState {
     /// keep an otherwise completed HTTP stream or its fanout task alive.
     pub attached_event_tx: Option<mpsc::WeakSender<Value>>,
     pub waiting_for: Option<String>,
-    /// True only while an execution task still exists and can observe a pause
-    /// flag or queued input. A resumable durable status alone is not proof that
-    /// the process-local executor survived.
+    /// The execution task and its canonical terminal attempt are still alive.
+    /// This remains true through settlement; durable status alone never proves
+    /// that a process-local executor survived.
     pub execution_live: bool,
-    /// The provider/tool loop has stopped, but durable terminal facts and
-    /// accounting have not yet reached their atomic settlement point.
-    pub settlement_in_progress: bool,
 }
 
 #[cfg(test)]

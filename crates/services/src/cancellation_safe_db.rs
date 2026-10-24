@@ -89,12 +89,11 @@ impl Drop for CancellationSafePoolConnection {
 /// several helpers. `sqlx::Transaction` borrows a checkout, so it cannot carry
 /// the close-on-cancel guard across those helpers without a second parallel
 /// state machine. A successful commit returns the synchronized checkout;
-/// every other drop closes it or starts a safe rollback after the last
-/// completed exchange.
+/// every unfinished or uncertain drop closes it. An acknowledged rollback
+/// returns its synchronized checkout through the explicit rollback method.
 pub(crate) struct CancellationSafeTransaction {
     connection: Option<PoolConnection<MySql>>,
     transaction_open: bool,
-    discard_on_drop: bool,
 }
 
 impl sealed::TransactionConnection for CancellationSafeTransaction {}
@@ -106,7 +105,6 @@ impl CancellationSafeTransaction {
         let mut transaction = Self {
             connection: Some(connection),
             transaction_open: false,
-            discard_on_drop: true,
         };
         MySqlTransactionManager::begin(transaction.connection_mut(), None).await?;
         transaction.transaction_open = true;
@@ -119,21 +117,11 @@ impl CancellationSafeTransaction {
             .expect("cancellation-safe transaction connection already released")
     }
 
-    pub(crate) fn mark_io_in_flight(&mut self) {
-        self.discard_on_drop = true;
-    }
-
-    pub(crate) fn mark_io_complete(&mut self) {
-        self.discard_on_drop = false;
-    }
-
     pub(crate) async fn commit(mut self) -> Result<(), sqlx::Error> {
         if self.transaction_open {
-            self.mark_io_in_flight();
             MySqlTransactionManager::commit(self.connection_mut()).await?;
             self.transaction_open = false;
         }
-        self.discard_on_drop = false;
         self.connection.take();
         Ok(())
     }
@@ -146,11 +134,9 @@ impl CancellationSafeTransaction {
     /// path rather than returning an uncertain connection to the pool.
     pub(crate) async fn rollback(&mut self) -> Result<(), sqlx::Error> {
         if self.transaction_open {
-            self.mark_io_in_flight();
             MySqlTransactionManager::rollback(self.connection_mut()).await?;
             self.transaction_open = false;
         }
-        self.discard_on_drop = false;
         // A rolled-back transaction is terminal. Dropping the synchronized
         // checkout returns it to the pool, while removing it from this guard
         // makes any accidental post-rollback SQL fail closed instead of
@@ -172,7 +158,6 @@ impl Deref for CancellationSafeTransaction {
 
 impl DerefMut for CancellationSafeTransaction {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.mark_io_in_flight();
         self.connection_mut()
     }
 }
@@ -182,10 +167,8 @@ impl Drop for CancellationSafeTransaction {
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
-        if self.discard_on_drop {
-            connection.close_on_drop();
-        } else if self.transaction_open {
-            MySqlTransactionManager::start_rollback(connection);
-        }
+        // Only an acknowledged commit/rollback removes the connection. Any
+        // remaining checkout is unfinished or protocol-uncertain and closes.
+        connection.close_on_drop();
     }
 }

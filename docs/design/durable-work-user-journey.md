@@ -324,6 +324,13 @@ independent Session in the same directory. The canonical binding generation
 fences delayed work for its own Session. The executor-owned workspace lease is
 the only physical-operation serialization boundary.
 
+Idle controller changes and recovery-point capture inspect actual Session
+execution occupancy under the same Session/slot fence as Run admission. An
+occupied slot, active child, paused Run awaiting input, or terminal executor
+with a live owner lease blocks that boundary even when no Controller writer
+lease exists. Recovery capture reports active execution and publishes no point
+until that execution has settled.
+
 ## Unhappy paths
 
 | Failure | Required behavior |
@@ -526,3 +533,13 @@ calling the full cross-surface E2E verified. Activity polling and multi-user
 capacity targets remain unmeasured. Server Run-owner crash recovery remains
 unsupported until its production recovery consumer and separate lifecycle E2E
 exist.
+
+## Raw conversation history
+
+Work transcript pages return available committed raw messages bounded by the
+canonical Context cursor. They do not maintain or certify a second transcript
+projection head. The response cursor identifies the canonical snapshot; it is
+not an independent assertion that every historical diagnostic has been copied
+into transcript storage. Uncommitted active-turn rows are excluded. Ordinary
+Run completion commits original conversation rows and Context together;
+reasoning and interaction diagnostics retain their own trace/event surfaces.

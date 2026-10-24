@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -57,7 +57,7 @@ async fn actual_requests(
         reuse_scope: None,
     });
     let session = format!("cache-core-{}", uuid::Uuid::new_v4());
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let mut host = server_host_builder(
         &gateway,
         &ledger,

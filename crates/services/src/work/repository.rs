@@ -62,10 +62,6 @@ pub enum WorkRecoveryPointBlocker {
         "the branch plan basis is behind the current Work plan; refresh before saving progress"
     )]
     BranchBasisChanged,
-    #[error("the Work Session execution slot has no canonical Run")]
-    DanglingRunSlot,
-    #[error("the Work Session Run is missing its status")]
-    RunStatusMissing,
     #[error("the Work Run is still active; finish or pause it before saving progress")]
     ActiveRun,
     #[error("the Work Session still has an active turn reservation")]
@@ -1613,27 +1609,34 @@ async fn lock_bindable_existing_session(
         return Err(WorkRepositoryError::SessionNotBindable);
     }
 
-    let active_run: Option<String> = query(
-        "SELECT run_id
-         FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ?
-         LIMIT 1
-         FOR UPDATE",
+    if !crate::storage::session_execution_activity(
+        transaction,
+        genesis.owner_id.as_str(),
+        genesis.session_id.as_str(),
+        expected_active_run_id,
     )
-    .bind(genesis.owner_id.as_str())
-    .bind(genesis.session_id.as_str())
-    .fetch_optional(&mut **transaction)
     .await
-    .map_err(|source| {
-        WorkRepositoryError::persistence("check existing session execution slot", source)
-    })?
-    .map(|row| row.try_get("run_id"))
-    .transpose()
-    .map_err(|source| WorkRepositoryError::corrupt("existing session execution slot", source))?;
-    match (active_run.as_deref(), expected_active_run_id) {
-        (None, None) => {}
-        (Some(actual), Some(expected)) if actual == expected => {}
-        _ => return Err(WorkRepositoryError::SessionBusy),
+    .map_err(|source| WorkRepositoryError::persistence("check existing session execution", source))?
+    .is_idle()
+    {
+        return Err(WorkRepositoryError::SessionBusy);
+    }
+    if let Some(expected) = expected_active_run_id {
+        let owned_coordinator: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?
+             AND status = 'running' AND parent_run_id IS NULL AND retry_of IS NULL
+             AND delegation_id IS NULL AND agent_id IS NULL
+             AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6) LIMIT 1 FOR UPDATE",
+        )
+        .bind(genesis.owner_id.as_str())
+        .bind(genesis.session_id.as_str())
+        .bind(expected)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|source| WorkRepositoryError::persistence("lock Work coordinator", source))?;
+        if owned_coordinator.is_none() {
+            return Err(WorkRepositoryError::SessionBusy);
+        }
     }
 
     let session_project = session
@@ -1653,7 +1656,7 @@ async fn lock_bindable_existing_session(
     Ok(())
 }
 
-/// Bind the exact slot-owning coordinator run to the Work it just created.
+/// Bind the exact admitted coordinator Run to the Work it just created.
 ///
 /// The run is deliberately not assigned to the root WorkItem: establishing
 /// and coordinating a plan is not evidence that the user's root outcome was
@@ -1685,7 +1688,7 @@ async fn bind_running_session_run(
         WorkRepositoryError::persistence("bind running session run to Work genesis", source)
     })?;
     if result.rows_affected() != 1 {
-        // The execution slot establishes which run has authority. Requiring
+        // Admission establishes the exact live coordinator. Requiring
         // its exact unbound durable row prevents a Work that subsequent child
         // runs cannot inherit and prevents rebinding an existing run lineage.
         return Err(WorkRepositoryError::SessionBusy);

@@ -58,8 +58,6 @@ impl AgenticRunLifecycleService {
                     }
                     observed.insert(run_id, result);
                 }
-                self.release_cancelled_run_writer(session_id, user_id, &observed)
-                    .await?;
                 execution_blocker = self
                     .session_cancellation_blocker(session_id, user_id)
                     .await?;
@@ -95,24 +93,10 @@ impl AgenticRunLifecycleService {
             .map_err(|error| Self::durable_persist_error("cancel target lookup", error))?
         {
             Some(control) if control.session_id == session_id => {
-                let mut result = self
-                    .cancel_run(run_id.to_owned(), user_id.to_owned())
-                    .await?;
-                if result.execution_settled
-                    && self
-                        .run_engine
-                        .has_open_run_settlement(user_id, run_id, control.run_generation)
-                        .await
-                        .map_err(|error| {
-                            Self::durable_persist_error("cancel settlement lookup", error)
-                        })?
-                {
-                    result.execution_settled = false;
-                }
-                Ok(result)
+                self.cancel_run(run_id.to_owned(), user_id.to_owned()).await
             }
-            // Writer acquisition can precede durable Run insertion. The
-            // reservation is still authority; missing Run is never idle proof.
+            // Discovery is only a hint; an unavailable or moved Run is never
+            // proof that all Session execution and tool custody settled.
             _ => Ok(CancelRunRecord {
                 run_id: run_id.to_owned(),
                 status: "cancellation_requested".to_owned(),
@@ -146,9 +130,7 @@ impl AgenticRunLifecycleService {
                 .await
                 .values()
                 .filter(|run| {
-                    run.user_id == user_id
-                        && run.session_id == session_id
-                        && (run.execution_live || run.settlement_in_progress)
+                    run.user_id == user_id && run.session_id == session_id && run.execution_live
                 })
                 .map(|run| run.run_id.clone()),
         );
@@ -156,33 +138,18 @@ impl AgenticRunLifecycleService {
         if let Some(pool) = self.shared_pool.as_ref() {
             // Discovery only; cancel_run rechecks owner/generation and the
             // final session fence proves quiescence. Include terminal leases
-            // and ledger/slot owners even on a fresh request to another pod.
+            // and blocking Runs or ledger owners even on a fresh request to another pod.
             let ids: Vec<String> = sqlx::query_scalar(
                 "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ?
-                   AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
+                   AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)
+                        OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))
                  UNION SELECT run_id FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?
                    AND state IN ('prepared', 'dispatched', 'outcome_unknown')
-                 UNION SELECT run_id FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?
-                 UNION SELECT r.run_id FROM agent_runs r WHERE r.user_id = ? AND r.session_id = ?
-                   AND EXISTS (SELECT 1 FROM agent_run_events e WHERE e.user_id = r.user_id AND e.run_id = r.run_id
-                               AND e.idempotency_key = CONCAT('run-settlement-started:', r.run_generation))
-                   AND NOT EXISTS (SELECT 1 FROM agent_run_events e WHERE e.user_id = r.user_id AND e.run_id = r.run_id
-                                   AND e.idempotency_key IN (CONCAT('run-settlement-finished:', r.run_generation), CONCAT('run-accounting-finalized:', r.run_generation)))",
-            ).bind(user_id).bind(session_id).bind(user_id).bind(session_id).bind(user_id).bind(session_id).bind(user_id).bind(session_id)
+",
+            ).bind(user_id).bind(session_id).bind(user_id).bind(session_id)
                 .fetch_all(pool.get()).await
                 .map_err(|error| Self::durable_persist_error("cancel retained execution discovery", error.to_string()))?;
             candidates.extend(ids);
-            let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
-            if let Some(writer) = coordinator
-                .load_active_writer(&session_cancellation_key(user_id, session_id))
-                .await
-                .map_err(|error| {
-                    Self::durable_persist_error("cancel writer discovery", error.to_string())
-                })?
-                && let Some(run_id) = internal_writer_run_id(&writer)
-            {
-                candidates.insert(run_id.to_owned());
-            }
         } else {
             // Process-local stores have no SQL discovery seam. Seek through
             // their durable owner records rather than a truncated session tree.
@@ -207,18 +174,7 @@ impl AgenticRunLifecycleService {
                         .map_err(|error| {
                             Self::durable_persist_error("cancel retained run control", error)
                         })?
-                        && (control.owner_lease_live
-                            || self
-                                .run_engine
-                                .has_open_run_settlement(
-                                    user_id,
-                                    &run.run_id,
-                                    control.run_generation,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    Self::durable_persist_error("cancel retained settlement", error)
-                                })?)
+                        && control.owner_lease_live
                     {
                         candidates.insert(run.run_id);
                     }
@@ -230,59 +186,6 @@ impl AgenticRunLifecycleService {
             }
         }
         Ok(candidates)
-    }
-
-    async fn release_cancelled_run_writer(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        observed: &BTreeMap<String, CancelRunRecord>,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let Some(pool) = self.shared_pool.as_ref() else {
-            return Ok(());
-        };
-        let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
-        let Some(writer) = coordinator
-            .load_active_writer(&session_cancellation_key(user_id, session_id))
-            .await
-            .map_err(|error| {
-                Self::durable_persist_error("cancel writer lookup", error.to_string())
-            })?
-        else {
-            return Ok(());
-        };
-        let Some(run_id) = internal_writer_run_id(&writer) else {
-            return Ok(());
-        };
-        if !observed
-            .get(run_id)
-            .is_some_and(|run| run.execution_settled && durable_run_status_is_terminal(&run.status))
-        {
-            return Ok(());
-        }
-        if self.runs.read().await.get(run_id).is_some_and(|run| {
-            run.user_id == user_id && (run.execution_live || run.settlement_in_progress)
-        }) {
-            return Ok(());
-        }
-        // The ordinary coordinator release compares lease id + writer epoch
-        // and clears its reservation atomically. Never release a controller's
-        // externally supplied writer, or the current writer of a newer run.
-        let Some(control) = self
-            .run_engine
-            .load_run_control(user_id, run_id)
-            .await
-            .map_err(|error| Self::durable_persist_error("cancel writer run lookup", error))?
-        else {
-            return Ok(());
-        };
-        coordinator
-            .release_terminal_execution_writer(&writer, run_id, control.run_generation)
-            .await
-            .map_err(|error| {
-                Self::durable_persist_error("cancel writer release", error.to_string())
-            })?;
-        Ok(())
     }
 
     async fn session_cancellation_blocker(
@@ -299,9 +202,7 @@ impl AgenticRunLifecycleService {
                 })?;
             return Ok(blocker.or(
                 if self.runs.read().await.values().any(|run| {
-                    run.user_id == user_id
-                        && run.session_id == session_id
-                        && (run.execution_live || run.settlement_in_progress)
+                    run.user_id == user_id && run.session_id == session_id && run.execution_live
                 }) {
                     Some(SessionExecutionBlocker::ActiveRun)
                 } else {
@@ -324,13 +225,4 @@ fn session_cancellation_key(user_id: &str, session_id: &str) -> astra_turn_types
         session_id,
         astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
     )
-}
-
-fn internal_writer_run_id(writer: &astra_turn_types::ConversationWriterLeaseV1) -> Option<&str> {
-    if writer.actor.actor_kind != astra_turn_types::ActorKindV1::Server {
-        return None;
-    }
-    let run_id = writer.actor.actor_id.strip_prefix("server-run:")?;
-    (writer.idempotency_key == format!("server-run:{run_id}:writer") && !run_id.is_empty())
-        .then_some(run_id)
 }
