@@ -1,4 +1,6 @@
 name: Test Suite
+run-name: >-
+  Test Suite pr=${{ github.event.pull_request.number || 0 }} base=${{ github.event.pull_request.base.sha || github.event.before }} head=${{ github.event.pull_request.head.sha || github.sha }} merge=${{ github.sha }}
 
 permissions:
   contents: read
@@ -13,6 +15,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -23,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      macos_runner: ${{ steps.scope.outputs.macos_runner }}
       test_cli: ${{ steps.scope.outputs.test_cli }}
       test_runtime: ${{ steps.scope.outputs.test_runtime }}
       test_services: ${{ steps.scope.outputs.test_services }}
@@ -39,6 +46,31 @@ jobs:
       - name: Classify changed paths
         id: scope
         run: python3 scripts/ci/ci_scope.py
+
+  macos-plan:
+    name: Resolve macOS execution
+    needs: scope
+    if: >-
+      !cancelled() && github.run_attempt == 1 &&
+      (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') &&
+      contains(fromJSON(needs.scope.outputs.macos_runner || '[]'), 'self-hosted')
+    runs-on: ubuntu-latest
+    timeout-minutes: 67
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.mini.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Wait for a bounded mini attempt
+        id: mini
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/macos_dispatch.py wait --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
   # Package groups remain parallel. CLI builds and executes its full inventory
   # once; stable protected labels require that same completed test result.
@@ -191,30 +223,28 @@ jobs:
     name: "Test: vendored terminal (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
-        run: rustc --version
+        uses: ./.github/actions/rust-toolchain
       # The patched crate is deliberately outside the application workspace.
       # These are parser/unit tests, not the real-reader PTY regression suite.
       - name: Test vendored terminal units
-        run: |
-          cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream
-          cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream,use-dev-tty
+        run: bash scripts/ci/run-macos-lanes.sh vendored
 
-  # Preserve required check names while three builds run on separate runners.
+  # Preserve required check names while the reader/reflow builds stay isolated.
   # Both aggregate checks require the entire terminal matrix.
   terminal-pty:
     name: "Test: terminal PTY (${{ matrix.os }})"
-    needs: [scope, terminal-pty-shards]
+    needs: [scope, terminal-pty-shards, terminal-pty-shards-macos]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -227,25 +257,28 @@ jobs:
         shell: bash
         env:
           SHARDS_RESULT: ${{ needs.terminal-pty-shards.result }}
+          MACOS_RESULT: ${{ needs.terminal-pty-shards-macos.result }}
           SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true' }}
         run: |
           set -euo pipefail
-          if [ "$SHARDS_REQUIRED" = true ]; then
-            test "$SHARDS_RESULT" = success
-          else
-            case "$SHARDS_RESULT" in success|skipped) ;; *) exit 1 ;; esac
-          fi
+          for result in "$SHARDS_RESULT" "$MACOS_RESULT"; do
+            if [ "$SHARDS_REQUIRED" = true ]; then
+              test "$result" = success
+            else
+              case "$result" in success|skipped) ;; *) exit 1 ;; esac
+            fi
+          done
 
   terminal-pty-shards:
     name: "Terminal: ${{ matrix.segment }} (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
+        os: [ubuntu-latest]
         segment: [default-reader, dev-tty-reader, reflow]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -257,45 +290,18 @@ jobs:
           # One writer per OS populates the shared dependency cache on pushes.
           save-cache: ${{ github.event_name == 'push' && matrix.segment == 'default-reader' }}
           install-nextest: false
-      # Separate runners keep dev-tty feature unification out of the default
-      # reader and avoid serializing two lib builds and the reflow binary build.
-      - name: Test default terminal reader through PTYs
-        if: matrix.segment == 'default-reader'
-        run: |
-          cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
-      - name: Initialize system Git for macOS CLI observation
-        if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'
-        timeout-minutes: 1
-        run: |
-          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
-            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
-            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
-            -c core.untrackedCache=false rev-parse --show-toplevel
-      - name: Test macOS CLI Bash execution
-        if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'
-        # Reuse the default-feature CLI test executable already built above.
-        run: >-
-          cargo test --locked --manifest-path Cargo.toml -p astra-cli
-          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
-      - name: Test dev-tty terminal reader through PTYs
-        if: matrix.segment == 'dev-tty-reader'
-        run: |
-          cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         if: matrix.segment == 'reflow'
         with:
           node-version-file: .nvmrc
-      - name: Test inline terminal resize with xterm reflow
-        if: matrix.segment == 'reflow'
-        run: |
-          cargo build --locked -p astra-cli --bin astra
-          npm ci --ignore-scripts --prefix scripts/tui-reflow
-          ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
+      - name: Test terminal lane
+        env:
+          MACOS_LANE: ${{ matrix.segment }}
+        run: bash scripts/ci/run-macos-lanes.sh "$MACOS_LANE"
 
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"
-    needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards]
+    needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -305,10 +311,11 @@ jobs:
         env:
           COORDINATION_RESULT: ${{ needs.macos-workspace-coordination-tests.result }}
           TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
+          MACOS_TERMINAL_RESULT: ${{ needs.terminal-pty-shards-macos.result }}
           SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true' }}
         run: |
           set -euo pipefail
-          for result in "$COORDINATION_RESULT" "$TERMINAL_RESULT"; do
+          for result in "$COORDINATION_RESULT" "$TERMINAL_RESULT" "$MACOS_TERMINAL_RESULT"; do
             if [ "$SHARDS_REQUIRED" = true ]; then
               test "$result" = success
             else
@@ -316,46 +323,105 @@ jobs:
             fi
           done
 
-  macos-workspace-coordination-tests:
-    name: "macOS workspace coordination contracts"
-    needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
-    runs-on: macos-15
-    timeout-minutes: 30
+  vendored-terminal-macos:
+    name: "Test: vendored terminal (macos-15)"
+    needs: [scope, macos-plan]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result) }}
+      MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
     steps:
+      - name: Require actual mini result
+        if: env.RUN_LANE != 'true'
+        run: |
+          set -euo pipefail
+          test "$MINI_RESULT" = success
+          echo 'All five macOS lanes passed on the mini; see Resolve macOS execution for the worker run.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_LANE == 'true'
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        if: env.RUN_LANE == 'true'
+      - name: Run hosted macOS lane
+        if: env.RUN_LANE == 'true'
+        env:
+          MACOS_LANE: vendored
+        run: bash scripts/ci/run-macos-lanes.sh "$MACOS_LANE"
+
+  terminal-pty-shards-macos:
+    name: "Terminal: ${{ matrix.segment }} (macos-15)"
+    needs: [scope, macos-plan]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    env:
+      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result) }}
+      MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
+    strategy:
+      fail-fast: false
+      matrix:
+        segment: [default-reader, dev-tty-reader, reflow]
+    steps:
+      - name: Require actual mini result
+        if: env.RUN_LANE != 'true'
+        run: |
+          set -euo pipefail
+          test "$MINI_RESULT" = success
+          echo 'All five macOS lanes passed on the mini; see Resolve macOS execution for the worker run.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_LANE == 'true'
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_LANE == 'true'
         with:
-          # Reuse the CLI dependency cache; default-reader is its only writer.
+          shared-key: ci-terminal-pty
+          save-cache: ${{ github.event_name == 'push' && matrix.segment == 'default-reader' }}
+          install-nextest: "false"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: env.RUN_LANE == 'true' && matrix.segment == 'reflow'
+        with:
+          node-version-file: .nvmrc
+      - name: Run hosted macOS lane
+        if: env.RUN_LANE == 'true'
+        env:
+          MACOS_LANE: ${{ matrix.segment }}
+        run: bash scripts/ci/run-macos-lanes.sh "$MACOS_LANE"
+
+  macos-workspace-coordination-tests:
+    name: "macOS workspace coordination contracts"
+    needs: [scope, macos-plan]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result) }}
+      MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
+    steps:
+      - name: Require actual mini result
+        if: env.RUN_LANE != 'true'
+        run: |
+          set -euo pipefail
+          test "$MINI_RESULT" = success
+          echo 'All five macOS lanes passed on the mini; see Resolve macOS execution for the worker run.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_LANE == 'true'
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        if: env.RUN_LANE == 'true'
+        with:
           shared-key: ci-terminal-pty
           save-cache: "false"
           install-nextest: "false"
-      - name: Lint macOS workspace coordination
-        run: >-
-          cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
-          --all-targets -- -D warnings
-      - name: Initialize system Git for bounded observation probes
-        timeout-minutes: 1
-        # Checkout uses Homebrew Git, but the hardened observer selects
-        # /usr/bin/git with a cleared environment. Initialize that executable
-        # before its first use under the production two-second probe deadline.
-        # Keep the timing visible so runner startup failures are diagnosable.
-        run: |
-          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
-            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
-            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
-            -c core.untrackedCache=false rev-parse --show-toplevel
-      - name: Test macOS workspace coordination invariants
-        # Several invariants launch re-exec lock contenders while fingerprint
-        # probes deliberately have a short wall-clock deadline. Keep the module
-        # serial on shared CI hosts; the contender test supplies explicit
-        # cross-process concurrency without starving unrelated probes.
-        run: >-
-          cargo test --locked --manifest-path Cargo.toml -p astra-tools
-          workspace_observation::tests:: -- --test-threads=1
+      - name: Run hosted macOS lane
+        if: env.RUN_LANE == 'true'
+        env:
+          MACOS_LANE: coordination
+        run: bash scripts/ci/run-macos-lanes.sh "$MACOS_LANE"
 
   # Preserve the required core check while its package groups run separately.
   # The aggregate requires all selected online jobs, including integration.

@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels: [mac-arm64-mini]
+# GitHub supports cache-mode; actionlint 1.7.12 predates the syntax.
+paths:
+  .github/workflows/macos-mini.yml:
+    ignore:
+      - 'unexpected key "cache-mode" for "workflow" section'

@@ -187,9 +187,10 @@ fn probe_child() {
             pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
                 "/skill", "skills",
             )]);
-            for ch in draft_command.chars() {
-                pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-            }
+            // Seed the command explicitly: scheduler-sized gaps in synthetic
+            // key loops can activate paste detection and consume Enter. This
+            // case tests draft custody across commands, not typing cadence.
+            pane.replace_composer_text(draft_command);
             pane.restore_into_composer("//returned");
             let BottomPaneAction::SubmitInput(command) =
                 pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))

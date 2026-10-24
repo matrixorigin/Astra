@@ -116,11 +116,42 @@ sys.exit(17 if sys.argv[1] == os.environ["FAIL_COMMAND"] else 0)
         self.assertIn("cancel-in-progress: true", self.workflow)
 
 
+class MacRunnerTests(unittest.TestCase):
+    def test_macos_fallback_is_parallel_and_does_not_block_linux(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        for job in ("vendored-terminal", "terminal-pty-shards", "test-online"):
+            header = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn("needs: scope", header)
+            self.assertIn("runs-on: ubuntu-latest", header)
+            self.assertNotIn("macos-plan", header)
+        for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
+            section = workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn("needs: [scope, macos-plan]", section)
+            self.assertIn("github.run_attempt > 1", section, "Failed-only reruns must ignore reused mini outputs")
+            self.assertIn("'macos-15' || 'ubuntu-latest'", section)
+        self.assertNotIn("pull_request_target:", workflow)
+        self.assertNotIn("self-hosted", workflow.split("  vendored-terminal:\n", 1)[1])
+
+    def test_remote_result_gate_never_accepts_failure_or_missing_output(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
+            section = workflow.split(f"\n  {job}:\n", 1)[1]
+            block = section.split("        run: |\n", 1)[1].split("      - ", 1)[0]
+            script = "\n".join(line[10:] for line in block.splitlines())
+            for outcome in ("success", "failure", "hosted", "", "skipped"):
+                with self.subTest(job=job, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                    result = subprocess.run(["bash", "-c", script], env={
+                        **os.environ, "MINI_RESULT": outcome,
+                        "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary"),
+                    }, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, outcome == "success")
+
+
 class ParallelGateTests(unittest.TestCase):
     def test_shard_gates_reject_failure_cancellation_and_unexpected_skip(self):
         for step, variables in (
-            ("Require terminal PTY shards", ("SHARDS_RESULT",)),
-            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT")),
+            ("Require terminal PTY shards", ("SHARDS_RESULT", "MACOS_RESULT")),
+            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT", "MACOS_TERMINAL_RESULT")),
         ):
             script = workflow_run_script(".github/workflows/test.yml", step)
             for required in (True, False):
@@ -151,7 +182,7 @@ class ParallelGateTests(unittest.TestCase):
             self.assertIn("!cancelled()", header)
             self.assertIn("fail-fast: false", header)
         terminal = workflow.split("\n  terminal-pty:\n", 1)[1].split("\n  terminal-pty-shards:", 1)[0]
-        self.assertIn("needs: [scope, terminal-pty-shards]", terminal)
+        self.assertIn("needs: [scope, terminal-pty-shards, terminal-pty-shards-macos]", terminal)
         self.assertIn("needs.scope.result != 'success'", terminal)
         self.assertIn("needs.scope.outputs.test_cli == 'true'", terminal)
         self.assertIn("needs.scope.outputs.test_core == 'true'", terminal)
@@ -159,11 +190,11 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() }}", terminal)
         coordination = workflow.split("\n  macos-workspace-coordination:\n", 1)[1].split("\n  macos-workspace-coordination-tests:", 1)[0]
         self.assertIn('name: "Test: macOS workspace coordination"', coordination)
-        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards]", coordination)
+        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos]", coordination)
         self.assertIn("needs.scope.result != 'success'", coordination)
         self.assertIn("if: ${{ !cancelled() }}", coordination)
         contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("needs: scope", contracts)
+        self.assertIn("needs: [scope, macos-plan]", contracts)
         self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
         online = workflow.split("\n  test-online:\n", 1)[1]
         self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)

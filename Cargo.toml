@@ -73,7 +73,9 @@ fs2 = "0.4"
 tar = "0.4"
 futures-util = "0.3.31"
 hmac = "0.12.1"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
+# Reuse AWS-LC: the RustCrypto backend pins crypto-bigint 0.5, affected by
+# RUSTSEC-2026-0387 with no compatible patched release.
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
 nix = { version = "0.31.2", features = ["fs", "signal", "term"] }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "socks"] }

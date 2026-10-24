@@ -1,0 +1,63 @@
+name: macOS mini worker
+run-name: Mac mini for Test Suite ${{ inputs.source_run_id }}/${{ inputs.source_attempt }} ${{ inputs.source_sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        required: true
+        type: string
+      source_attempt:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+cache-mode: read
+concurrency:
+  group: macos-mini-${{ inputs.source_run_id }}-${{ inputs.source_attempt }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+jobs:
+  execute:
+    runs-on: [self-hosted, macOS, ARM64, mac-arm64-mini]
+    timeout-minutes: 65
+    steps:
+      - name: Checkout control policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-control
+          persist-credentials: false
+      - name: Validate mini dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 .ci-control/scripts/ci/macos_dispatch.py admit --run-id "$SOURCE_RUN_ID" --attempt "$SOURCE_ATTEMPT" --sha "$SOURCE_SHA"
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Prepare Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-terminal-pty
+          save-cache: "false"
+          install-nextest: "false"
+      - name: Prepare Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+      - name: Run all macOS lanes
+        run: bash scripts/ci/run-macos-lanes.sh all

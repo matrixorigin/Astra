@@ -3,7 +3,9 @@
 
 The classifier is deliberately conservative: an unknown diff or a change to CI
 itself enables every scope. Documentation and repository-governance changes are
-handled by the always-on lightweight repository checks.
+handled by the always-on lightweight repository checks. The same event also
+selects macOS runners by a static PR-author ID allowlist, with hosted fallback
+for unknown authors or unavailable metadata.
 """
 
 from __future__ import annotations
@@ -14,6 +16,34 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+
+
+# GitHub account IDs survive login renames. Login values are review annotations.
+MACOS_RUNNER_AUTHORS = {
+    39627130: "XuPeng-SH",
+    52204121: "loveRhythm1990",
+    26336316: "gouhongshen",
+    49699333: "dependabot[bot]",
+    2245572: "zuyu",
+    4965857: "dengn",
+    85048713: "MatrixAdventurer",
+    176287284: "endlesschasey-ai",
+    49832303: "aptend",
+    169294: "fengttt",
+    28526327: "plane-hjh",
+}
+MACOS_SELF_HOSTED_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
+
+
+def select_macos_runner(event_name: str, event: dict) -> list[str]:
+    # Trusted pushes must not consume persistent state left by unmerged PRs.
+    if event_name == "pull_request" and isinstance(event, dict):
+        pull_request = event.get("pull_request")
+        author = pull_request.get("user") if isinstance(pull_request, dict) else None
+        author_id = author.get("id") if isinstance(author, dict) else None
+        if type(author_id) is int and author_id in MACOS_RUNNER_AUTHORS:
+            return MACOS_SELF_HOSTED_LABELS.copy()
+    return ["macos-15"]
 
 
 SCOPES = (
@@ -255,11 +285,22 @@ def emit(scopes: dict[str, bool], paths: list[str], *, fallback: str | None = No
         print(f"{scope}={'true' if scopes[scope] else 'false'}")
     print("changed_paths=" + (", ".join(sorted(paths)) or "<unknown; full fallback>"))
 
+    try:
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        labels = select_macos_runner(
+            os.environ.get("GITHUB_EVENT_NAME", ""), event
+        )
+    except (KeyError, OSError, ValueError, TypeError):
+        labels = ["macos-15"]
+    runner_json = json.dumps(labels, separators=(",", ":"))
+    print("macos_runner=" + runner_json)
+
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with Path(github_output).open("a", encoding="utf-8") as output:
             for scope in SCOPES:
                 output.write(f"{scope}={'true' if scopes[scope] else 'false'}\n")
+            output.write("macos_runner=" + runner_json + "\n")
 
 
 def main() -> int:

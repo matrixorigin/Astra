@@ -27,9 +27,12 @@ runs:
   using: "composite"
   steps:
     # Avoid paying for cleanup when the filesystem containing the workspace has
-    # enough room. Keep the cleanup fallback for low or unreadable disk space.
+    # enough room. Only hosted images use the cleanup fallback; persistent
+    # self-hosted runners report low/unreadable disk without privileged cleanup.
     - name: Guard workspace disk space
       shell: bash
+      env:
+        ASTRA_CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       run: |
         set -euxo pipefail
         disk_guard_workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
@@ -51,6 +54,9 @@ runs:
         if [[ "${disk_guard_measurement}" == "valid" ]] &&
           (( disk_guard_available_kib >= disk_guard_threshold_kib )); then
           echo "Disk guard decision: skip cleanup; workspace filesystem free=${disk_guard_available_kib} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB)."
+        elif [[ "${ASTRA_CI_RUNNER_ENVIRONMENT:-}" == self-hosted ]]; then
+          echo "::error::Disk guard decision: fail self-hosted; measurement=${disk_guard_measurement}; workspace filesystem free=${disk_guard_available_kib:-unavailable} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB). Reclaim runner disk before retrying."
+          exit 1
         else
           echo "Disk guard decision: run cleanup; measurement=${disk_guard_measurement}; workspace filesystem free=${disk_guard_available_kib:-unavailable} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB)."
           sudo rm -rf /usr/share/dotnet
@@ -63,9 +69,7 @@ runs:
         df -h "${disk_guard_workspace}"
 
     - name: Install pinned Rust toolchain
-      # The repository toolchain also owns test-created Cargo fixtures.
-      shell: bash
-      run: rustc --version
+      uses: ./.github/actions/rust-toolchain
 
     - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
       if: ${{ inputs.install-nextest == 'true' }}

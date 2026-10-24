@@ -1,0 +1,30 @@
+name: macOS mini scheduler
+on:
+  workflow_run:
+    workflows: [Test Suite]
+    types: [in_progress, completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: read
+concurrency:
+  group: macos-scheduler-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+jobs:
+  schedule:
+    if: github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      # Only the default-branch controller is loaded; it never executes PR code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Schedule and bound the mini attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_MODE: ${{ github.event.action == 'completed' && 'cleanup' || 'schedule' }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 scripts/ci/macos_dispatch.py "$DISPATCH_MODE" --run-id "$SOURCE_RUN_ID" --attempt "$SOURCE_ATTEMPT"
