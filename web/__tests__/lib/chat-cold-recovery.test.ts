@@ -7,7 +7,7 @@ vi.mock("@/lib/runtime-client/server", () => ({
 
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { WebRuntimeClient, getRuntimeClient, requireRuntimeClient } from "@/lib/runtime-client/server";
-import { ensureChatBackendSession, updateChatModel, updateChatWorkspaceSelection, archiveChat, moveChat, deleteChat, getChat, getChatHydrated, getStore, listChats, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
+import { createProject, ensureChatBackendSession, updateChatModel, updateChatWorkspaceSelection, archiveChat, moveChat, deleteChat, getChat, getChatHydrated, getStore, listChats, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
 import { GET as GETDetail } from "@/app/api/chats/[chatId]/route";
 import { POST as POSTMessage } from "@/app/api/chats/[chatId]/messages/route";
 import { GET, POST as POSTStream } from "@/app/api/chats/[chatId]/stream/route";
@@ -687,6 +687,7 @@ it.each(["detail", "directory"])("fences %s metadata across an A-B-A commit and 
   const read = deferred<RuntimeConversationResponse>();
   const directory = deferred<{ sessions: typeof session[] }>();
   metadataWriter(runtime);
+  await updateChatModel("owner", "session", "A");
   if (source === "detail") runtime.sdk.getSessionConversation.mockReturnValueOnce(read.promise);
   else runtime.sdk.listRuntimeSessions.mockReturnValueOnce(directory.promise);
   const reading = source === "detail" ? getChatHydrated("owner", "session") : listChats("owner", {});
@@ -694,8 +695,8 @@ it.each(["detail", "directory"])("fences %s metadata across an A-B-A commit and 
   await updateChatModel("owner", "session", "B");
   await updateChatModel("owner", "session", "A");
   await archiveChat("owner", "session", true);
-  getStore("owner").projects.push({ id: "project", name: "project", createdAt: session.created_at, updatedAt: session.created_at } as never);
-  moveChat("owner", "session", "project");
+  const project = createProject("owner", { name: "project" });
+  moveChat("owner", "session", project.id);
   const stale = conversation();
   stale.session = { ...session, metadata: { source: "web_v1", current_model: "stale" } };
   read.resolve(stale);
@@ -704,7 +705,7 @@ it.each(["detail", "directory"])("fences %s metadata across an A-B-A commit and 
   const chat = getChat("owner", "session")!.chat;
   expect(chat.model).toBe("A");
   expect(chat.archivedAt).toBeTruthy();
-  expect(chat.projectId).toBe("project");
+  expect(chat.projectId).toBe(project.id);
 });
 
 it("keeps a warm parser on an explicitly omitted history and cold-loads a successor", async () => {
@@ -726,10 +727,12 @@ it("binds the current shell after Session creation overlaps a metadata commit an
   runtime.sdk.createRuntimeSession.mockReturnValueOnce(creation.promise);
   const creating = ensureChatBackendSession("owner", "session", { model: "offering" });
   await vi.waitFor(() => expect(runtime.sdk.createRuntimeSession).toHaveBeenCalledTimes(1));
-  moveChat("owner", "session", null);
+  const project = createProject("owner", { name: "new project" });
+  moveChat("owner", "session", project.id);
   creation.resolve(session);
   expect(await creating).toBe("session");
   expect(getChat("owner", "session")?.session?.backendSessionId).toBe("session");
+  expect(getChat("owner", "session")?.chat.projectId).toBe(project.id);
   expect(await ensureChatBackendSession("owner", "session", { model: "offering" })).toBe("session");
   const response = await POSTStream(new Request("http://web.test/api/chats/session/stream", {
     method: "POST", headers: { "content-type": "application/json" },
@@ -740,4 +743,20 @@ it("binds the current shell after Session creation overlaps a metadata commit an
   expect(runtime.sdk.createRuntimeSession).toHaveBeenCalledTimes(1);
   const calls = runtime.fetchResponse.mock.calls as unknown as Array<[string, { json?: { session_id?: string } }]>;
   expect(calls.find(([path]) => path === "/chat/stream")?.[1].json?.session_id).toBe("session");
+});
+
+it("rejects an old missing-Session result after A-B-A metadata commits", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  metadataWriter(runtime);
+  await updateChatModel("owner", "session", "A");
+  const read = deferred<RuntimeConversationResponse>();
+  runtime.sdk.getSessionConversation.mockReturnValueOnce(read.promise);
+  const reading = getChatHydrated("owner", "session");
+  await vi.waitFor(() => expect(runtime.sdk.getSessionConversation).toHaveBeenCalledTimes(2));
+  await updateChatModel("owner", "session", "B");
+  await updateChatModel("owner", "session", "A");
+  read.reject(new AstraApiError(404, "Old Session snapshot was missing", "/sessions/session/transcript"));
+  expect((await reading)?.chat.model).toBe("A");
+  expect(getChat("owner", "session")?.chat.model).toBe("A");
 });
