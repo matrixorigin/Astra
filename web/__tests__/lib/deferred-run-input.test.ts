@@ -427,6 +427,7 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-open',
           sessionId: 'chat-open',
+          openingInput: { original_input: 'hello', source_event_id: 'opening-source', created_at: '2026-10-25T03:00:00Z' },
           parentRunId: null,
           rootRunId: 'run-open',
           depth: 0,
@@ -449,17 +450,14 @@ describe('queueDeferredRunInput', () => {
         listRuntimeSessions,
         listRuns,
         getSessionTranscript,
-        getRunProjection: vi.fn().mockResolvedValue({
-          run_id: 'run-open', session_id: 'chat-open', status: 'input-queued',
-          opening_input: { original_input: 'hello', source_event_id: 'opening-source' },
-        }),
+        getRunStatus: vi.fn().mockResolvedValue({ runId: 'run-open', sessionId: 'chat-open', status: 'input-queued' }),
       },
     } as never);
 
     const result = await getChatHydrated('user-a', 'chat-open');
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
-    expect(listRuns).toHaveBeenCalledWith({ limit: 200 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200, includeInputForSession: 'chat-open' });
     expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', {
       limit: 200,
     });
@@ -812,6 +810,7 @@ describe('queueDeferredRunInput', () => {
         {
           runId: 'run-stop',
           sessionId: 'chat-stop',
+          openingInput: { original_input: 'hello', source_event_id: 'opening-source', created_at: '2026-10-25T03:00:00Z' },
           parentRunId: null,
           rootRunId: 'run-stop',
           depth: 0,
@@ -830,10 +829,7 @@ describe('queueDeferredRunInput', () => {
     });
     mockGetRuntimeClient.mockResolvedValue({
       sdk: { listRuntimeSessions, listRuns, getSessionTranscript,
-        getRunProjection: vi.fn().mockResolvedValue({
-          run_id: 'run-stop', session_id: 'chat-stop', status: 'running',
-          opening_input: { original_input: 'hello', source_event_id: 'opening-source' },
-        }),
+        getRunStatus: vi.fn().mockResolvedValue({ runId: 'run-stop', sessionId: 'chat-stop', status: 'running' }),
       },
     } as never);
 

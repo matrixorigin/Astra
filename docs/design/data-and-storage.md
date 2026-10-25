@@ -176,8 +176,13 @@ Retention is a product contract:
   its original execution lease. It does not borrow a Controller writer or reservation,
   or materialize a second raw input before execution. Exact opening identity
   resolves a lost acknowledgement. Resume reuses this original admission.
-- Raw conversation history stores original input, applied user guidance and the
-  actual terminal assistant answer with its model-item identity. It does not
+- Raw conversation settlement stores original input, applied user guidance and the
+  actual terminal assistant answer with its model-item identity. An accepted Run
+  that ends before execution can retain only its immutable opening. User-visible
+  history combines that accepted input with materialized raw history through the
+  existing owner-scoped Run-list read, without another stored projection, query or
+  synthetic transcript cursor. Opt-in input payload is scoped to the selected
+  Session's roots; the composed Web detail retains its existing finite window. It does not
   copy tool starts/results: canonical Context owns model continuation and the
   invocation ledger owns governed outcomes and effect uncertainty. Run tool
   cards are optional live presentation. Paused output does not occupy the

@@ -277,6 +277,7 @@ impl RunLifecycleService for RecordingLifecycle {
         let active = *self.keep_run_active.lock().await;
         let failed = *self.failed_terminal_replay.lock().await;
         Ok(RunStatusRecord {
+            opening_input: None,
             artifact_publication: None,
             explain_requested: *self.publication_after_terminal.lock().await
                 || *self.publication_in_live_replay.lock().await,
@@ -459,6 +460,7 @@ impl RunLifecycleService for RecordingLifecycle {
         _user_id: String,
         _limit: u32,
         _cursor: Option<RunListCursor>,
+        _include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }

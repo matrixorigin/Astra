@@ -175,7 +175,6 @@ pub trait RunLifecycleService: Send + Sync {
         _run_id: String,
         _user_id: String,
         _recent_limit: u32,
-        _include_input: bool,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -230,6 +229,7 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
         limit: u32,
         cursor: Option<RunListCursor>,
+        include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     /// Return a bounded authoritative snapshot of one session's durable runs.
@@ -1360,6 +1360,7 @@ pub struct ChatStreamRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStatusRecord {
+    pub opening_input: Option<RunOpeningInputProjection>,
     pub artifact_publication: Option<serde_json::Value>,
     /// Durable root run-start intent, available from the bounded status read.
     pub explain_requested: bool,
@@ -1396,11 +1397,11 @@ pub struct RunProjectionCheckpointRecord {
 pub struct RunOpeningInputProjection {
     pub original_input: String,
     pub source_event_id: String,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunProjectionRecord {
-    pub opening_input: Option<RunOpeningInputProjection>,
     pub run_id: String,
     pub session_id: String,
     pub status: String,
@@ -27168,6 +27169,7 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _user_id: String,
         _limit: u32,
         _cursor: Option<RunListCursor>,
+        _include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,

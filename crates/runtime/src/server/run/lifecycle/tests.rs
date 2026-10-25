@@ -21428,7 +21428,7 @@ async fn lease_loss_during_preparation_closes_delivery_and_preserves_recovery_wo
             0,
             "recovery owns unconfirmed authority"
         );
-        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
         assert_eq!(runs.runs[0].status, STATUS_RUNNING);
         let workspace = runs.runs[0].workspace.as_ref().unwrap()["cwd"]
             .as_str()
@@ -21458,7 +21458,7 @@ async fn preparation_failure_keeps_lease_until_terminal_commit_and_releases_sess
             err(svc.create_run("user-1".into(), request).await)
         };
         assert_eq!(failure.0, StatusCode::SERVICE_UNAVAILABLE);
-        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
         assert_eq!(runs.runs.len(), 1);
         assert_eq!(runs.runs[0].status, STATUS_FAILED);
         let run = svc
@@ -21605,7 +21605,7 @@ async fn expired_start_receipt_returns_coded_conflict_without_rejecting_durable_
             "no local execution may start"
         );
         if entrypoint == "cloud" {
-            let list = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+            let list = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
             let run = svc
                 .run_engine
                 .load_run("user-1", &list.runs[0].run_id)
@@ -24220,7 +24220,7 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
         .unwrap()
         .unwrap();
     let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
-    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     assert!(status.workspace.is_none() && status.executor.is_none() && status.transport.is_none());
     assert!(
         listing.runs[0].workspace.is_none()
@@ -24403,7 +24403,7 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
     let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
     assert_eq!(status.workspace.unwrap()["cwd"], "/workspace/late-binding");
     assert_eq!(status.executor.unwrap()["kind"], "server_local");
-    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     assert_eq!(
         listing.runs[0].workspace.as_ref().unwrap()["cwd"],
         "/workspace/late-binding"
@@ -28069,7 +28069,7 @@ async fn stream_run_hides_foreign_run() {
 #[tokio::test]
 async fn list_runs_empty_initially() {
     let svc = test_service();
-    let result = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let result = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     assert_eq!(result.total, None);
     assert!(result.runs.is_empty());
 }
@@ -28080,13 +28080,13 @@ async fn list_runs_filters_by_user() {
     let u1_a = ok(svc.create_run("user-1".into(), test_request("a")).await);
     let u2_b = ok(svc.create_run("user-2".into(), test_request("b")).await);
     let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
-    let for_u1 = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let for_u1 = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     assert_eq!(for_u1.total, None);
     let ids: std::collections::HashSet<_> = for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
     assert!(ids.contains(u1_a.run_id.as_str()));
     assert!(ids.contains(u1_c.run_id.as_str()));
     assert!(!ids.contains(u2_b.run_id.as_str()));
-    let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None).await);
+    let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None, None).await);
     assert_eq!(for_u2.total, None);
     assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
 }
@@ -28099,18 +28099,18 @@ async fn list_runs_cursor_pagination_omits_count_and_returns_next_cursor() {
             .create_run("user-1".into(), test_request(&format!("msg {i}")))
             .await);
     }
-    let page1 = ok(svc.list_runs_cursor("user-1".into(), 2, None).await);
+    let page1 = ok(svc.list_runs_cursor("user-1".into(), 2, None, None).await);
     assert_eq!(page1.total, None);
     assert_eq!(page1.runs.len(), 2);
     assert!(page1.next_cursor.is_some());
     let page2 = ok(svc
-        .list_runs_cursor("user-1".into(), 2, page1.next_cursor)
+        .list_runs_cursor("user-1".into(), 2, page1.next_cursor, None)
         .await);
     assert_eq!(page2.total, None);
     assert_eq!(page2.runs.len(), 2);
     assert!(page2.next_cursor.is_some());
     let page3 = ok(svc
-        .list_runs_cursor("user-1".into(), 2, page2.next_cursor)
+        .list_runs_cursor("user-1".into(), 2, page2.next_cursor, None)
         .await);
     assert_eq!(page3.total, None);
     assert_eq!(page3.runs.len(), 1);
@@ -28123,12 +28123,12 @@ async fn list_runs_orders_by_latest_update() {
     let older = ok(svc.create_run("user-1".into(), test_request("older")).await);
     let newer = ok(svc.create_run("user-1".into(), test_request("newer")).await);
 
-    let initial = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let initial = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     assert_eq!(initial.runs[0].run_id, newer.run_id);
 
     ok(svc.pause_run(older.run_id.clone(), "user-1".into()).await);
 
-    let after_update = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let after_update = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     assert_eq!(
         after_update.runs[0].run_id, older.run_id,
         "list_runs_cursor should surface the most recently updated run first"
@@ -28141,7 +28141,7 @@ async fn list_runs_cursor_clamps_pagination() {
     let svc = test_service();
     // Absurdly large limit must not panic or produce unbounded queries.
     let result = ok(svc
-        .list_runs_cursor("user-clamp".into(), u32::MAX, None)
+        .list_runs_cursor("user-clamp".into(), u32::MAX, None, None)
         .await);
     assert_eq!(result.runs.len(), 0);
     // Verify the returned limit is clamped.
@@ -35150,7 +35150,7 @@ async fn list_runs_falls_back_to_durable_store_on_cache_miss() {
 
     svc.runs.write().await.remove(&first.run_id);
 
-    let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
     let run_ids: Vec<_> = runs.runs.iter().map(|run| run.run_id.as_str()).collect();
     assert_eq!(runs.total, None);
     assert!(run_ids.contains(&first.run_id.as_str()));
@@ -35428,6 +35428,124 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
         }),
         "durable run_finished must preserve the pre-spawn terminal code"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
+    use astra_services::SessionService;
+    let pool = setup_lifecycle_run_db_it().await;
+    for cancelled in [false, true] {
+        let user = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        let service = db_backed_test_service(&pool, "early-terminal-read-owner");
+        let request = prepared_test_request("  accepted before execution\n你好  ");
+        let mut participant = RootTurnStartParticipant {
+            service: &service,
+            user_id: &user,
+            session_id: &session,
+            run_id: &run,
+            request: &request,
+            admission: None,
+            prepared: None,
+            rejection: None,
+        };
+        assert!(matches!(
+            service
+                .run_engine
+                .admit_run_with_context(
+                    &run,
+                    &user,
+                    &session,
+                    Some(&session),
+                    RunStartContext {
+                        original_input: Some(request.message.clone()),
+                        ..Default::default()
+                    },
+                    true,
+                    &mut participant,
+                )
+                .await
+                .unwrap(),
+            DurableRunStartClaim::Started { .. }
+        ));
+        let generation = participant.admission.as_ref().unwrap().authority.generation;
+        if cancelled {
+            assert!(
+                service
+                    .run_engine
+                    .request_run_cancellation(&user, &run)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                AgenticRunLifecycleService::cancel_started_run_before_admission_with_handles(
+                    &service.run_engine,
+                    &service.runs,
+                    &user,
+                    &session,
+                    &run,
+                    generation,
+                )
+                .await
+                .is_some()
+            );
+        } else {
+            assert!(
+                AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
+                    &service.run_engine,
+                    &service.runs,
+                    &user,
+                    &session,
+                    &run,
+                    generation,
+                    "server capacity timeout before streaming agentic loop start",
+                    PreSpawnFailureCode::RunAdmissionTimeout,
+                )
+                .await
+            );
+        }
+        let default = ok(service.list_runs_cursor(user.clone(), 10, None, None).await);
+        assert!(default.runs[0].opening_input.is_none());
+        let page = ok(service
+            .list_runs_cursor(user.clone(), 10, None, Some(session.clone()))
+            .await);
+        assert_eq!(page.runs.len(), 1);
+        assert_eq!(
+            page.runs[0].status,
+            if cancelled {
+                STATUS_CANCELLED
+            } else {
+                STATUS_FAILED
+            }
+        );
+        let input = page.runs[0].opening_input.as_ref().unwrap();
+        assert_eq!(input.original_input, request.message);
+        assert_eq!(
+            input.source_event_id,
+            persistence::server_input_source_event_id(&session, &run)
+        );
+        let raw_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_count, 0,
+            "visibility reuses the opening without adding a transcript write"
+        );
+        drop(participant);
+        astra_services::DatabaseSessionService::new(pool.settings().clone())
+            .with_pool(pool.clone())
+            .delete_session(session, user)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -35857,14 +35975,14 @@ async fn list_runs_cursor_pagination_is_deterministic() {
     }
     // Collect all run_ids across 3 pages
     let mut all_ids = Vec::new();
-    let page1 = ok(svc.list_runs_cursor("user-pg".into(), 2, None).await);
+    let page1 = ok(svc.list_runs_cursor("user-pg".into(), 2, None, None).await);
     all_ids.extend(page1.runs.iter().map(|r| r.run_id.clone()));
     let page2 = ok(svc
-        .list_runs_cursor("user-pg".into(), 2, page1.next_cursor)
+        .list_runs_cursor("user-pg".into(), 2, page1.next_cursor, None)
         .await);
     all_ids.extend(page2.runs.iter().map(|r| r.run_id.clone()));
     let page3 = ok(svc
-        .list_runs_cursor("user-pg".into(), 2, page2.next_cursor)
+        .list_runs_cursor("user-pg".into(), 2, page2.next_cursor, None)
         .await);
     all_ids.extend(page3.runs.iter().map(|r| r.run_id.clone()));
 

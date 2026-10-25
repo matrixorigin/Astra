@@ -59,8 +59,10 @@ function runtimeRun(
     rootRunId: string;
     depth: number;
   },
+  input?: { original_input: string; source_event_id: string; created_at?: string },
 ) {
   return {
+    ...(input ? { opening_input: { created_at: "2026-10-25T03:00:00Z", ...input } } : {}),
     run_id: runId,
     session_id: sessionId,
     parent_run_id: lineage?.parentRunId ?? null,
@@ -500,7 +502,8 @@ describe("web store user scoping", () => {
               "run-waiting",
               "session-multi-run",
               "waiting",
-              "user_input",
+              "user_input", undefined,
+              { original_input: "hello", source_event_id: "source-run-waiting" },
             ),
           ]),
         ),
@@ -508,7 +511,7 @@ describe("web store user scoping", () => {
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])))
       .mockResolvedValueOnce(jsonResponse({
         run_id: "run-waiting", session_id: "session-multi-run", status: "running",
-        opening_input: { original_input: "hello", source_event_id: "source-run-waiting" },
+        events_count: 0,
       }));
 
     const detail = await getChatHydrated("user-a", "session-multi-run");
@@ -532,7 +535,7 @@ describe("web store user scoping", () => {
       .mockResolvedValueOnce(
         jsonResponse(
           runtimeRunList([
-            runtimeRun("run-freshest", "session-running-race", "running"),
+            runtimeRun("run-freshest", "session-running-race", "running", null, undefined, { original_input: "hello", source_event_id: "source-run-freshest" }),
             runtimeRun("run-stale", "session-running-race", "running"),
           ]),
         ),
@@ -540,7 +543,7 @@ describe("web store user scoping", () => {
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])))
       .mockResolvedValueOnce(jsonResponse({
         run_id: "run-freshest", session_id: "session-running-race", status: "running",
-        opening_input: { original_input: "hello", source_event_id: "source-run-freshest" },
+        events_count: 0,
       }));
 
     const detail = await getChatHydrated("user-a", "session-running-race");
@@ -569,14 +572,14 @@ describe("web store user scoping", () => {
               rootRunId: "root-run",
               depth: 1,
             }),
-            runtimeRun("root-run", "session-fanout", "running"),
+            runtimeRun("root-run", "session-fanout", "running", null, undefined, { original_input: "hello", source_event_id: "source-root-run" }),
           ]),
         ),
       )
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])))
       .mockResolvedValueOnce(jsonResponse({
         run_id: "root-run", session_id: "session-fanout", status: "running",
-        opening_input: { original_input: "hello", source_event_id: "source-root-run" },
+        events_count: 0,
       }));
 
     const detail = await getChatHydrated("user-a", "session-fanout");
@@ -601,14 +604,14 @@ describe("web store user scoping", () => {
       .mockResolvedValueOnce(
         jsonResponse(
           runtimeRunList([
-            runtimeRun("run-stream-lag", "session-stream-lag", "running"),
+            runtimeRun("run-stream-lag", "session-stream-lag", "running", null, undefined, { original_input: "hello", source_event_id: "source-run-stream-lag" }),
           ]),
         ),
       )
       .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])))
       .mockResolvedValueOnce(jsonResponse({
         run_id: "run-stream-lag", session_id: "session-stream-lag", status: "running",
-        opening_input: { original_input: "hello", source_event_id: "source-run-stream-lag" },
+        events_count: 0,
       }));
 
     getStore("user-a").chats.push({
@@ -702,7 +705,8 @@ describe("web store user scoping", () => {
       .mockResolvedValueOnce(
         jsonResponse(
           runtimeRunList([
-            runtimeRun("root-restart", "session-restart", "running"),
+            runtimeRun("root-restart", "session-restart", "running", null, undefined,
+              { original_input: input, source_event_id: "input-source" }),
           ]),
         ),
       )
@@ -713,7 +717,7 @@ describe("web store user scoping", () => {
       )
       .mockResolvedValueOnce(jsonResponse({
         run_id: "root-restart", session_id: "session-restart", status: "running",
-        opening_input: { original_input: input, source_event_id: "input-source" },
+        events_count: 0,
       }));
 
     const detail = await getChatHydrated("user-a", "web-stable");
@@ -721,7 +725,8 @@ describe("web store user scoping", () => {
       history.some(item => item.run_id === "root-restart") ? 1 : history.length + 1,
     );
     expect(detail?.messages.at(-2)?.content).toBe(input);
-    expect(fetchMock.mock.calls.at(-1)?.[0]).toContain("include_input=true");
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("include_input_for_session=session-restart");
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toContain("/chat/runs/root-restart");
 
     expect(detail?.chat.id).toBe("web-stable");
     expect(detail?.session?.backendSessionId).toBe("session-restart");
@@ -738,7 +743,8 @@ describe("web store user scoping", () => {
       const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
       fetchMock
         .mockResolvedValueOnce(jsonResponse(runtimeSessionList([runtimeSession("session-cold", "user-a", "Cold")])))
-        .mockResolvedValueOnce(jsonResponse(runtimeRunList([runtimeRun("run-cold", "session-cold", "running")])))
+        .mockResolvedValueOnce(jsonResponse(runtimeRunList([runtimeRun("run-cold", "session-cold", "running", null, undefined,
+          scenario === "missing input" ? undefined : { original_input: "original input", source_event_id: "input-source" })])))
         .mockResolvedValueOnce(jsonResponse(runtimeTranscript(scenario === "conflicting input" ? [
           { item_seq: 1, run_id: "run-cold", source_event_id: "input-source", role: "user", content: "altered input" },
         ] : [])))
@@ -751,24 +757,24 @@ describe("web store user scoping", () => {
           if (scenario === "read error") return jsonResponse({ error: "storage unavailable" }, 503);
           return jsonResponse({ run_id: "run-cold", session_id: scenario === "wrong session" ? "other" : "session-cold",
             status: scenario === "terminal" ? "completed" : "running",
-            ...(scenario === "conflicting input" ? { opening_input: { original_input: "original input", source_event_id: "input-source" } } : {}),
+            events_count: 0,
           });
         });
       if (scenario === "terminal") {
         fetchMock.mockResolvedValueOnce(jsonResponse(runtimeTranscript([
-          { item_seq: 1, run_id: "run-cold", role: "user", content: "hello" },
+          { item_seq: 1, run_id: "run-cold", source_event_id: "input-source", role: "user", content: "original input" },
           { item_seq: 2, run_id: "run-cold", role: "assistant", content: "done" },
         ])));
         const detail = await getChatHydrated("user-a", "session-cold");
         expect(detail?.activeRun).toBeUndefined();
-        expect(detail?.messages.map(message => message.content)).toEqual(["hello", "done"]);
+        expect(detail?.messages.map(message => message.content)).toEqual(["original input", "done"]);
         expect(detail?.messages.every(message => message.status === "complete")).toBe(true);
       } else if (scenario === "replaced run") {
         const detail = await getChatHydrated("user-a", "session-cold");
         expect(detail?.activeRun?.runId).toBe("new-run");
         expect(detail?.messages.map(message => message.content)).toEqual(["new turn"]);
       } else {
-        await expect(getChatHydrated("user-a", "session-cold")).rejects.toThrow(/recover input/);
+        await expect(getChatHydrated("user-a", "session-cold")).rejects.toThrow(/recover (?:input|run)/);
         expect(getStore("user-a").chats[0].messages).toEqual([]);
       }
     },

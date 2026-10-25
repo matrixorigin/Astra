@@ -1341,6 +1341,8 @@ export type AgentBindingRecord = {
 };
 
 export type RunStatus = {
+  /** Present only when listing root Runs for the requested input Session. */
+  openingInput?: { original_input: string; source_event_id: string; created_at: string };
   artifactPublication?: ArtifactPublicationV1;
   runId: string;
   sessionId: string;
@@ -1367,8 +1369,6 @@ export type RunStatus = {
 };
 
 export type RunProjectionResponse = {
-  /** Exact immutable input, present only for explicit includeInput reads. */
-  opening_input?: { original_input: string; source_event_id: string };
   run_id: string;
   session_id: string;
   status: string;
@@ -1873,6 +1873,7 @@ export type RunListCursor = {
 export type RunListParams = {
   limit?: number;
   cursor?: RunListCursor;
+  includeInputForSession?: string;
 };
 
 export type RunListResponse = {

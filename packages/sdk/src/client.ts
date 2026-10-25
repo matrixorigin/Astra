@@ -398,6 +398,7 @@ function assertWorkCommitMessage(value: string): void {
 }
 
 type RunStatusWire = {
+  opening_input?: RunStatus["openingInput"];
   artifact_publication?: import("./types").ArtifactPublicationV1;
   run_id: string;
   session_id: string;
@@ -447,6 +448,7 @@ function normalizeSession(w: SessionWire): SessionInfo {
 
 function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
+    ...(w.opening_input ? { openingInput: w.opening_input } : {}),
     artifactPublication: w.artifact_publication,
     runId: w.run_id,
     sessionId: w.session_id,
@@ -3083,10 +3085,9 @@ export class AstraClient {
    */
   async getRunProjection(
     runId: string,
-    opts?: { recentLimit?: number; includeInput?: boolean },
+    opts?: { recentLimit?: number },
   ): Promise<RunProjectionResponse> {
     const q = buildQueryString({
-      ...(opts?.includeInput ? { include_input: "true" } : {}),
       ...(opts?.recentLimit !== undefined
         ? { recent_limit: opts.recentLimit }
         : {}),
@@ -3101,6 +3102,7 @@ export class AstraClient {
   /** `GET /runs` — list durable runs for the current user. */
   async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {
     const q = buildQueryString({
+      ...(opts.includeInputForSession ? { include_input_for_session: opts.includeInputForSession } : {}),
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
       ...(opts.cursor
         ? {

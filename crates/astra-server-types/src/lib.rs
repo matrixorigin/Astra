@@ -1706,6 +1706,8 @@ pub struct ChatResponse {
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening_input: Option<astra_services::runs::RunOpeningInputProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub session_id: String,
@@ -1763,6 +1765,7 @@ pub struct RunListQuery {
     pub limit: u32,
     pub after_updated_at: Option<String>,
     pub after_run_id: Option<String>,
+    pub include_input_for_session: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -2324,6 +2327,7 @@ impl From<ChatRunRecord> for ChatResponse {
 impl From<RunStatusRecord> for RunStatusResponse {
     fn from(value: RunStatusRecord) -> Self {
         Self {
+            opening_input: value.opening_input,
             artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             session_id: value.session_id,

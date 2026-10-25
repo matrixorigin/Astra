@@ -12918,6 +12918,7 @@ impl AgenticRunLifecycleService {
                 .flatten()
         });
         RunStatusRecord {
+            opening_input: None,
             artifact_publication: None,
             explain_requested: astra_services::runs::run_requested_explain_analyze(run),
             run_id: run.run_id.clone(),
@@ -12937,6 +12938,7 @@ impl AgenticRunLifecycleService {
 
     fn durable_status_snapshot_record(snapshot: DurableRunStatusSnapshot) -> RunStatusRecord {
         RunStatusRecord {
+            opening_input: None,
             artifact_publication: None,
             explain_requested: snapshot.explain_requested,
             run_id: snapshot.run_id,
@@ -16319,7 +16321,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
         recent_limit: u32,
-        include_input: bool,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
         let latest_checkpoint = self
@@ -16338,22 +16339,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let recent_events = Self::durable_recent_events(&run, recent_limit);
         let binding = Self::durable_run_execution_binding_snapshot(&run);
         let latest_event_type = run.events.last().map(astra_services::extract_event_type);
-        let opening_input = if include_input {
-            run.opening
-                .as_ref()
-                .and_then(|opening| opening.input())
-                .map(|input| astra_services::runs::RunOpeningInputProjection {
-                    original_input: input.original_input.clone(),
-                    source_event_id: persistence::server_input_source_event_id(
-                        &run.session_id,
-                        &run.run_id,
-                    ),
-                })
-        } else {
-            None
-        };
         Ok(RunProjectionRecord {
-            opening_input,
             run_id: run.run_id,
             session_id: run.session_id,
             status: run.status,
@@ -17348,6 +17334,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         limit: u32,
         cursor: Option<RunListCursor>,
+        include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         let limit = astra_services::runs::validate_run_list_limit(limit);
         let durable_page = self
@@ -17363,7 +17350,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let page = durable_page
             .runs
             .iter()
-            .map(Self::durable_status_record)
+            .map(|run| {
+                let mut status = Self::durable_status_record(run);
+                if include_input_for_session.as_deref() == Some(run.session_id.as_str())
+                    && run.parent_run_id.is_none()
+                    && run.depth == 0
+                {
+                    status.opening_input = run
+                        .opening
+                        .as_ref()
+                        .and_then(|opening| opening.input())
+                        .map(|input| astra_services::runs::RunOpeningInputProjection {
+                            original_input: input.original_input.clone(),
+                            source_event_id: persistence::server_input_source_event_id(
+                                &run.session_id,
+                                &run.run_id,
+                            ),
+                            created_at: run.created_at.clone(),
+                        });
+                }
+                status
+            })
             .collect();
         Ok(RunListRecord {
             runs: page,

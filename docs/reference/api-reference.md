@@ -90,6 +90,25 @@ uses economy only for confidently easy, read-only tasks with compatible model
 contracts. See [model routing](../design/model-routing.md#deterministic-auto-selection-stage-3)
 for configuration, coverage, and persistence semantics.
 
+## Run history reads
+
+`GET /runs` keeps its owner-scoped keyset pagination (`limit`, `after_updated_at`,
+`after_run_id`). The optional `include_input_for_session=<session-id>` projects
+`opening_input` only for the authenticated owner's matching root Runs:
+
+```json
+{"original_input":"exact submitted text","source_event_id":"trace:user:...","created_at":"2026-10-25 03:00:00.123456"}
+```
+
+The timestamp is the immutable UTC admission time. This is a read projection of
+the opening already loaded by the list query; it adds no lookup or storage write.
+Default lists and `GET /chat/runs/{run_id}` omit the field. Context authority is
+never included. Clients can retain accepted input after a pre-execution failure
+or cancellation by merging Session/Run/source identity with raw history. Raw
+transcript `item_seq` pagination is unchanged; projected inputs have no raw cursor.
+The option adds the selected Session's input text to the HTTP payload, including
+text that may also be present in settled raw history.
+
 ## Active run permission mode
 
 ### POST /chat/runs/{run_id}/permission-mode

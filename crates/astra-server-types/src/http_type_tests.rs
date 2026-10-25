@@ -660,6 +660,7 @@ fn chat_response_serializes_with_explain() {
 #[test]
 fn run_status_response_serializes() {
     let resp = RunStatusResponse {
+        opening_input: None,
         artifact_publication: None,
         run_id: "r1".into(),
         session_id: "s1".into(),
@@ -1015,6 +1016,7 @@ fn session_list_record_to_response() {
 fn run_list_record_to_response_preserves_optional_total_and_cursor() {
     let record = RunListRecord {
         runs: vec![RunStatusRecord {
+            opening_input: None,
             artifact_publication: None,
             explain_requested: false,
             run_id: "run-1".into(),
@@ -1085,6 +1087,7 @@ fn chat_run_record_to_response() {
 fn run_status_record_to_response() {
     // with waiting_for
     let record = RunStatusRecord {
+        opening_input: None,
         artifact_publication: None,
         explain_requested: false,
         run_id: "r1".into(),
@@ -1110,6 +1113,7 @@ fn run_status_record_to_response() {
 
     // without waiting_for
     let record = RunStatusRecord {
+        opening_input: None,
         artifact_publication: None,
         explain_requested: false,
         run_id: "r2".into(),

@@ -334,8 +334,6 @@ pub(crate) async fn get_run_status_handler(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct RunProjectionQuery {
-    #[serde(default)]
-    pub include_input: bool,
     #[serde(default = "default_projection_recent_limit")]
     pub recent_limit: u32,
 }
@@ -355,8 +353,6 @@ pub(crate) struct RunProjectionCheckpointResponse {
 
 #[derive(serde::Serialize)]
 pub(crate) struct RunProjectionResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub opening_input: Option<astra_services::runs::RunOpeningInputProjection>,
     pub run_id: String,
     pub session_id: String,
     pub status: String,
@@ -405,7 +401,6 @@ impl RunProjectionResponse {
         observability: RunProjectionObservabilityResponse,
     ) -> Self {
         Self {
-            opening_input: value.opening_input,
             run_id: value.run_id,
             session_id: value.session_id,
             status: value.status,
@@ -445,12 +440,7 @@ pub(crate) async fn get_run_projection_handler(
     let projection = state
         .execution
         .run_lifecycle_service
-        .get_run_projection(
-            run_id.clone(),
-            user_id.clone(),
-            query.recent_limit,
-            query.include_input,
-        )
+        .get_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
         .await?;
     Ok(Json(
         build_run_projection_response(&state, &user_id, &run_id, projection).await?,
@@ -681,7 +671,12 @@ pub(crate) async fn list_runs_handler(
     let runs = state
         .execution
         .run_lifecycle_service
-        .list_runs_cursor(user.user_id, query.limit, cursor)
+        .list_runs_cursor(
+            user.user_id,
+            query.limit,
+            cursor,
+            query.include_input_for_session,
+        )
         .await?;
     Ok(Json(RunListResponse::from(runs)))
 }
@@ -2586,7 +2581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_input_projection_is_opt_in_exact_and_cross_instance() {
+    async fn opening_input_listing_is_opt_in_scoped_exact_and_cross_instance() {
         use crate::server::run::engine::{RunEngine, RunStartContext};
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
         use astra_services::runs::InMemoryRunStateStore;
@@ -2606,6 +2601,52 @@ mod tests {
             )
             .await
             .expect("persist opening only");
+        for (run, user, session) in [
+            ("other-session", "u1", "other-session"),
+            ("foreign-owner", "u2", "foreign-session"),
+        ] {
+            writer
+                .start_run_with_context(
+                    run,
+                    user,
+                    session,
+                    RunStartContext {
+                        original_input: Some("outside requested Session".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        writer
+            .start_run_ext_with_context(
+                "child-input",
+                "u1",
+                "opening-session",
+                Some("opening-read"),
+                None,
+                None,
+                None,
+                RunStartContext {
+                    original_input: Some("child task".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .transition_status_with_event_if_current(
+                "u1",
+                "opening-session",
+                "opening-read",
+                &["running"],
+                "failed",
+                None,
+                Some("capacity timeout"),
+                serde_json::json!({"event_type":"run_error","data":{"error":"capacity timeout"}}),
+            )
+            .await
+            .unwrap();
         // A separate engine and lifecycle have no writer process's local Run map.
         let reader = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2618,9 +2659,10 @@ mod tests {
                 .with_auth_service(Arc::new(StubAuthService))
                 .with_run_lifecycle_service(Arc::new(reader)),
         );
-        for include in [false, true] {
-            let uri = format!(
-                "/chat/runs/opening-read/projection?recent_limit=0&include_input={include}"
+        for session in [None, Some("opening-session"), Some("foreign-session")] {
+            let uri = session.map_or_else(
+                || "/runs?limit=20".to_owned(),
+                |session| format!("/runs?limit=20&include_input_for_session={session}"),
             );
             let response = app
                 .clone()
@@ -2637,18 +2679,38 @@ mod tests {
             let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
                 .unwrap();
+            eprintln!(
+                "opening input listing session={session:?} response_bytes={}",
+                bytes.len()
+            );
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(json["session_id"], "opening-session");
-            if include {
-                assert_eq!(json["opening_input"]["original_input"], input);
-                assert!(
-                    json["opening_input"]["source_event_id"]
-                        .as_str()
-                        .is_some_and(|id| !id.is_empty())
-                );
-                assert_eq!(json["opening_input"].as_object().unwrap().len(), 2);
-            } else {
-                assert!(json.get("opening_input").is_none());
+            let runs = json["runs"].as_array().unwrap();
+            assert_eq!(
+                runs.len(),
+                3,
+                "the owner-scoped list excludes the foreign Run"
+            );
+            for run in runs {
+                if session == Some("opening-session") && run["run_id"] == "opening-read" {
+                    assert_eq!(run["status"], "failed");
+                    assert_eq!(run["opening_input"]["original_input"], input);
+                    assert!(
+                        run["opening_input"]["source_event_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
+                    assert!(
+                        run["opening_input"]["created_at"]
+                            .as_str()
+                            .is_some_and(|time| !time.is_empty())
+                    );
+                    assert_eq!(run["opening_input"].as_object().unwrap().len(), 3);
+                } else {
+                    assert!(
+                        run.get("opening_input").is_none(),
+                        "default, unrelated Session and child rows stay compact"
+                    );
+                }
             }
         }
     }
@@ -2684,7 +2746,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/chat/runs/run-foreign/projection?include_input=true")
+                    .uri("/chat/runs/run-foreign/projection")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
                     .expect("request should build"),
