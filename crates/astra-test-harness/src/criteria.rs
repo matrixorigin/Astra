@@ -2701,11 +2701,7 @@ fn evaluate_one_with_primary_cache(
             }
         }
         Criterion::ToolsCountBetween { min, max } => {
-            // The terminal envelope and step-event archive cover the same
-            // inclusive execution but have independent capture paths. A
-            // short/partial step-event archive must never override a larger
-            // terminal count and accidentally certify an upper bound.
-            let n = outcome.total_tool_calls.max(outcome.tool_calls_count);
+            let n = outcome.observed_tool_calls();
             let pass = n >= *min && n <= *max;
             CriterionResult {
                 criterion: c.clone(),

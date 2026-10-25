@@ -41,7 +41,7 @@ fn criteria(
                 Criterion::DurationBetween { min_ms, max_ms } =>
                     json!({"kind":"count", "min":min_ms, "max":max_ms, "actual":outcome.duration_ms}),
                 Criterion::ToolsCountBetween { min, max } =>
-                    json!({"kind":"count", "min":min, "max":max, "actual":outcome.tool_calls_count}),
+                    json!({"kind":"count", "min":min, "max":max, "actual":outcome.observed_tool_calls()}),
                 Criterion::TurnRoundsBetween { min, max } =>
                     json!({"kind":"count", "min":min, "max":max, "actual":outcome.turn_rounds}),
                 Criterion::ExitCode { code } =>
@@ -259,6 +259,26 @@ mod tests {
             .and_then(|s| s.execution.as_ref())
             .map(crate::execution_capture::tests::trace);
         super::criteria(values, outcome, trace.as_ref())
+    }
+
+    #[test]
+    fn tool_budget_progress_reports_the_same_count_as_the_verdict() {
+        for (terminal, archive, expected, passed) in
+            [(7, 30, 30, false), (30, 7, 30, false), (8, 7, 8, true)]
+        {
+            let outcome = RunOutcome {
+                tool_calls_count: terminal,
+                total_tool_calls: archive,
+                ..RunOutcome::new("model")
+            };
+            let checks = fixture_evaluate(
+                &[Criterion::ToolsCountBetween { min: 4, max: 18 }],
+                &outcome,
+            );
+            let projected = fixture_criteria(&checks, &outcome).unwrap();
+            assert_eq!(projected[0]["passed"], passed);
+            assert_eq!(projected[0]["diagnostic"]["actual"], expected);
+        }
     }
 
     #[test]
