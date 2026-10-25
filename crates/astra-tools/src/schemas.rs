@@ -571,7 +571,7 @@ fn validate_schema_value(
             continue;
         };
         let mut matches = 0;
-        let mut best_failure: Option<Vec<ValidationIssue>> = None;
+        let mut best_failure: Option<(usize, Vec<ValidationIssue>)> = None;
         let has_type_compatible_branch = alternatives.iter().any(|candidate| {
             candidate
                 .get("type")
@@ -599,15 +599,40 @@ fn validate_schema_value(
                 if keyword == "anyOf" {
                     break;
                 }
-            } else if best_failure
-                .as_ref()
-                .is_none_or(|best| candidate_issues.len() < best.len())
-            {
-                best_failure = Some(candidate_issues);
+            } else {
+                // A malformed selected variant must not look like a different
+                // capability. Rank diagnostics by const/enum tags before issue
+                // count; every branch is still validated for union semantics.
+                let tag_mismatches = candidate
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| {
+                        properties
+                            .iter()
+                            .filter(|(field, rule)| {
+                                value.get(field.as_str()).is_some_and(|actual| {
+                                    rule.get("const").is_some_and(|expected| actual != expected)
+                                        || rule
+                                            .get("enum")
+                                            .and_then(Value::as_array)
+                                            .is_some_and(|allowed| !allowed.contains(actual))
+                                })
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if best_failure
+                    .as_ref()
+                    .is_none_or(|(best_tags, best_issues)| {
+                        (tag_mismatches, candidate_issues.len()) < (*best_tags, best_issues.len())
+                    })
+                {
+                    best_failure = Some((tag_mismatches, candidate_issues));
+                }
             }
         }
         if matches == 0 {
-            issues.extend(best_failure.unwrap_or_else(|| {
+            issues.extend(best_failure.map(|(_, issues)| issues).unwrap_or_else(|| {
                 vec![ValidationIssue::new(
                     ValidationCode::Union,
                     location,
@@ -2879,6 +2904,74 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn union_diagnostics_prefer_matching_tags_over_fewer_errors() {
+        for keyword in ["oneOf", "anyOf"] {
+            let mut parameters = json!({"type":"object"});
+            parameters[keyword] = json!([
+                {"properties":{"kind":{"const":"plain"}}, "required":["kind"], "additionalProperties":false},
+                {"properties":{"kind":{"enum":["record","structured"]}, "left":{"type":"string"}, "right":{"type":"string"}}, "required":["kind","left","right"], "additionalProperties":false}
+            ]);
+            let schema = json!({"function":{"parameters":parameters}});
+            let error = validate_tool_arguments_against_schema(
+                "dynamic",
+                &json!({"kind":"record","mistyped":true}),
+                &schema,
+            )
+            .unwrap_err();
+            for field in ["left", "right"] {
+                assert!(
+                    error.issues.iter().any(|issue| issue.location == [field]),
+                    "{keyword}: {error}"
+                );
+            }
+            assert!(
+                !error.issues.iter().any(|issue| issue.location == ["kind"]),
+                "{keyword}: {error}"
+            );
+            for args in [
+                json!({"kind":"plain"}),
+                json!({"kind":"record","left":"a","right":"b"}),
+            ] {
+                assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_ok());
+            }
+            assert!(
+                validate_tool_arguments_against_schema(
+                    "dynamic",
+                    &json!({"kind":"unknown"}),
+                    &schema
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_union_errors_describe_the_selected_model_policy() {
+        let mut args = json!({
+            "action":"spawn", "description":"Review", "prompt":"Review the change",
+            "requested_model_policy":{"mode":"fixed","model":"offering-1"}
+        });
+        let error = validate_tool_arguments("agent", &args).unwrap_err();
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.location == ["requested_model_policy", "selector"])
+        );
+        assert!(
+            !error
+                .issues
+                .iter()
+                .any(|issue| issue.location == ["requested_model_policy", "mode"])
+        );
+        args["requested_model_policy"] =
+            json!({"mode":"fixed", "selector":{"kind":"offering_id", "offering_id":"offering-1"}});
+        assert!(validate_tool_arguments("agent", &args).is_ok());
+        args["requested_model_policy"] = json!({"mode":"inherit"});
+        assert!(validate_tool_arguments("agent", &args).is_ok());
+    }
 
     #[test]
     fn validation_receipts_preserve_rules_without_publishing_private_data() {
