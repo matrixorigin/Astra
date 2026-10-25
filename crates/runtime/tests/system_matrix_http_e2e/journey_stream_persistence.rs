@@ -1555,11 +1555,15 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
             .map(|_| std::sync::Arc::new(tokio::sync::Notify::new()))
             .collect(),
     );
+    // Ordinary UTF-8/escaped output must reach synthesis in full, rather
+    // than silently becoming the small diagnostic preview. Siblings retain
+    // the existing lifecycle/order controls; no extra result-read call exists.
     let child_markers = [
-        "durable storage finding",
-        "durable runtime finding",
-        "durable journey finding",
+        "durable storage finding".to_owned(),
+        "runtime detail: 界\"\n".repeat(600) + "exact terminal tail",
+        "durable journey finding".to_owned(),
     ];
+    assert!(child_markers[1].len() > 4096);
     ctx.install_native_provider(
         auth,
         vec![
@@ -1709,12 +1713,6 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
         final_context.contains("runtime_input_action_fence.v1"),
         "the in-flight response must be fenced by real child input"
     );
-    for marker in child_markers {
-        assert!(
-            final_context.contains(marker),
-            "final request must include {marker}"
-        );
-    }
     assert_native_delegation_without_auxiliary_selector(
         ctx,
         1,
@@ -1744,6 +1742,25 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
         .as_str()
         .expect("root run_id")
         .to_string();
+    let delivered = captured_synthesis_children(
+        ctx,
+        &root_run_id,
+        "Run three reviews as one structured work group.",
+        final_reply,
+        &events,
+    )
+    .await;
+    assert_eq!(delivered.len(), child_markers.len());
+    for expected in &child_markers {
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|child| child["result"].as_str() == Some(expected))
+                .count(),
+            1,
+            "actual parent provider request must contain each exact child result once",
+        );
+    }
     let child_terminal_positions = events
         .iter()
         .enumerate()
