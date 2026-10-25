@@ -230,6 +230,13 @@ assistant or parser binding changes during a read. Selecting another Run retires
 the previous stream writer before publishing that selection. No freshness state,
 input mirror or second lifecycle is introduced.
 
+The Web synchronous messages endpoint uses the same message, parser and writer
+lease as streaming requests. It claims that lease before admission awaits and
+binds the acknowledged Session/Run before observing events. Detail refreshes
+preserve this owner; Stop, deletion and successor selection retire its mutation
+authority. Observation loss after admission keeps the existing continuation for
+reconnection rather than treating the Run as failed or dispatching another turn.
+
 The shared loop exit owns terminal rendering, SessionFacts and the final
 checkpoint. Canonical Context retains conversation input; memory extraction
 is owned by explicit Session close/finalize, without a second per-turn handoff. Execution/tool phases return outcomes;

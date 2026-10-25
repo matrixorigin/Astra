@@ -8,9 +8,6 @@ import {
   mergeChatArtifacts,
 } from "@/lib/api/stream-artifacts";
 import {
-  buildQueryString,
-  chatRunStreamPath,
-  parseSseDataEvents,
   type RunListResponse,
   type RunStatus,
   type RuntimeSessionListCursor,
@@ -25,7 +22,6 @@ import {
 } from "@/lib/chat-run-state";
 import {
   RuntimeClientError,
-  readRuntimeErrorDetail,
   runtimeErrorDetail,
 } from "@/lib/runtime-client/errors";
 import {
@@ -158,8 +154,6 @@ type Store = {
   files: Record<string, KnowledgeFile[]>;
 };
 
-const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
-const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
 const LOCAL_CANCELLING_STATUS_GRACE_MS = 15_000;
 const LOCAL_STOPPED_RUN_GRACE_MS = 30 * 60_000;
@@ -169,13 +163,6 @@ const CHAT_HISTORY_LIMIT = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(["chat-web-agent-notes"]);
 const WORKSPACE_SELECTION_METADATA_KEY = "workspace_selection";
-
-type StreamResult = {
-  assistantText: string;
-  error?: string;
-  finished?: boolean;
-  nextOffset?: number;
-};
 
 export type ModelOfferingSelectionErrorCode =
   | "invalid_selection"
@@ -268,7 +255,7 @@ function titleFromMessage(message: string) {
   return text.length > 56 ? `${text.slice(0, 53)}...` : text;
 }
 
-function normalizedActiveSkills(skills?: string[]) {
+export function normalizedActiveSkills(skills?: string[]) {
   if (!Array.isArray(skills)) {
     return [];
   }
@@ -277,7 +264,7 @@ function normalizedActiveSkills(skills?: string[]) {
   );
 }
 
-function normalizedActiveTools(tools?: string[], webSearch = false) {
+export function normalizedActiveTools(tools?: string[], webSearch = false) {
   const normalized = Array.isArray(tools)
     ? tools.map((tool) => tool.trim()).filter(Boolean)
     : [];
@@ -448,6 +435,16 @@ function publicActiveRun(
     ...(assistant ? { assistantMessageId: assistant.id } : {}),
     ...(nextEventIndex !== null ? { nextEventIndex } : {}),
   };
+}
+
+function hasContinuingStream(chat: ChatRecord): boolean {
+  const run = chat.activeRun;
+  const state = chat.streamProjection?.state;
+  return publicActiveRun(chat)?.nextEventIndex !== undefined &&
+    run?.status.trim().toLowerCase() !== "cancelling" && run?.waitingFor !== "cancel_requested" &&
+    chat.messages.some(message => message.id === run?.assistantMessageId && message.status === "streaming") &&
+    state?.lastStatus === "streaming" && state.runLifecycle !== "finished" &&
+    state.runLifecycle !== "paused" && !state.terminalStatus;
 }
 
 function workspaceSelectionMetadata(selection: WorkspaceSelection) {
@@ -840,71 +837,6 @@ export async function createChatWithMessage(
   };
 }
 
-export async function sendMessage(
-  ownerUserId: string,
-  chatId: string,
-  payload: {
-    content: string;
-    options?: ComposerOptions;
-  },
-) {
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  if (!chat) {
-    return null;
-  }
-  // Validate model selection before mutating chat state
-  const selectedModel = requireSelectedOfferingId(
-    payload.options?.model ?? chat.model,
-  );
-  const timestamp = nowIso();
-  const userMessage: ChatMessage = {
-    id: crypto.randomUUID(),
-    role: "user",
-    content: payload.content,
-    activeSkills: payload.options?.activeSkills,
-    activeTools: normalizedActiveTools(
-      payload.options?.activeTools,
-      payload.options?.webSearch,
-    ),
-    createdAt: timestamp,
-    status: "complete",
-  };
-  chat.messages.push(userMessage);
-  chat.lastMessageAt = timestamp;
-  chat.lastMessagePreview = payload.content;
-  chat.title ??= titleFromMessage(payload.content);
-  if (payload.options?.model) {
-    chat.model = payload.options.model;
-  }
-
-  const backendSessionId = await ensureChatBackendSession(
-    ownerUserId,
-    chat.id,
-    {
-      model: selectedModel,
-    },
-  );
-  const agentResult = await callBackendAgent({
-    sessionId: backendSessionId,
-    text: payload.content,
-    model: selectedModel,
-    activeSkills: payload.options?.activeSkills,
-    activeTools: payload.options?.activeTools,
-    webSearch: payload.options?.webSearch,
-  });
-  assertBackendSessionMatchesChat(backendSessionId, agentResult.sessionId);
-  const assistantMessage = appendAssistantMessage(
-    chat,
-    agentResult.assistantText,
-    agentResult.ok,
-  );
-  if (chat.projectId) {
-    touchProjectInStore(store, chat.projectId);
-  }
-  return { userMessage, assistantMessage };
-}
-
 export function beginStreamingMessage(
   ownerUserId: string,
   chatId: string,
@@ -919,6 +851,10 @@ export function beginStreamingMessage(
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
+  }
+  if (chat.streamProjection?.writer && !chat.streamProjection.writer.signal.aborted &&
+    chat.streamProjection.state.runLifecycle !== "finished") {
+    throw new ChatStreamProjectionError("stream_projection_busy");
   }
 
   const timestamp = nowIso();
@@ -938,6 +874,7 @@ export function beginStreamingMessage(
     role: "user",
     content: payload.content,
     activeSkills: payload.options?.activeSkills,
+    activeTools: normalizedActiveTools(payload.options?.activeTools, payload.options?.webSearch),
     createdAt: timestamp,
     status: "complete",
   };
@@ -1286,8 +1223,9 @@ export async function stopActiveRun(
   const completeMessage = () => {
     const current = ownedChat();
     if (!current) return;
-    if (message.complete(current) && current.projectId) {
-      touchProjectInStore(getStore(ownerUserId), current.projectId);
+    if (message.complete(current)) {
+      current.streamProjection?.writer?.abort();
+      if (current.projectId) touchProjectInStore(getStore(ownerUserId), current.projectId);
     }
   };
   const restore = () => {
@@ -1997,7 +1935,7 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     const backendRun = session.session_id ? activeRunBySession.get(session.session_id) : undefined;
     // Polling may observe terminal before the live parser receives it. Keep
     // that exact continuation until its real terminal, unless a successor won.
-    const preserveParser = existing && publicActiveRun(existing)?.nextEventIndex !== undefined &&
+    const preserveParser = existing && hasContinuingStream(existing) &&
       !backendRun && isTerminalChatRunStatus(backendRunStatuses.get(existing.activeRun!.runId));
     record.activeRun = preserveParser ? existing.activeRun : mergeActiveRunRecord({
       existing: existing?.activeRun,
@@ -2087,7 +2025,9 @@ function transcriptItemToMessage(
 }
 
 async function syncBackendTranscript(ownerUserId: string, chatId: string): Promise<string | undefined> {
-  const original = getStore(ownerUserId).chats.find(item => item.id === chatId);
+  const currentChat = () => getStore(ownerUserId).chats.find(item =>
+    item.id === chatId || item.backendSessionId === chatId);
+  const original = currentChat();
   const sessionId = original?.backendSessionId;
   const runId = original?.activeRun?.runId;
   const assistantId = original?.activeRun?.assistantMessageId;
@@ -2096,7 +2036,6 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   const pendingTurn = original?.pendingTurn;
   // A detail read may overlap POST admission, a terminal, or another reader.
   // Compare the entire existing continuation before publishing success/errors.
-  const currentChat = () => getStore(ownerUserId).chats.find(item => item.id === chatId);
   const stillCurrent = () => {
     const current = currentChat();
     return current?.backendSessionId === sessionId && current?.activeRun?.runId === runId &&
@@ -2104,14 +2043,14 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
       current?.messages === messages && current?.pendingTurn === pendingTurn;
   };
   const client = await getRuntimeClient({ auth: "required", operation: "read selected conversation" });
-  if (!client || !stillCurrent()) return;
+  if (!client || !stillCurrent()) return currentChat()?.id;
 
   let backendSessionId = sessionId;
   if (!backendSessionId) {
     // Resolve legacy Web IDs through the existing directory; known Sessions
     // read directly, without enumerating the owner's Runs or other Sessions.
     const sessions = await listAllBackendSessions(client, ownerUserId);
-    if (!stillCurrent()) return;
+    if (!stillCurrent()) return currentChat()?.id;
     backendSessionId = sessions.find(session => session.session_id === chatId ||
       metadataString(session.metadata, "web_chat_id") === chatId)?.session_id;
     if (!backendSessionId) return;
@@ -2120,7 +2059,7 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   try {
     parsed = await client.sdk.getSessionConversation(backendSessionId, CHAT_HISTORY_LIMIT);
   } catch (error) {
-    if (!stillCurrent()) return;
+    if (!stillCurrent()) return currentChat()?.id;
     if ((error instanceof AstraApiError || error instanceof RuntimeClientError) && error.status === 404) {
       const missing = currentChat();
       if (missing?.backendSessionId === backendSessionId) {
@@ -2132,7 +2071,7 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
     }
     throw runtimeOperationError(`Cannot sync persisted transcript for session ${backendSessionId}`, error);
   }
-  if (!stillCurrent()) return;
+  if (!stillCurrent()) return currentChat()?.id;
   if (parsed.session.session_id !== backendSessionId) {
     throw new Error("Conversation response does not match the selected Session.");
   }
@@ -2143,7 +2082,9 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
     !livePost.state.runId && !livePost.state.protocolError) return existing!.id;
   const root = parsed.selected_root;
   const stopped = root && isLocallyStoppedRun(existing, root.run_id, Date.now());
-  const warm = existing && root?.run_id === runId && publicActiveRun(existing)?.nextEventIndex !== undefined;
+  const continuing = existing && hasContinuingStream(existing);
+  const warm = existing && root && root.run_id === runId && publicActiveRun(existing)?.nextEventIndex !== undefined &&
+    (!isTerminalChatRunStatus(root.status) || !stopped && continuing);
   if (existing && !warm) discardChatStreamProjection(existing);
   const record = chatRecordFromBackendSession(parsed.session, existing);
   if (!record) return;
@@ -2158,7 +2099,8 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   if (warm) {
     // Stream terminal owns an unstopped continuation; cancellation keeps its
     // existing expiry rules even while the parser remains reusable.
-    record.activeRun = isTerminalChatRunStatus(root!.status) && !stopped ? existing.activeRun : reconciled;
+    record.activeRun = isTerminalChatRunStatus(root!.status) && !stopped && continuing
+      ? existing.activeRun : reconciled;
     if (!record.activeRun) discardChatStreamProjection(record);
   } else {
     record.activeRun = reconciled;
@@ -2316,14 +2258,6 @@ async function updateBackendSessionWorkspaceSelection(
   }
 }
 
-function assertBackendSessionMatchesChat(chatId: string, sessionId?: string) {
-  if (sessionId && sessionId !== chatId) {
-    throw new Error(
-      `Runtime returned session_id ${sessionId}, but Web chat is bound to ${chatId}.`,
-    );
-  }
-}
-
 function normalizeCanonicalChatIds(store: Store) {
   const seen = new Set<string>();
   const seenBackendSessionIds = new Set<string>();
@@ -2369,246 +2303,6 @@ function touchProjectInStore(store: Store, projectId: string) {
   if (project) {
     project.updatedAt = nowIso();
   }
-}
-
-function appendAssistantMessage(
-  chat: ChatRecord,
-  text: string,
-  ok: boolean,
-): ChatMessage {
-  const timestamp = nowIso();
-  const message: ChatMessage = {
-    id: crypto.randomUUID(),
-    role: "assistant",
-    content: text,
-    createdAt: timestamp,
-    status: ok ? "complete" : "failed",
-  };
-  chat.messages.push(message);
-  chat.lastMessageAt = timestamp;
-  chat.lastMessagePreview = text;
-  return message;
-}
-
-async function callBackendAgent(params: {
-  sessionId?: string;
-  text: string;
-  model: string;
-  activeSkills?: string[];
-  activeTools?: string[];
-  webSearch?: boolean;
-}): Promise<{ ok: boolean; sessionId?: string; assistantText: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    AGENT_RESPONSE_TIMEOUT_MS,
-  );
-
-  try {
-    const client = await requireRuntimeClient({
-      auth: "required",
-      operation: "start web chat turn",
-    });
-    const modelSelection = await resolveModelOfferingSelection(
-      client,
-      params.model,
-    );
-    const activeSkills = normalizedActiveSkills(params.activeSkills);
-    const activeTools = normalizedActiveTools(
-      params.activeTools,
-      params.webSearch,
-    );
-
-    const run = await client.sdk.createRun(
-      {
-        message: params.text,
-        sessionId: params.sessionId,
-        modelSelection,
-        allowSkills: activeSkills.length ? activeSkills : undefined,
-        enabledTools: activeTools,
-        context: {
-          source: "web_v1",
-          edge_profile:
-            activeSkills.length || activeTools.length
-              ? {
-                  ...(activeSkills.length
-                    ? { active_skills: activeSkills }
-                    : {}),
-                  ...(activeTools.length ? { active_tools: activeTools } : {}),
-                }
-              : undefined,
-        },
-      },
-      {
-        signal: controller.signal,
-      },
-    );
-    if (run.runId) {
-      const streamed = await readRunStream(client, run.runId);
-      if (streamed.error) {
-        throw new Error(streamed.error);
-      }
-      if (streamed.assistantText.trim()) {
-        return {
-          ok: true,
-          sessionId: run.sessionId,
-          assistantText: streamed.assistantText.trim(),
-        };
-      }
-    }
-
-    return {
-      ok: true,
-      sessionId: run.sessionId,
-      assistantText: run.runId
-        ? "Astra completed the run without returning visible text."
-        : "The run was accepted by Astra.",
-    };
-  } catch (error) {
-    const message =
-      error instanceof Error && error.name === "AbortError"
-        ? `timed out after ${AGENT_RESPONSE_TIMEOUT_MS / 1000}s`
-        : runtimeErrorDetail(error, "unknown error");
-    const prefix =
-      error instanceof RuntimeClientError
-        ? "Astra runtime rejected the request"
-        : "I could not reach the Astra runtime from the web UI";
-    return {
-      ok: false,
-      assistantText: `${prefix}. (${message})`,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function readRunStream(
-  client: WebRuntimeClient,
-  runId: string,
-): Promise<StreamResult> {
-  const startedAt = Date.now();
-  let nextOffset = 0;
-  let assistantText = "";
-
-  while (Date.now() - startedAt < AGENT_STREAM_TIMEOUT_MS) {
-    const controller = new AbortController();
-    const remainingMs = Math.max(
-      1,
-      AGENT_STREAM_TIMEOUT_MS - (Date.now() - startedAt),
-    );
-    const timeout = setTimeout(() => controller.abort(), remainingMs);
-
-    try {
-      const response = await client.fetchResponse(
-        `${chatRunStreamPath(runId)}${buildQueryString({ last_index: nextOffset })}`,
-        {
-          auth: "required",
-          operation: `stream run ${runId}`,
-          signal: controller.signal,
-        },
-      );
-
-      if (!response.ok) {
-        return { assistantText, error: await readRuntimeErrorDetail(response) };
-      }
-
-      const parsed = parseRunSseText(await response.text());
-      if (parsed.assistantText) {
-        assistantText = parsed.assistantText;
-      }
-      if (
-        typeof parsed.nextOffset === "number" &&
-        parsed.nextOffset > nextOffset
-      ) {
-        nextOffset = parsed.nextOffset;
-      }
-      if (parsed.error || parsed.finished) {
-        return {
-          assistantText,
-          error: parsed.error,
-          finished: parsed.finished,
-          nextOffset,
-        };
-      }
-    } catch (error) {
-      const detail =
-        error instanceof Error && error.name === "AbortError"
-          ? `timed out after ${AGENT_STREAM_TIMEOUT_MS / 1000}s while waiting for Astra`
-          : error instanceof Error
-            ? error.message
-            : "unknown stream error";
-      return { assistantText, error: detail };
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-
-  return {
-    assistantText,
-    error: `timed out after ${AGENT_STREAM_TIMEOUT_MS / 1000}s while waiting for Astra`,
-  };
-}
-
-function parseRunSseText(text: string): StreamResult {
-  let assistantText = "";
-  let finalText = "";
-  let error: string | undefined;
-  let finished = false;
-  let nextOffset = 0;
-
-  for (const event of parseSseDataEvents(text.replace(/\r\n/g, "\n"))) {
-    const record = event as Record<string, unknown>;
-    const type = typeof record.type === "string" ? record.type : "";
-    if (typeof record.index === "number" && Number.isFinite(record.index)) {
-      nextOffset = Math.max(nextOffset, Math.trunc(record.index) + 1);
-    }
-
-    if (type === "text_delta" && typeof record.content === "string") {
-      assistantText += record.content;
-    } else if (type === "text_done" && typeof record.full_text === "string") {
-      finalText = record.full_text;
-    } else if (
-      type === "turn_complete" &&
-      typeof record.assistant_text === "string"
-    ) {
-      finalText = record.assistant_text;
-    } else if (type === "run_error") {
-      const runError =
-        typeof record.message === "string"
-          ? record.message
-          : typeof record.error === "string"
-            ? record.error
-            : undefined;
-      if (runError) {
-        error = runError;
-      }
-    } else if (type === "error" && typeof record.message === "string") {
-      error = record.message;
-    } else if (
-      type === "run_finished" &&
-      record.status === "failed" &&
-      typeof record.error === "string"
-    ) {
-      error = record.error;
-      finished = true;
-    } else if (
-      type === "run_finished" &&
-      (record.status === "paused" || record.status === "interrupted")
-    ) {
-      finished = true;
-    } else if (type === "run_finished") {
-      finished = true;
-    }
-  }
-
-  return {
-    assistantText: finalText || assistantText,
-    error,
-    finished,
-    nextOffset,
-  };
 }
 
 export async function resolveModelOfferingSelection(

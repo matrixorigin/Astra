@@ -265,8 +265,12 @@ it("fences aborted writers and stale releases and retires state when a new messa
   expect(withChatStreamProjection(old, mutate)).toBe(false);
   releaseChatStreamProjection(old);
   expect(withChatStreamProjection(next, mutate)).toBe(true);
-  beginStreamingMessage("owner", "chat", { content: "next" });
-  expect(next.writer.signal.aborted).toBe(true);
+  expect(() => beginStreamingMessage("owner", "chat", { content: "next" }))
+    .toThrow("already being observed");
+  expect(withChatStreamProjection(next, mutate)).toBe(true);
+  releaseChatStreamProjection(next);
+  const selected = beginStreamingMessage("owner", "chat", { content: "next" })!;
+  expect(selected.assistantMessage.id).not.toBe(assistantId);
   expect(withChatStreamProjection(next, mutate)).toBe(false);
 });
 

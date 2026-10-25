@@ -131,6 +131,14 @@ metadata and artifact previews use their existing separate read boundaries.
 Selected detail refreshes perform a fresh bounded read; clients retaining a valid
 live parser keep that parser until its stream terminal, unless a successor wins.
 
+The Web `POST /api/chats/{chat_id}/messages` JSON endpoint shares the streaming
+message/parser owner. Concurrent observation does not discard its pending input
+or result. If its stream is interrupted after Run admission, it returns HTTP 502
+with `code: "stream_observation_interrupted"`; the admitted Run and cursor remain
+available for stream reconnection. Failures before an admission acknowledgement
+remain failed local assistant messages. Stop, Session deletion and a selected successor prevent late
+responses from changing the current view.
+
 ## Active run permission mode
 
 ### POST /chat/runs/{run_id}/permission-mode

@@ -8,7 +8,6 @@ import {
   getChat,
   getStore,
   listChats,
-  sendMessage,
   setChatActiveRun,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
@@ -226,37 +225,6 @@ describe("web store user scoping", () => {
     ]);
   });
 
-  it("rejects an invalid model selection without mutating the chat or creating a backend session", async () => {
-    const store = getStore("user-a");
-    const chat = {
-      id: "web-invalid-model",
-      title: null,
-      projectId: null,
-      createdAt: "2026-07-21T00:00:00.000Z",
-      lastMessageAt: "2026-07-21T00:00:00.000Z",
-      lastMessagePreview: "existing message",
-      model: "offering-a",
-      messages: [],
-      activeRun: undefined,
-    };
-    store.chats.push(chat);
-    const before = JSON.parse(JSON.stringify(chat));
-    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
-
-    await expect(
-      sendMessage("user-a", chat.id, {
-        content: "must not be appended",
-        options: {
-          model: "   ",
-          webSearch: false,
-          thinking: false,
-        },
-      }),
-    ).rejects.toMatchObject({ code: "invalid_selection" });
-
-    expect(chat).toEqual(before);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
 
   it("does not expose one user chat list to another authenticated user", async () => {
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;

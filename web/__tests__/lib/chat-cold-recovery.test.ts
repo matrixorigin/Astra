@@ -1,13 +1,15 @@
 // @vitest-environment node
 vi.mock("@/lib/api/auth-guard", () => ({ requireRuntimeUser: vi.fn() }));
 vi.mock("@/lib/runtime-client/server", () => ({
-  WebRuntimeClient: class {}, getRuntimeClient: vi.fn(), requireRuntimeClient: vi.fn(),
+  WebRuntimeClient: class { constructor(public config: unknown) {} },
+  getRuntimeClient: vi.fn(), requireRuntimeClient: vi.fn(),
 }));
 
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
-import { getRuntimeClient, requireRuntimeClient } from "@/lib/runtime-client/server";
-import { getChat, getChatHydrated, getStore, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
+import { WebRuntimeClient, getRuntimeClient, requireRuntimeClient } from "@/lib/runtime-client/server";
+import { deleteChat, getChat, getChatHydrated, getStore, listChats, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
 import { GET as GETDetail } from "@/app/api/chats/[chatId]/route";
+import { POST as POSTMessage } from "@/app/api/chats/[chatId]/messages/route";
 import { GET } from "@/app/api/chats/[chatId]/stream/route";
 import { AstraApiError, type RuntimeConversationResponse } from "@astra/sdk";
 
@@ -27,6 +29,9 @@ function setup() {
     listRuns: vi.fn().mockResolvedValue({ runs: [{ runId: "run", sessionId: "session", parentRunId: null, depth: 0, status: "running" }] }),
     getSessionConversation: vi.fn().mockResolvedValue(conversation()),
     getRunStatus: vi.fn().mockResolvedValue({ runId: "run", sessionId: "session", status: "running", eventsCount: 4 }),
+    createRun: vi.fn().mockResolvedValue({ runId: "run", sessionId: "session", status: "running" }),
+    createRuntimeSession: vi.fn().mockResolvedValue(session),
+    deleteSession: vi.fn().mockResolvedValue(undefined),
     cancelRun: vi.fn(() => new Promise(() => {})),
     submitRunInput: vi.fn().mockResolvedValue({ accepted: true }),
     listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
@@ -38,7 +43,7 @@ function setup() {
   ].map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
     headers: { "x-astra-agent-interaction-api-major": "3" },
   }));
-  const runtime = { sdk, fetchResponse };
+  const runtime = Object.assign(new WebRuntimeClient({ accessToken: "synthetic-test" } as never), { sdk, fetchResponse });
   vi.mocked(getRuntimeClient).mockResolvedValue(runtime as never);
   vi.mocked(requireRuntimeClient).mockResolvedValue(runtime as never);
   return runtime;
@@ -169,9 +174,13 @@ it("retires the old stream writer before publishing an active or terminal succes
   }
 });
 
-it.each(["response", "503", "404"])("fences an older idle publication after a completed successor (%s)", async result => {
+it.each(["response", "503", "404"].flatMap(result => [false, true].map(legacy => ({ result, legacy }))))(
+  "fences an older idle publication after a completed successor ($result, legacy=$legacy)", async ({ result, legacy }) => {
   const runtime = setup();
-  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("run", "failed"));
+  const prior = conversation("run", "failed");
+  if (legacy) prior.session = { ...session, metadata: { ...session.metadata, web_chat_id: "legacy-chat" } };
+  runtime.sdk.listRuntimeSessions.mockResolvedValue({ sessions: [prior.session] });
+  runtime.sdk.getSessionConversation.mockResolvedValue(prior);
   await getChatHydrated("owner", "session");
   let release!: () => void;
   let entered!: () => void;
@@ -180,15 +189,18 @@ it.each(["response", "503", "404"])("fences an older idle publication after a co
   runtime.sdk.getSessionConversation.mockImplementationOnce(async () => {
     entered(); await pending;
     if (result !== "response") throw new AstraApiError(Number(result), "old read failed", "/sessions/session/transcript");
-    return conversation("run", "failed");
+    return prior;
   });
   const older = getChatHydrated("owner", "session");
   await reading;
-  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("next", "completed", "newer completed input"));
+  runtime.sdk.getSessionConversation.mockResolvedValue({
+    ...conversation("next", "completed", "newer completed input"), session: prior.session,
+  });
   const newer = await getChatHydrated("owner", "session");
   release();
   await expect(older).resolves.toMatchObject({ messages: newer!.messages });
-  expect(getChat("owner", "session")?.messages).toBe(newer!.messages);
+  expect(getChat("owner", newer!.chat.id)?.messages).toBe(newer!.messages);
+  expect(runtime.sdk.listRuntimeSessions).toHaveBeenCalledTimes(1);
 });
 
 it("expires a real cancelling continuation through the existing Stop rules", async () => {
@@ -214,4 +226,351 @@ it("returns the existing Web 404 after a known persisted Session is deleted remo
   const response = await GETDetail({} as never, { params: Promise.resolve({ chatId: "session" }) });
   expect(response.status).toBe(404);
   expect(getChat("owner", "session")).toBeNull();
+});
+
+it("joins a competing cold lookup by Session identity", async () => {
+  const runtime = setup();
+  const aliased = { ...session, metadata: { ...session.metadata, web_chat_id: "legacy-chat" } };
+  runtime.sdk.listRuntimeSessions.mockResolvedValue({ sessions: [aliased] });
+  runtime.sdk.getSessionConversation.mockResolvedValue({
+    ...conversation("next", "completed", "newer completed input"), session: aliased,
+  });
+  runtime.sdk.getSessionConversation.mockImplementationOnce(async () => {
+    await getChatHydrated("owner", "legacy-chat");
+    return { ...conversation("run", "failed"), session: aliased };
+  });
+  const detail = await getChatHydrated("owner", "session");
+  expect(detail?.chat.id).toBe("legacy-chat");
+  expect(detail?.messages.map(message => message.content)).toEqual(["newer completed input"]);
+  expect(getStore("owner").chats).toHaveLength(1);
+});
+
+it.each([false, true])("retains a synchronous message through a concurrent detail GET (failure=%s)", async fail => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  runtime.sdk.createRun.mockImplementationOnce(async () => {
+    entered(); await pending;
+    if (fail) throw new AstraApiError(503, "admission unavailable", "/runs");
+    return { runId: "run", sessionId: "session", status: "running" };
+  });
+  const sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  await reading;
+  const during = await (await GETDetail({} as never, { params: Promise.resolve({ chatId: "session" }) })).json();
+  const competing = await POSTMessage({ json: async () => ({ content: "duplicate request" }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  release();
+  const response = await sending;
+  expect(response.status).toBe(200);
+  const result = await response.json();
+  expect(during.messages.map((message: { content: string }) => message.content)).toContain("new request");
+  expect(competing.status).toBe(409);
+  expect(runtime.sdk.createRun).toHaveBeenCalledTimes(1);
+  expect(getChat("owner", "session")?.pendingTurn).toBeUndefined();
+  expect(result.assistantMessage.content).toContain(fail ? "admission unavailable" : "recovered answer");
+  expect(getChat("owner", "session")?.messages.map(message => message.content)).toEqual([
+    "original request", "new request", result.assistantMessage.content,
+  ]);
+});
+
+it.each([20_000, 31 * 60_000])("retires a stopped terminal continuation after marker age %sms", async age => {
+  const runtime = setup();
+  const first = await getChatHydrated("owner", "session");
+  runtime.sdk.cancelRun.mockResolvedValue({});
+  runtime.sdk.getRunStatus.mockRejectedValue(new Error("status temporarily unavailable"));
+  await stopActiveRun("owner", "session", {
+    sessionId: "session", runId: "run", assistantMessageId: first!.activeRun!.assistantMessageId!,
+  }, { skipSync: true });
+  const record = getStore("owner").chats[0];
+  expect(record.activeRun?.status).toBe("cancelling");
+  record.locallyStoppedRuns!.run = new Date(Date.now() - age).toISOString();
+  record.activeRun!.observedAt = record.locallyStoppedRuns!.run;
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("run", "cancelled"));
+  for (let i = 0; i < 2; i++) expect((await getChatHydrated("owner", "session"))?.activeRun).toBeUndefined();
+});
+
+it("rejects an invalid synchronous model before mutating messages or dispatching", async () => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  const before = JSON.stringify(getChat("owner", "session"));
+  await expect(POSTMessage({ json: async () => ({ content: "must not be appended", options: { model: "   " } }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) })).rejects.toMatchObject({ code: "invalid_selection" });
+  expect(JSON.stringify(getChat("owner", "session"))).toBe(before);
+  expect(runtime.sdk.createRun).not.toHaveBeenCalled();
+});
+
+it("fences a detail read that began before synchronous admission", async () => {
+  const runtime = setup();
+  const prior = conversation("old", "completed");
+  runtime.sdk.getSessionConversation.mockResolvedValue(prior);
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  runtime.sdk.createRun.mockImplementationOnce(async () => {
+    entered(); await pending;
+    throw new AstraApiError(503, "admission unavailable", "/runs");
+  });
+  let sending!: ReturnType<typeof POSTMessage>;
+  runtime.sdk.getSessionConversation.mockImplementationOnce(async () => {
+    sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+      { params: Promise.resolve({ chatId: "session" }) });
+    await reading;
+    return prior;
+  });
+  const detail = await getChatHydrated("owner", "session");
+  release();
+  await sending;
+  expect(detail?.messages.map(message => message.content)).toContain("new request");
+  expect(getChat("owner", "session")?.messages.at(-1)?.status).toBe("failed");
+});
+
+it.each(["delete", "successor", "stop"].flatMap(action => [false, true].map(fail => ({ action, fail }))))(
+  "fences late synchronous output after $action (failure=$fail)", async ({ action, fail }) => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  runtime.fetchResponse.mockImplementationOnce(async () => {
+    entered(); await pending;
+    if (fail) throw new Error("late read failure");
+    return new Response('data: {"type":"text_delta","content":"late answer","index":0}\n\n' +
+      'data: {"type":"run_finished","run_id":"run","status":"completed","index":1}\n\n');
+  });
+  const sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  await reading;
+  const active = getChat("owner", "session")!.activeRun!;
+  expect(active.runId).toBe("run");
+  if (action === "delete") await deleteChat("owner", "session");
+  else if (action === "successor") {
+    runtime.sdk.getSessionConversation.mockResolvedValue(conversation("next", "running", "successor request"));
+    await getChatHydrated("owner", "session");
+  } else {
+    runtime.sdk.cancelRun.mockResolvedValue({});
+    runtime.sdk.getRunStatus.mockResolvedValue({ runId: "run", sessionId: "session", status: "cancelled", eventsCount: 4 });
+    await stopActiveRun("owner", "session", {
+      sessionId: "session", runId: "run", assistantMessageId: active.assistantMessageId!,
+    }, { skipSync: true });
+  }
+  const expected = JSON.stringify(getChat("owner", "session"));
+  release();
+  expect((await sending).status).toBe(502);
+  expect(JSON.stringify(getChat("owner", "session"))).toBe(expected);
+  expect(runtime.sdk.createRun).toHaveBeenCalledTimes(1);
+});
+
+it("does not observe a late admission after the Session is deleted", async () => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  runtime.sdk.createRun.mockImplementationOnce(async () => {
+    entered(); await pending;
+    return { runId: "run", sessionId: "session", status: "running" };
+  });
+  const sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  await reading;
+  await deleteChat("owner", "session");
+  release();
+  expect((await sending).status).toBe(502);
+  expect(runtime.fetchResponse).not.toHaveBeenCalled();
+  expect(getChat("owner", "session")).toBeNull();
+});
+
+it("resumes an interrupted synchronous observation through the existing stream cursor", async () => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  runtime.fetchResponse.mockResolvedValueOnce(new Response(
+    'data: {"type":"run_started","run_id":"run","index":0}\n\n' +
+    'data: {"type":"text_delta","content":"partial","index":1}\n\n',
+  ));
+  const response = await POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  expect(response.status).toBe(502);
+  expect(await response.json()).toMatchObject({ code: "stream_observation_interrupted" });
+  expect(getChat("owner", "session")?.activeRun?.nextEventIndex).toBe(2);
+  runtime.fetchResponse.mockResolvedValueOnce(new Response(
+    'data: {"type":"text_delta","content":" tail","index":2}\n\n' +
+    'data: {"type":"run_finished","run_id":"run","status":"completed","index":3}\n\n',
+    { headers: { "x-astra-agent-interaction-api-major": "3" } },
+  ));
+  const resumed = await stream();
+  expect(resumed.status).toBe(200);
+  await resumed.text();
+  expect(runtime.fetchResponse).toHaveBeenLastCalledWith("/chat/runs/run/stream?last_index=2", expect.anything());
+  expect(runtime.sdk.createRun).toHaveBeenCalledTimes(1);
+  expect(getChat("owner", "session")?.messages.at(-1)).toMatchObject({ content: "partial tail", status: "complete" });
+  expect(getChat("owner", "session")?.activeRun).toBeUndefined();
+});
+
+it("starts the next turn while a completed stream is still enriching artifacts", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const enriching = new Promise<void>(resolve => { entered = resolve; });
+  runtime.sdk.listSessionArtifacts.mockResolvedValueOnce({ artifacts: [] });
+  runtime.sdk.listSessionArtifacts.mockImplementationOnce(async () => {
+    entered(); await pending; return { artifacts: [] };
+  });
+  const previous = await stream();
+  const previousRead = previous.text();
+  await enriching;
+  expect(getChat("owner", "session")?.activeRun).toBeUndefined();
+  const result = await POSTMessage({ json: async () => ({ content: "next request" }) } as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  release();
+  await previousRead;
+  expect(result.status).toBe(200);
+  expect(runtime.sdk.createRun).toHaveBeenCalledTimes(1);
+  expect(getChat("owner", "session")?.messages.at(-1)).toMatchObject({ content: "recovered answer", status: "complete" });
+});
+
+it.each(["session", "run"])("settles a deadline during %s admission without an unresumable streaming message", async boundary => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let entered!: () => void;
+  const admitting = new Promise<void>(resolve => { entered = resolve; });
+  let releaseSession!: () => void;
+  if (boundary === "session") {
+    getStore("owner").chats[0].backendSessionId = null;
+    const pending = new Promise<void>(resolve => { releaseSession = resolve; });
+    runtime.sdk.createRuntimeSession.mockImplementationOnce(async () => {
+      entered(); await pending; return session;
+    });
+  } else {
+    runtime.sdk.createRun.mockImplementationOnce(async (_request, init) => {
+      entered();
+      return new Promise((_, reject) => {
+        init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+      });
+    });
+  }
+  vi.useFakeTimers();
+  try {
+    const sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+      { params: Promise.resolve({ chatId: "session" }) });
+    await admitting;
+    await vi.advanceTimersByTimeAsync(30_001);
+    if (boundary === "session") releaseSession();
+    const response = await sending;
+    expect(response.status).toBe(200);
+    expect((await response.json()).assistantMessage).toMatchObject({ status: "failed" });
+    expect(getChat("owner", "session")?.activeRun).toBeUndefined();
+    expect(getChat("owner", "session")?.messages.at(-1)?.status).toBe("failed");
+    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(runtime.sdk.createRun).toHaveBeenCalledTimes(boundary === "session" ? 0 : 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it.each(["waiting", "blocked"].flatMap(status => ["detail", "directory"].map(refresh => ({ status, refresh }))))(
+  "resumes a $status parser after a terminal $refresh poll", async ({ status, refresh }) => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  runtime.fetchResponse.mockResolvedValueOnce(new Response([
+    { type: "run_started", run_id: "run", index: 0 },
+    { type: "text_delta", content: "partial", index: 1 },
+    { type: status === "waiting" ? "run_waiting" : "run_blocked", run_id: "run", waiting_for: "tool_approval", index: 2 },
+  ].map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    headers: { "x-astra-agent-interaction-api-major": "3" },
+  }));
+  await (await stream()).text();
+  expect(getChat("owner", "session")?.activeRun).toMatchObject({ status, nextEventIndex: 3 });
+  const completed = conversation("run", "completed");
+  completed.items.push({ kind: "raw", session_id: "session", item_seq: 2, run_id: "run", role: "assistant", content: "partial final" });
+  runtime.sdk.getSessionConversation.mockResolvedValue(completed);
+  runtime.sdk.listRuns.mockResolvedValue({ runs: [{ runId: "run", sessionId: "session", parentRunId: null, depth: 0, status: "completed" }] });
+  if (refresh === "detail") await getChatHydrated("owner", "session");
+  else await listChats("owner", {});
+  expect(getChat("owner", "session")?.activeRun).toMatchObject({ status, nextEventIndex: 3 });
+  runtime.fetchResponse.mockResolvedValueOnce(new Response(
+    'data: {"type":"run_resumed","run_id":"run","index":3}\n\n' +
+    'data: {"type":"text_delta","content":" final","index":4}\n\n' +
+    'data: {"type":"run_finished","run_id":"run","status":"completed","index":5}\n\n',
+    { headers: { "x-astra-agent-interaction-api-major": "3" } },
+  ));
+  const resumed = await stream();
+  expect(resumed.status).toBe(200);
+  await resumed.text();
+  expect(runtime.fetchResponse).toHaveBeenLastCalledWith("/chat/runs/run/stream?last_index=3", expect.anything());
+  expect(runtime.sdk.createRun).not.toHaveBeenCalled();
+  expect(getChat("owner", "session")?.messages.at(-1)).toMatchObject({ content: "partial final", status: "complete" });
+  expect(getChat("owner", "session")?.activeRun).toBeUndefined();
+});
+
+it("retains a late admission acknowledgement after its deadline for stream recovery", async () => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].model = "offering";
+  let release!: () => void;
+  let entered!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const admitting = new Promise<void>(resolve => { entered = resolve; });
+  runtime.sdk.createRun.mockImplementationOnce(async () => {
+    entered(); await pending;
+    return { runId: "run", sessionId: "session", status: "running" };
+  });
+  vi.useFakeTimers();
+  try {
+    const sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
+      { params: Promise.resolve({ chatId: "session" }) });
+    await admitting;
+    await vi.advanceTimersByTimeAsync(30_001);
+    release();
+    expect((await sending).status).toBe(502);
+    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(getChat("owner", "session")?.activeRun).toMatchObject({ runId: "run", nextEventIndex: 0 });
+    await (await stream()).text();
+    expect(runtime.sdk.createRun).toHaveBeenCalledTimes(1);
+    expect(getChat("owner", "session")?.messages.at(-1)).toMatchObject({ content: "recovered answer", status: "complete" });
+    expect(getChat("owner", "session")?.activeRun).toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("publishes a terminal answer immediately when a paused parser cannot auto-attach", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  runtime.fetchResponse.mockResolvedValueOnce(new Response(
+    'data: {"type":"text_delta","content":"partial","index":0}\n\n' +
+    'data: {"type":"run_paused","run_id":"run","index":1}\n\n',
+    { headers: { "x-astra-agent-interaction-api-major": "3" } },
+  ));
+  await (await stream()).text();
+  expect(getChat("owner", "session")?.activeRun?.status).toBe("paused");
+  const completed = conversation("run", "completed");
+  completed.items.push({ kind: "raw", session_id: "session", item_seq: 2, run_id: "run", role: "assistant", content: "final answer" });
+  runtime.sdk.getSessionConversation.mockResolvedValue(completed);
+  const detail = await getChatHydrated("owner", "session");
+  expect(detail?.activeRun).toBeUndefined();
+  expect(detail?.messages.at(-1)).toMatchObject({ content: "final answer", status: "complete" });
 });
