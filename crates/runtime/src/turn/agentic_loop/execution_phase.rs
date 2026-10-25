@@ -270,7 +270,9 @@ fn stage_direct_child_results<H: AgenticLoopHost>(
     let children: Vec<_> = owner
         .take_completed_direct_children()
         .into_iter()
-        .map(|child| serde_json::to_value(child.as_ref()).expect("direct child must serialize"))
+        .map(|child| {
+            child.notification(crate::orchestration::agent_tool::MAX_FANOUT_AGGREGATE_BYTES)
+        })
         .filter(|child| {
             !retained.contains(&(
                 child["agent_id"].as_str().unwrap_or_default(),
@@ -9455,13 +9457,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
             .await
             .expect("wait started");
+        let result_text = "reviewed\n界\"".repeat(1_200);
         owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
             applied_user_intents: Vec::new(),
             agent_id: "first-child".into(),
             run_id: "first-child-run".into(),
             parent_agent_id: "agent".into(),
             status: crate::orchestration::AgentStatus::Completed {
-                result: "reviewed".into(),
+                result: result_text.clone(),
                 finish_reason: None,
             },
         });
@@ -9470,10 +9473,22 @@ mod tests {
             .expect("first child must wake execution")
             .unwrap();
         assert_eq!(result.unwrap(), RuntimeActivityOutcome::InputReady);
+        let child = &state.volatile_pending[0].payload["children"][0];
+        assert_eq!(child["result"], result_text);
+        assert_eq!(child["result_truncated"], false);
+        assert_eq!(
+            child["result_range"],
+            serde_json::json!([0, result_text.len(), result_text.len()])
+        );
+        assert_eq!(
+            child["result_sha256"],
+            format!("{:x}", Sha256::digest(result_text.as_bytes()))
+        );
         assert!(
-            serde_json::to_string(&state.volatile_pending)
+            serde_json::to_vec(&state.volatile_pending[0].payload)
                 .unwrap()
-                .contains("reviewed")
+                .len()
+                <= crate::orchestration::agent_tool::MAX_FANOUT_AGGREGATE_BYTES
         );
         assert!(
             owner.has_pending_direct_children(),
@@ -9636,6 +9651,53 @@ mod tests {
                 .applied_user_intents,
             vec![intent]
         );
+    }
+
+    #[test]
+    fn oversized_child_output_keeps_bounded_delivery_and_exact_retained_result() {
+        use crate::orchestration::spawner::DirectChildCompletion;
+        let budget = crate::orchestration::agent_tool::MAX_FANOUT_AGGREGATE_BYTES;
+        // Raw-byte overflow, JSON escaping overflow, and envelope overflow all
+        // use the same existing reference path, without losing original bytes.
+        for text in [
+            "界".repeat(budget),
+            "\"".repeat(budget / 2),
+            "x".repeat(budget),
+        ] {
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "parent-run",
+                "child",
+            );
+            owner.set_direct_child_for_test(DirectChildCompletion {
+                agent_id: "child".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "parent".into(),
+                status: crate::orchestration::AgentStatus::Completed {
+                    result: text.clone(),
+                    finish_reason: None,
+                },
+                applied_user_intents: vec![],
+            });
+            let mut host = MockHost::new(vec![]);
+            host.direct_child_owner = Some(Arc::clone(&owner));
+            let mut state = make_state();
+            state.current_run_id = Some("parent-run".into());
+            assert!(stage_direct_child_results(&mut host, &mut state).unwrap());
+            let payload = &state.volatile_pending[0].payload;
+            assert!(serde_json::to_vec(payload).unwrap().len() <= budget);
+            let child = &payload["children"][0];
+            assert_eq!(child["result"], "");
+            assert_eq!(child["result_truncated"], true);
+            assert_eq!(child["get_result"]["agent_id"], "child");
+            assert_eq!(child["result_bytes"], text.len());
+            assert_eq!(
+                owner.retained_direct_child_result("child").unwrap().status,
+                crate::orchestration::AgentStatus::Completed {
+                    result: text,
+                    finish_reason: None
+                }
+            );
+        }
     }
 
     #[test]
