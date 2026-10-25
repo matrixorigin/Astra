@@ -85,6 +85,17 @@ One total fetch deadline covers DNS, redirects and body reads. Network, timeout,
 HTTP and policy failures retain typed failure metadata through search and local
 tool callbacks; a failed connection is not reported as an unreadable search page.
 
+### Explicit native collaborator selection
+
+The CLI's ordinary Edge ledger and a native collaborator have different
+requirements. Ordinary turns do not eagerly probe PATH, create a Session, or
+attach a native provider WebSocket. Native collaborator installation is selected
+explicitly with `ASTRA_NATIVE_COLLABORATORS=true`, using the same delivery owner
+for headless and interactive turns. A selected capacity's readiness is a
+precondition for admission; failed installation must not fall through to a chat
+request whose Edge registration was withdrawn during cleanup. The existing
+invocation-time permission and account/attachment boundaries remain authoritative.
+
 ## Offline and degraded behavior
 
 CLI SSE consumption executes only typed, admitted Server tool requests.

@@ -68,6 +68,20 @@ available through a ready bound Edge provider. Capability availability does
 not enable either tool for a user turn; Web and SDK clients must explicitly
 select optional tools separately.
 
+### CLI native collaborator capacity
+
+Ordinary CLI and TUI turns use the selected Astra model and the existing local
+workspace tools. They do not automatically discover or attach an external native
+agent runtime merely because its executable is installed.
+
+Set `ASTRA_NATIVE_COLLABORATORS=true` (or `1`) in the CLI process to explicitly
+select native collaborator capacity. It must become ready before the turn is
+admitted; unavailable or timed-out preparation is an error, rather than silently
+submitting a turn against a withdrawn Edge registration. Default is `false`;
+`false`, `0`, or an empty value disable it. Other values are rejected.
+This does not enable native tool execution or bypass its invocation-time
+permission, sandbox, account, or Session attachment checks.
+
 ### Outbound HTTPS trust
 
 Astra HTTP clients using the workspace reqwest transport trust both bundled

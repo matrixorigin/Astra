@@ -2331,13 +2331,12 @@ async fn execute_cli_command_impl(
             // A headless turn normally lets /chat/stream create its session
             // lazily. Native capacity must be advertised before the parent
             // model is admitted, so use the existing session creation owner
-            // when a supported local collaborator is available. Environments
-            // without one keep the ordinary lazy path.
+            // only when native collaborators were explicitly selected. Ordinary
+            // turns do not probe external runtimes or pre-create a Session.
             let mut created_session_for_native = false;
-            if session_routing.server_session_id.is_none()
-                && !crate::edge_tools::native_codex::native_provider_executable_snapshot()
-                    .is_empty()
-            {
+            let native_collaborators_requested =
+                crate::cli::edge_lifecycle::native_delivery::native_collaborators_requested()?;
+            if session_routing.server_session_id.is_none() && native_collaborators_requested {
                 let session_id = setup_await!(
                     crate::cli::slash::slash_state::create_server_session_identity(api, &token)
                 )?;
@@ -2451,7 +2450,11 @@ async fn execute_cli_command_impl(
                         pm.subscribe_permission_policy(),
                         one_shot_terminal_deadline,
                     )
-                )
+                )?
+            } else if native_collaborators_requested {
+                return Err(
+                    "selected native collaborators require an authenticated Session owner".into(),
+                );
             } else {
                 None
             };
