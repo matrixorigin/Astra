@@ -1150,7 +1150,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1219,7 +1218,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1299,7 +1297,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1360,7 +1357,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1424,7 +1420,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1501,7 +1496,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
@@ -1570,7 +1564,6 @@ mod chat_stream_lifecycle_tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }

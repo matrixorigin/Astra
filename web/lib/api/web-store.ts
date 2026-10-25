@@ -1,6 +1,6 @@
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
 import { resumeStreamProjection } from "@/lib/api/stream-event-helpers";
-import { isArtifactPublicationV1 } from "@astra/sdk";
+import { AstraApiError, isArtifactPublicationV1 } from "@astra/sdk";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
@@ -769,9 +769,8 @@ export async function getChatHydrated(
   ownerUserId: string,
   chatId: string,
 ): Promise<ChatDetail | null> {
-  const runs = await syncBackendSessions(ownerUserId, chatId);
-  await syncBackendTranscript(ownerUserId, chatId, runs);
-  return getChat(ownerUserId, chatId);
+  const canonicalId = await syncBackendTranscript(ownerUserId, chatId);
+  return getChat(ownerUserId, canonicalId ?? chatId);
 }
 
 export async function createChatWithMessage(
@@ -1860,7 +1859,6 @@ function chatRecordFromBackendSession(
 async function listAllBackendRuns(
   client: WebRuntimeClient,
   ownerUserId: string,
-  includeInputForSession?: string,
 ): Promise<RunStatus[]> {
   const runs: RunStatus[] = [];
   let cursor: NonNullable<RunListResponse["nextCursor"]> | undefined;
@@ -1870,7 +1868,6 @@ async function listAllBackendRuns(
     try {
       parsed = await client.sdk.listRuns({
         limit: RUN_SYNC_PAGE_SIZE,
-        ...(includeInputForSession ? { includeInputForSession } : {}),
         ...(cursor ? { cursor } : {}),
       });
     } catch (error) {
@@ -1930,21 +1927,17 @@ async function listAllBackendSessions(
   return sessions;
 }
 
-async function syncBackendSessions(ownerUserId: string, inputChatId?: string): Promise<RunStatus[]> {
+async function syncBackendSessions(ownerUserId: string): Promise<void> {
   const client = await getRuntimeClient({
     auth: "required",
     operation: `sync persisted sessions for user ${ownerUserId}`,
   });
   if (!client) {
-    return [];
+    return;
   }
 
   const sessions = await listAllBackendSessions(client, ownerUserId);
-  const selected = getStore(ownerUserId).chats.find(chat => chat.id === inputChatId);
-  const inputSession = inputChatId ? sessions.find(session =>
-    session.session_id === (selected?.backendSessionId ?? inputChatId) ||
-    metadataString(session.metadata, "web_chat_id") === inputChatId)?.session_id : undefined;
-  const runs = await listAllBackendRuns(client, ownerUserId, inputSession);
+  const runs = await listAllBackendRuns(client, ownerUserId);
   const syncStartedAt = nowIso();
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
@@ -2036,7 +2029,6 @@ async function syncBackendSessions(ownerUserId: string, inputChatId?: string): P
   });
   normalizeCanonicalChatIds(store);
   store.chats.sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
-  return runs;
 }
 
 function transcriptItemToMessage(
@@ -2094,136 +2086,105 @@ function transcriptItemToMessage(
   };
 }
 
-// Raw history retains its sequence order. Missing accepted inputs come from the
-// same Run-list snapshot; admission time places them without inventing raw cursors.
-function conversationMessages(chatId: string, sessionId: string, items: RuntimeTranscriptItemResponse[],
-  runs: RunStatus[], activeRunId?: string): ChatMessage[] {
-  const order = (time: string) => time.replace(" ", "T").replace(/(?:Z|\+00:00)$/, "");
-  const roots = runs.filter(run => run.sessionId === sessionId && run.parentRunId === null &&
-    run.depth === 0 && run.openingInput).sort((a, b) =>
-    order(a.openingInput!.created_at).localeCompare(order(b.openingInput!.created_at)) || a.runId.localeCompare(b.runId));
-  const byRun = new Map(roots.map(run => [run.runId, run.openingInput!]));
-  const bySource = new Map(items.map(item => [item.source_event_id, item]));
-  const entries = items.flatMap(item => {
-    const message = transcriptItemToMessage(chatId, item);
-    return message ? [{ message, runId: item.run_id, source: item.source_event_id,
-      time: byRun.get(item.run_id ?? "")?.created_at ?? item.created_at ?? "" }] : [];
-  });
-  for (const run of roots.slice(-CHAT_HISTORY_LIMIT)) {
-    const input = run.openingInput!;
-    if (typeof input.original_input !== "string" || !input.source_event_id || !input.created_at) {
-      throw new Error(`Cannot recover input for run ${run.runId}: immutable opening input is unavailable.`);
-    }
-    const stored = bySource.get(input.source_event_id);
-    if (stored) {
-      if (stored.run_id !== run.runId || stored.role !== "user" || stored.content !== input.original_input) {
-        throw new Error(`Cannot recover input for run ${run.runId}: conflicting transcript input.`);
+async function syncBackendTranscript(ownerUserId: string, chatId: string): Promise<string | undefined> {
+  const original = getStore(ownerUserId).chats.find(item => item.id === chatId);
+  const sessionId = original?.backendSessionId;
+  const runId = original?.activeRun?.runId;
+  const assistantId = original?.activeRun?.assistantMessageId;
+  const projection = original?.streamProjection;
+  const messages = original?.messages;
+  const pendingTurn = original?.pendingTurn;
+  // A detail read may overlap POST admission, a terminal, or another reader.
+  // Compare the entire existing continuation before publishing success/errors.
+  const currentChat = () => getStore(ownerUserId).chats.find(item => item.id === chatId);
+  const stillCurrent = () => {
+    const current = currentChat();
+    return current?.backendSessionId === sessionId && current?.activeRun?.runId === runId &&
+      current?.activeRun?.assistantMessageId === assistantId && current?.streamProjection === projection &&
+      current?.messages === messages && current?.pendingTurn === pendingTurn;
+  };
+  const client = await getRuntimeClient({ auth: "required", operation: "read selected conversation" });
+  if (!client || !stillCurrent()) return;
+
+  let backendSessionId = sessionId;
+  if (!backendSessionId) {
+    // Resolve legacy Web IDs through the existing directory; known Sessions
+    // read directly, without enumerating the owner's Runs or other Sessions.
+    const sessions = await listAllBackendSessions(client, ownerUserId);
+    if (!stillCurrent()) return;
+    backendSessionId = sessions.find(session => session.session_id === chatId ||
+      metadataString(session.metadata, "web_chat_id") === chatId)?.session_id;
+    if (!backendSessionId) return;
+  }
+  let parsed;
+  try {
+    parsed = await client.sdk.getSessionConversation(backendSessionId, CHAT_HISTORY_LIMIT);
+  } catch (error) {
+    if (!stillCurrent()) return;
+    if ((error instanceof AstraApiError || error instanceof RuntimeClientError) && error.status === 404) {
+      const missing = currentChat();
+      if (missing?.backendSessionId === backendSessionId) {
+        discardChatStreamProjection(missing);
+        const store = getStore(ownerUserId);
+        store.chats = store.chats.filter(item => item !== missing);
       }
-      continue;
+      return;
     }
-    const index = entries.findIndex(entry => entry.runId === run.runId ||
-      order(entry.time) > order(input.created_at) ||
-      order(entry.time) === order(input.created_at) && (entry.runId ?? "").localeCompare(run.runId) > 0);
-    entries.splice(index < 0 ? entries.length : index, 0, {
-      runId: run.runId, source: input.source_event_id, time: input.created_at,
-      message: { id: `input:${run.runId}:${input.source_event_id}`, role: "user", content: input.original_input,
-        createdAt: input.created_at, status: "complete" },
-    });
+    throw runtimeOperationError(`Cannot sync persisted transcript for session ${backendSessionId}`, error);
   }
-  const visible = entries.slice(-CHAT_HISTORY_LIMIT);
-  const activeSource = activeRunId ? byRun.get(activeRunId)?.source_event_id : undefined;
-  const activeInput = activeSource ? entries.find(entry => entry.source === activeSource) : undefined;
-  if (activeInput && !visible.includes(activeInput)) {
-    visible.shift();
-    visible.unshift(activeInput);
+  if (!stillCurrent()) return;
+  if (parsed.session.session_id !== backendSessionId) {
+    throw new Error("Conversation response does not match the selected Session.");
   }
-  return visible.map(entry => entry.message);
-}
-
-async function syncBackendTranscript(
-  ownerUserId: string,
-  chatId: string,
-  runs: RunStatus[],
-): Promise<void> {
-  const store = getStore(ownerUserId);
-  let chat = store.chats.find((item) => item.id === chatId);
-  if (!chat || (chat.messages.length > 0 && !chat.activeRun &&
-    !chat.messages.some(message => message.role === "assistant" && message.status === "streaming"))) return;
-  const backendSessionId = backendSessionIdForChat(chat);
-  const runId = chat.activeRun?.runId;
-  const assistantMessageId = chat.activeRun?.assistantMessageId;
-  const projection = chat.streamProjection;
-  if (runId && publicActiveRun(chat)?.nextEventIndex !== undefined) return;
-  // Hydration can overlap a stream update, a second detail read, or a new turn.
-  // Reacquire the shell after awaits; never publish a prior Run into its successor.
-  const currentChat = () => {
-    const current = getStore(ownerUserId).chats.find(item => item.id === chatId);
-    return current && backendSessionIdForChat(current) === backendSessionId &&
-      current.activeRun?.runId === runId &&
-      current.activeRun?.assistantMessageId === assistantMessageId &&
-      current.streamProjection === projection ? current : undefined;
-  };
-  const client = await getRuntimeClient({
-    auth: "required",
-    operation: `sync persisted transcript for session ${backendSessionId}`,
+  const existing = currentChat();
+  // A newly started POST has a parser before its Run identity arrives.
+  const livePost = existing?.streamProjection;
+  if (livePost?.writer && !livePost.writer.signal.aborted &&
+    !livePost.state.runId && !livePost.state.protocolError) return existing!.id;
+  const root = parsed.selected_root;
+  const stopped = root && isLocallyStoppedRun(existing, root.run_id, Date.now());
+  const warm = existing && root?.run_id === runId && publicActiveRun(existing)?.nextEventIndex !== undefined;
+  if (existing && !warm) discardChatStreamProjection(existing);
+  const record = chatRecordFromBackendSession(parsed.session, existing);
+  if (!record) return;
+  if (root && isTerminalChatRunStatus(root.status)) forgetLocallyStoppedRun(record, root.run_id);
+  const active = root && runBlocksChatTurn(root.status) && !stopped
+    ? makeActiveRunRecord({ runId: root.run_id, status: root.status, waitingFor: root.waiting_for }, "backend_poll")
+    : undefined;
+  const reconciled = mergeActiveRunRecord({
+    existing: root?.run_id === existing?.activeRun?.runId ? existing?.activeRun : undefined,
+    backend: active, backendRunStatuses: new Map(root ? [[root.run_id, root.status]] : []),
   });
-  if (!client || !currentChat()) return;
-
-  const readTranscript = async () => {
-    try {
-      return await client.sdk.getSessionTranscript(backendSessionId, { limit: CHAT_HISTORY_LIMIT });
-    } catch (error) {
-      if (!currentChat()) return null;
-      throw runtimeOperationError(
-        `Cannot sync persisted transcript for session ${backendSessionId}`, error,
-      );
-    }
-  };
-  let parsed = await readTranscript();
-  chat = currentChat();
-  if (!chat || !parsed) return;
-
-  if (runId && chat.activeRun && runBlocksChatTurn(chat.activeRun.status)) {
-    let status;
-    try {
-      status = await client.sdk.getRunStatus(runId);
-    } catch (error) {
-      if (!currentChat()) return;
-      throw runtimeOperationError(`Cannot recover run ${runId}`, error);
-    }
-    chat = currentChat();
-    if (!chat) return;
-    if (status.runId !== runId || status.sessionId !== backendSessionId) {
-      throw new Error(`Cannot recover input for run ${runId}: mismatched Run or Session.`);
-    }
-    if (isTerminalChatRunStatus(status.status)) {
-      // The first read may precede the atomic terminal transcript commit.
-      // One reread closes that window without creating a polling protocol.
-      parsed = await readTranscript();
-      chat = currentChat();
-      if (!chat || !parsed) return;
-      chat.activeRun = undefined;
-    }
-  }
-
-  const activeRun = chat.activeRun;
-  const messages = conversationMessages(chatId, backendSessionId, parsed.items ?? [], runs, activeRun?.runId);
-  if (activeRun && runBlocksChatTurn(activeRun.status)) {
-    if (!runs.some(run => run.runId === activeRun.runId && run.openingInput)) {
-      throw new Error(`Cannot recover input for run ${runId}: immutable opening input is unavailable.`);
-    }
-    const assistant = streamingAssistantMessage(chat, `inflight:${activeRun.runId}`, nowIso(), {
-      sessionId: backendSessionId, runId: activeRun.runId, nextEventIndex: 0,
+  if (warm) {
+    // Stream terminal owns an unstopped continuation; cancellation keeps its
+    // existing expiry rules even while the parser remains reusable.
+    record.activeRun = isTerminalChatRunStatus(root!.status) && !stopped ? existing.activeRun : reconciled;
+    if (!record.activeRun) discardChatStreamProjection(record);
+  } else {
+    record.activeRun = reconciled;
+    record.messages = parsed.items.flatMap(item => {
+      if (item.kind === "opening") return [{ id: item.id, role: "user" as const,
+        content: item.content, createdAt: item.created_at, status: "complete" as const }];
+      const message = transcriptItemToMessage(record.id, item);
+      return message ? [message] : [];
     });
-    messages.push(assistant);
-    activeRun.assistantMessageId = assistant.id;
+    if (record.activeRun) {
+      const active = record.activeRun;
+      const assistant = streamingAssistantMessage(record, `inflight:${active.runId}`, nowIso(), {
+        sessionId: backendSessionId, runId: active.runId, nextEventIndex: 0,
+      });
+      record.messages.push(assistant);
+      active.assistantMessageId = assistant.id;
+    }
+    const latest = record.messages.at(-1);
+    record.lastMessageAt = latest?.createdAt ?? record.lastMessageAt;
+    record.lastMessagePreview = latest?.content || record.lastMessagePreview;
   }
-
-  if (!activeRun) discardChatStreamProjection(chat);
-  chat.messages = messages;
-  const latest = messages[messages.length - 1];
-  chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;
-  chat.lastMessagePreview = latest?.content || chat.lastMessagePreview;
+  const store = getStore(ownerUserId);
+  const index = store.chats.findIndex(item => item.id === chatId || item.backendSessionId === backendSessionId);
+  if (index < 0) store.chats.push(record);
+  else store.chats[index] = record;
+  return record.id;
 }
 
 async function createBackendSession(params: {

@@ -1341,8 +1341,6 @@ export type AgentBindingRecord = {
 };
 
 export type RunStatus = {
-  /** Present only when listing root Runs for the requested input Session. */
-  openingInput?: { original_input: string; source_event_id: string; created_at: string };
   artifactPublication?: ArtifactPublicationV1;
   runId: string;
   sessionId: string;
@@ -1509,6 +1507,18 @@ export type RuntimeTranscriptResponse = {
   items: RuntimeTranscriptItemResponse[];
   next_before_seq?: number | null;
   has_more?: boolean;
+};
+
+/** Bounded display projection; opening inputs never acquire raw item sequences. */
+export type RuntimeConversationResponse = {
+  kind: "conversation";
+  session: RuntimeSessionResponse;
+  selected_root: { run_id: string; status: string; waiting_for: string | null; created_at: string } | null;
+  items: Array<({ kind: "raw" } & RuntimeTranscriptItemResponse) | {
+    kind: "opening"; id: string; run_id: string; source_event_id: string; created_at: string; content: string;
+  }>;
+  raw_page: { next_before_seq: number | null; has_more: boolean };
+  truncated: boolean;
 };
 
 export type RuntimeTranscriptParams = {
@@ -1873,7 +1883,6 @@ export type RunListCursor = {
 export type RunListParams = {
   limit?: number;
   cursor?: RunListCursor;
-  includeInputForSession?: string;
 };
 
 export type RunListResponse = {

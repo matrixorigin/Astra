@@ -47,6 +47,7 @@ import type {
   RuntimeSessionUpdateBody,
   RuntimeTranscriptParams,
   RuntimeTranscriptResponse,
+  RuntimeConversationResponse,
   ReauthenticationProof,
   ReauthenticationPurpose,
   SessionActivityCursor,
@@ -398,7 +399,6 @@ function assertWorkCommitMessage(value: string): void {
 }
 
 type RunStatusWire = {
-  opening_input?: RunStatus["openingInput"];
   artifact_publication?: import("./types").ArtifactPublicationV1;
   run_id: string;
   session_id: string;
@@ -448,7 +448,6 @@ function normalizeSession(w: SessionWire): SessionInfo {
 
 function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
-    ...(w.opening_input ? { openingInput: w.opening_input } : {}),
     artifactPublication: w.artifact_publication,
     runId: w.run_id,
     sessionId: w.session_id,
@@ -2800,6 +2799,13 @@ export class AstraClient {
     return this.put<RuntimeSessionResponse>(sessionPath(sessionId), body);
   }
 
+  /** Current root and bounded conversation facts from one database snapshot. */
+  async getSessionConversation(sessionId: string, limit = 200): Promise<RuntimeConversationResponse> {
+    return this.fetch<RuntimeConversationResponse>(
+      `${sessionTranscriptPath(sessionId)}${buildQueryString({ scope: "conversation", limit })}`,
+    );
+  }
+
   async getSessionTranscript(
     sessionId: string,
     params: RuntimeTranscriptParams = {},
@@ -3102,7 +3108,6 @@ export class AstraClient {
   /** `GET /runs` — list durable runs for the current user. */
   async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {
     const q = buildQueryString({
-      ...(opts.includeInputForSession ? { include_input_for_session: opts.includeInputForSession } : {}),
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
       ...(opts.cursor
         ? {

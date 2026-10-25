@@ -179,10 +179,15 @@ Retention is a product contract:
 - Raw conversation settlement stores original input, applied user guidance and the
   actual terminal assistant answer with its model-item identity. An accepted Run
   that ends before execution can retain only its immutable opening. User-visible
-  history combines that accepted input with materialized raw history through the
-  existing owner-scoped Run-list read, without another stored projection, query or
-  synthetic transcript cursor. Opt-in input payload is scoped to the selected
-  Session's roots; the composed Web detail retains its existing finite window. It does not
+  history combines that input with materialized raw history at the transcript
+  owner through the bounded `scope=conversation` read. This replaces selected
+  detail's owner-wide Run enumeration; idle/warm reads also refresh raw history.
+  It adds no stored projection or synthetic transcript cursor. Root status and
+  raw rows share one SQL statement snapshot; metadata and artifact previews keep
+  their separate read boundaries. Historical opening inputs have a 256 KiB
+  serialized budget within 200 candidates; the selected input is retained exactly
+  under the existing opening-size limit. Display history is limited to 200 items.
+  These bounds do not imply history-independent database scans. It does not
   copy tool starts/results: canonical Context owns model continuation and the
   invocation ledger owns governed outcomes and effect uncertainty. Run tool
   cards are optional live presentation. Paused output does not occupy the

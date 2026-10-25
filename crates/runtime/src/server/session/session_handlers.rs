@@ -220,6 +220,7 @@ pub(crate) struct TranscriptQuery {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TranscriptQueryScope {
     RootConversation,
+    Conversation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +234,10 @@ fn transcript_read_scope(
     query: &TranscriptQuery,
 ) -> Result<TranscriptReadScope<'_>, (StatusCode, Json<ErrorResponse>)> {
     match (query.scope, query.run_id.as_deref()) {
+        (Some(TranscriptQueryScope::Conversation), _) => Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "conversation scope cannot use raw filters",
+        )),
         (Some(TranscriptQueryScope::RootConversation), Some(_)) => Err(error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "transcript scope=root_conversation cannot be combined with run_id",
@@ -243,6 +248,13 @@ fn transcript_read_scope(
         (None, Some(run_id)) => Ok(TranscriptReadScope::Run(run_id)),
         (None, None) => Ok(TranscriptReadScope::Session),
     }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum TranscriptReadResponse {
+    Raw(TranscriptResponse),
+    Conversation(Box<super::conversation::ConversationResponse>),
 }
 
 #[derive(Serialize)]
@@ -671,10 +683,10 @@ pub(crate) async fn get_session_transcript_handler(
     Path(session_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<TranscriptQuery>,
-) -> Result<Json<TranscriptResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TranscriptReadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
-    let _ = state
+    let session = state
         .session_service
         .get_session(session_id.clone(), user_id.clone())
         .await?;
@@ -682,6 +694,29 @@ pub(crate) async fn get_session_transcript_handler(
         .shared_pool
         .as_ref()
         .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    if query.scope == Some(TranscriptQueryScope::Conversation)
+        && query.run_id.is_none()
+        && query.before_seq.is_none()
+    {
+        let (selected_root, items, raw_page, truncated) = super::conversation::read_conversation(
+            pool,
+            &user_id,
+            &session_id,
+            query.limit as usize,
+        )
+        .await
+        .map_err(internal_error)?;
+        return Ok(Json(TranscriptReadResponse::Conversation(Box::new(
+            super::conversation::ConversationResponse {
+                kind: "conversation",
+                session: session.into(),
+                selected_root,
+                items,
+                raw_page,
+                truncated,
+            },
+        ))));
+    }
     let scope = transcript_read_scope(&query)?;
     let limit = query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
     let before_seq = query.before_seq.unwrap_or(i64::MAX);
@@ -819,15 +854,15 @@ pub(crate) async fn get_session_transcript_handler(
     } else {
         false
     };
-    Ok(Json(TranscriptResponse {
+    Ok(Json(TranscriptReadResponse::Raw(TranscriptResponse {
         session_id,
         items,
         next_before_seq,
         has_more,
-    }))
+    })))
 }
 
-fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, String> {
+pub(super) fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, String> {
     let run_id = session_row_optional_string(row, "run_id")?;
     let role = session_row_string(row, "role")?;
     let payload = session_row_optional_string(row, "payload_json")?
@@ -879,7 +914,7 @@ fn attach_transcript_artifacts(
     }
 }
 
-async fn hydrate_transcript_artifacts(
+pub(super) async fn hydrate_transcript_artifacts(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
@@ -4351,23 +4386,29 @@ mod tests {
         };
         assert_eq!(state_err.0, StatusCode::FORBIDDEN);
 
-        let transcript_err = match get_session_transcript_handler(
-            State(state),
-            Path(session_id.clone()),
-            auth_headers(),
-            Query(TranscriptQuery::default()),
-        )
-        .await
-        {
-            Ok(_) => panic!("transcript should stop at session ownership check"),
-            Err(err) => err,
-        };
-        assert_eq!(transcript_err.0, StatusCode::FORBIDDEN);
+        for scope in [None, Some(TranscriptQueryScope::Conversation)] {
+            let transcript_err = match get_session_transcript_handler(
+                State(state.clone()),
+                Path(session_id.clone()),
+                auth_headers(),
+                Query(TranscriptQuery {
+                    scope,
+                    ..Default::default()
+                }),
+            )
+            .await
+            {
+                Ok(_) => panic!("transcript should stop at session ownership check"),
+                Err(err) => err,
+            };
+            assert_eq!(transcript_err.0, StatusCode::FORBIDDEN);
+        }
 
         let calls = session_service.get_session_calls.lock().await.clone();
         assert_eq!(
             calls,
             vec![
+                (session_id.clone(), "artifact-owner".to_string()),
                 (session_id.clone(), "artifact-owner".to_string()),
                 (session_id, "artifact-owner".to_string()),
             ],

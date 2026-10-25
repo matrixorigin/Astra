@@ -403,7 +403,6 @@ mod tests {
             _user_id: String,
             _limit: u32,
             _cursor: Option<astra_services::runs::RunListCursor>,
-            _include_input_for_session: Option<String>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!("list_runs is not used in delegation handler tests")
         }

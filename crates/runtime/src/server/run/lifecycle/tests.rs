@@ -21428,7 +21428,7 @@ async fn lease_loss_during_preparation_closes_delivery_and_preserves_recovery_wo
             0,
             "recovery owns unconfirmed authority"
         );
-        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
         assert_eq!(runs.runs[0].status, STATUS_RUNNING);
         let workspace = runs.runs[0].workspace.as_ref().unwrap()["cwd"]
             .as_str()
@@ -21458,7 +21458,7 @@ async fn preparation_failure_keeps_lease_until_terminal_commit_and_releases_sess
             err(svc.create_run("user-1".into(), request).await)
         };
         assert_eq!(failure.0, StatusCode::SERVICE_UNAVAILABLE);
-        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
         assert_eq!(runs.runs.len(), 1);
         assert_eq!(runs.runs[0].status, STATUS_FAILED);
         let run = svc
@@ -21605,7 +21605,7 @@ async fn expired_start_receipt_returns_coded_conflict_without_rejecting_durable_
             "no local execution may start"
         );
         if entrypoint == "cloud" {
-            let list = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+            let list = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
             let run = svc
                 .run_engine
                 .load_run("user-1", &list.runs[0].run_id)
@@ -24220,7 +24220,7 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
         .unwrap()
         .unwrap();
     let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
-    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     assert!(status.workspace.is_none() && status.executor.is_none() && status.transport.is_none());
     assert!(
         listing.runs[0].workspace.is_none()
@@ -24403,7 +24403,7 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
     let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
     assert_eq!(status.workspace.unwrap()["cwd"], "/workspace/late-binding");
     assert_eq!(status.executor.unwrap()["kind"], "server_local");
-    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     assert_eq!(
         listing.runs[0].workspace.as_ref().unwrap()["cwd"],
         "/workspace/late-binding"
@@ -28069,7 +28069,7 @@ async fn stream_run_hides_foreign_run() {
 #[tokio::test]
 async fn list_runs_empty_initially() {
     let svc = test_service();
-    let result = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let result = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     assert_eq!(result.total, None);
     assert!(result.runs.is_empty());
 }
@@ -28080,13 +28080,13 @@ async fn list_runs_filters_by_user() {
     let u1_a = ok(svc.create_run("user-1".into(), test_request("a")).await);
     let u2_b = ok(svc.create_run("user-2".into(), test_request("b")).await);
     let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
-    let for_u1 = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let for_u1 = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     assert_eq!(for_u1.total, None);
     let ids: std::collections::HashSet<_> = for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
     assert!(ids.contains(u1_a.run_id.as_str()));
     assert!(ids.contains(u1_c.run_id.as_str()));
     assert!(!ids.contains(u2_b.run_id.as_str()));
-    let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None, None).await);
+    let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None).await);
     assert_eq!(for_u2.total, None);
     assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
 }
@@ -28099,18 +28099,18 @@ async fn list_runs_cursor_pagination_omits_count_and_returns_next_cursor() {
             .create_run("user-1".into(), test_request(&format!("msg {i}")))
             .await);
     }
-    let page1 = ok(svc.list_runs_cursor("user-1".into(), 2, None, None).await);
+    let page1 = ok(svc.list_runs_cursor("user-1".into(), 2, None).await);
     assert_eq!(page1.total, None);
     assert_eq!(page1.runs.len(), 2);
     assert!(page1.next_cursor.is_some());
     let page2 = ok(svc
-        .list_runs_cursor("user-1".into(), 2, page1.next_cursor, None)
+        .list_runs_cursor("user-1".into(), 2, page1.next_cursor)
         .await);
     assert_eq!(page2.total, None);
     assert_eq!(page2.runs.len(), 2);
     assert!(page2.next_cursor.is_some());
     let page3 = ok(svc
-        .list_runs_cursor("user-1".into(), 2, page2.next_cursor, None)
+        .list_runs_cursor("user-1".into(), 2, page2.next_cursor)
         .await);
     assert_eq!(page3.total, None);
     assert_eq!(page3.runs.len(), 1);
@@ -28123,12 +28123,12 @@ async fn list_runs_orders_by_latest_update() {
     let older = ok(svc.create_run("user-1".into(), test_request("older")).await);
     let newer = ok(svc.create_run("user-1".into(), test_request("newer")).await);
 
-    let initial = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let initial = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     assert_eq!(initial.runs[0].run_id, newer.run_id);
 
     ok(svc.pause_run(older.run_id.clone(), "user-1".into()).await);
 
-    let after_update = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let after_update = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     assert_eq!(
         after_update.runs[0].run_id, older.run_id,
         "list_runs_cursor should surface the most recently updated run first"
@@ -28141,7 +28141,7 @@ async fn list_runs_cursor_clamps_pagination() {
     let svc = test_service();
     // Absurdly large limit must not panic or produce unbounded queries.
     let result = ok(svc
-        .list_runs_cursor("user-clamp".into(), u32::MAX, None, None)
+        .list_runs_cursor("user-clamp".into(), u32::MAX, None)
         .await);
     assert_eq!(result.runs.len(), 0);
     // Verify the returned limit is clamped.
@@ -35150,7 +35150,7 @@ async fn list_runs_falls_back_to_durable_store_on_cache_miss() {
 
     svc.runs.write().await.remove(&first.run_id);
 
-    let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None, None).await);
+    let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
     let run_ids: Vec<_> = runs.runs.iter().map(|run| run.run_id.as_str()).collect();
     assert_eq!(runs.total, None);
     assert!(run_ids.contains(&first.run_id.as_str()));
@@ -35507,26 +35507,27 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                 .await
             );
         }
-        let default = ok(service.list_runs_cursor(user.clone(), 10, None, None).await);
-        assert!(default.runs[0].opening_input.is_none());
-        let page = ok(service
-            .list_runs_cursor(user.clone(), 10, None, Some(session.clone()))
-            .await);
-        assert_eq!(page.runs.len(), 1);
+        let (selected, items, raw_page, _) =
+            crate::server::session::conversation::read_conversation(&pool, &user, &session, 200)
+                .await
+                .unwrap();
         assert_eq!(
-            page.runs[0].status,
+            selected.unwrap().status,
             if cancelled {
                 STATUS_CANCELLED
             } else {
                 STATUS_FAILED
             }
         );
-        let input = page.runs[0].opening_input.as_ref().unwrap();
-        assert_eq!(input.original_input, request.message);
+        let json = serde_json::to_value(items).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["content"], request.message);
         assert_eq!(
-            input.source_event_id,
+            json[0]["source_event_id"],
             persistence::server_input_source_event_id(&session, &run)
         );
+        assert_eq!(raw_page.next_before_seq, None);
+        assert!(!raw_page.has_more);
         let raw_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
         )
@@ -35975,14 +35976,14 @@ async fn list_runs_cursor_pagination_is_deterministic() {
     }
     // Collect all run_ids across 3 pages
     let mut all_ids = Vec::new();
-    let page1 = ok(svc.list_runs_cursor("user-pg".into(), 2, None, None).await);
+    let page1 = ok(svc.list_runs_cursor("user-pg".into(), 2, None).await);
     all_ids.extend(page1.runs.iter().map(|r| r.run_id.clone()));
     let page2 = ok(svc
-        .list_runs_cursor("user-pg".into(), 2, page1.next_cursor, None)
+        .list_runs_cursor("user-pg".into(), 2, page1.next_cursor)
         .await);
     all_ids.extend(page2.runs.iter().map(|r| r.run_id.clone()));
     let page3 = ok(svc
-        .list_runs_cursor("user-pg".into(), 2, page2.next_cursor, None)
+        .list_runs_cursor("user-pg".into(), 2, page2.next_cursor)
         .await);
     all_ids.extend(page3.runs.iter().map(|r| r.run_id.clone()));
 
@@ -36888,4 +36889,250 @@ pub(crate) fn assert_empty_recovery_run_finalization(
                 .all(|event| event["event_type"] != "run_interrupted")
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursors() {
+    use crate::server::session::conversation::read_conversation;
+    use astra_services::SessionService;
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = "test-user".to_owned();
+    let session = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+    let service = db_backed_test_service(&pool, "bounded-conversation-fixture");
+    let current = Uuid::new_v4().to_string();
+    let template = Uuid::new_v4().to_string();
+    let template_session = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &template_session).await;
+    let exact = "\"你好\n".repeat(60_000);
+    for (id, run_session, input) in [
+        (&template, &template_session, "history".repeat(2400)),
+        (&current, &session, exact.clone()),
+    ] {
+        service
+            .run_engine
+            .start_run_with_context(
+                id,
+                &user,
+                run_session,
+                RunStartContext {
+                    original_input: Some(input),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE agent_runs SET created_at = '2026-01-01', updated_at = NOW(6) WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&current).execute(pool.get()).await.unwrap();
+    // Use valid admitted bytes; this is fixture population, not a second opening encoder.
+    for index in 0..205 {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, opening_events_json, opening_context_json, opening_hash, created_at) SELECT user_id, ?, ?, ?, ?, 'failed', opening_events_json, opening_context_json, opening_hash, DATE_ADD('2026-02-01', INTERVAL ? SECOND) FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&session).bind(&id).bind(&id).bind(&id).bind(index).bind(&user).bind(&template).execute(pool.get()).await.unwrap();
+    }
+    // Exercise the actual authenticated handler and Axum's HTTP serializer,
+    // including the selected input larger than the historical byte budget.
+    let mut state = crate::app_state::AppState::new(
+        crate::app_state::ServiceInfo::default(),
+        Arc::new(crate::app_state::MatrixOneHealthChecker::new(
+            pool.settings().clone(),
+        )),
+    )
+    .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+    .with_session_service(Arc::new(
+        astra_services::DatabaseSessionService::new(pool.settings().clone())
+            .with_pool(pool.clone()),
+    ));
+    state.shared_pool = Some(pool.clone());
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "authorization",
+        axum::http::HeaderValue::from_static("Bearer synthetic-test"),
+    );
+    for scope in [
+        Some(crate::server::session::session_handlers::TranscriptQueryScope::Conversation),
+        None,
+    ] {
+        use axum::response::IntoResponse;
+        let start = std::time::Instant::now();
+        let response = crate::server::session::session_handlers::get_session_transcript_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(session.clone()),
+            headers.clone(),
+            axum::extract::Query(crate::server::session::session_handlers::TranscriptQuery {
+                scope,
+                limit: 200,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let read_elapsed = start.elapsed();
+        let serialize_start = std::time::Instant::now();
+        let response = response.into_response();
+        let serialize_elapsed = serialize_start.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        if scope.is_some() {
+            assert_eq!(json["kind"], "conversation");
+            assert_eq!(json["session"]["session_id"], session);
+            assert_eq!(json["selected_root"]["run_id"], current);
+            assert_eq!(json["items"][0]["content"], exact);
+        } else {
+            assert!(json.get("kind").is_none());
+            assert_eq!(json["session_id"], session);
+            assert!(json["items"].as_array().unwrap().is_empty());
+        }
+        println!(
+            "conversation_http_cost scope={scope:?} body_bytes={} read_and_projection_us={} serialize_us={}",
+            bytes.len(),
+            read_elapsed.as_micros(),
+            serialize_elapsed.as_micros()
+        );
+    }
+    for (run_id, before_seq) in [(Some(current.clone()), None), (None, Some(1))] {
+        let result = crate::server::session::session_handlers::get_session_transcript_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(session.clone()),
+            headers.clone(),
+            axum::extract::Query(crate::server::session::session_handlers::TranscriptQuery {
+                scope: Some(
+                    crate::server::session::session_handlers::TranscriptQueryScope::Conversation,
+                ),
+                run_id,
+                before_seq,
+                limit: 200,
+            }),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let (root, items, page, truncated) = read_conversation(&pool, &user, &session, 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        root.unwrap().run_id,
+        current,
+        "active root outside the newest 200 must still be selected"
+    );
+    assert!(truncated);
+    assert!(!page.has_more);
+    let wire = serde_json::to_value(&items).unwrap();
+    assert_eq!(wire[0]["content"], exact);
+    let history_bytes: usize = wire
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|item| serde_json::to_vec(item).unwrap().len())
+        .sum();
+    assert!(history_bytes <= 256 * 1024);
+
+    let child = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,parent_run_id,depth,status) VALUES (?,?,?,?,?,?,1,'waiting')")
+        .bind(&user).bind(&session).bind(&child).bind(&current).bind(&child).bind(&current).execute(pool.get()).await.unwrap();
+    let foreign = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) VALUES ('foreign-owner',?,?,?,?,'waiting')")
+        .bind(&session).bind(&foreign).bind(&foreign).bind(&foreign).execute(pool.get()).await.unwrap();
+    let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash) ",
+    );
+    insert.push_values(1..=205, |mut row, seq| {
+        row.push_bind(&user)
+            .push_bind(&session)
+            .push_bind(seq)
+            .push_bind(&current)
+            .push_bind("user")
+            .push_bind(format!("guidance {seq}"))
+            .push_bind("fixture");
+    });
+    insert.build().execute(pool.get()).await.unwrap();
+    for (seq, id) in [(206, &child), (207, &foreign)] {
+        sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash) VALUES (?,?,?,?,'user','excluded','fixture')")
+            .bind(&user).bind(&session).bind(seq).bind(id).execute(pool.get()).await.unwrap();
+    }
+    let (root, items, page, truncated) = read_conversation(&pool, &user, &session, 200)
+        .await
+        .unwrap();
+    assert_eq!(root.unwrap().run_id, current);
+    assert!(truncated && page.has_more);
+    assert_eq!(
+        page.next_before_seq,
+        Some(6),
+        "raw page is independent of the display-window eviction"
+    );
+    let wire = serde_json::to_value(items).unwrap();
+    assert_eq!(wire.as_array().unwrap().len(), 200);
+    assert_eq!(wire[0]["content"], exact);
+    assert_eq!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .rfind(|item| item["kind"] == "raw")
+            .unwrap()["content"],
+        "guidance 205"
+    );
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["content"] != "excluded")
+    );
+    assert!(
+        read_conversation(&pool, "unrelated-owner", &session, 200)
+            .await
+            .unwrap()
+            .1
+            .is_empty()
+    );
+
+    // Reuse the prepared reader after nonempty results for an owned empty Session.
+    let empty_session = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &empty_session).await;
+    let empty = crate::server::session::session_handlers::get_session_transcript_handler(
+        axum::extract::State(state),
+        axum::extract::Path(empty_session.clone()),
+        headers,
+        axum::extract::Query(crate::server::session::session_handlers::TranscriptQuery {
+            scope: Some(
+                crate::server::session::session_handlers::TranscriptQueryScope::Conversation,
+            ),
+            limit: 200,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let empty = serde_json::to_value(empty.0).unwrap();
+    assert!(empty["selected_root"].is_null());
+    assert!(empty["items"].as_array().unwrap().is_empty());
+
+    // Identity conflicts fail rather than replacing the accepted input silently.
+    sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash,source_event_id) VALUES (?,?,208,?,'user','altered','fixture',?)")
+        .bind(&user).bind(&session).bind(&current).bind(persistence::server_input_source_event_id(&session, &current)).execute(pool.get()).await.unwrap();
+    assert!(
+        read_conversation(&pool, &user, &session, 200)
+            .await
+            .err()
+            .unwrap()
+            .contains("conflicting transcript input")
+    );
+    let sessions = astra_services::DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone());
+    for id in [&session, &template_session, &empty_session] {
+        sessions
+            .delete_session(id.clone(), user.clone())
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = 'foreign-owner' AND session_id = ?")
+        .bind(session)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }

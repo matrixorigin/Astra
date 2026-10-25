@@ -229,7 +229,6 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
         limit: u32,
         cursor: Option<RunListCursor>,
-        include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     /// Return a bounded authoritative snapshot of one session's durable runs.
@@ -1360,7 +1359,6 @@ pub struct ChatStreamRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStatusRecord {
-    pub opening_input: Option<RunOpeningInputProjection>,
     pub artifact_publication: Option<serde_json::Value>,
     /// Durable root run-start intent, available from the bounded status read.
     pub explain_requested: bool,
@@ -1389,14 +1387,6 @@ pub struct RunProjectionCheckpointRecord {
     pub checkpoint_kind: String,
     pub checkpoint_version: String,
     pub node_seq: i64,
-    pub created_at: String,
-}
-
-/// Read-only original input identity; never includes Context authority.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RunOpeningInputProjection {
-    pub original_input: String,
-    pub source_event_id: String,
     pub created_at: String,
 }
 
@@ -24272,6 +24262,14 @@ fn run_list_cursor_from_row(row: &impl RunStateDbRow) -> DbStoreResult<RunListCu
     Ok(RunListCursor { updated_at, run_id })
 }
 
+/// Decode an explicitly loaded immutable opening with the same identity checks
+/// used by durable Run recovery. Read projections must not parse it separately.
+pub fn decode_loaded_run_opening(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Option<DurableRunOpening>, String> {
+    decode_run_opening_from_row(row).map_err(|error| error.to_string())
+}
+
 fn decode_run_opening_from_row(
     row: &impl RunStateDbRow,
 ) -> DbStoreResult<Option<DurableRunOpening>> {
@@ -27169,7 +27167,6 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _user_id: String,
         _limit: u32,
         _cursor: Option<RunListCursor>,
-        _include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,

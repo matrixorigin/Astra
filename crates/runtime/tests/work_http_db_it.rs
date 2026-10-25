@@ -228,7 +228,6 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         _user_id: String,
         _limit: u32,
         _cursor: Option<RunListCursor>,
-        _include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }

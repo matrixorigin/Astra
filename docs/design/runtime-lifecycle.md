@@ -208,21 +208,27 @@ transaction. Execution starts only within the original committed owner lease
 window. Prior-history restoration excludes the current Run's opening input, which
 becomes history for subsequent Runs.
 
-Web cold recovery asks the existing Run list for
-`include_input_for_session=<session-id>`. Matching owned root entries project the
-exact original input, canonical `source_event_id` and immutable admission time
-from their already-read opening. Default lists and status polling omit this
-payload. Accepted inputs remain visible when capacity failure or cancellation
-ends a Run before raw conversation settlement; those exits need no extra write.
-Web merges opening and raw history by Session/Run/source identity, preserves raw
-sequence order and bounds the composed detail window. It creates no raw sequence
-for an opening projection. The ordinary bounded status read closes the terminal
-race, with one existing transcript reread; it does not fetch a second opening,
-checkpoint or event history. An active Run initializes the existing stream parser
-at cursor zero even with empty raw history. A valid warm parser retains the entire
-in-flight conversation, including deferred guidance. Recovery discards responses
-if the Session, Run, assistant or parser binding changes during a read. Selecting
-another Run retires the previous stream writer before publishing that selection.
+Selected Web detail reads use `GET /sessions/{id}/transcript?scope=conversation`.
+The transcript owner composes committed root/runless history and immutable root
+opening inputs by Session/Run/source identity. Early failure or cancellation
+requires no additional write. Root selection and raw rows share one SQL statement
+snapshot; Session metadata and artifact enrichment retain their existing separate
+read boundaries. They do not determine Run completion or execution authority.
+Raw scopes and their sequence cursors remain unchanged; projected opening inputs
+have no raw sequence. The conversation read selects at most 200 historical roots
+plus the current root, budgets serialized historical input at 256 KiB, and retains
+the selected input exactly within the existing opening-size limit. Display history
+is limited to 200 items; the live assistant placeholder is additional. Limits bound
+returned work, not rows examined by the database.
+
+Every selected detail refresh obtains this bounded view, including idle and warm
+pages. It does not enumerate the owner's Runs. An active Run initializes the
+existing stream parser at cursor zero even with empty raw history. A valid warm
+parser retains the entire in-flight conversation, including deferred guidance,
+until its actual stream terminal. Recovery discards responses if the Session, Run,
+assistant or parser binding changes during a read. Selecting another Run retires
+the previous stream writer before publishing that selection. No freshness state,
+input mirror or second lifecycle is introduced.
 
 The shared loop exit owns terminal rendering, SessionFacts and the final
 checkpoint. Canonical Context retains conversation input; memory extraction

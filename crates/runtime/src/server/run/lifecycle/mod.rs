@@ -11,6 +11,7 @@ mod admission;
 mod cancellation;
 mod execution_resume;
 mod persistence;
+pub(crate) use persistence::server_input_source_event_id;
 mod projection;
 pub(crate) mod run_state;
 
@@ -12918,7 +12919,6 @@ impl AgenticRunLifecycleService {
                 .flatten()
         });
         RunStatusRecord {
-            opening_input: None,
             artifact_publication: None,
             explain_requested: astra_services::runs::run_requested_explain_analyze(run),
             run_id: run.run_id.clone(),
@@ -12938,7 +12938,6 @@ impl AgenticRunLifecycleService {
 
     fn durable_status_snapshot_record(snapshot: DurableRunStatusSnapshot) -> RunStatusRecord {
         RunStatusRecord {
-            opening_input: None,
             artifact_publication: None,
             explain_requested: snapshot.explain_requested,
             run_id: snapshot.run_id,
@@ -17334,7 +17333,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         limit: u32,
         cursor: Option<RunListCursor>,
-        include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         let limit = astra_services::runs::validate_run_list_limit(limit);
         let durable_page = self
@@ -17350,27 +17348,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let page = durable_page
             .runs
             .iter()
-            .map(|run| {
-                let mut status = Self::durable_status_record(run);
-                if include_input_for_session.as_deref() == Some(run.session_id.as_str())
-                    && run.parent_run_id.is_none()
-                    && run.depth == 0
-                {
-                    status.opening_input = run
-                        .opening
-                        .as_ref()
-                        .and_then(|opening| opening.input())
-                        .map(|input| astra_services::runs::RunOpeningInputProjection {
-                            original_input: input.original_input.clone(),
-                            source_event_id: persistence::server_input_source_event_id(
-                                &run.session_id,
-                                &run.run_id,
-                            ),
-                            created_at: run.created_at.clone(),
-                        });
-                }
-                status
-            })
+            .map(Self::durable_status_record)
             .collect();
         Ok(RunListRecord {
             runs: page,

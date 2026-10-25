@@ -121,6 +121,7 @@ export type {
   RuntimeSessionListParams,
   RuntimeTranscriptItemResponse,
   RuntimeTranscriptResponse,
+  RuntimeConversationResponse,
   RuntimeTranscriptParams,
   RuntimeModelAccessKind,
   RuntimeModelExecutionPlacement,

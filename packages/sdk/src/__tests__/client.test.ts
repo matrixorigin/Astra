@@ -435,13 +435,15 @@ describe("AstraClient — Runs", () => {
     ).toContain("last_index=5");
   });
 
-  test("listRuns projects exact scoped opening input through the normalizer", async () => {
-    const input = { original_input: " \n你好 ", source_event_id: "source-1", created_at: "2026-10-25 03:00:00.123456" };
-    globalThis.fetch = mockFetch(200, { runs: [{ run_id: "r1", session_id: "s1", status: "failed",
-      events_count: 2, opening_input: input }], limit: 200, total: null });
-    const result = await createClient().listRuns({ includeInputForSession: "s1" });
-    expect(result.runs[0].openingInput).toEqual(input);
-    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("include_input_for_session=s1");
+  test("getSessionConversation preserves typed input identity and raw cursors", async () => {
+    const body = { kind: "conversation", session: { session_id: "s1" },
+      selected_root: { run_id: "r1", status: "failed" },
+      items: [{ kind: "opening", id: "input:r1:source-1", run_id: "r1", content: " \n你好 ",
+        source_event_id: "source-1", created_at: "2026-10-25T03:00:00.123456Z" }],
+      raw_page: { next_before_seq: null, has_more: false }, truncated: false };
+    globalThis.fetch = mockFetch(200, body);
+    expect(await createClient().getSessionConversation("s1")).toEqual(body);
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("/sessions/s1/transcript?scope=conversation&limit=200");
   });
 
   test("getRunProjection uses bounded projection endpoint", async () => {

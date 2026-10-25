@@ -200,7 +200,6 @@ impl RunLifecycleService for E2eRunLifecycle {
             ));
         };
         Ok(RunStatusRecord {
-            opening_input: None,
             artifact_publication: None,
             explain_requested: false,
             root_run_id: Some(run_id.clone()),
@@ -299,7 +298,6 @@ impl RunLifecycleService for E2eRunLifecycle {
         _user_id: String,
         _limit: u32,
         _cursor: Option<RunListCursor>,
-        _include_input_for_session: Option<String>,
     ) -> Result<RunListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         unreachable!("approval callback e2e does not list runs")
     }
