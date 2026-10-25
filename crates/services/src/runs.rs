@@ -175,6 +175,7 @@ pub trait RunLifecycleService: Send + Sync {
         _run_id: String,
         _user_id: String,
         _recent_limit: u32,
+        _include_input: bool,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -1390,8 +1391,16 @@ pub struct RunProjectionCheckpointRecord {
     pub created_at: String,
 }
 
+/// Read-only original input identity; never includes Context authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RunOpeningInputProjection {
+    pub original_input: String,
+    pub source_event_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunProjectionRecord {
+    pub opening_input: Option<RunOpeningInputProjection>,
     pub run_id: String,
     pub session_id: String,
     pub status: String,

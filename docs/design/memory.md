@@ -166,20 +166,21 @@ Completion flags and the status report remain available after retirement.
 This bounds payload generations, not total retained sessions or arbitrary input
 bytes. Permanently failing work remains recoverable and can retain large inputs;
 Session deletion owns physical removal. More worker pods can process independent
-sessions, but the shared due index and the separate global admission gate remain
+sessions, but the shared due index and database pool remain
 database capacity limits; this is not a claim of unlimited horizontal throughput.
 
 CLI exit targets its idle generation; a follow-up turn invalidates that old
 maintenance request. Explicit close settles all already-admitted extraction and
 rejects writes after the closed generation is consolidated. The close transaction
 creates its journal without requiring a per-turn snapshot, allowing restart recovery to discover canonical input. A previously completed
-CLI-exit generation cannot complete an explicit close while the existing Session
-execution slot is occupied or canonical writer/reservation authority remains live.
-Terminal Run persistence releases the slot before canonical context commit; slot
-absence alone does not prove settlement. Close invalidates the old maintenance
-plan under the same fence and retains pending work for the admitted turn's late
-handoff or canonical recovery. Destructive checkpoints wait for both execution
-and canonical authority to settle, using database time for authority expiry.
+CLI-exit generation cannot complete an explicit close while actual Run execution,
+a live owner lease, unresolved effect custody or explicit Controller authority
+remains. The atomic Run terminal/context commit retires its exact execution
+owner; there is no earlier derived-slot release to interpret as settlement.
+Close invalidates the old maintenance plan under the same canonical Session/Run
+fences and retains pending work for the admitted turn's late handoff or canonical
+recovery. Destructive checkpoints wait for execution and actual authority to
+settle, using database time for authority expiry.
 Repeated close or exit requests on an idle, completed generation retain journal
 progress instead of creating duplicate archives.
 `GET /sessions/{session_id}/memory/status` exposes pending work, the settled turn,

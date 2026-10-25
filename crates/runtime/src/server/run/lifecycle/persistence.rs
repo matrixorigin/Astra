@@ -1170,6 +1170,10 @@ fn server_turn_id(run_id: &str) -> String {
     format!("turn-{}", trace_hash(&[run_id]))
 }
 
+pub(crate) fn server_input_source_event_id(session_id: &str, run_id: &str) -> String {
+    trace_event_id("user", &[session_id, &server_turn_id(run_id)])
+}
+
 pub(crate) fn server_trace_context(
     user_id: &str,
     session_id: &str,
@@ -1178,7 +1182,7 @@ pub(crate) fn server_trace_context(
 ) -> TraceContext {
     let turn_id = server_turn_id(run_id);
     TraceContext {
-        root_event_id: trace_event_id("user", &[session_id, &turn_id]),
+        root_event_id: server_input_source_event_id(session_id, run_id),
         // Root-turn persistence is invoked at both admission and terminal
         // settlement. The causal chain must therefore be a stable turn
         // identity, not a fresh UUID per persistence pass; otherwise the
@@ -1202,7 +1206,7 @@ pub(crate) fn trace_context_from_subrun_context(
     let turn_seq = context.get("trace_turn_seq")?.as_i64()?;
     let turn_id = server_turn_id(run_id);
     Some(TraceContext {
-        root_event_id: trace_event_id("user", &[&session_id, &turn_id]),
+        root_event_id: server_input_source_event_id(&session_id, run_id),
         session_id,
         user_id: context.get("trace_user_id")?.as_str()?.to_string(),
         turn_id,

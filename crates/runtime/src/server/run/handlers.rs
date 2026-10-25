@@ -334,6 +334,8 @@ pub(crate) async fn get_run_status_handler(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct RunProjectionQuery {
+    #[serde(default)]
+    pub include_input: bool,
     #[serde(default = "default_projection_recent_limit")]
     pub recent_limit: u32,
 }
@@ -353,6 +355,8 @@ pub(crate) struct RunProjectionCheckpointResponse {
 
 #[derive(serde::Serialize)]
 pub(crate) struct RunProjectionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening_input: Option<astra_services::runs::RunOpeningInputProjection>,
     pub run_id: String,
     pub session_id: String,
     pub status: String,
@@ -401,6 +405,7 @@ impl RunProjectionResponse {
         observability: RunProjectionObservabilityResponse,
     ) -> Self {
         Self {
+            opening_input: value.opening_input,
             run_id: value.run_id,
             session_id: value.session_id,
             status: value.status,
@@ -440,7 +445,12 @@ pub(crate) async fn get_run_projection_handler(
     let projection = state
         .execution
         .run_lifecycle_service
-        .get_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
+        .get_run_projection(
+            run_id.clone(),
+            user_id.clone(),
+            query.recent_limit,
+            query.include_input,
+        )
         .await?;
     Ok(Json(
         build_run_projection_response(&state, &user_id, &run_id, projection).await?,
@@ -2576,6 +2586,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_input_projection_is_opt_in_exact_and_cross_instance() {
+        use crate::server::run::engine::{RunEngine, RunStartContext};
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let writer = RunEngine::new(store.clone());
+        let input = " 你好\n🌍 ".repeat(16_384);
+        writer
+            .start_run_with_context(
+                "opening-read",
+                "u1",
+                "opening-session",
+                RunStartContext {
+                    original_input: Some(input.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist opening only");
+        // A separate engine and lifecycle have no writer process's local Run map.
+        let reader = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(crate::FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            RunEngine::new(store),
+        );
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(reader)),
+        );
+        for include in [false, true] {
+            let uri = format!(
+                "/chat/runs/opening-read/projection?recent_limit=0&include_input={include}"
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer good-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["session_id"], "opening-session");
+            if include {
+                assert_eq!(json["opening_input"]["original_input"], input);
+                assert!(
+                    json["opening_input"]["source_event_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty())
+                );
+                assert_eq!(json["opening_input"].as_object().unwrap().len(), 2);
+            } else {
+                assert!(json.get("opening_input").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn get_run_projection_http_hides_foreign_run() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
@@ -2606,7 +2684,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/chat/runs/run-foreign/projection")
+                    .uri("/chat/runs/run-foreign/projection?include_input=true")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
                     .expect("request should build"),

@@ -449,6 +449,10 @@ describe('queueDeferredRunInput', () => {
         listRuntimeSessions,
         listRuns,
         getSessionTranscript,
+        getRunProjection: vi.fn().mockResolvedValue({
+          run_id: 'run-open', session_id: 'chat-open', status: 'input-queued',
+          opening_input: { original_input: 'hello', source_event_id: 'opening-source' },
+        }),
       },
     } as never);
 
@@ -461,7 +465,7 @@ describe('queueDeferredRunInput', () => {
     });
     expect(result?.chat.id).toBe('chat-open');
     expect(result?.chat.model).toBe('sonnet-4.6-adaptive');
-    expect(result?.activeRun).toEqual({
+    expect(result?.activeRun).toMatchObject({
       runId: 'run-open',
       status: 'input-queued',
       waitingFor: 'user_input',
@@ -825,7 +829,12 @@ describe('queueDeferredRunInput', () => {
       offset: 0,
     });
     mockGetRuntimeClient.mockResolvedValue({
-      sdk: { listRuntimeSessions, listRuns, getSessionTranscript },
+      sdk: { listRuntimeSessions, listRuns, getSessionTranscript,
+        getRunProjection: vi.fn().mockResolvedValue({
+          run_id: 'run-stop', session_id: 'chat-stop', status: 'running',
+          opening_input: { original_input: 'hello', source_event_id: 'opening-source' },
+        }),
+      },
     } as never);
 
     const store = getStore('user-a');
@@ -854,7 +863,7 @@ describe('queueDeferredRunInput', () => {
     });
 
     const detail = await getChatHydrated('user-a', 'chat-stop');
-    expect(detail?.activeRun).toEqual({
+    expect(detail?.activeRun).toMatchObject({
       runId: 'run-stop',
       status: 'cancelling',
       waitingFor: 'cancel_requested',

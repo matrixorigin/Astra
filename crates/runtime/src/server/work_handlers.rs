@@ -10228,6 +10228,7 @@ mod tests {
         let work_id = WorkId::parse("work-1").expect("work");
         let branch_id = WorkBranchId::parse("branch-1").expect("branch");
         let projection = astra_services::runs::RunProjectionRecord {
+            opening_input: None,
             run_id: "run-1".to_string(),
             session_id: "internal-session".to_string(),
             status: "waiting".to_string(),

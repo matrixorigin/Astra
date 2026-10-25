@@ -1367,6 +1367,8 @@ export type RunStatus = {
 };
 
 export type RunProjectionResponse = {
+  /** Exact immutable input, present only for explicit includeInput reads. */
+  opening_input?: { original_input: string; source_event_id: string };
   run_id: string;
   session_id: string;
   status: string;
@@ -1490,6 +1492,7 @@ export type RuntimeSessionListParams = {
 };
 
 export type RuntimeTranscriptItemResponse = {
+  source_event_id?: string | null;
   session_id: string;
   item_seq: number;
   run_id?: string | null;

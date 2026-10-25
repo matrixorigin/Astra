@@ -3083,9 +3083,10 @@ export class AstraClient {
    */
   async getRunProjection(
     runId: string,
-    opts?: { recentLimit?: number },
+    opts?: { recentLimit?: number; includeInput?: boolean },
   ): Promise<RunProjectionResponse> {
     const q = buildQueryString({
+      ...(opts?.includeInput ? { include_input: "true" } : {}),
       ...(opts?.recentLimit !== undefined
         ? { recent_limit: opts.recentLimit }
         : {}),

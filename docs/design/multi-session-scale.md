@@ -45,8 +45,7 @@ provider capacity and database capacity determine effective deployment capacity.
 ## Horizontal scaling invariant
 
 HTTP, SSE, WebSocket reconnect, and status reads may land on any server. The
-database remains authoritative for session heads, run ownership, turn
-reservations, events, checkpoints, interactions, and Edge dispatch results.
+database remains authoritative for session heads, Run ownership and leases, explicit Controller authority, events, checkpoints, interactions, and Edge dispatch results.
 Process-local maps and channels are delivery accelerators only. They may be
 lost on restart and must never be required to prove ownership, idempotency, or
 completion.
@@ -155,17 +154,13 @@ fan-in.
 
 ## Admission and failure behavior
 
-- A run waits only at the existing bounded admission boundary; the local
-  durable-gate queue, the database-pool acquire, and the cross-server gate
-  lock share one run admission deadline. The HTTP request must not hold a
-  database connection while waiting in the local queue.
-- A distributed capacity rejection is explicit and typed, with retryable HTTP
-  semantics and metrics. It must not look like a provider failure.
-- If the admission deadline expires before the durable reservation can be
-  decided, the request returns an explicit retryable admission-timeout error;
-  cancelled local waiters leave no semaphore permit behind.
-- Cancellation releases local and durable admission promptly. TTL cleanup is a
-  recovery path, not normal capacity accounting.
+- A run waits only at the existing bounded process-local admission boundary,
+  with an explicit deadline. It holds no database connection while waiting.
+- Capacity rejection is explicit, typed and retryable; it must not look like a
+  provider failure. Cancelled waiters leave no local permit behind.
+- Cancellation and execution drain release process-local RAII capacity. Durable
+  Run ownership and effect custody remain independently fenced; no database
+  capacity reservation, cross-server gate or capacity TTL cleanup is required.
 - A database or provider outage preserves durable run state and exposes a
   degraded reason. It must not create an unbounded in-memory queue.
 
@@ -175,11 +170,11 @@ Every capacity change reports, per workload and per pod count:
 
 - admission attempts, rejection reason, wait p50/p95/p99;
 - database pool acquire wait, timeouts, in-use and idle connections;
-- weighted reservation count and renew/release latency;
+- process-local weighted permits, retained resources and release latency;
 - run RSS and retained live-event bytes;
 - provider request rate, token rate, time to first token, and error rate;
 - durable event/control-plane QPS and end-to-end turn latency.
-- for 1,000 waiting parents: execution permits and weighted reservations held,
+- for 1,000 waiting parents: process-local execution permits and weighted resources held,
   retained parent state bytes, observer queries per second, resume queue depth,
   and ordinary-turn admission latency while children complete in a burst.
 

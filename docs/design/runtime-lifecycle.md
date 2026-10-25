@@ -192,22 +192,32 @@ same fenced transition and atomic batch registration as production.
 
 ## Run
 
-Database-backed fresh root admission commits the Run identity, Session execution
-slot, canonical Context writer/turn reservation, and accepted user input
-(audit, transcript and event counter) in one transaction. The existing Run
-creation owner stages these writes; Context keeps its existing validation and
-mutation algorithms. The existing opening event's unique row identity and hash
-bind commit-acknowledgement recovery to that transaction. Observing an existing Run
-never creates a writer or borrows its distributed capacity permit.
+Database-backed fresh root admission commits the Run identity, owner generation,
+initial lease and immutable opening in the existing Run transaction. The opening
+holds the exact original user input. Ordinary Agent turns acquire no Controller
+writer or turn reservation and write no admission transcript, audit input mirror,
+event counter or derived Session execution-slot row. The opening identity and
+hash bind commit-acknowledgement recovery to that transaction. Observation grants
+neither execution authority nor capacity.
 
-Immutable history and weighted-capacity preparation happen before the Run
-transaction so concurrent starts cannot exhaust the pool while holding Session
-locks. Each attempt uses its own capacity identity and releases only its own
-permit on a lost claim or rollback. Context validates the prepared cursor and
-authority under the winning transaction. No workspace, provider or tool operation
-occurs inside that transaction. Execution starts only within the original
-committed owner lease window. Prior-history restoration excludes the current Run's already
-persisted input, which becomes history for subsequent Runs.
+Immutable history preparation and process-local capacity admission happen before
+the transaction. Each attempt owns its RAII permit; a lost claim or rollback drops
+only that permit. Canonical lifecycle/Session/Run locks arbitrate actual execution
+and effect custody. No workspace, provider or tool operation occurs inside the
+transaction. Execution starts only within the original committed owner lease
+window. Prior-history restoration excludes the current Run's opening input, which
+becomes history for subsequent Runs.
+
+Web cold recovery explicitly requests the existing Run projection with
+`include_input=true`. It returns only the original input and its canonical
+`source_event_id`, derived from the immutable opening; default projections and
+status/list polling omit this payload. The client merges by Run/input identity,
+initializes the existing stream parser at cursor zero even with an empty
+transcript. A valid warm parser retains the entire in-flight conversation,
+including deferred guidance. Recovery discards responses if the Session, Run,
+assistant or parser binding changes during a read. A terminal projection requires one fresh
+transcript read rather than a streaming placeholder. This is an on-demand recovery
+read, not a new transcript writer or input authority.
 
 The shared loop exit owns terminal rendering, SessionFacts and the final
 checkpoint. Canonical Context retains conversation input; memory extraction
@@ -786,25 +796,17 @@ Active-run enumeration is insufficient: terminal runs can retain live
 executors, owner leases, tool invocations or canonical turn authority. Retries
 rediscover that retained authority and preserve the targets observed while
 waiting. The coordinator owns one fenced Session execution-settlement proof,
-including slots, active execution, generation-scoped durable settlement fences
-(started without finished or accounting-finalized), writer/reservation authority,
-unresolved invocations and unfinished execution-binding switches. Run statuses
-remain truthful when completion wins a cancellation race.
+including active Run status, live execution leases, unresolved invocations and
+unfinished execution-binding switches. Run statuses remain truthful when
+completion wins a cancellation race. Per-provider request settlement markers are
+not ordinary Agent execution debt.
 
-At normal completion, a Server-owned turn commits its canonical context and
-releases its internally acquired writer in one coordinator transaction. Both
-authority audit facts remain durable with that commit. Externally retained
-writers keep the ordinary commit-without-release contract. An exact commit
-replay cannot release a newer writer or a later reservation held by the same
-writer; failure or cancellation cannot expose a half-committed context/release.
-
-An orphan's terminal transition does not itself retire its canonical writer.
-Cleanup rechecks the terminal Run generation and owner under the Session
-execution fence, then releases only the exact internally acquired writer and
-matching reservation. A newer writer, recovered generation or externally
-supplied controller lease is not released. A writer acquired before its Run
-exists remains pending. Cleanup is idempotent and can resume after a failed or
-unacknowledged attempt without replaying execution.
+Normal Server completion commits its Run-owned canonical context, exact raw
+conversation, terminal Run facts and owner retirement through the existing atomic
+settlement owner. It does not acquire or release a Controller writer. Orphan
+cleanup fences the actual Run generation and effect custody; terminal status or
+lease expiry alone cannot prove that an external effect stopped. The standalone
+Controller lease/reserve/commit APIs retain their own exact authority contracts.
 
 Cancellation invokes the existing terminal tool reconciler promptly. A
 prepared invocation with no dispatch attempts becomes a durable rejection;
@@ -896,7 +898,7 @@ Runtime lifecycle migration should proceed in stages:
 | Resume after compaction | Rebuild from checkpoint, transcript, tasks, provider state. |
 | Deleted task in old UI cache | Durable projection wins; task remains hidden. |
 | Owner lease expired | New owner may recover without double-executing non-idempotent side effects. |
-| Buffered answer exists | Resume through current authorization, custody and execution-slot guards; cached events never authorize completion. |
+| Buffered answer exists | Resume through current authorization, custody and Run execution guards; cached events never authorize completion. |
 
 The legacy webhook and schedule trigger APIs are retired. They did not admit a Run: webhook firing only returned `fired: true`, and stored cron expressions had no scheduler consumer. Executed work uses the existing Run admission and lifecycle boundaries.
 
@@ -958,12 +960,12 @@ transport observations. Offering authorization and durable tool invocation
 admission remain mandatory; losing model output on a process crash may require
 a user to resend or continue.
 
-The completed stream follows the durable terminal, canonical conversation
-commit and exact writer release. After remaining derived consumers and hooks, the
-owning task drops its resident context and interaction senders, then releases
-distributed capacity. Agent cleanup does not query or retire per-model WAL
-payloads because agent execution no longer produces them. Existing permit-drop
-and expiry handling recover an interrupted capacity release.
+The completed stream follows the atomic durable terminal and canonical
+conversation commit. After remaining derived consumers and hooks, the owning task
+drops its resident context and interaction senders, then drops its process-local
+capacity permit. There is no distributed capacity release or expiry repair.
+Agent cleanup does not query or retire per-model WAL payloads because Agent
+execution no longer produces them.
 
 The Explain Analyze graph is produced only for a root run that explicitly
 requested it. Ordinary runs retain canonical Context, raw conversation history,

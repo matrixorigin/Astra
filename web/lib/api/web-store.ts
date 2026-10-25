@@ -17,7 +17,6 @@ import {
   type RuntimeSessionListResponse,
   type RuntimeSessionResponse,
   type RuntimeTranscriptItemResponse,
-  type RuntimeTranscriptResponse,
 } from "@astra/sdk";
 import {
   activeRunPriority,
@@ -2097,100 +2096,101 @@ async function syncBackendTranscript(
   chatId: string,
 ): Promise<void> {
   const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  const hasIncompleteAssistant =
-    chat?.messages.some(
-      (message) =>
-        message.role === "assistant" && message.status === "streaming",
-    ) ?? false;
-  if (!chat || (chat.messages.length > 0 && !hasIncompleteAssistant)) {
+  let chat = store.chats.find((item) => item.id === chatId);
+  if (!chat || (chat.messages.length > 0 && !chat.activeRun &&
+    !chat.messages.some(message => message.role === "assistant" && message.status === "streaming"))) {
     return;
   }
-  const backendSessionId = chat.backendSessionId ?? chat.id;
-
+  const backendSessionId = backendSessionIdForChat(chat);
+  const runId = chat.activeRun?.runId;
+  const assistantMessageId = chat.activeRun?.assistantMessageId;
+  const projection = chat.streamProjection;
+  // The existing live parser owns every in-flight message, including deferred
+  // guidance. Rebuilding its last pair from committed history loses that state.
+  if (runId && publicActiveRun(chat)?.nextEventIndex !== undefined) return;
+  // Hydration can overlap a stream update, a second detail read, or a new turn.
+  // Reacquire the shell after awaits; never publish a prior Run into its successor.
+  const currentChat = () => {
+    const current = getStore(ownerUserId).chats.find(item => item.id === chatId);
+    return current && backendSessionIdForChat(current) === backendSessionId &&
+      current.activeRun?.runId === runId &&
+      current.activeRun?.assistantMessageId === assistantMessageId &&
+      current.streamProjection === projection ? current : undefined;
+  };
   const client = await getRuntimeClient({
     auth: "required",
     operation: `sync persisted transcript for session ${backendSessionId}`,
   });
-  if (!client) {
-    return;
+  if (!client || !currentChat()) return;
+
+  const readTranscript = async () => {
+    try {
+      return await client.sdk.getSessionTranscript(backendSessionId, { limit: 200 });
+    } catch (error) {
+      if (!currentChat()) return null;
+      throw runtimeOperationError(
+        `Cannot sync persisted transcript for session ${backendSessionId}`, error,
+      );
+    }
+  };
+  let parsed = await readTranscript();
+  chat = currentChat();
+  if (!chat || !parsed) return;
+
+  let openingInput: { original_input: string; source_event_id: string } | undefined;
+  if (runId && chat.activeRun && runBlocksChatTurn(chat.activeRun.status)) {
+    let projection;
+    try {
+      projection = await client.sdk.getRunProjection(runId, { recentLimit: 0, includeInput: true });
+    } catch (error) {
+      if (!currentChat()) return;
+      throw runtimeOperationError(`Cannot recover input for run ${runId}`, error);
+    }
+    chat = currentChat();
+    if (!chat) return;
+    if (projection.run_id !== runId || projection.session_id !== backendSessionId) {
+      throw new Error(`Cannot recover input for run ${runId}: mismatched Run or Session.`);
+    }
+    if (isTerminalChatRunStatus(projection.status)) {
+      // The first read may precede the atomic terminal transcript commit.
+      // One reread closes that window without creating a polling protocol.
+      parsed = await readTranscript();
+      chat = currentChat();
+      if (!chat || !parsed) return;
+      chat.activeRun = undefined;
+    } else {
+      openingInput = projection.opening_input;
+      if (!openingInput || typeof openingInput.original_input !== "string" || !openingInput.source_event_id) {
+        throw new Error(`Cannot recover input for run ${runId}: immutable opening input is unavailable.`);
+      }
+    }
   }
 
-  let parsed: RuntimeTranscriptResponse;
-  try {
-    parsed = await client.sdk.getSessionTranscript(backendSessionId, {
-      limit: 200,
-    });
-  } catch (error) {
-    throw runtimeOperationError(
-      `Cannot sync persisted transcript for session ${backendSessionId}`,
-      error,
-    );
-  }
   const messages = (parsed.items ?? [])
-    .map((item) => transcriptItemToMessage(chatId, item))
+    .map(item => transcriptItemToMessage(chatId, item))
     .filter((message): message is ChatMessage => Boolean(message));
-  if (!messages.length) {
-    return;
-  }
-
-  // The transcript is authoritative for committed history, while the active
-  // run is authoritative for the in-flight turn. A turn's assistant row is
-  // not committed until output arrives, so replacing local state with the
-  // transcript during refresh leaves no message for SSE resume to target.
-  // Preserve that overlay, and synthesize it after a Web process restart.
   const activeRun = chat.activeRun;
   if (activeRun && runBlocksChatTurn(activeRun.status)) {
-    const localAssistant =
-      (activeRun.assistantMessageId
-        ? chat.messages.find(
-            (message) =>
-              message.id === activeRun.assistantMessageId &&
-              message.role === "assistant",
-          )
-        : undefined) ??
-      [...chat.messages]
-        .reverse()
-        .find(
-          (message) =>
-            message.role === "assistant" && message.status === "streaming",
-        );
-    const localAssistantIndex = localAssistant
-      ? chat.messages.findIndex((message) => message.id === localAssistant.id)
-      : -1;
-    const localUser =
-      localAssistantIndex > 0 &&
-      chat.messages[localAssistantIndex - 1]?.role === "user"
-        ? chat.messages[localAssistantIndex - 1]
-        : undefined;
-    const canonicalTail = messages[messages.length - 1];
-    const canonicalHasCurrentUser =
-      canonicalTail?.role === "user" &&
-      (!localUser || canonicalTail.content === localUser.content);
-
-    if (!canonicalHasCurrentUser && localUser) {
-      messages.push(localUser);
+    const currentInput = (parsed.items ?? []).find(item => item.role === "user" &&
+      item.run_id === activeRun.runId && item.source_event_id === openingInput?.source_event_id);
+    if (currentInput && currentInput.content !== openingInput?.original_input) {
+      throw new Error(`Cannot recover input for run ${runId}: conflicting transcript input.`);
     }
-    const assistant =
-      localAssistant ??
-      ({
-        id: `inflight:${activeRun.runId}`,
-        role: "assistant",
-        content: "",
-        createdAt: nowIso(),
-        reasoning: "",
-        reasoningStatus: "streaming",
-        status: "streaming",
-      } satisfies ChatMessage);
+    if (!currentInput && openingInput) {
+      messages.push({
+        id: `input:${activeRun.runId}:${openingInput.source_event_id}`,
+        role: "user", content: openingInput.original_input,
+        createdAt: nowIso(), status: "complete",
+      });
+    }
+    const assistant = streamingAssistantMessage(chat, `inflight:${activeRun.runId}`, nowIso(), {
+      sessionId: backendSessionId, runId: activeRun.runId, nextEventIndex: 0,
+    });
     messages.push(assistant);
     activeRun.assistantMessageId = assistant.id;
   }
 
-  if (chat.streamProjection) {
-    const messageId = chat.streamProjection.assistantMessageId;
-    const prior = chat.messages.find(message => message.id === messageId);
-    if (!prior || !messages.includes(prior)) discardChatStreamProjection(chat);
-  }
+  if (!activeRun) discardChatStreamProjection(chat);
   chat.messages = messages;
   const latest = messages[messages.length - 1];
   chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;

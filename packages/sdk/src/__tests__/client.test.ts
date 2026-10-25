@@ -437,6 +437,7 @@ describe("AstraClient — Runs", () => {
 
   test("getRunProjection uses bounded projection endpoint", async () => {
     globalThis.fetch = mockFetch(200, {
+      opening_input: { original_input: " \n你好 ", source_event_id: "source-1" },
       run_id: "r1",
       session_id: "s1",
       status: "running",
@@ -471,7 +472,9 @@ describe("AstraClient — Runs", () => {
 
     const projection = await createClient().getRunProjection("r1", {
       recentLimit: 25,
+      includeInput: true,
     });
+    expect(projection.opening_input).toEqual({ original_input: " \n你好 ", source_event_id: "source-1" });
     expect(projection.recent_events).toHaveLength(1);
     expect(projection.workspace?.kind).toBe("edge_workspace");
     expect(projection.workspace?.cwd).toBe("/workspace/astra");
@@ -481,6 +484,7 @@ describe("AstraClient — Runs", () => {
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/chat/runs/r1/projection");
     expect(url).toContain("recent_limit=25");
+    expect(url).toContain("include_input=true");
   });
 
 

@@ -16319,6 +16319,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
         recent_limit: u32,
+        include_input: bool,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
         let latest_checkpoint = self
@@ -16337,7 +16338,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let recent_events = Self::durable_recent_events(&run, recent_limit);
         let binding = Self::durable_run_execution_binding_snapshot(&run);
         let latest_event_type = run.events.last().map(astra_services::extract_event_type);
+        let opening_input = if include_input {
+            run.opening
+                .as_ref()
+                .and_then(|opening| opening.input())
+                .map(|input| astra_services::runs::RunOpeningInputProjection {
+                    original_input: input.original_input.clone(),
+                    source_event_id: persistence::server_input_source_event_id(
+                        &run.session_id,
+                        &run.run_id,
+                    ),
+                })
+        } else {
+            None
+        };
         Ok(RunProjectionRecord {
+            opening_input,
             run_id: run.run_id,
             session_id: run.session_id,
             status: run.status,

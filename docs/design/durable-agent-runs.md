@@ -36,7 +36,7 @@ accounting. Full reads and bounded observations use the same watermark boundary.
 
 New background and streaming requests use the same preparation owner. Exact
 stream replays attach to frozen run facts before mutable model or capability
-admission. A fresh request wins the durable session slot and activates its lease
+admission. A fresh request wins canonical Session/Run admission and activates its lease
 before provisioning a workspace. Actual workspace/executor facts are committed
 as one immutable, generation-fenced binding pair before execution or delivery;
 status/list projections leave unmaterialized bindings absent.
@@ -252,7 +252,7 @@ Resume should validate:
 - pending side-effect safety;
 - user intent.
 
-A buffered answer does not authorize completion. Resume uses current authorization, custody, execution-slot and Context guards; only the execution owner can commit a terminal outcome.
+A buffered answer does not authorize completion. Resume uses current authorization, custody, Run ownership and Context guards; only the execution owner can commit a terminal outcome.
 
 ### Process restart is not a new user turn
 
@@ -343,7 +343,7 @@ owner may authorize another action. Missing control state must not default to
 ordinary execution. Only a validated reconstructable snapshot proceeds
 to current authorization and atomic takeover; an unavailable snapshot continues
 through the existing session-continuation path without unnecessary credential
-requests. Preparation must precede any release of the original session slot.
+requests. Preparation must precede any release of the original process execution permit.
 Deferred Work surviving restart and later explicit activation verifies only
 that existing contract, not unattended multi-day recovery.
 

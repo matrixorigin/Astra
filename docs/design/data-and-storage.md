@@ -190,7 +190,7 @@ Retention is a product contract:
   siblings. Exact replay allocates no new sequence and preserves enrichment.
 - Root execution commits canonical Context (one manifest/content row and head),
   original raw transcript, one bounded Run completion receipt, semantic usage
-  and execution-slot release together. It needs no Controller operation receipt,
+  and exact Run owner retirement together. It needs no Controller operation receipt,
   writer release, settlement markers or mirrored terminal event payloads. Context rejection leaves the Run active; Run rejection rolls back
   Context too. Lost acknowledgement resolves the exact generation-scoped Run
   receipt and verifies full raw identities and the exact immutable Context
@@ -255,7 +255,7 @@ Retention is a product contract:
   statements do not imply fewer stored rows or unlimited concurrent executions.
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
-- Slot/lease semantics must avoid permanent deadlock through expiry or repair.
+- Canonical Run lease recovery must preserve execution and effect custody without a derived slot or reclamation clock.
 - Run-event append checks persisted idempotency identities in bounded windows
   (64 keys, 16 KiB of key bytes; an indivisible key is queried alone), under
   the existing owner/session/run transaction. Database column equality maps
@@ -264,7 +264,7 @@ Retention is a product contract:
   windows. Unkeyed events remain distinct. This reduces preflight round trips,
   not retained event rows or payload bytes; exact commit reconciliation retains
   its existing canonical owner.
-- Run mutations retain the deletion-fence → session → execution-slot → run
+- Run mutations retain the deletion-fence → Session → Run
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.
   Canonical owner-backed appends use their exact-session generation/lease

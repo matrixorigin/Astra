@@ -326,15 +326,15 @@ resume an old conversation or reject a new one; verified Edge-to-Edge transfer
 remains a separate operation.
 
 Session execution debt remains Session-scoped: a live Run, unresolved tool,
-writer/reservation, settlement fence, or provider switch can block that
+explicit Controller authority or provider switch can block that
 Session's own cancellation or binding change, but it cannot block an
 independent Session in the same directory. The canonical binding generation
 fences delayed work for its own Session. The executor-owned workspace lease is
 the only physical-operation serialization boundary.
 
 Idle controller changes and recovery-point capture inspect actual Session
-execution occupancy under the same Session/slot fence as Run admission. An
-occupied slot, active child, paused Run awaiting input, or terminal executor
+execution occupancy under the same canonical Session/Run fences as Run admission. An
+active child, paused Run awaiting input, or terminal executor
 with a live owner lease blocks that boundary even when no Controller writer
 lease exists. Recovery capture reports active execution and publishes no point
 until that execution has settled.
@@ -447,7 +447,7 @@ until that execution has settled.
   Run admission checks the selected generation while holding the canonical
   Session authority, and tool dispatch checks it again in the same transaction
   as Run action admission and the invocation claim. A selection change is
-  rejected while writer/reservation authority, a Run slot, or a prepared,
+  rejected while explicit Controller authority, an active Run or live execution lease, or a prepared,
   dispatched, or outcome-unknown invocation remains active. Exact composite-key
   reads and the existing owner/Session/state invocation index keep coordination
   scoped to the affected Session; dispatch does not lock the selection row, so
