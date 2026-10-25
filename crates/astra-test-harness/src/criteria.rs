@@ -11333,74 +11333,106 @@ mod tests {
     }
 
     #[test]
-    fn shipped_prefix_cache_case_rejects_low_reads_on_each_warm_turn() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/cache_prefix_provider_stable_system.yaml");
-        let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
-        assert_eq!(case.steps.len(), 3);
-        let weak = cache_request_outcome("weak", "turn", &[(100, 2_400, 0)]);
-        for (index, step) in case.steps.iter().enumerate() {
-            assert!(
-                !step.criteria.is_empty(),
-                "warm step {index} must measure its own cache read"
-            );
-            let results = evaluate_deterministic_with_session(&step.criteria, &weak, None);
-            assert!(
-                results
+    fn shipped_cache_cases_require_observed_reuse_on_every_warm_turn() {
+        for name in [
+            "cache_prefix_provider_stable_system",
+            "cache_volatile_lane_stability",
+        ] {
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("cases/{name}.yaml"));
+            let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
+            let warm_steps = case.steps.iter().filter(|step| !step.criteria.is_empty());
+            assert_eq!(warm_steps.clone().count(), 3);
+            for step in warm_steps {
+                // Even a small prefix can be correctly reused. Partial provider
+                // evidence proves measured reads, but cannot prove an exact ratio.
+                let mut partial = cache_request_outcome("warm", "turn", &[(10, 64, 0)]);
+                for event in &mut partial.explain_capture.as_mut().unwrap().events {
+                    if let Some(usage) = &mut event.usage {
+                        usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                        usage.cache_creation_tokens = None;
+                    }
+                }
+                let results = evaluate_deterministic_with_session(&step.criteria, &partial, None);
+                assert!(
+                    results
+                        .iter()
+                        .filter(|result| result.severity == CriterionSeverity::Hard)
+                        .all(|result| result.passed),
+                    "{name}: {results:?}"
+                );
+                let ratio = results
                     .iter()
-                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
-                "warm step {index} must hard-fail at only 2,400 cache-read tokens: {results:?}"
-            );
-        }
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_500, 0)]);
-        for event in &mut strong.explain_capture.as_mut().unwrap().events {
-            if let Some(usage) = &mut event.usage {
-                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
-                usage.cache_creation_tokens = None;
+                    .find(|result| {
+                        matches!(
+                            result.criterion,
+                            Criterion::ProviderPromptCacheReadRatio { .. }
+                        )
+                    })
+                    .expect("ratio diagnostic");
+                assert_eq!(ratio.severity, CriterionSeverity::Soft);
+                assert!(
+                    !ratio.passed && ratio.detail.contains("evidence unavailable"),
+                    "{ratio:?}"
+                );
+                let mut missing = partial.clone();
+                for event in &mut missing.explain_capture.as_mut().unwrap().events {
+                    if let Some(usage) = &mut event.usage {
+                        usage.cache_read_tokens = None;
+                    }
+                }
+                for invalid in [
+                    cache_request_outcome("zero", "turn", &[(100, 0, 0)]),
+                    missing,
+                ] {
+                    let results =
+                        evaluate_deterministic_with_session(&step.criteria, &invalid, None);
+                    assert!(
+                        results
+                            .iter()
+                            .any(|result| !result.passed
+                                && result.severity == CriterionSeverity::Hard),
+                        "{name}: {results:?}"
+                    );
+                }
+                let churn = cache_request_outcome("churn", "turn", &[(10, 64, 1_000)]);
+                let results = evaluate_deterministic_with_session(&step.criteria, &churn, None);
+                assert!(
+                    results
+                        .iter()
+                        .any(|result| !result.passed && result.severity == CriterionSeverity::Soft),
+                    "{name}: {results:?}"
+                );
             }
-        }
-        for (index, step) in case.steps.iter().enumerate() {
-            let results = evaluate_deterministic_with_session(&step.criteria, &strong, None);
-            assert!(
-                results
-                    .iter()
-                    .any(|result| { result.passed && result.severity == CriterionSeverity::Hard }),
-                "warm step {index} must accept observed partial-provider reads: {results:?}"
-            );
         }
     }
 
     #[test]
-    fn shipped_volatile_lane_case_checks_each_post_correction_turn() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/cache_volatile_lane_stability.yaml");
-        let case = crate::case::Case::from_path(&path).expect("load shipped volatile-lane case");
-        assert_eq!(case.steps.len(), 4);
-
-        let weak = cache_request_outcome("weak", "turn", &[(100, 7_999, 0)]);
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_000, 0)]);
-        for event in &mut strong.explain_capture.as_mut().unwrap().events {
-            if let Some(usage) = &mut event.usage {
-                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
-                usage.cache_creation_tokens = None;
-            }
-        }
-
-        for (index, step) in case.steps.iter().enumerate().skip(1) {
-            let weak_result = evaluate_deterministic_with_session(&step.criteria, &weak, None);
-            assert!(
-                weak_result
-                    .iter()
-                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
-                "post-correction step {index} must hard-fail weak reads: {weak_result:?}"
-            );
-            let strong_result = evaluate_deterministic_with_session(&step.criteria, &strong, None);
-            assert!(
-                strong_result
-                    .iter()
-                    .any(|result| result.passed && result.severity == CriterionSeverity::Hard),
-                "post-correction step {index} must accept observed partial reads: {strong_result:?}"
-            );
+    fn shipped_fanout_case_requires_all_exact_slots_from_canonical_adoption() {
+        let case: crate::case::Case =
+            serde_yaml_ng::from_str(include_str!("../cases/fanout_completion_truth.yaml")).unwrap();
+        let adoption = case
+            .criteria
+            .iter()
+            .filter_map(|criterion| match criterion {
+                Criterion::ExecutionChildResultsAdopted {
+                    children,
+                    fanout_group,
+                } => Some((children, fanout_group)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(adoption.len(), 1);
+        let (children, group) = adoption[0];
+        assert!(
+            matches!(group, Some(FanoutGroupSelector::Id(id)) if id == "fanout-completion-truth")
+        );
+        assert_eq!(children.len(), 3);
+        for (index, token) in ["ALPHA", "BETA", "GAMMA"].into_iter().enumerate() {
+            assert_eq!(children[index].slot_index, Some(index as u32));
+            assert_eq!(children[index].model, "{{model}}");
+            assert!(matches!(&children[index].expected_result,
+                Some(ChildResultExpectation::Text(text)) if text == &format!("FANOUT-EVIDENCE-{token}")));
         }
     }
 
