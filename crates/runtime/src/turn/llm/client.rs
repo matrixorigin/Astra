@@ -19636,6 +19636,63 @@ mod tests {
     }
 
     #[test]
+    fn resident_agent_wire_keeps_action_identity_scope_and_rejects_targeted_wait() {
+        let surface = crate::tool_registry::surface::ToolSurface::build(
+            astra_tools::schemas::all_tool_schemas(),
+            &astra_config::ToolSurfaceConfig::default(),
+            &[],
+        );
+        let tools = surface
+            .always_load_schemas()
+            .into_iter()
+            .filter(|tool| tool["function"]["name"] == "agent")
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        let body = build_provider_request_body(
+            &[json!({"role":"user", "content":"delegate"})],
+            &tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let schema = &body["tools"][0]["function"]["parameters"];
+        assert!(
+            schema["properties"]["agent_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("get_result/list only")
+        );
+        let wait = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"] == json!(["wait"]))
+            .unwrap();
+        assert_eq!(wait["additionalProperties"], false);
+        assert!(wait["properties"].get("agent_id").is_none());
+        assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 300000);
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"action":"wait", "timeout_ms":1000}),
+                &body["tools"][0]
+            )
+            .is_ok()
+        );
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"action":"wait", "agent_id":"child", "timeout_ms":1000}),
+                &body["tools"][0]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn openai_action_tools_materialize_structural_per_action_contracts() {
         let tools = astra_tools::schemas::all_tool_schemas()
             .into_iter()

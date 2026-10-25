@@ -2884,15 +2884,14 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Session(SessionCmd::Judge(args))) => {
-            if args.message.trim().is_empty() {
-                return Err("judgment message must not be empty".to_string());
-            }
+            let message =
+                crate::cli::session_judge::read_message(args.message, std::io::stdin().lock())?;
             let token = fresh_access_token_or_error(&api, profile.as_deref()).await?;
             let result = crate::cli::session_judge::execute_for_model(
                 &api,
                 &token,
                 &args.model,
-                &args.message,
+                &message,
                 args.timeout_seconds,
             )
             .await?;

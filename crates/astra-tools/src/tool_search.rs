@@ -1265,6 +1265,12 @@ mod tests {
             assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
             for selected in parsed["matches"].as_array().unwrap() {
                 let parameters = &selected["parameters"]["properties"];
+                if selected["name"] == "agent" {
+                    assert_eq!(
+                        parameters["agent_id"]["description"],
+                        "get_result/list only."
+                    );
+                }
                 let brief = if selected["name"] == "agent" {
                     &parameters["prompt"]
                 } else {

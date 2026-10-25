@@ -57,6 +57,14 @@ a separate required semantic judgment. An omitted child `expected_result` must
 be paired with a required judge. Both built-in and external judges receive the
 same complete, verified child bodies and identities, separately from parent
 claims. Missing, oversized, or contradictory evidence cannot authorize a pass.
+The built-in judge streams its complete JSON request through CLI stdin, rather
+than imposing an OS argument-size budget on valid child evidence. The existing
+Server request and Offering admission boundaries still apply; rejection or
+missing evidence never becomes a passing verdict. The external-command protocol
+retains its own 64 KiB serialized-envelope limit.
+User-visible response requirements apply to the assistant response in its labelled
+exchange, while user prompts and tool/diagnostic records establish context and
+execution facts. They must not be attributed to the assistant's answer.
 Explicit text and JSON expectations remain available for actual output-format
 contracts; they must not be imposed accidentally on general collaboration tests.
 

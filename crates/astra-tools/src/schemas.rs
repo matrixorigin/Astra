@@ -1671,7 +1671,7 @@ fn requested_model_policy_schema() -> Value {
         "Exact catalog provider/access_label only; omit unless user specifies one.";
     json!({
         "type": "object",
-        "x-astra-discovery-summary": "Not task/output text; inherit unless user picks execution model. Chat Offering override: mode=fixed uses an exact model_catalog Offering ID/configured name; omit execution. Preserve model/source.",
+        "x-astra-discovery-summary": "Not task/output text; inherit unless user picks execution model. Chat: mode=fixed + exact model_catalog Offering ID/name; omit execution. Preserve model/source.",
         "description": "Optional execution-model override, distinct from the resolved Offering. Omit to inherit the parent Offering. Set a fixed selector only when the user requests an execution-model override, using an exact authorized Offering ID or configured name. If those choices are unknown, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not overrides. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
@@ -1835,7 +1835,7 @@ fn agent_parameters_schema() -> Value {
                 "required": ["item_id", "item_revision"],
                 "additionalProperties": false
             },
-            "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
+            "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn.", "x-astra-discovery-summary": "get_result/list only."},
             "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
             "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
             "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Default text. Provider-owned native stages accept text guidance, not structured requests such as question or shutdown_request. Shutdown is cooperative messaging, not runtime cancellation; queued never proves the recipient stopped. Hard cancellation belongs to the authenticated run/session control.", "x-astra-discovery-summary": "Native stages accept text only. Shutdown is cooperative, not cancellation; queued is not stopped."},
