@@ -1826,7 +1826,7 @@ fn agent_parameters_schema() -> Value {
                     "required": ["tool", "args"]
                 }
             },
-            "description": {"type": "string", "description": "Short operation description when required by the selected action."},
+            "description": {"type": "string", "description": "Short task label for spawn or run_chain. Put task instructions in prompt or steps.", "x-astra-discovery-summary": "Short task label."},
             "prompt": {"type": "string", "description": "A self-contained objective, constraints, conditional mappings and exact output requirements, with bounded evidence locations rather than pasted file contents or prior tool output. The child reads its own evidence. Keep parent-only reporting outside the brief: report execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; evidence locations, not copied contents; parent uses model/status receipts."},
             "agent_type": delegation_agent_type_schema(),
             "requested_model_policy": requested_model_policy_schema(),

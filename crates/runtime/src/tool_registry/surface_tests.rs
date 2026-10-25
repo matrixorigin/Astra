@@ -535,10 +535,13 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("spawn:description(label)+prompt"));
-    assert!(agent_description.contains("wait:this run"));
+    assert!(agent_description.contains("spawn needs description+prompt"));
     assert!(agent_description.contains("No substitution"));
     assert!(agent_description.starts_with(astra_tools::agent_parent_scope_guidance!()));
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["description"]["description"],
+        "Short task label."
+    );
     let full = catalog_schemas();
     let policy =
         &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
@@ -645,7 +648,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("Auto results")
+            .contains("Results arrive automatically")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
@@ -692,7 +695,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     }
     assert_eq!(
         agent_params["properties"]["action"]["enum"],
-        serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"])
+        serde_json::json!(["spawn", "list", "get_result", "send_message"])
     );
     assert_eq!(agent_params["required"], serde_json::json!(["action"]));
     assert_eq!(agent_params["additionalProperties"], false);
@@ -903,26 +906,52 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     }
 
     let agent = find(&resident, "agent");
-    assert_eq!(
-        agent["function"]["parameters"]["x-astra-per-action-allowed"]["wait"],
-        json!(["action", "timeout_ms"])
+    let canonical_agent = find(&full, "agent");
+    assert!(
+        agent["function"]["parameters"]["x-astra-per-action-allowed"]
+            .get("wait")
+            .is_none()
+    );
+    assert!(
+        agent["function"]["parameters"]["properties"]
+            .get("timeout_ms")
+            .is_none()
     );
     for arguments in [
         json!({"action": "wait"}),
         json!({"action": "wait", "timeout_ms": 1}),
     ] {
-        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &arguments, agent)
-            .expect("resident wait accepts its canonical observation shape");
-    }
-    assert!(
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent", &arguments, agent
+            )
+            .is_err()
+        );
         astra_tools::schemas::validate_tool_arguments_against_schema(
             "agent",
-            &json!({"action": "wait", "agent_id": "other-child"}),
-            agent,
+            &arguments,
+            canonical_agent,
         )
-        .is_err(),
-        "resident wait must not accept fields belonging to other actions"
+        .expect("explicit observation remains available in the selected canonical contract");
+    }
+    let selected = astra_tools::tool_search::tool_selection_contract(canonical_agent).unwrap();
+    assert!(
+        selected["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("wait"))
     );
+    for schema in [agent, canonical_agent] {
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"action":"wait", "agent_id":"other-child"}),
+                schema,
+            )
+            .is_err(),
+            "selection cannot turn current-run observation into a targeted child wait"
+        );
+    }
 
     let advanced_memory = json!({
         "action": "remember",

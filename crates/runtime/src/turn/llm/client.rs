@@ -19636,7 +19636,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_agent_wire_keeps_action_identity_scope_and_rejects_targeted_wait() {
+    fn resident_agent_wire_defers_observation_and_keeps_spawn_required_fields() {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             astra_tools::schemas::all_tool_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
@@ -19696,7 +19696,30 @@ mod tests {
                 "{arguments}",
             );
         }
-        let wait = schema["oneOf"]
+        assert!(
+            schema["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|branch| branch["properties"]["action"]["enum"] != json!(["wait"]))
+        );
+        assert!(schema["properties"].get("timeout_ms").is_none());
+        let canonical_tools = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .filter(|tool| tool["function"]["name"] == "agent")
+            .collect::<Vec<_>>();
+        let canonical_body = build_provider_request_body(
+            &[json!({"role":"user", "content":"explicitly observe runtime activity"})],
+            &canonical_tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let canonical_schema = &canonical_body["tools"][0]["function"]["parameters"];
+        let wait = canonical_schema["oneOf"]
             .as_array()
             .unwrap()
             .iter()
@@ -19705,19 +19728,26 @@ mod tests {
         assert_eq!(wait["additionalProperties"], false);
         assert!(wait["properties"].get("agent_id").is_none());
         assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 300000);
+        let observation = json!({"action":"wait", "timeout_ms":1000});
         assert!(
             astra_tools::schemas::validate_tool_arguments_against_schema(
                 "agent",
-                &json!({"action":"wait", "timeout_ms":1000}),
-                &body["tools"][0]
+                &observation,
+                &body["tools"][0],
             )
-            .is_ok()
+            .is_err()
         );
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &observation,
+            &canonical_body["tools"][0],
+        )
+        .expect("canonical observation retains its bounded wire contract");
         assert!(
             astra_tools::schemas::validate_tool_arguments_against_schema(
                 "agent",
                 &json!({"action":"wait", "agent_id":"child", "timeout_ms":1000}),
-                &body["tools"][0]
+                &canonical_body["tools"][0],
             )
             .is_err()
         );

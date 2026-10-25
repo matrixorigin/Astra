@@ -427,7 +427,8 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "collaborator_id",
                 "max_output_tokens",
                 "agent_id",
-                "timeout_ms",
+                // Ordinary completion uses the runtime barrier. Explicit
+                // current-run observation stays in the selected full contract.
                 "to",
                 "message",
                 "message_type",
@@ -435,7 +436,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " No substitution. spawn:description(label)+prompt. Auto results;wait:this run. Resume:exact collaborator_id."
+                " No substitution. spawn needs description+prompt. Results arrive automatically. Resume:exact collaborator_id."
             ),
         ),
         "introspect" => (
@@ -524,7 +525,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 actions.retain(|action, _| {
                     matches!(
                         action.as_str(),
-                        "spawn" | "list" | "get_result" | "wait" | "send_message"
+                        "spawn" | "list" | "get_result" | "send_message"
                     )
                 });
                 if key == "x-astra-per-action-allowed" {
@@ -583,7 +584,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
     {
         action.insert(
             "enum".to_string(),
-            serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"]),
+            serde_json::json!(["spawn", "list", "get_result", "send_message"]),
         );
     }
     if name == "ask_user"
