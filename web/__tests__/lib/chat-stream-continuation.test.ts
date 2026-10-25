@@ -604,7 +604,7 @@ it("hydrates status without advancing the genuine projection cursor", async () =
   vi.spyOn(client.sdk, "getSessionConversation").mockResolvedValue({ kind: "conversation",
     session: { session_id: "session", status: "active", metadata: { source: "web_v1" }, created_at: "2026-10-21T00:00:00Z" },
     selected_root: { run_id: "root", status: "waiting", waiting_for: "tool_approval", created_at: "2026-10-21T00:00:00Z" },
-    items: [], raw_page: { next_before_seq: null, has_more: false }, truncated: false,
+    items: [], history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false,
   });
   const detail = await getChatHydrated("owner", "chat");
   expect(detail?.activeRun).toMatchObject({ status: "waiting", nextEventIndex: 9, assistantMessageId: assistantId });

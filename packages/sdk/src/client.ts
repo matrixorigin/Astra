@@ -2800,9 +2800,11 @@ export class AstraClient {
   }
 
   /** Current root and bounded conversation facts from one database snapshot. */
-  async getSessionConversation(sessionId: string, limit = 200): Promise<RuntimeConversationResponse> {
+  async getSessionConversation(sessionId: string, limit = 200,
+    continuation?: { runId: string; preserveTerminal: boolean }): Promise<RuntimeConversationResponse> {
     return this.fetch<RuntimeConversationResponse>(
-      `${sessionTranscriptPath(sessionId)}${buildQueryString({ scope: "conversation", limit })}`,
+      `${sessionTranscriptPath(sessionId)}${buildQueryString({ scope: "conversation", limit,
+        ...(continuation ? { reuse_run_id: continuation.runId, reuse_terminal: String(continuation.preserveTerminal) } : {}) })}`,
     );
   }
 

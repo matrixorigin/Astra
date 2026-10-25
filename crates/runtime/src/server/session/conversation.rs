@@ -5,7 +5,7 @@ use super::session_handlers::{
 };
 use crate::server::run::lifecycle::server_input_source_event_id;
 use astra_core::SharedPool;
-use astra_services::runs::decode_loaded_run_opening;
+use astra_services::runs::{MAX_RUN_CHECKPOINT_BYTES, decode_loaded_run_opening};
 use serde::Serialize;
 use sqlx::Row;
 
@@ -18,8 +18,9 @@ pub(crate) struct ConversationResponse {
     pub session: astra_server_types::SessionResponse,
     pub selected_root: Option<ConversationRoot>,
     pub items: Vec<ConversationItem>,
-    pub raw_page: RawPage,
-    pub truncated: bool,
+    pub history_loaded: bool,
+    pub raw_page: Option<RawPage>,
+    pub truncated: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +80,14 @@ pub(crate) struct RawPage {
 // a terminal commit that can change both. Metadata is read by SessionService;
 // artifact previews retain the raw endpoint's subsequent enrichment boundary.
 // Window limits bound returned candidates, not database rows examined.
+// Historical admission counts BOTH stored JSON bodies plus a conservative
+// display envelope: two fully escaped run IDs (<= 6 bytes per source byte),
+// two fixed trace:user:<64 hex> identities, timestamp and JSON field syntax.
+// This bounds transfer before decoding. Recent history is a contiguous prefix;
+// inputs are never sliced. The selected opening keeps its existing 8 MiB bound.
+// A matching reusable continuation needs only root metadata in this snapshot.
+// Keep the already-fixed owner/Session partition on SUM: it is semantically
+// identical and avoids MatrixOne prepared-window failure (matrixone#31089).
 const CONVERSATION_SQL: &str = r#"
 WITH roots AS (
     SELECT user_id, run_id, session_id, status, waiting_for, created_at,
@@ -88,54 +97,79 @@ WITH roots AS (
                     WHEN status = 'running' THEN 2 WHEN status = 'paused' THEN 1 ELSE 0 END DESC,
                created_at DESC, run_id DESC) AS selected_rank
     FROM agent_runs WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL AND depth = 0
+), selection AS (
+    SELECT CASE WHEN MAX(run_id) = ? AND
+        (MAX(status) IN ('running', 'waiting', 'paused') OR ? = 1)
+        THEN 0 ELSE 1 END AS history_loaded
+    FROM roots WHERE selected_rank = 1
+), candidates AS (
+    SELECT r.*, b.opening_hash, b.context_admission_hash,
+           COALESCE(OCTET_LENGTH(b.opening_events_json), 0) +
+               COALESCE(OCTET_LENGTH(b.opening_context_json), 4) AS stored_bytes,
+           s.history_loaded
+    FROM roots r JOIN agent_runs b ON b.user_id = r.user_id AND b.run_id = r.run_id
+    CROSS JOIN selection s
+    WHERE b.user_id = ? AND b.session_id = ? AND (history_rank <= 201 OR selected_rank = 1)
+      AND (s.history_loaded = 1 OR selected_rank = 1)
+), budgeted AS (
+    SELECT c.*, SUM(CASE WHEN selected_rank = 1 THEN 0 ELSE
+        stored_bytes + 512 + 12 * OCTET_LENGTH(run_id) END)
+        OVER (PARTITION BY user_id, session_id ORDER BY history_rank ROWS UNBOUNDED PRECEDING) AS history_bytes
+    FROM candidates c
+), admitted AS (
+    SELECT b.*, CASE WHEN history_loaded = 1 AND stored_bytes <= ? AND
+        (selected_rank = 1 OR (history_rank <= 200 AND history_bytes <= ?))
+        THEN 1 ELSE 0 END AS body_loaded
+    FROM budgeted b
 ), raw_items AS (
     SELECT t.user_id, t.session_id, t.item_seq
     FROM session_transcript_items t
     LEFT JOIN agent_runs r ON r.user_id = ? AND r.session_id = ? AND r.run_id = t.run_id
     WHERE t.user_id = ? AND t.session_id = ?
+      AND (SELECT history_loaded FROM selection) = 1
       AND (t.run_id IS NULL OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL AND r.depth = 0))
     ORDER BY t.item_seq DESC LIMIT ?
 )
 SELECT 'root' AS record_kind, r.session_id, r.run_id, r.status, r.waiting_for,
        DATE_FORMAT(r.created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at,
        history_rank, selected_rank,
-       opening_hash, context_admission_hash,
-       CASE WHEN history_rank <= 200 OR selected_rank = 1 THEN opening_events_json ELSE CAST(NULL AS CHAR) END AS opening_events_json,
-       CASE WHEN history_rank <= 200 OR selected_rank = 1 THEN opening_context_json ELSE CAST(NULL AS CHAR) END AS opening_context_json,
-       CAST(1 AS SIGNED) AS opening_body_loaded,
+       r.opening_hash, r.context_admission_hash,
+       CASE WHEN body_loaded = 1 THEN b.opening_events_json ELSE CAST(NULL AS CHAR) END AS opening_events_json,
+       CASE WHEN body_loaded = 1 THEN b.opening_context_json ELSE CAST(NULL AS CHAR) END AS opening_context_json,
+       body_loaded AS opening_body_loaded, stored_bytes, history_loaded,
        CAST(NULL AS SIGNED) AS item_seq, CAST(NULL AS CHAR) AS role,
        CAST(NULL AS CHAR) AS content, CAST(NULL AS CHAR) AS payload_json, CAST(NULL AS CHAR) AS source_event_id
-FROM roots r JOIN agent_runs b ON b.user_id = r.user_id AND b.run_id = r.run_id
-WHERE b.user_id = ? AND b.session_id = ? AND (history_rank <= 201 OR selected_rank = 1)
+FROM admitted r JOIN agent_runs b
+ ON b.user_id = r.user_id AND b.session_id = r.session_id AND b.run_id = r.run_id
 UNION ALL
 SELECT 'raw', t.session_id, t.run_id, CAST(NULL AS CHAR), CAST(NULL AS CHAR),
        DATE_FORMAT(t.created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
        CAST(0 AS SIGNED), CAST(0 AS SIGNED),
-       CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(0 AS SIGNED),
+       CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(0 AS SIGNED), CAST(0 AS SIGNED), CAST(1 AS SIGNED),
        t.item_seq, t.role, t.content, t.payload_json, t.source_event_id
 FROM raw_items p JOIN session_transcript_items t
  ON t.user_id = p.user_id AND t.session_id = p.session_id AND t.item_seq = p.item_seq
 WHERE t.user_id = ? AND t.session_id = ?
 "#;
 
-pub(crate) async fn read_conversation(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
+// Keep bind order beside the SQL, shared by the reader and its database
+// regression, which measures returned bodies before any Rust materialization.
+pub(crate) fn conversation_query<'a>(
+    user_id: &'a str,
+    session_id: &'a str,
     limit: usize,
-) -> Result<
-    (
-        Option<ConversationRoot>,
-        Vec<ConversationItem>,
-        RawPage,
-        bool,
-    ),
-    String,
-> {
-    let limit = limit.clamp(1, HISTORY_LIMIT);
-    let rows = sqlx::query(CONVERSATION_SQL)
+    reuse_run_id: Option<&'a str>,
+    reuse_terminal: bool,
+) -> sqlx::query::Query<'a, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    sqlx::query(CONVERSATION_SQL)
         .bind(user_id)
         .bind(session_id)
+        .bind(reuse_run_id)
+        .bind(i32::from(reuse_terminal))
+        .bind(user_id)
+        .bind(session_id)
+        .bind(MAX_RUN_CHECKPOINT_BYTES as i64)
+        .bind(HISTORICAL_INPUT_BYTES as i64)
         .bind(user_id)
         .bind(session_id)
         .bind(user_id)
@@ -143,8 +177,27 @@ pub(crate) async fn read_conversation(
         .bind((limit + 1) as i64)
         .bind(user_id)
         .bind(session_id)
-        .bind(user_id)
-        .bind(session_id)
+}
+
+pub(crate) async fn read_conversation(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    limit: usize,
+    reuse_run_id: Option<&str>,
+    reuse_terminal: bool,
+) -> Result<
+    (
+        Option<ConversationRoot>,
+        Vec<ConversationItem>,
+        RawPage,
+        bool,
+        bool,
+    ),
+    String,
+> {
+    let limit = limit.clamp(1, HISTORY_LIMIT);
+    let rows = conversation_query(user_id, session_id, limit, reuse_run_id, reuse_terminal)
         .fetch_all(pool.get())
         .await
         .map_err(|error| error.to_string())?;
@@ -152,6 +205,7 @@ pub(crate) async fn read_conversation(
     let mut openings = Vec::new();
     let mut raw = Vec::new();
     let mut truncated = false;
+    let mut history_loaded = true;
     for row in rows {
         if row
             .try_get::<String, _>("record_kind")
@@ -175,6 +229,34 @@ pub(crate) async fn read_conversation(
             waiting_for: row.try_get("waiting_for").map_err(|e| e.to_string())?,
             created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
         };
+        history_loaded = row
+            .try_get::<i64, _>("history_loaded")
+            .map_err(|e| e.to_string())?
+            == 1;
+        let loaded = row
+            .try_get::<i64, _>("opening_body_loaded")
+            .map_err(|e| e.to_string())?
+            == 1;
+        if selected_rank == 1 {
+            selected = Some(ConversationRoot {
+                run_id: root.run_id.clone(),
+                status: root.status.clone(),
+                waiting_for: root.waiting_for.clone(),
+                created_at: root.created_at.clone(),
+            });
+            if history_loaded
+                && row
+                    .try_get::<i64, _>("stored_bytes")
+                    .map_err(|e| e.to_string())?
+                    > MAX_RUN_CHECKPOINT_BYTES as i64
+            {
+                return Err("Run opening exceeds the bounded snapshot size".into());
+            }
+        }
+        if !loaded {
+            truncated |= history_loaded;
+            continue;
+        }
         if let Some(input) = decode_loaded_run_opening(&row)?
             .and_then(|opening| opening.input().map(|input| input.original_input.clone()))
         {
@@ -214,7 +296,13 @@ pub(crate) async fn read_conversation(
         selected.as_ref().map(|root| root.run_id.as_str()),
         limit,
     )?;
-    Ok((selected, items, raw_page, truncated || has_more || omitted))
+    Ok((
+        selected,
+        items,
+        raw_page,
+        truncated || has_more || omitted,
+        history_loaded,
+    ))
 }
 
 fn compose_conversation(
@@ -246,9 +334,8 @@ fn compose_conversation(
             item: Box::new(item),
         })
         .collect();
-    let mut bytes = 0;
     let mut omitted = false;
-    // Prefer recent exact inputs within the historical byte budget.
+    // SQL has already admitted a bounded prefix of complete opening bodies.
     let mut retained = Vec::new();
     for opening in openings.into_iter().rev() {
         let ConversationItem::Opening {
@@ -269,16 +356,6 @@ fn compose_conversation(
                 return Err(format!("conflicting transcript input for Run {run_id}"));
             }
             continue;
-        }
-        let size = serde_json::to_vec(&opening)
-            .map_err(|error| error.to_string())?
-            .len();
-        if Some(run_id.as_str()) != selected {
-            if size > HISTORICAL_INPUT_BYTES.saturating_sub(bytes) {
-                omitted = true;
-                continue;
-            }
-            bytes += size;
         }
         retained.push(opening);
     }
@@ -476,32 +553,25 @@ mod tests {
         }
     }
     #[test]
-    fn conversation_bounds_serialized_historical_inputs_but_keeps_exact_selected_input() {
-        // Quotes, backslashes and multibyte UTF-8 challenge byte vs character accounting.
-        let large = "\"\\你好\n".repeat(50_000);
-        let history = "\"\\你好\n".repeat(800);
-        let mut openings: Vec<_> = (0..200)
-            .map(|n| {
-                opening(
-                    &format!("r{n:03}"),
-                    &format!("2026-10-25T03:00:{n:06}Z"),
-                    &history,
-                )
-            })
-            .collect();
-        openings.push(opening("current", "2026-10-25T00:00:00.000000Z", &large));
-        let (items, omitted) =
-            compose_conversation(vec![], openings, Some("current"), 200).unwrap();
-        assert!(omitted);
-        assert_eq!(contents(&items)[0], large);
-        let historical: usize = items
-            .iter()
-            .filter(|item| item.run_id() != Some("current"))
-            .map(|item| serde_json::to_vec(item).unwrap().len())
-            .sum();
-        assert!(historical <= HISTORICAL_INPUT_BYTES);
-        assert!(items.len() < 200);
+    fn historical_sql_envelope_bounds_json_escaping_and_fixed_identities() {
+        for run in ["run".to_owned(), "\"\n\t\\你好".repeat(100)] {
+            let source = server_input_source_event_id("session", &run);
+            let item = ConversationItem::Opening {
+                id: format!("input:{run}:{source}"),
+                run_id: run.clone(),
+                source_event_id: source,
+                created_at: "2026-10-25T03:00:00.123456Z".into(),
+                content: "\"\n\\你好".repeat(100),
+            };
+            let encoded = serde_json::to_vec(&item).unwrap().len();
+            let ConversationItem::Opening { content, .. } = &item else {
+                unreachable!()
+            };
+            let stored_content = serde_json::to_vec(content).unwrap().len();
+            assert!(encoded <= stored_content + 512 + 12 * run.len());
+        }
     }
+
     #[test]
     fn conversation_retains_current_input_when_guidance_fills_the_display_window() {
         for committed in [false, true] {

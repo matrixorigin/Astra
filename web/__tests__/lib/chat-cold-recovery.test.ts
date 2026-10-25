@@ -7,10 +7,10 @@ vi.mock("@/lib/runtime-client/server", () => ({
 
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { WebRuntimeClient, getRuntimeClient, requireRuntimeClient } from "@/lib/runtime-client/server";
-import { deleteChat, getChat, getChatHydrated, getStore, listChats, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
+import { ensureChatBackendSession, updateChatModel, updateChatWorkspaceSelection, archiveChat, moveChat, deleteChat, getChat, getChatHydrated, getStore, listChats, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
 import { GET as GETDetail } from "@/app/api/chats/[chatId]/route";
 import { POST as POSTMessage } from "@/app/api/chats/[chatId]/messages/route";
-import { GET } from "@/app/api/chats/[chatId]/stream/route";
+import { GET, POST as POSTStream } from "@/app/api/chats/[chatId]/stream/route";
 import { AstraApiError, type RuntimeConversationResponse } from "@astra/sdk";
 
 const session = { session_id: "session", created_at: "2026-10-25T03:00:00Z", status: "active", metadata: { source: "web_v1" } };
@@ -19,7 +19,7 @@ function conversation(runId = "run", status = "running", content = "original req
     selected_root: { run_id: runId, status, waiting_for: null, created_at: "2026-10-25T03:00:00.123456Z" },
     items: [{ kind: "opening", id: `input:${runId}`, run_id: runId, source_event_id: `source:${runId}`,
       created_at: "2026-10-25T03:00:00.123456Z", content }],
-    raw_page: { next_before_seq: null, has_more: false }, truncated: false };
+    history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false };
 }
 function setup() {
   globalThis.__astraWebStores = undefined;
@@ -117,7 +117,7 @@ it("reads one bounded projection on cold and warm details without enumerating Ru
   const second = await getChatHydrated("owner", "session");
   expect(first?.messages).toHaveLength(201);
   expect(second?.messages).toBe(first?.messages);
-  expect(runtime.sdk.getSessionConversation.mock.calls).toEqual([["session", 200], ["session", 200]]);
+  expect(runtime.sdk.getSessionConversation.mock.calls).toEqual([["session", 200, undefined], ["session", 200, { runId: "run", preserveTerminal: true }]]);
   expect(runtime.sdk.listRuns).not.toHaveBeenCalled();
 });
 
@@ -573,4 +573,171 @@ it("publishes a terminal answer immediately when a paused parser cannot auto-att
   const detail = await getChatHydrated("owner", "session");
   expect(detail?.activeRun).toBeUndefined();
   expect(detail?.messages.at(-1)).toMatchObject({ content: "final answer", status: "complete" });
+});
+
+// Independent review counterexample: a real mutation must survive an older read.
+it("preserves a model selection completed while detail recovery was reading", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  let resolveRead!: (value: RuntimeConversationResponse) => void;
+  runtime.sdk.getSessionConversation.mockImplementationOnce(() => new Promise(resolve => { resolveRead = resolve; }));
+  const reading = getChatHydrated("owner", "session");
+  await vi.waitFor(() => expect(resolveRead).toBeDefined());
+  const sdk = runtime.sdk as typeof runtime.sdk & { updateRuntimeSession: ReturnType<typeof vi.fn> };
+  sdk.updateRuntimeSession = vi.fn().mockResolvedValue(session);
+  await updateChatModel("owner", "session", "new-offering");
+  expect(getChat("owner", "session")?.chat.model).toBe("new-offering");
+  const old = conversation();
+  old.session = { ...old.session, metadata: { source: "web_v1", current_model: "old-offering" } };
+  resolveRead(old);
+  await reading;
+  expect(getChat("owner", "session")?.chat.model).toBe("new-offering");
+});
+
+it("preserves a completed workspace selection while an older detail snapshot returns", async () => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  let resolveRead!: (value: RuntimeConversationResponse) => void;
+  runtime.sdk.getSessionConversation.mockImplementationOnce(() => new Promise(resolve => { resolveRead = resolve; }));
+  const reading = getChatHydrated("owner", "session");
+  await vi.waitFor(() => expect(resolveRead).toBeDefined());
+  const sdk = runtime.sdk as typeof runtime.sdk & { updateRuntimeSession: ReturnType<typeof vi.fn> };
+  sdk.updateRuntimeSession = vi.fn().mockResolvedValue(session);
+  const selected = { kind: "edge_workspace" as const, edgeAgentId: "new-edge", cwd: "/workspace/new" };
+  await updateChatWorkspaceSelection("owner", "session", selected);
+  expect(getChat("owner", "session")?.workspaceSelection).toMatchObject(selected);
+  const old = conversation("old", "completed");
+  old.session = { ...old.session, metadata: { source: "web_v1", workspace_selection:
+    { kind: "edge_workspace", edgeAgentId: "old-edge", cwd: "/workspace/old" } } };
+  resolveRead(old);
+  await reading;
+  const edgeRuntime = runtime as typeof runtime & { get: ReturnType<typeof vi.fn> };
+  edgeRuntime.get = vi.fn().mockResolvedValue({ edges: [
+    { edge_agent_id: "new-edge", workspace_dir: "/workspace/new" },
+    { edge_agent_id: "old-edge", workspace_dir: "/workspace/old" },
+  ] });
+  const response = await POSTStream(new Request("http://web.test/api/chats/session/stream", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: "create a file in the selected workspace", options: { model: "offering" } }) }) as never,
+    { params: Promise.resolve({ chatId: "session" }) });
+  expect(response.status).toBe(200);
+  await response.text();
+  const requests = runtime.fetchResponse.mock.calls as unknown as Array<[string, { json?: { workspace_binding?: { root?: string } } }]>;
+  const start = requests.find(([path]) => path === "/chat/stream");
+  expect(start?.[1].json?.workspace_binding?.root).toBe("/workspace/new");
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+function metadataWriter(runtime: ReturnType<typeof setup>) {
+  const sdk = runtime.sdk as typeof runtime.sdk & { updateRuntimeSession: ReturnType<typeof vi.fn> };
+  sdk.updateRuntimeSession = vi.fn().mockResolvedValue(session);
+  return sdk.updateRuntimeSession;
+}
+
+it("commits an acknowledged model to the current shell after a reader replaces it", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  const write = deferred<typeof session>();
+  const writer = metadataWriter(runtime).mockReturnValueOnce(write.promise);
+  const changing = updateChatModel("owner", "session", "acknowledged-model");
+  await vi.waitFor(() => expect(writer).toHaveBeenCalledTimes(1));
+  await getChatHydrated("owner", "session");
+  write.resolve(session);
+  await changing;
+  expect(getChat("owner", "session")?.chat.model).toBe("acknowledged-model");
+});
+
+it("does not roll back a successful workspace selection when an older write fails", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  const older = deferred<typeof session>();
+  const writer = metadataWriter(runtime).mockReturnValueOnce(older.promise);
+  const first = updateChatWorkspaceSelection("owner", "session", { kind: "edge_workspace", edgeAgentId: "older", cwd: "/older" });
+  const failure = expect(first).rejects.toThrow("write failed");
+  await vi.waitFor(() => expect(writer).toHaveBeenCalledTimes(1));
+  expect(getChat("owner", "session")?.workspaceSelection).toBeUndefined();
+  await updateChatWorkspaceSelection("owner", "session", { kind: "edge_workspace", edgeAgentId: "newer", cwd: "/newer" });
+  older.reject(new Error("write failed"));
+  await failure;
+  expect(getChat("owner", "session")?.workspaceSelection).toMatchObject({ kind: "edge_workspace", cwd: "/newer" });
+});
+
+it.each(["delete", "rebind"])("does not publish an old metadata acknowledgement after %s", async action => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  const write = deferred<typeof session>();
+  const writer = metadataWriter(runtime).mockReturnValueOnce(write.promise);
+  const changing = updateChatModel("owner", "session", "obsolete");
+  await vi.waitFor(() => expect(writer).toHaveBeenCalledTimes(1));
+  if (action === "delete") await deleteChat("owner", "session");
+  else getStore("owner").chats[0].backendSessionId = "replacement-session";
+  write.resolve(session);
+  expect(await changing).toBeNull();
+  expect(getChat("owner", "session")?.chat.model).not.toBe("obsolete");
+});
+
+it.each(["detail", "directory"])("fences %s metadata across an A-B-A commit and archive/project changes", async source => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  const read = deferred<RuntimeConversationResponse>();
+  const directory = deferred<{ sessions: typeof session[] }>();
+  metadataWriter(runtime);
+  if (source === "detail") runtime.sdk.getSessionConversation.mockReturnValueOnce(read.promise);
+  else runtime.sdk.listRuntimeSessions.mockReturnValueOnce(directory.promise);
+  const reading = source === "detail" ? getChatHydrated("owner", "session") : listChats("owner", {});
+  await vi.waitFor(() => expect(source === "detail" ? runtime.sdk.getSessionConversation : runtime.sdk.listRuntimeSessions).toHaveBeenCalledTimes(2));
+  await updateChatModel("owner", "session", "B");
+  await updateChatModel("owner", "session", "A");
+  await archiveChat("owner", "session", true);
+  getStore("owner").projects.push({ id: "project", name: "project", createdAt: session.created_at, updatedAt: session.created_at } as never);
+  moveChat("owner", "session", "project");
+  const stale = conversation();
+  stale.session = { ...session, metadata: { source: "web_v1", current_model: "stale" } };
+  read.resolve(stale);
+  directory.resolve({ sessions: [stale.session as typeof session] });
+  await reading;
+  const chat = getChat("owner", "session")!.chat;
+  expect(chat.model).toBe("A");
+  expect(chat.archivedAt).toBeTruthy();
+  expect(chat.projectId).toBe("project");
+});
+
+it("keeps a warm parser on an explicitly omitted history and cold-loads a successor", async () => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  const before = getChat("owner", "session")!.messages;
+  runtime.sdk.getSessionConversation.mockResolvedValueOnce({ ...conversation(), history_loaded: false, items: [], raw_page: null, truncated: null });
+  expect((await getChatHydrated("owner", "session"))?.messages).toBe(before);
+  runtime.sdk.getSessionConversation.mockResolvedValueOnce(conversation("successor", "failed", "new accepted input"));
+  expect((await getChatHydrated("owner", "session"))?.messages.map(item => item.content)).toEqual(["new accepted input"]);
+});
+
+it("binds the current shell after Session creation overlaps a metadata commit and reuses it on the next POST", async () => {
+  const runtime = setup();
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("old", "completed"));
+  await getChatHydrated("owner", "session");
+  getStore("owner").chats[0].backendSessionId = null;
+  const creation = deferred<typeof session>();
+  runtime.sdk.createRuntimeSession.mockReturnValueOnce(creation.promise);
+  const creating = ensureChatBackendSession("owner", "session", { model: "offering" });
+  await vi.waitFor(() => expect(runtime.sdk.createRuntimeSession).toHaveBeenCalledTimes(1));
+  moveChat("owner", "session", null);
+  creation.resolve(session);
+  expect(await creating).toBe("session");
+  expect(getChat("owner", "session")?.session?.backendSessionId).toBe("session");
+  expect(await ensureChatBackendSession("owner", "session", { model: "offering" })).toBe("session");
+  const response = await POSTStream(new Request("http://web.test/api/chats/session/stream", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: "hello again", options: { model: "offering" } }),
+  }) as never, { params: Promise.resolve({ chatId: "session" }) });
+  expect(response.status).toBe(200);
+  await response.text();
+  expect(runtime.sdk.createRuntimeSession).toHaveBeenCalledTimes(1);
+  const calls = runtime.fetchResponse.mock.calls as unknown as Array<[string, { json?: { session_id?: string } }]>;
+  expect(calls.find(([path]) => path === "/chat/stream")?.[1].json?.session_id).toBe("session");
 });

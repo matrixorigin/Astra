@@ -1517,8 +1517,9 @@ export type RuntimeConversationResponse = {
   items: Array<({ kind: "raw" } & RuntimeTranscriptItemResponse) | {
     kind: "opening"; id: string; run_id: string; source_event_id: string; created_at: string; content: string;
   }>;
-  raw_page: { next_before_seq: number | null; has_more: boolean };
-  truncated: boolean;
+  history_loaded: boolean;
+  raw_page: { next_before_seq: number | null; has_more: boolean } | null;
+  truncated: boolean | null;
 };
 
 export type RuntimeTranscriptParams = {

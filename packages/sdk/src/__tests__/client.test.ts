@@ -440,10 +440,21 @@ describe("AstraClient — Runs", () => {
       selected_root: { run_id: "r1", status: "failed" },
       items: [{ kind: "opening", id: "input:r1:source-1", run_id: "r1", content: " \n你好 ",
         source_event_id: "source-1", created_at: "2026-10-25T03:00:00.123456Z" }],
-      raw_page: { next_before_seq: null, has_more: false }, truncated: false };
+      history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false };
     globalThis.fetch = mockFetch(200, body);
     expect(await createClient().getSessionConversation("s1")).toEqual(body);
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("/sessions/s1/transcript?scope=conversation&limit=200");
+  });
+
+  test("getSessionConversation sends the reusable continuation and preserves explicit history omission", async () => {
+    const body = { kind: "conversation", session: { session_id: "s1" },
+      selected_root: { run_id: "r1", status: "completed" },
+      history_loaded: false, items: [], raw_page: null, truncated: null };
+    globalThis.fetch = mockFetch(200, body);
+    expect(await createClient().getSessionConversation("s1", 200, { runId: "r1", preserveTerminal: true })).toEqual(body);
+    const url = new URL((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    expect(url.searchParams.get("reuse_run_id")).toBe("r1");
+    expect(url.searchParams.get("reuse_terminal")).toBe("true");
   });
 
   test("getRunProjection uses bounded projection endpoint", async () => {

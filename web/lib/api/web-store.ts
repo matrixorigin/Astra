@@ -892,13 +892,11 @@ export function beginStreamingMessage(
   }
   chat.lastMessageAt = timestamp;
   chat.lastMessagePreview = payload.content;
-  chat.title ??= titleFromMessage(payload.content);
-  if (payload.options?.model) {
-    chat.model = payload.options.model;
-  }
-  if (payload.workspaceSelection) {
-    chat.workspaceSelection = payload.workspaceSelection;
-  }
+  commitChatMetadata(ownerUserId, chat, {
+    title: chat.title ?? titleFromMessage(payload.content),
+    ...(payload.options?.model ? { model: payload.options.model } : {}),
+    ...(payload.workspaceSelection ? { workspaceSelection: payload.workspaceSelection } : {}),
+  });
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
   }
@@ -1397,6 +1395,22 @@ export function updateStreamingAssistantMessage(
   return message;
 }
 
+// Metadata commits replace only the shell. In-flight readers can then reject
+// their old snapshot without another revision or cache; live Run/parser owners
+// retain their existing references. Async writers rebind after acknowledgement.
+function commitChatMetadata(
+  ownerUserId: string,
+  original: Pick<ChatRecord, "id" | "backendSessionId">,
+  patch: Partial<Pick<ChatRecord, "model" | "workspaceSelection" | "title" | "projectId" | "archivedAt" | "lastMessageAt" | "backendSessionId">>,
+): boolean {
+  const store = getStore(ownerUserId);
+  const index = store.chats.findIndex(chat => chat.id === original.id &&
+    chat.backendSessionId === original.backendSessionId);
+  if (index < 0) return false;
+  store.chats[index] = { ...store.chats[index], ...patch };
+  return true;
+}
+
 export async function updateChatModel(
   ownerUserId: string,
   chatId: string,
@@ -1411,8 +1425,9 @@ export async function updateChatModel(
   if (!chat) {
     return null;
   }
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   await updateBackendSessionModel(chat, normalized);
-  chat.model = normalized;
+  if (!commitChatMetadata(ownerUserId, binding, { model: normalized })) return null;
   return getChat(ownerUserId, chatId);
 }
 
@@ -1432,27 +1447,14 @@ export async function updateChatWorkspaceSelection(
     return null;
   }
 
-  const previous = chat.workspaceSelection;
-  if (sameWorkspaceSelection(previous, normalized)) {
+  if (sameWorkspaceSelection(chat.workspaceSelection, normalized)) {
     return getChat(ownerUserId, chatId);
   }
-  if (normalized) {
-    chat.workspaceSelection = normalized;
-  } else {
-    delete chat.workspaceSelection;
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
+  if (chat.backendSessionId) {
+    await updateBackendSessionWorkspaceSelection(chat, normalized);
   }
-  try {
-    if (chat.backendSessionId) {
-      await updateBackendSessionWorkspaceSelection(chat, normalized);
-    }
-  } catch (error) {
-    if (previous) {
-      chat.workspaceSelection = previous;
-    } else {
-      delete chat.workspaceSelection;
-    }
-    throw error;
-  }
+  if (!commitChatMetadata(ownerUserId, binding, { workspaceSelection: normalized ?? undefined })) return null;
   return getChat(ownerUserId, chatId);
 }
 
@@ -1472,8 +1474,7 @@ export function moveChat(
   ) {
     return null;
   }
-  chat.projectId = projectId;
-  chat.lastMessageAt = nowIso();
+  commitChatMetadata(ownerUserId, chat, { projectId, lastMessageAt: nowIso() });
   return getChat(ownerUserId, chatId);
 }
 
@@ -1486,8 +1487,9 @@ export async function archiveChat(
   if (!chat) {
     return null;
   }
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   await updateBackendSessionArchive(chat, archived);
-  chat.archivedAt = archived ? nowIso() : null;
+  if (!commitChatMetadata(ownerUserId, binding, { archivedAt: archived ? nowIso() : null })) return null;
   return getChat(ownerUserId, chatId);
 }
 
@@ -1663,6 +1665,7 @@ export async function ensureChatBackendSession(
     return chat.backendSessionId;
   }
 
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   const model = requireSelectedOfferingId(params.model ?? chat.model);
   const session = await createBackendSession({
     chatId: chat.id,
@@ -1672,7 +1675,9 @@ export async function ensureChatBackendSession(
     workspaceSelection: chat.workspaceSelection,
     runtime: params.runtime,
   });
-  chat.backendSessionId = session.sessionId;
+  if (!commitChatMetadata(ownerUserId, binding, { backendSessionId: session.sessionId })) {
+    throw new Error("The chat was deleted or rebound while its Session was being created.");
+  }
   return session.sessionId;
 }
 
@@ -1866,6 +1871,9 @@ async function listAllBackendSessions(
 }
 
 async function syncBackendSessions(ownerUserId: string): Promise<void> {
+  const beforeRead = new Map(getStore(ownerUserId).chats.map(chat => [chat.id, chat]));
+  const beforeBySession = new Map([...beforeRead.values()].filter(chat => chat.backendSessionId)
+    .map(chat => [chat.backendSessionId!, chat]));
   const client = await getRuntimeClient({
     auth: "required",
     operation: `sync persisted sessions for user ${ownerUserId}`,
@@ -1928,6 +1936,11 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
       ? (byBackendSessionId.get(session.session_id) ??
         byId.get(session.session_id))
       : undefined;
+    const original = beforeBySession.get(session.session_id) ?? beforeRead.get(existing?.id ?? session.session_id);
+    if (existing !== original) {
+      if (existing) backendChatIds.add(existing.id);
+      continue;
+    }
     const record = chatRecordFromBackendSession(session, existing);
     if (!record) {
       continue;
@@ -1961,7 +1974,8 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   // Keeping those shells lets the UI send messages to non-existent sessions and
   // turns a clean 404 into a fake assistant error message.
   store.chats = store.chats.filter((chat) => {
-    const retained = backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat);
+    const retained = backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat) ||
+      beforeRead.get(chat.id) !== chat;
     if (!retained) discardChatStreamProjection(chat);
     return retained;
   });
@@ -2038,7 +2052,7 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   // Compare the entire existing continuation before publishing success/errors.
   const stillCurrent = () => {
     const current = currentChat();
-    return current?.backendSessionId === sessionId && current?.activeRun?.runId === runId &&
+    return current === original && current?.backendSessionId === sessionId && current?.activeRun?.runId === runId &&
       current?.activeRun?.assistantMessageId === assistantId && current?.streamProjection === projection &&
       current?.messages === messages && current?.pendingTurn === pendingTurn;
   };
@@ -2057,7 +2071,10 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   }
   let parsed;
   try {
-    parsed = await client.sdk.getSessionConversation(backendSessionId, CHAT_HISTORY_LIMIT);
+    const reusable = runId && publicActiveRun(original)?.nextEventIndex !== undefined;
+    parsed = await client.sdk.getSessionConversation(backendSessionId, CHAT_HISTORY_LIMIT,
+      reusable ? { runId, preserveTerminal: !isLocallyStoppedRun(original, runId, Date.now()) &&
+        !!original && hasContinuingStream(original) } : undefined);
   } catch (error) {
     if (!stillCurrent()) return currentChat()?.id;
     if ((error instanceof AstraApiError || error instanceof RuntimeClientError) && error.status === 404) {
@@ -2085,6 +2102,9 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
   const continuing = existing && hasContinuingStream(existing);
   const warm = existing && root && root.run_id === runId && publicActiveRun(existing)?.nextEventIndex !== undefined &&
     (!isTerminalChatRunStatus(root.status) || !stopped && continuing);
+  // An omitted history is only valid for the exact reusable continuation.
+  // Never turn it into an empty cold transcript after a local Stop/expiry.
+  if (!parsed.history_loaded && !warm) return existing?.id;
   if (existing && !warm) discardChatStreamProjection(existing);
   const record = chatRecordFromBackendSession(parsed.session, existing);
   if (!record) return;

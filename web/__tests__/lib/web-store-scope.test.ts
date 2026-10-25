@@ -207,7 +207,7 @@ describe("web store user scoping", () => {
               ],
               created_at: timestamp,
             },
-          ], raw_page: { has_more: false, next_before_seq: 1 }, truncated: false },
+          ], history_loaded: true, raw_page: { has_more: false, next_before_seq: 1 }, truncated: false },
         ),
       );
 
@@ -618,7 +618,7 @@ describe("web store user scoping", () => {
     const projection = { kind: "conversation", session: persisted,
       selected_root: { run_id: "root", status: "running", waiting_for: null },
       items: [{ kind: "opening", id: "input:root", run_id: "root", source_event_id: "source", content: " 你好\n ", created_at: "2026-10-25T03:00:00.123456Z" }],
-      raw_page: { has_more: false, next_before_seq: null }, truncated: false };
+      history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false };
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce(jsonResponse(runtimeSessionList([persisted])))
       .mockResolvedValueOnce(jsonResponse(projection)).mockResolvedValueOnce(jsonResponse(projection));

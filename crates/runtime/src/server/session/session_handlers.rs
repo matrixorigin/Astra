@@ -209,6 +209,9 @@ pub(crate) struct TranscriptQuery {
     pub before_seq: Option<i64>,
     pub run_id: Option<String>,
     pub scope: Option<TranscriptQueryScope>,
+    pub reuse_run_id: Option<String>,
+    #[serde(default)]
+    pub reuse_terminal: bool,
     #[serde(default = "default_transcript_limit")]
     pub limit: u32,
 }
@@ -698,24 +701,34 @@ pub(crate) async fn get_session_transcript_handler(
         && query.run_id.is_none()
         && query.before_seq.is_none()
     {
-        let (selected_root, items, raw_page, truncated) = super::conversation::read_conversation(
-            pool,
-            &user_id,
-            &session_id,
-            query.limit as usize,
-        )
-        .await
-        .map_err(internal_error)?;
+        let (selected_root, items, raw_page, truncated, history_loaded) =
+            super::conversation::read_conversation(
+                pool,
+                &user_id,
+                &session_id,
+                query.limit as usize,
+                query.reuse_run_id.as_deref(),
+                query.reuse_terminal,
+            )
+            .await
+            .map_err(internal_error)?;
         return Ok(Json(TranscriptReadResponse::Conversation(Box::new(
             super::conversation::ConversationResponse {
                 kind: "conversation",
                 session: session.into(),
                 selected_root,
                 items,
-                raw_page,
-                truncated,
+                history_loaded,
+                raw_page: history_loaded.then_some(raw_page),
+                truncated: history_loaded.then_some(truncated),
             },
         ))));
+    }
+    if query.reuse_run_id.is_some() || query.reuse_terminal {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "continuation filters require conversation scope without raw filters",
+        ));
     }
     let scope = transcript_read_scope(&query)?;
     let limit = query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT);

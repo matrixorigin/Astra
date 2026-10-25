@@ -104,6 +104,7 @@ bounded display view for the authenticated Session owner:
   "session": { "session_id": "...", "metadata": {}, "status": "active" },
   "selected_root": { "run_id": "...", "status": "failed", "waiting_for": null, "created_at": "2026-10-25T03:00:00.123456Z" },
   "items": [{ "kind": "opening", "id": "input:...", "run_id": "...", "source_event_id": "trace:user:...", "created_at": "2026-10-25T03:00:00.123456Z", "content": "exact submitted text" }],
+  "history_loaded": true,
   "raw_page": { "next_before_seq": null, "has_more": false },
   "truncated": false
 }
@@ -119,7 +120,9 @@ never included.
 
 The view retains up to 200 display items and examines at most 200 historical
 opening candidates plus the selected root. Historical opening payload has a
-256 KiB serialized-byte budget; the selected input is retained exactly under the
+256 KiB budget applied in SQL before body transfer and decoding. It counts both
+stored opening JSON bodies plus a conservative display envelope; the most recent
+continuous prefix is retained. The selected input is retained exactly under the
 existing 8 MiB opening limit. Strings are never truncated. `truncated` signals
 older omitted history. Only raw rows have `item_seq`; `raw_page` describes the raw
 page independently of composed display items. Continue older raw history through
@@ -128,8 +131,20 @@ other transcript scopes and cursors are unchanged.
 
 Root status and raw history are read in one database statement snapshot. Session
 metadata and artifact previews use their existing separate read boundaries.
-Selected detail refreshes perform a fresh bounded read; clients retaining a valid
-live parser keep that parser until its stream terminal, unless a successor wins.
+Selected detail refreshes perform a fresh bounded read. A client with a reusable
+continuation can send `reuse_run_id` and `reuse_terminal=true` while retaining
+that continuation until its actual stream terminal. If the snapshot selects that
+same Run and it is active (or terminal preservation was requested), the response
+has `history_loaded:false`, `items:[]`, `raw_page:null`, and `truncated:null`.
+These nulls mean unexamined history, not an empty transcript. A successor returns
+full bounded history in the same read. Clients must recheck their continuation
+after awaiting the response; an invalidated parser cannot use omitted history to
+rebuild a cold view. Continuation parameters are rejected outside conversation scope.
+
+Web metadata mutations commit only their changed fields after backend success
+and invalidate overlapping older detail/directory reads. A failed workspace update
+does not roll back another successful selection. This fences one Web store's
+concurrent publication; it does not promise linearizable caches across Web servers.
 
 The Web `POST /api/chats/{chat_id}/messages` JSON endpoint shares the streaming
 message/parser owner. Concurrent observation does not discard its pending input

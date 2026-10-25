@@ -35507,10 +35507,13 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                 .await
             );
         }
-        let (selected, items, raw_page, _) =
-            crate::server::session::conversation::read_conversation(&pool, &user, &session, 200)
-                .await
-                .unwrap();
+        let (selected, items, raw_page, _, history_loaded) =
+            crate::server::session::conversation::read_conversation(
+                &pool, &user, &session, 200, None, false,
+            )
+            .await
+            .unwrap();
+        assert!(history_loaded);
         assert_eq!(
             selected.unwrap().status,
             if cancelled {
@@ -37007,20 +37010,22 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
                 run_id,
                 before_seq,
                 limit: 200,
+                ..Default::default()
             }),
         )
         .await;
         assert_eq!(result.err().unwrap().0, StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let (root, items, page, truncated) = read_conversation(&pool, &user, &session, 200)
-        .await
-        .unwrap();
+    let (root, items, page, truncated, history_loaded) =
+        read_conversation(&pool, &user, &session, 200, None, false)
+            .await
+            .unwrap();
     assert_eq!(
         root.unwrap().run_id,
         current,
         "active root outside the newest 200 must still be selected"
     );
-    assert!(truncated);
+    assert!(truncated && history_loaded);
     assert!(!page.has_more);
     let wire = serde_json::to_value(&items).unwrap();
     assert_eq!(wire[0]["content"], exact);
@@ -37032,6 +37037,76 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
         .map(|item| serde_json::to_vec(item).unwrap().len())
         .sum();
     assert!(history_bytes <= 256 * 1024);
+
+    // Inspect the actual reader's SQL rows, BEFORE decoding/composition. A
+    // post-fetch display limit cannot satisfy this transfer/resource contract.
+    let rows =
+        crate::server::session::conversation::conversation_query(&user, &session, 200, None, false)
+            .fetch_all(pool.get())
+            .await
+            .unwrap();
+    let mut historical_bytes = 0;
+    let mut omitted_bodies = 0;
+    for row in rows {
+        if row.try_get::<String, _>("record_kind").unwrap() != "root" {
+            continue;
+        }
+        let events: Option<String> = row.try_get("opening_events_json").unwrap();
+        let context: Option<String> = row.try_get("opening_context_json").unwrap();
+        if row.try_get::<String, _>("run_id").unwrap() == current {
+            assert!(context.as_ref().unwrap().len() > 256 * 1024);
+            continue;
+        }
+        historical_bytes +=
+            events.as_ref().map_or(0, String::len) + context.as_ref().map_or(0, String::len);
+        if row.try_get::<i64, _>("opening_body_loaded").unwrap() == 0 {
+            assert!(events.is_none() && context.is_none());
+            omitted_bodies += 1;
+        }
+    }
+    assert!(historical_bytes > 0 && historical_bytes <= 256 * 1024);
+    assert!(omitted_bodies > 0);
+
+    // Exact reusable root omits bodies/cursors; a successor returns the complete
+    // bounded view in the SAME statement rather than requiring another query.
+    let (root, items, _, _, loaded) =
+        read_conversation(&pool, &user, &session, 200, Some(&current), false)
+            .await
+            .unwrap();
+    assert_eq!(root.unwrap().run_id, current);
+    assert!(!loaded && items.is_empty());
+    let (_, items, _, _, loaded) =
+        read_conversation(&pool, &user, &session, 200, Some("superseded-run"), true)
+            .await
+            .unwrap();
+    assert!(loaded && !items.is_empty());
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&user)
+        .bind(&current)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    // A non-reusable terminal triggers a cold view; preserving its actual live
+    // parser explicitly avoids loading history until its stream terminal.
+    let (_, items, _, _, loaded) =
+        read_conversation(&pool, &user, &session, 200, Some(&current), false)
+            .await
+            .unwrap();
+    assert!(loaded && !items.is_empty());
+    // Return current to the highest selection priority for the terminal control.
+    sqlx::query("UPDATE agent_runs SET created_at = '2026-03-01' WHERE user_id = ? AND run_id = ?")
+        .bind(&user)
+        .bind(&current)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let (_, items, _, _, loaded) =
+        read_conversation(&pool, &user, &session, 200, Some(&current), true)
+            .await
+            .unwrap();
+    assert!(!loaded && items.is_empty());
+    sqlx::query("UPDATE agent_runs SET status = 'running', created_at = '2026-01-01' WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&current).execute(pool.get()).await.unwrap();
 
     let child = Uuid::new_v4().to_string();
     sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,parent_run_id,depth,status) VALUES (?,?,?,?,?,?,1,'waiting')")
@@ -37056,11 +37131,12 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
         sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash) VALUES (?,?,?,?,'user','excluded','fixture')")
             .bind(&user).bind(&session).bind(seq).bind(id).execute(pool.get()).await.unwrap();
     }
-    let (root, items, page, truncated) = read_conversation(&pool, &user, &session, 200)
-        .await
-        .unwrap();
+    let (root, items, page, truncated, history_loaded) =
+        read_conversation(&pool, &user, &session, 200, None, false)
+            .await
+            .unwrap();
     assert_eq!(root.unwrap().run_id, current);
-    assert!(truncated && page.has_more);
+    assert!(truncated && history_loaded && page.has_more);
     assert_eq!(
         page.next_before_seq,
         Some(6),
@@ -37084,7 +37160,7 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
             .all(|item| item["content"] != "excluded")
     );
     assert!(
-        read_conversation(&pool, "unrelated-owner", &session, 200)
+        read_conversation(&pool, "unrelated-owner", &session, 200, None, false)
             .await
             .unwrap()
             .1
@@ -37112,11 +37188,25 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
     assert!(empty["selected_root"].is_null());
     assert!(empty["items"].as_array().unwrap().is_empty());
 
+    // Imported raw rows need no root. Empty-root selection must not suppress
+    // legitimate history through a NULL scalar subquery condition.
+    sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,role,content,content_hash) VALUES (?,?,1,'user','imported without Run','fixture')")
+        .bind(&user).bind(&empty_session).execute(pool.get()).await.unwrap();
+    let (root, items, page, _, loaded) =
+        read_conversation(&pool, &user, &empty_session, 200, None, false)
+            .await
+            .unwrap();
+    assert!(root.is_none() && loaded && !page.has_more);
+    assert_eq!(
+        serde_json::to_value(items).unwrap()[0]["content"],
+        "imported without Run"
+    );
+
     // Identity conflicts fail rather than replacing the accepted input silently.
     sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash,source_event_id) VALUES (?,?,208,?,'user','altered','fixture',?)")
         .bind(&user).bind(&session).bind(&current).bind(persistence::server_input_source_event_id(&session, &current)).execute(pool.get()).await.unwrap();
     assert!(
-        read_conversation(&pool, &user, &session, 200)
+        read_conversation(&pool, &user, &session, 200, None, false)
             .await
             .err()
             .unwrap()

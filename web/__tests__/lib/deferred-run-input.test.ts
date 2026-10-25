@@ -440,7 +440,7 @@ describe('queueDeferredRunInput', () => {
     const getSessionConversation = vi.fn().mockImplementation(async () => ({
       kind: 'conversation', session: { session_id: 'chat-open', status: 'active', metadata: { source: 'web_v1', current_model: 'sonnet-4.6-adaptive' } },
       selected_root: { run_id: 'run-open', status: 'input-queued', waiting_for: 'user_input' },
-      items: [], raw_page: { has_more: false, next_before_seq: null }, truncated: false,
+      items: [], history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false,
     }));
 
     mockGetRuntimeClient.mockResolvedValue({
@@ -456,7 +456,7 @@ describe('queueDeferredRunInput', () => {
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
     expect(listRuns).not.toHaveBeenCalled();
-    expect(getSessionConversation).toHaveBeenCalledWith('chat-open', 200);
+    expect(getSessionConversation).toHaveBeenCalledWith('chat-open', 200, undefined);
     expect(result?.chat.id).toBe('chat-open');
     expect(result?.chat.model).toBe('sonnet-4.6-adaptive');
     expect(result?.activeRun).toMatchObject({
@@ -819,7 +819,7 @@ describe('queueDeferredRunInput', () => {
     const getSessionConversation = vi.fn().mockImplementation(async () => ({
       kind: 'conversation', session: { session_id: 'chat-stop', status: 'active', metadata: { source: 'web_v1', current_model: 'sonnet-4.6-adaptive' } },
       selected_root: { run_id: 'run-stop', status: 'running', waiting_for: null },
-      items: [], raw_page: { has_more: false, next_before_seq: null }, truncated: false,
+      items: [], history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false,
     }));
     mockGetRuntimeClient.mockResolvedValue({
       sdk: { listRuntimeSessions, listRuns, getSessionConversation,
@@ -905,7 +905,7 @@ describe('queueDeferredRunInput', () => {
     const getSessionConversation = vi.fn().mockImplementation(async () => ({
       kind: 'conversation', session: { session_id: 'chat-stop', status: 'active', metadata: { source: 'web_v1', current_model: 'sonnet-4.6-adaptive' } },
       selected_root: { run_id: 'run-stop', status: 'running', waiting_for: null },
-      items: [], raw_page: { has_more: false, next_before_seq: null }, truncated: false,
+      items: [], history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false,
     }));
     mockGetRuntimeClient.mockResolvedValue({
       sdk: { listRuntimeSessions, listRuns, getSessionConversation },

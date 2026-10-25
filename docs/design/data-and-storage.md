@@ -185,7 +185,11 @@ Retention is a product contract:
   It adds no stored projection or synthetic transcript cursor. Root status and
   raw rows share one SQL statement snapshot; metadata and artifact previews keep
   their separate read boundaries. Historical opening inputs have a 256 KiB
-  serialized budget within 200 candidates; the selected input is retained exactly
+  budget on both stored JSON bodies plus a conservative display envelope, applied
+  in the same SQL before transfer/decoding. History retains a newest continuous
+  prefix within 200 candidates. A reusable same-root continuation can conditionally
+  omit history in that snapshot; a successor returns full bounded history. Explicit
+  omission has no raw cursor or truncation assertion. The selected input is retained exactly
   under the existing opening-size limit. Display history is limited to 200 items.
   These bounds do not imply history-independent database scans. It does not
   copy tool starts/results: canonical Context owns model continuation and the
