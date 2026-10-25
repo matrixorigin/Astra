@@ -542,7 +542,7 @@ fn concurrent_fanout_scripts(
     let child_anchor = format!("{}: Return the", case.name);
     let call_id = format!("{}-fanout-start", case.name);
     let responses = vec![
-        native_search_response(&format!("{}-tool-search", case.name), "agent_fanout"),
+        native_search_response(&format!("{}-tool-search", case.name), "agent_fanout,agent"),
         native_invoke_response(
             &call_id,
             "agent_fanout",
@@ -1171,11 +1171,12 @@ pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(exp
                         "agent",
                         corrected,
                     )),
-                    native_tool_response(provider_tool_call(
+                    native_search_response("select-observation", "agent"),
+                    native_invoke_response(
                         "wait-for-result",
                         "agent",
                         json!({"action":"wait","timeout_ms":10000}),
-                    )),
+                    ),
                     native_text_response("The observed child result is 221."),
                 ],
             ),
@@ -1269,8 +1270,8 @@ pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(exp
                 })
             })
             .count(),
-        4,
-        "Explain capture must not change the correction/spawn/wait/final execution sequence"
+        5,
+        "Explain capture must preserve correction/spawn/selection/wait/final execution"
     );
     let children: Vec<_> = requests
         .iter()
@@ -1583,7 +1584,7 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
                         })
                 },
                 vec![
-                    native_search_response("online-fanout-search", "agent_fanout"),
+                    native_search_response("online-fanout-search", "agent_fanout,agent"),
                     native_invoke_response("online-fanout-start", "agent_fanout", fanout_args),
                     gated_native_delta(json!({"tool_calls":[{"index":0,"id":"online-fanout-wait","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}).to_string()}}]}), "tool_calls", releases.0[3].clone()),
                     native_text_response(final_reply),
@@ -2203,7 +2204,7 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
     );
     let mut child_responses:Vec<_>=releases.0.iter().map(|release|ProviderResponse::Stream { content_type:"text/event-stream", chunks:vec![format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{"content":"late child output must be suppressed"}}]})).into_bytes(),format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})).into_bytes(),b"data: [DONE]\n\n".to_vec()],release_before_chunk:Some((0,release.clone())) }).collect();
     ctx.install_native_provider(&auth,vec![
-        ProviderScript::new("cancel root exact requests",move |request|request.path=="/v1/chat/completions" && request.body["model"]==root_model && request.body["stream"]==true && delegation_assessment(&request.body).is_none() && request.body["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["role"]=="user" && m["content"]=="Start three slow reviews; the user will cancel the live root.")),vec![native_search_response("slow-fanout-tool-search", "agent_fanout"),native_invoke_response(
+        ProviderScript::new("cancel root exact requests",move |request|request.path=="/v1/chat/completions" && request.body["model"]==root_model && request.body["stream"]==true && delegation_assessment(&request.body).is_none() && request.body["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["role"]=="user" && m["content"]=="Start three slow reviews; the user will cancel the live root.")),vec![native_search_response("slow-fanout-tool-search", "agent_fanout,agent"),native_invoke_response(
                     "slow-fanout-before-root-cancel",
                     "agent_fanout",
                     json!({
@@ -3018,7 +3019,7 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
     let child_model = fixture_model.clone();
     ctx.install_native_provider(auth,vec![
         ProviderScript::new("actual parent fanout execution",move |request| request.path=="/v1/chat/completions" && request.body["model"]==root_model && request.body["stream"]==true && delegation_assessment(&request.body).is_none() && request.body["messages"].as_array().is_some_and(|messages|messages.iter().any(|message|message["role"]=="user" && message["content"]=="Run three reviews and preserve every failure cause.")),vec![
-                    native_search_response("online-failed-fanout-search", "agent_fanout"),
+                    native_search_response("online-failed-fanout-search", "agent_fanout,agent"),
                     native_invoke_response(
                         "online-failed-fanout-start",
                         "agent_fanout",

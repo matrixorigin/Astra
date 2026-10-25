@@ -2313,7 +2313,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
                             tool_call(
                                 "call-select-agent-parallel",
                                 "tool_search",
-                                json!({"query": "select:agent_fanout"})
+                                json!({"query": "select:agent_fanout,agent"})
                             )
                         ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call("call-fanout", "invoke_tool", json!({
@@ -2754,7 +2754,7 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
                 "action":"spawn","description":"discover GitHub availability","prompt":CHILD,
                 "agent_type":"explore","allowed_tools":["tool_search"],"max_output_tokens":256
             }}))], ""),
-            response(vec![tool_call("join-discovery-child", "agent", json!({"action":"wait","timeout_ms":10000}))], ""),
+            response(vec![tool_call("join-discovery-child", "invoke_tool", json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))], ""),
             response(vec![], MARKER),
         ]),
         ProviderScript::new("discovery child", |request| primary_request_for(request, CHILD) && delegation_assessment(&request.body).is_none(), vec![
