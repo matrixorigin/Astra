@@ -1671,7 +1671,7 @@ fn requested_model_policy_schema() -> Value {
         "Exact catalog provider/access_label only; omit unless user specifies one.";
     json!({
         "type": "object",
-        "x-astra-discovery-summary": "Not task/output text; inherit unless user picks execution model.",
+        "x-astra-discovery-summary": "Not task/output text; inherit unless user picks execution model. Chat Offering override: mode=fixed uses an exact model_catalog Offering ID/configured name; omit execution. Preserve model/source.",
         "description": "Optional execution-model override, distinct from the resolved Offering. Omit to inherit the parent Offering. Set a fixed selector only when the user requests an execution-model override, using an exact authorized Offering ID or configured name. If those choices are unknown, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not overrides. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
@@ -1726,6 +1726,7 @@ fn provider_child_execution_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
+        "x-astra-discovery-summary": "External collaborator only: copy exact tool/model from the current provider directory. Chat Offerings use requested_model_policy; omit execution. Never combine the two.",
         "description": "Use a currently available provider-owned agent tool when the user names that provider/protocol or when the requested model uniquely matches a model in the current provider directory. Choose the exact tool and, when supplied, exact model selector from that directory; do not inspect workspace configuration or use Bash to discover it. A plain model request that matches an authorized Astra Offering uses requested_model_policy and omits execution. If a request matches neither, or matches multiple capacities, ask once for the missing choice. Omit for normal internal model execution. Do not combine with requested_model_policy.",
         "properties": {
             "tool": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Exact tool name from the current capability surface; never a shell command or executable path."},

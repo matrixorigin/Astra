@@ -1298,7 +1298,28 @@ mod tests {
                         &parameters["slots"]["items"]["properties"]["requested_model_policy"],
                     ]
                 };
+                let executions = if selected["name"] == "agent" {
+                    vec![&parameters["execution"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["execution"],
+                        &parameters["slots"]["items"]["properties"]["execution"],
+                    ]
+                };
+                for execution in executions {
+                    let guidance = execution["description"].as_str().expect(
+                        "selected execution must distinguish provider collaborators from Chat Offerings",
+                    );
+                    assert!(guidance.contains("provider directory"));
+                    assert!(guidance.contains("requested_model_policy"));
+                    assert!(execution.get("x-astra-discovery-summary").is_none());
+                }
                 for policy in policies {
+                    let guidance = policy["description"].as_str().unwrap();
+                    assert!(guidance.contains("inherit"));
+                    assert!(guidance.contains("model_catalog"));
+                    assert!(guidance.contains("fixed"));
+                    assert!(guidance.contains("Not task/output text"));
                     let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
                         ["source"];
                     assert_eq!(source["description"], "Exact provider/access_label.");
