@@ -435,7 +435,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " No substitution. launch≠done. Wait. Mailbox:send_message;provider follow-up:exact collaborator_id."
+                " No substitution. spawn:description(label)+prompt. Auto results;wait:this run. Resume:exact collaborator_id."
             ),
         ),
         "introspect" => (

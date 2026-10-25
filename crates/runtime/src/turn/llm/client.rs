@@ -19665,6 +19665,37 @@ mod tests {
                 .unwrap()
                 .contains("get_result/list only")
         );
+        let spawn = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["properties"]["action"]["enum"] == json!(["spawn"]))
+            .unwrap();
+        assert_eq!(
+            spawn["required"],
+            json!(["action", "description", "prompt"])
+        );
+        for (arguments, accepted) in [
+            (
+                json!({"action":"spawn", "prompt":"Return a greeting"}),
+                false,
+            ),
+            (
+                json!({"action":"spawn", "description":"Greeting", "prompt":"Return a greeting"}),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                astra_tools::schemas::validate_tool_arguments_against_schema(
+                    "agent",
+                    &arguments,
+                    &body["tools"][0]
+                )
+                .is_ok(),
+                accepted,
+                "{arguments}",
+            );
+        }
         let wait = schema["oneOf"]
             .as_array()
             .unwrap()

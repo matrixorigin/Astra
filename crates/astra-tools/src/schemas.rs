@@ -24,7 +24,7 @@ pub const PER_ACTION_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-per-action-discove
 /// fan-out summary additionally preserves its cross-field slot invariant.
 const DELEGATION_DISCOVERY_SUMMARY: &str = concat!(
     crate::agent_parent_scope_guidance!(),
-    " Exact provider/Offering;no config/substitution;launch≠done;wait."
+    " Exact provider/Offering;no fallback;description+prompt;auto results."
 );
 const FANOUT_DISCOVERY_SUMMARY: &str = concat!(
     crate::agent_parent_scope_guidance!(),
@@ -3428,7 +3428,7 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("launch≠done")
+                        .contains("auto results")
                 );
                 let mut spawn = agent.clone();
                 project_action_discovery_summary(

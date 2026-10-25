@@ -535,7 +535,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("Wait"));
+    assert!(agent_description.contains("spawn:description(label)+prompt"));
+    assert!(agent_description.contains("wait:this run"));
     assert!(agent_description.contains("No substitution"));
     assert!(agent_description.starts_with(astra_tools::agent_parent_scope_guidance!()));
     let full = catalog_schemas();
@@ -644,7 +645,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("launch≠done")
+            .contains("Auto results")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
