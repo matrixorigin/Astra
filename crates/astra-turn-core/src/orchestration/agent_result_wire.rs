@@ -770,10 +770,10 @@ fn render_child_agent_result(mut body: Value) -> String {
 
 pub const CHILD_OUTCOME_GUIDANCE: &str = concat!(
     astra_tools::agent_parent_scope_guidance!(),
-    " While owned children remain pending and no independent work remains, use agent(action='wait') or propose an answer for runtime completion waiting. After sufficient terminal outcomes arrive, finish the request; wait for future input only when requested. Terminal child outcomes are delivered automatically. Do not re-fetch an already observed, sufficient terminal result. get_result/get_results remain available for inspection, missing or truncated output, pagination, and recovery. Do not busy-poll or use shell sleep. A wait timeout does not cancel children or authorize completion."
+    " When no independent work remains, propose an answer; the runtime completion barrier waits for owned children and resumes synthesis with their terminal outcomes. Do not claim completion before observing those outcomes. After sufficient terminal outcomes arrive, finish the request; wait for future input only when requested. Terminal child outcomes are delivered automatically. Do not re-fetch an already observed, sufficient terminal result. get_result/get_results remain available for inspection, missing or truncated output, pagination, and recovery. Do not busy-poll or use shell sleep. A wait timeout does not cancel children or authorize completion."
 );
 
-pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run, use agent(action='wait') for input, or propose a final answer so the runtime waits and resumes when continuation is available. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
+pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run with no independent work remaining, propose an answer so the runtime completion barrier waits and resumes when continuation is available. This does not authorize claiming that the child has completed. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
 
 pub fn render_wait_timeout_outcome(
     agent_id: &str,
