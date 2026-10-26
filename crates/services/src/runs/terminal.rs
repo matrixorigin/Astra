@@ -20,6 +20,7 @@ pub struct CanonicalRunTerminalRequest<'a> {
     pub waiting_for: Option<&'a str>,
     pub error_message: Option<&'a str>,
     pub error_code: Option<&'a str>,
+    pub error_kind: Option<astra_core::ErrorKind>,
     pub error_metadata: Option<&'a crate::models::ModelGatewayErrorMetadata>,
     pub cancellation_origin: Option<DurableCancellationOrigin>,
     pub prompt_tokens: u64,
@@ -90,6 +91,8 @@ pub struct CanonicalRunTerminalReceipt {
     /// owner, agent_runs.error_message.
     pub error_hash: Option<String>,
     pub error_code: Option<String>,
+    /// Source-authored classification, independent of a domain error code.
+    pub error_kind: Option<astra_core::ErrorKind>,
     pub error_metadata: Option<crate::models::ModelGatewayErrorMetadata>,
     pub context: CanonicalTerminalContext,
     pub transcript: CanonicalTerminalTranscript,
@@ -173,6 +176,9 @@ impl CanonicalRunTerminalReceipt {
                     ("error".into(), error_message.unwrap_or("Run failed").into()),
                     ("error_code".into(), serde_json::json!(self.error_code)),
                 ]);
+                if let Some(kind) = self.error_kind {
+                    data.insert("error_kind".into(), serde_json::json!(kind));
+                }
                 if let Some(metadata) = &self.error_metadata {
                     data.extend(metadata.wire_fields());
                 }
@@ -184,6 +190,9 @@ impl CanonicalRunTerminalReceipt {
             let mut data = serde_json::json!({"run_id":self.run_id, "owner_generation":self.generation,
                 "status":self.outcome.status(), "outcome":self.outcome.status(),
                 "qualified_usage":self.usage, "error":error_message, "error_code":self.error_code});
+            if let Some(kind) = self.error_kind {
+                data["error_kind"] = serde_json::json!(kind);
+            }
             if let CanonicalTerminalOutcome::Cancelled { origin } = self.outcome {
                 data["cancelled"] = true.into();
                 data["cancellation_origin"] = origin.as_str().into();
@@ -244,6 +253,9 @@ impl CanonicalRunTerminalReceipt {
             .is_some_and(|code| code.is_empty() || code.len() > 128)
         {
             return Err("invalid canonical terminal error code".into());
+        }
+        if self.error_kind.is_some() && !matches!(self.outcome, CanonicalTerminalOutcome::Failed) {
+            return Err("only failed outcomes carry an error classification".into());
         }
         if let Some(metadata) = &self.error_metadata {
             metadata.validate()?;
@@ -546,6 +558,7 @@ impl DatabaseRunStateStore {
             || receipt.generation != request.expected_owner_generation
             || receipt.outcome.status() != request.status
             || receipt.error_hash != CanonicalRunTerminalReceipt::error_hash(request.error_message)
+            || receipt.error_kind != request.error_kind
             || receipt.error_code.as_deref() != request.error_code
             || receipt.error_metadata.as_ref() != request.error_metadata
             || receipt.outcome != CanonicalRunTerminalReceipt::outcome_for_request(request)?
@@ -836,6 +849,7 @@ impl DatabaseRunStateStore {
             || decoded.receipt.session_id != request.expected_session_id
             || decoded.receipt.run_id != request.run_id
             || decoded.receipt.generation != request.expected_owner_generation
+            || decoded.receipt.error_kind != request.error_kind
             || error_message.as_deref() != request.error_message
             || error_code != expected.error_code
             || opening_hash.as_deref() != Some(expected.opening_hash.as_str())
@@ -939,6 +953,7 @@ mod tests {
                 outcome: CanonicalTerminalOutcome::Failed,
                 error_hash: CanonicalRunTerminalReceipt::error_hash(Some("Inference rejected")),
                 error_code: Some("insufficient_credit".into()),
+                error_kind: Some(astra_core::ErrorKind::Unknown),
                 error_metadata: ModelGatewayErrorMetadata::from_details(
                     details.as_object().unwrap(),
                 ),
@@ -975,10 +990,40 @@ mod tests {
         assert_eq!(public.len(), 2);
         assert_eq!(public[0]["type"], "run_error");
         assert_eq!(public[0]["error_code"], "insufficient_credit");
+        assert_eq!(public[0]["error_kind"], "unknown");
         assert_eq!(public[0]["http_status"], 402);
         assert_eq!(public[0]["retryable"], false);
         assert_eq!(public[0]["action"], "open_billing_overview");
         assert_eq!(public[1]["type"], "run_finished");
+        assert_eq!(public[1]["error_kind"], "unknown");
+    }
+
+    #[test]
+    fn cold_terminal_classification_is_typed_and_failure_only() {
+        let encoded = serde_json::to_value(failed_receipt()).unwrap();
+        for invalid in [
+            serde_json::json!("insufficient_credit"),
+            serde_json::json!(7),
+        ] {
+            let mut corrupt = encoded.clone();
+            corrupt["receipt"]["error_kind"] = invalid;
+            assert!(CommittedRunTerminalReceipt::decode(&corrupt.to_string(), 2).is_err());
+        }
+        let mut receipt = failed_receipt().receipt;
+        receipt.error_metadata = None;
+        receipt.error_code = None;
+        receipt.validate().unwrap();
+        // Missing evidence stays missing; Unknown is an explicit source classification.
+        receipt.error_kind = None;
+        receipt.validate().unwrap();
+        receipt.outcome = CanonicalTerminalOutcome::Completed;
+        receipt.validate().unwrap();
+        receipt.error_kind = Some(astra_core::ErrorKind::Unknown);
+        assert!(receipt.validate().is_err());
+        receipt.outcome = CanonicalTerminalOutcome::Cancelled {
+            origin: DurableCancellationOrigin::User,
+        };
+        assert!(receipt.validate().is_err());
     }
 
     #[test]
@@ -1000,6 +1045,7 @@ mod tests {
             );
         }
         let mut cancelled = failed_receipt();
+        cancelled.receipt.error_kind = None;
         cancelled.receipt.outcome = CanonicalTerminalOutcome::Cancelled {
             origin: DurableCancellationOrigin::User,
         };

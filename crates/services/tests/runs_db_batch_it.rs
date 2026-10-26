@@ -180,6 +180,7 @@ async fn complete_run_fixture(
         outcome: CanonicalTerminalOutcome::Completed,
         error_hash: None,
         error_code: None,
+        error_kind: None,
         error_metadata: None,
         context: CanonicalTerminalContext::Unowned,
         transcript: CanonicalTerminalTranscript {
@@ -208,6 +209,7 @@ async fn complete_run_fixture(
                 waiting_for: None,
                 error_message: None,
                 error_code: None,
+                error_kind: None,
                 error_metadata: None,
                 cancellation_origin: None,
                 prompt_tokens: prompt.unwrap_or(0),

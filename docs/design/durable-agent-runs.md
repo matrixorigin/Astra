@@ -241,6 +241,15 @@ Terminal states should distinguish:
 - expired;
 - superseded.
 
+The canonical terminal receipt keeps source-authored `error_kind` independently
+of the domain `error_code`. Live delivery and replay project the same kind on
+both `run_error` and `run_finished`; a reconnect after the error frame must not
+lose the classification or discard a valid partial answer. A missing kind stays
+unknown evidence, rather than being inferred from a business code. Only failed
+outcomes carry a kind, and accepted cancellation clears it with the failure code
+and gateway metadata. Exact terminal reconciliation compares this fact as part
+of the existing receipt, without an additional query or storage projection.
+
 ## Resume
 
 Resume should validate:

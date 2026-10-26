@@ -323,6 +323,7 @@ impl PostLoopPersistContext {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
         error_code: Option<&str>,
+        error_kind: Option<astra_core::ErrorKind>,
         error_metadata: Option<&astra_services::models::ModelGatewayErrorMetadata>,
         cancellation_origin: Option<astra_turn_core::orchestration_types::CancellationOrigin>,
         context_commit: Option<&PreparedSessionContextCommit>,
@@ -349,6 +350,7 @@ impl PostLoopPersistContext {
                 waiting_for,
                 error_message,
                 error_code,
+                error_kind,
                 error_metadata,
                 cancellation_origin,
                 prompt_tokens: state.provider_input_tokens(),
@@ -412,6 +414,7 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
     pub(crate) waiting_for: Option<&'a str>,
     pub(crate) error_message: Option<&'a str>,
     pub(crate) error_code: Option<&'a str>,
+    pub(crate) error_kind: Option<astra_core::ErrorKind>,
     pub(crate) error_metadata: Option<&'a astra_services::models::ModelGatewayErrorMetadata>,
     pub(crate) cancellation_origin:
         Option<astra_turn_core::orchestration_types::CancellationOrigin>,
@@ -443,6 +446,7 @@ fn atomic_terminal_request<'a>(
         waiting_for: settlement.waiting_for,
         error_message: settlement.error_message,
         error_code: settlement.error_code,
+        error_kind: settlement.error_kind,
         error_metadata: settlement.error_metadata,
         cancellation_origin: settlement.cancellation_origin.map(|origin| match origin {
             astra_turn_core::orchestration_types::CancellationOrigin::User => {
@@ -661,6 +665,7 @@ async fn prepare_canonical_terminal(
         outcome,
         error_hash: CanonicalRunTerminalReceipt::error_hash(settlement.error_message),
         error_code: request.error_code.map(str::to_owned),
+        error_kind: request.error_kind,
         error_metadata: settlement.error_metadata.cloned(),
         context,
         transcript: CanonicalTerminalTranscript {
@@ -767,6 +772,7 @@ async fn persist_server_loop_canonical_append_inner(
                             astra_turn_core::orchestration_types::CancellationOrigin::User,
                         ),
                         error_code: None,
+                        error_kind: None,
                         error_metadata: None,
                         ..*current
                     };
@@ -779,6 +785,7 @@ async fn persist_server_loop_canonical_append_inner(
                         CanonicalTerminalContext::Unowned
                     };
                     prepared.receipt.error_code = None;
+                    prepared.receipt.error_kind = None;
                     prepared.receipt.error_metadata = None;
                 }
                 CanonicalTerminalClaim::Paused => {
@@ -4546,6 +4553,7 @@ mod tests {
                 waiting_for: None,
                 error_message: None,
                 error_code: None,
+                error_kind: None,
                 error_metadata: None,
                 cancellation_origin: None,
                 prompt_tokens: 11,
@@ -4690,6 +4698,7 @@ mod tests {
                 waiting_for: None,
                 error_message: None,
                 error_code: None,
+                error_kind: None,
                 error_metadata: None,
                 cancellation_origin: None,
                 prompt_tokens: 31,
@@ -4795,6 +4804,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_terminal_failure_keeps_classification_through_commit_and_replay() {
+        assert_canonical_terminal(TerminalCase::Failed).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_user_cancellation_converges_with_raw_in_same_transaction() {
         assert_canonical_terminal(TerminalCase::UserCancellation).await;
     }
@@ -4814,6 +4829,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum TerminalCase {
         Completed,
+        Failed,
         LateGuidance,
         RawCollision,
         UserCancellation,
@@ -4926,14 +4942,21 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let proposed_failure =
+            matches!(case, TerminalCase::Failed | TerminalCase::UserCancellation);
         let settlement = CanonicalTerminalSettlement {
             expected_owner_pod_id: owner,
             expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
             expected_owner_generation: generation,
-            status: astra_core::STATUS_COMPLETED,
+            status: if proposed_failure {
+                astra_core::STATUS_FAILED
+            } else {
+                astra_core::STATUS_COMPLETED
+            },
             waiting_for: None,
-            error_message: None,
-            error_code: None,
+            error_message: proposed_failure.then_some("provider disconnected"),
+            error_code: proposed_failure.then_some("provider_connection_lost"),
+            error_kind: proposed_failure.then_some(astra_core::ErrorKind::Network),
             error_metadata: None,
             cancellation_origin: None,
             prompt_tokens: 606,
@@ -4994,6 +5017,8 @@ mod tests {
             let commit = result.unwrap();
             let expected_status = if case == TerminalCase::UserCancellation {
                 STATUS_CANCELLED
+            } else if case == TerminalCase::Failed {
+                astra_core::STATUS_FAILED
             } else {
                 astra_core::STATUS_COMPLETED
             };
@@ -5039,6 +5064,20 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(completion.len(), 1);
             assert_eq!(completion[0]["data"]["status"], expected_status);
+            let expected_kind =
+                (case == TerminalCase::Failed).then_some(astra_core::ErrorKind::Network);
+            assert_eq!(completion[0]["data"]["error_kind"], json!(expected_kind));
+            let stored = astra_services::runs::CommittedRunTerminalReceipt::decode(
+                current.terminal_receipt_json.as_deref().unwrap(),
+                current.last_event_idx,
+            )
+            .unwrap();
+            assert_eq!(stored.receipt.error_kind, expected_kind);
+            if case == TerminalCase::UserCancellation {
+                assert!(stored.receipt.error_code.is_none());
+                assert!(stored.receipt.error_metadata.is_none());
+            }
+
             let text = current
                 .events
                 .iter()
@@ -5074,6 +5113,27 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(replay.terminal_status, commit.terminal_status);
+            assert_eq!(replay.terminal_events, commit.terminal_events);
+            if case == TerminalCase::Failed {
+                for kind in [None, Some(astra_core::ErrorKind::Unknown)] {
+                    assert!(
+                        persist_server_loop_canonical_terminal_settlement(
+                            &pool,
+                            append(),
+                            &state,
+                            CanonicalTerminalSettlement {
+                                error_kind: kind,
+                                ..settlement
+                            },
+                            None,
+                        )
+                        .await
+                        .is_err(),
+                        "changed classification cannot reconcile an exact commit"
+                    );
+                }
+            }
+
             assert_eq!(
                 store
                     .load_run(&user, &run_id)

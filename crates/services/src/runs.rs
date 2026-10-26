@@ -34830,9 +34830,10 @@ mod tests {
             generation: opened.run_generation,
             opening_hash: opened.opening_hash.clone().unwrap(),
             context_admission_hash: opened.context_admission_hash.clone(),
-            outcome: CanonicalTerminalOutcome::Completed,
+            outcome: CanonicalTerminalOutcome::Failed,
             error_hash: None,
-            error_code: None,
+            error_code: Some("business_failure".into()),
+            error_kind: Some(astra_core::ErrorKind::Unknown),
             error_metadata: None,
             context: CanonicalTerminalContext::Unchanged,
             transcript: CanonicalTerminalTranscript {
@@ -34849,10 +34850,11 @@ mod tests {
             expected_session_id: &session,
             expected_statuses: &[STATUS_RUNNING],
             expected_owner_generation: opened.run_generation,
-            status: STATUS_COMPLETED,
+            status: STATUS_FAILED,
             waiting_for: None,
             error_message: None,
-            error_code: None,
+            error_code: Some("business_failure"),
+            error_kind: Some(astra_core::ErrorKind::Unknown),
             error_metadata: None,
             cancellation_origin: None,
             prompt_tokens: 0,
@@ -34895,6 +34897,23 @@ mod tests {
                 .expect("changed metadata must not claim a terminal")
                 .contains("exact receipt")
         );
+        for kind in [None, Some(astra_core::ErrorKind::Network)] {
+            assert!(
+                store
+                    .claim_canonical_terminal_in_transaction(
+                        &mut tx,
+                        CanonicalRunTerminalRequest {
+                            error_kind: kind,
+                            ..request
+                        },
+                        &receipt
+                    )
+                    .await
+                    .err()
+                    .expect("classification mismatch must fail")
+                    .contains("exact receipt")
+            );
+        }
         let admission = store
             .claim_canonical_terminal_in_transaction(&mut tx, request, &receipt)
             .await
@@ -34988,7 +35007,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(committed.completion_first(), 4);
-        assert_eq!(committed.completion_count(), 1);
+        assert_eq!(committed.completion_count(), 2);
+        assert_eq!(
+            committed.receipt.error_kind,
+            Some(astra_core::ErrorKind::Unknown)
+        );
+        for kind in [None, Some(astra_core::ErrorKind::Network)] {
+            assert!(
+                store
+                    .resolve_canonical_terminal_receipt(
+                        CanonicalRunTerminalRequest {
+                            error_kind: kind,
+                            ..request
+                        },
+                        &receipt
+                    )
+                    .await
+                    .is_err()
+            );
+            let altered = CanonicalRunTerminalReceipt {
+                error_kind: kind,
+                ..receipt.clone()
+            };
+            assert!(
+                store
+                    .resolve_canonical_terminal_receipt(
+                        CanonicalRunTerminalRequest {
+                            error_kind: kind,
+                            ..request
+                        },
+                        &altered
+                    )
+                    .await
+                    .is_err()
+            );
+        }
         // Later genuine facts cannot shift the reserved virtual completion.
         sqlx::query("UPDATE agent_runs SET last_event_idx = last_event_idx + 5 WHERE user_id = ? AND run_id = ?")
             .bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();

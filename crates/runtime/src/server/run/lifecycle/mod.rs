@@ -7927,6 +7927,7 @@ impl AgenticRunLifecycleService {
         loop_state: &AgenticLoopState,
     ) -> (Vec<Value>, RunStatus, Option<String>) {
         let usage = Self::durable_run_accounting(loop_state);
+        let error_kind = loop_terminal_error_kind(&loop_outcome, loop_state);
         let lease_lost = loop_state.cancellation.execution_lease_lost.as_ref();
         let mut ownership_fenced = lease_lost.is_some_and(|lost| lost.load(Ordering::Acquire));
         let raw_cancellation_requested = loop_state
@@ -8063,13 +8064,13 @@ impl AgenticRunLifecycleService {
                         "data": {
                             "error": rejection.message.clone(),
                             "error_code": rejection.code,
-                            "error_kind": "contract_violation",
+                            "error_kind": error_kind,
                         }
                     }));
                     let mut finished = usage;
                     finished["error"] = Value::String(rejection.message.clone());
                     finished["error_code"] = Value::String(rejection.code.to_string());
-                    finished["error_kind"] = Value::String("contract_violation".to_string());
+                    finished["error_kind"] = json!(error_kind);
                     events.push(json!({
                         "event_type": "run_finished",
                         "data": finished,
@@ -8094,12 +8095,12 @@ impl AgenticRunLifecycleService {
                         }}));
                     }
                     events.push(json!({"event_type":"run_error", "data": {
-                        "error":message, "error_code":code, "error_kind":code,
+                        "error":message, "error_code":code, "error_kind":error_kind,
                     }}));
                     let mut finished = usage;
                     finished["error"] = json!(message);
                     finished["error_code"] = json!(code);
-                    finished["error_kind"] = json!(code);
+                    finished["error_kind"] = json!(error_kind);
                     events.push(json!({"event_type":"run_finished", "data":finished}));
                     (RunStatus::Failed, Some(message))
                 }
@@ -8129,20 +8130,19 @@ impl AgenticRunLifecycleService {
                     (RunStatus::Cancelled, None)
                 }
                 Ok(AgenticLoopOutcome::Error(e)) => {
-                    let classified = astra_core::ClassifiedError::from(e.clone());
-                    let error_kind = classified.kind.as_str();
+                    let error_code = error_kind.map(astra_core::ErrorKind::as_str);
                     events.push(json!({
                         "event_type": "run_error",
                         "data": {
                             "error": e.clone(),
-                            "error_code": error_kind,
+                            "error_code": error_code,
                             "error_kind": error_kind,
                         }
                     }));
                     let mut finished = usage.clone();
                     finished["error"] = Value::String(e.clone());
-                    finished["error_code"] = Value::String(error_kind.to_string());
-                    finished["error_kind"] = Value::String(error_kind.to_string());
+                    finished["error_code"] = json!(error_code);
+                    finished["error_kind"] = json!(error_kind);
                     events.push(json!({
                         "event_type": "run_finished",
                         "data": finished,
@@ -8179,7 +8179,6 @@ impl AgenticRunLifecycleService {
                         }}));
                     }
                     let msg = err.to_string();
-                    let error_kind = err.kind.as_str();
                     let error_code = classified_terminal_error_code(&err);
                     let mut run_error = json!({
                         "event_type": "run_error",
@@ -8196,7 +8195,7 @@ impl AgenticRunLifecycleService {
                     let mut finished = usage;
                     finished["error"] = Value::String(msg.clone());
                     finished["error_code"] = Value::String(error_code);
-                    finished["error_kind"] = Value::String(error_kind.to_string());
+                    finished["error_kind"] = json!(error_kind);
                     events.push(json!({
                         "event_type": "run_finished",
                         "data": finished,
@@ -14207,6 +14206,7 @@ impl AgenticRunLifecycleService {
                     result => result,
                 };
                 let loop_success = loop_result.is_ok() && state.interruption.is_none();
+                let terminal_error_kind = loop_terminal_error_kind(&loop_result, &state);
                 let terminal_error_metadata = loop_result
                     .as_ref()
                     .err()
@@ -14551,6 +14551,8 @@ impl AgenticRunLifecycleService {
                                         (persisted_status == RunStatus::Failed)
                                             .then_some(terminal_error_code.as_deref())
                                             .flatten(),
+                                        terminal_error_kind
+                                            .filter(|_| persisted_status == RunStatus::Failed),
                                         terminal_error_metadata
                                             .as_ref()
                                             .filter(|_| persisted_status == RunStatus::Failed),
@@ -19564,6 +19566,29 @@ fn server_subrun_live_reason(
             Some(format!("{}: {}", rejection.code, rejection.message))
         }
         Err(error) => Some(error.to_string()),
+    }
+}
+
+/// Preserve the source classification independently of a domain error code.
+/// Interruption labels without an ErrorKind remain unclassified; neither a
+/// business code nor missing evidence is permission to invent a failure kind.
+fn loop_terminal_error_kind(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    state: &AgenticLoopState,
+) -> Option<astra_core::ErrorKind> {
+    match outcome {
+        Err(error) => Some(error.kind),
+        Ok(AgenticLoopOutcome::Error(message)) => {
+            Some(astra_core::ClassifiedError::from(message.clone()).kind)
+        }
+        Ok(AgenticLoopOutcome::ControlRejected(_)) => {
+            Some(astra_core::ErrorKind::ContractViolation)
+        }
+        Ok(AgenticLoopOutcome::Completed) => state
+            .interruption
+            .as_ref()
+            .and_then(|interruption| astra_core::ErrorKind::parse_tag(interruption.kind.label())),
+        _ => None,
     }
 }
 
@@ -24614,6 +24639,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 waiting_for,
                 error_message: durable_error.as_deref(),
                 error_code: durable_error_code,
+                error_kind: loop_terminal_error_kind(&outcome, &loop_state)
+                    .filter(|_| durable_status == STATUS_FAILED),
                 error_metadata: error_metadata.as_ref().filter(|_| durable_status == STATUS_FAILED),
                 cancellation_origin,
                 prompt_tokens,

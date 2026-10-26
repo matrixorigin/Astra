@@ -1402,6 +1402,7 @@ mod tests {
                     },
                     error_hash: CanonicalRunTerminalReceipt::error_hash(error),
                     error_code: failed.then(|| "stream_transport".into()),
+                    error_kind: failed.then_some(astra_core::ErrorKind::StreamTransport),
                     error_metadata: None,
                     context: CanonicalTerminalContext::Unowned,
                     transcript: CanonicalTerminalTranscript {
@@ -1480,77 +1481,126 @@ mod tests {
         use astra_turn_core::sse::stream_host::{NoopSseStreamHost, consume_sse_stream};
         let usage =
             astra_turn_types::CanonicalTokenUsage::new(Some(17), None, None, Some(3)).unwrap();
-        let receipt = CanonicalRunTerminalReceipt {
-            schema_version: 1,
-            user_id: "owner".into(),
-            session_id: "session".into(),
-            run_id: "partial-run".into(),
-            generation: 4,
-            opening_hash: "a".repeat(64),
-            context_admission_hash: None,
-            outcome: CanonicalTerminalOutcome::Failed,
-            error_hash: CanonicalRunTerminalReceipt::error_hash(Some("stream stopped")),
-            error_code: Some("stream_transport".into()),
-            error_metadata: None,
-            context: CanonicalTerminalContext::Unowned,
-            transcript: CanonicalTerminalTranscript {
-                item_count: 1,
-                digest: "b".repeat(64),
-                assistant_source_event_id: Some("source".into()),
-            },
-            usage: Some(usage),
-            tool_ledger: None,
-        };
-        let completion = receipt
-            .completion_events(
-                Some("  observed partial bytes\n"),
-                Some("answer-id"),
-                Some("stream stopped"),
-                Some(1),
-                -1,
-                3,
-            )
-            .unwrap();
-        let mut projected = vec![serde_json::json!({
-            "type":"session_info", "session_id":"session", "run_id":"partial-run"
-        })];
-        projected.extend(transform_stream_run_events_for_client(
-            "partial-run",
-            completion,
-        ));
-        let frames: Vec<_> = projected
-            .iter()
-            .map(|event| format!("data: {event}\n\n"))
-            .collect();
-        for chunks in [
-            frames
-                .iter()
-                .map(|frame| Ok(frame.as_bytes().to_vec()))
-                .collect::<Vec<_>>(),
-            vec![Ok(frames.concat().trim_end().as_bytes().to_vec())],
+        for (error_code, error_kind) in [
+            (
+                Some("stream_transport"),
+                Some(astra_core::ErrorKind::StreamTransport),
+            ),
+            (
+                Some("insufficient_credit"),
+                Some(astra_core::ErrorKind::Unknown),
+            ),
+            (None, Some(astra_core::ErrorKind::Network)),
+            (
+                Some("work_lifecycle_topology_conflict"),
+                Some(astra_core::ErrorKind::ContractViolation),
+            ),
+            (Some("unclassified_business_failure"), None),
+            (Some("stream_transport"), None),
         ] {
-            let mut source = futures_util::stream::iter(chunks);
-            let (result, abort) = consume_sse_stream(
-                &mut source,
-                &mut NoopSseStreamHost,
-                std::time::Duration::from_secs(1),
-            )
-            .await;
-            assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
-            assert!(result.accum.has_authoritative_failed_terminal());
-            assert_eq!(result.accum.full_text, "  observed partial bytes\n");
-            assert_eq!(result.accum.model_item_id.as_deref(), Some("answer-id"));
-            assert_eq!(result.accum.accounted_usage(), Some(usage));
-            assert!(!result.accum.stream_complete);
-            assert!(result.accum.server_execution_summary.is_none());
-            assert!(result.tool_results.is_empty());
-            let snapshot =
+            let receipt = CanonicalRunTerminalReceipt {
+                schema_version: 1,
+                user_id: "owner".into(),
+                session_id: "session".into(),
+                run_id: "partial-run".into(),
+                generation: 4,
+                opening_hash: "a".repeat(64),
+                context_admission_hash: None,
+                outcome: CanonicalTerminalOutcome::Failed,
+                error_hash: CanonicalRunTerminalReceipt::error_hash(Some("stream stopped")),
+                error_code: error_code.map(str::to_owned),
+                error_kind,
+                error_metadata: None,
+                context: CanonicalTerminalContext::Unowned,
+                transcript: CanonicalTerminalTranscript {
+                    item_count: 1,
+                    digest: "b".repeat(64),
+                    assistant_source_event_id: Some("source".into()),
+                },
+                usage: Some(usage),
+                tool_ledger: None,
+            };
+            // Cold replay must preserve the same typed fact as live completion.
+            let receipt: CanonicalRunTerminalReceipt =
+                serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
+            for terminal_only in [false, true] {
+                let completion = receipt
+                    .completion_events(
+                        (!terminal_only).then_some("  observed partial bytes\n"),
+                        Some("answer-id"),
+                        Some("stream stopped"),
+                        Some(1),
+                        if terminal_only { 2 } else { -1 },
+                        3,
+                    )
+                    .unwrap();
+                if terminal_only {
+                    assert_eq!(completion.len(), 1);
+                    assert_eq!(completion[0]["event_type"], "run_finished");
+                }
+                let mut projected = vec![serde_json::json!({
+                    "type":"session_info", "session_id":"session", "run_id":"partial-run"
+                })];
+                if terminal_only {
+                    projected.push(
+                        serde_json::json!({"type":"text_delta", "content":"  observed partial bytes\n"}),
+                    );
+                }
+                projected.extend(transform_stream_run_events_for_client(
+                    "partial-run",
+                    completion,
+                ));
+                let frames: Vec<_> = projected
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                for chunks in [
+                    frames
+                        .iter()
+                        .map(|frame| Ok(frame.as_bytes().to_vec()))
+                        .collect::<Vec<_>>(),
+                    vec![Ok(frames.concat().trim_end().as_bytes().to_vec())],
+                ] {
+                    let mut source = futures_util::stream::iter(chunks);
+                    let (result, abort) = consume_sse_stream(
+                        &mut source,
+                        &mut NoopSseStreamHost,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await;
+                    let expected_kind = error_kind
+                        .or_else(|| error_code.and_then(astra_core::ErrorKind::parse_tag))
+                        .unwrap_or(astra_core::ErrorKind::ContractViolation);
+                    let preserve = expected_kind != astra_core::ErrorKind::ContractViolation;
+                    let expected_text = if preserve {
+                        "  observed partial bytes\n"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(abort, Some(expected_kind));
+                    assert_eq!(result.accum.has_authoritative_failed_terminal(), preserve);
+                    assert_eq!(result.accum.full_text, expected_text);
+                    if preserve {
+                        assert_eq!(
+                            result.accum.model_item_id.as_deref(),
+                            (!terminal_only).then_some("answer-id")
+                        );
+                        assert_eq!(result.accum.accounted_usage(), Some(usage));
+                    }
+                    assert!(!result.accum.stream_complete);
+                    assert!(result.accum.server_execution_summary.is_none());
+                    assert!(result.tool_results.is_empty());
+                    let snapshot =
                 astra_turn_core::agentic::turn_ingest::agentic_turn_stream_snapshot_from_sse_accum(
                     &result.accum,
                     None,
                 );
-            assert_eq!(snapshot.full_text, "  observed partial bytes\n");
-            assert_eq!(snapshot.qualified_usage, Some(usage));
+                    assert_eq!(snapshot.full_text, expected_text);
+                    if preserve {
+                        assert_eq!(snapshot.qualified_usage, Some(usage));
+                    }
+                }
+            }
         }
     }
 

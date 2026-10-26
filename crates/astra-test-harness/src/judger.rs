@@ -1286,21 +1286,22 @@ impl Judger for ExternalCmdJudger {
         if let Some(evidence) = evidence {
             let request =
                 build_judger_request(criterion, outcome, Some(evidence)).map_err(prepare)?;
-            input["verified_child_evidence"] = request.state["verified_child_evidence"].clone();
+            for field in ["verified_child_evidence", "execution_evidence"] {
+                if let Some(value) = request.state.get(field) {
+                    input[field] = value.clone();
+                }
+            }
             input["policy"] = request.state["policy"].clone();
             input["outcome"]["text"] = evidence.0["parent_response"].clone();
             input["outcome"]["stderr"] = serde_json::json!("");
-            if serde_json::to_vec(&input)
-                .map_err(|e| prepare(e.to_string()))?
-                .len()
-                > EXTERNAL_JUDGER_REQUEST_CAP
-            {
-                return Err(judger_error(
-                    ErrorKind::ResourceLimit,
-                    JudgerFailureStage::RequestPreparation,
-                    "complete semantic judgment exceeds judge budget",
-                ));
-            }
+        }
+        let payload = serde_json::to_vec(&input).map_err(|e| prepare(e.to_string()))?;
+        if payload.len() > EXTERNAL_JUDGER_REQUEST_CAP {
+            return Err(judger_error(
+                ErrorKind::ResourceLimit,
+                JudgerFailureStage::RequestPreparation,
+                "complete judgment exceeds judge budget",
+            ));
         }
         if self.cmd.trim().is_empty() {
             return Err(judger_error(
@@ -1310,7 +1311,6 @@ impl Judger for ExternalCmdJudger {
             ));
         }
 
-        let payload = serde_json::to_vec(&input).map_err(|e| prepare(e.to_string()))?;
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(self.timeout_seconds);
         let mut command = Command::new("sh");
@@ -1682,37 +1682,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_external_judger_receives_child_and_parent_separately() {
+    async fn external_judger_preserves_child_and_action_evidence() {
         let (outcome, adoption) = semantic_fixture();
-        let evidence = semantic_fixture_evidence("Compute six times seven", &outcome, &adoption)
+        let child = semantic_fixture_evidence("Compute six times seven", &outcome, &adoption)
             .unwrap()
             .unwrap();
-        let script = r#"
-input=$(cat)
-for field in '"verified_child_evidence"' '"content":"43"' '"parent_response":"The answer is 42."'; do
-  case "$input" in
-    *"$field"*) ;;
-    *) echo 'missing original evidence' >&2; exit 1 ;;
-  esac
-done
-echo '{"score":0.0,"rationale":"child is wrong despite correct parent"}'
-"#;
-        let result = evaluate_judger(
-            &ExternalCmdJudger::new(script, 5),
-            &hard_criterion(1.0),
-            &outcome,
-            Some(&evidence),
-        )
-        .await
-        .unwrap();
-        assert!(!result.passed);
-        assert!(
-            result
-                .detail
-                .contains("child is wrong despite correct parent"),
-            "{result:?}"
+        let trace = crate::execution_capture::tests::trace(
+            outcome
+                .stream_capture
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap(),
         );
+        let action =
+            semantic_judger_evidence("verify action", &outcome, &[&outcome], None, Some(&trace))
+                .unwrap()
+                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for (field, evidence) in [
+            ("verified_child_evidence", child),
+            ("execution_evidence", action),
+        ] {
+            let input_file = directory.path().join(field);
+            let command = format!(
+                "cat > {}; printf '%s' '{{\"score\":0.0,\"rationale\":\"original evidence received\"}}'",
+                crate::exec::shell_escape(input_file.display().to_string()),
+            );
+            let result = evaluate_judger(
+                &ExternalCmdJudger::new(command, 5),
+                &hard_criterion(1.0),
+                &outcome,
+                Some(&evidence),
+            )
+            .await
+            .unwrap();
+            assert!(!result.passed);
+            let input: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(input_file).unwrap()).unwrap();
+            assert_eq!(input[field], evidence.0);
+            assert_eq!(input["outcome"]["text"], evidence.0["parent_response"]);
+            let other = if field == "execution_evidence" {
+                "verified_child_evidence"
+            } else {
+                "execution_evidence"
+            };
+            assert!(input.get(other).is_none());
+            assert_eq!(
+                input["policy"],
+                build_judger_request(&hard_criterion(1.0), &outcome, Some(&evidence))
+                    .unwrap()
+                    .state["policy"]
+            );
+        }
     }
+
+    #[tokio::test]
+    async fn oversized_text_only_judgment_never_launches_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("started");
+        let command = format!(
+            "touch {}",
+            crate::exec::shell_escape(marker.display().to_string())
+        );
+        let mut outcome = dummy_outcome();
+        outcome.text = "x".repeat(EXTERNAL_JUDGER_REQUEST_CAP);
+        let error = ExternalCmdJudger::new(command, 5)
+            .judge(&quality_criterion("q"), &outcome, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ResourceLimit);
+        assert!(error.message.contains("exceeds judge budget"));
+        assert!(!marker.exists());
+    }
+
     pub(super) fn quality_criterion(question: &str) -> Criterion {
         Criterion::Judger {
             question: question.into(),
@@ -2825,7 +2869,9 @@ print({response:?})
             ("head -c 131072 /dev/zero >&2; cat >/dev/null; echo '{\"score\":1.0,\"rationale\":\"ok\"}'", ""),
         ].map(|(command, expected)| async move {
             let judge = ExternalCmdJudger::new(command, 1);
-            let outcome = dummy_outcome().with_text("x".repeat(2 * 1024 * 1024));
+            // Exercise pipe deadlines with an admissible envelope. Oversized
+            // input has its own pre-spawn rejection control above.
+            let outcome = dummy_outcome().with_text("x".repeat(EXTERNAL_JUDGER_REQUEST_CAP / 2));
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 judge.judge(&quality_criterion("q"), &outcome, None),
@@ -2833,7 +2879,8 @@ print({response:?})
             if expected.is_empty() {
                 assert_eq!(grade(&result.unwrap()), 1.0);
             } else {
-                assert!(result.unwrap_err().message.contains(expected), "{command}");
+                let error = result.unwrap_err();
+                assert!(error.message.contains(expected), "{command}: {error}");
             }
         })).await;
     }
