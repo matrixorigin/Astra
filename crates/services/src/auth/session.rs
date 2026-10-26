@@ -16,10 +16,30 @@ use sqlx::{Connection, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
-const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (COALESCE(updated_at, created_at) < ";
-const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (COALESCE(updated_at, created_at) = ";
-const SESSION_LIST_ORDER_SQL: &str =
-    " ORDER BY COALESCE(updated_at, created_at) DESC, session_id DESC LIMIT ";
+const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (activity_at < ";
+const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (activity_at = ";
+const SESSION_LIST_ORDER_SQL: &str = " ORDER BY activity_at DESC, session_id DESC LIMIT ";
+
+/// Session recency includes metadata and established Context head activity,
+/// including Controller writes. It does not read immutable conversation history.
+/// Keep one row per owner/session and preserve metadata-only sessions.
+pub(crate) fn push_session_activity_source(query: &mut QueryBuilder<MySql>, user_id: &str) {
+    query.push(
+        "(SELECT s.*, COALESCE(h.completed_turn, 0) AS context_completed_turn,
+                    GREATEST(COALESCE(s.updated_at, s.created_at),
+                              COALESCE(h.updated_at, s.created_at)) AS activity_at
+          FROM agent_sessions s
+          LEFT JOIN session_context_heads h
+            ON h.isolation_domain = 'server' AND h.owner_user_id = s.user_id
+           AND h.session_id = s.session_id AND h.branch_id = ",
+    );
+    query.push_bind(astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID);
+    query.push(
+        " AND h.head_json IS NOT NULL AND h.completed_turn > 0
+          WHERE s.user_id = ",
+    );
+    query.push_bind(user_id).push(") AS s");
+}
 const SESSION_ACTIVITY_SELECT_SQL: &str = "SELECT log_id, action, \
         IFNULL(CAST(details AS CHAR), 'null') AS details_json, \
         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
@@ -675,20 +695,25 @@ impl DatabaseSessionService {
         user_id: &str,
     ) -> Result<Option<(SessionRecord, SessionAdmissionFacts)>, (StatusCode, Json<ErrorResponse>)>
     {
-        let row = query(
+        let mut select = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
              active_plan_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
-             DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
+             DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_optional(executor)
-        .await
-        .map_err(internal_error)?;
+             FROM ",
+        );
+        push_session_activity_source(&mut select, user_id);
+        select
+            .push(" WHERE session_id = ")
+            .push_bind(session_id)
+            .push(" LIMIT 1");
+        let row = select
+            .build()
+            .fetch_optional(executor)
+            .await
+            .map_err(internal_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -840,13 +865,14 @@ impl SessionService for DatabaseSessionService {
         let mut list_query = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
-             DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
+             DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
-             DATE_FORMAT(COALESCE(updated_at, created_at), '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at, \
+             DATE_FORMAT(activity_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM agent_sessions WHERE user_id = ",
+             FROM ",
         );
-        list_query.push_bind(&filter.user_id);
+        push_session_activity_source(&mut list_query, &filter.user_id);
+        list_query.push(" WHERE 1 = 1");
         if let Some(agent_id) = &filter.agent_id {
             list_query.push(" AND agent_id = ");
             list_query.push_bind(agent_id);

@@ -251,16 +251,6 @@ fn map_recovery_point_blocker(
             false,
             vec![WorkApiActionHint::RefreshWork],
         ),
-        Blocker::DanglingRunSlot | Blocker::RunStatusMissing => {
-            tracing::error!(work_id, blocker = ?reason, "Work recovery point found corrupt Run slot");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "recovery_point_repair_required",
-                WorkApiErrorCategory::Degraded,
-                false,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        }
         Blocker::ActiveRun => work_error(
             StatusCode::CONFLICT,
             "recovery_point_run_active",
@@ -1970,61 +1960,6 @@ fn transcript_row_u64(row: &sqlx::mysql::MySqlRow, field: &str) -> Result<u64, S
     u64::try_from(value).map_err(|_| format!("{field} is negative"))
 }
 
-fn decode_work_transcript_head(
-    row: &sqlx::mysql::MySqlRow,
-) -> Result<WorkConversationHeadV1, String> {
-    let completed_turn = u32::try_from(transcript_row_u64(row, "completed_turn")?)
-        .map_err(|_| "completed_turn exceeds u32".to_string())?;
-    let projection_schema = u32::try_from(transcript_row_u64(row, "projection_schema")?)
-        .map_err(|_| "projection_schema exceeds u32".to_string())?;
-    let canonical_root_hash = row
-        .try_get::<String, _>("canonical_root_hash")
-        .map_err(|error| error.to_string())?;
-    if completed_turn == 0
-        || projection_schema == 0
-        || canonical_root_hash.len() != 64
-        || !canonical_root_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err("transcript cursor is structurally invalid".to_string());
-    }
-    Ok(WorkConversationHeadV1 {
-        completed_turn,
-        journal_event_seq: transcript_row_u64(row, "journal_event_seq")?,
-        conversation_seq: transcript_row_u64(row, "conversation_seq")?,
-        canonical_root_hash,
-        projection_schema,
-        compaction_generation: transcript_row_u64(row, "compaction_generation")?,
-        config_version_id: row
-            .try_get::<Option<String>, _>("config_version_id")
-            .map_err(|error| error.to_string())?,
-    })
-}
-
-fn classify_work_transcript_sync(
-    canonical: Option<&WorkConversationHeadV1>,
-    projected: Option<&WorkConversationHeadV1>,
-) -> WorkBranchSyncStateV1 {
-    match (canonical, projected) {
-        (None, None) => WorkBranchSyncStateV1::Current,
-        (Some(_), None) => WorkBranchSyncStateV1::ProjectionStale,
-        (None, Some(_)) => WorkBranchSyncStateV1::Corrupt,
-        (Some(canonical), Some(projected)) if canonical == projected => {
-            WorkBranchSyncStateV1::Current
-        }
-        (Some(canonical), Some(projected))
-            if projected.completed_turn < canonical.completed_turn
-                && projected.journal_event_seq <= canonical.journal_event_seq
-                && projected.conversation_seq <= canonical.conversation_seq
-                && projected.compaction_generation <= canonical.compaction_generation =>
-        {
-            WorkBranchSyncStateV1::ProjectionStale
-        }
-        (Some(_), Some(_)) => WorkBranchSyncStateV1::Corrupt,
-    }
-}
-
 fn decode_work_transcript_item(row: sqlx::mysql::MySqlRow) -> Result<WorkTranscriptItemV1, String> {
     let item_seq = transcript_row_u64(&row, "item_seq")?;
     let committed_turn = u32::try_from(transcript_row_u64(&row, "canonical_completed_turn")?)
@@ -2066,9 +2001,9 @@ fn decode_work_transcript_item(row: sqlx::mysql::MySqlRow) -> Result<WorkTranscr
     })
 }
 
-/// Return one bounded chronological page from the transcript prefix known to
-/// be complete at `transcript_cursor`. Rows from an active/uncommitted turn
-/// never enter this view; their progress remains available through activity.
+/// Return one bounded page of available committed raw history at the canonical
+/// Context cursor. This view has no separate projection-completeness promise.
+/// Active/uncommitted rows remain excluded; progress is available in activity.
 pub(super) async fn get_work_branch_transcript_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2144,27 +2079,19 @@ pub(super) async fn get_work_branch_transcript_handler(
         binding.session_id.as_str(),
         astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
     );
+    // One conversation cursor owns this read. Raw history is a best-effort
+    // view of available committed items, not another independently certified
+    // projection with its own head, lag and repair protocol.
+    let canonical_head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(map_work_attachment_coordinator_error)?
+        .map(|head| work_conversation_head(head.cursor));
+    let transcript_cursor = canonical_head.clone();
     let mut tx = pool
         .get()
         .begin()
         .await
-        .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
-    let projection_row = sqlx::query(
-        "SELECT completed_turn, journal_event_seq, conversation_seq,
-                canonical_root_hash, projection_schema, compaction_generation,
-                config_version_id
-         FROM session_transcript_projection_heads
-         WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(owner_id.as_str())
-    .bind(binding.session_id.as_str())
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
-    let transcript_cursor = projection_row
-        .as_ref()
-        .map(decode_work_transcript_head)
-        .transpose()
         .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
     let mut items = Vec::new();
     let mut has_more = false;
@@ -2212,19 +2139,7 @@ pub(super) async fn get_work_branch_transcript_handler(
     tx.commit()
         .await
         .map_err(|error| work_transcript_projection_degraded(work_id.as_str(), error))?;
-    // Read canonical authority after the projection snapshot. Projection
-    // promotion is ordered after canonical commit, so this ordering cannot
-    // falsely label a healthy concurrent promotion as "ahead/corrupt".
-    let canonical_head = coordinator
-        .load_head(&key)
-        .await
-        .map_err(map_work_attachment_coordinator_error)?
-        .map(|head| work_conversation_head(head.cursor));
-    let sync = classify_work_transcript_sync(canonical_head.as_ref(), transcript_cursor.as_ref());
-    if sync == WorkBranchSyncStateV1::Corrupt {
-        items.clear();
-        has_more = false;
-    }
+    let sync = WorkBranchSyncStateV1::Current;
     let next_before_item_seq = has_more
         .then(|| items.first().map(|item| item.item_seq))
         .flatten();
@@ -4020,7 +3935,6 @@ pub(super) async fn post_work_branch_turn_handler(
         explain: false,
         interaction_mode: None,
         interactive_client: false,
-        conversation_authority: None,
     };
     let stream_result = state
         .execution
@@ -10281,60 +10195,6 @@ pub(super) async fn get_work_events_handler(
 mod tests {
     use super::*;
 
-    fn transcript_head(
-        completed_turn: u32,
-        journal_event_seq: u64,
-        conversation_seq: u64,
-        root: char,
-    ) -> WorkConversationHeadV1 {
-        WorkConversationHeadV1 {
-            completed_turn,
-            journal_event_seq,
-            conversation_seq,
-            canonical_root_hash: root.to_string().repeat(64),
-            projection_schema: 2,
-            compaction_generation: 0,
-            config_version_id: None,
-        }
-    }
-
-    #[test]
-    fn transcript_sync_requires_an_exact_or_monotonic_causal_prefix() {
-        let first = transcript_head(1, 1, 1, 'a');
-        let second = transcript_head(2, 2, 2, 'b');
-        assert_eq!(
-            classify_work_transcript_sync(None, None),
-            WorkBranchSyncStateV1::Current
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&first), None),
-            WorkBranchSyncStateV1::ProjectionStale
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&first), Some(&first)),
-            WorkBranchSyncStateV1::Current
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&second), Some(&first)),
-            WorkBranchSyncStateV1::ProjectionStale
-        );
-
-        let same_turn_different_root = transcript_head(2, 2, 2, 'c');
-        assert_eq!(
-            classify_work_transcript_sync(Some(&second), Some(&same_turn_different_root)),
-            WorkBranchSyncStateV1::Corrupt
-        );
-        assert_eq!(
-            classify_work_transcript_sync(Some(&first), Some(&second)),
-            WorkBranchSyncStateV1::Corrupt
-        );
-        let impossible_prefix = transcript_head(1, 3, 1, 'd');
-        assert_eq!(
-            classify_work_transcript_sync(Some(&second), Some(&impossible_prefix)),
-            WorkBranchSyncStateV1::Corrupt
-        );
-    }
-
     #[test]
     fn execution_identity_is_session_stable_and_directory_scoped() {
         let branch = WorkBranchId::parse("feature-work-branch").expect("branch");
@@ -10377,15 +10237,11 @@ mod tests {
             executor: None,
             transport: None,
             run_event_high_watermark: 4,
-            projection_event_idx: 4,
-            projection_updated_at: "2026-09-17T00:00:00Z".to_string(),
-            projection_hash: "hash".to_string(),
             latest_event_type: Some("ask_user_prompted".to_string()),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
             latest_checkpoint: None,
-            has_durable_projection: true,
             recent_events: vec![serde_json::json!({
                 "event_type": "ask_user_prompted",
                 "data": {
@@ -10562,15 +10418,6 @@ mod tests {
                 WorkApiActionHint::ReviewEffects,
                 WorkApiActionHint::RefreshWork
             ]
-        ));
-
-        let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::RunStatusMissing);
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.code, "recovery_point_repair_required");
-        assert!(!error.retryable);
-        assert!(matches!(
-            error.action_hints.as_slice(),
-            [WorkApiActionHint::RetryRead]
         ));
 
         let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::BasisChanged);

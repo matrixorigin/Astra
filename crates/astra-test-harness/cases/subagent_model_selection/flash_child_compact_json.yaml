@@ -7,6 +7,7 @@ prompt: |
   用 glm5.2 子代理判断“所有鸟类都会飞”是否成立。让它只回复紧凑 JSON，
   唯一字段 valid，值为布尔值，不要解释或 Markdown。你收到并采用它的结果后，
   也只回复该 JSON。不要访问文件或网络。
+required_models: [glm-5.2]
 debug_log: true
 capability: delegation
 timeout_seconds: 120
@@ -24,14 +25,6 @@ criteria:
   - type: turn_rounds_between
     min: 2
     max: 3
-  - type: execution_tool_count
-    name: model_catalog
-    min: 0
-    max: 0
-  - type: execution_tool_count
-    name: tool_search
-    min: 0
-    max: 0
   - type: execution_tool_count
     name: bash
     min: 0

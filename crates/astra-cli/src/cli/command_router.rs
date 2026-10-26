@@ -38,14 +38,13 @@ use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::{slash_agent, slash_telemetry};
-use crate::cli::stream::streaming_types::{
-    StreamResult, stream_result_from_resumable_turn_failure,
-};
+use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
 use crate::cli::{diff_presenter, journal_diff, journal_digest, journal_tree, theme};
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
+use std::io::IsTerminal;
 use std::io::Read;
 
 /// A wall deadline has already stopped useful new work.  The rest of its
@@ -1424,7 +1423,7 @@ mod token_refresh_error_tests {
                     "/chat/runs/root/projection",
                     serde_json::json!({
                         "run_id":projection_run, "session_id":projection_session,
-                        "run_event_high_watermark":7, "projection_event_idx":7,
+                        "run_event_high_watermark":7,
                         "recent_events":[{"index":7,"type":"run_finished"}],
                     }),
                     u64::from(!truncated),
@@ -2332,13 +2331,12 @@ async fn execute_cli_command_impl(
             // A headless turn normally lets /chat/stream create its session
             // lazily. Native capacity must be advertised before the parent
             // model is admitted, so use the existing session creation owner
-            // when a supported local collaborator is available. Environments
-            // without one keep the ordinary lazy path.
+            // only when native collaborators were explicitly selected. Ordinary
+            // turns do not probe external runtimes or pre-create a Session.
             let mut created_session_for_native = false;
-            if session_routing.server_session_id.is_none()
-                && !crate::edge_tools::native_codex::native_provider_executable_snapshot()
-                    .is_empty()
-            {
+            let native_collaborators_requested =
+                crate::cli::edge_lifecycle::native_delivery::native_collaborators_requested()?;
+            if session_routing.server_session_id.is_none() && native_collaborators_requested {
                 let session_id = setup_await!(
                     crate::cli::slash::slash_state::create_server_session_identity(api, &token)
                 )?;
@@ -2452,7 +2450,11 @@ async fn execute_cli_command_impl(
                         pm.subscribe_permission_policy(),
                         one_shot_terminal_deadline,
                     )
-                )
+                )?
+            } else if native_collaborators_requested {
+                return Err(
+                    "selected native collaborators require an authenticated Session owner".into(),
+                );
             } else {
                 None
             };
@@ -2807,41 +2809,13 @@ async fn execute_cli_command_impl(
                     return Ok(ExitCode::Success);
                 }
                 Err(e) => {
-                    if let Some(mut sr) = one_shot_resumable_turn_failure(
-                        &e,
-                        user_interrupted,
-                        interruption_cleanup_settled,
-                    ) {
-                        let exit_code = finalize_one_shot_stream_result_with_request_lease(
-                            profile.as_deref(),
-                            effective_model.as_deref(),
-                            &message,
-                            &mut sr,
-                            turn_start,
-                            request_session_execution_lease.as_ref(),
-                        );
-
-                        if args.json {
-                            let mut json_output = final_json_output(&sr, exit_code);
-                            if let Some(obj) = json_output.as_object_mut() {
-                                obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
-                                obj.insert(
-                                    "context_ms".to_string(),
-                                    serde_json::json!(sr.context_ms),
-                                );
-                            }
-                            write_headless_stdout_line(
-                                &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
-                            )?;
-                            return Ok(exit_code);
-                        }
-                        if quiet {
-                            write_headless_stdout_line(&sr.full_text)?;
-                        }
-                        print_one_shot_completion_warning(&sr, exit_code, args.json);
-                        return Ok(exit_code);
-                    }
                     let failure_exit = hard_failure_exit_code(&e);
+                    if (quiet || !std::io::stdout().is_terminal())
+                        && !args.json
+                        && !e.partial.partial_text.is_empty()
+                    {
+                        write_headless_stdout_line(&e.partial.partial_text)?;
+                    }
                     eprintln!(
                         "{}",
                         crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
@@ -2910,15 +2884,14 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Session(SessionCmd::Judge(args))) => {
-            if args.message.trim().is_empty() {
-                return Err("judgment message must not be empty".to_string());
-            }
+            let message =
+                crate::cli::session_judge::read_message(args.message, std::io::stdin().lock())?;
             let token = fresh_access_token_or_error(&api, profile.as_deref()).await?;
             let result = crate::cli::session_judge::execute_for_model(
                 &api,
                 &token,
                 &args.model,
-                &args.message,
+                &message,
                 args.timeout_seconds,
             )
             .await?;
@@ -3489,17 +3462,6 @@ fn one_shot_local_ownership_unsettled(
     })
 }
 
-fn one_shot_resumable_turn_failure(
-    failure: &crate::TurnFailure,
-    user_interrupted: bool,
-    cleanup_settled: bool,
-) -> Option<StreamResult> {
-    if user_interrupted || !cleanup_settled {
-        return None;
-    }
-    stream_result_from_resumable_turn_failure(failure)
-}
-
 pub(crate) fn one_shot_stdout_closure_is_settled(
     failure: &crate::TurnFailure,
     user_interrupted: bool,
@@ -3581,6 +3543,7 @@ fn retain_one_shot_interruption_failure(
             }
         }
     };
+    failure.partial.failed_run_terminal = None;
     retain_one_shot_observed_partial(&mut failure, incremental_state);
     if had_failure {
         if !failure.error.is_empty() {
@@ -3810,6 +3773,12 @@ fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
 fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let exit_code = hard_failure_exit_code(&failure);
     let partial = failure.partial;
+    let authoritative_failed = partial.failed_run_terminal.is_some()
+        && !partial.remote_cancel_required
+        && !partial.callback_client_detached
+        && !partial.admission_rejected
+        && partial.output_transport_failure.is_none();
+    let model_item_id = partial.partial_text_model_item_id.clone();
     let classes = partial
         .tool_outcomes
         .as_ref()
@@ -3832,12 +3801,15 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         completion_tokens: partial.completion_tokens,
         cache_read_tokens: partial.cache_read_tokens,
         cache_creation_tokens: partial.cache_creation_tokens,
+        qualified_usage: partial.qualified_usage,
+        usage_attribution: partial.usage_attribution,
         token_usage_coverage: partial.token_usage_coverage,
         llm_rounds: partial.llm_rounds,
         tool_calls_count: partial.tool_calls_count,
         tools_used: partial.tools_used,
         final_state: "failed".to_string(),
-        server_terminal_unverified: true,
+        server_terminal_authoritative: authoritative_failed,
+        server_terminal_unverified: !authoritative_failed,
         tool_record_coverage_partial: true,
         ..Default::default()
     };
@@ -3847,6 +3819,9 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         if let Some(kind) = partial.failure_kind {
             output["error_kind"] = serde_json::json!(kind.as_str());
         }
+    }
+    if let Some(model_item_id) = model_item_id {
+        output["model_item_id"] = serde_json::json!(model_item_id);
     }
     output["tool_result_class_counts"] = classes;
     output["error"] = serde_json::json!(failure.error);
@@ -3905,6 +3880,7 @@ fn final_json_output_with_context(
             "creation_tokens": sr.cache_creation_tokens,
         },
         "completion_tokens": sr.completion_tokens,
+        "qualified_usage": sr.qualified_usage.map(astra_turn_types::CanonicalTokenUsage::to_json),
         "token_usage_coverage": {
             "scope": "logical_provider_calls",
             "attempts": sr.token_usage_coverage.attempts,
@@ -4105,6 +4081,9 @@ pub(crate) async fn run_print_mode(
         }
         Err(e) => {
             let failure_exit = hard_failure_exit_code(&e);
+            if output_format == "text" && !e.partial.partial_text.is_empty() {
+                write_headless_stdout(e.partial.partial_text.as_bytes())?;
+            }
             eprintln!(
                 "{}",
                 crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
@@ -5067,6 +5046,73 @@ mod exit_code_tests {
         );
     }
 
+    fn accepted_failed_run() -> crate::TurnFailure {
+        crate::TurnFailure {
+            error: "provider stream stopped".into(),
+            partial: crate::PartialTurnData {
+                run_id: Some("failed-root".into()),
+                failure_kind: Some(astra_core::ErrorKind::StreamTransport),
+                failed_run_terminal: Some(astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
+                    run_id: "failed-root".into(), owner_generation: Some(4),
+                    status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
+                    error: Some("provider stream stopped".into()),
+                    error_kind: Some(astra_core::ErrorKind::StreamTransport),
+                }),
+                partial_text: "  real partial bytes\n".into(),
+                partial_text_model_item_id: Some("partial-model-item".into()),
+                qualified_usage: Some(astra_turn_types::CanonicalTokenUsage::new(Some(17), None, None, Some(3)).unwrap()),
+                prompt_tokens: 17, completion_tokens: 3,
+                interruption: Some(serde_json::json!({"kind":"stream_transport","resumable":true})),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn failed_terminal_stays_failed_with_observed_identity_and_unknown_usage_lanes() {
+        let failure = accepted_failed_run();
+        assert!(!failure.is_clean_local_cancel());
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["final_state"], "failed");
+        assert_eq!(json["exit_code"], 3);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["server_terminal_authoritative"], true);
+        assert_eq!(json["server_terminal_unverified"], false);
+        assert_eq!(json["text"], "  real partial bytes\n");
+        assert_eq!(json["model_item_id"], "partial-model-item");
+        assert_eq!(
+            json["qualified_usage"],
+            serde_json::json!({"input_tokens":17,"output_tokens":3})
+        );
+        assert!(json["llm_rounds"].is_null());
+        assert!(json["local_continuation"].is_null());
+    }
+
+    #[test]
+    fn local_failure_owner_revokes_failed_terminal_projection_without_losing_observations() {
+        let mut settled = true;
+        let failure = super::apply_one_shot_cleanup_result(
+            Err(accepted_failed_run()),
+            Err("local output writer failed".into()),
+            &Default::default(),
+            &mut settled,
+        )
+        .unwrap_err();
+        assert!(!settled);
+        assert!(failure.partial.failed_run_terminal.is_none());
+        let json = super::hard_failure_json_output(failure);
+        assert_eq!(json["server_terminal_authoritative"], false);
+        assert_eq!(json["server_terminal_unverified"], true);
+        assert_eq!(json["text"], "  real partial bytes\n");
+        assert_eq!(json["model_item_id"], "partial-model-item");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("local output writer failed")
+        );
+    }
+
     #[test]
     fn one_shot_root_drain_failure_preserves_original_partial_classification() {
         let state = astra_turn_core::turn_event_sink::IncrementalTurnState::default();
@@ -5076,7 +5122,6 @@ mod exit_code_tests {
         });
         let mut prior = one_shot_cleanup_test_failure(astra_core::ErrorKind::ContractViolation);
         prior.partial.interruption = Some(interruption.clone());
-        assert!(super::one_shot_resumable_turn_failure(&prior, false, true).is_some());
         let mut cleanup_settled = true;
         let result = super::apply_one_shot_cleanup_result(
             Err(prior),
@@ -5086,8 +5131,6 @@ mod exit_code_tests {
         );
         let failure = result.unwrap_err();
         assert_eq!(failure.partial.interruption, Some(interruption));
-        assert!(super::one_shot_resumable_turn_failure(&failure, false, cleanup_settled).is_none());
-        assert!(super::one_shot_resumable_turn_failure(&failure, true, true).is_none());
         assert_one_shot_cleanup_stays_failed(
             Err(failure),
             cleanup_settled,

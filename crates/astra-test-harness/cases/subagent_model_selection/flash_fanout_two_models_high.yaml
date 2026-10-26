@@ -15,6 +15,7 @@ prompt: |
   Do not retry, replace or add slots. Do not busy-poll. Report both exact
   markers and 2/2 after the group reaches its terminal boundary. Do not call
   Reflect or another diagnostic tool.
+required_models: [deepseek-v4-flash, glm-5.2]
 debug_log: true
 capability: delegation
 timeout_seconds: 240

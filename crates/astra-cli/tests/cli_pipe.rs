@@ -487,9 +487,19 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
     };
     use serde_json::{Value, json};
     use std::process::Stdio;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     const SESSION: &str = "395d819b-81a7-4cc0-9aa8-3666ec1ac194";
-    for admitted in [true, false] {
+    for (admitted, closed) in [(true, true), (true, false), (false, false)] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = requests.clone();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed_reads = reads.clone();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let observed_deletes = deletes.clone();
         let app = Router::new()
             .route(
                 "/sessions",
@@ -500,7 +510,8 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 "skills": [], "total": 0, "limit": 100, "next_cursor": null
             })) }))
             .route("/models", get(|| async { pipe_model_catalog() }))
-            .route("/chat/stream", post(move || async move {
+            .route("/chat/stream", post(move || { let calls = observed_requests.clone(); async move {
+                calls.fetch_add(1, Ordering::SeqCst);
                 let mut events = Vec::new();
                 events.push(if admitted {
                     json!({"type": "session_info", "session_id": SESSION, "run_id": "failure-root"})
@@ -511,28 +522,31 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 events.push(json!({"type": "run_started", "run_id": "failure-child", "parent_run_id": "failure-root"}));
                 if admitted {
                     events.push(json!({"type": "text_delta", "content": "Observed partial output"}));
-                    events.push(json!({"type": "usage", "input_tokens": 10, "output_tokens": 5}));
+                    events.push(json!({"type": "text_done", "full_text": "Observed partial output", "model_item_id":"partial-model-item", "partial":true}));
+                    events.push(json!({"type": "usage", "usage_scope":"run_total", "input_tokens": 10, "output_tokens": 5, "qualified_usage":{"input_tokens":10,"output_tokens":5}}));
                 }
-                events.push(json!({"type": "error", "message": "LLM payment required (402)", "error_code": "payment_required"}));
-                if admitted {
-                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": "payment_required", "error": "LLM payment required (402)"}));
+                events.push(json!({"type": "error", "message": "provider stream stopped", "error_code": "stream_transport", "error_kind":"stream_transport", "metadata":{"interruption":{"kind":"stream_transport","resumable":true}}}));
+                if closed {
+                    events.push(json!({"type":"run_error", "run_id":"failure-root", "error":"provider stream stopped", "error_code":"stream_transport"}));
+                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": "stream_transport", "error": "provider stream stopped"}));
                 }
                 let body = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
                 ([
                     ("content-type", "text/event-stream"),
                     (astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR),
                 ], body)
-            }))
-            .route("/chat/runs/{run_id}", get(|| async { axum::Json(json!({
+            }}))
+            .route("/chat/runs/{run_id}", get(move || { let reads=observed_reads.clone(); async move { reads.fetch_add(1, Ordering::SeqCst); axum::Json(json!({
                 "status": "failed", "accounting": {
                     "prompt_tokens": 10, "completion_tokens": 5,
                     "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_call_count": 0
                 }
-            })) }));
+            })) }}).delete(move || { let deletes=observed_deletes.clone(); async move { deletes.fetch_add(1, Ordering::SeqCst); axum::Json(json!({"status":"cancelled"})) }}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for mode in ["chat-json", "print-json", "stream-json", "chat-text"] {
+            let before = requests.load(Ordering::SeqCst);
             let home = tempfile::tempdir().unwrap();
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
             command.args([
@@ -592,7 +606,7 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                     if !admitted && mode == "stream-json" {
                         "without a bridge run_id"
                     } else {
-                        "402"
+                        "stream stopped"
                     }
                 ),
                 "{mode}, admitted={admitted}: stdout={stdout}; stderr={}",
@@ -604,14 +618,37 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 "{mode}, admitted={admitted}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                before + 1,
+                "no implicit retry"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                0,
+                "no accounting reconciliation"
+            );
+            assert_eq!(
+                deletes.load(Ordering::SeqCst),
+                0,
+                "a failed terminal is already closed"
+            );
             if mode == "chat-text" {
+                if admitted {
+                    assert_eq!(
+                        stdout.matches("Observed partial output").count(),
+                        1,
+                        "{mode}, admitted={admitted}, closed={closed}: stdout={stdout}; stderr={}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
                 assert_no_completed_turn(home.path().join(".astra/sessions"), SESSION);
                 continue;
             }
             let diagnostic = if !admitted && mode == "stream-json" {
                 "without a bridge run_id"
             } else {
-                "402"
+                "stream stopped"
             };
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr)
@@ -664,22 +701,38 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
             assert_eq!(result["error_kind"], "api_error");
             assert_eq!(result["success"], false);
             assert_eq!(result["completion_disposition"], "failed");
-            assert_eq!(result["server_terminal_unverified"], true);
+            assert_eq!(result["server_terminal_unverified"], !closed);
+            assert_eq!(result["server_terminal_authoritative"], closed);
             assert_eq!(result["tool_record_coverage"], "partial");
-            assert_eq!(result["error_code"], "payment_required");
+            assert_eq!(result["error_code"], "stream_transport");
             assert!(result["error"].as_str().unwrap().contains(
                 if !admitted && mode == "stream-json" {
                     "without a bridge run_id"
                 } else {
-                    "402"
+                    "stream stopped"
                 }
             ));
             assert_eq!(
-                result["text"], "",
-                "durable failure tombstones uncompleted output"
+                result["text"],
+                if admitted {
+                    "Observed partial output"
+                } else {
+                    ""
+                },
+                "only actually observed output survives"
             );
             if admitted {
                 assert_eq!(result["session_id"], SESSION);
+                assert_eq!(result["model_item_id"], "partial-model-item");
+                assert_eq!(
+                    result["qualified_usage"],
+                    if closed {
+                        json!({"input_tokens":10,"output_tokens":5})
+                    } else {
+                        json!({})
+                    }
+                );
+                assert_eq!(result["llm_rounds"], Value::Null);
                 assert_eq!(result["fresh_prompt_tokens"], 10);
                 assert_eq!(result["completion_tokens"], 5);
                 assert_no_completed_turn(home.path().join(".astra/sessions"), SESSION);

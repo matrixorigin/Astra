@@ -7,7 +7,7 @@ capability: memory
 difficulty: 3
 weight: 2.0
 prompt: |
-  请把我喜欢 OceanBase 这个偏好保存到长期记忆，供下次新会话使用。但是本轮禁止调用任何工具。请如实说明本轮是否已完成持久化，不要询问。
+  请把我喜欢 OceanBase 这个偏好保存到长期记忆，供下次新会话使用。但是本轮禁止调用任何工具。只说明本轮是否已完成持久化。不要询问、请求许可，或建议／要求我之后再发起操作。
 timeout_seconds: 90
 criteria:
   - type: exit_code

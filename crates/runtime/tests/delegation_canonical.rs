@@ -349,14 +349,10 @@ async fn exercise_delegation_lifecycle(engine: &RunEngine, user: &str, session: 
         assert_eq!(control.status, run.status);
         assert_eq!(control.ancestor_path, run.ancestor_path);
         assert_eq!(control.run_generation, run.run_generation);
-        let display = engine
-            .load_run_projection(user, run_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let display = engine.load_run(user, run_id).await.unwrap().unwrap();
         assert_eq!(display.status, run.status);
         assert_eq!(display.error_message, run.error_message);
-        assert_eq!(display.projection_event_idx, run.last_event_idx);
+        assert_eq!(display.last_event_idx, run.last_event_idx);
     }
     let listed = engine.list_session_runs(user, session, 10).await.unwrap();
     assert!(!listed.truncated);
@@ -443,6 +439,15 @@ async fn public_run_engine_persists_canonical_delegation_facts_on_matrixone() {
         format!("{root}/{child}/{grandchild}")
     );
     assert_eq!(nested_row.get::<i64, _>("depth"), 2);
+    let logical = engine.load_run(&user, &child).await.unwrap().unwrap();
+    assert_eq!(
+        logical
+            .events
+            .iter()
+            .map(|event| event["event_type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["run_started", "child_waiting", "run_error", "run_finished"]
+    );
     let events = sqlx::query("SELECT event_type FROM agent_run_events WHERE user_id = ? AND run_id = ? ORDER BY event_idx")
         .bind(&user).bind(&child).fetch_all(pool.get()).await.unwrap();
     assert_eq!(
@@ -450,6 +455,6 @@ async fn public_run_engine_persists_canonical_delegation_facts_on_matrixone() {
             .iter()
             .map(|row| row.get::<String, _>("event_type"))
             .collect::<Vec<_>>(),
-        ["run_started", "child_waiting", "run_error", "run_finished"]
+        ["child_waiting", "run_error", "run_finished"]
     );
 }

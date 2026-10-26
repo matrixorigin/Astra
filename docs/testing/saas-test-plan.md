@@ -94,7 +94,7 @@ Cloud 每一 server-owned stream admission 必须完成（非简单 LLM 代理�
 1. JWT 鉴权 + 限流
 2. 持久化 Edge 上报的 `tool_results`
 3. 上下文组装（Memoria、Skill 索引、few-shot）
-4. 模型路由 + **预算门禁**（`ResourceGovernor.check_token_budget`）
+4. 模型准入 + 单轮预算及进程容量限制（普通 Run 不读取日 token 配额镜像）
 5. LLM 调用（Key 不出 Cloud）
 6. 防火墙 / 置信度
 7. Audit（snapshot + decision + events）
@@ -209,7 +209,7 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 |--------|----------------|----------|
 | `max_sessions_per_day` | unlimited (`0`) | 显式配置有限额度后，下一次超限 Session → Denied |
 | `max_concurrent_sessions` | unlimited (`0`) | 显式配置有限额度后，下一次超限活跃 Session → Denied |
-| `max_tokens_per_day` | unlimited (`0`) | 显式配置有限额度后，超限 Turn → Denied |
+| `max_tokens_per_day` | unlimited (`0`) | 显式 Session 创建检查配置额度；已有 Session 的 Run 不受 daily token 镜像门禁控制，用量记录在 Run 终结事务中 |
 | `max_concurrent_bash` | 3 | Edge 并发 bash 超限 |
 | `max_disk_bytes` | 1GB | 工作区/upload 超限 |
 

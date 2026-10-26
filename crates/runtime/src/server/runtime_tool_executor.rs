@@ -71,8 +71,7 @@ use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJourn
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
-    run_local_tool_policy_preflight, spawn_resource_tool_call_recording, unknown_local_tool_result,
-    validate_local_tool_arguments,
+    run_local_tool_policy_preflight, unknown_local_tool_result, validate_local_tool_arguments,
 };
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
@@ -815,9 +814,6 @@ pub struct RuntimeToolExecutor {
     pub(crate) journal_turn_index: AtomicU32,
     /// Aggregate output bytes this turn.
     aggregate_output_bytes: AtomicUsize,
-    /// Optional resource governor for usage tracking (Phase 5).
-    resource_governor:
-        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
 
     // ── Persistence ───────────────────────────────────────────────────────────
     /// Owner-checked remote artifact store shared by workspace snapshots and
@@ -1019,7 +1015,6 @@ impl RuntimeToolExecutor {
             provider_interaction_gate: None,
             progress_callback: None,
             auxiliary_event_writer: None,
-            resource_governor: None,
             tool_execution_service: ToolExecutionService::builder().build(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
@@ -3070,13 +3065,66 @@ impl RuntimeToolExecutor {
 
     pub(super) fn set_work_binding(&mut self, binding: WorkRuntimeBinding) {
         self.install_work_binding(binding)
-            .expect("RuntimeToolExecutor Work binding may only be installed once");
+            .expect("RuntimeToolExecutor Work binding identity must remain unchanged");
     }
 
     pub(super) fn install_work_binding(&self, binding: WorkRuntimeBinding) -> Result<(), String> {
-        self.work_binding
-            .set(binding)
-            .map_err(|_| "canonical Work binding is already installed".to_string())
+        match self.work_binding.set(binding) {
+            Ok(()) => Ok(()),
+            Err(binding) => {
+                let current = self.work_binding.get().expect("installed Work binding");
+                if current.owner_id == binding.owner_id
+                    && current.session_id == binding.session_id
+                    && current.work_id == binding.work_id
+                    && current.branch_id == binding.branch_id
+                {
+                    Ok(())
+                } else {
+                    Err("canonical Work binding conflicts with the installed identity".to_string())
+                }
+            }
+        }
+    }
+
+    /// Resolve only on explicit Work control. Ordinary chat has no Work lookup.
+    /// This identity is a selection hint; repository revisions and attempts still
+    /// authorize each operation, including after another Server changes the graph.
+    pub(super) async fn resolve_work_binding(
+        &self,
+    ) -> Result<Option<&WorkRuntimeBinding>, astra_tools::ToolResult> {
+        use astra_services::work::{
+            InternalSessionId, WorkOwnerId, WorkRepository, WorkRepositoryError,
+        };
+        if let Some(binding) = self.work_binding.get() {
+            return Ok(Some(binding));
+        }
+        let Some(pool) = self.context_manifest_pool.clone() else {
+            return Ok(None);
+        };
+        let resolve = async {
+            let owner = WorkOwnerId::parse(self.user_id.clone()).map_err(|e| e.to_string())?;
+            let session =
+                InternalSessionId::parse(self.session_id.clone()).map_err(|e| e.to_string())?;
+            let repository = astra_services::work::DatabaseWorkRepository::new(pool.clone());
+            let binding = match repository.load_session_plan_binding(&owner, &session).await {
+                Ok(binding) => binding,
+                Err(WorkRepositoryError::NotFound) => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            self.install_work_binding(WorkRuntimeBinding::new(
+                pool,
+                owner,
+                session,
+                binding.work_id,
+                binding.branch_id,
+            ))?;
+            Ok(self.work_binding.get())
+        };
+        resolve.await.map_err(|error: String| {
+            astra_tools::ToolResult::error(format!(
+                "canonical Work binding could not be resolved: {error}"
+            ))
+        })
     }
 
     /// Attach the shared dynamic-agent tool context.
@@ -3409,6 +3457,25 @@ impl RuntimeToolExecutor {
         request.runtime_edge_dispatch_authorization_required =
             request.runtime_edge_dispatch_authorization.is_some();
         request
+    }
+
+    pub(crate) fn invocation_requires_receive_inbox(
+        &self,
+        invocation: &astra_turn_core::tool::deferred_activation::CanonicalToolInvocation,
+    ) -> bool {
+        let call = invocation.logical_target_call();
+        let Some(name) = astra_turn_core::tool_call_shape::tool_call_name(call) else {
+            return false;
+        };
+        let Ok(args) = astra_turn_core::tool_call_shape::parse_tool_call_arguments(call) else {
+            return false;
+        };
+        let request = self.tool_execution_request(name, &args);
+        self.tool_execution_service
+            .builtin_agent_invocation_semantics(&request)
+            .ok()
+            .flatten()
+            .is_some_and(|semantics| semantics.receive_inbox)
     }
 
     pub(crate) fn tool_execution_request_for_invocation(
@@ -4071,8 +4138,16 @@ impl RuntimeToolExecutor {
                 .invocation_admission_snapshot(&request)
                 .await,
         );
+        // Readonly execution is repeatable. The shared loop owns observations;
+        // there is no second replay cache or persistent dispatch state here.
+        let route = self.tool_execution_service.routing_decision(&request);
+        request.policy.work_attribution = self.work_invocation_attribution(&request, route);
+        let is_observation = match self.tool_execution_service.is_run_observation(&request) {
+            Ok(observation) => observation && delegation_preparation.is_none(),
+            Err(result) => return GovernableRuntimeToolResult::completed(result),
+        };
         let mut dispatch_rejection = None;
-        let durable_invocation = if request.policy.permission_grant.is_some() {
+        let durable_invocation = if request.policy.permission_grant.is_some() && !is_observation {
             let identity = match astra_turn_types::ToolInvocationIdentity::new(
                 &request.user_id,
                 &request.session_id,
@@ -5793,7 +5868,6 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
             drop(workspace_authority);
             return result.into();
         }
-        spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
         self.execute_local_with_metadata(request, cancel_token)
             .await
     }
@@ -6098,7 +6172,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::server::tool_execution_result::agent_tool_result_from_output;
-    use crate::server::tool_session_history::session_history_match_score;
     use crate::server::tool_transport::{ExecutorStatus, ToolTransportKind};
     use crate::tool_sandbox::extract_local_workspace_path_mentions;
     use astra_plan::PlanRepository;
@@ -9046,7 +9119,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn session_history_actions_are_advertised_on_session_tool() {
+    fn session_tool_advertises_supported_actions() {
         let names: std::collections::HashSet<String> =
             crate::capabilities::server_builtin_tool_schemas(
                 &crate::capabilities::full_server_capabilities_for_tests(),
@@ -9080,12 +9153,7 @@ pub(crate) mod tests {
             .pointer("/function/parameters/properties/action/enum")
             .and_then(Value::as_array)
             .expect("session action enum should exist");
-        for action in ["history_page", "history_search", "history_around"] {
-            assert!(
-                actions.iter().any(|value| value.as_str() == Some(action)),
-                "session action {action} must be advertised for web-agent history recall"
-            );
-        }
+        assert_eq!(actions, &[json!("config"), json!("sleep")]);
     }
 
     #[tokio::test]
@@ -9105,20 +9173,6 @@ pub(crate) mod tests {
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine session errors should still receive execution metadata"
         );
-    }
-
-    #[test]
-    fn session_history_search_scores_exact_and_fuzzy_hits() {
-        let exact = session_history_match_score(
-            "payment offset storm",
-            "We debugged a payment offset storm and saved the SQL fix.",
-        );
-        let fuzzy = session_history_match_score("payment lag", "payment consumer lag root cause");
-        let miss = session_history_match_score("lunar seed base", "unrelated rustfmt output");
-
-        assert!(exact > fuzzy, "exact phrase should outrank token overlap");
-        assert!(fuzzy > 0, "token overlap should still be searchable");
-        assert_eq!(miss, 0, "unrelated content must not match");
     }
 
     #[cfg(unix)]
@@ -10098,11 +10152,17 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_freezes_control_attribution_without_provider_policy() {
-        use astra_services::runs::WorkInvocationAttribution;
-
+    async fn tool_search_executes_without_creating_a_durable_effect_receipt() {
         let (mut executor, _dir) = test_executor();
         executor.enable_durable_invocations();
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "tool_search".into(),
+            SelectedToolOfferSnapshot::new_with_route(
+                "tool_search",
+                "server-control-plane",
+                super::super::tool_route_selection::ToolExecutionRouteKind::ServerControlPlane,
+            ),
+        )]));
         let identity = astra_turn_types::ToolInvocationIdentity::new(
             "test-user",
             "test-session",
@@ -10128,24 +10188,81 @@ pub(crate) mod tests {
             )
             .await;
         assert!(!result.is_error, "{result:?}");
-        let record = executor
-            .invocation_ledger
-            .as_ref()
-            .unwrap()
-            .get(&identity)
-            .await
-            .unwrap()
-            .unwrap();
-        let decision =
-            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(
-                &record.decision,
+        assert!(
+            executor
+                .durable_invocation_record_for_test(&identity)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_readonly_failures_keep_recovery_without_creating_effect_custody() {
+        let (mut executor, _workspace) = test_executor();
+        executor.enable_durable_invocations();
+        executor.set_current_selected_tool_offers(HashMap::from([(
+            "agent".into(),
+            SelectedToolOfferSnapshot::new_with_route(
+                "agent",
+                "server-control-plane",
+                super::super::tool_route_selection::ToolExecutionRouteKind::ServerControlPlane,
+            ),
+        )]));
+        let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+            reason: None,
+            updates_hash: None,
+        };
+        // The executor has no agent context, giving a real readonly handler
+        // failure. Invalid calls use the same canonical schema error owner.
+        for (call, args, invalid) in [
+            ("handler-failure", json!({"action":"list"}), false),
+            ("missing-action", json!({}), true),
+            ("unknown-action", json!({"action":"unsupported"}), true),
+            (
+                "malformed",
+                json!({"action":"list", "_parse_error":{"kind":"truncated"}}),
+                true,
+            ),
+        ] {
+            let identity = astra_turn_types::ToolInvocationIdentity::new(
+                "test-user",
+                "test-session",
+                "run",
+                "chain",
+                call,
             )
             .unwrap();
-        assert_eq!(
-            decision.work_attribution,
-            WorkInvocationAttribution::Control
-        );
-        assert!(decision.provider_policy.is_none());
+            let result = executor
+                .execute_invocation_with_metadata(
+                    "run",
+                    "chain",
+                    call,
+                    "agent",
+                    &args,
+                    None,
+                    Some(&grant),
+                )
+                .await;
+            assert!(result.is_error, "{call}: {result:?}");
+            assert!(
+                executor
+                    .durable_invocation_record_for_test(&identity)
+                    .await
+                    .is_none(),
+                "{call}"
+            );
+            if invalid {
+                let body: Value = serde_json::from_str(&result.output).unwrap();
+                assert_eq!(body["executed"], false, "{call}: {body}");
+                assert_eq!(
+                    body["error_kind"],
+                    astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+                    "{call}: {body}"
+                );
+                assert!(body["recovery_evidence"].is_object(), "{call}: {body}");
+            }
+        }
     }
 
     #[test]
@@ -15337,6 +15454,22 @@ for line in sys.stdin:
         let progress = Arc::new(ToolLifecycleProgressCallback::default());
         exec.set_progress_callback(progress.clone());
         for (tool_name, arguments) in [
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "reasoning":{"mode":"medium"}}),
+            ),
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "reasoning":{"mode":"adaptive"}}),
+            ),
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "requested_model_policy":{"mode":"fixed","model":"wrong"}}),
+            ),
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "requested_model_policy":{"mode":"fixed","selector":"wrong"}}),
+            ),
             ("notify", json!({"message":"   "})),
             (
                 "agent",
@@ -15349,6 +15482,16 @@ for line in sys.stdin:
             let result = exec.execute_with_metadata(tool_name, &arguments).await;
 
             assert_tool_invalid_args(&result);
+            if arguments.get("reasoning").is_some() {
+                assert!(result.output.contains("adaptive") && result.output.contains("effort"));
+            }
+            if arguments.get("requested_model_policy").is_some() {
+                assert!(
+                    result.output.contains("offering_id")
+                        && result.output.contains("configured_name")
+                );
+            }
+
             let metadata = result.metadata.as_ref().expect("schema preflight metadata");
             assert_eq!(metadata["disposition"], "rejected");
             assert_eq!(metadata["execution_started"], false);

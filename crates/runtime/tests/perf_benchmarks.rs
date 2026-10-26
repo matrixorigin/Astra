@@ -5,10 +5,8 @@ use test_support::require_db_it_env;
 use std::{sync::Arc, time::Instant};
 
 use astra_core::SharedPool;
-use astra_services::runs::ToolOutputBatchItem;
 use astra_services::{
     ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
-    DatabaseRunStateStore,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -96,61 +94,6 @@ async fn perf_benchmark_1_hot_path_query_under_50ms_p99() {
     assert!(
         p99 < 50,
         "PERF-1 hot path query p99 must be <50ms, got {p99}ms; samples={samples:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-async fn perf_benchmark_3_one_thousand_tool_outputs_under_1000ms() {
-    let pool = setup_pool().await;
-    let user_id = id("user");
-    let session_id = id("session");
-    let run_id = id("run");
-    insert_session(&pool, &user_id, &session_id).await;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let started = Instant::now();
-    for batch in 0..2 {
-        let mut items = Vec::with_capacity(500);
-        for i in 0..500 {
-            let idx = batch * 500 + i;
-            items.push(ToolOutputBatchItem {
-                output_id: id("out"),
-                tool_call_id: Some(format!("call-{idx}")),
-                tool_name: "slow_query_analyzer".to_string(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    format!(r#"{{"idx":{idx},"line":"slow query","duration_ms":123}}"#),
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            });
-        }
-        store
-            .insert_tool_output_batch(&id("batch"), &session_id, &run_id, &user_id, &items)
-            .await
-            .expect("PERF-3 tool output batch insert must succeed");
-    }
-    let elapsed_ms = millis(started);
-    let count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_tool_outputs
-         WHERE user_id = ? AND session_id = ? AND run_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&run_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("PERF-3 tool output count query must succeed")
-    .try_get::<i64, _>("c")
-    .unwrap_or_default();
-    assert!(
-        count == 1_000,
-        "PERF-3 must persist exactly 1000 tool output rows, got {count}"
-    );
-    let max_ms = 1_000;
-    assert!(
-        elapsed_ms < max_ms,
-        "PERF-3 1000 tool output rows must insert in <{max_ms}ms, got {elapsed_ms}ms"
     );
 }
 

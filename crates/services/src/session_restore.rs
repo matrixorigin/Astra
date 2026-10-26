@@ -15,16 +15,13 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
-use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
-
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
-pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
 const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
     SELECT number, turn, title, summary, total_tokens \
     FROM ( \
@@ -39,86 +36,6 @@ const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
     SELECT COUNT(*) AS checkpoint_count \
     FROM session_checkpoints \
     WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
-pub const MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS: i64 = 80;
-pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
-    SELECT role, content, run_id, run_status \
-    FROM ( \
-        SELECT sti.item_seq, sti.role, sti.content, sti.run_id, r.status AS run_status \
-        FROM session_transcript_items sti \
-        LEFT JOIN agent_runs r \
-          ON r.user_id = sti.user_id \
-         AND r.session_id = sti.session_id \
-         AND r.run_id = sti.run_id \
-        WHERE sti.session_id = ? \
-          AND sti.user_id = ? \
-          AND sti.role IN ('user', 'assistant', 'system') \
-          AND TRIM(sti.content) <> '' \
-          AND ( \
-              sti.run_id IS NULL \
-              OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
-          ) \
-        ORDER BY sti.item_seq DESC \
-        LIMIT ? \
-    ) recent_prompt_history \
-    ORDER BY item_seq";
-
-/// Prompt-facing closure for a durable root run whose transcript contains a
-/// user request but no assistant response. Without this typed boundary, a new
-/// turn can interpret a cancelled/failed request as a second still-active
-/// objective and resume it after completing the latest request.
-pub fn prompt_history_terminal_boundary(status: &str) -> Option<String> {
-    let status = match status {
-        "cancelled" => "cancelled before completion",
-        "failed" => "failed before completion",
-        "paused" | "waiting" => "paused before completion",
-        "delegated" => "handed off to delegated execution",
-        "completed" => "completed without a prompt-facing assistant response",
-        _ => return None,
-    };
-    Some(format!(
-        "[Runtime turn boundary: the preceding request {status}. It is not an active objective; continue it only when the latest user request explicitly asks to do so.]"
-    ))
-}
-
-pub fn prompt_history_role_is_provider_safe(role: &str, has_prompt_content: bool) -> bool {
-    has_prompt_content && matches!(role, "user" | "assistant" | "system")
-}
-
-pub fn prompt_history_boundary_after_message(
-    role: &str,
-    has_prompt_content: bool,
-    run_id: Option<&str>,
-    next_run_id: Option<&str>,
-    run_status: Option<&str>,
-) -> Option<String> {
-    // A cancelled turn can contain non-provider-safe tool evidence after its
-    // user request. The bounded fallback excludes that evidence, so close at
-    // the last prompt-facing row when the next safe row belongs elsewhere. A
-    // terminal assistant response already closes the objective naturally and
-    // must not gain a synthetic suffix.
-    let can_end_unfinished_turn = role != "assistant" || !has_prompt_content;
-    if !can_end_unfinished_turn || run_id.is_none() || run_id == next_run_id {
-        return None;
-    }
-    prompt_history_terminal_boundary(run_status?)
-}
-pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
-    SELECT 1 AS present \
-    FROM session_transcript_items sti \
-    LEFT JOIN agent_runs r \
-      ON r.user_id = sti.user_id \
-     AND r.session_id = sti.session_id \
-     AND r.run_id = sti.run_id \
-    WHERE sti.session_id = ? \
-      AND sti.user_id = ? \
-          AND sti.role IN ('user', 'assistant', 'system') \
-          AND TRIM(sti.content) <> '' \
-      AND ( \
-          sti.run_id IS NULL \
-          OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
-      ) \
-    LIMIT 1";
-
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -294,7 +211,8 @@ fn apply_restore_cache_token_usage(
 
 // ─── Restored Session State ─────────────────────────────────────────────────
 
-/// The reconstructed state needed to resume a session.
+/// Reconstructed Session state. The resumable directory returns only its summary
+/// fields; execution requires the separate selected-Session restore and admission.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RestoredSession {
     /// Session ID being restored.
@@ -431,7 +349,9 @@ pub trait SessionRestoreService: Send + Sync {
         session_id: &str,
     ) -> Result<Vec<RestoredCheckpoint>, String>;
 
-    /// List resumable sessions for a user (active or paused).
+    /// List active or paused Session metadata/head summaries without recovery details.
+    /// Zero usage
+    /// and empty detail fields mean they were not loaded, rather than absent.
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
 }
 
@@ -1357,42 +1277,6 @@ fn local_checkpoint_count(
     })
 }
 
-fn composite_snapshot_index_to_remote_artifact_record(
-    session_id: &str,
-    user_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
-    Ok(SessionArtifactJsonRecord {
-        artifact_id: COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID.to_string(),
-        session_id: session_id.to_string(),
-        user_id: user_id.to_string(),
-        artifact_kind: COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND.to_string(),
-        source: Some("composite_snapshot_index".to_string()),
-        turn: index.snapshots.last().map(|snapshot| snapshot.turn),
-        round: None,
-        content: serde_json::to_value(index)?,
-        metadata: Some(json!({
-            "snapshot_count": index.snapshots.len(),
-            "latest_version": index.current_version(),
-        })),
-        references: Vec::new(),
-    })
-}
-
-pub async fn persist_remote_composite_snapshot_index(
-    session_id: &str,
-    user_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-    store: &impl SessionArtifactJsonStore,
-) -> Result<StoredSessionArtifact, String> {
-    let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
-        .map_err(|error| error.to_string())?;
-    store
-        .merge_composite_snapshot_index_projection(record)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 fn recent_tools_from_context_trace(
     trace: Option<&super::session_workspace::ContextTraceSignal>,
 ) -> Vec<String> {
@@ -1739,95 +1623,43 @@ impl SessionRestoreService for HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
-        let rows = sqlx::query(
+        // A directory item selects a Session; it is not a hydrated resume bundle.
+        // Detail recovery and its evidence checks run only after that selection.
+        let mut select = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "SELECT s.session_id, s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
-         COALESCE(event_summary.turn_count, 0) AS turn_count, \
-         latest_model.llm_model_used AS latest_model \
-         FROM agent_sessions s \
-         LEFT JOIN ( \
-           SELECT user_id, session_id, COALESCE(MAX(CASE WHEN parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count \
-           FROM agent_events \
-           GROUP BY user_id, session_id \
-         ) event_summary \
-           ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
-         LEFT JOIN ( \
-           SELECT user_id, session_id, llm_model_used \
-           FROM ( \
-             SELECT user_id, session_id, llm_model_used, \
-                    ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
-             FROM agent_events \
-             WHERE parent_run_id IS NULL \
-               AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-           ) ranked_models \
-           WHERE rn = 1 \
-         ) latest_model \
-           ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
-         WHERE s.user_id = ? AND s.status IN ('active', 'paused') \
-         ORDER BY s.updated_at DESC LIMIT 20",
-        )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("list_resumable: {e}"))?;
+             s.context_completed_turn AS turn_count FROM ",
+        );
+        crate::auth::session::push_session_activity_source(&mut select, user_id);
+        select.push(
+            " WHERE s.status IN ('active', 'paused') \
+              ORDER BY s.activity_at DESC, s.session_id DESC LIMIT 20",
+        );
+        let rows = select
+            .build()
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("list_resumable: {e}"))?;
 
-        let mut sessions = Vec::new();
+        let mut sessions = Vec::with_capacity(rows.len());
         for row in &rows {
-            let session_id = mysql_string(row, "list_resumable_sessions", "session_id")?;
-            let title = mysql_optional_string(row, "list_resumable_sessions", "title")?;
-            let status = mysql_string(row, "list_resumable_sessions", "status")?;
-            let turn_count = mysql_i64(row, "list_resumable_sessions", "turn_count")?;
             let metadata_json =
                 mysql_optional_string(row, "list_resumable_sessions", "metadata_json")?;
-            let metadata_state = metadata_json_state(metadata_json.as_deref())?;
-            let latest_model = astra_core::model_override::normalize_model_override_owned(
-                mysql_optional_string(row, "list_resumable_sessions", "latest_model")?,
-            );
-            let model = metadata_state.model.clone().or(latest_model);
-            let mut restored = if let Some(workspace) =
-                self.restore_cloud_workspace(user_id, &session_id).await?
-            {
-                let mut recent_tools = self.restore_recent_tools(user_id, &session_id).await?;
-                if recent_tools.is_empty() {
-                    recent_tools = recent_tools_from_context_trace(
-                        workspace.metadata.last_context_trace.as_ref(),
-                    );
-                }
-                let checkpoint_count = self
-                    .cloud_checkpoint_count(user_id, &session_id)
-                    .await
-                    .map_err(|e| format!("list_resumable_sessions checkpoint count: {e}"))?;
-                restored_session_from_workspace(
-                    workspace.metadata,
-                    None,
-                    recent_tools,
-                    checkpoint_count,
-                    true,
-                )
-            } else {
-                RestoredSession {
-                    session_id: session_id.clone(),
-                    restored_from_cloud: true,
-                    ..Default::default()
-                }
-            };
-            restored.turn_count = restored.turn_count.max(non_negative_i64_to_u32(
-                turn_count,
-                "list_resumable_sessions",
-                "turn_count",
-            )?);
-            restored.last_status = status;
-            restored.title = restored.title.or(title);
-            if restored.git_branch.is_none() {
-                restored.git_branch = metadata_state.git_branch.clone();
-            }
-            if restored.model.is_none() {
-                restored.model = model;
-            }
-            if restored.permission_mode.is_none() {
-                restored.permission_mode = metadata_state.permission_mode.clone();
-            }
-            restored.restored_from_cloud = true;
-            sessions.push(restored);
+            let metadata = metadata_json_state(metadata_json.as_deref())?;
+            sessions.push(RestoredSession {
+                session_id: mysql_string(row, "list_resumable_sessions", "session_id")?,
+                title: mysql_optional_string(row, "list_resumable_sessions", "title")?,
+                last_status: mysql_string(row, "list_resumable_sessions", "status")?,
+                turn_count: non_negative_i64_to_u32(
+                    mysql_i64(row, "list_resumable_sessions", "turn_count")?,
+                    "list_resumable_sessions",
+                    "turn_count",
+                )?,
+                git_branch: metadata.git_branch,
+                model: metadata.model,
+                permission_mode: metadata.permission_mode,
+                restored_from_cloud: true,
+                ..Default::default()
+            });
         }
         Ok(sessions)
     }
@@ -1916,6 +1748,7 @@ mod tests {
     use super::*;
     use crate::session_journal::JournalDirGuard;
     use crate::session_workspace;
+    use serde_json::json;
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
@@ -3202,155 +3035,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_history_transcript_query_restores_only_root_conversation_rows() {
-        for sql in [
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL,
-            PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL,
-        ] {
-            let upper = sql.to_ascii_uppercase();
-
-            assert!(
-                upper.contains("LEFT JOIN AGENT_RUNS"),
-                "prompt-history transcript restore must classify transcript rows by durable run lineage: {sql}"
-            );
-            assert!(
-                upper.contains("R.SESSION_ID = STI.SESSION_ID"),
-                "run lineage lookup must stay scoped to the same session: {sql}"
-            );
-            assert!(
-                upper.contains("STI.RUN_ID IS NULL"),
-                "system/session transcript rows without a run owner remain restorable: {sql}"
-            );
-            assert!(
-                upper.contains("R.RUN_ID IS NOT NULL") && upper.contains("R.PARENT_RUN_ID IS NULL"),
-                "child/subrun transcript rows must not be restored as main prompt history: {sql}"
-            );
-        }
-        assert!(
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
-                .to_ascii_uppercase()
-                .contains("ORDER BY STI.ITEM_SEQ DESC"),
-            "inner prompt-history transcript query must choose the newest bounded rows first: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
-        );
-        assert!(
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
-                .to_ascii_uppercase()
-                .contains("LIMIT ?"),
-            "prompt-history transcript restore must be bounded: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
-        );
-        assert!(
-            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
-                .to_ascii_uppercase()
-                .ends_with("ORDER BY ITEM_SEQ"),
-            "prompt-history transcript restore must preserve transcript order: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
-        );
-        assert_eq!(
-            MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS, 80,
-            "transcript fallback is not the canonical log; keep it bounded"
-        );
-    }
-
-    #[test]
-    fn dangling_terminal_user_request_gets_a_typed_prompt_boundary() {
-        assert!(
-            !PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL.contains("'tool'")
-                && PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL.contains("TRIM(sti.content) <> ''"),
-            "bare tool/empty assistant evidence must not consume the provider-safe history quota"
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "user",
-                true,
-                Some("run-old"),
-                Some("run-old"),
-                Some("cancelled"),
-            )
-            .is_none(),
-            "an assistant or later intent in the same run still owns closure"
-        );
-        let boundary = prompt_history_boundary_after_message(
-            "user",
-            true,
-            Some("run-old"),
-            Some("run-new"),
-            Some("cancelled"),
-        )
-        .expect("cancelled dangling request must be closed");
-        assert!(boundary.contains("cancelled before completion"));
-        assert!(boundary.contains("not an active objective"));
-        assert!(
-            prompt_history_boundary_after_message(
-                "tool",
-                true,
-                Some("run-old"),
-                Some("run-new"),
-                Some("cancelled"),
-            )
-            .is_some(),
-            "partial side effects remain evidence but must not keep the old objective active"
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "assistant",
-                true,
-                Some("run-old"),
-                Some("run-new"),
-                Some("cancelled"),
-            )
-            .is_none()
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "assistant",
-                false,
-                Some("run-old"),
-                Some("run-new"),
-                Some("cancelled"),
-            )
-            .is_some(),
-            "an empty assistant tool-call tail does not naturally close a cancelled request"
-        );
-        assert!(prompt_history_role_is_provider_safe("assistant", true));
-        assert!(
-            !prompt_history_role_is_provider_safe("tool", true),
-            "a bare tool row without tool_call_id/pairing must never enter provider history"
-        );
-        assert!(
-            prompt_history_boundary_after_message(
-                "user",
-                true,
-                Some("run-old"),
-                Some("run-new"),
-                Some("running"),
-            )
-            .is_none(),
-            "a live run must not be sealed by a restore projection"
-        );
-    }
-
-    #[test]
-    fn tool_heavy_terminal_tail_cannot_evict_provider_safe_history_quota() {
-        let mut newest_first = (0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-            .map(|index| ("tool", format!("tool-result-{index}")))
-            .collect::<Vec<_>>();
-        newest_first.extend(
-            (0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-                .map(|index| ("user", format!("prompt-{index}"))),
-        );
-
-        let selected = newest_first
-            .into_iter()
-            .filter(|(role, content)| {
-                prompt_history_role_is_provider_safe(role, !content.trim().is_empty())
-            })
-            .take(MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize)
-            .collect::<Vec<_>>();
-
-        assert_eq!(selected.len(), MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize);
-        assert!(selected.iter().all(|(role, _)| *role == "user"));
-    }
-
     static SESSION_RESTORE_DB: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
 
@@ -3651,20 +3335,6 @@ mod tests {
             vec!["rg".to_string(), "bash".to_string()],
             "resume recent_tools must contain canonical non-empty tool names only"
         );
-    }
-
-    #[test]
-    fn composite_snapshot_index_uses_one_stable_remote_projection_id() {
-        let index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        let first =
-            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
-                .expect("serialize first index");
-        let second =
-            composite_snapshot_index_to_remote_artifact_record("session-a", "user-a", &index)
-                .expect("serialize replayed index");
-
-        assert_eq!(first.artifact_id, COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID);
-        assert_eq!(second.artifact_id, first.artifact_id);
     }
 
     #[test]

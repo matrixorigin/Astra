@@ -700,7 +700,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     let stderr = child.stderr.take().expect("piped stderr is present");
     let machine_observation = Arc::new(Mutex::new(MachineEventObservation {
         stream: (cfg.artifacts_dir.is_some()
-            || crate::criteria::requires_execution_capture(&case.criteria))
+            || crate::criteria::requires_execution_capture(&case.criteria)
+            || crate::criteria::requires_judger_evidence(&case.criteria))
         .then(Default::default),
         ..Default::default()
     }));
@@ -2170,14 +2171,6 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 run.parent_run_id = Some(root.into());
             }
         }
-        capture
-            .reflection
-            .model_requests
-            .terminal
-            .as_mut()
-            .unwrap()
-            .groups[0]
-            .parent_run_id = Some(root.into());
         for fact in capture.reflection.graph_slice.nodes[0]
             .metadata
             .as_mut()

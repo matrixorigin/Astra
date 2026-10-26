@@ -4,7 +4,11 @@ vi.mock("@/lib/api/auth-guard", () => ({
   requireRuntimeUser: vi.fn(),
 }));
 
-vi.mock("@/lib/api/web-store", () => ({
+vi.mock("@/lib/api/web-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api/web-store")>();
+  return {
+  normalizedActiveSkills: actual.normalizedActiveSkills,
+  normalizedActiveTools: actual.normalizedActiveTools,
   claimChatStreamProjection: vi.fn(),
   withChatStreamProjection: vi.fn((_lease, apply) => { apply(); return true; }),
   releaseChatStreamProjection: vi.fn(),
@@ -23,7 +27,8 @@ vi.mock("@/lib/api/web-store", () => ({
   setChatActiveRun: vi.fn(),
   updateChatWorkspaceSelection: vi.fn(),
   updateStreamingAssistantMessage: vi.fn(),
-}));
+  };
+});
 
 vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {

@@ -1057,9 +1057,9 @@ fn direct_child_result_fingerprint(
     format!("{:x}", writer.0.finalize())
 }
 
-impl serde::Serialize for DirectChildCompletion {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let result = match &self.status {
+impl DirectChildCompletion {
+    fn result_text(&self) -> &str {
+        match &self.status {
             AgentStatus::Completed { result, .. } => result.as_str(),
             AgentStatus::Interrupted { partial_result, .. } => partial_result.as_str(),
             AgentStatus::Failed { error, .. } => error.as_str(),
@@ -1067,7 +1067,44 @@ impl serde::Serialize for DirectChildCompletion {
             | AgentStatus::Waiting { reason }
             | AgentStatus::Paused { reason } => reason.as_str(),
             _ => "",
-        };
+        }
+    }
+
+    /// Delivery uses the existing aggregate budget, not the diagnostic preview.
+    /// Oversized output stays at the existing result owner and is referenced,
+    /// rather than making every ordinary result a manual pagination protocol.
+    pub(crate) fn notification(&self, result_budget: usize) -> serde_json::Value {
+        let result = self.result_text();
+        self.result_projection(if result.len() <= result_budget {
+            result
+        } else {
+            ""
+        })
+    }
+
+    fn result_projection(&self, inline_result: &str) -> serde_json::Value {
+        let result = self.result_text();
+        serde_json::json!({
+            "agent_id": self.agent_id,
+            "run_id": self.run_id,
+            "parent_agent_id": self.parent_agent_id,
+            "applied_user_intents": self.applied_user_intents,
+            "status": DynamicAgentSpawner::agent_status_trace_label(&self.status),
+            "status_fingerprint": direct_child_result_fingerprint(&self.status, &self.applied_user_intents),
+            "result": inline_result,
+            "result_sha256": format!("{:x}", Sha256::digest(inline_result.as_bytes())),
+            "result_bytes": result.len(),
+            "result_range": [0, inline_result.len(), result.len()],
+            "result_truncated": inline_result.len() < result.len(),
+            "get_result": {"action": "get_result", "agent_id": self.agent_id},
+        })
+    }
+}
+
+impl serde::Serialize for DirectChildCompletion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Status snapshots and diagnostics stay small. They are not result delivery.
+        let result = self.result_text();
         let end = result
             .char_indices()
             .map(|(index, _)| index)
@@ -1079,21 +1116,7 @@ impl serde::Serialize for DirectChildCompletion {
         } else {
             &result[..end]
         };
-        serde_json::json!({
-            "agent_id": self.agent_id,
-            "run_id": self.run_id,
-            "parent_agent_id": self.parent_agent_id,
-            "applied_user_intents": self.applied_user_intents,
-            "status": DynamicAgentSpawner::agent_status_trace_label(&self.status),
-            "status_fingerprint": direct_child_result_fingerprint(&self.status, &self.applied_user_intents),
-            "result": preview,
-            "result_sha256": format!("{:x}", Sha256::digest(preview.as_bytes())),
-            "result_bytes": result.len(),
-            "result_range": [0, preview.len(), result.len()],
-            "result_truncated": preview.len() < result.len(),
-            "get_result": {"action": "get_result", "agent_id": self.agent_id},
-        })
-        .serialize(serializer)
+        self.result_projection(preview).serialize(serializer)
     }
 }
 
@@ -12111,6 +12134,10 @@ pub(crate) mod tests {
         status: &str,
     ) -> astra_services::runs::DurableRunRecord {
         astra_services::runs::DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
+            terminal_receipt_json: None,
             run_id: run_id.into(),
             user_id: "user-1".into(),
             session_id: "session-1".into(),

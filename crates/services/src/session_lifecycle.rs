@@ -89,7 +89,15 @@ const SESSION_LOCK_AGENT_RUNS_SQL: &str = "SELECT run_id FROM agent_runs
 const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
     "SELECT isolation_domain, fork_id, parent_session_id
        FROM session_forks
-      WHERE child_session_id = ? AND owner_user_id = ?";
+      WHERE child_session_id = ? AND owner_user_id = ?
+        AND NOT EXISTS (
+            SELECT 1 FROM session_forks descendants
+            WHERE descendants.isolation_domain = session_forks.isolation_domain
+              AND descendants.owner_user_id = session_forks.owner_user_id
+              AND descendants.parent_session_id = session_forks.child_session_id
+              AND descendants.parent_branch_id = session_forks.child_branch_id
+              AND descendants.state IN ('prepared', 'active')
+        )";
 
 const SESSION_DELETE_CHILD_FORK_EVENTS_SQL: &str = "DELETE FROM session_fork_events
          WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?";
@@ -124,23 +132,6 @@ const SESSION_DELETE_ORPHAN_MANIFESTS_SQL: &str = "DELETE FROM conversation_mani
                      )
                  )
            )";
-
-const SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL: &str =
-    "DELETE FROM conversation_manifest_segments
-      WHERE owner_user_id = ? AND session_id = ?
-        AND NOT EXISTS (
-                SELECT 1 FROM conversation_manifest_nodes
-                 WHERE conversation_manifest_nodes.isolation_domain =
-                           conversation_manifest_segments.isolation_domain
-                   AND conversation_manifest_nodes.owner_user_id =
-                           conversation_manifest_segments.owner_user_id
-                   AND conversation_manifest_nodes.session_id =
-                           conversation_manifest_segments.session_id
-                   AND conversation_manifest_nodes.branch_id =
-                           conversation_manifest_segments.branch_id
-                   AND conversation_manifest_nodes.manifest_root =
-                           conversation_manifest_segments.manifest_root
-            )";
 
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
@@ -252,10 +243,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
     },
     SessionDeleteStatement {
-        label: "agent_session_execution_slots",
-        sql: "DELETE FROM agent_session_execution_slots WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "context_manifests",
         sql: "DELETE FROM context_manifests WHERE session_id = ? AND user_id = ?",
     },
@@ -302,10 +289,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "session_transcript_items",
         sql: "DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_transcript_projection_heads",
-        sql: "DELETE FROM session_transcript_projection_heads WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "ctx_snapshots",
@@ -379,20 +362,6 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL,
     },
     SessionBatchDeleteStatement {
-        label: "inference_canonical_transition_wal",
-        sql: "DELETE FROM inference_canonical_transition_wal
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY turn_index ASC, transition_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "inference_canonical_transition_heads",
-        sql: "DELETE FROM inference_canonical_transition_heads
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY turn_index ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
         label: "inference_provider_attempts",
         sql: "DELETE FROM inference_provider_attempts
              WHERE session_id = ? AND user_id = ?
@@ -411,20 +380,6 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: "DELETE FROM inference_routes
              WHERE session_id = ? AND user_id = ?
              ORDER BY created_at ASC, route_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "session_tool_outputs",
-        sql: "DELETE FROM session_tool_outputs
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY created_at ASC, output_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "session_tool_output_batches",
-        sql: "DELETE FROM session_tool_output_batches
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY created_at ASC, batch_id ASC
              LIMIT ?",
     },
     SessionBatchDeleteStatement {
@@ -480,10 +435,6 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM run_checkpoints WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "run_display_projections",
-        sql: "DELETE FROM run_display_projections WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "agent_runs",
         sql: "DELETE FROM agent_runs WHERE session_id = ? AND user_id = ?",
     },
@@ -496,7 +447,6 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
 const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("agent_session_memory_work", "user_id"),
     ("agent_sessions", "user_id"),
-    ("agent_session_execution_slots", "user_id"),
     ("session_context_heads", "owner_user_id"),
     ("session_execution_bindings", "owner_user_id"),
     ("session_execution_switches", "owner_user_id"),
@@ -514,8 +464,6 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("agent_events", "user_id"),
     ("agent_event_edges", "user_id"),
     ("agent_runs", "user_id"),
-    ("inference_canonical_transition_wal", "user_id"),
-    ("inference_canonical_transition_heads", "user_id"),
     ("inference_invocation_settlement_debts", "user_id"),
 ];
 
@@ -673,30 +621,6 @@ async fn verify_core_session_tables_deleted(
     Ok(())
 }
 
-async fn verify_session_admission_reservations_deleted(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    let remaining: i64 = query_scalar(
-        "SELECT COUNT(*) FROM session_weighted_admission_reservations
-         WHERE session_id = ? AND owner_user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| {
-        format!("delete_session.verify.session_weighted_admission_reservations: {source}")
-    })?;
-    if remaining > 0 {
-        return Err(format!(
-            "delete_session.verify.session_weighted_admission_reservations: {remaining} rows remain for session/user after delete"
-        ));
-    }
-    Ok(())
-}
-
 async fn enqueue_workspace_cleanup_debts_for_session_delete(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -846,24 +770,6 @@ async fn delete_unpinned_orphan_manifests(
     Ok(())
 }
 
-async fn delete_orphan_manifest_references_for_session(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-    outcome: &mut SessionDatabaseDeleteOutcome,
-) -> Result<(), String> {
-    let rows = query(SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL)
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| {
-            format!("delete_session.orphan_conversation_manifest_segments: {source}")
-        })?
-        .rows_affected();
-    record_table_delete(outcome, "orphan_conversation_manifest_segments", rows)
-}
-
 pub(crate) async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -957,9 +863,9 @@ pub(crate) async fn hard_delete_session_rows(
     outcome.workspace_cleanup_debts_enqueued =
         enqueue_workspace_cleanup_debts_for_session_delete(tx, session_id, user_id).await?;
 
-    // A child fork owns the pin that keeps its parent's exact prefix alive.
-    // Remove that dependency before deleting the child; parent deletion keeps
-    // the same records intact while any child still exists.
+    // A child fork pins its parent's exact prefix. Live descendants still need
+    // that ancestry after this Session is deleted; retain the existing group
+    // until the bottom-up fork collector can release it.
     let fork_parent_scopes = delete_child_fork_state(tx, session_id, user_id, &mut outcome).await?;
 
     for statement in SESSION_DELETE_DIRECT_BATCH_TABLES {
@@ -1031,11 +937,6 @@ pub(crate) async fn hard_delete_session_rows(
     // If the parent session was deleted earlier, removing its last child pin
     // makes the retained manifests collectible in this same transaction.
     delete_unpinned_orphan_manifests(tx, user_id, &fork_parent_scopes, &mut outcome).await?;
-    delete_orphan_manifest_references_for_session(tx, session_id, user_id, &mut outcome).await?;
-    for (_, parent_session_id) in &fork_parent_scopes {
-        delete_orphan_manifest_references_for_session(tx, parent_session_id, user_id, &mut outcome)
-            .await?;
-    }
 
     // A provider terminal that already owned the invocation lock can publish a
     // debt while hard-delete waits. The second owner-scoped pass runs after the
@@ -1065,59 +966,7 @@ pub(crate) async fn hard_delete_session_rows(
     .await?;
     record_table_delete(&mut outcome, "agent_event_edges", rows_deleted)?;
 
-    // Verify all unrelated session tables before acquiring the admission gate.
-    // This keeps the global gate out of the long residual-check phase.
     verify_core_session_tables_deleted(tx, session_id, user_id).await?;
-
-    // Admission release and expiry cleanup lock the durable gate before they
-    // touch reservation rows. Take that same lock before the session delete so
-    // a release cannot form a reservation -> gate / gate -> reservation cycle.
-    // The gate is held only for the reservation delete, the materialized-usage
-    // invalidation, the reservation-specific check, and the final fence.
-    query(
-        "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = ? FOR UPDATE",
-    )
-    .bind(crate::weighted_admission::distributed_admission_scope(
-        crate::weighted_admission::distributed_admission_partition(user_id),
-    ))
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| format!("delete_session.lock_admission_gate: {source}"))?;
-    let rows_deleted = query(
-        "DELETE FROM session_weighted_admission_reservations
-         WHERE scope_name = ? AND session_id = ? AND owner_user_id = ?",
-    )
-    .bind(crate::weighted_admission::distributed_admission_scope(
-        crate::weighted_admission::distributed_admission_partition(user_id),
-    ))
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await
-    .map(|result| result.rows_affected())
-    .map_err(|source| {
-        format!("delete_session.session_weighted_admission_reservations: {source}")
-    })?;
-    record_table_delete(
-        &mut outcome,
-        "session_weighted_admission_reservations",
-        rows_deleted,
-    )?;
-    if rows_deleted != 0 {
-        query(
-            "UPDATE session_weighted_admission_gates
-             SET usage_initialized = 0, updated_at = NOW(6)
-             WHERE scope_name = ?",
-        )
-        .bind(crate::weighted_admission::distributed_admission_scope(
-            crate::weighted_admission::distributed_admission_partition(user_id),
-        ))
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| format!("delete_session.invalidate_admission_usage: {source}"))?;
-    }
-    verify_session_admission_reservations_deleted(tx, session_id, user_id).await?;
 
     query(COMPLETE_SESSION_DELETE_FENCE_SQL)
         .bind(session_id)
@@ -1631,8 +1480,6 @@ mod tests {
                 "agent_events",
                 "agent_run_events",
                 "conversation_log",
-                "inference_canonical_transition_heads",
-                "inference_canonical_transition_wal",
                 "inference_invocation_settlement_debts",
                 "inference_invocations",
                 "inference_provider_attempts",
@@ -1640,8 +1487,6 @@ mod tests {
                 "model_request_context_events",
                 "prompt_deltas",
                 "prompt_request_records",
-                "session_tool_output_batches",
-                "session_tool_outputs",
             ])
         );
         for statement in statements {

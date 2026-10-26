@@ -41,10 +41,14 @@ criteria:
     require_addition: true
     require_retired_revision: true
     require_cancelled_revision: true
-  - type: journal_tool_call_count
-    name: settle_work_item
-    min: 2
-    max: 2
+  - type: journal_work_replacement_lifecycle
+    initial_items: 2
+    cancelled_items: 1
+    added_items: 1
+    delivered_items: 2
+    cancellation_after_deliveries: 1
+    require_cancel_before_execution: true
+    require_board_before_execution: true
   - type: journal_tool_call_count
     name: settle_work_item
     min: 0

@@ -393,6 +393,11 @@ configuration cannot repair it. Physical attempts remain separately accounted.
   parent has no independent work, it proposes a final answer; the existing
   completion barrier waits for direct children and resumes synthesis with
   their results, without shell sleeps, polling, or an extra database read.
+  Terminal notifications inline complete child output when the existing aggregate
+  delivery budget permits, including JSON escaping and envelope overhead. The
+  small diagnostic/status preview is not the delivery payload. Output exceeding
+  that budget retains its exact producer-owned result and uses the existing
+  explicit read/artifact reference; a reference is not proof of complete adoption.
   Observation timeouts do not cancel children. Completion waiting uses the
   host's authorized execution deadline, if present, rather than inventing a
   deadline; cancellation and user guidance remain active while parked.

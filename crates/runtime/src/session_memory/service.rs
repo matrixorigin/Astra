@@ -289,9 +289,9 @@ impl MemoryExtractionService {
         self
     }
 
-    /// Publish canonical inputs before user-visible turn completion. Expensive
-    /// extraction stays detached; only this bounded durable handoff is inline.
-    pub(crate) async fn prepare_request(&self, req: &ExtractionRequest) -> Result<bool, String> {
+    /// An explicitly dispatched extraction owns its durable input handoff.
+    /// Ordinary turns retain input only in canonical Context storage.
+    async fn publish_request(&self, req: &ExtractionRequest) -> Result<bool, String> {
         let Some(store) = self.durable_store.as_ref() else {
             return Ok(true);
         };
@@ -679,10 +679,8 @@ impl MemoryExtractionService {
 
     /// Best-effort final flush for short or lightly-active sessions.
     ///
-    /// Normal turn-end extraction is still the primary path. This helper
-    /// exists for session shutdown: if a session never crossed the normal
-    /// init/growth gates but still accumulated meaningful state, enqueue one
-    /// last extraction before callers block in [`Self::wait_for_pending`].
+    /// Explicit session shutdown uses the shared extraction gate and worker.
+    /// Ordinary turn completion does not schedule extraction.
     ///
     /// Message text is not classified here. The canonical fingerprint decides
     /// whether the latest snapshot is already fresh; semantic interpretation
@@ -923,14 +921,6 @@ impl MemoryExtractionService {
 
     // ── internals ─────────────────────────────────────────────────────
 
-    /// Resolve the current write capability for lifecycle classification.
-    /// A denied capability is normal optional-feature state, not evidence of
-    /// a failed extraction. The check is intentionally dynamic so revocation
-    /// takes effect without restarting the server.
-    pub(crate) async fn write_access_enabled(&self) -> Result<bool, String> {
-        self.memoria_client.admits_operation(true).await
-    }
-
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
         if let Some(store) = self.durable_store.as_ref() {
             let Some(owner) = self.user_id.as_deref() else {
@@ -940,6 +930,9 @@ impl MemoryExtractionService {
                 return;
             };
             let result = async {
+                if !self.publish_request(&req).await? {
+                    return Ok(());
+                }
                 store.request_extraction(owner, session).await?;
                 if let Some(claim) = store.claim(owner, session).await? {
                     if claim.work.active_request.is_some() {

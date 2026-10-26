@@ -566,6 +566,12 @@ pub enum Criterion {
         /// tool execution, including one whose execution result is an error.
         #[serde(default)]
         require_added_before_execution: bool,
+        /// User explicitly requires retirement before any execution.
+        #[serde(default)]
+        require_cancel_before_execution: bool,
+        /// Task execution must follow a server-issued Work assignment.
+        #[serde(default)]
+        require_board_before_execution: bool,
     },
 
     /// Proves a successful canonical graph patch was committed after Work was
@@ -1086,24 +1092,26 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
 }
 
 /// Share the same structured proof with classification, including composites.
-pub(crate) fn execution_verification_unavailable(
-    result: &CriterionResult,
-    outcome: &RunOutcome,
-) -> bool {
+pub(crate) fn execution_verification_unavailable(result: &CriterionResult) -> bool {
     match &result.criterion {
         Criterion::ExecutionToolCount { .. }
         | Criterion::ExecutionToolSequence { .. }
         | Criterion::ExecutionChildCount { .. }
-        | Criterion::ExecutionChildResultsAdopted { .. } => {
-            execution_contract_proof(&result.criterion, outcome).is_err()
-        }
+        | Criterion::ExecutionChildResultsAdopted { .. } => result
+            .full_detail
+            .as_deref()
+            .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
+            .is_some_and(|proof| {
+                proof["kind"] == "unavailable"
+                    || (proof["kind"] == "child_adoption" && proof["status"] == "unavailable")
+            }),
         Criterion::AnyOf { .. } | Criterion::AllOf { .. } => result
             .full_detail
             .as_deref()
             .and_then(|value| serde_json::from_str::<Vec<CriterionResult>>(value).ok())
             .is_some_and(|nested| {
                 nested.iter().any(|evaluated| {
-                    !evaluated.passed && execution_verification_unavailable(evaluated, outcome)
+                    !evaluated.passed && execution_verification_unavailable(evaluated)
                 })
             }),
         _ => false,
@@ -1142,6 +1150,7 @@ impl ExecutionProofUnavailable {
 pub(crate) fn execution_contract_proof(
     c: &Criterion,
     outcome: &RunOutcome,
+    session: Option<&SessionCapture>,
 ) -> Result<(bool, serde_json::Value), ExecutionProofUnavailable> {
     let stream = outcome
         .stream_capture
@@ -1164,7 +1173,7 @@ pub(crate) fn execution_contract_proof(
         fanout_group,
     } = c
     {
-        return match capture.verify_children(root, children, fanout_group.as_ref()) {
+        return match capture.verify_children(root, children, fanout_group.as_ref(), session) {
             Ok(_) => Ok((
                 true,
                 serde_json::json!({
@@ -1194,7 +1203,7 @@ pub(crate) fn execution_contract_proof(
             serde_json::json!({"kind":"count", "min":min, "max":max, "actual":count}),
         ));
     }
-    let calls = capture.tools(root)?;
+    let calls = capture.tools(root, session)?;
     match c {
         Criterion::ExecutionToolCount {
             name,
@@ -1211,10 +1220,9 @@ pub(crate) fn execution_contract_proof(
                         .into(),
                 );
             }
-            for call in calls
-                .iter()
-                .filter(|call| call.name == name && (!root_only || call.run_id == root))
-            {
+            for call in calls.iter().filter(|call| {
+                call.name == *name && (!root_only || call.run_id.as_deref() == Some(root))
+            }) {
                 if ok.is_some() && call.ok.is_none() {
                     return Err("requested tool outcome not captured".into());
                 }
@@ -1243,7 +1251,7 @@ pub(crate) fn execution_contract_proof(
             let count = calls
                 .iter()
                 .filter(|call| {
-                    if call.name != name || (*root_only && call.run_id != root) {
+                    if call.name != *name || (*root_only && call.run_id.as_deref() != Some(root)) {
                         return false;
                     }
                     considered += 1;
@@ -1268,7 +1276,7 @@ pub(crate) fn execution_contract_proof(
                     }
                     outcome_matches += 1;
                     let error_match = error_contains.as_ref().is_none_or(|needle| {
-                        call.ok == Some(false) && call.raw_result.contains(needle)
+                        call.ok == Some(false) && call.raw_result().contains(needle)
                     });
                     error_matches += usize::from(error_match);
                     let mut all_match = error_match;
@@ -1319,39 +1327,53 @@ pub(crate) fn execution_contract_proof(
         Criterion::ExecutionToolSequence {
             tools,
             last_ok,
-            require_settled,
+            require_settled: _,
         } => {
-            // Match an ordered subsequence of terminal receipts, rather than
-            // merely proving that every name exists somewhere in the run.
-            // Using the receipt order makes a recovery check cross the actual
-            // failed boundary instead of only the request emission boundary.
-            let mut calls: Vec<_> = calls.iter().filter(|call| call.run_id == root).collect();
-            calls.sort_by_key(|call| call.terminal_seq);
+            // A provider round completes before the next one is requested.
+            // Slots within one round do not establish execution order.
+            let mut calls: Vec<_> = calls
+                .iter()
+                .filter(|call| call.run_id.as_deref() == Some(root))
+                .collect();
+            if calls.iter().any(|call| call.round.is_none()) {
+                return Err("tool ordering requires exact producer rounds".into());
+            }
+            calls.sort_by_key(|call| call.round);
             let mut calls = calls.into_iter();
+            let mut previous_round = None;
             let mut last_call = None;
-            let mut previous_terminal_seq = None;
             for (position, name) in tools.iter().enumerate() {
                 let final_call = position + 1 == tools.len();
+                let mut ambiguous = false;
                 last_call = calls.find(|call| {
-                    call.name == name
-                        && (!*require_settled
-                            || previous_terminal_seq
-                                .is_none_or(|terminal_seq| call.request_seq > terminal_seq))
-                        && (!final_call || last_ok.is_none_or(|expected| call.ok == Some(expected)))
+                    if call.name != *name
+                        || (final_call && last_ok.is_some_and(|expected| call.ok != Some(expected)))
+                    {
+                        return false;
+                    }
+                    if previous_round.is_some_and(|round| call.round <= Some(round)) {
+                        ambiguous = true;
+                        return false;
+                    }
+                    true
                 });
                 if last_call.is_none() {
+                    if ambiguous {
+                        return Err("same-round tool order is unavailable".into());
+                    }
                     return Ok((
                         false,
                         serde_json::json!({"kind":"sequence", "matched":position, "expected":tools.len()}),
                     ));
                 }
-                previous_terminal_seq = last_call.map(|call| call.terminal_seq);
+                previous_round = last_call.and_then(|call| call.round);
             }
             Ok((
                 last_ok.is_none_or(|expected| last_call.and_then(|call| call.ok) == Some(expected)),
                 serde_json::json!({"kind":"sequence", "matched":tools.len(), "expected":tools.len()}),
             ))
         }
+
         _ => unreachable!(),
     }
 }
@@ -1605,57 +1627,6 @@ pub fn requires_session_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(criterion_requires_session_capture)
 }
 
-/// Whether a criterion tree explicitly checks the post-loop memory
-/// subsystem.  A health assertion for a different future subsystem must not
-/// suppress the Memoria gate on a memory case.
-pub fn requires_memoria_subsystem_health(criteria: &[Criterion]) -> bool {
-    criteria.iter().any(|criterion| match criterion {
-        Criterion::SessionSubsystemHealthy { settled_subsystem } => settled_subsystem
-            .as_deref()
-            .is_none_or(|subsystem| subsystem == "post_loop_memory"),
-        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
-            requires_memoria_subsystem_health(criteria)
-        }
-        _ => false,
-    })
-}
-
-/// Whether a criterion tree contains a Memoria health assertion on every
-/// successful path at the current list level.  `AnyOf` is deliberately
-/// conservative: a sibling branch can bypass its health assertion, so the
-/// runner keeps the injected hard gate in that case.
-pub fn has_unconditional_memoria_subsystem_health(criteria: &[Criterion]) -> bool {
-    criteria.iter().any(|criterion| match criterion {
-        // An omitted settlement target only validates the capture that is
-        // already available. It must not suppress the runner-injected
-        // post-loop barrier, because asynchronous memory work may still
-        // publish an error after that first capture.
-        Criterion::SessionSubsystemHealthy {
-            settled_subsystem: Some(subsystem),
-        } => subsystem == "post_loop_memory",
-        Criterion::AllOf { criteria } => has_unconditional_memoria_subsystem_health(criteria),
-        Criterion::AnyOf { .. } => false,
-        _ => false,
-    })
-}
-
-/// Return the explicit settlement target from an unconditional Memoria health
-/// assertion. `AnyOf` is excluded because a successful branch can bypass the
-/// health assertion; `AllOf` preserves the requirement for nested criteria.
-pub fn unconditional_memoria_settled_subsystem(criteria: &[Criterion]) -> Option<String> {
-    criteria.iter().find_map(|criterion| match criterion {
-        Criterion::SessionSubsystemHealthy { settled_subsystem }
-            if settled_subsystem
-                .as_deref()
-                .is_none_or(|subsystem| subsystem == "post_loop_memory") =>
-        {
-            settled_subsystem.clone()
-        }
-        Criterion::AllOf { criteria } => unconditional_memoria_settled_subsystem(criteria),
-        _ => None,
-    })
-}
-
 /// Return the explicit settlement target from any unconditional subsystem
 /// health assertion. This retains the runner-wide health mode's historical
 /// support for future subsystem names while keeping `AnyOf` fail-closed.
@@ -1692,6 +1663,9 @@ pub fn requires_durable_run_binding(criteria: &[Criterion]) -> bool {
 fn criterion_requires_session_capture(c: &Criterion) -> bool {
     match c {
         Criterion::SessionEventCount { .. }
+        | Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. }
         | Criterion::SessionChildResultAdopted { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
@@ -1722,6 +1696,16 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
     }
 }
 
+pub(crate) fn requires_judger_evidence(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(|criterion| match criterion {
+        Criterion::Judger { .. } | Criterion::HardJudger { .. } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_judger_evidence(criteria)
+        }
+        _ => false,
+    })
+}
+
 pub(crate) fn requires_execution_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(|criterion| match criterion {
         Criterion::ExecutionChildResultsAdopted { .. }
@@ -1737,7 +1721,6 @@ pub(crate) fn requires_execution_capture(criteria: &[Criterion]) -> bool {
 
 pub(crate) fn requires_execution_transcript(criteria: &[Criterion]) -> bool {
     criteria.iter().any(|criterion| match criterion {
-        Criterion::ExecutionToolCount { .. } | Criterion::ExecutionToolSequence { .. } => true,
         Criterion::ExecutionChildResultsAdopted { .. } => true,
         Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
             requires_execution_transcript(criteria)
@@ -2734,11 +2717,7 @@ fn evaluate_one_with_primary_cache(
             }
         }
         Criterion::ToolsCountBetween { min, max } => {
-            // The terminal envelope and step-event archive cover the same
-            // inclusive execution but have independent capture paths. A
-            // short/partial step-event archive must never override a larger
-            // terminal count and accidentally certify an upper bound.
-            let n = outcome.total_tool_calls.max(outcome.tool_calls_count);
+            let n = outcome.observed_tool_calls();
             let pass = n >= *min && n <= *max;
             CriterionResult {
                 criterion: c.clone(),
@@ -3149,7 +3128,7 @@ fn evaluate_one_with_primary_cache(
         | Criterion::ExecutionToolSequence { .. }
         | Criterion::ExecutionChildCount { .. }
         | Criterion::ExecutionChildResultsAdopted { .. } => {
-            let proof = execution_contract_proof(c, outcome);
+            let proof = execution_contract_proof(c, outcome, session);
             CriterionResult {
                 criterion: c.clone(),
                 severity: CriterionSeverity::Hard,
@@ -3160,7 +3139,10 @@ fn evaluate_one_with_primary_cache(
                     }
                     Err(reason) => format!("Server verification unavailable: {reason}"),
                 },
-                full_detail: None,
+                full_detail: proof
+                    .as_ref()
+                    .err()
+                    .map(|reason| reason.diagnostic().to_string()),
                 score: None,
             }
         }
@@ -4094,6 +4076,8 @@ fn evaluate_one_with_primary_cache(
             added_execution_after_initial_deliveries,
             require_added_at_start,
             require_added_before_execution,
+            require_cancel_before_execution,
+            require_board_before_execution,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_work_replacement_lifecycle");
@@ -4110,6 +4094,8 @@ fn evaluate_one_with_primary_cache(
                         *added_execution_after_initial_deliveries,
                     require_added_at_start: *require_added_at_start,
                     require_added_before_execution: *require_added_before_execution,
+                    require_cancel_before_execution: *require_cancel_before_execution,
+                    require_board_before_execution: *require_board_before_execution,
                 },
             );
             CriterionResult {
@@ -5440,7 +5426,12 @@ fn evaluate_prompt_cache_reuse_scope(
         let witness = groups
             .iter()
             .map(|requests| {
-                let reads: u128 = requests.iter().skip(1).map(|read| u128::from(*read)).sum();
+                let reads: u128 = requests
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .map(|read| u128::from(*read))
+                    .sum();
                 (requests.len(), reads)
             })
             .max_by_key(|(count, reads)| (*count >= 2 && *reads > 0, *reads, *count))
@@ -5450,6 +5441,7 @@ fn evaluate_prompt_cache_reuse_scope(
         let reads: u128 = groups
             .iter()
             .skip(1)
+            .flatten()
             .flatten()
             .map(|read| u128::from(*read))
             .sum();
@@ -5461,7 +5453,7 @@ fn evaluate_prompt_cache_reuse_scope(
         passed: observations >= 2 && reuse_reads > 0,
         detail: format!(
             "required prompt-cache scope={boundary}: observations={observations}, \
-             post-cold cache_read_tokens={reuse_reads}, expected >=2 observations and read>0"
+             post-cold cache_read_tokens={reuse_reads} (known reads only), expected >=2 observations and read>0"
         ),
         full_detail: Some(CacheScopeDiagnostic::capture(
             scope,
@@ -6495,6 +6487,18 @@ mod tests {
         }
     }
 
+    fn evaluate_execution_fixture(
+        criteria: &[Criterion],
+        outcome: &RunOutcome,
+    ) -> Vec<CriterionResult> {
+        let trace = outcome
+            .stream_capture
+            .as_ref()
+            .and_then(|s| s.execution.as_ref())
+            .map(crate::execution_capture::tests::trace);
+        evaluate_deterministic_with_session(criteria, outcome, trace.as_ref())
+    }
+
     #[test]
     fn failed_tool_diagnostic_is_bound_to_its_typed_call() {
         let criterion = Criterion::ExecutionToolCount {
@@ -6556,10 +6560,10 @@ mod tests {
             stream.identity_verified = true;
             stream.execution = Some(capture);
             outcome.stream_capture = Some(stream);
-            let evaluated = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            let evaluated = evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
             assert_eq!(evaluated[0].passed, passed, "{fault}");
             assert_eq!(
-                execution_verification_unavailable(&evaluated[0], &outcome),
+                execution_verification_unavailable(&evaluated[0]),
                 unavailable,
                 "{fault}"
             );
@@ -6723,10 +6727,10 @@ mod tests {
                     .unwrap()
                     .run_projections = None;
             }
-            let evaluated = evaluate_deterministic(&[requested], &outcome);
+            let evaluated = evaluate_execution_fixture(&[requested], &outcome);
             assert_eq!(evaluated[0].passed, passes, "{fault}");
             assert_eq!(
-                execution_verification_unavailable(&evaluated[0], &outcome),
+                execution_verification_unavailable(&evaluated[0]),
                 unavailable,
                 "{fault}"
             );
@@ -6860,9 +6864,9 @@ mod tests {
             stream.identity_verified = true;
             stream.execution = Some(capture);
             outcome.stream_capture = Some(stream);
-            let result = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            let result = evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
             assert_eq!(result[0].passed, expected_pass, "{raw}");
-            assert!(!execution_verification_unavailable(&result[0], &outcome));
+            assert!(!execution_verification_unavailable(&result[0]));
             if !expected_pass {
                 assert_eq!(
                     crate::classify::classify(&outcome, &result),
@@ -6893,7 +6897,8 @@ mod tests {
                         }
                         _ => unreachable!(),
                     }
-                    let rejected = evaluate_deterministic(std::slice::from_ref(&criterion), &known);
+                    let rejected =
+                        evaluate_execution_fixture(std::slice::from_ref(&criterion), &known);
                     assert!(!rejected[0].passed, "{tree_change}");
                     assert_eq!(
                         crate::classify::classify(&known, &rejected),
@@ -6908,7 +6913,7 @@ mod tests {
                 equals: serde_json::json!({"value":42}),
             };
             assert_eq!(
-                evaluate_deterministic(&[parent], &outcome)[0].passed,
+                evaluate_execution_fixture(&[parent], &outcome)[0].passed,
                 expected_pass
             );
             let capture = outcome
@@ -6923,7 +6928,9 @@ mod tests {
                 .as_mut()
                 .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
                 serde_json::json!("wrong");
-            assert!(!evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+            assert!(
+                !evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed
+            );
             outcome
                 .stream_capture
                 .as_mut()
@@ -6932,11 +6939,9 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .transcript = None;
-            let unavailable = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
-            assert!(execution_verification_unavailable(
-                &unavailable[0],
-                &outcome
-            ));
+            let unavailable =
+                evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
+            assert!(execution_verification_unavailable(&unavailable[0]));
             assert_eq!(
                 crate::classify::classify(&outcome, &unavailable),
                 crate::classify::FailureClass::InfraVerificationUnavailable
@@ -6978,7 +6983,7 @@ mod tests {
         stream.identity_verified = true;
         stream.execution = Some(capture.clone());
         outcome.stream_capture = Some(stream);
-        assert!(evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+        assert!(evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed);
         capture.run_tree.runs[0].total_tool_calls = 2;
         let page = capture.transcript.as_mut().unwrap();
         let mut second_request = page.items[0].clone();
@@ -6993,7 +6998,7 @@ mod tests {
         page.items[0].tool_calls[0].arguments = r#"{"action":"spawn","prompt":"MARKER-A"}"#.into();
         page.items.extend([second_request, second_result]);
         outcome.stream_capture.as_mut().unwrap().execution = Some(capture);
-        let results = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+        let results = evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome);
         assert!(!results[0].passed);
         assert_eq!(
             crate::classify::classify(&outcome, &results),
@@ -7015,7 +7020,7 @@ mod tests {
             error_contains: None,
         };
         let check = |outcome: &RunOutcome, criterion: &Criterion| {
-            evaluate_deterministic(std::slice::from_ref(criterion), outcome)[0].passed
+            evaluate_execution_fixture(std::slice::from_ref(criterion), outcome)[0].passed
         };
         assert!(
             !check(&outcome, &absence),
@@ -7079,12 +7084,9 @@ mod tests {
             *max = 0;
         }
         let unavailable =
-            evaluate_deterministic(std::slice::from_ref(&negative_predicate), &malformed);
+            evaluate_execution_fixture(std::slice::from_ref(&negative_predicate), &malformed);
         assert!(!unavailable[0].passed);
-        assert!(execution_verification_unavailable(
-            &unavailable[0],
-            &malformed
-        ));
+        assert!(execution_verification_unavailable(&unavailable[0]));
         assert_eq!(
             crate::classify::classify(&malformed, &unavailable),
             crate::classify::FailureClass::InfraVerificationUnavailable
@@ -7104,20 +7106,17 @@ mod tests {
             error_contains: None,
         };
         assert!(check(&outcome, &requested));
-        let evaluated = evaluate_deterministic(std::slice::from_ref(&requested), &outcome);
-        assert!(!execution_verification_unavailable(&evaluated[0], &outcome));
+        let evaluated = evaluate_execution_fixture(std::slice::from_ref(&requested), &outcome);
+        assert!(!execution_verification_unavailable(&evaluated[0]));
         let mut unverified = outcome.clone();
         unverified
             .stream_capture
             .as_mut()
             .unwrap()
             .identity_verified = false;
-        let unavailable = evaluate_deterministic(std::slice::from_ref(&requested), &unverified);
+        let unavailable = evaluate_execution_fixture(std::slice::from_ref(&requested), &unverified);
         assert!(!unavailable[0].passed);
-        assert!(execution_verification_unavailable(
-            &unavailable[0],
-            &unverified
-        ));
+        assert!(execution_verification_unavailable(&unavailable[0]));
         assert!(check(&outcome, &result));
         let mut mixed = outcome.clone();
         let capture = mixed
@@ -7155,10 +7154,10 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .status = Some(status.into());
-            let evaluated = evaluate_deterministic(std::slice::from_ref(&result), &mixed);
+            let evaluated = evaluate_execution_fixture(std::slice::from_ref(&result), &mixed);
             assert_eq!(evaluated[0].passed, available, "{status}");
             if !available {
-                assert!(execution_verification_unavailable(&evaluated[0], &mixed));
+                assert!(execution_verification_unavailable(&evaluated[0]));
             }
         }
         malformed = outcome.clone();
@@ -7174,11 +7173,8 @@ mod tests {
             .unwrap()
             .items[1]
             .content = "{\"value\":42}\ndisplay advisory".into();
-        let unavailable = evaluate_deterministic(std::slice::from_ref(&result), &malformed);
-        assert!(
-            !unavailable[0].passed
-                && execution_verification_unavailable(&unavailable[0], &malformed)
-        );
+        let unavailable = evaluate_execution_fixture(std::slice::from_ref(&result), &malformed);
+        assert!(!unavailable[0].passed && execution_verification_unavailable(&unavailable[0]));
         outcome
             .stream_capture
             .as_mut()
@@ -7196,7 +7192,7 @@ mod tests {
                 criteria: vec![absence.clone()],
             },
         ] {
-            let results = evaluate_deterministic(std::slice::from_ref(&composite), &outcome);
+            let results = evaluate_execution_fixture(std::slice::from_ref(&composite), &outcome);
             assert!(!results[0].passed);
             assert_eq!(
                 crate::classify::classify(&outcome, &results),
@@ -7216,7 +7212,7 @@ mod tests {
                 error_contains: None,
             }],
         };
-        let results = evaluate_deterministic(std::slice::from_ref(&contradiction), &outcome);
+        let results = evaluate_execution_fixture(std::slice::from_ref(&contradiction), &outcome);
         assert!(!results[0].passed);
         assert_eq!(
             crate::classify::classify(&outcome, &results),
@@ -7245,7 +7241,7 @@ mod tests {
                 crate::classify::FailureClass::InfraVerificationUnavailable,
             ),
         ] {
-            let results = evaluate_deterministic(std::slice::from_ref(&composite), &outcome);
+            let results = evaluate_execution_fixture(std::slice::from_ref(&composite), &outcome);
             assert!(!results[0].passed);
             assert_eq!(crate::classify::classify(&outcome, &results), expected);
         }
@@ -7304,7 +7300,7 @@ mod tests {
             require_settled: true,
         };
         assert!(
-            !evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed,
+            !evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed,
             "calls before the boundary must not satisfy the sequence"
         );
 
@@ -7328,7 +7324,7 @@ mod tests {
             items[3].tool_result.as_mut().unwrap().status = Some("failed".into());
         }
         assert!(
-            !evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed,
+            !evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed,
             "a failed recovery call must not satisfy last_ok"
         );
         outcome
@@ -7346,7 +7342,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .status = Some("completed".into());
-        assert!(evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+        assert!(evaluate_execution_fixture(std::slice::from_ref(&criterion), &outcome)[0].passed);
     }
 
     #[test]
@@ -7354,7 +7350,6 @@ mod tests {
         use astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind;
         for (name, model) in [
             ("flash_missing_child_model_fail_closed", "glm-99.99"),
-            ("flash_near_version_must_not_substitute", "glm-5.3"),
             (
                 "flash_rejected_delegation_preserves_parent_tools",
                 "glm-99.99",
@@ -7450,7 +7445,7 @@ mod tests {
             stream.execution = Some(capture);
             outcome.stream_capture = Some(stream);
             assert!(
-                evaluate_deterministic(&criteria, &outcome)
+                evaluate_execution_fixture(&criteria, &outcome)
                     .iter()
                     .all(|result| result.passed),
                 "{name}"
@@ -7539,7 +7534,7 @@ mod tests {
                 if fault == "missing-capture" {
                     candidate.stream_capture = None;
                 }
-                let evaluated = evaluate_deterministic(&criteria, &candidate);
+                let evaluated = evaluate_execution_fixture(&criteria, &candidate);
                 assert_eq!(
                     evaluated.iter().all(|check| check.passed),
                     fault == "scope-binding",
@@ -7579,7 +7574,7 @@ mod tests {
                     );
                 }
                 outcome.stream_capture.as_mut().unwrap().execution = Some(extra);
-                let results = evaluate_deterministic(&criteria, &outcome);
+                let results = evaluate_execution_fixture(&criteria, &outcome);
                 if extra_name == "model_catalog" {
                     assert!(
                         results.iter().all(|result| result.passed),
@@ -8952,14 +8947,6 @@ mod tests {
             );
             let mut capture = crate::execution_capture::tests::capture();
             capture.run_tree.runs[1].runtime.model_name = Some(model.clone());
-            capture
-                .reflection
-                .model_requests
-                .terminal
-                .as_mut()
-                .unwrap()
-                .groups[0]
-                .model = model.clone();
             let mut stream = crate::runner::StreamCapture::default();
             stream.identity_verified = true;
             stream.execution = Some(capture.clone());
@@ -9331,37 +9318,6 @@ mod tests {
         );
         assert!(!result[0].passed);
         assert!(result[0].detail.contains("incomplete"));
-    }
-
-    #[test]
-    fn memoria_health_deduplication_is_not_bypassed_by_any_of() {
-        let health_without_settlement = Criterion::SessionSubsystemHealthy {
-            settled_subsystem: None,
-        };
-        assert!(!has_unconditional_memoria_subsystem_health(
-            std::slice::from_ref(&health_without_settlement,)
-        ));
-        let health = Criterion::SessionSubsystemHealthy {
-            settled_subsystem: Some("post_loop_memory".into()),
-        };
-        assert!(has_unconditional_memoria_subsystem_health(
-            std::slice::from_ref(&health,)
-        ));
-        assert!(has_unconditional_memoria_subsystem_health(&[
-            Criterion::AllOf {
-                criteria: vec![health.clone(), Criterion::ExitCode { code: 0 }],
-            },
-        ]));
-        assert!(!has_unconditional_memoria_subsystem_health(&[
-            Criterion::AnyOf {
-                criteria: vec![health_without_settlement, Criterion::ExitCode { code: 0 }],
-            },
-        ]));
-        assert!(!has_unconditional_memoria_subsystem_health(&[
-            Criterion::AnyOf {
-                criteria: vec![health, Criterion::ExitCode { code: 0 }],
-            },
-        ]));
     }
 
     #[test]
@@ -11399,74 +11355,106 @@ mod tests {
     }
 
     #[test]
-    fn shipped_prefix_cache_case_rejects_low_reads_on_each_warm_turn() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/cache_prefix_provider_stable_system.yaml");
-        let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
-        assert_eq!(case.steps.len(), 3);
-        let weak = cache_request_outcome("weak", "turn", &[(100, 2_400, 0)]);
-        for (index, step) in case.steps.iter().enumerate() {
-            assert!(
-                !step.criteria.is_empty(),
-                "warm step {index} must measure its own cache read"
-            );
-            let results = evaluate_deterministic_with_session(&step.criteria, &weak, None);
-            assert!(
-                results
+    fn shipped_cache_cases_require_observed_reuse_on_every_warm_turn() {
+        for name in [
+            "cache_prefix_provider_stable_system",
+            "cache_volatile_lane_stability",
+        ] {
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("cases/{name}.yaml"));
+            let case = crate::case::Case::from_path(&path).expect("load shipped cache case");
+            let warm_steps = case.steps.iter().filter(|step| !step.criteria.is_empty());
+            assert_eq!(warm_steps.clone().count(), 3);
+            for step in warm_steps {
+                // Even a small prefix can be correctly reused. Partial provider
+                // evidence proves measured reads, but cannot prove an exact ratio.
+                let mut partial = cache_request_outcome("warm", "turn", &[(10, 64, 0)]);
+                for event in &mut partial.explain_capture.as_mut().unwrap().events {
+                    if let Some(usage) = &mut event.usage {
+                        usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
+                        usage.cache_creation_tokens = None;
+                    }
+                }
+                let results = evaluate_deterministic_with_session(&step.criteria, &partial, None);
+                assert!(
+                    results
+                        .iter()
+                        .filter(|result| result.severity == CriterionSeverity::Hard)
+                        .all(|result| result.passed),
+                    "{name}: {results:?}"
+                );
+                let ratio = results
                     .iter()
-                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
-                "warm step {index} must hard-fail at only 2,400 cache-read tokens: {results:?}"
-            );
-        }
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_500, 0)]);
-        for event in &mut strong.explain_capture.as_mut().unwrap().events {
-            if let Some(usage) = &mut event.usage {
-                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
-                usage.cache_creation_tokens = None;
+                    .find(|result| {
+                        matches!(
+                            result.criterion,
+                            Criterion::ProviderPromptCacheReadRatio { .. }
+                        )
+                    })
+                    .expect("ratio diagnostic");
+                assert_eq!(ratio.severity, CriterionSeverity::Soft);
+                assert!(
+                    !ratio.passed && ratio.detail.contains("evidence unavailable"),
+                    "{ratio:?}"
+                );
+                let mut missing = partial.clone();
+                for event in &mut missing.explain_capture.as_mut().unwrap().events {
+                    if let Some(usage) = &mut event.usage {
+                        usage.cache_read_tokens = None;
+                    }
+                }
+                for invalid in [
+                    cache_request_outcome("zero", "turn", &[(100, 0, 0)]),
+                    missing,
+                ] {
+                    let results =
+                        evaluate_deterministic_with_session(&step.criteria, &invalid, None);
+                    assert!(
+                        results
+                            .iter()
+                            .any(|result| !result.passed
+                                && result.severity == CriterionSeverity::Hard),
+                        "{name}: {results:?}"
+                    );
+                }
+                let churn = cache_request_outcome("churn", "turn", &[(10, 64, 1_000)]);
+                let results = evaluate_deterministic_with_session(&step.criteria, &churn, None);
+                assert!(
+                    results
+                        .iter()
+                        .any(|result| !result.passed && result.severity == CriterionSeverity::Soft),
+                    "{name}: {results:?}"
+                );
             }
-        }
-        for (index, step) in case.steps.iter().enumerate() {
-            let results = evaluate_deterministic_with_session(&step.criteria, &strong, None);
-            assert!(
-                results
-                    .iter()
-                    .any(|result| { result.passed && result.severity == CriterionSeverity::Hard }),
-                "warm step {index} must accept observed partial-provider reads: {results:?}"
-            );
         }
     }
 
     #[test]
-    fn shipped_volatile_lane_case_checks_each_post_correction_turn() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/cache_volatile_lane_stability.yaml");
-        let case = crate::case::Case::from_path(&path).expect("load shipped volatile-lane case");
-        assert_eq!(case.steps.len(), 4);
-
-        let weak = cache_request_outcome("weak", "turn", &[(100, 7_999, 0)]);
-        let mut strong = cache_request_outcome("strong", "turn", &[(100, 8_000, 0)]);
-        for event in &mut strong.explain_capture.as_mut().unwrap().events {
-            if let Some(usage) = &mut event.usage {
-                usage.basis = astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial;
-                usage.cache_creation_tokens = None;
-            }
-        }
-
-        for (index, step) in case.steps.iter().enumerate().skip(1) {
-            let weak_result = evaluate_deterministic_with_session(&step.criteria, &weak, None);
-            assert!(
-                weak_result
-                    .iter()
-                    .any(|result| !result.passed && result.severity == CriterionSeverity::Hard),
-                "post-correction step {index} must hard-fail weak reads: {weak_result:?}"
-            );
-            let strong_result = evaluate_deterministic_with_session(&step.criteria, &strong, None);
-            assert!(
-                strong_result
-                    .iter()
-                    .any(|result| result.passed && result.severity == CriterionSeverity::Hard),
-                "post-correction step {index} must accept observed partial reads: {strong_result:?}"
-            );
+    fn shipped_fanout_case_requires_all_exact_slots_from_canonical_adoption() {
+        let case: crate::case::Case =
+            serde_yaml_ng::from_str(include_str!("../cases/fanout_completion_truth.yaml")).unwrap();
+        let adoption = case
+            .criteria
+            .iter()
+            .filter_map(|criterion| match criterion {
+                Criterion::ExecutionChildResultsAdopted {
+                    children,
+                    fanout_group,
+                } => Some((children, fanout_group)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(adoption.len(), 1);
+        let (children, group) = adoption[0];
+        assert!(
+            matches!(group, Some(FanoutGroupSelector::Id(id)) if id == "fanout-completion-truth")
+        );
+        assert_eq!(children.len(), 3);
+        for (index, token) in ["ALPHA", "BETA", "GAMMA"].into_iter().enumerate() {
+            assert_eq!(children[index].slot_index, Some(index as u32));
+            assert_eq!(children[index].model, "{{model}}");
+            assert!(matches!(&children[index].expected_result,
+                Some(ChildResultExpectation::Text(text)) if text == &format!("FANOUT-EVIDENCE-{token}")));
         }
     }
 
@@ -11641,9 +11629,16 @@ mod tests {
     }
 
     #[test]
-    fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
+    fn required_prompt_cache_scope_retains_witness_with_unknown_unrelated_usage() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
-        let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        let mut witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        for event in &mut witness.explain_capture.as_mut().unwrap().events {
+            if event.round_index == Some(0)
+                && let Some(usage) = &mut event.usage
+            {
+                usage.cache_read_tokens = None;
+            }
+        }
         let criterion = Criterion::PromptCacheReuseScope {
             scope: PromptCacheReuseScope::IntraTurnRounds,
         };
@@ -11672,8 +11667,65 @@ mod tests {
             None,
             &[&many, &witness, &unknown],
         );
-        assert!(!result[0].passed);
-        assert!(result[0].detail.contains("evidence unavailable"));
+        assert!(
+            result[0].passed,
+            "unknown unrelated counters must not erase a witness"
+        );
+    }
+
+    #[test]
+    fn required_cache_reuse_accepts_unknown_cold_usage_but_not_unknown_warm_usage() {
+        let mut cold = cache_request_outcome("cold", "t1", &[(100, 0, 0)]);
+        for event in &mut cold.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = None;
+            }
+        }
+        let warm = cache_request_outcome("warm", "t2", &[(100, 4864, 0)]);
+        let criterion = Criterion::PromptCacheReuseScope {
+            scope: PromptCacheReuseScope::ConversationTurns,
+        };
+        let check = |a: &RunOutcome, b: &RunOutcome| {
+            evaluate_with_primary_executions(
+                std::slice::from_ref(&criterion),
+                &RunOutcome::new("aggregate"),
+                None,
+                &[a, b],
+            )
+            .remove(0)
+        };
+        assert!(check(&cold, &warm).passed);
+        assert!(
+            !check(&warm, &cold).passed,
+            "cold hit cannot stand in for unknown warm usage"
+        );
+        let zero = cache_request_outcome("zero", "t2", &[(100, 0, 0)]);
+        assert!(!check(&cold, &zero).passed, "unknown must not become a hit");
+        let mut incomplete = cold.clone();
+        incomplete
+            .explain_capture
+            .as_mut()
+            .unwrap()
+            .snapshot_pending = true;
+        assert!(
+            !check(&incomplete, &warm).passed,
+            "cold capture integrity remains required"
+        );
+        let exact = Criterion::PromptCacheTokens {
+            min_read: 1,
+            min_creation: 0,
+            max_creation: None,
+        };
+        assert!(
+            !evaluate_with_primary_executions(
+                &[exact],
+                &RunOutcome::new("aggregate"),
+                None,
+                &[&cold, &warm],
+            )[0]
+            .passed,
+            "exact total still requires complete measurement"
+        );
     }
 
     #[test]

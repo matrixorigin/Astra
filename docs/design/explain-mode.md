@@ -487,7 +487,7 @@ are never added to physical model-attempt cache denominators.
   derived-report path never substitutes for server publication success.
 - Failed publication is a run observation, not an immutable empty snapshot.
   Missing reports can be recovered from the exact completed run's durable
-  facts on explicit discovery or buffered-completion resume. Paused or cancelled runs
+  facts on explicit discovery after the execution owner commits completion. Paused or cancelled runs
   cannot promote buffered successful facts into a completed report. Recovery
   preserves turn and generation identity and records its publication result;
   it does not rerun the model or overwrite a successful conflicting snapshot.

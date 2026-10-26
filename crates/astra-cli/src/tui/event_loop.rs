@@ -3688,18 +3688,10 @@ fn expire_guidance_closure_as_unconfirmed(
     Some(unconfirmed_ids.into_iter().collect())
 }
 
-/// Machine code returned when durable admission rolls back current-run
-/// guidance because the run is already settling. The submission did not commit.
-const RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE: &str = "run_intent_settlement_fenced";
-
 /// Machine code returned when the run had already reached a terminal status
 /// (completed/failed/cancelled/delegated) before this submission landed.
-/// Ownership never existed to transfer, so this is handled the same way as
-/// the settlement fence: requeue the text as the next turn.
+/// Ownership never transferred, so requeue the text as the next turn.
 const RUN_INTENT_RUN_TERMINAL_ERROR_CODE: &str = "run_intent_run_terminal";
-
-const SETTLEMENT_FENCED_FOLLOW_UP_NOTICE: &str =
-    "This run is settling. Your message is queued and will be sent as the next turn.";
 
 /// Terminal covers `cancelled` and `failed`, not just `completed`. Those two
 /// are exactly the cases where the turn also settles abnormally, and then
@@ -3718,8 +3710,8 @@ enum GuidanceSubmissionError {
     /// The request is known not to have transferred ownership to the run.
     Rejected(String),
     /// The server rolled this guidance back because current-run ownership is
-    /// gone — either the run fenced for settlement or it already reached a
-    /// terminal status. Either way ownership did not transfer, so the
+    /// gone because the run reached a terminal status. Ownership did not
+    /// transfer, so the
     /// original text can move to the next-turn queue instead of being
     /// retried against a run that will never accept it. The carried notice
     /// is the exact user-facing text for whichever case applied.
@@ -3746,7 +3738,7 @@ fn api_error_code(body: &str) -> Option<String> {
 /// late fence response does not land behind messages the user sent afterward.
 /// Returns whether the text was queued. The caller must not post it again
 /// until the current turn owner hands control back.
-fn release_settlement_fenced_guidance(
+fn release_closed_run_guidance(
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
     bottom_pane: &mut BottomPane,
     intent_id: &str,
@@ -3761,13 +3753,6 @@ fn release_settlement_fenced_guidance(
 impl GuidanceSubmissionError {
     fn from_thin_client(error: astra_thin_client::ThinClientError) -> Self {
         match error {
-            astra_thin_client::ThinClientError::Api { status, ref body }
-                if status == reqwest::StatusCode::CONFLICT
-                    && api_error_code(body).as_deref()
-                        == Some(RUN_INTENT_SETTLEMENT_FENCED_ERROR_CODE) =>
-            {
-                Self::GuidanceClosed(SETTLEMENT_FENCED_FOLLOW_UP_NOTICE)
-            }
             astra_thin_client::ThinClientError::Api { status, ref body }
                 if status == reqwest::StatusCode::CONFLICT
                     && api_error_code(body).as_deref()
@@ -9749,7 +9734,7 @@ pub(crate) async fn run_tui_session(
                                                                         .queued_next_turn_submission_count()
                                                                 },
                                                             );
-                                                            let queued = release_settlement_fenced_guidance(
+                                                            let queued = release_closed_run_guidance(
                                                                 &preinstalled_run_control,
                                                                 &mut bottom_pane,
                                                                 &submission.intent_id,
@@ -16396,7 +16381,7 @@ mod tests {
             control.pending_remote_submission_ids(),
             vec!["in-flight-guidance"]
         );
-        assert!(release_settlement_fenced_guidance(
+        assert!(release_closed_run_guidance(
             &control,
             &mut pane,
             "in-flight-guidance",
@@ -20097,24 +20082,6 @@ mod tests {
             GuidanceSubmissionError::Unconfirmed(_)
         ));
 
-        let fenced = GuidanceSubmissionError::from_thin_client(
-            astra_thin_client::ThinClientError::Api {
-                status: reqwest::StatusCode::CONFLICT,
-                body: serde_json::json!({
-                    "detail": "This run is settling and no longer accepts current-run guidance. Submit it as the next session turn instead.",
-                    "error_code": "run_intent_settlement_fenced",
-                    "request_id": "256cd25fa6dde3ee22694940bf00125f"
-                })
-                .to_string(),
-            },
-        );
-        assert_eq!(
-            fenced,
-            GuidanceSubmissionError::GuidanceClosed(SETTLEMENT_FENCED_FOLLOW_UP_NOTICE)
-        );
-        assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("HTTP"));
-        assert!(!SETTLEMENT_FENCED_FOLLOW_UP_NOTICE.contains("request_id"));
-
         let run_terminal = GuidanceSubmissionError::from_thin_client(
             astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::CONFLICT,
@@ -20146,8 +20113,8 @@ mod tests {
 
         // A conflict on the SAME run, but in a durable status this branch
         // does not special-case (e.g. a manual pause), must keep falling
-        // through to a plain rejection. Only terminal statuses and the
-        // settlement fence get requeued to the next turn.
+        // through to a plain rejection. Only terminal status gets requeued
+        // to the next turn.
         let unhandled_status_conflict =
             GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::CONFLICT,
@@ -20178,75 +20145,20 @@ mod tests {
             other => panic!("identity conflict must stay a rejection, got {other:?}"),
         }
 
-        let timed_out_fence =
+        let timed_out =
             GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::REQUEST_TIMEOUT,
                 body: serde_json::json!({
-                    "error_code": "run_intent_settlement_fenced"
+                    "error_code": "unrecognized_error_code"
                 })
                 .to_string(),
             });
-        assert!(matches!(
-            timed_out_fence,
-            GuidanceSubmissionError::Unconfirmed(_)
-        ));
-    }
-
-    #[test]
-    fn settlement_fenced_follow_up_is_queued_without_keeping_the_rejected_intent() {
-        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
-        let mut bottom_pane = BottomPane::new();
-        bottom_pane
-            .try_accept_user_intent(
-                "intent-fenced",
-                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                astra_turn_types::UserIntentStatus::AcceptedLocal,
-                "list my workspaces",
-            )
-            .expect("local guidance intent");
-        run_control.expect_remote_user_intent_submission("intent-fenced");
-
-        assert!(release_settlement_fenced_guidance(
-            &run_control,
-            &mut bottom_pane,
-            "intent-fenced",
-            "list my workspaces",
-            0,
-        ));
-        assert!(run_control.pending_remote_submission_ids().is_empty());
-        assert!(
-            bottom_pane
-                .take_client_recoverable_user_intents()
-                .is_empty()
-        );
-
-        let mut queued = bottom_pane.take_queued_next_turn_submissions();
-        let mut followups = std::collections::VecDeque::new();
-        assert!(
-            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
-                .is_none()
-        );
-        assert_eq!(
-            interactive_texts(followups),
-            vec!["list my workspaces".to_string()]
-        );
-
-        let mut restored_queue = interactive_queue(["list my workspaces".to_string()]);
-        let restored = settle_followup_submissions(
-            &mut std::collections::VecDeque::new(),
-            std::iter::empty(),
-            &mut restored_queue,
-            false,
-        );
-        assert_eq!(
-            restored.as_ref().map(restored_interactive_text).as_deref(),
-            Some("list my workspaces")
-        );
+        assert!(matches!(timed_out, GuidanceSubmissionError::Unconfirmed(_)));
     }
 
     /// Terminal-guidance rejection (`run_intent_run_terminal`) reuses the exact
-    /// same next-turn queue as the settlement fence — but its wording promises
-    /// only "queued", not "will be sent" (see `RUN_TERMINAL_FOLLOW_UP_NOTICE`),
+    /// next-turn queue; its wording promises only "queued", not "will be sent"
+    /// (see `RUN_TERMINAL_FOLLOW_UP_NOTICE`),
     /// precisely because completion, cancellation, and failure settle
     /// differently. This exercises the real queue/settlement path — the real
     /// `should_start_queued_followups`, not a hand-picked bool — for all three
@@ -20271,7 +20183,7 @@ mod tests {
                 )
                 .expect("local guidance intent");
             run_control.expect_remote_user_intent_submission("intent-terminal-completed");
-            assert!(release_settlement_fenced_guidance(
+            assert!(release_closed_run_guidance(
                 &run_control,
                 &mut bottom_pane,
                 "intent-terminal-completed",
@@ -20319,7 +20231,7 @@ mod tests {
                 )
                 .expect("local guidance intent");
             run_control.expect_remote_user_intent_submission("intent-terminal-cancelled");
-            assert!(release_settlement_fenced_guidance(
+            assert!(release_closed_run_guidance(
                 &run_control,
                 &mut bottom_pane,
                 "intent-terminal-cancelled",
@@ -20366,7 +20278,7 @@ mod tests {
                 )
                 .expect("local guidance intent");
             run_control.expect_remote_user_intent_submission("intent-terminal-failed");
-            assert!(release_settlement_fenced_guidance(
+            assert!(release_closed_run_guidance(
                 &run_control,
                 &mut bottom_pane,
                 "intent-terminal-failed",
@@ -20407,7 +20319,7 @@ mod tests {
             .expect("local guidance intent");
         run_control.expect_remote_user_intent_submission("intent-a");
         assert!(bottom_pane.queue_next_turn_submission("message B".to_string()));
-        assert!(release_settlement_fenced_guidance(
+        assert!(release_closed_run_guidance(
             &run_control,
             &mut bottom_pane,
             "intent-a",
@@ -20451,7 +20363,7 @@ mod tests {
         run_control.expect_remote_user_intent_submission("intent-a");
         assert!(bottom_pane.queue_next_turn_submission("message B".to_string()));
 
-        assert!(release_settlement_fenced_guidance(
+        assert!(release_closed_run_guidance(
             &run_control,
             &mut bottom_pane,
             "intent-a",

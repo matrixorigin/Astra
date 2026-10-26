@@ -1,7 +1,6 @@
 //! Session artifact HTTP E2E: authenticated list/get routes align with `session_artifacts`,
 //! including kind filtering, session scoping, and cross-user isolation.
 
-use super::harness::{ProviderResponse, ProviderScript};
 use axum::http::StatusCode;
 use axum::{body, body::Body, http::Request};
 use serde_json::{Value, json};
@@ -19,7 +18,7 @@ use astra_services::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND;
 
 use super::harness::{
     E2E_PASSWORD, bootstrap, cleanup_session_data, collect_full_sse_stream, get_json,
-    model_selection, offering_id_from_model_response, post_json, seeded_model_selection,
+    model_selection, offering_id_from_model_response, post_json,
 };
 
 async fn read_full_http_request(socket: &mut tokio::net::TcpStream) -> String {
@@ -639,54 +638,215 @@ async fn spawn_raw_server_loop_block_parse_server(
     (format!("http://{addr}"), hits)
 }
 
-async fn wait_for_artifact_count(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    session_id: &str,
-    artifact_kind: &str,
-    min_count: i64,
-    timeout: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(artifact_kind)
-        .fetch_one(pool)
+async fn publish_artifact_fixture(
+    ctx: &super::harness::MatrixE2eCtx,
+    session: &str,
+    answer: &str,
+) -> String {
+    use astra_services::session_artifact_store::{
+        DatabaseSessionArtifactStore, SessionArtifactJsonRecord, SessionArtifactJsonStore,
+    };
+    let id = Uuid::new_v4().to_string();
+    DatabaseSessionArtifactStore::new(ctx.shared_pool.settings().clone())
+        .with_pool(ctx.shared_pool.clone())
+        .persist_json_artifact(SessionArtifactJsonRecord {
+            artifact_id: id.clone(),
+            session_id: session.into(),
+            user_id: ctx.user_id.clone(),
+            artifact_kind: "fixture_document".into(),
+            source: Some("http-fixture".into()),
+            turn: Some(1),
+            round: Some(0),
+            content: json!({"response":{"full_text":answer}}),
+            metadata: Some(json!({"outcome":"success"})),
+            references: vec![],
+        })
         .await
-        .unwrap_or(0);
-        if n >= min_count {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timeout ({timeout:?}) waiting for >= {min_count} artifacts of kind={artifact_kind} for user_id={user_id} session_id={session_id} (got {n})"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+        .expect("explicit artifact owner publication");
+    id
 }
 
-async fn latest_llm_capture_artifact_id(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    session_id: &str,
-    expect: &str,
-) -> String {
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+async fn assert_failed_run(
+    ctx: &super::harness::MatrixE2eCtx,
+    auth: &str,
+    session: &str,
+    body: &str,
+    partial: Option<&str>,
+) {
+    use astra_services::{
+        SessionContextCoordinator,
+        runs::{DatabaseRunStateStore, RunStateStore},
+    };
+    let events = super::harness::parse_sse_events(body);
+    let id = events
+        .iter()
+        .find(|event| event["type"] == "session_info")
+        .and_then(|event| event["run_id"].as_str())
+        .expect("admitted Run");
+    let store = DatabaseRunStateStore::new(ctx.shared_pool.clone());
+    let run = store.load_run(&ctx.user_id, id).await.unwrap().unwrap();
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.terminal_receipt_json.is_some(),
+        "provider failure must commit one canonical terminal receipt"
+    );
+    assert!(
+        run.error_message.is_some(),
+        "provider failure retains its typed terminal error"
+    );
+    let key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        &ctx.user_id,
+        session,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let head = astra_services::DatabaseSessionContextCoordinator::new(ctx.shared_pool.clone())
+        .load_head(&key)
+        .await
+        .unwrap();
+    let head = head.expect("failed turn retains its canonical Context head");
+    assert_eq!(head.cursor.completed_turn, 1);
+    let conversation =
+        astra_services::DatabaseSessionContextCoordinator::new(ctx.shared_pool.clone())
+            .materialize(&head)
+            .await
+            .unwrap();
+    let user_input: String = sqlx::query_scalar("SELECT content FROM session_transcript_items WHERE user_id = ? AND run_id = ? AND role = 'user'")
+        .bind(&ctx.user_id).bind(id).fetch_one(&ctx.pool).await.unwrap();
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .filter(|item| item["role"] == "user" && item["content"] == user_input)
+            .count(),
+        1
+    );
+    if let Some(partial) = partial {
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .filter(|item| item["role"] == "assistant" && item["content"] == partial)
+                .count(),
+            1
+        );
+    } else {
+        assert!(
+            !conversation
+                .messages
+                .iter()
+                .any(|item| item["role"] == "assistant")
+        );
+    }
+    let assistant_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND run_id = ? AND role = 'assistant'")
+        .bind(&ctx.user_id).bind(id).fetch_one(&ctx.pool).await.unwrap();
+    assert_eq!(
+        assistant_rows,
+        i64::from(partial.is_some()),
+        "store only the actual partial answer"
+    );
+    let (status, _, display) = get_bytes(
+        &ctx.app,
+        &format!("/sessions/{session}/transcript?scope=conversation"),
+        Some(auth),
+        &[],
     )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_one(pool)
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let display: Value = serde_json::from_slice(&display).unwrap();
+    assert_eq!(display["selected_root"]["status"], "failed");
+    let failures: Vec<_> = display["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item.get("failure").is_some())
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one durable failure survives cold history reads"
+    );
+    let expected_error: String = run
+        .error_message
+        .as_ref()
+        .unwrap()
+        .chars()
+        .take(256)
+        .collect();
+    assert_eq!(failures[0]["failure"]["message"], expected_error);
+    if let Some(partial) = partial {
+        assert_eq!(failures[0]["kind"], "raw");
+        assert_eq!(failures[0]["content"], partial);
+    } else {
+        assert_eq!(failures[0]["kind"], "failure");
+        assert!(failures[0].get("item_seq").is_none());
+    }
+    let (status, _, replay) = get_bytes(
+        &ctx.app,
+        &format!("/chat/runs/{id}/stream?last_index=0&replay_only=true"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let replay = super::harness::parse_sse_events(std::str::from_utf8(&replay).unwrap());
+    let receipt: astra_services::runs::CommittedRunTerminalReceipt =
+        serde_json::from_str(run.terminal_receipt_json.as_deref().unwrap()).unwrap();
+    let mut accumulated = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+    for event in &replay {
+        astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &format!("data: {}\n\n", serde_json::to_string(event).unwrap()),
+            &mut accumulated,
+            &mut Vec::new(),
+        );
+    }
+    assert!(
+        replay
+            .iter()
+            .any(|event| event["type"] == "usage" && event["usage_scope"] == "run_total")
+    );
+    assert_eq!(accumulated.qualified_usage, receipt.receipt.usage);
+    assert!(accumulated.current_request_usage.is_none());
+
+    if let Some(partial) = partial {
+        let answers: Vec<_> = replay
+            .iter()
+            .filter(|event| event["type"] == "text_done")
+            .collect();
+        assert_eq!(
+            answers.len(),
+            1,
+            "cold replay={replay:?}; durable={:?}",
+            run.events
+        );
+        assert_eq!(answers[0]["full_text"], partial);
+        assert_eq!(answers[0]["partial"], true);
+    }
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|event| event["type"] == "run_finished")
+            .count(),
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT owner_pod_id FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&ctx.user_id)
+            .bind(id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+            if owner.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect(expect);
-    row.try_get("artifact_id").expect("artifact_id")
+    .expect("stopped failed executor releases its exact lease");
 }
 
 pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
@@ -914,73 +1074,34 @@ pub async fn run_published_session_artifact_round_trip() {
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact publish roundtrip", "metadata": { "full_llm_capture": true, "suite": "artifact_roundtrip" } }),
+        json!({ "title": "artifact publish roundtrip", "metadata": { "suite": "artifact_roundtrip" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    let before_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_capture'",
-    )
-    .bind(&ctx.user_id)
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("llm capture count before stream");
-    assert_eq!(
-        before_count, 0,
-        "fresh session should not have llm_capture artifacts"
-    );
-
-    let fixture_model = format!("mock-{}", ctx.suffix);
-    ctx.install_native_provider(auth,vec![ProviderScript::new("run_published_session_artifact_round_trip",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="publish llm capture and read it back")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Artifact publish verified.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let payload = json!({
-        "message": "publish llm capture and read it back",
-    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
-        "session_id": &session_id,
-        "model_selection": seeded_model_selection(ctx),
-        "context": {
-
-        }
-    });
-    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains("Artifact publish verified."),
-        "SSE body should include the model text response: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
+    publish_artifact_fixture(ctx, &session_id, "Artifact publish verified.").await;
 
     let row = sqlx::query(
         "SELECT artifact_id, source, turn, round, content_json, CAST(metadata AS CHAR) AS metadata_json \
-         FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_capture' \
+         FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'fixture_document' \
          ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
     )
     .bind(&ctx.user_id)
     .bind(&session_id)
     .fetch_one(pool)
     .await
-    .expect("latest llm_capture row");
+    .expect("latest fixture_document row");
     let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
     let source: Option<String> = row.try_get("source").expect("source");
     let turn: Option<i32> = row.try_get("turn").expect("turn");
     let round: Option<i32> = row.try_get("round").expect("round");
     let content_json: String = row.try_get("content_json").expect("content_json");
     let content: serde_json::Value =
-        serde_json::from_str(&content_json).expect("parse llm_capture content");
-    assert_eq!(source.as_deref(), Some("server_loop_host"));
+        serde_json::from_str(&content_json).expect("parse fixture_document content");
+    assert_eq!(source.as_deref(), Some("http-fixture"));
     assert!(turn.unwrap_or_default() >= 1);
-    let round = round.expect("published llm_capture artifact should persist round");
+    let round = round.expect("published fixture_document artifact should persist round");
     assert!(
         round >= 0,
         "artifact round should be non-negative, got {round}"
@@ -990,7 +1111,8 @@ pub async fn run_published_session_artifact_round_trip() {
         Some("Artifact publish verified.")
     );
 
-    let list_path = format!("/sessions/{session_id}/artifacts?artifact_kind=llm_capture&limit=10");
+    let list_path =
+        format!("/sessions/{session_id}/artifacts?artifact_kind=fixture_document&limit=10");
     let (st_list, list_j) = get_json(app, &list_path, Some(auth), &[]).await;
     assert_eq!(
         st_list,
@@ -1002,7 +1124,7 @@ pub async fn run_published_session_artifact_round_trip() {
         artifacts
             .iter()
             .any(|artifact| artifact["artifact_id"].as_str() == Some(artifact_id.as_str())),
-        "list should contain the published llm_capture artifact: {list_j}"
+        "list should contain the published fixture_document artifact: {list_j}"
     );
 
     let get_path = format!("/sessions/{session_id}/artifacts/{artifact_id}");
@@ -1012,8 +1134,8 @@ pub async fn run_published_session_artifact_round_trip() {
         StatusCode::OK,
         "artifact get after publish: {get_j}"
     );
-    assert_eq!(get_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(get_j["source"].as_str(), Some("server_loop_host"));
+    assert_eq!(get_j["artifact_kind"].as_str(), Some("fixture_document"));
+    assert_eq!(get_j["source"].as_str(), Some("http-fixture"));
     assert_eq!(
         get_j["content"]["response"]["full_text"].as_str(),
         Some("Artifact publish verified.")
@@ -1045,55 +1167,25 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
-    let pool = &ctx.pool;
 
     let (st_sess, sess) = post_json(
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact latest download", "metadata": { "full_llm_capture": true, "suite": "artifact_latest_download" } }),
+        json!({ "title": "artifact latest download", "metadata": { "suite": "artifact_latest_download" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
-    let fixture_model = format!("mock-{}", ctx.suffix);
-    ctx.install_native_provider(auth,vec![ProviderScript::new("run_session_artifact_latest_and_download_routes",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="publish llm capture for latest and download routes")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Artifact download verified.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let payload = json!({
-        "message": "publish llm capture for latest and download routes",
-    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
-        "session_id": &session_id,
-        "model_selection": seeded_model_selection(ctx),
-        "context": {
-
-        }
-    });
-    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains("Artifact download verified."),
-        "SSE body should include the model text response: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
     let artifact_id =
-        latest_llm_capture_artifact_id(pool, &ctx.user_id, &session_id, "latest llm_capture row")
-            .await;
+        publish_artifact_fixture(ctx, &session_id, "Artifact download verified.").await;
 
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
+    let latest_path = format!("/sessions/{session_id}/artifacts/latest/fixture_document");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
     assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
     assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
+    assert_eq!(latest_j["artifact_kind"].as_str(), Some("fixture_document"));
     assert_eq!(
         latest_j["content"]["response"]["full_text"].as_str(),
         Some("Artifact download verified.")
@@ -1116,7 +1208,10 @@ pub async fn run_session_artifact_latest_and_download_routes() {
         download_j["artifact_id"].as_str(),
         Some(artifact_id.as_str())
     );
-    assert_eq!(download_j["artifact_kind"].as_str(), Some("llm_capture"));
+    assert_eq!(
+        download_j["artifact_kind"].as_str(),
+        Some("fixture_document")
+    );
     assert_eq!(
         download_j["content"]["response"]["full_text"].as_str(),
         Some("Artifact download verified.")
@@ -1141,7 +1236,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
 
     let (st_wrong_latest, wrong_latest_j) = get_json(
         app,
-        &format!("/sessions/{other_session_id}/artifacts/latest/llm_capture"),
+        &format!("/sessions/{other_session_id}/artifacts/latest/fixture_document"),
         Some(auth),
         &[],
     )
@@ -1255,7 +1350,7 @@ pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes
         Some(auth.as_str()),
         json!({
             "title": "server loop malformed stream without replay",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_block_parse_no_replay" }
+            "metadata": { "suite": "server_loop_block_parse_no_replay" }
         }),
     )
     .await;
@@ -1274,67 +1369,20 @@ pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes
         "server-loop SSE should preserve text delivered before the malformed block: {body}"
     );
     assert!(
-        body.contains("\"error_kind\":\"stream_transport\""),
+        body.contains("\"error_code\":\"stream_transport\""),
         "server-loop SSE should expose the original typed stream failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
-        "a partial stream failure must preserve a resumable run: {body}"
+        body.contains("\"status\":\"failed\""),
+        "a partial stream failure must settle as failed: {body}"
     );
     assert!(
-        body.contains("\"type\":\"run_interrupted\"")
-            && body.contains("\"type\":\"turn_complete\""),
-        "the server must publish the interruption and one terminal summary: {body}"
+        !body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"run_finished\""),
+        "the server must publish the failure and one terminal summary: {body}"
     );
 
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop block-parse llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
+    assert_failed_run(ctx, auth, &session_id, &body, Some(partial_text)).await;
 
     assert_eq!(
         hits.stream_hits.load(Ordering::SeqCst),
@@ -1390,7 +1438,7 @@ pub async fn run_server_loop_transport_preserves_partial_without_replay_routes()
         Some(auth.as_str()),
         json!({
             "title": "server loop transport failure without replay",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_transport_no_replay" }
+            "metadata": { "suite": "server_loop_transport_no_replay" }
         }),
     )
     .await;
@@ -1409,64 +1457,21 @@ pub async fn run_server_loop_transport_preserves_partial_without_replay_routes()
         "server-loop SSE should retain text delivered before the transport break: {body}"
     );
     assert!(
-        body.contains("\"error_kind\":\"stream_transport\""),
+        body.contains("\"error_code\":\"stream_transport\""),
         "server-loop SSE should retain the typed transport failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
-        "server-loop transport failure should leave a resumable paused run: {body}"
+        body.contains("\"status\":\"failed\""),
+        "server-loop transport failure must settle as failed: {body}"
     );
     assert!(
-        body.contains("\"type\":\"run_interrupted\"")
-            && body.contains("\"type\":\"turn_complete\""),
-        "the server must publish the interruption and one terminal summary: {body}"
+        !body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"run_finished\""),
+        "the server must publish the failure and one terminal summary: {body}"
     );
 
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
+    assert_failed_run(ctx, auth, &session_id, &body, Some(partial_text)).await;
 
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop transport no-replay llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
-    assert_eq!(latest_j["content"]["response"]["usage"]["input_tokens"], 17);
-    assert_eq!(latest_j["content"]["response"]["usage"]["output_tokens"], 3);
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    assert_eq!(
-        download_headers.get("content-type").unwrap(),
-        "application/json"
-    );
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
     assert_eq!(
         hits.stream_hits.load(Ordering::SeqCst),
         1,
@@ -1523,7 +1528,7 @@ pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
         Some(auth.as_str()),
         json!({
             "title": "server loop idle failure without replay",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_idle_no_replay" }
+            "metadata": { "suite": "server_loop_idle_no_replay" }
         }),
     )
     .await;
@@ -1542,67 +1547,20 @@ pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
         "server-loop SSE should retain text delivered before the idle timeout: {body}"
     );
     assert!(
-        body.contains("\"error_kind\":\"stream_idle\""),
+        body.contains("\"error_code\":\"stream_idle\""),
         "server-loop SSE should retain the typed idle failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
-        "server-loop idle timeout should leave a resumable paused run: {body}"
+        body.contains("\"status\":\"failed\""),
+        "server-loop idle timeout must settle as failed: {body}"
     );
     assert!(
-        body.contains("\"type\":\"run_interrupted\"")
-            && body.contains("\"type\":\"turn_complete\""),
-        "the server must publish the interruption and one terminal summary: {body}"
+        !body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"run_finished\""),
+        "the server must publish the failure and one terminal summary: {body}"
     );
 
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop idle no-replay llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_idle")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_idle")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
+    assert_failed_run(ctx, auth, &session_id, &body, Some(partial_text)).await;
 
     assert_eq!(
         hits.stream_hits.load(Ordering::SeqCst),
@@ -1659,7 +1617,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         Some(auth.as_str()),
         json!({
             "title": "server loop rate limit latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_rate_limit_latest_download" }
+            "metadata": { "suite": "server_loop_rate_limit_latest_download" }
         }),
     )
     .await;
@@ -1674,59 +1632,20 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
     let (status, body) = stream_chat_full_server_owned(app, auth, payload.clone()).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
-        body.contains("\"kind\":\"rate_limited\"")
-            && body.contains("Please wait ~30s before retrying."),
+        body.contains("\"error_code\":\"rate_limit\""),
         "server-loop SSE should surface an actionable typed rate-limit interruption: {body}"
     );
     assert!(
-        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
-        "rate-limit exhaustion should leave a resumable paused run: {body}"
+        body.contains("\"status\":\"failed\""),
+        "rate-limit exhaustion must settle as failed: {body}"
     );
     assert!(
-        body.contains("\"type\":\"run_interrupted\"")
-            && body.contains("\"type\":\"turn_complete\""),
-        "the server must publish the interruption and one terminal summary: {body}"
+        !body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"run_finished\""),
+        "the server must publish the failure and one terminal summary: {body}"
     );
 
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop rate-limit llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("rate_limit")
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("rate_limit")
-    );
+    assert_failed_run(ctx, auth, &session_id, &body, None).await;
 
     let (cooldown_status, cooldown_body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(
@@ -1739,14 +1658,13 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         "follow-up turn should be rejected by local rate-limit cooldown: {cooldown_body}"
     );
     assert!(
-        cooldown_body.contains("\"kind\":\"rate_limited\"")
-            && cooldown_body.contains("\"resume_action\":{\"wait_and_retry\":"),
+        cooldown_body.contains("\"error_code\":\"rate_limit\""),
         "cooldown reject should give an actionable typed rate-limit interruption: {cooldown_body}"
     );
     assert!(
-        cooldown_body.contains("\"status\":\"paused\"")
-            && cooldown_body.contains("\"type\":\"turn_complete\""),
-        "cooldown reject should settle a resumable paused turn: {cooldown_body}"
+        cooldown_body.contains("\"status\":\"failed\"")
+            && cooldown_body.contains("\"type\":\"run_finished\""),
+        "cooldown reject must settle a failed turn: {cooldown_body}"
     );
 
     assert_eq!(
@@ -1804,7 +1722,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         Some(auth.as_str()),
         json!({
             "title": "server loop rate limit retry success latest download",
-            "metadata": { "full_llm_capture": true, "suite": "server_loop_rate_limit_retry_success_latest_download" }
+            "metadata": { "suite": "server_loop_rate_limit_retry_success_latest_download" }
         }),
     )
     .await;
@@ -1829,46 +1747,6 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
     assert!(
         !body.contains("\"type\":\"error\""),
         "successful 429 retry should not expose an error event to the client: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest server-loop rate-limit retry llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        latest_j["content"]["response"]["full_text"].as_str(),
-        Some(success_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        download_j["content"]["response"]["full_text"].as_str(),
-        Some(success_text)
     );
 
     assert_eq!(
@@ -1899,7 +1777,7 @@ pub async fn run_session_artifact_latest_route_uses_stable_tiebreaker() {
         app,
         "/sessions",
         Some(auth.as_str()),
-        json!({ "title": "artifact latest tie breaker", "metadata": { "full_llm_capture": true, "suite": "artifact_latest_tiebreak" } }),
+        json!({ "title": "artifact latest tie breaker", "metadata": { "suite": "artifact_latest_tiebreak" } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");

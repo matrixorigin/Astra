@@ -10,7 +10,7 @@ use astra_services::work::{
 };
 use astra_services::{
     AcquireWriterOutcome, DatabaseSessionContextCoordinator, ReserveTurnOutcome,
-    SessionContextCoordinator, SessionContextCoordinatorError,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionService,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
@@ -99,6 +99,62 @@ async fn add_non_delivery_branch(
     .expect("add non-delivery branch fixture");
 }
 
+async fn activate_context_fork(
+    pool: &astra_core::SharedPool,
+    parent: &SessionKeyV1,
+    child: &SessionKeyV1,
+    cursor: &astra_turn_types::SessionCursorV1,
+    actor: &ActorContextV1,
+) -> astra_turn_types::SessionForkActivationV1 {
+    use astra_turn_types::{
+        ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
+    };
+    let context = std::sync::Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
+    let forks = astra_services::DatabaseSessionForkCoordinator::new(pool.clone(), context);
+    let prepared = forks
+        .prepare(&astra_services::PrepareSessionForkV1 {
+            idempotency_key: child.session_id.clone(),
+            parent_key: parent.clone(),
+            child_key: child.clone(),
+            expected_parent_cursor: cursor.clone(),
+            dimensions: [
+                ForkBasisDimensionV1::Conversation,
+                ForkBasisDimensionV1::TaskBoard,
+                ForkBasisDimensionV1::Checkpoint,
+                ForkBasisDimensionV1::Workspace,
+                ForkBasisDimensionV1::Artifacts,
+            ]
+            .into_iter()
+            .map(|dimension| {
+                let conversation = dimension == ForkBasisDimensionV1::Conversation;
+                ForkDimensionEvidenceV1 {
+                    dimension,
+                    disposition: if conversation {
+                        ForkDimensionDispositionV1::SharedPrefix
+                    } else {
+                        ForkDimensionDispositionV1::Gap
+                    },
+                    source_cursor: conversation.then(|| cursor.clone()),
+                    evidence_digest: conversation.then(|| cursor.canonical_root_hash.clone()),
+                    detail: (!conversation).then(|| "not present in the fixture".into()),
+                }
+            })
+            .collect(),
+            reason: "retain live descendants during Work branch deletion".into(),
+        })
+        .await
+        .expect("prepare real Context fork");
+    forks
+        .activate(
+            parent,
+            &prepared.fork_id,
+            actor,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("activate real Context fork")
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authority() {
@@ -152,19 +208,24 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     .execute(pool.get())
     .await
     .expect("seed branch-owned proposal sequence");
+    let root_session_id = common::id("root-session");
+    let descendant_session_id = common::id("descendant-session");
     sqlx::query(
         "INSERT INTO agent_sessions
          (user_id, session_id, status, created_at, updated_at, last_active_at)
          VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
     )
     .bind(&owner_id)
-    .bind(&session_id)
+    .bind(&root_session_id)
     .execute(pool.get())
     .await
-    .expect("create branch session");
+    .expect("create ancestor session");
 
     let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let root_key = SessionKeyV1::owner_session("server", &owner_id, &root_session_id, "main");
     let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    let descendant_key =
+        SessionKeyV1::owner_session("server", &owner_id, &descendant_session_id, "main");
     let actor = ActorContextV1::owner_user(
         &owner_id,
         "branch-deletion-test",
@@ -173,9 +234,9 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         None,
         AuthorityEpochsV1::default(),
     );
-    let lease = match coordinator
+    let root_lease = match coordinator
         .acquire_writer(
-            &key,
+            &root_key,
             None,
             &actor,
             std::time::Duration::from_secs(60),
@@ -189,9 +250,9 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         }
         other => panic!("unexpected writer acquisition: {other:?}"),
     };
-    let reservation = match coordinator
+    let root_reservation = match coordinator
         .reserve_turn(
-            &lease,
+            &root_lease,
             None,
             std::time::Duration::from_secs(60),
             "branch-deletion-turn",
@@ -203,6 +264,55 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         ReserveTurnOutcome::Reserved(reservation)
         | ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
         other => panic!("unexpected turn reservation: {other:?}"),
+    };
+    let root_messages = vec![
+        serde_json::json!({"role":"user","content":"Retain this history."}),
+        serde_json::json!({"role":"assistant","content":"Shared ancestor answer."}),
+    ];
+    let root_cursor = match coordinator
+        .commit_turn(
+            &root_reservation,
+            CanonicalTurnDeltaV1 {
+                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                compaction_generation: 0,
+                config_version_id: None,
+                mode: CanonicalDeltaModeV1::Append,
+                logical_segments: vec![root_messages.clone()],
+            },
+            "seed-ancestor",
+        )
+        .await
+        .expect("commit ancestor turn")
+    {
+        astra_turn_types::CoordinatorMutationV1::Applied { cursor } => cursor,
+        other => panic!("unexpected ancestor commit: {other:?}"),
+    };
+    let branch_fork = activate_context_fork(&pool, &root_key, &key, &root_cursor, &actor).await;
+    let descendant_fork = activate_context_fork(
+        &pool,
+        &key,
+        &descendant_key,
+        &branch_fork.child_head.cursor,
+        &actor,
+    )
+    .await;
+    let reservation = match coordinator
+        .reserve_turn(
+            &branch_fork.writer_lease,
+            Some(&branch_fork.child_head.cursor),
+            std::time::Duration::from_secs(60),
+            "branch-deletion-turn-after-fork",
+            None,
+        )
+        .await
+        .expect("reserve branch turn")
+    {
+        ReserveTurnOutcome::Reserved(reservation)
+        | ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
+        other => panic!("unexpected branch reservation: {other:?}"),
     };
     let admission = deletion
         .admit(&deletion_request(
@@ -237,14 +347,16 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             .expect("concurrent claim")
             .is_none()
     );
+    let active_run_id = common::id("run");
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots
-         (user_id, session_id, run_id, acquired_at, updated_at)
-         VALUES (?, ?, ?, NOW(6), NOW(6))",
+        "INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status)
+         VALUES (?, ?, ?, ?, ?, 'running')",
     )
     .bind(&owner_id)
     .bind(&session_id)
-    .bind(common::id("run"))
+    .bind(&active_run_id)
+    .bind(&active_run_id)
+    .bind(&active_run_id)
     .execute(pool.get())
     .await
     .expect("add active run slot");
@@ -271,12 +383,12 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         .unwrap(),
         "active"
     );
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
         .await
-        .expect("settle active run");
+        .unwrap();
     let fenced = deletion
         .fence_session(
             &WorkOwnerId::parse(&owner_id).unwrap(),
@@ -308,9 +420,9 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                 &reservation,
                 CanonicalTurnDeltaV1 {
                     schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-                    completed_turn: 1,
-                    journal_event_seq: 1,
-                    conversation_seq: 1,
+                    completed_turn: branch_fork.child_head.cursor.completed_turn + 1,
+                    journal_event_seq: branch_fork.child_head.cursor.journal_event_seq + 1,
+                    conversation_seq: branch_fork.child_head.cursor.conversation_seq + 1,
                     compaction_generation: 0,
                     config_version_id: None,
                     mode: CanonicalDeltaModeV1::Append,
@@ -322,7 +434,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                 "branch-deletion-late-commit",
             )
             .await,
-        Err(SessionContextCoordinatorError::Fenced)
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
     ));
     let cleaned = deletion
         .cleanup_session(
@@ -417,6 +529,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             .await,
         Err(WorkBranchDeletionError::LineagePending {
             orphaned_pins: 1,
+            orphaned_forks: 0,
             ..
         })
     ));
@@ -584,6 +697,48 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
     assert_eq!(terminal.try_get::<i64, _>("patch_commit_rows").unwrap(), 0);
     assert_eq!(terminal.try_get::<i64, _>("settlement_rows").unwrap(), 0);
     assert_eq!(terminal.try_get::<i64, _>("terminal_cut_rows").unwrap(), 0);
+    assert_eq!(
+        coordinator
+            .materialize(&descendant_fork.child_head)
+            .await
+            .expect("live descendant survives completed Work branch deletion")
+            .messages,
+        root_messages
+    );
+    coordinator
+        .release_writer(&descendant_fork.writer_lease)
+        .await
+        .unwrap();
+    coordinator.release_writer(&root_lease).await.unwrap();
+    for session in [&descendant_session_id, &root_session_id] {
+        astra_services::DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+            .with_pool(pool.clone())
+            .delete_session(session.clone(), owner_id.clone())
+            .await
+            .unwrap();
+    }
+    let forks = astra_services::DatabaseSessionForkCoordinator::new(
+        pool.clone(),
+        std::sync::Arc::new(DatabaseSessionContextCoordinator::new(pool.clone())),
+    );
+    forks.collect_orphaned_fork_records(100).await.unwrap();
+    forks.collect_unpinned_orphan_manifests(100).await.unwrap();
+    for table in [
+        "session_forks",
+        "conversation_manifest_pins",
+        "conversation_manifest_nodes",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE owner_user_id = ?");
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(&owner_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "deleted Work lineage must be collectible: {table}"
+        );
+    }
     common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
@@ -985,6 +1140,12 @@ async fn archive_restore_is_atomic_replayable_and_runtime_visible() {
         &session_id,
     )
     .await;
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')")
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 
     let archive_request_id = common::id("archive");
     let archive = retention_change(
@@ -1161,6 +1322,12 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         &session_id,
     )
     .await;
+    sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')")
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 
     let delivery_archive = retention_change(
         &owner_id,
@@ -1176,14 +1343,15 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         Err(WorkRepositoryError::DeliveryBranchProtected)
     ));
 
+    let active_run_id = common::id("run");
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots
-         (user_id, session_id, run_id, acquired_at, updated_at)
-         VALUES (?, ?, ?, NOW(6), NOW(6))",
+        "INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status)
+         VALUES (?, ?, ?, ?, '[]', 'running')",
     )
     .bind(&owner_id)
     .bind(&session_id)
-    .bind(common::id("run"))
+    .bind(&active_run_id)
+    .bind(&active_run_id)
     .execute(pool.get())
     .await
     .expect("own active branch session");
@@ -1200,13 +1368,13 @@ async fn archive_rejects_delivery_active_stale_and_foreign_branches_without_muta
         repository.change_branch_retention(active_archive).await,
         Err(WorkRepositoryError::BranchActive)
     ));
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
         .await
-        .expect("release branch session");
-
+        .unwrap();
     let stale_archive = retention_change(
         &owner_id,
         &work_id,

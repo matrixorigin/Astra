@@ -26,6 +26,10 @@ pub(crate) fn physical_workspace_id() -> String {
 
 pub(crate) fn record(user_id: &str, session_id: &str, parent: Option<&str>) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: Uuid::new_v4().to_string(),
         user_id: user_id.into(),
         session_id: session_id.into(),
@@ -145,7 +149,17 @@ pub(crate) async fn seed_live_edge_invocation(
     use astra_services::multi_agent::{
         DatabaseEdgeDispatchService, EdgeDispatchIdentity, EdgeDispatchService,
     };
-    let binding = seed_execution_binding(pool, &user_id, &session_id).await;
+    let key = SessionKeyV1::owner_session(
+        "server",
+        &user_id,
+        &session_id,
+        DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let binding = astra_services::DatabaseSessionContextCoordinator::new(pool.clone())
+        .load_execution_binding(&key)
+        .await
+        .unwrap()
+        .expect("prepare the canonical binding before creating the parent Run");
     child.events = vec![json!({"event_type":"run_started", "data":{
         "execution_binding_generation": binding.generation,
         "workspace": {"kind":"edge_workspace", "cwd":"/selected-runner", "authority":"read_write"},

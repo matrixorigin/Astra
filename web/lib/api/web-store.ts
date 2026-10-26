@@ -1,6 +1,6 @@
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
-import { resumeStreamProjection } from "@/lib/api/stream-event-helpers";
-import { isArtifactPublicationV1 } from "@astra/sdk";
+import { appendRunFailure, resumeStreamProjection } from "@/lib/api/stream-event-helpers";
+import { AstraApiError, isArtifactPublicationV1 } from "@astra/sdk";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
@@ -8,16 +8,12 @@ import {
   mergeChatArtifacts,
 } from "@/lib/api/stream-artifacts";
 import {
-  buildQueryString,
-  chatRunStreamPath,
-  parseSseDataEvents,
   type RunListResponse,
   type RunStatus,
   type RuntimeSessionListCursor,
   type RuntimeSessionListResponse,
   type RuntimeSessionResponse,
   type RuntimeTranscriptItemResponse,
-  type RuntimeTranscriptResponse,
 } from "@astra/sdk";
 import {
   activeRunPriority,
@@ -26,7 +22,6 @@ import {
 } from "@/lib/chat-run-state";
 import {
   RuntimeClientError,
-  readRuntimeErrorDetail,
   runtimeErrorDetail,
 } from "@/lib/runtime-client/errors";
 import {
@@ -159,23 +154,15 @@ type Store = {
   files: Record<string, KnowledgeFile[]>;
 };
 
-const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
-const AGENT_STREAM_TIMEOUT_MS = 180_000;
 const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
 const LOCAL_CANCELLING_STATUS_GRACE_MS = 15_000;
 const LOCAL_STOPPED_RUN_GRACE_MS = 30 * 60_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
 const RUN_SYNC_PAGE_SIZE = 200;
+const CHAT_HISTORY_LIMIT = 200;
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(["chat-web-agent-notes"]);
 const WORKSPACE_SELECTION_METADATA_KEY = "workspace_selection";
-
-type StreamResult = {
-  assistantText: string;
-  error?: string;
-  finished?: boolean;
-  nextOffset?: number;
-};
 
 export type ModelOfferingSelectionErrorCode =
   | "invalid_selection"
@@ -268,7 +255,7 @@ function titleFromMessage(message: string) {
   return text.length > 56 ? `${text.slice(0, 53)}...` : text;
 }
 
-function normalizedActiveSkills(skills?: string[]) {
+export function normalizedActiveSkills(skills?: string[]) {
   if (!Array.isArray(skills)) {
     return [];
   }
@@ -277,7 +264,7 @@ function normalizedActiveSkills(skills?: string[]) {
   );
 }
 
-function normalizedActiveTools(tools?: string[], webSearch = false) {
+export function normalizedActiveTools(tools?: string[], webSearch = false) {
   const normalized = Array.isArray(tools)
     ? tools.map((tool) => tool.trim()).filter(Boolean)
     : [];
@@ -407,24 +394,12 @@ function mergeActiveRunRecord(params: {
   now?: number;
 }): ChatActiveRunRecord | undefined {
   const { existing, backend, backendRunStatuses, now = Date.now() } = params;
-  if (existing) {
-    const backendStatusForExisting = backendRunStatuses.get(existing.runId);
-    if (isTerminalChatRunStatus(backendStatusForExisting)) {
-      return undefined;
-    }
-  }
+  if (!existing) return backend;
+  if (backend && existing.runId !== backend.runId) return backend;
+  if (isTerminalChatRunStatus(backendRunStatuses.get(existing.runId))) return undefined;
   if (!backend) {
-    return existing &&
-      runBlocksChatTurn(existing.status) &&
-      isFreshLocalActiveRun(existing, now)
-      ? existing
-      : undefined;
-  }
-  if (!existing) {
-    return backend;
-  }
-  if (existing.runId !== backend.runId) {
-    return backend;
+    return runBlocksChatTurn(existing.status) && isFreshLocalActiveRun(existing, now)
+      ? existing : undefined;
   }
   if (
     existing.source !== "backend_poll" &&
@@ -460,6 +435,16 @@ function publicActiveRun(
     ...(assistant ? { assistantMessageId: assistant.id } : {}),
     ...(nextEventIndex !== null ? { nextEventIndex } : {}),
   };
+}
+
+function hasContinuingStream(chat: ChatRecord): boolean {
+  const run = chat.activeRun;
+  const state = chat.streamProjection?.state;
+  return publicActiveRun(chat)?.nextEventIndex !== undefined &&
+    run?.status.trim().toLowerCase() !== "cancelling" && run?.waitingFor !== "cancel_requested" &&
+    chat.messages.some(message => message.id === run?.assistantMessageId && message.status === "streaming") &&
+    state?.lastStatus === "streaming" && state.runLifecycle !== "finished" &&
+    state.runLifecycle !== "paused" && !state.terminalStatus;
 }
 
 function workspaceSelectionMetadata(selection: WorkspaceSelection) {
@@ -781,9 +766,8 @@ export async function getChatHydrated(
   ownerUserId: string,
   chatId: string,
 ): Promise<ChatDetail | null> {
-  await syncBackendSessions(ownerUserId);
-  await syncBackendTranscript(ownerUserId, chatId);
-  return getChat(ownerUserId, chatId);
+  const canonicalId = await syncBackendTranscript(ownerUserId, chatId);
+  return getChat(ownerUserId, canonicalId ?? chatId);
 }
 
 export async function createChatWithMessage(
@@ -853,71 +837,6 @@ export async function createChatWithMessage(
   };
 }
 
-export async function sendMessage(
-  ownerUserId: string,
-  chatId: string,
-  payload: {
-    content: string;
-    options?: ComposerOptions;
-  },
-) {
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  if (!chat) {
-    return null;
-  }
-  // Validate model selection before mutating chat state
-  const selectedModel = requireSelectedOfferingId(
-    payload.options?.model ?? chat.model,
-  );
-  const timestamp = nowIso();
-  const userMessage: ChatMessage = {
-    id: crypto.randomUUID(),
-    role: "user",
-    content: payload.content,
-    activeSkills: payload.options?.activeSkills,
-    activeTools: normalizedActiveTools(
-      payload.options?.activeTools,
-      payload.options?.webSearch,
-    ),
-    createdAt: timestamp,
-    status: "complete",
-  };
-  chat.messages.push(userMessage);
-  chat.lastMessageAt = timestamp;
-  chat.lastMessagePreview = payload.content;
-  chat.title ??= titleFromMessage(payload.content);
-  if (payload.options?.model) {
-    chat.model = payload.options.model;
-  }
-
-  const backendSessionId = await ensureChatBackendSession(
-    ownerUserId,
-    chat.id,
-    {
-      model: selectedModel,
-    },
-  );
-  const agentResult = await callBackendAgent({
-    sessionId: backendSessionId,
-    text: payload.content,
-    model: selectedModel,
-    activeSkills: payload.options?.activeSkills,
-    activeTools: payload.options?.activeTools,
-    webSearch: payload.options?.webSearch,
-  });
-  assertBackendSessionMatchesChat(backendSessionId, agentResult.sessionId);
-  const assistantMessage = appendAssistantMessage(
-    chat,
-    agentResult.assistantText,
-    agentResult.ok,
-  );
-  if (chat.projectId) {
-    touchProjectInStore(store, chat.projectId);
-  }
-  return { userMessage, assistantMessage };
-}
-
 export function beginStreamingMessage(
   ownerUserId: string,
   chatId: string,
@@ -932,6 +851,10 @@ export function beginStreamingMessage(
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
+  }
+  if (chat.streamProjection?.writer && !chat.streamProjection.writer.signal.aborted &&
+    chat.streamProjection.state.runLifecycle !== "finished") {
+    throw new ChatStreamProjectionError("stream_projection_busy");
   }
 
   const timestamp = nowIso();
@@ -951,6 +874,7 @@ export function beginStreamingMessage(
     role: "user",
     content: payload.content,
     activeSkills: payload.options?.activeSkills,
+    activeTools: normalizedActiveTools(payload.options?.activeTools, payload.options?.webSearch),
     createdAt: timestamp,
     status: "complete",
   };
@@ -968,13 +892,11 @@ export function beginStreamingMessage(
   }
   chat.lastMessageAt = timestamp;
   chat.lastMessagePreview = payload.content;
-  chat.title ??= titleFromMessage(payload.content);
-  if (payload.options?.model) {
-    chat.model = payload.options.model;
-  }
-  if (payload.workspaceSelection) {
-    chat.workspaceSelection = payload.workspaceSelection;
-  }
+  commitChatMetadata(ownerUserId, chat, {
+    title: chat.title ?? titleFromMessage(payload.content),
+    ...(payload.options?.model ? { model: payload.options.model } : {}),
+    ...(payload.workspaceSelection ? { workspaceSelection: payload.workspaceSelection } : {}),
+  });
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
   }
@@ -1299,8 +1221,9 @@ export async function stopActiveRun(
   const completeMessage = () => {
     const current = ownedChat();
     if (!current) return;
-    if (message.complete(current) && current.projectId) {
-      touchProjectInStore(getStore(ownerUserId), current.projectId);
+    if (message.complete(current)) {
+      current.streamProjection?.writer?.abort();
+      if (current.projectId) touchProjectInStore(getStore(ownerUserId), current.projectId);
     }
   };
   const restore = () => {
@@ -1472,6 +1395,22 @@ export function updateStreamingAssistantMessage(
   return message;
 }
 
+// Metadata commits replace only the shell. In-flight readers can then reject
+// their old snapshot without another revision or cache; live Run/parser owners
+// retain their existing references. Async writers rebind after acknowledgement.
+function commitChatMetadata(
+  ownerUserId: string,
+  original: Pick<ChatRecord, "id" | "backendSessionId">,
+  patch: Partial<Pick<ChatRecord, "model" | "workspaceSelection" | "title" | "projectId" | "archivedAt" | "lastMessageAt" | "backendSessionId">>,
+): boolean {
+  const store = getStore(ownerUserId);
+  const index = store.chats.findIndex(chat => chat.id === original.id &&
+    chat.backendSessionId === original.backendSessionId);
+  if (index < 0) return false;
+  store.chats[index] = { ...store.chats[index], ...patch };
+  return true;
+}
+
 export async function updateChatModel(
   ownerUserId: string,
   chatId: string,
@@ -1486,8 +1425,9 @@ export async function updateChatModel(
   if (!chat) {
     return null;
   }
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   await updateBackendSessionModel(chat, normalized);
-  chat.model = normalized;
+  if (!commitChatMetadata(ownerUserId, binding, { model: normalized })) return null;
   return getChat(ownerUserId, chatId);
 }
 
@@ -1507,27 +1447,14 @@ export async function updateChatWorkspaceSelection(
     return null;
   }
 
-  const previous = chat.workspaceSelection;
-  if (sameWorkspaceSelection(previous, normalized)) {
+  if (sameWorkspaceSelection(chat.workspaceSelection, normalized)) {
     return getChat(ownerUserId, chatId);
   }
-  if (normalized) {
-    chat.workspaceSelection = normalized;
-  } else {
-    delete chat.workspaceSelection;
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
+  if (chat.backendSessionId) {
+    await updateBackendSessionWorkspaceSelection(chat, normalized);
   }
-  try {
-    if (chat.backendSessionId) {
-      await updateBackendSessionWorkspaceSelection(chat, normalized);
-    }
-  } catch (error) {
-    if (previous) {
-      chat.workspaceSelection = previous;
-    } else {
-      delete chat.workspaceSelection;
-    }
-    throw error;
-  }
+  if (!commitChatMetadata(ownerUserId, binding, { workspaceSelection: normalized ?? undefined })) return null;
   return getChat(ownerUserId, chatId);
 }
 
@@ -1547,8 +1474,7 @@ export function moveChat(
   ) {
     return null;
   }
-  chat.projectId = projectId;
-  chat.lastMessageAt = nowIso();
+  commitChatMetadata(ownerUserId, chat, { projectId, lastMessageAt: nowIso() });
   return getChat(ownerUserId, chatId);
 }
 
@@ -1561,8 +1487,9 @@ export async function archiveChat(
   if (!chat) {
     return null;
   }
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   await updateBackendSessionArchive(chat, archived);
-  chat.archivedAt = archived ? nowIso() : null;
+  if (!commitChatMetadata(ownerUserId, binding, { archivedAt: archived ? nowIso() : null })) return null;
   return getChat(ownerUserId, chatId);
 }
 
@@ -1738,6 +1665,7 @@ export async function ensureChatBackendSession(
     return chat.backendSessionId;
   }
 
+  const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   const model = requireSelectedOfferingId(params.model ?? chat.model);
   const session = await createBackendSession({
     chatId: chat.id,
@@ -1747,7 +1675,9 @@ export async function ensureChatBackendSession(
     workspaceSelection: chat.workspaceSelection,
     runtime: params.runtime,
   });
-  chat.backendSessionId = session.sessionId;
+  if (!commitChatMetadata(ownerUserId, binding, { backendSessionId: session.sessionId })) {
+    throw new Error("The chat was deleted or rebound while its Session was being created.");
+  }
   return session.sessionId;
 }
 
@@ -1941,6 +1871,9 @@ async function listAllBackendSessions(
 }
 
 async function syncBackendSessions(ownerUserId: string): Promise<void> {
+  const beforeRead = new Map(getStore(ownerUserId).chats.map(chat => [chat.id, chat]));
+  const beforeBySession = new Map([...beforeRead.values()].filter(chat => chat.backendSessionId)
+    .map(chat => [chat.backendSessionId!, chat]));
   const client = await getRuntimeClient({
     auth: "required",
     operation: `sync persisted sessions for user ${ownerUserId}`,
@@ -2003,17 +1936,29 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
       ? (byBackendSessionId.get(session.session_id) ??
         byId.get(session.session_id))
       : undefined;
+    const original = beforeBySession.get(session.session_id) ?? beforeRead.get(existing?.id ?? session.session_id);
+    if (existing !== original) {
+      if (existing) backendChatIds.add(existing.id);
+      continue;
+    }
     const record = chatRecordFromBackendSession(session, existing);
     if (!record) {
       continue;
     }
-    record.activeRun = mergeActiveRunRecord({
+    const backendRun = session.session_id ? activeRunBySession.get(session.session_id) : undefined;
+    // Polling may observe terminal before the live parser receives it. Keep
+    // that exact continuation until its real terminal, unless a successor won.
+    const preserveParser = existing && hasContinuingStream(existing) &&
+      !backendRun && isTerminalChatRunStatus(backendRunStatuses.get(existing.activeRun!.runId));
+    record.activeRun = preserveParser ? existing.activeRun : mergeActiveRunRecord({
       existing: existing?.activeRun,
-      backend: session.session_id
-        ? activeRunBySession.get(session.session_id)
-        : undefined,
+      backend: backendRun,
       backendRunStatuses,
     });
+    if (record.streamProjection?.state.runId && record.activeRun &&
+      record.streamProjection.state.runId !== record.activeRun.runId) {
+      discardChatStreamProjection(record);
+    }
     backendChatIds.add(record.id);
     const index = store.chats.findIndex((chat) => chat.id === record.id);
     if (index >= 0) {
@@ -2029,7 +1974,8 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   // Keeping those shells lets the UI send messages to non-existent sessions and
   // turns a clean 404 into a fake assistant error message.
   store.chats = store.chats.filter((chat) => {
-    const retained = backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat);
+    const retained = backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat) ||
+      beforeRead.get(chat.id) !== chat;
     if (!retained) discardChatStreamProjection(chat);
     return retained;
   });
@@ -2092,109 +2038,122 @@ function transcriptItemToMessage(
   };
 }
 
-async function syncBackendTranscript(
-  ownerUserId: string,
-  chatId: string,
-): Promise<void> {
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  const hasIncompleteAssistant =
-    chat?.messages.some(
-      (message) =>
-        message.role === "assistant" && message.status === "streaming",
-    ) ?? false;
-  if (!chat || (chat.messages.length > 0 && !hasIncompleteAssistant)) {
-    return;
-  }
-  const backendSessionId = chat.backendSessionId ?? chat.id;
+async function syncBackendTranscript(ownerUserId: string, chatId: string): Promise<string | undefined> {
+  const currentChat = () => getStore(ownerUserId).chats.find(item =>
+    item.id === chatId || item.backendSessionId === chatId);
+  const original = currentChat();
+  const sessionId = original?.backendSessionId;
+  const runId = original?.activeRun?.runId;
+  const assistantId = original?.activeRun?.assistantMessageId;
+  const projection = original?.streamProjection;
+  const messages = original?.messages;
+  const pendingTurn = original?.pendingTurn;
+  // A detail read may overlap POST admission, a terminal, or another reader.
+  // Compare the entire existing continuation before publishing success/errors.
+  const stillCurrent = () => {
+    const current = currentChat();
+    return current === original && current?.backendSessionId === sessionId && current?.activeRun?.runId === runId &&
+      current?.activeRun?.assistantMessageId === assistantId && current?.streamProjection === projection &&
+      current?.messages === messages && current?.pendingTurn === pendingTurn;
+  };
+  const client = await getRuntimeClient({ auth: "required", operation: "read selected conversation" });
+  if (!client || !stillCurrent()) return currentChat()?.id;
 
-  const client = await getRuntimeClient({
-    auth: "required",
-    operation: `sync persisted transcript for session ${backendSessionId}`,
-  });
-  if (!client) {
-    return;
+  let backendSessionId = sessionId;
+  if (!backendSessionId) {
+    // Resolve legacy Web IDs through the existing directory; known Sessions
+    // read directly, without enumerating the owner's Runs or other Sessions.
+    const sessions = await listAllBackendSessions(client, ownerUserId);
+    if (!stillCurrent()) return currentChat()?.id;
+    backendSessionId = sessions.find(session => session.session_id === chatId ||
+      metadataString(session.metadata, "web_chat_id") === chatId)?.session_id;
+    if (!backendSessionId) return;
   }
-
-  let parsed: RuntimeTranscriptResponse;
+  let parsed;
   try {
-    parsed = await client.sdk.getSessionTranscript(backendSessionId, {
-      limit: 200,
-    });
+    const reusable = runId && publicActiveRun(original)?.nextEventIndex !== undefined;
+    parsed = await client.sdk.getSessionConversation(backendSessionId, CHAT_HISTORY_LIMIT,
+      reusable ? { runId, preserveTerminal: !isLocallyStoppedRun(original, runId, Date.now()) &&
+        !!original && hasContinuingStream(original) } : undefined);
   } catch (error) {
-    throw runtimeOperationError(
-      `Cannot sync persisted transcript for session ${backendSessionId}`,
-      error,
-    );
-  }
-  const messages = (parsed.items ?? [])
-    .map((item) => transcriptItemToMessage(chatId, item))
-    .filter((message): message is ChatMessage => Boolean(message));
-  if (!messages.length) {
-    return;
-  }
-
-  // The transcript is authoritative for committed history, while the active
-  // run is authoritative for the in-flight turn. A turn's assistant row is
-  // not committed until output arrives, so replacing local state with the
-  // transcript during refresh leaves no message for SSE resume to target.
-  // Preserve that overlay, and synthesize it after a Web process restart.
-  const activeRun = chat.activeRun;
-  if (activeRun && runBlocksChatTurn(activeRun.status)) {
-    const localAssistant =
-      (activeRun.assistantMessageId
-        ? chat.messages.find(
-            (message) =>
-              message.id === activeRun.assistantMessageId &&
-              message.role === "assistant",
-          )
-        : undefined) ??
-      [...chat.messages]
-        .reverse()
-        .find(
-          (message) =>
-            message.role === "assistant" && message.status === "streaming",
-        );
-    const localAssistantIndex = localAssistant
-      ? chat.messages.findIndex((message) => message.id === localAssistant.id)
-      : -1;
-    const localUser =
-      localAssistantIndex > 0 &&
-      chat.messages[localAssistantIndex - 1]?.role === "user"
-        ? chat.messages[localAssistantIndex - 1]
-        : undefined;
-    const canonicalTail = messages[messages.length - 1];
-    const canonicalHasCurrentUser =
-      canonicalTail?.role === "user" &&
-      (!localUser || canonicalTail.content === localUser.content);
-
-    if (!canonicalHasCurrentUser && localUser) {
-      messages.push(localUser);
+    if (!stillCurrent()) return currentChat()?.id;
+    if ((error instanceof AstraApiError || error instanceof RuntimeClientError) && error.status === 404) {
+      const missing = currentChat();
+      if (missing?.backendSessionId === backendSessionId) {
+        discardChatStreamProjection(missing);
+        const store = getStore(ownerUserId);
+        store.chats = store.chats.filter(item => item !== missing);
+      }
+      return;
     }
-    const assistant =
-      localAssistant ??
-      ({
-        id: `inflight:${activeRun.runId}`,
-        role: "assistant",
-        content: "",
-        createdAt: nowIso(),
-        reasoning: "",
-        reasoningStatus: "streaming",
-        status: "streaming",
-      } satisfies ChatMessage);
-    messages.push(assistant);
-    activeRun.assistantMessageId = assistant.id;
+    throw runtimeOperationError(`Cannot sync persisted transcript for session ${backendSessionId}`, error);
   }
-
-  if (chat.streamProjection) {
-    const messageId = chat.streamProjection.assistantMessageId;
-    const prior = chat.messages.find(message => message.id === messageId);
-    if (!prior || !messages.includes(prior)) discardChatStreamProjection(chat);
+  if (!stillCurrent()) return currentChat()?.id;
+  if (parsed.session.session_id !== backendSessionId) {
+    throw new Error("Conversation response does not match the selected Session.");
   }
-  chat.messages = messages;
-  const latest = messages[messages.length - 1];
-  chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;
-  chat.lastMessagePreview = latest?.content || chat.lastMessagePreview;
+  const existing = currentChat();
+  // A newly started POST has a parser before its Run identity arrives.
+  const livePost = existing?.streamProjection;
+  if (livePost?.writer && !livePost.writer.signal.aborted &&
+    !livePost.state.runId && !livePost.state.protocolError) return existing!.id;
+  const root = parsed.selected_root;
+  const stopped = root && isLocallyStoppedRun(existing, root.run_id, Date.now());
+  const continuing = existing && hasContinuingStream(existing);
+  const warm = existing && root && root.run_id === runId && publicActiveRun(existing)?.nextEventIndex !== undefined &&
+    (!isTerminalChatRunStatus(root.status) || !stopped && continuing);
+  // An omitted history is only valid for the exact reusable continuation.
+  // Never turn it into an empty cold transcript after a local Stop/expiry.
+  if (!parsed.history_loaded && !warm) return existing?.id;
+  if (existing && !warm) discardChatStreamProjection(existing);
+  const record = chatRecordFromBackendSession(parsed.session, existing);
+  if (!record) return;
+  if (root && isTerminalChatRunStatus(root.status)) forgetLocallyStoppedRun(record, root.run_id);
+  const active = root && runBlocksChatTurn(root.status) && !stopped
+    ? makeActiveRunRecord({ runId: root.run_id, status: root.status, waitingFor: root.waiting_for }, "backend_poll")
+    : undefined;
+  const reconciled = mergeActiveRunRecord({
+    existing: root?.run_id === existing?.activeRun?.runId ? existing?.activeRun : undefined,
+    backend: active, backendRunStatuses: new Map(root ? [[root.run_id, root.status]] : []),
+  });
+  if (warm) {
+    // Stream terminal owns an unstopped continuation; cancellation keeps its
+    // existing expiry rules even while the parser remains reusable.
+    record.activeRun = isTerminalChatRunStatus(root!.status) && !stopped && continuing
+      ? existing.activeRun : reconciled;
+    if (!record.activeRun) discardChatStreamProjection(record);
+  } else {
+    record.activeRun = reconciled;
+    record.messages = parsed.items.flatMap(item => {
+      if (item.kind === "opening") return [{ id: item.id, role: "user" as const,
+        content: item.content, createdAt: item.created_at, status: "complete" as const }];
+      if (item.kind === "failure") return [{ id: item.id, role: "assistant" as const,
+        content: item.failure.message, createdAt: item.created_at, status: "failed" as const }];
+      const message = transcriptItemToMessage(record.id, item);
+      if (message && item.failure) {
+        message.status = "failed";
+        message.content = appendRunFailure(message.content, item.failure.message);
+        message.reasoningStatus = undefined;
+      }
+      return message ? [message] : [];
+    });
+    if (record.activeRun) {
+      const active = record.activeRun;
+      const assistant = streamingAssistantMessage(record, `inflight:${active.runId}`, nowIso(), {
+        sessionId: backendSessionId, runId: active.runId, nextEventIndex: 0,
+      });
+      record.messages.push(assistant);
+      active.assistantMessageId = assistant.id;
+    }
+    const latest = record.messages.at(-1);
+    record.lastMessageAt = latest?.createdAt ?? record.lastMessageAt;
+    record.lastMessagePreview = latest?.content || record.lastMessagePreview;
+  }
+  const store = getStore(ownerUserId);
+  const index = store.chats.findIndex(item => item.id === chatId || item.backendSessionId === backendSessionId);
+  if (index < 0) store.chats.push(record);
+  else store.chats[index] = record;
+  return record.id;
 }
 
 async function createBackendSession(params: {
@@ -2326,14 +2285,6 @@ async function updateBackendSessionWorkspaceSelection(
   }
 }
 
-function assertBackendSessionMatchesChat(chatId: string, sessionId?: string) {
-  if (sessionId && sessionId !== chatId) {
-    throw new Error(
-      `Runtime returned session_id ${sessionId}, but Web chat is bound to ${chatId}.`,
-    );
-  }
-}
-
 function normalizeCanonicalChatIds(store: Store) {
   const seen = new Set<string>();
   const seenBackendSessionIds = new Set<string>();
@@ -2379,246 +2330,6 @@ function touchProjectInStore(store: Store, projectId: string) {
   if (project) {
     project.updatedAt = nowIso();
   }
-}
-
-function appendAssistantMessage(
-  chat: ChatRecord,
-  text: string,
-  ok: boolean,
-): ChatMessage {
-  const timestamp = nowIso();
-  const message: ChatMessage = {
-    id: crypto.randomUUID(),
-    role: "assistant",
-    content: text,
-    createdAt: timestamp,
-    status: ok ? "complete" : "failed",
-  };
-  chat.messages.push(message);
-  chat.lastMessageAt = timestamp;
-  chat.lastMessagePreview = text;
-  return message;
-}
-
-async function callBackendAgent(params: {
-  sessionId?: string;
-  text: string;
-  model: string;
-  activeSkills?: string[];
-  activeTools?: string[];
-  webSearch?: boolean;
-}): Promise<{ ok: boolean; sessionId?: string; assistantText: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    AGENT_RESPONSE_TIMEOUT_MS,
-  );
-
-  try {
-    const client = await requireRuntimeClient({
-      auth: "required",
-      operation: "start web chat turn",
-    });
-    const modelSelection = await resolveModelOfferingSelection(
-      client,
-      params.model,
-    );
-    const activeSkills = normalizedActiveSkills(params.activeSkills);
-    const activeTools = normalizedActiveTools(
-      params.activeTools,
-      params.webSearch,
-    );
-
-    const run = await client.sdk.createRun(
-      {
-        message: params.text,
-        sessionId: params.sessionId,
-        modelSelection,
-        allowSkills: activeSkills.length ? activeSkills : undefined,
-        enabledTools: activeTools,
-        context: {
-          source: "web_v1",
-          edge_profile:
-            activeSkills.length || activeTools.length
-              ? {
-                  ...(activeSkills.length
-                    ? { active_skills: activeSkills }
-                    : {}),
-                  ...(activeTools.length ? { active_tools: activeTools } : {}),
-                }
-              : undefined,
-        },
-      },
-      {
-        signal: controller.signal,
-      },
-    );
-    if (run.runId) {
-      const streamed = await readRunStream(client, run.runId);
-      if (streamed.error) {
-        throw new Error(streamed.error);
-      }
-      if (streamed.assistantText.trim()) {
-        return {
-          ok: true,
-          sessionId: run.sessionId,
-          assistantText: streamed.assistantText.trim(),
-        };
-      }
-    }
-
-    return {
-      ok: true,
-      sessionId: run.sessionId,
-      assistantText: run.runId
-        ? "Astra completed the run without returning visible text."
-        : "The run was accepted by Astra.",
-    };
-  } catch (error) {
-    const message =
-      error instanceof Error && error.name === "AbortError"
-        ? `timed out after ${AGENT_RESPONSE_TIMEOUT_MS / 1000}s`
-        : runtimeErrorDetail(error, "unknown error");
-    const prefix =
-      error instanceof RuntimeClientError
-        ? "Astra runtime rejected the request"
-        : "I could not reach the Astra runtime from the web UI";
-    return {
-      ok: false,
-      assistantText: `${prefix}. (${message})`,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function readRunStream(
-  client: WebRuntimeClient,
-  runId: string,
-): Promise<StreamResult> {
-  const startedAt = Date.now();
-  let nextOffset = 0;
-  let assistantText = "";
-
-  while (Date.now() - startedAt < AGENT_STREAM_TIMEOUT_MS) {
-    const controller = new AbortController();
-    const remainingMs = Math.max(
-      1,
-      AGENT_STREAM_TIMEOUT_MS - (Date.now() - startedAt),
-    );
-    const timeout = setTimeout(() => controller.abort(), remainingMs);
-
-    try {
-      const response = await client.fetchResponse(
-        `${chatRunStreamPath(runId)}${buildQueryString({ last_index: nextOffset })}`,
-        {
-          auth: "required",
-          operation: `stream run ${runId}`,
-          signal: controller.signal,
-        },
-      );
-
-      if (!response.ok) {
-        return { assistantText, error: await readRuntimeErrorDetail(response) };
-      }
-
-      const parsed = parseRunSseText(await response.text());
-      if (parsed.assistantText) {
-        assistantText = parsed.assistantText;
-      }
-      if (
-        typeof parsed.nextOffset === "number" &&
-        parsed.nextOffset > nextOffset
-      ) {
-        nextOffset = parsed.nextOffset;
-      }
-      if (parsed.error || parsed.finished) {
-        return {
-          assistantText,
-          error: parsed.error,
-          finished: parsed.finished,
-          nextOffset,
-        };
-      }
-    } catch (error) {
-      const detail =
-        error instanceof Error && error.name === "AbortError"
-          ? `timed out after ${AGENT_STREAM_TIMEOUT_MS / 1000}s while waiting for Astra`
-          : error instanceof Error
-            ? error.message
-            : "unknown stream error";
-      return { assistantText, error: detail };
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-
-  return {
-    assistantText,
-    error: `timed out after ${AGENT_STREAM_TIMEOUT_MS / 1000}s while waiting for Astra`,
-  };
-}
-
-function parseRunSseText(text: string): StreamResult {
-  let assistantText = "";
-  let finalText = "";
-  let error: string | undefined;
-  let finished = false;
-  let nextOffset = 0;
-
-  for (const event of parseSseDataEvents(text.replace(/\r\n/g, "\n"))) {
-    const record = event as Record<string, unknown>;
-    const type = typeof record.type === "string" ? record.type : "";
-    if (typeof record.index === "number" && Number.isFinite(record.index)) {
-      nextOffset = Math.max(nextOffset, Math.trunc(record.index) + 1);
-    }
-
-    if (type === "text_delta" && typeof record.content === "string") {
-      assistantText += record.content;
-    } else if (type === "text_done" && typeof record.full_text === "string") {
-      finalText = record.full_text;
-    } else if (
-      type === "turn_complete" &&
-      typeof record.assistant_text === "string"
-    ) {
-      finalText = record.assistant_text;
-    } else if (type === "run_error") {
-      const runError =
-        typeof record.message === "string"
-          ? record.message
-          : typeof record.error === "string"
-            ? record.error
-            : undefined;
-      if (runError) {
-        error = runError;
-      }
-    } else if (type === "error" && typeof record.message === "string") {
-      error = record.message;
-    } else if (
-      type === "run_finished" &&
-      record.status === "failed" &&
-      typeof record.error === "string"
-    ) {
-      error = record.error;
-      finished = true;
-    } else if (
-      type === "run_finished" &&
-      (record.status === "paused" || record.status === "interrupted")
-    ) {
-      finished = true;
-    } else if (type === "run_finished") {
-      finished = true;
-    }
-  }
-
-  return {
-    assistantText: finalText || assistantText,
-    error,
-    finished,
-    nextOffset,
-  };
 }
 
 export async function resolveModelOfferingSelection(

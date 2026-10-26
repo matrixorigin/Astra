@@ -1377,9 +1377,6 @@ export type RunProjectionResponse = {
   transport?: string | null;
   fallback_policy?: string | null;
   run_event_high_watermark: number;
-  projection_event_idx: number;
-  projection_updated_at: string;
-  projection_hash: string;
   latest_event_type?: string | null;
   total_prompt_tokens: number;
   total_completion_tokens: number;
@@ -1392,9 +1389,7 @@ export type RunProjectionResponse = {
     created_at: string;
   } | null;
   observability: {
-    has_durable_projection: boolean;
     observability_available: boolean;
-    projection_lag_events: number;
     prompt_request_count: number;
     latest_prompt_request?: {
       request_id: string;
@@ -1407,10 +1402,7 @@ export type RunProjectionResponse = {
   recent_events: Array<StreamEvent | Record<string, unknown>>;
 };
 
-export type RunProjectionRepairResponse = {
-  repaired: boolean;
-  projection: RunProjectionResponse;
-};
+
 
 export type RunInputRequestBody = {
   idempotencyKey: string;
@@ -1498,6 +1490,7 @@ export type RuntimeSessionListParams = {
 };
 
 export type RuntimeTranscriptItemResponse = {
+  source_event_id?: string | null;
   session_id: string;
   item_seq: number;
   run_id?: string | null;
@@ -1514,6 +1507,22 @@ export type RuntimeTranscriptResponse = {
   items: RuntimeTranscriptItemResponse[];
   next_before_seq?: number | null;
   has_more?: boolean;
+};
+
+/** Bounded display projection; opening inputs never acquire raw item sequences. */
+export type RuntimeConversationFailure = { message: string; error_code: string | null };
+export type RuntimeConversationResponse = {
+  kind: "conversation";
+  session: RuntimeSessionResponse;
+  selected_root: { run_id: string; status: string; waiting_for: string | null; created_at: string } | null;
+  items: Array<({ kind: "raw"; failure?: RuntimeConversationFailure } & RuntimeTranscriptItemResponse) | {
+    kind: "opening"; id: string; run_id: string; source_event_id: string; created_at: string; content: string;
+  } | {
+    kind: "failure"; id: string; run_id: string; created_at: string; failure: RuntimeConversationFailure;
+  }>;
+  history_loaded: boolean;
+  raw_page: { next_before_seq: number | null; has_more: boolean } | null;
+  truncated: boolean | null;
 };
 
 export type RuntimeTranscriptParams = {

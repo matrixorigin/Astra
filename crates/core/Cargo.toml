@@ -25,6 +25,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+sqlx-core.workspace = true
 tokio-tungstenite.workspace = true
 rcgen = "0.13.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

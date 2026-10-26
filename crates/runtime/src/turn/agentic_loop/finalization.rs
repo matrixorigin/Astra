@@ -1,4 +1,3 @@
-use crate::{EventCreateRequestData, EventService};
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_services::SessionArtifactStore;
@@ -14,7 +13,6 @@ use super::lifecycle::{
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
 pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
-    update_session_facts_from_turn(state);
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
@@ -29,7 +27,6 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         first_budget_pressure: &mut state.telemetry.first_budget_pressure,
         pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
         observability_session: state.telemetry.observability_session.clone(),
-        persistence: state.telemetry.context_trace_persistence.clone(),
     })
     .await;
 }
@@ -46,7 +43,6 @@ pub struct TurnTraceFinalizationInput<'a> {
     pub pending_context_assembly_trace: &'a mut Option<(u32, serde_json::Value)>,
     pub observability_session:
         Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
-    pub persistence: Option<super::host::ContextTracePersistenceContext>,
 }
 
 /// Settle measured context evidence without execution-loop state.
@@ -92,10 +88,16 @@ pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) 
         // the first one made long tool turns look artificially small.
         *input.pending_context_assembly_trace = Some((session_turn, trace.to_json_value()));
     }
+}
+
+/// Publish derived context displays only after canonical terminal settlement.
+/// The existing run cleanup task owns completion and shutdown draining.
+pub(crate) async fn persist_completed_context_trace(state: &AgenticLoopState) {
     persist_latest_context_trace_signal(
-        input.session_id,
-        input.persistence,
-        input.observability_session,
+        state.current_session_id.as_deref(),
+        state.telemetry.context_trace_persistence.clone(),
+        state.telemetry.observability_session.clone(),
+        state.telemetry.trace_ingestion.as_ref(),
     )
     .await;
 }
@@ -104,6 +106,7 @@ async fn persist_latest_context_trace_signal(
     session_id: Option<&str>,
     persistence: Option<super::host::ContextTracePersistenceContext>,
     session: Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
+    ingestion: Option<&astra_services::event_ingestion::IngestionSender>,
 ) {
     let (session_id, persistence, session) = match (session_id, persistence, session) {
         (Some(session_id), Some(persistence), Some(session)) if !session_id.is_empty() => {
@@ -168,33 +171,24 @@ async fn persist_latest_context_trace_signal(
     } else {
         signal.turn_id.clone()
     };
-    if let Err((status, response)) = persistence
-        .event_service
-        .create_event(
-            persistence.user_id.clone(),
-            EventCreateRequestData {
-                ingestion_source: astra_services::events::EventIngestionSource::Client,
-                event_id: None,
-                session_id: session_id.clone(),
-                event_type: "context_trace_signal".to_string(),
-                content,
-                agent_id: Some(persistence.agent_id),
-                agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                parent_event_id: None,
-                parent_event_ids: Some(Vec::new()),
-                causal_chain_id: Some(format!("{session_id}:context-trace:{turn_id}")),
-                metadata: Some(metadata),
-            },
-        )
-        .await
-    {
-        astra_core::agent_warn!(
-            "context-trace",
-            "Failed to persist context trace signal for {}: {} {}",
-            session_id,
-            status,
-            response.0.detail
-        );
+    if let Some(ingestion) = ingestion {
+        ingestion.enqueue(astra_services::event_ingestion::IngestionEvent {
+            event_id: uuid::Uuid::now_v7().to_string(),
+            session_id: session_id.clone(),
+            user_id: persistence.user_id,
+            event_type: "context_trace_signal".into(),
+            content: Some(content),
+            token_usage: None,
+            llm_model_used: None,
+            skill_name: None,
+            metadata: Some(metadata),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: Some(format!("{session_id}:context-trace:{turn_id}")),
+            history_work_queue_reservation: None,
+            ingestion_enqueued_at: None,
+        });
     }
 }
 
@@ -250,45 +244,6 @@ async fn persist_context_trace_to_workspace_if_present(
                 err
             );
         }
-    }
-}
-
-fn persist_remote_composite_snapshot_index_blocking(
-    persistence: Option<&super::host::ContextTracePersistenceContext>,
-    session_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-    source: &str,
-) {
-    let Some(persistence) = persistence.cloned() else {
-        return;
-    };
-    let session_id = session_id.to_string();
-    let session_id_for_log = session_id.clone();
-    let index = index.clone();
-    let future = async move {
-        astra_services::session_restore::persist_remote_composite_snapshot_index(
-            &session_id,
-            &persistence.user_id,
-            &index,
-            &persistence.artifact_store,
-        )
-        .await
-        .map(|_| ())
-    };
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map(|runtime| runtime.block_on(future))
-            .map_err(|error| error.to_string())
-            .and_then(|result| result),
-    };
-    if let Err(error) = result {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to {source} for {session_id_for_log}: {error}"
-        );
     }
 }
 
@@ -400,13 +355,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     }
 
     let turn = session_turn_number(state);
-    if let Some((cp, snapshot)) = commit_session_continuity_checkpoint(
-        user_id,
-        sid,
-        turn,
-        cp,
-        state.telemetry.context_trace_persistence.as_ref(),
-    ) {
+    if let Some((cp, snapshot)) = commit_session_continuity_checkpoint(user_id, sid, turn, cp) {
         state.last_composite_snapshot = Some(snapshot);
         state.stall.last_heavy_checkpoint = Some(cp);
     }
@@ -420,7 +369,6 @@ pub fn commit_session_continuity_checkpoint(
     session_id: &str,
     turn: u32,
     cp: StepCheckpoint,
-    persistence: Option<&super::host::ContextTracePersistenceContext>,
 ) -> Option<(
     StepCheckpoint,
     astra_core::composite_snapshot::CompositeSnapshot,
@@ -430,7 +378,7 @@ pub fn commit_session_continuity_checkpoint(
             .label(format!("checkpoint-t{turn}"))
             .workspace_state(session_id.to_owned())
             .build();
-    let (_ckpt_num, snapshot, index) =
+    let (_ckpt_num, snapshot, _index) =
         match step_checkpoint::commit_composite_checkpoint(user_id, session_id, &cp, snapshot) {
             Ok(committed) => committed,
             Err(error) => {
@@ -443,12 +391,6 @@ pub fn commit_session_continuity_checkpoint(
                 return None;
             }
         };
-    persist_remote_composite_snapshot_index_blocking(
-        persistence,
-        session_id,
-        &index,
-        "persist remote composite snapshot index",
-    );
 
     Some((cp, snapshot))
 }
@@ -566,9 +508,31 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
     }
 
+    // One loop exit owns turn facts and settlement. Round trace callbacks are
+    // observations: they must not append the same cumulative tool facts again.
+    // Waiting/delegated/rejected control does not settle an unfinished turn.
+    if !host.is_pre_admission_rejection()
+        && !matches!(
+            &result,
+            Ok(AgenticLoopOutcome::Waiting(_)
+                | AgenticLoopOutcome::Delegated
+                | AgenticLoopOutcome::ControlRejected(_))
+        )
+    {
+        update_session_facts_from_turn(state);
+        // Cancellation before any output has no assistant answer to render.
+        // Fatal errors retain their existing partial/checkpoint error path.
+        if result.is_ok()
+            && (matches!(&result, Ok(AgenticLoopOutcome::Completed))
+                || !state.final_text.is_empty())
+        {
+            finalize_and_render(host, state).await;
+        }
+    }
+
     host.on_turn_terminal(state, &result).await;
 
-    // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
+    // One SessionEnd owner covers normal completion and error returns alike.
     if !input_wait_continuation {
         super::super::harness_adapter::harness_at!(
             &state.harness,
@@ -664,6 +628,10 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    // All terminal routes retain the producer-owned child obligation here.
+    if !state.final_output_ready_notified {
+        super::execution_phase::fence_direct_child_finalization(host, state).await;
+    }
     // The answer itself belongs to the interactive critical path. Everything
     // below this boundary is durable/derived settlement and must never keep a
     // displayed answer looking live just because a database, workspace, or
@@ -681,11 +649,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     finalize_turn_trace(state).await;
 
-    // Publish the bounded durable handoff before terminal completion. Server
-    // runs admit extraction only at their detached post-loop boundary; other
-    // surfaces let the same service dispatch background extraction here.
-    maybe_run_memory_extraction(state, host.owns_post_loop_memory_settlement()).await;
-
     // Desired-state convergence authority is deliberately live-only. A
     // terminal turn (successful, interrupted, or cancelled) must not leave a
     // no-op writer snapshot consumable by a later run on the same long-lived
@@ -701,15 +664,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     reset_per_turn_advisory_state(state);
     update_working_memory_for_turn_settlement(state);
-
-    // ── Harness: SessionEnd (observe only, fire at most once) ──
-    // Fire after terminal text/interruption normalization so snapshots expose
-    // the real final state instead of a pre-finalization empty/completed shell.
-    super::super::harness_adapter::harness_at!(
-        &state.harness,
-        astra_harness::HookPoint::SessionEnd,
-        state
-    );
 
     try_write_heavy_checkpoint(state);
 }
@@ -779,7 +733,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // envelope to text that may already have streamed. Apart from leaking
     // internal details, re-rendering that envelope on an append-only stream
     // duplicates the provider response.
-    if let Some(interruption) = state.interruption.as_ref() {
+    if state.interruption.is_some() {
         // Prefer the latest provider response, then the bounded settlement
         // candidate. A current runtime-owned Work settlement sentence is not
         // provider output and must not be promoted to partial assistant text.
@@ -795,15 +749,14 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                     && !state.final_text.trim().is_empty())
                 .then(|| {
                     (
-                        state.final_text.trim().to_string(),
+                        state.final_text.clone(),
                         state.final_text_model_item_id.clone(),
                     )
                 })
             });
         if let Some((candidate, model_item_id)) = candidate {
-            let candidate = candidate.trim();
-            let already_current = state.final_text.trim() == candidate;
-            state.final_text = candidate.to_string();
+            let already_current = state.final_text == candidate;
+            state.final_text = candidate;
             state.final_text_model_item_id = model_item_id;
             // Preserve the live-stream fact only when this is the exact text
             // that already crossed the render boundary. A replacement
@@ -812,10 +765,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 state.final_text_streamed = false;
             }
         } else {
-            // With no partial assistant content, render only the safe public
-            // message. `error_detail` remains available on `run_interrupted`
-            // for diagnostics but never becomes transcript text.
-            state.final_text = interruption_terminal_message(interruption);
+            // Lifecycle notices belong to the interruption/error channel,
+            // never to assistant history or canonical Context.
+            state.final_text.clear();
             state.final_text_model_item_id = None;
             state.final_text_streamed = false;
         }
@@ -855,32 +807,6 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // durability and render human copy. Internal reason codes and scheduler
     // counters remain observability data; they are not user-facing prose.
     if state.total_tool_calls > 0 {
-        let recent_tools: Vec<String> = state
-            .stall
-            .tool_call_records
-            .iter()
-            .filter_map(|r| {
-                if r.result_preview.as_deref() == Some("") {
-                    return None;
-                }
-                if r.error.is_some() {
-                    Some(format!("{}(failed)", r.name))
-                } else {
-                    Some(r.name.clone())
-                }
-            })
-            .collect();
-        let tool_summary = if recent_tools.is_empty() {
-            String::new()
-        } else {
-            let mut seen = std::collections::HashSet::new();
-            let unique: Vec<&str> = recent_tools
-                .iter()
-                .filter(|n| seen.insert(n.as_str()))
-                .map(|s| s.as_str())
-                .collect();
-            format!(" Completed tools included: {}.", unique.join(", "))
-        };
         let rounds_completed = state.max_turns.saturating_sub(state.remaining_turns);
         let detail = format!(
             "turn ended while working: {} tool call(s) completed, last_finish_reason={}, rounds_completed={}, remaining_turns={}, max_turns={}",
@@ -897,12 +823,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 settlement_interruption_summary(state, Some(detail)),
             ));
         }
-        if let Some(interruption) = state.interruption.as_ref() {
-            state.final_text = interruption_terminal_message(interruption);
-            state.final_text_model_item_id = None;
-            state.final_text.push_str(&tool_summary);
-            state.final_text_streamed = false;
-        }
+        state.final_text.clear();
+        state.final_text_model_item_id = None;
+        state.final_text_streamed = false;
         return;
     }
     if state.interruption.is_none() {
@@ -915,17 +838,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             ),
         ));
     }
-    if let Some(interruption) = state.interruption.as_ref() {
-        state.final_text = interruption_terminal_message(interruption);
-        state.final_text_model_item_id = None;
-        state.final_text_streamed = false;
-    }
-}
-
-fn interruption_terminal_message(
-    interruption: &astra_turn_core::interruption::InterruptionRecord,
-) -> String {
-    interruption.user_message.clone()
+    state.final_text.clear();
+    state.final_text_model_item_id = None;
+    state.final_text_streamed = false;
 }
 
 fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
@@ -997,75 +912,6 @@ fn update_session_facts_from_turn(state: &mut super::host::AgenticLoopState) {
         .session_facts
         .set_blocked_tools(state.restricted_tools.iter().cloned().collect());
     let _ = had_error;
-}
-
-/// Bridge between turn finalization and
-/// [`crate::session_memory::MemoryExtractionService`]. Returns
-/// after a bounded durable input handoff. The service owns per-session
-/// debounce and background extraction; Server defers dispatch to its sole
-/// post-loop settlement owner without skipping the durable publication.
-async fn maybe_run_memory_extraction(state: &mut AgenticLoopState, defer_dispatch: bool) {
-    let Some(svc) = state.memory_extraction_service.clone() else {
-        return;
-    };
-    let Some(session_id) = state.current_session_id.clone() else {
-        return;
-    };
-    let Some(_user_id) = state.context_manifest_user_id.clone() else {
-        tracing::warn!(
-            session_id = %session_id,
-            "Skipping session-memory extraction: missing durable user_id"
-        );
-        return;
-    };
-    let turn_number = session_turn_number(state);
-
-    let had_error = state.error_recovery.consecutive_same_error > 0;
-
-    // Total context size the model actually sees — uncached prompt +
-    // cache reads + cache creation. Using `total_prompt` alone here
-    // was a semantic bug: on prompt-cache-heavy sessions 90% of the
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::MemoryExtractionHistoryClone,
-        &state.messages,
-    );
-    let req = crate::session_memory::ExtractionRequest {
-        inference_scope: astra_turn_types::InferenceInvocationScope::Session {
-            session_id,
-            turn: turn_number,
-            round: state.current_round_index,
-            operation_id: "memory_extraction".to_string(),
-            logical_attempt: 0,
-        },
-        messages: state.messages.clone(),
-        session_facts: state.session_facts.clone(),
-        had_error,
-        reanchors_current_objective: state
-            .turn_intent
-            .as_ref()
-            .is_some_and(|intent| intent.reanchors_current_objective()),
-    };
-
-    match tokio::time::timeout(std::time::Duration::from_secs(1), svc.prepare_request(&req)).await {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "session memory durable handoff failed");
-            return;
-        }
-        Err(_) => {
-            tracing::warn!("session memory durable handoff timed out");
-            return;
-        }
-    }
-    if defer_dispatch {
-        return;
-    }
-    match svc.maybe_spawn(req) {
-        crate::session_memory::SpawnDecision::Spawned => {}
-        crate::session_memory::SpawnDecision::Queued => {}
-        crate::session_memory::SpawnDecision::Skipped => {}
-    }
 }
 
 #[cfg(test)]
@@ -1223,7 +1069,7 @@ mod tests {
         let mut state = make_state();
         state.final_text = "stale completion-shaped summary".to_string();
         state.hooks.completion_settlement.deferred_candidate_text =
-            Some("The build passed its final check.".to_string());
+            Some("  The build passed its final check.\n".to_string());
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
@@ -1240,7 +1086,7 @@ mod tests {
 
         ensure_terminal_text(&mut state);
 
-        assert_eq!(state.final_text, "The build passed its final check.");
+        assert_eq!(state.final_text, "  The build passed its final check.\n");
         assert!(!state.final_text.contains("prompt budget"));
         assert_eq!(
             state
@@ -1432,16 +1278,16 @@ mod tests {
             },
         ));
 
+        let before = state.messages.clone();
+        state.begin_run_transcript_capture(std::iter::empty());
         finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(
-            state.final_text,
-            state.interruption.as_ref().unwrap().user_message,
-            "interrupted tool-only turns must not persist an empty or success-shaped final answer"
-        );
-        assert!(!state.final_text.is_empty());
-        assert!(!state.final_text.contains("budget_exhausted"));
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text.is_empty());
+        assert!(state.final_text_model_item_id.is_none());
+        assert!(state.interruption.is_some());
+        assert!(host.rendered_final_text.is_empty());
+        assert_eq!(state.messages, before);
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[tokio::test]
@@ -1502,6 +1348,8 @@ mod tests {
         state.total_tool_calls = 3;
         state.remaining_turns = 2;
 
+        let before = state.messages.clone();
+        state.begin_run_transcript_capture(std::iter::empty());
         finalize_and_render(&mut host, &mut state).await;
 
         let interruption = state
@@ -1517,11 +1365,12 @@ mod tests {
             Vec::<String>::new(),
             "empty completion should preserve the user's full tool surface; settlement is guidance/state, not a tool denylist"
         );
-        assert!(state.final_text.contains("final answer"));
-        assert!(state.final_text.contains("Continue this session to resume"));
-        assert!(!state.final_text.contains("empty_completion"));
-        assert!(!state.final_text.contains("[turn_interrupted]"));
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text.is_empty());
+        assert!(state.final_text_model_item_id.is_none());
+        assert!(state.interruption.is_some());
+        assert!(host.rendered_final_text.is_empty());
+        assert_eq!(state.messages, before);
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[tokio::test]
@@ -1944,44 +1793,73 @@ mod tests {
                 resume_restricted_tools: vec![],
             },
         ));
-        let expected = interruption_terminal_message(
-            state.interruption.as_ref().expect("budget interruption"),
-        );
-
+        let before = state.messages.clone();
+        state.begin_run_transcript_capture(std::iter::empty());
         finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(state.final_text, expected);
-        assert!(!state.final_text.contains("Infrastructure round limit"));
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(state.final_text.is_empty());
+        assert!(state.final_text_model_item_id.is_none());
+        assert!(state.interruption.is_some());
+        assert!(host.rendered_final_text.is_empty());
+        assert_eq!(state.messages, before);
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[tokio::test]
     async fn finalize_and_render_does_not_repeat_streamed_partial_text() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text = "Useful partial answer.".to_string();
-        state.final_text_streamed = true;
-        state.hooks.completion_settlement.latest_provider_text = Some(state.final_text.clone());
-        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            astra_turn_core::interruption::InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 2,
-                turns_completed: 3,
-                remaining_turns: 4,
-                error_detail: Some("typed completion action was not satisfied".into()),
-                stall_signal: None,
-                resume_restricted_tools: vec![],
-            },
-        ));
+        for deferred in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            let text = "  Useful partial answer.\n";
+            let mut response = text_result(text, 10, 5, None);
+            response.accum.model_item_id = Some("observed-partial".into());
+            state.messages = vec![serde_json::json!({"role":"user","content":"original request"})];
+            state.begin_run_transcript_capture(std::iter::empty());
+            state.final_text = text.to_owned();
+            state.final_text_model_item_id = response.accum.model_item_id.clone();
+            state.final_text_streamed = true;
+            if deferred {
+                state.hooks.completion_settlement.text_only = true;
+                super::super::execution_phase::capture_deferred_candidate_text(
+                    &mut state, &response,
+                );
+            } else {
+                super::super::execution_phase::capture_latest_provider_text(&mut state, &response);
+            }
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                astra_turn_core::interruption::InterruptionStateSummary {
+                    has_checkpoint: true,
+                    tool_calls_completed: 2,
+                    turns_completed: 3,
+                    remaining_turns: 4,
+                    error_detail: Some("typed completion action was not satisfied".into()),
+                    stall_signal: None,
+                    resume_restricted_tools: vec![],
+                },
+            ));
 
-        finalize_and_render(&mut host, &mut state).await;
+            finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(state.final_text, "Useful partial answer.");
-        assert!(state.final_text_streamed);
-        assert!(host.rendered_final_text.is_empty());
-        assert!(!state.final_text.contains("typed completion action"));
+            assert_eq!(state.final_text, text);
+            assert_eq!(
+                state.final_text_model_item_id.as_deref(),
+                Some("observed-partial")
+            );
+            materialize_terminal_text_message(&mut state);
+            let assistants: Vec<_> = state
+                .messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .collect();
+            assert_eq!(assistants.len(), 1);
+            assert_eq!(assistants[0]["content"], text);
+            assert_eq!(state.take_run_transcript_capture().len(), 1);
+            assert!(state.final_text_streamed);
+            assert!(host.rendered_final_text.is_empty());
+            assert!(!state.final_text.contains("typed completion action"));
+        }
     }
 
     #[tokio::test]
@@ -2111,6 +1989,60 @@ mod tests {
         assert_eq!(trace.token_budget.total_used, 25_000);
         assert_eq!(trace.token_budget.max_tokens, 100_000);
         assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn context_display_is_queued_only_after_completed_core() {
+        let mut state = make_state();
+        let session_id = format!("async-context-{}", uuid::Uuid::new_v4());
+        state.current_session_id = Some(session_id.clone());
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(20_000);
+        let hub = crate::observability::ObservabilityHub::new();
+        state.telemetry.observability_session = Some(hub.start_session("owner", &session_id));
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-1",
+                session_id.clone(),
+            ));
+        state.telemetry.context_trace_persistence =
+            Some(super::super::host::ContextTracePersistenceContext {
+                user_id: "owner".into(),
+                artifact_store: astra_services::DatabaseSessionArtifactStore::new(
+                    astra_core::MatrixOneSettings::default(),
+                ),
+            });
+        let (sender, mut receiver) = astra_services::event_ingestion::IngestionSender::for_tests(4);
+        state.telemetry.trace_ingestion = Some(sender);
+        finalize_turn_trace(&mut state).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "finalization must not publish before canonical core commits"
+        );
+        assert_eq!(
+            state
+                .telemetry
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .context_traces
+                .len(),
+            1
+        );
+        persist_completed_context_trace(&state).await;
+        let event = receiver
+            .try_recv()
+            .expect("completed context projection is queued");
+        assert_eq!(event.user_id, "owner");
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.event_type, "context_trace_signal");
+        assert!(event.metadata.unwrap().get("budget").is_some());
+        assert!(
+            receiver.try_recv().is_err(),
+            "one projection per completed turn"
+        );
     }
 
     #[tokio::test]
@@ -2401,8 +2333,8 @@ mod tests {
         // Before finalization, facts should be empty
         assert!(state.session_facts.active_files.is_empty());
 
-        // Run finalization (which calls update_session_facts_from_turn)
-        finalize_turn_trace(&mut state).await;
+        // Turn settlement updates facts independently of optional round traces.
+        update_session_facts_from_turn(&mut state);
 
         // After finalization, facts should be populated
         assert_eq!(state.session_facts.turn, 7);
@@ -2415,17 +2347,8 @@ mod tests {
         assert_eq!(state.session_facts.recent_tool_calls.len(), 2);
     }
 
-    // ── finalize_and_render integrates MemoryExtractionService ─────────
-    //
-    // Verifies the post-wiring finalization path:
-    //   * actually calls `svc.maybe_spawn` when a service is attached
-    //   * writes `session-memory.md` on the rule-based fallback path
-    //   * emits a `session_memory_extraction` event
-    //   * is a no-op when no service is attached (test/dispatcher paths)
-
-    /// Capturing no-op Memoria client for finalize-side integration tests.
-    /// Records every `store` so assertions can verify the runner persisted
-    /// L1 content without hitting a real Memoria HTTP endpoint.
+    // Turn completion must not schedule optional extraction or duplicate its
+    // canonical input, even with an extraction service attached.
     #[derive(Default)]
     struct CapturingMemoriaForFinalize {
         stored: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
@@ -2506,7 +2429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_does_not_classify_short_user_text() {
+    async fn finalize_and_render_does_not_extract_memory_on_turn_completion() {
         let sid = format!(
             "finalize-skips-{}",
             std::time::SystemTime::now()
@@ -2535,48 +2458,14 @@ mod tests {
             .await;
         assert_eq!(pending, 0);
         assert!(
-            !memoria.stored.lock().unwrap().is_empty(),
-            "structured freshness, not message length, admits extraction"
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_and_render_defers_memory_to_post_loop_owner() {
-        let sid = format!(
-            "finalize-defers-memory-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let mut host = MockHost::new(Vec::new()).with_post_loop_memory_settlement_owner();
-        let mut state = make_state();
-        state.current_session_id = Some(sid);
-        state.context_manifest_user_id = Some("test-user".into());
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "server turn"}));
-        let (_rx, memoria) = attach_memory_extraction_service(&mut state);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        let pending = state
-            .memory_extraction_service
-            .as_ref()
-            .expect("memory extraction service")
-            .wait_for_pending(std::time::Duration::from_millis(20))
-            .await;
-        assert_eq!(pending, 0);
-        assert!(
             memoria.stored.lock().unwrap().is_empty(),
-            "the post-loop settlement owner must admit extraction at its own boundary"
+            "turn completion must not dispatch optional session-finalization work"
         );
     }
 
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-    async fn post_loop_owner_preserves_durable_handoff_before_dispatch() {
+    async fn turn_completion_does_not_duplicate_canonical_input_in_memory_journal() {
         let settings = astra_core::MatrixOneSettings::from_env();
         crate::isolated_database::require_isolated_database(&settings.database);
         astra_services::storage::ensure_core_schema(&settings, "mysql")
@@ -2607,31 +2496,22 @@ mod tests {
             .unwrap_or_else(|_| panic!("fixture owns its service"));
         state.memory_extraction_service =
             Some(std::sync::Arc::new(svc.with_durable_store(pool.clone())));
-        let mut host = MockHost::new(Vec::new()).with_post_loop_memory_settlement_owner();
+        let mut host = MockHost::new(Vec::new());
 
         finalize_and_render(&mut host, &mut state).await;
 
-        let sqlx::types::Json(work): sqlx::types::Json<
-            astra_services::session_memory_lifecycle::SessionMemoryWork,
-        > = sqlx::query_scalar(
-            "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
         )
         .bind(&user)
         .bind(&session)
         .fetch_one(pool.get())
         .await
         .unwrap();
-        let request = work
-            .pending_request
-            .expect("terminal finalization must persist its input");
-        assert_eq!(request["session_facts"]["turn"], 1);
-        assert_eq!(request["messages"], serde_json::json!(state.messages));
-        assert!(work.latest_fingerprint.is_some());
-        assert!(
-            !work.extraction_requested,
-            "post-loop owner must admit dispatch later"
+        assert_eq!(
+            count, 0,
+            "the Context owner already holds this turn's input"
         );
-        assert!(work.active_request.is_none());
         assert_eq!(
             state
                 .memory_extraction_service
@@ -2877,13 +2757,6 @@ mod tests {
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     }
 
-    // I11 test removed in rebase: the branch wired a now-deleted
-    // `memory_extraction_runner` module directly from
-    // `finalize_and_render`. Main's refactor routes session-memory
-    // extraction through a dedicated service that fires on its own
-    // schedule, not synchronously from finalize. Re-add equivalent
-    // coverage when the new service surfaces a synchronous hook.
-
     #[tokio::test]
     async fn error_triggered_l1_sets_error_state_and_builds_l1() {
         let mut state = make_state();
@@ -2913,10 +2786,9 @@ mod tests {
         }];
         state.total_prompt = 15000;
 
-        // finalize_turn_trace will attempt L1 write to $HOME/.astra/... which may
-        // fail in test (no writable session dir). That's fine — it's non-fatal.
-        // We verify the facts update and L1 content generation instead.
-        finalize_turn_trace(&mut state).await;
+        // Error facts belong to turn settlement, independently of tracing or
+        // optional memory extraction.
+        update_session_facts_from_turn(&mut state);
 
         // Error tracked in facts
         assert_eq!(state.session_facts.error_state.total_errors, 1);

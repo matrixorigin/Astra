@@ -8,10 +8,10 @@ use astra_services::runs::{
     AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
     AtomicRunInteractionWaitRequest, COLLABORATOR_NATIVE_SESSION_METADATA_KEY,
     CollaboratorNativeSession, CollaboratorProvider, CollaboratorStageAdmission,
-    CollaboratorStageReceipt, CollaboratorStoreError, DatabaseRunStateStore,
-    DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
-    DurableRunInteractionWaitOutcome, DurableRunRecord, InMemoryRunStateStore, RunStateStore,
-    ToolInteractionAdmissionError, ToolInvocationInteractionOrigin,
+    CollaboratorStageReceipt, DatabaseRunStateStore, DurableRunInteractionKind,
+    DurableRunInteractionResolveOutcome, DurableRunInteractionWaitOutcome, DurableRunRecord,
+    InMemoryRunStateStore, RunAdmissionError, RunStateStore, ToolInteractionAdmissionError,
+    ToolInvocationInteractionOrigin,
 };
 use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
@@ -542,7 +542,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 1
             )
             .await,
-        Err(CollaboratorStoreError::ParentNotCurrent { .. })
+        Err(RunAdmissionError::ParentNotCurrent { .. })
     ));
     assert!(matches!(
         restarted
@@ -554,7 +554,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 2
             )
             .await,
-        Err(CollaboratorStoreError::PreviousStageChanged { .. })
+        Err(RunAdmissionError::PreviousStageChanged { .. })
     ));
     let grant: (i64, String) = sqlx::query_as("SELECT event_idx, event_hash FROM agent_run_events
         WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'action_admission_granted' LIMIT 1")
@@ -573,7 +573,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 2
             )
             .await,
-        Err(CollaboratorStoreError::NativeSessionUnproven)
+        Err(RunAdmissionError::NativeSessionUnproven)
     ));
     sqlx::query("UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND run_id = ? AND event_idx = ?")
         .bind(grant.1).bind(&fixture.user_id).bind(&first.run_id).bind(grant.0)
@@ -629,7 +629,7 @@ async fn cancelled_native_receipt_recovers_session_after_store_restart_without_r
                 2
             )
             .await,
-        Err(CollaboratorStoreError::SessionUnavailable)
+        Err(RunAdmissionError::SessionUnavailable)
     ));
     // The existing live parent admits a later stage; recording the old receipt
     // did not restart or renew the cancelled stage or create another root run.
@@ -719,6 +719,7 @@ impl Fixture {
         sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at)
                      VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))")
             .bind(&user_id).bind(&session_id).execute(pool.get()).await.unwrap();
+        collaborator_fixture::seed_execution_binding(&pool, &user_id, &session_id).await;
         let parent = record(&user_id, &session_id, None);
         let parent_id = parent.run_id.clone();
         store.insert_run(parent).await.unwrap();
@@ -1896,7 +1897,7 @@ async fn memory_store_does_not_invent_durable_ledger_or_session_evidence() {
         store
             .insert_run_with_collaborator_stage(child, request, None)
             .await,
-        Err(CollaboratorStoreError::Unsupported)
+        Err(RunAdmissionError::Unsupported)
     ));
 }
 
@@ -1928,7 +1929,7 @@ async fn source_replay_survives_store_recreation_and_does_not_create_candidate()
         reopened
             .insert_run_with_collaborator_stage(fixture.child(), conflict, None)
             .await,
-        Err(CollaboratorStoreError::SourceMessageConflict { .. })
+        Err(RunAdmissionError::SourceMessageConflict { .. })
     ));
     let association = reopened
         .load_collaborator_association(&fixture.user_id, &fixture.session_id, &first.anchor_run_id)
@@ -1952,7 +1953,7 @@ async fn concurrent_next_stages_have_one_winner_and_preserve_terminal_anchor() {
             .store
             .insert_run_with_collaborator_stage(fixture.child(), request.clone(), None)
             .await,
-        Err(CollaboratorStoreError::PreviousStageActive { .. })
+        Err(RunAdmissionError::PreviousStageActive { .. })
     ));
     fixture.bind_native_session(&first.run_id).await;
     fixture.settle(&first.run_id).await;
@@ -1974,13 +1975,8 @@ async fn concurrent_next_stages_have_one_winner_and_preserve_terminal_anchor() {
     );
     assert!(matches!(
         (&left, &right),
-        (
-            Ok(_),
-            Err(CollaboratorStoreError::PreviousStageChanged { .. })
-        ) | (
-            Err(CollaboratorStoreError::PreviousStageChanged { .. }),
-            Ok(_)
-        )
+        (Ok(_), Err(RunAdmissionError::PreviousStageChanged { .. }))
+            | (Err(RunAdmissionError::PreviousStageChanged { .. }), Ok(_))
     ));
     let after = fixture
         .store
@@ -2013,7 +2009,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                 .store
                 .confirm_collaborator_native_session(&identity, &native, 1)
                 .await,
-            Err(CollaboratorStoreError::NativeSessionUnproven)
+            Err(RunAdmissionError::NativeSessionUnproven)
         ));
         let mut metadata = BTreeMap::new();
         metadata.insert("workspace_effect_settled".into(), json!(true));
@@ -2120,7 +2116,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                     .store
                     .confirm_collaborator_native_session(&probe, &native, 1)
                     .await,
-                Err(CollaboratorStoreError::NativeSessionUnproven)
+                Err(RunAdmissionError::NativeSessionUnproven)
             ));
             assert!(
                 fixture
@@ -2157,7 +2153,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                     .store
                     .confirm_collaborator_native_session(&identity, &native, 1)
                     .await,
-                Err(CollaboratorStoreError::NativeSessionUnproven)
+                Err(RunAdmissionError::NativeSessionUnproven)
             ));
             assert!(
                 fixture
@@ -2204,14 +2200,14 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                 .store
                 .confirm_collaborator_native_session(&identity, &mismatched, 1)
                 .await,
-            Err(CollaboratorStoreError::NativeSessionUnproven)
+            Err(RunAdmissionError::NativeSessionUnproven)
         ));
         assert!(matches!(
             fixture
                 .store
                 .confirm_collaborator_native_session(&identity, &native, 2)
                 .await,
-            Err(CollaboratorStoreError::ParentNotCurrent { .. })
+            Err(RunAdmissionError::ParentNotCurrent { .. })
         ));
         fixture
             .store
@@ -2225,7 +2221,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                 .store
                 .confirm_collaborator_native_session(&unrelated, &native, 1)
                 .await,
-            Err(CollaboratorStoreError::NativeSessionUnproven)
+            Err(RunAdmissionError::NativeSessionUnproven)
         ));
         fixture
             .store
@@ -2291,7 +2287,7 @@ async fn outcome_unknown_and_dispatched_previous_stages_fence_admission() {
                 .store
                 .insert_run_with_collaborator_stage(fixture.child(), request.clone(), None)
                 .await,
-            Err(CollaboratorStoreError::UnsettledDispatch { .. })
+            Err(RunAdmissionError::UnsettledDispatch { .. })
         ));
     }
     fixture.cleanup().await;
@@ -2310,7 +2306,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(foreign, request.clone(), None)
             .await,
-        Err(CollaboratorStoreError::SessionUnavailable)
+        Err(RunAdmissionError::SessionUnavailable)
     ));
     request.expected_parent_generation = 2;
     assert!(matches!(
@@ -2318,7 +2314,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(child.clone(), request.clone(), None)
             .await,
-        Err(CollaboratorStoreError::ParentNotCurrent { .. })
+        Err(RunAdmissionError::ParentNotCurrent { .. })
     ));
     request.expected_parent_generation = 1;
     let existing_child_id = child.run_id.clone();
@@ -2328,7 +2324,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(child, request, None)
             .await,
-        Err(CollaboratorStoreError::AssociationConflict { .. })
+        Err(RunAdmissionError::AssociationConflict { .. })
     ));
     assert!(
         fixture
@@ -2354,7 +2350,7 @@ async fn tenant_generation_cancel_and_failed_insert_do_not_publish_association()
             .store
             .insert_run_with_collaborator_stage(child.clone(), request, None)
             .await,
-        Err(CollaboratorStoreError::ParentNotCurrent { .. })
+        Err(RunAdmissionError::ParentNotCurrent { .. })
     ));
     assert!(
         fixture
@@ -2473,7 +2469,7 @@ async fn association_snapshots_do_not_wait_for_session_write_admission_locks() {
                 &stage.run_id
             )
             .await,
-        Err(CollaboratorStoreError::SessionUnavailable)
+        Err(RunAdmissionError::SessionUnavailable)
     ));
     assert_eq!(
         fixture
@@ -2503,10 +2499,7 @@ async fn association_snapshots_do_not_wait_for_session_write_admission_locks() {
                 .load_collaborator_association(&fixture.user_id, &fixture.session_id, &stage.run_id)
                 .await
         };
-        assert!(matches!(
-            result,
-            Err(CollaboratorStoreError::SessionUnavailable)
-        ));
+        assert!(matches!(result, Err(RunAdmissionError::SessionUnavailable)));
     }
     fixture.cleanup().await;
 }
@@ -2526,7 +2519,7 @@ async fn expired_budget_is_typed_and_external_native_binding_is_required() {
                 Some(tokio::time::Instant::now()),
             )
             .await,
-        Err(CollaboratorStoreError::DeadlineExpired)
+        Err(RunAdmissionError::DeadlineExpired)
     ));
     assert!(
         fixture
@@ -2545,7 +2538,7 @@ async fn expired_budget_is_typed_and_external_native_binding_is_required() {
             .store
             .insert_run_with_collaborator_stage(fixture.child(), request, None)
             .await,
-        Err(CollaboratorStoreError::NativeSessionUnbound { .. })
+        Err(RunAdmissionError::NativeSessionUnbound { .. })
     ));
     fixture.cleanup().await;
 }

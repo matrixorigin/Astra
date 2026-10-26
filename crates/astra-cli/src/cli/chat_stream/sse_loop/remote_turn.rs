@@ -236,7 +236,6 @@ impl RemoteTurnState {
             session_id,
             self.session_turn.max(1),
             checkpoint,
-            None,
         ) {
             self.stall.last_heavy_checkpoint = Some(checkpoint);
         }
@@ -390,7 +389,8 @@ pub(super) async fn consume_remote_turn(
     } else {
         if let Err(error) = &result {
             state.step_recorder.end_turn(false);
-            if state.interruption.is_none()
+            if host.failed_run_terminal.is_none()
+                && state.interruption.is_none()
                 && error.kind != astra_core::ErrorKind::Cancelled
                 && let Some((kind, action)) =
                     astra_turn_core::interruption::interruption_from_error_kind(error.kind)
@@ -588,8 +588,15 @@ async fn consume_remote_turn_inner(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
         },
     );
+    state.qualified_usage = turn.core.accounted_usage();
+    if turn.core.has_authoritative_failed_terminal()
+        && !host.remote_cancel_required
+        && !host.callback_client_detached
+        && host.output_transport_failure.is_none()
+    {
+        host.failed_run_terminal = turn.core.run_terminal.take();
+    }
     state.capture_appended_messages(start);
-    state.qualified_usage = turn.core.qualified_usage;
     state.llm_rounds_completed = turn
         .core
         .server_execution_summary
@@ -702,7 +709,6 @@ async fn finalize_remote_trace(state: &mut RemoteTurnState) {
             first_budget_pressure: &mut state.telemetry.first_budget_pressure,
             pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
             observability_session: state.telemetry.observability_session.clone(),
-            persistence: None,
         })
         .await;
     }

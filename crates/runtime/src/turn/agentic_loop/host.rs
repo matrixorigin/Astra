@@ -49,7 +49,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use astra_services::DatabaseEventService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord, TraceSpanBuilder};
 use async_trait::async_trait;
@@ -780,15 +779,6 @@ pub trait AgenticLoopHost: Send {
 
     /// Asynchronous hosts publish admission at the background task's boundary.
     fn owns_semantic_admission_timing(&self) -> bool {
-        false
-    }
-
-    /// Whether this host already owns post-loop session-memory settlement.
-    ///
-    /// Server runs schedule extraction and its lifecycle evidence after the
-    /// durable terminal response. Other hosts still use the shared turn
-    /// finalization boundary as their extraction owner.
-    fn owns_post_loop_memory_settlement(&self) -> bool {
         false
     }
 
@@ -2016,9 +2006,7 @@ pub struct TelemetryState {
 #[derive(Clone, Debug)]
 pub struct ContextTracePersistenceContext {
     pub user_id: String,
-    pub event_service: DatabaseEventService,
     pub artifact_store: astra_services::DatabaseSessionArtifactStore,
-    pub agent_id: String,
 }
 
 /// Stall and verdict tracking state for the agentic loop.
@@ -2178,8 +2166,47 @@ pub(crate) struct ObservedUserIntents {
 }
 
 impl UserIntentState {
-    pub fn bind_wake(&mut self, wake: Option<tokio::sync::watch::Receiver<i64>>) {
+    pub fn bind_wake(&mut self, mut wake: Option<tokio::sync::watch::Receiver<i64>>) {
+        // One initial snapshot covers input accepted during preparation or
+        // before a recovered executor attached its readiness observer.
+        if let Some(wake) = wake.as_mut() {
+            wake.mark_changed();
+        }
         self.wake = wake;
+    }
+
+    /// A successful new opening contains no guidance history. Consume only
+    /// readiness at/before that ACK; newer committed input remains pending.
+    pub(crate) fn bind_opening_wake(
+        &mut self,
+        mut wake: tokio::sync::watch::Receiver<i64>,
+        tail: i64,
+    ) {
+        self.durable.user_intent_cursor =
+            usize::try_from(tail).expect("opening tail is nonnegative");
+        let observed = *wake.borrow_and_update();
+        if observed > tail {
+            wake.mark_changed();
+        }
+        self.wake = Some(wake);
+    }
+
+    pub(crate) fn input_wake_is_pending(&self) -> Option<bool> {
+        self.wake
+            .as_ref()
+            .map(|wake| wake.has_changed().unwrap_or(true))
+    }
+
+    pub(crate) fn note_input_poll_started(&mut self) {
+        if let Some(wake) = self.wake.as_mut() {
+            let _ = wake.borrow_and_update();
+        }
+    }
+
+    pub(crate) fn retry_input_wake(&mut self) {
+        if let Some(wake) = self.wake.as_mut() {
+            wake.mark_changed();
+        }
     }
 
     pub(crate) fn durable_continuation(&self) -> DurableUserIntentState {
@@ -2205,7 +2232,8 @@ impl UserIntentState {
             .next_user_intent_poll_at
             .map(|next| now >= next)
             .unwrap_or(true);
-        regular_poll_due || self.should_retry_apply_ack(now)
+        (regular_poll_due && self.input_wake_is_pending().unwrap_or(true))
+            || self.should_retry_apply_ack(now)
     }
 
     pub(crate) fn note_user_intent_poll_finished(
@@ -2409,12 +2437,64 @@ pub struct MessagingState {
     /// When set, incoming messages are drained at each turn start and
     /// progress updates are sent to the parent at turn end.
     pub mailbox: Option<astra_messaging::router::AgentMailbox>,
+    pub(crate) root_registration: Option<RootMailboxRegistration>,
     /// Run-owned question obligations shared with the sending tool. These
     /// remain empty for ordinary turns and never trigger a database read.
     pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
+}
+
+/// Request-local wiring only. Registering a durable inbox is deferred until
+/// an admitted messaging/delegation call needs it; ordinary reads never poll it.
+pub(crate) struct RootMailboxRegistration {
+    router: Arc<astra_messaging::router::AgentMailboxRouter>,
+    address: astra_messaging::AgentAddress,
+    run_id: String,
+    agent_id: String,
+}
+
+impl MessagingState {
+    pub(crate) fn configure_root_mailbox(
+        &mut self,
+        router: Arc<astra_messaging::router::AgentMailboxRouter>,
+        address: astra_messaging::AgentAddress,
+        run_id: String,
+        agent_id: String,
+    ) {
+        self.root_registration = Some(RootMailboxRegistration {
+            router,
+            address,
+            run_id,
+            agent_id,
+        });
+    }
+
+    pub(crate) async fn ensure_mailbox(&mut self) -> Result<(), String> {
+        if self.mailbox.is_some() {
+            return Ok(());
+        }
+        let Some(registration) = self.root_registration.as_ref() else {
+            return Ok(());
+        };
+        let mailbox = registration
+            .router
+            .register(registration.address.clone(), None)
+            .await
+            .map_err(|error| format!("messaging inbox registration failed: {error}"))?;
+        registration
+            .router
+            .record_parent_delivery_alias(
+                &registration.run_id,
+                &registration.address,
+                &registration.agent_id,
+            )
+            .await;
+        self.mailbox = Some(mailbox);
+        self.root_registration = None;
+        Ok(())
+    }
 }
 
 /// Completion verification state for the agentic loop.
@@ -2681,8 +2761,6 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub canonical_turn_chain_id: Option<String>,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub root_user_query_event_id: Option<String>,
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    pub canonical_turn_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub total_prompt: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,
@@ -2745,7 +2823,6 @@ impl OriginalLoopExecutionFacts {
             session_turn: state.session_turn,
             canonical_turn_chain_id: state.canonical_turn_chain_id.clone(),
             root_user_query_event_id: state.root_user_query_event_id.clone(),
-            canonical_turn_started_at: state.canonical_turn_started_at.get().copied(),
             total_prompt: state.total_prompt,
             total_completion: state.total_completion,
             total_cache_read: state.total_cache_read,
@@ -3621,6 +3698,10 @@ pub struct AgenticLoopState {
     pub current_run_owner_generation: Option<u64>,
     /// In-memory projection of the durable permission revision selected for this round.
     pub applied_permission_mode: Option<astra_turn_types::RunPermissionModeSelection>,
+    pub(crate) permission_mode_observation: super::permission_boundary::PermissionModeObservation,
+    /// The sender lives inside the Server watcher task. A closed channel
+    /// restores synchronous control observation if that task exits or panics.
+    pub(crate) durable_control_watcher: Option<tokio::sync::watch::Receiver<()>>,
     /// Why this loop is allowed to consume model capacity. This is set by the
     /// run owner before execution and remains stable for the lifetime of the
     /// loop; provider, access source, and model selection are separate facts.
@@ -3830,9 +3911,6 @@ pub struct AgenticLoopState {
     /// canonical coordinator admitted the turn; local/subrun histories must
     /// not invent this authority.
     pub provider_canonical_wal_base: Option<astra_turn_types::ProviderCanonicalWalBaseV2>,
-    /// Atomic database-owned WAL head. Identity and capacity accounting move
-    /// together so a half-initialized lineage cannot be represented.
-    pub provider_canonical_wal_head: Option<ProviderCanonicalWalHead>,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -3907,32 +3985,11 @@ pub struct AgenticLoopState {
     pub session_facts: astra_turn_types::session_facts::SessionFacts,
 
     // ── Session-memory extraction (LLM-backed L1) ──
-    /// Coordinator for background session-memory extraction. When `Some`,
-    /// `finalize_and_render` calls `svc.maybe_spawn(req)` after each
-    /// turn; the service owns LLM selector resolution, selector
-    /// cooldown, in-flight dedup, the event stream, the UX broker,
-    /// AND the per-session debounce state. When `None` (tests, sub-runs
-    /// that opt out), no extraction happens and no events are emitted.
-    /// Cloned from the host service at state-build time.
-    ///
-    /// Per-session debounce state (`initialized`, `tokens_at_last_extraction`,
-    /// …) deliberately lives *inside* the service — not here — because
-    /// `AgenticLoopState` is rebuilt every turn and would lose the
-    /// debounce across turns, making the "growth delta" branch of the
-    /// gate structurally unreachable.
+    /// Shared service for explicit session finalization and sub-run wiring.
+    /// Ordinary turn completion does not schedule extraction or duplicate its
+    /// inputs. The service owns selector resolution, debounce and worker custody.
     pub memory_extraction_service:
         Option<std::sync::Arc<crate::session_memory::MemoryExtractionService>>,
-
-    /// Debounce state for the LLM-backed session-memory extractor that
-    /// writes `session-memory.md` in the background (fire-and-forget).
-    /// Persists across turns so `should_extract` can compare growth deltas.
-    /// Reset to `Default::default()` only when a new session starts.
-    ///
-    /// Wrapped in `Arc<Mutex<>>` so the background extraction task can
-    /// flip `mark_extracted` itself *after* the write completes.
-    pub session_memory_state: std::sync::Arc<
-        std::sync::Mutex<astra_turn_core::cloud_session_memory_extract::SessionMemoryState>,
-    >,
 
     /// Provider-aware compaction strategy for microcompact placeholders.
     pub compact_strategy: astra_turn_core::microcompact::CompactStrategy,
@@ -3955,84 +4012,9 @@ pub struct AgenticLoopState {
     pub root_user_query_event_id: Option<String>,
     /// Created at turn start, flushed at turn end or on interruption.
     pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
-    /// Frozen before the first durable root event write. The loop may create
-    /// its event buffer later, but canonical replay must retain this envelope.
-    pub canonical_turn_started_at: std::sync::OnceLock<chrono::DateTime<chrono::Utc>>,
-    /// Frozen on first post-loop capture; persistence retries must not generate
-    /// new event timestamps for the same completed execution.
-    pub canonical_trace_time_bounds: std::sync::OnceLock<(chrono::DateTime<chrono::Utc>, u64)>,
 
     // ── Harness (observation + verification layer) ──
     pub harness: super::super::harness_adapter::HarnessSlot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderCanonicalWalHead {
-    pub(crate) transition_id: String,
-    pub(crate) result: astra_turn_types::ProviderCanonicalHistoryIdentityV2,
-    pub(crate) chain_length: u32,
-    pub(crate) chain_payload_bytes: u64,
-}
-
-impl ProviderCanonicalWalHead {
-    pub(crate) fn from_chain(
-        transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
-    ) -> Result<Option<Self>, astra_turn_types::ProviderCanonicalTransitionError> {
-        let Some(last) = transitions.last() else {
-            return Ok(None);
-        };
-        let mut chain_payload_bytes = 0_u64;
-        for transition in transitions {
-            chain_payload_bytes = chain_payload_bytes
-                .checked_add(transition.durable_payload_bytes()?)
-                .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes)?;
-        }
-        Ok(Some(Self {
-            transition_id: last.transition_id.clone(),
-            result: last.result.clone(),
-            chain_length: u32::try_from(transitions.len()).map_err(|_| {
-                astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries
-            })?,
-            chain_payload_bytes,
-        }))
-    }
-
-    pub(crate) fn advanced(
-        &self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
-    ) -> Result<Self, astra_turn_types::ProviderCanonicalTransitionError> {
-        let payload_bytes = transition.durable_payload_bytes()?;
-        let (chain_length, chain_payload_bytes) = if transition.recovery_mode
-            == astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
-        {
-            (
-                self.chain_length
-                    .checked_add(1)
-                    .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries)?,
-                self.chain_payload_bytes
-                    .checked_add(payload_bytes)
-                    .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes)?,
-            )
-        } else {
-            (1, payload_bytes)
-        };
-        Ok(Self {
-            transition_id: transition.transition_id.clone(),
-            result: transition.result.clone(),
-            chain_length,
-            chain_payload_bytes,
-        })
-    }
-
-    pub(crate) fn would_exceed_with_limits(
-        &self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
-        max_entries: u32,
-        max_bytes: u64,
-    ) -> Result<bool, astra_turn_types::ProviderCanonicalTransitionError> {
-        let next = self.advanced(transition)?;
-        Ok(next.chain_length > max_entries || next.chain_payload_bytes > max_bytes)
-    }
 }
 
 /// Build the stable runtime manifest carried through context metadata.
@@ -4061,6 +4043,12 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    pub(crate) fn has_durable_control_watcher(&self) -> bool {
+        self.durable_control_watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.has_changed().is_ok())
+    }
+
     /// Common empty loop state. Callers install identity, authority, context and
     /// restored frontiers explicitly; this never admits, restores or performs I/O.
     /// Reuse the caller's transport rather than constructing an unused client.
@@ -4092,6 +4080,8 @@ impl AgenticLoopState {
             current_run_id: None,
             current_run_owner_generation: None,
             applied_permission_mode: None,
+            permission_mode_observation: Default::default(),
+            durable_control_watcher: None,
             inference_purpose,
             context_manifest_pool: None,
             context_manifest_user_id: None,
@@ -4175,7 +4165,6 @@ impl AgenticLoopState {
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
@@ -4186,15 +4175,12 @@ impl AgenticLoopState {
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
-            session_memory_state: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
             session_turn: 0,
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
             turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
             harness: super::super::harness_adapter::HarnessSlot::empty(),
         }
     }
@@ -4316,7 +4302,6 @@ impl AgenticLoopState {
     pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
         self.provider_canonical_wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(durable_prefix).ok();
-        self.provider_canonical_wal_head = None;
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -4350,21 +4335,6 @@ impl AgenticLoopState {
             .as_mut()
             .ok_or_else(|| "provider WAL replacement has no admitted rewrite proof".to_string())?
             .recover_provider_wal_replacement(durable_base, transition, recovered_messages)
-    }
-
-    pub(crate) fn acknowledge_provider_canonical_replacement(
-        &mut self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
-    ) -> Result<(), String> {
-        let durable_base = self
-            .provider_canonical_wal_base
-            .as_ref()
-            .ok_or_else(|| "provider WAL admission has no admitted durable base".to_string())?;
-        self.canonical_rewrite_state
-            .proof
-            .as_mut()
-            .ok_or_else(|| "provider WAL replacement has no admitted rewrite proof".to_string())?
-            .acknowledge_provider_wal_replacement(durable_base, transition)
     }
 
     pub(crate) fn begin_canonical_rewrite(
@@ -4554,16 +4524,6 @@ impl AgenticLoopState {
     #[must_use]
     pub fn owns_session_composite_snapshot(&self) -> bool {
         self.recursion_depth == 0 && self.delegation_chain.is_empty()
-    }
-
-    /// Whether this loop owns provider-attempt write-ahead transitions for
-    /// the canonical session conversation. Subagents and delegated loops may
-    /// share a session id for tool/evidence custody, but their private prompt
-    /// histories must never hydrate from or write into the root transcript.
-    #[must_use]
-    pub fn owns_provider_canonical_transition_wal(&self) -> bool {
-        self.owns_session_composite_snapshot()
-            && self.inference_purpose == astra_turn_types::InferencePurpose::PrimaryAgent
     }
 
     /// Provider-reported total tokens consumed by this loop.
@@ -5167,17 +5127,6 @@ pub(crate) use super::finalization::{
     finalize_turn_trace, run_agentic_loop_with_host, try_write_heavy_checkpoint,
 };
 
-/// Every shared-loop finalization route (including exhausted slices and
-/// harness exits) must retain the producer-owned child obligation.
-pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
-    host: &mut H,
-    state: &mut AgenticLoopState,
-) {
-    if !state.final_output_ready_notified {
-        super::execution_phase::fence_direct_child_finalization(host, state).await;
-    }
-    super::finalization::finalize_and_render(host, state).await;
-}
 pub(crate) use super::lifecycle::{
     PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
@@ -5260,7 +5209,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause { reason, .. } => {
@@ -5270,7 +5219,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessPaused,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Continue => {}
@@ -5320,7 +5269,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
             try_write_heavy_checkpoint(state);
             if !outcome.should_continue() {
-                finalize_and_render(host, state).await;
                 return Ok(AgenticLoopOutcome::Completed);
             }
             state.loop_entry = LoopEntry::IterationBoundary {
@@ -5343,14 +5291,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             turn_start_time,
         } = match prepare_turn_iteration(host, state, turn_index).await? {
             PreparedTurnIteration::Ready(prep) => prep,
-            PreparedTurnIteration::Finished(outcome) => {
-                if matches!(outcome, AgenticLoopOutcome::Completed)
-                    && (!state.final_text.is_empty() || state.interruption.is_some())
-                {
-                    finalize_and_render(host, state).await;
-                }
-                return Ok(outcome);
-            }
+            PreparedTurnIteration::Finished(outcome) => return Ok(outcome),
         };
 
         let TurnExecutionPhase {
@@ -5378,15 +5319,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     .wait_for_input(RuntimeInputWait::Completion)?;
                 continue;
             }
-            TurnExecutionControl::Return(outcome) => {
-                if !matches!(
-                    &outcome,
-                    AgenticLoopOutcome::Delegated | AgenticLoopOutcome::ControlRejected(_)
-                ) {
-                    finalize_and_render(host, state).await;
-                }
-                return Ok(outcome);
-            }
+            TurnExecutionControl::Return(outcome) => return Ok(outcome),
         };
 
         // ── Harness: PostLlmResponse — Block/Pause halts session ──
@@ -5403,7 +5336,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause { reason, .. } => {
@@ -5413,7 +5346,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessPaused,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Continue => {}
@@ -5538,7 +5471,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                         &reason,
                     );
-                    finalize_and_render(host, state).await;
+
                     return Ok(AgenticLoopOutcome::Completed);
                 }
                 astra_harness::HookVerdict::Pause { reason, .. } => {
@@ -5548,7 +5481,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         astra_turn_core::interruption::InterruptionKind::HarnessPaused,
                         &reason,
                     );
-                    finalize_and_render(host, state).await;
+
                     return Ok(AgenticLoopOutcome::Completed);
                 }
                 astra_harness::HookVerdict::Continue => {}
@@ -5565,7 +5498,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     astra_turn_core::interruption::InterruptionKind::HarnessBlocked,
                     &reason,
                 );
-                finalize_and_render(host, state).await;
+
                 return Ok(AgenticLoopOutcome::Completed);
             }
             astra_harness::HookVerdict::Pause {
@@ -5608,8 +5541,8 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         state.loop_entry.advance()?;
     }
-    // Loop exhausted max_turns without explicit break — write final state.
-    finalize_and_render(host, state).await;
+    // Exhausting the slice settles at the shared loop exit, like explicit returns.
+
     Ok(AgenticLoopOutcome::Completed)
 }
 
@@ -5762,6 +5695,30 @@ pub(crate) mod tests {
 
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
+
+    #[test]
+    fn opening_control_ack_preserves_newer_guidance_and_closed_wakes() {
+        let (send, receive) = tokio::sync::watch::channel(2);
+        let mut state = UserIntentState::default();
+        state.bind_opening_wake(receive, 2);
+        assert_eq!(state.user_intent_cursor(), 2);
+        assert!(!state.should_poll_user_intents(tokio::time::Instant::now()));
+        send.send_replace(3);
+        assert!(state.should_poll_user_intents(tokio::time::Instant::now()));
+        state.note_input_poll_started();
+        assert!(!state.should_poll_user_intents(tokio::time::Instant::now()));
+        let mut attached_late = UserIntentState::default();
+        attached_late.bind_opening_wake(send.subscribe(), 2);
+        assert!(
+            attached_late.should_poll_user_intents(tokio::time::Instant::now()),
+            "input committed before attachment must remain pending"
+        );
+        drop(send);
+        assert!(
+            state.should_poll_user_intents(tokio::time::Instant::now()),
+            "closed readiness falls back to the authoritative owner"
+        );
+    }
 
     #[test]
     fn pending_intent_disposition_requires_exact_custody_and_cannot_be_replaced() {
@@ -6406,21 +6363,17 @@ pub(crate) mod tests {
     fn only_root_loop_owns_session_composite_snapshot() {
         let mut state = make_state();
         assert!(state.owns_session_composite_snapshot());
-        assert!(state.owns_provider_canonical_transition_wal());
 
         state.recursion_depth = 1;
         assert!(!state.owns_session_composite_snapshot());
-        assert!(!state.owns_provider_canonical_transition_wal());
 
         state.recursion_depth = 0;
         state.delegation_chain = vec!["orchestrator".to_string()];
         assert!(!state.owns_session_composite_snapshot());
-        assert!(!state.owns_provider_canonical_transition_wal());
 
         state.delegation_chain.clear();
         state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
         assert!(state.owns_session_composite_snapshot());
-        assert!(!state.owns_provider_canonical_transition_wal());
     }
 
     fn structured_task_profile(
@@ -6510,7 +6463,6 @@ pub(crate) mod tests {
         cancel_child_agents_delay: Option<std::time::Duration>,
         terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
         stop_after_success_completion: Option<RuntimeSuccessfulToolCompletion>,
-        owns_post_loop_memory_settlement: bool,
 
         committed_work_synthesis: Result<bool, String>,
         committed_work_synthesis_sequence: std::collections::VecDeque<Result<bool, String>>,
@@ -6577,7 +6529,6 @@ pub(crate) mod tests {
                 cancel_child_agents_delay: None,
                 terminal_control_outcome: None,
                 stop_after_success_completion: None,
-                owns_post_loop_memory_settlement: false,
 
                 committed_work_synthesis: Ok(false),
                 committed_work_synthesis_sequence: std::collections::VecDeque::new(),
@@ -6594,11 +6545,6 @@ pub(crate) mod tests {
 
         pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
-            self
-        }
-
-        pub(crate) fn with_post_loop_memory_settlement_owner(mut self) -> Self {
-            self.owns_post_loop_memory_settlement = true;
             self
         }
 
@@ -6680,10 +6626,6 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
-        fn owns_post_loop_memory_settlement(&self) -> bool {
-            self.owns_post_loop_memory_settlement
-        }
-
         fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
             self.history_artifact_enabled
         }
@@ -8350,7 +8292,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_textless_response_stops_bounded_with_human_copy() {
+    async fn repeated_textless_response_stops_bounded_without_fabricated_answer() {
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "file list")], 20, 10, Some(50)),
             text_result("", 15, 0, Some(30)),
@@ -8368,13 +8310,8 @@ pub(crate) mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::EmptyCompletion)
         );
-        assert!(
-            state.final_text.contains("final answer"),
-            "{}",
-            state.final_text
-        );
-        assert!(!state.final_text.contains("empty_completion"));
-        assert!(!state.final_text.contains("[turn_interrupted]"));
+        assert!(state.final_text.is_empty());
+        assert!(host.rendered_final_text.is_empty());
     }
 
     #[tokio::test]
@@ -8453,6 +8390,15 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+
+        assert_eq!(host.final_output_ready, vec!["done"]);
+        assert_eq!(
+            state.session_facts.recent_tool_calls.len(),
+            1,
+            "one executed tool must contribute one fact at the shared loop exit"
+        );
+        assert_eq!(state.session_facts.recent_tool_calls[0].name, "bash");
+        assert!(state.session_facts.recent_tool_calls[0].ok);
 
         let mut terminal_counts = std::collections::BTreeMap::new();
         for event in state.step_recorder.events() {
@@ -8808,8 +8754,8 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 0); // No turns executed
-        assert!(state.final_text.contains("before producing a final answer"));
-        assert!(!state.final_text.contains("empty_completion"));
+        assert!(state.final_text.is_empty());
+        assert!(host.rendered_final_text.is_empty());
         assert_eq!(state.remaining_turns, 10); // Unchanged
         // EmptyCompletion interruption recorded
         let interruption = state
@@ -13108,7 +13054,7 @@ pub(crate) mod tests {
     async fn rate_limit_after_tool_calls_preserves_work() {
         // Turn 1: successful tool execution
         // Turn 2: 429 rate limit error
-        // Expected: graceful completion (Ok), not hard error (Err)
+        // Preserve actual tool work while returning the typed failure.
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_edge_tool("bash", "file list output")],
@@ -13124,18 +13070,17 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "review code"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::RateLimit);
         assert!(
-            outcome.is_ok(),
-            "429 after tool calls should complete gracefully, got: {outcome:?}"
+            state.final_text.is_empty(),
+            "runtime notices cannot become an assistant answer"
         );
+        assert_eq!(state.total_tool_calls, 1);
         assert!(
-            state.final_text.contains("Rate limit reached"),
-            "final_text should mention rate limit: {}",
-            state.final_text,
-        );
-        assert!(
-            state.final_text.contains("1 tool call"),
-            "final_text should mention tool call count",
+            state
+                .messages
+                .iter()
+                .any(|message| message["role"] == "tool")
         );
     }
 
@@ -13267,7 +13212,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn rate_limit_cooldown_reject_preserves_prior_tool_work() {
         // When the first turn does tool work but the second turn 429s,
-        // the existing rate-limit graceful degradation preserves results.
+        // the typed failure must preserve results without fabricating success.
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "hello")], 100, 20, Some(50)),
             error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
@@ -13278,11 +13223,17 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "test"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "should gracefully complete: {outcome:?}");
+        assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::RateLimit);
         assert!(
-            state.final_text.contains("Rate limit"),
-            "should mention rate limit in final text: {}",
-            state.final_text,
+            state.final_text.is_empty(),
+            "runtime notices cannot become an assistant answer"
+        );
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message["role"] == "tool")
         );
         // Verify cooldown recorded the error for future turns.
         assert!(

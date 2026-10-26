@@ -5,6 +5,7 @@ description: |
 prompt: |
   使用 qwen 3.7 的子代理只回答 ASTRA-CHILD-OK，当前代理只需计算 17 + 26。
   最后告诉我子代理的回答和计算结果。
+required_models: [qwen3.7-max]
 debug_log: true
 capability: delegation
 timeout_seconds: 180

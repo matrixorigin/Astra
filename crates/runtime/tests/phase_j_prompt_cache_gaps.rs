@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -29,7 +29,7 @@ async fn request(model: &str, prefix: Vec<Value>) -> Value {
     }))])]).await;
     let session = format!("cache-fixture-{}", uuid::Uuid::new_v4());
     let workspace = tempfile::TempDir::new().unwrap();
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let mut host = server_host_builder(&gateway, &ledger, &session, "anthropic", model, None)
         .with_static_tool_catalog_admissible(true)
         .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(

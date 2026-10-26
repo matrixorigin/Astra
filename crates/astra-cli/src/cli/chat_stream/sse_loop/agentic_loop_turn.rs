@@ -1919,6 +1919,7 @@ mod tests {
     #[test]
     fn server_loop_admission_excludes_client_owned_conversation_authority() {
         let prepared = json!({
+            "conversation_authority": {"execution_grant": "client-owned-capability"},
             "completion_checks": {
                 "stop": [{"label": "root", "command": "make check", "working_dir": null,
                     "depends_on": [], "timeout_secs": null, "authoritative": true}],

@@ -363,6 +363,24 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// A classified failure accepted by the physical root terminal dispatcher.
+    /// This proves failure closure, never successful completion or tool authority.
+    pub fn has_authoritative_failed_terminal(&self) -> bool {
+        self.run_terminal.as_ref().is_some_and(|terminal| {
+            terminal.status == DurableRunTerminalStatus::Failed
+                && terminal.owner_generation.is_some()
+                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+                && terminal.error_kind.is_some_and(|kind| {
+                    kind != astra_core::ErrorKind::ContractViolation
+                        && self.error_kind.is_none_or(|observed| observed == kind)
+                })
+        })
+    }
+
+    fn has_final_error(&self) -> bool {
+        self.error_message.is_some() && !self.pending_attempt_error
+    }
+
     /// Enforce terminal evidence for a Server-owned admission without losing
     /// observed execution facts or replacing an existing failure.
     pub fn require_server_terminal_evidence(&mut self) {
@@ -418,7 +436,8 @@ impl ChatTurnSseAccum {
     /// Missing coverage must not turn a snapshot into a qualified increment.
     pub fn accounted_usage(&self) -> Option<astra_turn_types::CanonicalTokenUsage> {
         let unbound_snapshot = self.usage_is_run_total
-            && (self.server_execution_summary.is_none()
+            && ((self.server_execution_summary.is_none()
+                && !self.has_authoritative_failed_terminal())
                 || self.run_id.as_deref().is_none_or(|id| id.trim().is_empty()));
         let missing_report = self.qualified_usage.is_none()
             && self
@@ -505,7 +524,10 @@ pub fn durable_run_terminal_from_event(
     let status = DurableRunTerminalStatus::from_wire(status_text)
         .ok_or_else(|| format!("run_finished carried unknown status `{status_text}`"))?;
     let error_kind = match event.get("error_kind") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => event
+            .get("error_code")
+            .and_then(Value::as_str)
+            .and_then(astra_core::ErrorKind::parse_tag),
         Some(Value::String(tag)) => Some(
             astra_core::ErrorKind::parse_tag(tag)
                 .ok_or_else(|| format!("run_finished carried unknown error_kind `{tag}`"))?,
@@ -911,7 +933,8 @@ fn apply_one_event(
             Some(_) => {}
         }
     }
-    if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+    if (accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+        || accum.has_final_error())
         && matches!(
             etype,
             "tool_request" | "approval_required" | "approval_batch_required"
@@ -1486,7 +1509,9 @@ fn apply_one_event(
                                     | DurableRunTerminalStatus::Paused
                             )
                         });
-                    if !accum.pending_attempt_error || receipt_supersedes_attempt_error {
+                    if !accum.has_final_error()
+                        && (!accum.pending_attempt_error || receipt_supersedes_attempt_error)
+                    {
                         accum.error_kind = None;
                         accum.error_message = None;
                     }
@@ -1687,8 +1712,14 @@ fn apply_one_event(
                 .get("error_code")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
-            accum.pending_attempt_error = true;
+            accum.error_kind = event
+                .get("error_kind")
+                .or_else(|| event.get("error_code"))
+                .and_then(Value::as_str)
+                .and_then(astra_core::ErrorKind::parse_tag)
+                .or(Some(astra_core::ErrorKind::ContractViolation));
+            // Root failure is final, unlike a recoverable provider-attempt error.
+            accum.pending_attempt_error = false;
             accum.attempt_error_supersession_eligible = false;
             accum.explain_analyze_degraded = true;
             edge_pending.clear();
@@ -1703,7 +1734,9 @@ fn apply_one_event(
             // Identity and protocol violations describe the stream itself,
             // not one provider attempt. They are sticky and must never be
             // downgraded by a later attempt-shaped error.
-            if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+            if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+                || accum.has_final_error()
+            {
                 accum.attempt_error_supersession_eligible = false;
                 return;
             }
@@ -1874,6 +1907,18 @@ fn apply_one_event(
                             accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
                             accum.error_message =
                                 Some("Conflicting root terminal evaluation".into());
+                            return;
+                        }
+                        if accum.has_final_error()
+                            && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
+                            && (terminal.status != DurableRunTerminalStatus::Failed
+                                || terminal
+                                    .error_kind
+                                    .is_some_and(|kind| Some(kind) != accum.error_kind))
+                        {
+                            accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                            accum.error_message =
+                                Some("Root failure contradicted by terminal outcome".into());
                             return;
                         }
                         accum.turn_evaluation = evaluation;
@@ -2941,6 +2986,42 @@ mod tests {
             &mut pending,
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn root_failure_cannot_be_superseded_by_attempt_error_or_success() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        for event in [
+            serde_json::json!({"type":"run_started","run_id":"root"}),
+            serde_json::json!({"type":"run_error","run_id":"root","error":"stream failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"error","message":"later attempt","error_kind":"rate_limit"}),
+        ] {
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+        }
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::StreamTransport)
+        );
+        assert_eq!(accum.error_message.as_deref(), Some("stream failed"));
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_finished",
+                ",\"run_id\":\"root\",\"owner_generation\":4,\"status\":\"completed\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(!accum.has_authoritative_failed_terminal());
+        assert!(accum.run_terminal.is_none());
     }
 
     #[test]

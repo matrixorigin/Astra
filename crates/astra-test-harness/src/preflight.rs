@@ -13,6 +13,8 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use astra_turn_core::interruption::InterruptionKind;
+
 use crate::runner::parse_strict_cli_outcome;
 use crate::session_identity::{delete_server_session, session_id_from_stream_event};
 
@@ -38,8 +40,10 @@ pub enum PreflightError {
         model: String,
         stage: &'static str,
         exit_code: Option<i32>,
-        error_kind: Option<String>,
-        error_code: Option<String>,
+        error_kind: Option<Box<str>>,
+        error_code: Option<Box<str>>,
+        final_state: Option<&'static str>,
+        interruption_kind: Option<InterruptionKind>,
         detail: String,
     },
     #[error("could not create an isolated preflight workspace: {detail}")]
@@ -70,10 +74,12 @@ pub fn write_preflight_result(
         "unavailable_model": unavailable,
         "failure": match result {
             Err(PreflightError::ExecutionProbeFailed {
-                model, stage, exit_code, error_kind, error_code, ..
+                model, stage, exit_code, error_kind, error_code, final_state, interruption_kind, ..
             }) => Some(serde_json::json!({
                 "model": model, "stage": stage, "exit_code": exit_code,
                 "error_kind": error_kind, "error_code": error_code,
+                "final_state": final_state,
+                "interruption_kind": interruption_kind.map(InterruptionKind::label),
             })),
             _ => None,
         },
@@ -336,15 +342,14 @@ fn failed_execution_probe(output: &Output, model: &str) -> PreflightError {
     let mut stage = "terminal_protocol";
     let mut error_kind = None;
     let mut error_code = None;
+    let mut final_state = None;
+    let mut interruption_kind = None;
     let detail = match parse_strict_cli_outcome(&stdout, model) {
         Ok(outcome) if outcome.exit_code == exit => {
-            let terminal: serde_json::Value = serde_json::from_str(&stdout)
-                .expect("strict terminal parser already validated JSON");
             // Only bounded machine identifiers may leave the private log.
             // Neither the provider message nor arbitrary terminal fields are diagnostics.
-            let identifier = |key: &str| {
-                terminal[key]
-                    .as_str()
+            let identifier = |value: Option<&str>| {
+                value
                     .filter(|value| {
                         !value.is_empty()
                             && value.len() <= 128
@@ -352,11 +357,23 @@ fn failed_execution_probe(output: &Output, model: &str) -> PreflightError {
                                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
                             })
                     })
-                    .map(str::to_owned)
+                    .map(Box::<str>::from)
             };
             stage = "execution";
-            error_kind = identifier("error_kind");
-            error_code = identifier("error_code");
+            error_kind = identifier(outcome.error_kind.as_deref());
+            error_code = identifier(outcome.error_code.as_deref());
+            final_state = match outcome.final_state.as_deref() {
+                Some("completed") => Some("completed"),
+                Some("interrupted") => Some("interrupted"),
+                Some("failed") => Some("failed"),
+                _ => None,
+            };
+            if final_state == Some("interrupted") {
+                interruption_kind = outcome
+                    .interruption_kind
+                    .as_deref()
+                    .and_then(InterruptionKind::from_label);
+            }
             format!(
                 "exit {exit}, error_kind={}, error_code={}",
                 error_kind.as_deref().unwrap_or("unknown"),
@@ -372,6 +389,8 @@ fn failed_execution_probe(output: &Output, model: &str) -> PreflightError {
         exit_code: output.status.code(),
         error_kind,
         error_code,
+        final_state,
+        interruption_kind,
         detail,
     }
 }
@@ -863,6 +882,8 @@ fn probe_boundary_error(model: &str, stage: &'static str, detail: String) -> Pre
         exit_code: None,
         error_kind: None,
         error_code: None,
+        final_state: None,
+        interruption_kind: None,
     }
 }
 
@@ -1114,7 +1135,8 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(error, super::PreflightError::AuthFailed { .. }),
+                matches!(&error, super::PreflightError::AuthFailed { detail }
+                    if detail.contains("isolated auto-register/login failed")),
                 "{error}"
             );
             return;
@@ -1371,7 +1393,7 @@ esac
         .await
         .unwrap();
         assert_eq!(profile.as_deref(), Some("harness-auto"));
-        let log = std::fs::read_to_string(calls).unwrap();
+        let log = std::fs::read_to_string(&calls).unwrap();
         let lines: Vec<_> = log.lines().collect();
         assert!(
             lines[0].starts_with("--profile user-current chat "),
@@ -1387,6 +1409,53 @@ esac
         assert_eq!(log.matches(" chat ").count(), 2, "{log}");
         assert!(log.contains(&format!("session cancel {SESSION}")), "{log}");
         assert!(log.contains(&format!("session delete {SESSION}")), "{log}");
+
+        let mut partial = outcome.clone();
+        partial["text"] = "private-probe-sentinel".into();
+        partial["final_state"] = "interrupted".into();
+        partial["interruption_kind"] = "provider_deadline".into();
+        partial["exit_code"] = 5.into();
+        partial["success"] = false.into();
+        partial["error_kind"] = "partial".into();
+        let shim = std::fs::read_to_string(&bin).unwrap().replace(
+            &format!("printf '%s' '{outcome}'"),
+            &format!("printf '%s' '{partial}'; exit 5"),
+        );
+        crate::test_support::write_executable_shim(&bin, shim).unwrap();
+        std::fs::remove_file(&registered).unwrap();
+        std::fs::write(&calls, "").unwrap();
+        let result = super::check_model(
+            &bin,
+            "test-model",
+            Some("user-current"),
+            dir.path(),
+            "harness-auto",
+            Some(SHA),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(PreflightError::ExecutionProbeFailed {
+                final_state: Some("interrupted"),
+                interruption_kind: Some(InterruptionKind::ProviderDeadline),
+                ..
+            })
+        ));
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(log.matches(" chat ").count(), 2, "{log}");
+        assert!(
+            log.lines()
+                .skip(1)
+                .all(|line| line.starts_with("--profile harness-auto ")),
+            "{log}"
+        );
+        assert!(log.contains(&format!("session cancel {SESSION}")), "{log}");
+        assert!(log.contains(&format!("session delete {SESSION}")), "{log}");
+        let report = dir.path().join("partial.json");
+        super::write_preflight_result(Some(&report), &["test-model".into()], &result).unwrap();
+        let sidecar = std::fs::read_to_string(report.with_extension("preflight.json")).unwrap();
+        assert!(!sidecar.contains("private-probe-sentinel"));
     }
 
     #[cfg(unix)]
@@ -2204,6 +2273,137 @@ exec sleep 5
     }
 
     #[cfg(unix)]
+    fn partial_probe_envelope(kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "trace_id": null, "request_id": null, "run_id": "run-1",
+            "session_id": "550e8400-e29b-41d4-a716-446655440000",
+            "text": "private-probe-sentinel", "final_state": "interrupted",
+            "interruption_kind": kind, "tool_result_class_counts": {},
+            "prompt_tokens": 0, "fresh_prompt_tokens": 0,
+            "cache": {"hit": false, "read_tokens": 0, "creation_tokens": 0},
+            "completion_tokens": 0, "llm_rounds": 0, "tool_calls_count": 0,
+            "tools_used": [], "persistence_error": null, "exit_code": 5,
+            "success": false, "error_kind": "partial"
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_sidecar_keeps_only_canonical_terminal_categories() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        for kind in [
+            "budget_exhausted",
+            "empty_completion",
+            "token_budget_exceeded",
+            "rate_limited",
+            "cooldown_rejected",
+            "user_cancelled",
+            "context_overflow",
+            "auth_failure",
+            "critical_verdict",
+            "approval_rejected",
+            "server_overload",
+            "stream_transport",
+            "stream_idle",
+            "provider_deadline",
+            "harness_blocked",
+            "harness_paused",
+            "interrupted",
+            "execution_incomplete",
+            "executor_dropped",
+            "private_probe_sentinel",
+            "",
+        ] {
+            let output = Output {
+                status: ExitStatus::from_raw(5 << 8),
+                stdout: partial_probe_envelope(kind).to_string().into_bytes(),
+                stderr: b"private-probe-sentinel".to_vec(),
+            };
+            assert!(validate_successful_model_probe(&output.stdout, "fixture", 5).is_err());
+            let error = super::failed_execution_probe(&output, "fixture");
+            super::write_preflight_result(Some(&report), &["fixture".into()], &Err(error)).unwrap();
+            let raw = std::fs::read_to_string(report.with_extension("preflight.json")).unwrap();
+            assert!(!raw.contains("private-probe-sentinel"));
+            assert!(!raw.contains("private_probe_sentinel"));
+            let actual: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(actual["status"], "failed");
+            assert_eq!(actual["failure"]["stage"], "execution");
+            assert_eq!(actual["failure"]["exit_code"], 5);
+            assert_eq!(actual["failure"]["error_kind"], "partial");
+            assert_eq!(actual["failure"]["final_state"], "interrupted");
+            assert_eq!(
+                actual["failure"]["interruption_kind"],
+                serde_json::to_value(
+                    InterruptionKind::from_label(kind).map(InterruptionKind::label)
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_probe_terminal_cannot_publish_terminal_categories() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let base = partial_probe_envelope("provider_deadline");
+        let mut invalid = vec![serde_json::json!({})];
+        for (field, value) in [
+            ("final_state", serde_json::Value::Null),
+            ("interruption_kind", serde_json::Value::Null),
+            ("interruption_kind", serde_json::json!([])),
+            ("final_state", serde_json::json!("private_probe_sentinel")),
+            ("final_state", serde_json::json!("completed")),
+            ("exit_code", serde_json::json!(3)),
+        ] {
+            let mut envelope = base.clone();
+            if value.is_null() {
+                envelope.as_object_mut().unwrap().remove(field);
+            } else {
+                envelope[field] = value;
+            }
+            invalid.push(envelope);
+        }
+        let mut cases = invalid
+            .into_iter()
+            .map(|envelope| (envelope, 5 << 8))
+            .collect::<Vec<_>>();
+        // Valid-looking envelopes cannot supply facts for a different process
+        // outcome, including a process terminated without an exit code.
+        cases.extend([(base.clone(), 0), (base, 9)]);
+        for (envelope, status) in cases {
+            let output = Output {
+                status: ExitStatus::from_raw(status),
+                stdout: envelope.to_string().into_bytes(),
+                stderr: b"private-probe-sentinel".to_vec(),
+            };
+            let error = super::failed_execution_probe(&output, "fixture");
+            super::write_preflight_result(Some(&report), &["fixture".into()], &Err(error)).unwrap();
+            let raw = std::fs::read_to_string(report.with_extension("preflight.json")).unwrap();
+            assert!(!raw.contains("private_probe_sentinel"));
+            let actual: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(actual["failure"]["stage"], "terminal_protocol");
+            assert!(actual["failure"]["final_state"].is_null());
+            assert!(actual["failure"]["interruption_kind"].is_null());
+        }
+        let error = super::probe_boundary_error(
+            "fixture",
+            "probe_process",
+            "private-probe-sentinel".into(),
+        );
+        super::write_preflight_result(Some(&report), &["fixture".into()], &Err(error)).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(report.with_extension("preflight.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(actual["failure"]["final_state"].is_null());
+        assert!(actual["failure"]["interruption_kind"].is_null());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn model_probe_does_not_misclassify_execution_or_protocol_failure_as_model_unavailability()
      {
@@ -2286,6 +2486,15 @@ exec sleep 5
             assert!(summary["unavailable_model"].is_null());
             assert_eq!(summary["failure"]["model"], "fixture-model");
             assert_eq!(summary["failure"]["exit_code"], 3);
+            assert_eq!(
+                summary["failure"]["final_state"],
+                if summary["failure"]["stage"] == "execution" {
+                    serde_json::json!("failed")
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert!(summary["failure"]["interruption_kind"].is_null());
             if expected == "execution_binding_provider_required" {
                 assert_eq!(summary["failure"]["stage"], "execution");
                 assert_eq!(summary["failure"]["error_kind"], "api_error");

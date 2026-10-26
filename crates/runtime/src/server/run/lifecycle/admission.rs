@@ -1,12 +1,10 @@
-//! Run admission control, quota gating, and post-loop memory cleanup permits.
+//! Run capacity admission and durable event metrics.
 //!
 //! This module handles:
 //! - Run admission timeouts and capacity errors
-//! - Per-user run quota enforcement
-//! - Post-loop memory cleanup concurrency control
-//! - Metrics registration for admission and cleanup subsystems
+//! - Metrics registration for admission and durable events
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
@@ -30,22 +28,9 @@ pub(super) const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_
 pub(super) const METRIC_DURABLE_RUN_EVENT_BYTES_TOTAL: &str = "astra_durable_run_event_bytes_total";
 pub(super) const METRIC_DURABLE_RUN_EVENT_ROW_BUDGET: &str = "astra_durable_run_event_row_budget";
 pub(super) const METRIC_DURABLE_RUN_EVENT_BYTE_BUDGET: &str = "astra_durable_run_event_byte_budget";
-pub(super) const METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL: &str =
-    "astra_post_loop_memory_cleanup_dispatches_total";
-pub(super) const METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL: &str =
-    "astra_post_loop_memory_cleanup_workers_total";
-pub(super) const METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL: &str =
-    "astra_session_memory_post_loop_drains_total";
-pub(super) const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
-/// The extraction worker has one bounded end-to-end deadline, including
-/// provider selection and durable snapshot I/O. Post-loop settlement runs
-/// outside the response stream, but must still outlive that contract instead
-/// of calling an in-flight memory operation failed or settled prematurely.
-pub(super) const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 45_000;
 /// Phase-0 observed behavior: run admission is count-based and every run
 /// consumes one unit regardless of prompt size.
 pub(super) const CURRENT_RUN_ADMISSION_WEIGHT_UNITS: u64 = 1;
-static POST_LOOP_MEMORY_CLEANUP_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 pub(super) fn run_admission_timeout() -> Duration {
     Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
@@ -90,14 +75,6 @@ impl From<RunAdmissionError> for PreSpawnFailureCode {
     }
 }
 
-pub(super) fn post_loop_memory_cleanup_permits() -> Arc<tokio::sync::Semaphore> {
-    Arc::clone(POST_LOOP_MEMORY_CLEANUP_PERMITS.get_or_init(|| {
-        Arc::new(tokio::sync::Semaphore::new(
-            DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
-        ))
-    }))
-}
-
 pub(super) fn pre_spawn_failure_terminal_events(
     message: &str,
     failure_code: PreSpawnFailureCode,
@@ -120,44 +97,6 @@ pub(super) fn pre_spawn_failure_terminal_events(
                 "error": message,
                 "error_code": error_code,
                 "error_kind": "server_error",
-            },
-        }),
-    ]
-}
-
-pub(super) fn per_user_run_quota_response(
-    limit: astra_services::resource_governor::ResourceLimitKind,
-    reason: String,
-) -> (StatusCode, Json<ErrorResponse>) {
-    error_response_coded(
-        StatusCode::TOO_MANY_REQUESTS,
-        format!("Per-user run quota exceeded ({}): {reason}", limit.as_str()),
-        limit.error_code(),
-    )
-}
-
-pub(super) fn per_user_run_quota_terminal_events(
-    limit: astra_services::resource_governor::ResourceLimitKind,
-    reason: &str,
-) -> [Value; 2] {
-    let error_code = limit.error_code();
-    [
-        json!({
-            "event_type": "run_error",
-            "data": {
-                "error": reason,
-                "error_code": error_code,
-                "error_kind": "budget_exhausted",
-            },
-        }),
-        json!({
-            "event_type": "run_finished",
-            "data": {
-                "total_prompt_tokens": 0,
-                "total_completion_tokens": 0,
-                "error": reason,
-                "error_code": error_code,
-                "error_kind": "budget_exhausted",
             },
         }),
     ]
@@ -209,41 +148,8 @@ pub(super) fn classified_terminal_error_code(error: &astra_core::ClassifiedError
 pub(super) fn classified_terminal_error_metadata(
     error: &astra_core::ClassifiedError,
 ) -> Map<String, Value> {
-    let Some(details) = error
-        .details_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.as_object().cloned())
-    else {
-        return Map::new();
-    };
-    if details.get("source").and_then(Value::as_str)
-        != Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE)
-    {
-        return Map::new();
-    }
-    let mut metadata = Map::from_iter([(
-        "source".to_string(),
-        Value::String(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE.to_string()),
-    )]);
-    if let Some(retryable) = details.get("retryable").and_then(Value::as_bool) {
-        metadata.insert("retryable".to_string(), Value::Bool(retryable));
-    }
-    if let Some(action) = details
-        .get("action")
-        .and_then(Value::as_str)
-        .filter(|value| astra_services::models::is_safe_moi_model_gateway_error_code(value))
-    {
-        metadata.insert("action".to_string(), Value::String(action.to_string()));
-    }
-    if let Some(status) = details
-        .get("http_status")
-        .and_then(Value::as_u64)
-        .filter(|status| (400..=599).contains(status))
-    {
-        metadata.insert("http_status".to_string(), Value::from(status));
-    }
-    metadata
+    astra_services::models::ModelGatewayErrorMetadata::from_error(error)
+        .map_or_else(Map::new, |metadata| metadata.wire_fields())
 }
 
 pub(super) fn register_run_admission_metrics(
@@ -332,23 +238,6 @@ mod model_gateway_error_tests {
     }
 }
 
-pub(super) fn register_post_loop_memory_cleanup_metrics(
-    registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
-) {
-    registry.register_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL,
-        "Post-loop memory cleanup dispatches by mode and low-cardinality outcome.",
-    );
-    registry.register_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL,
-        "Post-loop memory cleanup workers by low-cardinality outcome.",
-    );
-    registry.register_counter(
-        METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL,
-        "Post-loop session-memory extraction drains by low-cardinality outcome.",
-    );
-}
-
 pub(super) fn refresh_durable_run_event_budget_metrics(
     registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
 ) {
@@ -408,84 +297,4 @@ pub(super) fn record_durable_run_event_batch_metrics(
             .try_into()
             .unwrap_or(u64::MAX),
     );
-}
-
-pub(super) fn record_post_loop_memory_cleanup_dispatch_metrics(
-    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    mode: &'static str,
-    outcome: &'static str,
-) {
-    let Some(registry) = registry else {
-        return;
-    };
-    register_post_loop_memory_cleanup_metrics(registry);
-    registry.increment_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_DISPATCHES_TOTAL,
-        &[("mode", mode), ("outcome", outcome)],
-        1,
-    );
-}
-
-pub(super) fn record_post_loop_memory_cleanup_worker_metrics(
-    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    outcome: &'static str,
-) {
-    let Some(registry) = registry else {
-        return;
-    };
-    register_post_loop_memory_cleanup_metrics(registry);
-    registry.increment_counter(
-        METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL,
-        &[("outcome", outcome)],
-        1,
-    );
-}
-
-pub(super) fn record_session_memory_post_loop_drain_metrics(
-    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    outcome: &'static str,
-) {
-    let Some(registry) = registry else {
-        return;
-    };
-    register_post_loop_memory_cleanup_metrics(registry);
-    registry.increment_counter(
-        METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL,
-        &[("outcome", outcome)],
-        1,
-    );
-}
-
-/// A canonical writer acquisition conflict. A live lease is an active run.
-/// A missing lease is only a cursor mismatch: the previous writer already
-/// released, so cancelling the Session would be unnecessary.
-pub(super) fn session_writer_conflict_response(
-    session_id: &str,
-    active_lease_expires_at_unix_ms: Option<i64>,
-) -> (StatusCode, Json<ErrorResponse>) {
-    if active_lease_expires_at_unix_ms.is_some() {
-        error_response_coded_with_metadata(
-            StatusCode::CONFLICT,
-            format!(
-                "another run still owns session {session_id}; wait for it to finish, or stop it with `astra session cancel {session_id}`, then run `astra --resume {session_id}` before sending another message"
-            ),
-            "session_writer_conflict",
-            json!({
-                "admission_state": "rejected",
-                "recovery_action": "wait_or_cancel_session",
-                "session_id": session_id,
-            }),
-        )
-    } else {
-        error_response_coded_with_metadata(
-            StatusCode::CONFLICT,
-            "the canonical session cursor changed before this turn was admitted; retry the message",
-            "session_writer_conflict",
-            json!({
-                "admission_state": "rejected",
-                "recovery_action": "retry_session",
-                "session_id": session_id,
-            }),
-        )
-    }
 }

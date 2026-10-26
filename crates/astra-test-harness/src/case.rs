@@ -553,14 +553,10 @@ impl Case {
         })
     }
 
-    /// Whether this case needs the live Memoria contract and its durable
-    /// post-loop settlement marker. Explicit opt-in, exact-record cleanup, or
-    /// a post-loop memory health criterion enables it; a capability label
-    /// alone does not, because negative memory cases may ban the tool.
+    /// Live Memoria is an explicit case requirement or exact-record cleanup
+    /// boundary. Generic subsystem health does not enable an optional backend.
     pub fn requires_memoria(&self) -> bool {
-        self.requires_memoria
-            || self.cleanup_memory_records
-            || super::criteria::requires_memoria_subsystem_health(&self.criteria)
+        self.requires_memoria || self.cleanup_memory_records
     }
 
     pub(crate) fn validate_execution_scope(&self) -> Result<(), String> {

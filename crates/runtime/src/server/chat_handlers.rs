@@ -16,112 +16,6 @@ fn parse_chat_request_body(body: &Bytes) -> Result<ChatRequest, (StatusCode, Jso
     })
 }
 
-pub(super) async fn validate_conversation_authority(
-    state: &AppState,
-    authenticated_user_id: &str,
-    session_id: Option<&str>,
-    authority: Option<&astra_turn_types::ConversationAuthorityEnvelopeV1>,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some(authority) = authority else {
-        // `/chat` and `/chat/stream` are Server-owned loops. They may start
-        // without a client grant; the run lifecycle acquires authority
-        // internally. A supplied grant, however, always fails closed.
-        return Ok(());
-    };
-    authority.validate_shape().map_err(|error| {
-        error_response_coded(
-            StatusCode::BAD_REQUEST,
-            format!("invalid conversation authority envelope: {error}"),
-            "conversation_authority_invalid",
-        )
-    })?;
-    if authority.key.owner_user_id != authenticated_user_id
-        || session_id != Some(authority.key.session_id.as_str())
-    {
-        return Err(error_response_coded(
-            StatusCode::FORBIDDEN,
-            "conversation authority does not match the authenticated owner and session",
-            "conversation_authority_owner_mismatch",
-        ));
-    }
-    let coordinator = state.session_context_coordinator.as_ref().ok_or_else(|| {
-        error_response_coded(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "canonical session coordinator is unavailable",
-            "session_coordinator_unavailable",
-        )
-    })?;
-    let signer = state.execution_grant_signer.as_ref().ok_or_else(|| {
-        error_response_coded(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "execution grant verifier is unavailable",
-            "execution_grant_verifier_unavailable",
-        )
-    })?;
-    // The authority lease and canonical head must come from one database
-    // snapshot. Besides avoiding two serialized round trips, this prevents
-    // validating the grant against a lease and cursor observed at different
-    // instants. The run lifecycle still revalidates and reserves the turn
-    // immediately before execution.
-    let admission_snapshot = coordinator
-        .load_admission_snapshot(&authority.key)
-        .await
-        .map_err(|error| {
-            error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to load current session authority: {error}"),
-                "session_authority_unavailable",
-            )
-        })?;
-    let active_lease = admission_snapshot.active_writer.ok_or_else(|| {
-        error_response_coded(
-            StatusCode::CONFLICT,
-            "conversation authority no longer owns the active writer lease",
-            "conversation_authority_fenced",
-        )
-    })?;
-    let now_unix_ms = chrono::Utc::now().timestamp_millis();
-    let claims = signer
-        .verify(
-            &authority.execution_grant,
-            &active_lease,
-            &authority.run_id,
-            authority.run_generation,
-            authority.provider_binding_id.as_deref(),
-            authority.provider_generation,
-            now_unix_ms,
-        )
-        .map_err(|error| {
-            error_response_coded(
-                StatusCode::CONFLICT,
-                format!("conversation execution grant was rejected: {error}"),
-                "conversation_authority_fenced",
-            )
-        })?;
-    if claims.writer_epoch != authority.writer_epoch
-        || claims.actor_id != authority.actor_id
-        || authority.execution_grant.claims.lease_id != active_lease.lease_id
-    {
-        return Err(error_response_coded(
-            StatusCode::CONFLICT,
-            "conversation authority generations do not match the signed grant",
-            "conversation_authority_fenced",
-        ));
-    }
-    let head = admission_snapshot.head;
-    if head.as_ref().map(|head| &head.cursor) != authority.expected_cursor.as_ref()
-        || authority.prompt_manifest_root.as_deref()
-            != head.as_ref().map(|head| head.latest_manifest_root.as_str())
-    {
-        return Err(error_response_coded(
-            StatusCode::CONFLICT,
-            "conversation cursor or prompt manifest is stale",
-            "conversation_cursor_conflict",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(super) async fn resolve_or_create_chat_session_id(
     state: &AppState,
@@ -159,6 +53,16 @@ pub(super) async fn resolve_or_create_chat_session(
     match requested_session_id {
         Some(session_id) => {
             validate_requested_chat_session_id(&session_id)?;
+            if !provider_authorized && state.shared_pool.is_some() {
+                // This supplied ID is not an ownership proof. The canonical
+                // Run admission checks current ownership/status under its
+                // mutation fence, before any provider or tool dispatch.
+                return Ok(ResolvedChatSession {
+                    session_id: Some(session_id),
+                    full_llm_capture: false,
+                    session_admission_facts: None,
+                });
+            }
 
             let session = if provider_authorized {
                 state
@@ -307,13 +211,6 @@ pub(super) async fn chat_handler(
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
     chat_data.session_admission_facts = resolved.session_admission_facts;
-    validate_conversation_authority(
-        &state,
-        &user.user_id,
-        chat_data.session_id.as_deref(),
-        chat_data.conversation_authority.as_ref(),
-    )
-    .await?;
     inject_effective_runtime_context(&state, &principal, &mut chat_data).await?;
     let run = state
         .execution
@@ -407,24 +304,6 @@ pub(super) async fn chat_stream_handler(
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
     chat_data.session_admission_facts = resolved.session_admission_facts;
-    if let Err((status, error)) = validate_conversation_authority(
-        &state,
-        &user.user_id,
-        chat_data.session_id.as_deref(),
-        chat_data.conversation_authority.as_ref(),
-    )
-    .await
-    {
-        return sse_error_response_from_error_with_context(
-            status,
-            error.0,
-            SseErrorContext {
-                request_id: request_id.as_deref(),
-                session_id: chat_data.session_id.as_deref(),
-                ..SseErrorContext::default()
-            },
-        );
-    }
     if let Err((status, error)) = runtime_context {
         return sse_error_response_from_error_with_context(
             status,
@@ -536,7 +415,7 @@ mod session_resolution_tests {
     }
 
     #[derive(Clone, Default)]
-    struct RecordingSessionService {
+    pub(super) struct RecordingSessionService {
         created: Arc<Mutex<Vec<(String, SessionCreateRequestData)>>>,
         missing_sessions: Arc<Mutex<Vec<String>>>,
         looked_up_session_ids: Arc<Mutex<Vec<String>>>,
@@ -551,11 +430,11 @@ mod session_resolution_tests {
                 .push(session_id.to_string());
         }
 
-        async fn created_requests(&self) -> Vec<(String, SessionCreateRequestData)> {
+        pub(super) async fn created_requests(&self) -> Vec<(String, SessionCreateRequestData)> {
             self.created.lock().await.clone()
         }
 
-        async fn looked_up_session_ids(&self) -> Vec<String> {
+        pub(super) async fn looked_up_session_ids(&self) -> Vec<String> {
             self.looked_up_session_ids.lock().await.clone()
         }
     }
@@ -1722,6 +1601,65 @@ mod chat_stream_lifecycle_tests {
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"error_code\":\"chat_request_invalid\""));
         assert!(!text.contains("\"type\":\"session_info\""));
+    }
+
+    #[tokio::test]
+    async fn server_chat_rejects_controller_capabilities_before_admission() {
+        use super::session_resolution_tests::RecordingSessionService;
+        use serde_json::{Value, json};
+        let sessions = RecordingSessionService::default();
+        let lifecycle = RecordingCreateRunLifecycle::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(sessions.clone()))
+                .with_run_lifecycle_service(Arc::new(lifecycle.clone())),
+        );
+        for route in ["/chat", "/chat/stream"] {
+            for authority in [
+                Value::Null,
+                json!({}),
+                json!({"execution_grant": "forged", "run_id": "foreign-run"}),
+                json!({"writer_epoch": 1, "expires_at_unix_ms": 0}),
+                json!("malformed"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(route)
+                            .header("authorization", "Bearer good-token")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&json!({
+                                    "message": "hi", "conversation_authority": authority,
+                                }))
+                                .unwrap(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if route == "/chat" {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                let body = body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                assert!(text.contains("chat_request_invalid"), "{route}: {text}");
+                assert!(!text.contains("session_info"));
+            }
+        }
+        assert!(sessions.created_requests().await.is_empty());
+        assert!(sessions.looked_up_session_ids().await.is_empty());
+        assert!(lifecycle.recorded_requests().await.is_empty());
     }
 
     #[tokio::test]

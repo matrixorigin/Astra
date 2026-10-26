@@ -124,7 +124,6 @@ pub(crate) async fn apply_user_cancelled_turn(
             }
             reconcile_and_report_turn_failure(
                 state,
-                api,
                 profile,
                 line,
                 &mut failure,

@@ -42,6 +42,14 @@ owned by their canonical contracts linked below.
   user's Work with another principal requires an explicit membership contract;
   matching ids or URLs never grant access.
 
+Ordinary conversation admission does not discover or load Work. On an explicit
+Work planning or execution-control tool call, a fresh executor resolves the
+canonical owner/Session binding and retains that identity for its own lifetime.
+Later operations still validate repository ownership, branch, revision and
+attempt authority. A new turn or another Server uses the same persisted
+relationship; neither a model-supplied Work id nor a cached binding grants
+permission to change the graph or execute an item.
+
 ## The user's journey
 
 ## Delivery boundary
@@ -318,11 +326,18 @@ resume an old conversation or reject a new one; verified Edge-to-Edge transfer
 remains a separate operation.
 
 Session execution debt remains Session-scoped: a live Run, unresolved tool,
-writer/reservation, settlement fence, or provider switch can block that
+explicit Controller authority or provider switch can block that
 Session's own cancellation or binding change, but it cannot block an
 independent Session in the same directory. The canonical binding generation
 fences delayed work for its own Session. The executor-owned workspace lease is
 the only physical-operation serialization boundary.
+
+Idle controller changes and recovery-point capture inspect actual Session
+execution occupancy under the same canonical Session/Run fences as Run admission. An
+active child, paused Run awaiting input, or terminal executor
+with a live owner lease blocks that boundary even when no Controller writer
+lease exists. Recovery capture reports active execution and publishes no point
+until that execution has settled.
 
 ## Unhappy paths
 
@@ -432,7 +447,7 @@ the only physical-operation serialization boundary.
   Run admission checks the selected generation while holding the canonical
   Session authority, and tool dispatch checks it again in the same transaction
   as Run action admission and the invocation claim. A selection change is
-  rejected while writer/reservation authority, a Run slot, or a prepared,
+  rejected while explicit Controller authority, an active Run or live execution lease, or a prepared,
   dispatched, or outcome-unknown invocation remains active. Exact composite-key
   reads and the existing owner/Session/state invocation index keep coordination
   scoped to the affected Session; dispatch does not lock the selection row, so
@@ -526,3 +541,13 @@ calling the full cross-surface E2E verified. Activity polling and multi-user
 capacity targets remain unmeasured. Server Run-owner crash recovery remains
 unsupported until its production recovery consumer and separate lifecycle E2E
 exist.
+
+## Raw conversation history
+
+Work transcript pages return available committed raw messages bounded by the
+canonical Context cursor. They do not maintain or certify a second transcript
+projection head. The response cursor identifies the canonical snapshot; it is
+not an independent assertion that every historical diagnostic has been copied
+into transcript storage. Uncommitted active-turn rows are excluded. Ordinary
+Run completion commits original conversation rows and Context together;
+reasoning and interaction diagnostics retain their own trace/event surfaces.

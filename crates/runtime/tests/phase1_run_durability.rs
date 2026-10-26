@@ -12,7 +12,6 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunRecord, RunStateStore, SSE_HEARTBEAT_INTERVAL_SECS,
-    ToolOutputBatchItem,
 };
 use async_trait::async_trait;
 use axum::{
@@ -86,6 +85,10 @@ fn test_ids() -> (String, String, String) {
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: run_id.to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
@@ -442,7 +445,9 @@ async fn l2_event_idx_and_idempotency_use_agent_runs() {
         .into_iter()
         .map(|row| row.try_get::<i64, _>("event_idx").unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(idx, [0, 1, 2]);
+    assert_eq!(idx, [1, 2]);
+    let logical = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(logical.events.iter().map(|event| event["index"].as_i64().unwrap()).collect::<Vec<_>>(), [0,1,2]);
 
     let counter = sqlx::query("SELECT last_event_idx FROM agent_runs WHERE run_id = ?")
         .bind(&run_id)
@@ -540,7 +545,7 @@ async fn l2_crash_recovery_marks_running_failed() {
 
 shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l2_retry_scope_and_batch_contracts_hold() {
+async fn l2_retry_scope_contract_holds() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -555,50 +560,7 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
     invalid.retry_scope = Some("branch".to_string());
     assert!(store.insert_run(invalid).await.is_err());
 
-    let batch_id = format!("batch-{}", Uuid::new_v4());
-    let items = (0..500)
-        .map(|idx| ToolOutputBatchItem {
-            output_id: format!("out-{idx}-{}", Uuid::new_v4()),
-            tool_call_id: Some(format!("call-{idx}")),
-            tool_name: "bash".to_string(),
-            result: astra_turn_types::ToolInvocationResultPayload::new(
-                format!(r#"{{"idx":{idx},"stdout":"ok"}}"#),
-                Default::default(),
-                None,
-            )
-            .unwrap(),
-        })
-        .collect::<Vec<_>>();
-    store
-        .insert_tool_output_batch(&batch_id, &session_id, &run_id, &user_id, &items)
-        .await
-        .unwrap();
 
-    let oversized = (0..501)
-        .map(|idx| ToolOutputBatchItem {
-            output_id: format!("oversized-{idx}-{}", Uuid::new_v4()),
-            tool_call_id: None,
-            tool_name: "bash".to_string(),
-            result: astra_turn_types::ToolInvocationResultPayload::new(
-                idx.to_string(),
-                Default::default(),
-                None,
-            )
-            .unwrap(),
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        store
-            .insert_tool_output_batch(
-                &format!("batch-{}", Uuid::new_v4()),
-                &session_id,
-                &run_id,
-                &user_id,
-                &oversized,
-            )
-            .await
-            .is_err()
-    );
 }
 
 }
@@ -785,6 +747,7 @@ async fn reconnect_replays_recovery_and_guidance_uses_a_new_run() {
             .all(|event| event["data"]["intent_id"] != "rejected-old-run")
     );
 
+    assert!(store_a.release_owner_lease(&user_id, &session_id, &run_id, loaded.run_generation).await.unwrap());
     let continuation_id = format!("{run_id}-continuation");
     engine
         .start_run(&continuation_id, &user_id, &session_id)

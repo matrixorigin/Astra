@@ -231,3 +231,10 @@ Parent should receive:
 - Deep delegation depth limit.
 - Provider constraints inherited correctly.
 - Child result survives parent resume.
+
+Ordinary Server chat installs the existing durable-agent reconciler without
+discovering Session-wide Run history. Explicit agent tools and remote-child waits
+load through the spawner's canonical reconciliation path. Same-Run execution
+handoff restores durable children before reattaching fan-in; process-local child
+completion remains in memory. Starting a new conversation turn is not a durable
+agent-recovery operation.

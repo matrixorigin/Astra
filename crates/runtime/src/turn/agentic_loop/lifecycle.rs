@@ -469,7 +469,9 @@ async fn wait_for_pause_control(state: &mut AgenticLoopState) -> bool {
             return true;
         }
 
-        if last_db_poll.elapsed() >= PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL {
+        if !state.has_durable_control_watcher()
+            && last_db_poll.elapsed() >= PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL
+        {
             if let Some(run_control) = state.run_control.as_ref() {
                 if let (Some(user_id), Some(run_id)) = (
                     state.context_manifest_user_id.as_deref(),
@@ -3726,10 +3728,10 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .as_ref()
                 .is_some_and(|t| t.is_cancelled());
 
-        // Cross-pod durable control check (only if same-pod fast path did not
-        // already catch cancellation). One lookup covers both cancel and pause
-        // so between-turn control polling does not double DB load per run.
-        let durable_control_status = if !in_memory_cancelled {
+        // Server's live watcher owns cross-pod observation. Local flags are
+        // already checked above; profiles without a watcher retain polling.
+        let durable_control_status = if !in_memory_cancelled && !state.has_durable_control_watcher()
+        {
             if let Some(ref rc) = state.run_control {
                 if let (Some(user_id), Some(run_id)) = (
                     state.context_manifest_user_id.as_deref(),

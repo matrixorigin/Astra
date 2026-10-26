@@ -5,9 +5,9 @@ vi.mock("@/lib/runtime-config", () => ({
 import {
   createChatWithMessage,
   getChatHydrated,
+  getChat,
   getStore,
   listChats,
-  sendMessage,
   setChatActiveRun,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
@@ -77,15 +77,6 @@ function runtimeRunList(runs: unknown[]) {
     runs,
     total: runs.length,
     limit: 200,
-  };
-}
-
-function runtimeTranscript(items: unknown[] = []) {
-  return {
-    items,
-    total: items.length,
-    limit: 200,
-    offset: 0,
   };
 }
 
@@ -199,20 +190,9 @@ describe("web store user scoping", () => {
       )
       .mockResolvedValueOnce(
         jsonResponse(
-          runtimeRunList([
-            runtimeRun(
-              "run-artifact-history",
-              "session-artifact-history",
-              "completed",
-            ),
-          ]),
-        ),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeTranscript([
+          { kind: "conversation", session: runtimeSession("session-artifact-history", "user-a", "Artifacts"), selected_root: null, items: [
             {
-              session_id: "session-artifact-history",
+              kind: "raw", session_id: "session-artifact-history",
               item_seq: 1,
               run_id: "run-artifact-history",
               role: "assistant",
@@ -227,7 +207,7 @@ describe("web store user scoping", () => {
               ],
               created_at: timestamp,
             },
-          ]),
+          ], history_loaded: true, raw_page: { has_more: false, next_before_seq: 1 }, truncated: false },
         ),
       );
 
@@ -245,37 +225,6 @@ describe("web store user scoping", () => {
     ]);
   });
 
-  it("rejects an invalid model selection without mutating the chat or creating a backend session", async () => {
-    const store = getStore("user-a");
-    const chat = {
-      id: "web-invalid-model",
-      title: null,
-      projectId: null,
-      createdAt: "2026-07-21T00:00:00.000Z",
-      lastMessageAt: "2026-07-21T00:00:00.000Z",
-      lastMessagePreview: "existing message",
-      model: "offering-a",
-      messages: [],
-      activeRun: undefined,
-    };
-    store.chats.push(chat);
-    const before = JSON.parse(JSON.stringify(chat));
-    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
-
-    await expect(
-      sendMessage("user-a", chat.id, {
-        content: "must not be appended",
-        options: {
-          model: "   ",
-          webSearch: false,
-          thinking: false,
-        },
-      }),
-    ).rejects.toMatchObject({ code: "invalid_selection" });
-
-    expect(chat).toEqual(before);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
 
   it("does not expose one user chat list to another authenticated user", async () => {
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
@@ -318,7 +267,6 @@ describe("web store user scoping", () => {
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
-      .mockResolvedValueOnce(jsonResponse(runtimeRunList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeSessionList([])))
       .mockResolvedValueOnce(jsonResponse(runtimeRunList([])));
 
@@ -504,11 +452,11 @@ describe("web store user scoping", () => {
             ),
           ]),
         ),
-      )
-      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+      );
 
-    const detail = await getChatHydrated("user-a", "session-multi-run");
-    expect(detail?.activeRun).toEqual({
+    await listChats("user-a", {});
+    const detail = getChat("user-a", "session-multi-run");
+    expect(detail?.activeRun).toMatchObject({
       runId: "run-waiting",
       status: "waiting",
       waitingFor: "user_input",
@@ -532,11 +480,11 @@ describe("web store user scoping", () => {
             runtimeRun("run-stale", "session-running-race", "running"),
           ]),
         ),
-      )
-      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+      );
 
-    const detail = await getChatHydrated("user-a", "session-running-race");
-    expect(detail?.activeRun).toEqual({
+    await listChats("user-a", {});
+    const detail = getChat("user-a", "session-running-race");
+    expect(detail?.activeRun).toMatchObject({
       runId: "run-freshest",
       status: "running",
       waitingFor: null,
@@ -564,12 +512,12 @@ describe("web store user scoping", () => {
             runtimeRun("root-run", "session-fanout", "running"),
           ]),
         ),
-      )
-      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+      );
 
-    const detail = await getChatHydrated("user-a", "session-fanout");
+    await listChats("user-a", {});
+    const detail = getChat("user-a", "session-fanout");
 
-    expect(detail?.activeRun).toEqual({
+    expect(detail?.activeRun).toMatchObject({
       runId: "root-run",
       status: "running",
       waitingFor: null,
@@ -592,8 +540,7 @@ describe("web store user scoping", () => {
             runtimeRun("run-stream-lag", "session-stream-lag", "running"),
           ]),
         ),
-      )
-      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+      );
 
     getStore("user-a").chats.push({
       id: "session-stream-lag",
@@ -612,8 +559,9 @@ describe("web store user scoping", () => {
       waitingFor: "user_input",
     });
 
-    const detail = await getChatHydrated("user-a", "session-stream-lag");
-    expect(detail?.activeRun).toEqual({
+    await listChats("user-a", {});
+    const detail = getChat("user-a", "session-stream-lag");
+    expect(detail?.activeRun).toMatchObject({
       runId: "run-stream-lag",
       status: "input-queued",
       waitingFor: "user_input",
@@ -640,8 +588,7 @@ describe("web store user scoping", () => {
             ),
           ]),
         ),
-      )
-      .mockResolvedValueOnce(jsonResponse(runtimeTranscript([])));
+      );
 
     getStore("user-a").chats.push({
       id: "session-terminal-sync",
@@ -660,131 +607,29 @@ describe("web store user scoping", () => {
       waitingFor: null,
     });
 
-    const detail = await getChatHydrated("user-a", "session-terminal-sync");
+    await listChats("user-a", {});
+    const detail = getChat("user-a", "session-terminal-sync");
     expect(detail?.activeRun).toBeUndefined();
   });
 
-  it("preserves the in-flight assistant overlay when durable transcript has only committed user input", async () => {
-    const timestamp = "2026-07-17T09:54:04.000Z";
-    getStore("user-a").chats.push({
-      id: "chat-refresh",
-      title: "Refresh",
-      projectId: null,
-      createdAt: timestamp,
-      lastMessageAt: timestamp,
-      lastMessagePreview: "run agents",
-      model: "sonnet-4.6-adaptive",
-      backendSessionId: "session-refresh",
-      messages: [
-        {
-          id: "local-user",
-          role: "user",
-          content: "run agents",
-          createdAt: timestamp,
-          status: "complete",
-        },
-        {
-          id: "local-assistant",
-          role: "assistant",
-          content: "",
-          createdAt: timestamp,
-          reasoning: "",
-          reasoningStatus: "streaming",
-          status: "streaming",
-        },
-      ],
-    });
-    setChatActiveRun("user-a", "chat-refresh", {
-      runId: "root-refresh",
-      status: "running",
-      waitingFor: null,
-      assistantMessageId: "local-assistant",
-    });
-
+  it("resolves a legacy Web id once, then reads the known Session directly", async () => {
+    const persisted = { ...runtimeSession("session-restart", "user-a", "Restart"),
+      metadata: { source: "web_v1", web_chat_id: "web-stable" } };
+    const projection = { kind: "conversation", session: persisted,
+      selected_root: { run_id: "root", status: "running", waiting_for: null },
+      items: [{ kind: "opening", id: "input:root", run_id: "root", source_event_id: "source", content: " 你好\n ", created_at: "2026-10-25T03:00:00.123456Z" }],
+      history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false };
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
-    fetchMock
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeSessionList([
-            runtimeSession("session-refresh", "user-a", "Refresh"),
-          ]),
-        ),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeRunList([
-            runtimeRun("root-refresh", "session-refresh", "running"),
-          ]),
-        ),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeTranscript([
-            {
-              item_seq: 1,
-              role: "user",
-              content: "run agents",
-              created_at: timestamp,
-            },
-          ]),
-        ),
-      );
-
-    const detail = await getChatHydrated("user-a", "chat-refresh");
-
-    expect(detail?.messages.map(({ role, status }) => ({ role, status }))).toEqual([
-      { role: "user", status: "complete" },
-      { role: "assistant", status: "streaming" },
+    fetchMock.mockResolvedValueOnce(jsonResponse(runtimeSessionList([persisted])))
+      .mockResolvedValueOnce(jsonResponse(projection)).mockResolvedValueOnce(jsonResponse(projection));
+    const first = await getChatHydrated("user-a", "web-stable");
+    const second = await getChatHydrated("user-a", "web-stable");
+    expect(second?.chat.id).toBe("web-stable");
+    expect(second?.messages).toBe(first?.messages);
+    expect(second?.messages[0].content).toBe(" 你好\n ");
+    expect(second?.activeRun?.nextEventIndex).toBe(0);
+    expect(fetchMock.mock.calls.map(call => new URL(call[0]).pathname)).toEqual([
+      "/sessions", "/sessions/session-restart/transcript", "/sessions/session-restart/transcript",
     ]);
-    expect(detail?.messages[1]?.id).toBe("local-assistant");
-    expect(detail?.activeRun?.assistantMessageId).toBe("local-assistant");
-  });
-
-  it("synthesizes a resumable assistant target after Web process state is lost", async () => {
-    const timestamp = "2026-07-17T09:54:04.000Z";
-    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
-    fetchMock
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeSessionList([
-            {
-              ...runtimeSession("session-restart", "user-a", "Restart"),
-              metadata: { source: "web_v1", web_chat_id: "web-stable" },
-            },
-          ]),
-        ),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeRunList([
-            runtimeRun("root-restart", "session-restart", "running"),
-          ]),
-        ),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(
-          runtimeTranscript([
-            {
-              item_seq: 1,
-              role: "user",
-              content: "run agents",
-              created_at: timestamp,
-            },
-          ]),
-        ),
-      );
-
-    const detail = await getChatHydrated("user-a", "web-stable");
-
-    expect(detail?.chat.id).toBe("web-stable");
-    expect(detail?.session?.backendSessionId).toBe("session-restart");
-    expect(detail?.messages.at(-1)).toMatchObject({
-      id: "inflight:root-restart",
-      role: "assistant",
-      status: "streaming",
-    });
-    expect(detail?.activeRun?.assistantMessageId).toBe(
-      "inflight:root-restart",
-    );
   });
 });
