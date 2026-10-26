@@ -1693,8 +1693,16 @@ pub(crate) mod tests {
         }
         for ((run, round), records) in groups {
             trace.events.push(JournalEvent {event_type:"llm_round".into(), raw:serde_json::json!({
-                "type":"llm_round","turn":1,"round":round,"producer_scope":{"run_id":run},"tool_calls":records,
+                "type":"llm_round","ts":chrono::Utc::now().to_rfc3339(),"turn":1,"round":round,"producer_scope":{"run_id":run},"tool_calls":records,
             })});
+        }
+        for run in &capture.run_tree.runs {
+            if let Some(parent) = &run.parent_run_id {
+                trace.events.push(JournalEvent { event_type:"agent_spawned".into(), raw:serde_json::json!({
+                    "type":"agent_spawned","ts":chrono::Utc::now().to_rfc3339(),"session_id":capture.session_id,
+                    "metadata":{"parent_run_id":parent,"run_id":run.run_id}
+                }) });
+            }
         }
         trace
     }

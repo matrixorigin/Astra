@@ -115,18 +115,23 @@ bounded diagnostic data in report details, never interpreted as a valid score.
 Truncated, filtered, or unknown completion endings are rejected even if their
 text contains a score. External `--judger-cmd` process timeout behavior is unchanged.
 
-Live quality judging uses a bounded projection of the durable tool
-journal. It preserves canonical run, turn, round, batch, and parallel metadata
-when present; missing identity stays unknown and cannot prove batching. It
-reserves room for call identities and statuses before sharing the
-remaining budget across arguments and results, so a large early response does
-not hide later verification. Truncated fields report their original and omitted
-character counts; if even the call identities exceed the budget, the envelope
-reports omitted calls. The projection fits the final judge prompt's existing
-budget. Raw reports and deterministic checks retain the original evidence.
-An inconclusive quality judgment caused by omitted evidence is not proof that
-the agent's claimed result is false, and a passing exit code is not a substitute
-for inspecting quality failures.
+Live quality judging receives complete invocation-scoped tool documents from
+its authorized trace, including identities, dispositions, arguments, results
+and Work receipts. Rejected and suppressed requests stay non-executions.
+Child-result judging additionally retains the existing Server custody gates.
+Tool evidence and ordered user/assistant exchanges are structured input, not
+stderr excerpts. The harness does not truncate or repack them to obtain a
+verdict: built-in requests use the existing governed Server admission boundary,
+while an external command rejects a complete serialized envelope above 64 KiB
+before spawning. Stderr remains bounded diagnostic text. Inconclusive judgments
+and input-limit failures stay unavailable; they are never converted to passes.
+
+An owned archived invocation can be replayed without another model call using
+`ASTRA_TEST_JUDGER_REPLAY=/path/to/fixture.json cargo test -p astra-test-harness
+recorded_action_documents_reach_actual_judgment_request -- --ignored`.
+The private fixture contains `outcome`, machine `stream_capture` identity and
+`session` trace; the check compares every complete tool document with the actual
+judgment request. Store captured fixtures outside tracked source.
 
 Harness cleanup cancels only the exact server-issued Session observed by its
 CLI invocation. `astra session cancel` waits up to 10 seconds for the Server's

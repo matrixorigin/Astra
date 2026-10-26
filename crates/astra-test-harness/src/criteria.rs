@@ -1696,6 +1696,16 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
     }
 }
 
+pub(crate) fn requires_judger_evidence(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(|criterion| match criterion {
+        Criterion::Judger { .. } | Criterion::HardJudger { .. } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_judger_evidence(criteria)
+        }
+        _ => false,
+    })
+}
+
 pub(crate) fn requires_execution_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(|criterion| match criterion {
         Criterion::ExecutionChildResultsAdopted { .. }

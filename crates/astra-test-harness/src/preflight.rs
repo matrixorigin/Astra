@@ -1135,7 +1135,8 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(error, super::PreflightError::AuthFailed { .. }),
+                matches!(&error, super::PreflightError::AuthFailed { detail }
+                    if detail.contains("isolated auto-register/login failed")),
                 "{error}"
             );
             return;

@@ -700,7 +700,8 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     let stderr = child.stderr.take().expect("piped stderr is present");
     let machine_observation = Arc::new(Mutex::new(MachineEventObservation {
         stream: (cfg.artifacts_dir.is_some()
-            || crate::criteria::requires_execution_capture(&case.criteria))
+            || crate::criteria::requires_execution_capture(&case.criteria)
+            || crate::criteria::requires_judger_evidence(&case.criteria))
         .then(Default::default),
         ..Default::default()
     }));

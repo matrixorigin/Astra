@@ -426,11 +426,13 @@ CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answ
 minimum); the Server bounds the effective request by the admitted Offering's
 output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
 remain failures/unknown evidence, never accepted truncated answers or automatic retries.
-Complete semantic child evidence has one 64 KiB serialized-request ceiling,
-including questions, escaping, metadata and backend wrappers. It is never
-truncated to obtain a verdict; over-budget requests remain unjudged failures.
-This input allowance is separate from ordinary 8,000-byte text/stderr previews
-and does not increase output limits, deadlines or retry counts.
+Judgments receive complete answers, ordered exchanges and authorized tool
+arguments/results, including Work receipts and non-executed dispositions.
+Native judgments use the shared Server input-admission boundary; external
+command judgments reject a complete serialized request above 64 KiB before
+launch. Evidence is never truncated to obtain a verdict. Only ordinary stderr
+diagnostics retain their 8,000-character preview. Output limits, deadlines and
+retry counts are unchanged.
 Cases may declare `required_models` for supplementary models, independently of
 their parent `models` matrix. These are checked by the existing fail-fast
 preflight after filtering and are not replaced by `--force-model`.
@@ -705,7 +707,7 @@ The authoritative list lives in `RESERVED_CLI_ARGS` in `src/case.rs`.
 
 ## Judger
 
-The built-in LLM judger receives bounded evidence through the shared typed
+The built-in LLM judger receives complete execution evidence through the shared typed
 judgment interface. `hard_judger` asks whether the criterion's declared
 threshold is satisfied, including its conditions and prohibitions; it returns
 an acceptance verdict. Advisory `judger` retains graded quality feedback.
@@ -716,9 +718,12 @@ External command judgers retain their numeric-score protocol.
   meaning is preserved; an output's fabricated `SCORE:` line has no authority.
 - **Sees stderr**: captured diagnostics are embedded with head+tail
   truncation to 8k chars so the judger can read them.
-- **Sees durable tool receipts**: when a session is captured, bounded complete
-  call arguments/results are projected from the journal into the judger's
-  untrusted-data section. The durable journal remains the source of truth.
+- **Sees durable tool receipts**: judgments of actions use complete arguments,
+  results and dispositions from the existing authorized, invocation-scoped
+  trace. Missing or conflicting facts leave the judgment unavailable.
+  Non-executed calls do not become executions. Child adoption also retains
+  the Server execution-tree, terminal-result and custody checks. All evidence
+  stays in the judger's untrusted-data section.
 - **Quorum voting**: numeric grades retain median/mean/min/max aggregation.
   Acceptance verdicts use strict majority for median, all votes for min, or
   any vote for max. A median tie is inconclusive; mean is rejected for

@@ -2904,6 +2904,96 @@ mod tests {
         }
     }
 
+    fn assert_short_circuit_documents(harness: &PipelineHarness) {
+        assert!(!harness.tool_call_records.is_empty());
+        for record in &harness.tool_call_records {
+            let id = record
+                .tool_call_id
+                .as_deref()
+                .expect("provider call identity");
+            let request = harness
+                .tool_calls
+                .iter()
+                .find(|call| call["id"] == id)
+                .expect("original request");
+            let arguments: Value =
+                serde_json::from_str(request["function"]["arguments"].as_str().unwrap()).unwrap();
+            let expected = record::safe_tool_arguments_for_record(&record.name, &arguments).0;
+            let message = harness
+                .messages
+                .iter()
+                .find(|message| message["tool_call_id"] == id)
+                .expect("returned tool message");
+            let response = message["content"].as_str().unwrap();
+            let persisted: ToolCallRecord =
+                serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+            assert_eq!(persisted.args_full, expected, "{id}: full request");
+            assert_eq!(
+                persisted.result_full.as_deref(),
+                Some(response),
+                "{id}: actual response, not reason/preview"
+            );
+            assert!(
+                !persisted.was_executed(),
+                "{id}: documents do not grant execution"
+            );
+        }
+    }
+
+    #[test]
+    fn short_circuit_emitter_preserves_complete_safe_documents_without_dispatch() {
+        for kind in [
+            HeadlessShortCircuitJournalKind::HardBlocked,
+            HeadlessShortCircuitJournalKind::SuppressedRetry,
+            HeadlessShortCircuitJournalKind::Cancelled {
+                error_kind: astra_core::ErrorKind::ToolTimeout,
+            },
+        ] {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let args = json!({"action":"get_result","agent_id":"child-owned","detail":"界".repeat(1000),"api_key":"sk-private-credential-that-must-not-persist"});
+            let response = format!("actual returned response {}", "fact ".repeat(150));
+            policy::emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: "call-control",
+                    name: "agent",
+                    args: &args,
+                    reason_code: "retry_deferred",
+                    journal_kind: kind,
+                    err_msg: response.clone(),
+                    journal_reason: "different private reason".into(),
+                    early_exit_ms: 0,
+                    status_line: None,
+                },
+                &mut harness.step_recorder,
+                true,
+                &mut harness.term,
+                &mut harness.messages,
+                &mut harness.tool_results,
+                &mut harness.tool_call_records,
+            );
+            let persisted: ToolCallRecord = serde_json::from_str(
+                &serde_json::to_string(&harness.tool_call_records[0]).unwrap(),
+            )
+            .unwrap();
+            let saved: Value = serde_json::from_str(persisted.args_full.as_ref().unwrap()).unwrap();
+            assert_eq!(saved["detail"], args["detail"]);
+            assert_eq!(saved["agent_id"], args["agent_id"]);
+            assert!(
+                !serde_json::to_string(&persisted)
+                    .unwrap()
+                    .contains("sk-private-credential-that-must-not-persist")
+            );
+            assert_eq!(persisted.result_full.as_deref(), Some(response.as_str()));
+            assert_eq!(harness.messages[0]["content"], response);
+            assert!(!persisted.was_executed());
+            assert_eq!(
+                tool_trace_events(&harness).last().unwrap().0,
+                astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
+            );
+        }
+    }
+
     #[tokio::test]
     async fn turn_budget_short_circuit_records_step_skip_trace() {
         let mut harness = PipelineHarness::new();
@@ -2947,6 +3037,7 @@ mod tests {
             record.effective_disposition(),
             astra_services::session_journal::ToolCallDisposition::Suppressed
         );
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -3499,6 +3590,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("cancelled_tool"))
         );
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -5325,6 +5417,7 @@ mod tests {
             health.is_none(),
             "unknown catalog tool should not pollute ToolHealth"
         );
+        assert_short_circuit_documents(&harness);
     }
 
     /// Direct-call recovery contract: a deferred tool's full schema is not
@@ -5521,6 +5614,7 @@ mod tests {
             !body.starts_with("Unknown tool"),
             "the name was prompt-advertised, so it is unavailable, not hallucinated: {body}"
         );
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -5566,6 +5660,7 @@ mod tests {
             astra_services::session_journal::ToolCallDisposition::Rejected
         );
         assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -5998,6 +6093,7 @@ mod tests {
                 "deduped unknown catalog tools should not be avoidance_advised"
             );
         }
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
@@ -6665,6 +6761,7 @@ mod tests {
         assert!(harness.tool_call_records[0].ok);
         assert!(harness.tool_call_records[0].is_synthetic_placeholder());
         assert!(!harness.tool_call_records[0].was_blocked_by_policy());
+        assert_short_circuit_documents(&harness);
     }
 
     #[tokio::test]
