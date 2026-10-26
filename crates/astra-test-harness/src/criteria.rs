@@ -5426,7 +5426,12 @@ fn evaluate_prompt_cache_reuse_scope(
         let witness = groups
             .iter()
             .map(|requests| {
-                let reads: u128 = requests.iter().skip(1).map(|read| u128::from(*read)).sum();
+                let reads: u128 = requests
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .map(|read| u128::from(*read))
+                    .sum();
                 (requests.len(), reads)
             })
             .max_by_key(|(count, reads)| (*count >= 2 && *reads > 0, *reads, *count))
@@ -5436,6 +5441,7 @@ fn evaluate_prompt_cache_reuse_scope(
         let reads: u128 = groups
             .iter()
             .skip(1)
+            .flatten()
             .flatten()
             .map(|read| u128::from(*read))
             .sum();
@@ -5447,7 +5453,7 @@ fn evaluate_prompt_cache_reuse_scope(
         passed: observations >= 2 && reuse_reads > 0,
         detail: format!(
             "required prompt-cache scope={boundary}: observations={observations}, \
-             post-cold cache_read_tokens={reuse_reads}, expected >=2 observations and read>0"
+             post-cold cache_read_tokens={reuse_reads} (known reads only), expected >=2 observations and read>0"
         ),
         full_detail: Some(CacheScopeDiagnostic::capture(
             scope,
@@ -11623,9 +11629,16 @@ mod tests {
     }
 
     #[test]
-    fn required_prompt_cache_scope_reports_one_witness_after_full_coverage_validation() {
+    fn required_prompt_cache_scope_retains_witness_with_unknown_unrelated_usage() {
         let many = cache_request_outcome("r1", "t1", &[(0, 0, 0); 3]);
-        let witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        let mut witness = cache_request_outcome("r2", "t2", &[(0, 0, 0), (0, 300, 0)]);
+        for event in &mut witness.explain_capture.as_mut().unwrap().events {
+            if event.round_index == Some(0)
+                && let Some(usage) = &mut event.usage
+            {
+                usage.cache_read_tokens = None;
+            }
+        }
         let criterion = Criterion::PromptCacheReuseScope {
             scope: PromptCacheReuseScope::IntraTurnRounds,
         };
@@ -11654,8 +11667,65 @@ mod tests {
             None,
             &[&many, &witness, &unknown],
         );
-        assert!(!result[0].passed);
-        assert!(result[0].detail.contains("evidence unavailable"));
+        assert!(
+            result[0].passed,
+            "unknown unrelated counters must not erase a witness"
+        );
+    }
+
+    #[test]
+    fn required_cache_reuse_accepts_unknown_cold_usage_but_not_unknown_warm_usage() {
+        let mut cold = cache_request_outcome("cold", "t1", &[(100, 0, 0)]);
+        for event in &mut cold.explain_capture.as_mut().unwrap().events {
+            if let Some(usage) = &mut event.usage {
+                usage.cache_read_tokens = None;
+            }
+        }
+        let warm = cache_request_outcome("warm", "t2", &[(100, 4864, 0)]);
+        let criterion = Criterion::PromptCacheReuseScope {
+            scope: PromptCacheReuseScope::ConversationTurns,
+        };
+        let check = |a: &RunOutcome, b: &RunOutcome| {
+            evaluate_with_primary_executions(
+                std::slice::from_ref(&criterion),
+                &RunOutcome::new("aggregate"),
+                None,
+                &[a, b],
+            )
+            .remove(0)
+        };
+        assert!(check(&cold, &warm).passed);
+        assert!(
+            !check(&warm, &cold).passed,
+            "cold hit cannot stand in for unknown warm usage"
+        );
+        let zero = cache_request_outcome("zero", "t2", &[(100, 0, 0)]);
+        assert!(!check(&cold, &zero).passed, "unknown must not become a hit");
+        let mut incomplete = cold.clone();
+        incomplete
+            .explain_capture
+            .as_mut()
+            .unwrap()
+            .snapshot_pending = true;
+        assert!(
+            !check(&incomplete, &warm).passed,
+            "cold capture integrity remains required"
+        );
+        let exact = Criterion::PromptCacheTokens {
+            min_read: 1,
+            min_creation: 0,
+            max_creation: None,
+        };
+        assert!(
+            !evaluate_with_primary_executions(
+                &[exact],
+                &RunOutcome::new("aggregate"),
+                None,
+                &[&cold, &warm],
+            )[0]
+            .passed,
+            "exact total still requires complete measurement"
+        );
     }
 
     #[test]

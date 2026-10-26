@@ -569,6 +569,35 @@ impl ExplainAnalyzeGraphV1 {
         )
     }
 
+    /// Cache-read observations retain unknown counters without losing request
+    /// boundaries. Reuse witnesses may use known reads; exact totals and ratios
+    /// must continue to use the fully attributed methods above.
+    pub fn primary_prompt_cache_read_observations(&self) -> Option<Vec<Option<u64>>> {
+        let nodes = self.primary_attempt_nodes()?;
+        for node in nodes.clone() {
+            if !node.start_observed || !node.terminal_observed || node.conflicted {
+                return None;
+            }
+        }
+        let groups = self.primary_prompt_cache_request_groups_from(
+            nodes.map(|node| {
+                let read = Self::known_primary_cache_read(node);
+                (node, (read.unwrap_or_default(), read.is_none()))
+            }),
+            |total, (read, unknown)| {
+                total.0 = total.0.checked_add(read)?;
+                total.1 |= unknown;
+                Some(())
+            },
+        )?;
+        Some(
+            groups
+                .into_iter()
+                .map(|(read, unknown)| (!unknown).then_some(read))
+                .collect(),
+        )
+    }
+
     fn primary_prompt_cache_request_groups_from<'a, T: Copy + Default>(
         &self,
         inputs: impl Iterator<Item = (&'a ExplainAnalyzeProjectedNodeV1, T)>,

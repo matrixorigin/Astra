@@ -187,20 +187,28 @@ pub(crate) fn primary_execution_cache_read_groups(
     executions: &[&crate::runner::RunOutcome],
     rounds: bool,
     within_run: bool,
-) -> Option<Vec<Vec<u64>>> {
+) -> Option<Vec<Vec<Option<u64>>>> {
     primary_execution_groups(
         executions,
         rounds,
         within_run,
         |graph, rounds| {
+            let reads = graph.primary_prompt_cache_read_observations()?;
             if rounds {
-                graph.primary_prompt_cache_read_request_groups()
+                Some(reads)
             } else {
-                Some(vec![graph.primary_prompt_cache_read_tokens()?])
+                Some(vec![
+                    reads
+                        .into_iter()
+                        .try_fold(0_u64, |total, read| total.checked_add(read?)),
+                ])
             }
         },
         |total, read| {
-            *total = total.checked_add(read)?;
+            *total = match (*total, read) {
+                (Some(total), Some(read)) => Some(total.checked_add(read)?),
+                _ => None,
+            };
             Some(())
         },
     )

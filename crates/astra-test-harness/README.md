@@ -128,7 +128,13 @@ overlapping archives, nonadjacent repeated turns, and multiple physical scopes
 inside one capture are unavailable rather than assigned a guessed order. There
 is no journal or terminal-counter fallback for this ratio.
 The injected `required_cache_scope` hard gate uses qualified cache-read facts;
-it does not require unrelated creation or fresh-input lanes.
+it does not require unrelated creation or fresh-input lanes. All captures must
+retain trusted identity, complete execution boundaries, and unambiguous order,
+but missing cache counters remain unknown and do not erase a known reuse witness.
+The post-cold read count is the sum of known request-group reads, a lower bound
+when other counters are unknown. Unknown or zero reads alone cannot prove reuse.
+Exact totals, ratios, and explicit per-warm-turn read requirements retain their
+complete-measurement checks.
 Conversation reuse requires reads after the first user turn; intra-turn reuse
 requires reads after the first ModelRound request in one user turn and run.
 Physical retries alone cannot establish another request boundary. Consecutive
