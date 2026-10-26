@@ -166,8 +166,6 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
         ("works", "owner_id"),
         ("agent_run_events", "user_id"),
         ("run_checkpoints", "user_id"),
-        ("run_display_projections", "user_id"),
-        ("agent_session_execution_slots", "user_id"),
         ("agent_runs", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),

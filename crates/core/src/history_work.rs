@@ -88,7 +88,6 @@ pub enum HistoryWorkSite {
     ProviderBodySerialization,
     LlmCaptureArtifactClone,
     LlmCaptureArtifactSerialization,
-    ServerCslPersistClone,
     ServerObserverQueue,
     ServerCompactionFixedContextClone,
     ServerToolPolicySchemaClone,
@@ -140,7 +139,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 120;
+    const COUNT: usize = 119;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -215,7 +214,6 @@ impl HistoryWorkSite {
         Self::ProviderBodySerialization,
         Self::LlmCaptureArtifactClone,
         Self::LlmCaptureArtifactSerialization,
-        Self::ServerCslPersistClone,
         Self::ServerObserverQueue,
         Self::ServerCompactionFixedContextClone,
         Self::ServerToolPolicySchemaClone,
@@ -347,7 +345,6 @@ impl HistoryWorkSite {
             Self::ProviderBodySerialization => "provider_body_serialization",
             Self::LlmCaptureArtifactClone => "llm_capture_artifact_clone",
             Self::LlmCaptureArtifactSerialization => "llm_capture_artifact_serialization",
-            Self::ServerCslPersistClone => "server_csl_persist_clone",
             Self::ServerObserverQueue => "server_observer_queue",
             Self::ServerCompactionFixedContextClone => "server_compaction_fixed_context_clone",
             Self::ServerToolPolicySchemaClone => "server_tool_policy_schema_clone",
@@ -482,7 +479,6 @@ impl HistoryWorkSite {
             Self::LlmCaptureArtifactClone | Self::LlmCaptureArtifactSerialization => {
                 "runtime.turn.llm_capture"
             }
-            Self::ServerCslPersistClone => "runtime.server.csl",
             Self::ServerObserverQueue => "runtime.server.observer",
             Self::ServerCompactionFixedContextClone => "runtime.server.compaction",
             Self::ServerToolPolicySchemaClone => "runtime.server.tool_policy",

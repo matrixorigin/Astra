@@ -15,7 +15,8 @@ description: |
   was silently replaced, or the parent claimed completion without 3/3 evidence.
 prompt: |
   Use `agent_fanout` to run exactly one fixed group with target_count 3. Give the
-  group a stable ID. The three slots are independent and must not be replaced or
+  group the ID `fanout-completion-truth`. All children must inherit the current
+  execution model. The three slots are independent and must not be replaced or
   retried:
 
   1. Ask one child to reply with exactly `FANOUT-EVIDENCE-ALPHA`.
@@ -43,6 +44,20 @@ criteria:
     document: arguments
     path: /action
     equals: start
+  # Start is an immutable launch receipt. Prove terminal child results and
+  # parent adoption from canonical execution evidence, not launch JSON.
+  - type: execution_child_results_adopted
+    fanout_group: {kind: id, value: fanout-completion-truth}
+    children:
+      - slot_index: 0
+        model: '{{model}}'
+        expected_result: {text: FANOUT-EVIDENCE-ALPHA}
+      - slot_index: 1
+        model: '{{model}}'
+        expected_result: {text: FANOUT-EVIDENCE-BETA}
+      - slot_index: 2
+        model: '{{model}}'
+        expected_result: {text: FANOUT-EVIDENCE-GAMMA}
   - type: session_event_count
     event_type: agent_terminated
     min: 3
@@ -66,21 +81,6 @@ criteria:
     document: result
     path: /fanout/accepted
     equals: 3
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /fanout/terminal
-    equals: 3
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /provenance/all_slots_delivered
-    equals: true
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /work_unit_observation/status
-    equals: completed
   # Explicit fanout is an admitted coordinator capability.  It must not spend
   # a model boundary rediscovering its own entrypoint or silently fall back to
   # generic agent spawning; both paths waste prompt tokens and can change the
@@ -113,21 +113,6 @@ criteria:
     name: start_work
     min: 0
     max: 0
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /results/0/result/result
-    equals: FANOUT-EVIDENCE-ALPHA
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /results/1/result/result
-    equals: FANOUT-EVIDENCE-BETA
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /results/2/result/result
-    equals: FANOUT-EVIDENCE-GAMMA
   - type: tools_count_between
     min: 1
     max: 8

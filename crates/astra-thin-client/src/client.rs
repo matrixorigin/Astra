@@ -866,9 +866,6 @@ impl ThinClient {
             }
             reason = match value.get("execution_blocker").and_then(Value::as_str) {
                 Some("execution_slot" | "active_run") => "an execution is still stopping",
-                Some("settlement_pending") => {
-                    "execution stopped but its durable settlement is incomplete"
-                }
                 Some("writer_or_reservation") => {
                     "a conversation write or turn admission is still in progress"
                 }
@@ -1983,23 +1980,6 @@ impl ThinClient {
             .http
             .get(url)
             .headers(self.auth_headers_for(bearer_override).await?)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
-    }
-
-    /// Best-effort read that already holds a still-valid token. The installed
-    /// bearer provider is not consulted, so this cannot start a native rotation.
-    pub async fn get_run_with_presented_bearer(
-        &self,
-        bearer: &str,
-        run_id: &str,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::chat_run(run_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(bearer)?)
             .send()
             .await?;
         Self::json_or_error(resp).await

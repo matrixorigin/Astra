@@ -1751,21 +1751,6 @@ struct IngestionCaptureReadback {
     ingestion_write_id: String,
 }
 
-fn all_capture_rows_were_inserted(
-    reported_rows_inserted: i64,
-    attempts: &[IngestionCaptureAttempt],
-) -> bool {
-    if attempts.is_empty() || usize::try_from(reported_rows_inserted).ok() != Some(attempts.len()) {
-        return false;
-    }
-    let mut identities = HashSet::with_capacity(attempts.len());
-    attempts.iter().all(|attempt| {
-        !attempt.event_id.is_empty()
-            && attempt.event_id.len() <= crate::storage::AGENT_EVENT_ID_LEN
-            && identities.insert(attempt.event_id.as_str())
-    })
-}
-
 fn classify_ingestion_capture_attempts(
     attempts: &[IngestionCaptureAttempt],
     readbacks: &HashMap<String, IngestionCaptureReadback>,
@@ -2714,37 +2699,40 @@ impl EventIngestionWorker {
                 payload_hash: values.payload_hash.clone(),
             })
             .collect::<Vec<_>>();
-        let mut capture_outcomes =
-            if all_capture_rows_were_inserted(reported_rows_inserted, &capture_attempts) {
-                // INSERT IGNORE reports one affected row per newly inserted row.
-                // When every distinct, untruncated identity was inserted, there is
-                // no existing row to classify. Partial insertion and retries after
-                // an actually committed attempt take the owner-scoped readback path.
-                vec![DurableCaptureOutcome::Inserted; capture_attempts.len()]
-            } else {
-                let mut owners = BTreeMap::<&str, Vec<usize>>::new();
-                for (index, event) in events.iter().enumerate() {
-                    owners.entry(&event.user_id).or_default().push(index);
+        let mut capture_outcomes = if crate::observation_capture::all_agent_event_rows_were_inserted(
+            reported_rows_inserted as u64,
+            capture_attempts
+                .iter()
+                .map(|attempt| attempt.event_id.as_str()),
+        ) {
+            // INSERT IGNORE reports one affected row per newly inserted row.
+            // When every distinct, untruncated identity was inserted, there is
+            // no existing row to classify. Partial insertion and retries after
+            // an actually committed attempt take the owner-scoped readback path.
+            vec![DurableCaptureOutcome::Inserted; capture_attempts.len()]
+        } else {
+            let mut owners = BTreeMap::<&str, Vec<usize>>::new();
+            for (index, event) in events.iter().enumerate() {
+                owners.entry(&event.user_id).or_default().push(index);
+            }
+            let mut outcomes = vec![DurableCaptureOutcome::Replayed; events.len()];
+            for (user_id, indices) in owners {
+                let attempts = indices
+                    .iter()
+                    .map(|&index| capture_attempts[index].clone())
+                    .collect::<Vec<_>>();
+                let readbacks = read_back_ingestion_captures(&mut tx, user_id, &attempts).await?;
+                let classified = classify_ingestion_capture_attempts(
+                    &attempts,
+                    &readbacks,
+                    &ingestion_write_id,
+                )?;
+                for (index, outcome) in indices.into_iter().zip(classified) {
+                    outcomes[index] = outcome;
                 }
-                let mut outcomes = vec![DurableCaptureOutcome::Replayed; events.len()];
-                for (user_id, indices) in owners {
-                    let attempts = indices
-                        .iter()
-                        .map(|&index| capture_attempts[index].clone())
-                        .collect::<Vec<_>>();
-                    let readbacks =
-                        read_back_ingestion_captures(&mut tx, user_id, &attempts).await?;
-                    let classified = classify_ingestion_capture_attempts(
-                        &attempts,
-                        &readbacks,
-                        &ingestion_write_id,
-                    )?;
-                    for (index, outcome) in indices.into_iter().zip(classified) {
-                        outcomes[index] = outcome;
-                    }
-                }
-                outcomes
-            };
+            }
+            outcomes
+        };
 
         // SQL admission returns stored row identities, including alias spelling.
         // Effects are applied once across the entire transaction, not per group.
@@ -4870,32 +4858,6 @@ mod tests {
             ),
             "derived edge inputs are part of the complete payload fence"
         );
-    }
-
-    #[test]
-    fn full_insert_fast_path_requires_exact_count_and_distinct_bounded_identities() {
-        let attempt = |event_id: &str| IngestionCaptureAttempt {
-            event_id: event_id.into(),
-            payload_hash: "hash".into(),
-        };
-        assert!(all_capture_rows_were_inserted(
-            2,
-            &[attempt("a"), attempt("b")]
-        ));
-        assert!(!all_capture_rows_were_inserted(
-            1,
-            &[attempt("a"), attempt("b")]
-        ));
-        assert!(!all_capture_rows_were_inserted(0, &[attempt("a")]));
-        assert!(!all_capture_rows_were_inserted(
-            2,
-            &[attempt("a"), attempt("a")]
-        ));
-        assert!(!all_capture_rows_were_inserted(1, &[attempt("")]));
-        assert!(!all_capture_rows_were_inserted(
-            1,
-            &[attempt(&"x".repeat(crate::storage::AGENT_EVENT_ID_LEN + 1))]
-        ));
     }
 
     #[test]

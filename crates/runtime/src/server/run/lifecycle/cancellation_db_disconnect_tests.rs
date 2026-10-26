@@ -115,7 +115,6 @@ async fn db_cancel_session_disconnect_during_begin_discards_connection() {
     let pool = SharedPool::new(&settings).await.unwrap();
     for operation in [
         "idle_proof",
-        "terminal_writer",
         "active_writer",
         "tool_reconcile",
         "session_update",
@@ -125,22 +124,12 @@ async fn db_cancel_session_disconnect_during_begin_discards_connection() {
             .await
             .unwrap();
         proxy.armed.store(true, Ordering::SeqCst);
-        let (task_pool, key, writer, run_id) = (
-            pool.clone(),
-            fixture.key.clone(),
-            fixture.writer.clone(),
-            fixture.run_id.clone(),
-        );
+        let (task_pool, key, run_id) = (pool.clone(), fixture.key.clone(), fixture.run_id.clone());
         let task = tokio::spawn(async move {
             let coordinator = DatabaseSessionContextCoordinator::new(task_pool.clone());
             match operation {
                 "idle_proof" => {
                     let _ = coordinator.execution_reuse_blocker(&key).await;
-                }
-                "terminal_writer" => {
-                    let _ = coordinator
-                        .release_terminal_execution_writer(&writer, &run_id, 0)
-                        .await;
                 }
                 "active_writer" => {
                     let _ = coordinator.load_active_writer(&key).await;

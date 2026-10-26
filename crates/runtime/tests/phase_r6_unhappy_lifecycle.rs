@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -26,7 +26,7 @@ async fn recover_from_call(
         ProviderResponse::OpenAi(json!({"id":"misbehaving-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":preliminary_text,"tool_calls":[{"id":"call-unhappy","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
         ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"The request could not be executed; no changes were made."},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}})),
     ])]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("unhappy-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,

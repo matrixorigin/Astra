@@ -376,7 +376,6 @@ fn build_artifact(
         unmeasured_phase0_metrics: vec![
             "production-path per-turn and per-round O(history) amplification",
             "provider cache share",
-            "projection lag",
             "compaction rate and tokens freed",
             "estimator error against canonical provider usage",
             "multi-tenant fairness and queue wait",

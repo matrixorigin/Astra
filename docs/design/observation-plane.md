@@ -245,7 +245,13 @@ accepted the request or consumed a particular reasoning level. Actual request
 and usage attribution remains with inference evidence; absent evidence is
 unknown, not zero.
 
-The inference ledger stores content-free accepted/terminal request diagnostics
+Agent model calls emit request-local wire/dispatch/terminal observations through
+the existing trace projection. They do not synchronously insert accepted and
+terminal request-context rows. A process crash may lose uncommitted observations;
+missing evidence remains unknown. Trace failure does not reject a completed model
+response.
+
+Standalone inference accounting stores content-free accepted/terminal request diagnostics
 in `model_request_context_events`. These records complement `agent_events` and
 are exposed through the existing owner-scoped request queries and session
 observability projection. They do not require full prompt capture.
@@ -530,18 +536,18 @@ references. An exact retry after a lost commit acknowledgement therefore does
 not repeat those effects. Each database attempt uses a fresh write marker;
 retries must not reuse a marker from an attempt whose commit outcome is unknown.
 
-Capture outcomes remain available to downstream projections. A collision must
-not create a transcript row or snapshot link from the rejected payload, nor be
-reported as a successfully captured response. Exact replay may repair a missing
-projection from the accepted payload under the existing transaction and session
-fences. Valid sibling events in the same batch continue to be captured.
+Diagnostic capture outcomes govern diagnostic projections and their counters,
+edges and artifact references. They do not govern raw conversation durability.
+Canonical admission and terminal settlement write original input, applied user
+guidance and the final assistant answer directly through the raw transcript
+owner. Run events, Context and actual effect receipts retain execution facts.
+Tool detail is not copied into raw conversation history.
 
-Atomic run-terminal settlement is stricter than ordinary batch capture: every
-canonical event in the settlement (including user intents, rounds, and tool
-events) must be inserted or exactly replayed. Any collision rolls back the
-settlement before terminal status, usage, or transcript changes can commit.
-Initial commit and lost-acknowledgement recovery therefore require the same
-complete evidence; recovery must not relax hash verification to accept a subset.
+Raw identity collisions roll back canonical settlement before Context, terminal
+status or usage can commit. Exact Run receipt resolution after a lost
+acknowledgement also requires matching raw identities, stored content hashes and
+Context commitments. Optional diagnostics may be absent or conflicting without
+invalidating canonical evidence; replay cannot rebuild absent raw history.
 
 Manifest identity and item identity are tenant-scoped: `(user_id, manifest_id)`
 and `(user_id, manifest_id, item_order)`. The manifest digest covers its header

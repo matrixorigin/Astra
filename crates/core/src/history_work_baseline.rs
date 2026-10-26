@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 
 use crate::history_work::{HistoryWorkSite, HistoryWorkSnapshot, instrumentation_enabled};
 
-pub const PRODUCTION_BASELINE_SCHEMA: &str = "astra.history_work.production_baseline.v4";
-pub const PROCESS_CAPTURE_SCHEMA: &str = "astra.history_work.production_process_capture.v3";
+pub const PRODUCTION_BASELINE_SCHEMA: &str = "astra.history_work.production_baseline.v5";
+pub const PROCESS_CAPTURE_SCHEMA: &str = "astra.history_work.production_process_capture.v4";
 const PROCESS_CAPTURE_PATH_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_FRAGMENT";
 pub const BASELINE_RUN_ID_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_RUN_ID";
 pub const BASELINE_GIT_SHA_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_GIT_SHA";
@@ -891,10 +891,8 @@ pub struct CacheEvidence {
 pub enum ProjectionEvidence {
     DurableRun {
         durable_event_index: u64,
-        projected_event_index: u64,
-        lag_events: u64,
     },
-    /// A session-scoped CLI bridge has no `agent_runs` projection or replay.
+    /// A session-scoped CLI bridge has no Server Run or durable Run replay.
     CliSessionBridgeNotApplicable,
 }
 
@@ -1891,7 +1889,7 @@ fn verify_scenario(scenario: &ProductionScenario, violations: &mut Vec<String>) 
             );
             require(
                 matches!(&scenario.projection, ProjectionEvidence::DurableRun { .. }),
-                "Server/Edge topology must provide durable projection evidence",
+                "Server/Edge topology must provide canonical Run event evidence",
                 violations,
             );
         }
@@ -2207,34 +2205,16 @@ fn verify_cache(
 }
 
 fn verify_projection(projection: &ProjectionEvidence, violations: &mut Vec<String>) {
-    let ProjectionEvidence::DurableRun {
+    if let ProjectionEvidence::DurableRun {
         durable_event_index,
-        projected_event_index,
-        lag_events,
     } = projection
-    else {
-        return;
-    };
-    require(
-        *durable_event_index > 0,
-        "durable projection cursor is zero",
-        violations,
-    );
-    require(
-        *projected_event_index > 0,
-        "projected cursor is zero",
-        violations,
-    );
-    require(
-        projected_event_index <= durable_event_index,
-        "projection index exceeds durable event index",
-        violations,
-    );
-    require(
-        *lag_events == durable_event_index.saturating_sub(*projected_event_index),
-        "projection lag is inconsistent with durable/projected indices",
-        violations,
-    );
+    {
+        require(
+            *durable_event_index > 0,
+            "canonical Run event watermark is zero",
+            violations,
+        );
+    }
 }
 
 fn verify_compaction(
@@ -2780,8 +2760,6 @@ mod tests {
             } else {
                 ProjectionEvidence::DurableRun {
                     durable_event_index: 1,
-                    projected_event_index: 1,
-                    lag_events: 0,
                 }
             },
             compaction: CompactionEvidence {

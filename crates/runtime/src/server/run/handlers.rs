@@ -91,12 +91,38 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             .iter()
             .any(|key| data.contains_key(*key));
 
-            if has_token_usage {
+            let normalized = if let Some(qualified) = data.get("qualified_usage") {
+                // C0 already owns qualification. Unknown buckets are not bad
+                // numbers, and its aggregate must not be rebuilt from mirrors.
+                if qualified.is_null() {
+                    Some(serde_json::Map::from_iter([(
+                        "qualified_usage".into(),
+                        serde_json::Value::Null,
+                    )]))
+                } else {
+                    match astra_turn_types::CanonicalTokenUsage::from_json(qualified) {
+                        Ok(usage) => {
+                            let canonical = usage.to_json();
+                            let mut fields = canonical
+                                .as_object()
+                                .expect("canonical usage is an object")
+                                .clone();
+                            fields.insert("qualified_usage".into(), canonical);
+                            Some(fields)
+                        }
+                        Err(_) => {
+                            tracing::warn!(run_id, index = ?index,
+                                "run terminal contained malformed qualified token usage; suppressing its external usage projection");
+                            None
+                        }
+                    }
+                }
+            } else if has_token_usage {
                 let read = |key: &str| match data.get(key) {
                     None => Some(0),
                     Some(value) => value.as_u64(),
                 };
-                let normalized = match (
+                match (
                     read("prompt_tokens"),
                     read("cache_read_tokens"),
                     read("cache_creation_tokens"),
@@ -118,40 +144,37 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                         );
                         None
                     }
-                };
-                if let Some(normalized) = normalized {
-                    let mut usage = normalized.to_json_map();
-                    usage.insert(
-                        "type".to_string(),
-                        serde_json::Value::String("usage".to_string()),
-                    );
-                    usage.insert(
-                        "usage_scope".to_string(),
-                        serde_json::Value::String("run_total".to_string()),
-                    );
-                    for key in [
-                        "qualified_usage",
-                        "last_request_usage",
-                        "last_request_input_tokens",
-                    ] {
-                        if let Some(value) = data.get(key) {
-                            usage.insert(key.to_string(), value.clone());
-                        }
+                }.map(|usage| usage.to_json_map())
+            } else {
+                None
+            };
+            if let Some(mut usage) = normalized {
+                usage.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("usage".to_string()),
+                );
+                usage.insert(
+                    "usage_scope".to_string(),
+                    serde_json::Value::String("run_total".to_string()),
+                );
+                for key in ["last_request_usage", "last_request_input_tokens"] {
+                    if let Some(value) = data.get(key) {
+                        usage.insert(key.to_string(), value.clone());
                     }
-                    if let Some(tool_call_count) = data
-                        .get("tool_call_count")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        usage.insert(
-                            "tool_call_count".to_string(),
-                            serde_json::Value::from(tool_call_count),
-                        );
-                    }
-                    if let Some(index) = index.clone() {
-                        usage.insert("index".to_string(), index);
-                    }
-                    transformed_events.push(serde_json::Value::Object(usage));
                 }
+                if let Some(tool_call_count) = data
+                    .get("tool_call_count")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    usage.insert(
+                        "tool_call_count".to_string(),
+                        serde_json::Value::from(tool_call_count),
+                    );
+                }
+                if let Some(index) = index.clone() {
+                    usage.insert("index".to_string(), index);
+                }
+                transformed_events.push(serde_json::Value::Object(usage));
             }
 
             // `run_finished` records an accounting total.  A separate,
@@ -344,9 +367,6 @@ pub(crate) struct RunProjectionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     pub run_event_high_watermark: i64,
-    pub projection_event_idx: i64,
-    pub projection_updated_at: String,
-    pub projection_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_event_type: Option<String>,
     pub total_prompt_tokens: u64,
@@ -356,12 +376,6 @@ pub(crate) struct RunProjectionResponse {
     pub latest_checkpoint: Option<RunProjectionCheckpointResponse>,
     pub observability: RunProjectionObservabilityResponse,
     pub recent_events: Vec<serde_json::Value>,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct RunProjectionRepairResponse {
-    pub repaired: bool,
-    pub projection: RunProjectionResponse,
 }
 
 #[derive(serde::Serialize)]
@@ -375,9 +389,7 @@ pub(crate) struct PromptRequestObservabilityResponse {
 
 #[derive(serde::Serialize)]
 pub(crate) struct RunProjectionObservabilityResponse {
-    pub has_durable_projection: bool,
     pub observability_available: bool,
-    pub projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
@@ -398,9 +410,6 @@ impl RunProjectionResponse {
             executor: value.executor,
             transport: value.transport,
             run_event_high_watermark: value.run_event_high_watermark,
-            projection_event_idx: value.projection_event_idx,
-            projection_updated_at: value.projection_updated_at,
-            projection_hash: value.projection_hash,
             latest_event_type: value.latest_event_type,
             total_prompt_tokens: value.total_prompt_tokens,
             total_completion_tokens: value.total_completion_tokens,
@@ -438,25 +447,6 @@ pub(crate) async fn get_run_projection_handler(
     ))
 }
 
-pub(crate) async fn repair_run_projection_handler(
-    State(state): State<AppState>,
-    Path(run_id): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<RunProjectionQuery>,
-) -> Result<Json<RunProjectionRepairResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let user_id = user.user_id.clone();
-    let projection = state
-        .execution
-        .run_lifecycle_service
-        .repair_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
-        .await?;
-    Ok(Json(RunProjectionRepairResponse {
-        repaired: true,
-        projection: build_run_projection_response(&state, &user_id, &run_id, projection).await?,
-    }))
-}
-
 async fn build_run_projection_response(
     state: &AppState,
     user_id: &str,
@@ -465,17 +455,12 @@ async fn build_run_projection_response(
 ) -> Result<RunProjectionResponse, (StatusCode, Json<ErrorResponse>)> {
     projection.recent_events =
         transform_stream_run_events_for_client(run_id, projection.recent_events);
-    let projection_lag_events =
-        (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
     let (observability_available, prompt_request_count, latest_prompt_request) =
         load_run_prompt_observability(state, user_id, run_id).await?;
-    let has_durable_projection = projection.has_durable_projection;
     Ok(RunProjectionResponse::new(
         projection,
         RunProjectionObservabilityResponse {
-            has_durable_projection,
             observability_available,
-            projection_lag_events,
             prompt_request_count,
             latest_prompt_request,
         },
@@ -1084,7 +1069,6 @@ mod tests {
 
     async fn cleanup_run_http_fixture(pool: &astra_core::SharedPool, user_id: &str, run_id: &str) {
         for sql in [
-            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -1386,6 +1370,241 @@ mod tests {
     }
 
     #[test]
+    fn canonical_terminal_usage_reaches_the_actual_sse_consumer_without_guessing() {
+        use astra_services::runs::{
+            CanonicalRunTerminalReceipt, CanonicalTerminalContext, CanonicalTerminalOutcome,
+            CanonicalTerminalTranscript,
+        };
+        use astra_turn_types::CanonicalTokenUsage;
+        let known = CanonicalTokenUsage::new(Some(7), Some(11), Some(2), Some(3)).unwrap();
+        let samples = [
+            Some(CanonicalTokenUsage::new(Some(13), None, None, Some(5)).unwrap()),
+            Some(known),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            None,
+        ];
+        for failed in [false, true] {
+            for sample in samples {
+                let error = failed.then_some("stream stopped");
+                let receipt = CanonicalRunTerminalReceipt {
+                    schema_version: 1,
+                    user_id: "owner".into(),
+                    session_id: "session".into(),
+                    run_id: "run-usage-boundary".into(),
+                    generation: 1,
+                    opening_hash: "a".repeat(64),
+                    context_admission_hash: None,
+                    outcome: if failed {
+                        CanonicalTerminalOutcome::Failed
+                    } else {
+                        CanonicalTerminalOutcome::Completed
+                    },
+                    error_hash: CanonicalRunTerminalReceipt::error_hash(error),
+                    error_code: failed.then(|| "stream_transport".into()),
+                    error_kind: failed.then_some(astra_core::ErrorKind::StreamTransport),
+                    error_metadata: None,
+                    context: CanonicalTerminalContext::Unowned,
+                    transcript: CanonicalTerminalTranscript {
+                        item_count: 0,
+                        digest: "b".repeat(64),
+                        assistant_source_event_id: None,
+                    },
+                    usage: sample,
+                    tool_ledger: None,
+                };
+                let completion = receipt
+                    .completion_events(None, None, error, Some(1), -1, 2)
+                    .unwrap();
+                let projected =
+                    transform_stream_run_events_for_client("run-usage-boundary", completion);
+                let usage = projected
+                    .iter()
+                    .find(|event| event["type"] == "usage")
+                    .expect("C0 accounting event");
+                let expected = sample
+                    .map(CanonicalTokenUsage::to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                assert_eq!(usage["qualified_usage"], expected);
+                for key in [
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_creation_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                ] {
+                    assert_eq!(usage.get(key), expected.get(key));
+                }
+                let mut accum =
+                    astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+                accum.qualified_usage = Some(known);
+                accum.has_usage = true;
+                accum.prompt_tokens = 7;
+                accum.current_request_usage =
+                    Some(astra_turn_types::RequestTokenUsage::try_new(7, 11, 2, 3).unwrap());
+                for event in projected {
+                    astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                        &format!("data: {}\n\n", serde_json::to_string(&event).unwrap()),
+                        &mut accum,
+                        &mut Vec::new(),
+                    );
+                }
+                assert_eq!(accum.qualified_usage, sample);
+                assert!(accum.usage_is_run_total);
+                assert!(accum.current_request_usage.is_none());
+                assert_eq!(
+                    accum.prompt_tokens,
+                    sample
+                        .and_then(CanonicalTokenUsage::input_tokens)
+                        .unwrap_or(0)
+                );
+                assert_eq!(
+                    accum.completion_tokens,
+                    sample
+                        .and_then(CanonicalTokenUsage::output_tokens)
+                        .unwrap_or(0)
+                );
+                assert_eq!(
+                    accum.has_usage,
+                    sample.is_some_and(|usage| !usage.to_json().as_object().unwrap().is_empty())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_c0_projection_survives_the_shared_stream_pump() {
+        use astra_services::runs::{
+            CanonicalRunTerminalReceipt, CanonicalTerminalContext, CanonicalTerminalOutcome,
+            CanonicalTerminalTranscript,
+        };
+        use astra_turn_core::sse::stream_host::{NoopSseStreamHost, consume_sse_stream};
+        let usage =
+            astra_turn_types::CanonicalTokenUsage::new(Some(17), None, None, Some(3)).unwrap();
+        for (error_code, error_kind) in [
+            (
+                Some("stream_transport"),
+                Some(astra_core::ErrorKind::StreamTransport),
+            ),
+            (
+                Some("insufficient_credit"),
+                Some(astra_core::ErrorKind::Unknown),
+            ),
+            (None, Some(astra_core::ErrorKind::Network)),
+            (
+                Some("work_lifecycle_topology_conflict"),
+                Some(astra_core::ErrorKind::ContractViolation),
+            ),
+            (Some("unclassified_business_failure"), None),
+            (Some("stream_transport"), None),
+        ] {
+            let receipt = CanonicalRunTerminalReceipt {
+                schema_version: 1,
+                user_id: "owner".into(),
+                session_id: "session".into(),
+                run_id: "partial-run".into(),
+                generation: 4,
+                opening_hash: "a".repeat(64),
+                context_admission_hash: None,
+                outcome: CanonicalTerminalOutcome::Failed,
+                error_hash: CanonicalRunTerminalReceipt::error_hash(Some("stream stopped")),
+                error_code: error_code.map(str::to_owned),
+                error_kind,
+                error_metadata: None,
+                context: CanonicalTerminalContext::Unowned,
+                transcript: CanonicalTerminalTranscript {
+                    item_count: 1,
+                    digest: "b".repeat(64),
+                    assistant_source_event_id: Some("source".into()),
+                },
+                usage: Some(usage),
+                tool_ledger: None,
+            };
+            // Cold replay must preserve the same typed fact as live completion.
+            let receipt: CanonicalRunTerminalReceipt =
+                serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
+            for terminal_only in [false, true] {
+                let completion = receipt
+                    .completion_events(
+                        (!terminal_only).then_some("  observed partial bytes\n"),
+                        Some("answer-id"),
+                        Some("stream stopped"),
+                        Some(1),
+                        if terminal_only { 2 } else { -1 },
+                        3,
+                    )
+                    .unwrap();
+                if terminal_only {
+                    assert_eq!(completion.len(), 1);
+                    assert_eq!(completion[0]["event_type"], "run_finished");
+                }
+                let mut projected = vec![serde_json::json!({
+                    "type":"session_info", "session_id":"session", "run_id":"partial-run"
+                })];
+                if terminal_only {
+                    projected.push(
+                        serde_json::json!({"type":"text_delta", "content":"  observed partial bytes\n"}),
+                    );
+                }
+                projected.extend(transform_stream_run_events_for_client(
+                    "partial-run",
+                    completion,
+                ));
+                let frames: Vec<_> = projected
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                for chunks in [
+                    frames
+                        .iter()
+                        .map(|frame| Ok(frame.as_bytes().to_vec()))
+                        .collect::<Vec<_>>(),
+                    vec![Ok(frames.concat().trim_end().as_bytes().to_vec())],
+                ] {
+                    let mut source = futures_util::stream::iter(chunks);
+                    let (result, abort) = consume_sse_stream(
+                        &mut source,
+                        &mut NoopSseStreamHost,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await;
+                    let expected_kind = error_kind
+                        .or_else(|| error_code.and_then(astra_core::ErrorKind::parse_tag))
+                        .unwrap_or(astra_core::ErrorKind::ContractViolation);
+                    let preserve = expected_kind != astra_core::ErrorKind::ContractViolation;
+                    let expected_text = if preserve {
+                        "  observed partial bytes\n"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(abort, Some(expected_kind));
+                    assert_eq!(result.accum.has_authoritative_failed_terminal(), preserve);
+                    assert_eq!(result.accum.full_text, expected_text);
+                    if preserve {
+                        assert_eq!(
+                            result.accum.model_item_id.as_deref(),
+                            (!terminal_only).then_some("answer-id")
+                        );
+                        assert_eq!(result.accum.accounted_usage(), Some(usage));
+                    }
+                    assert!(!result.accum.stream_complete);
+                    assert!(result.accum.server_execution_summary.is_none());
+                    assert!(result.tool_results.is_empty());
+                    let snapshot =
+                astra_turn_core::agentic::turn_ingest::agentic_turn_stream_snapshot_from_sse_accum(
+                    &result.accum,
+                    None,
+                );
+                    assert_eq!(snapshot.full_text, expected_text);
+                    if preserve {
+                        assert_eq!(snapshot.qualified_usage, Some(usage));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn projected_terminal_usage_is_accepted_by_the_chat_sse_consumer() {
         let projected = transform_stream_run_events_for_client(
             "run-usage-boundary",
@@ -1506,21 +1725,22 @@ mod tests {
 
     #[test]
     fn malformed_terminal_usage_is_not_relabelled_as_zero() {
-        let projected = transform_stream_run_events_for_client(
-            "run-malformed-usage",
-            vec![json!({
-                "event_type": "run_finished",
-                "data": {"prompt_tokens": "seven", "completion_tokens": 3},
-                "index": 4
-            })],
-        );
-
-        assert!(projected.iter().all(|event| event["type"] != "usage"));
-        assert!(
-            projected
-                .iter()
-                .any(|event| event["type"] == "run_finished")
-        );
+        for data in [
+            json!({"prompt_tokens":"seven", "completion_tokens":3}),
+            json!({"qualified_usage":{"input_tokens":"seven"}, "prompt_tokens":7,
+                "cache_read_tokens":0,"cache_creation_tokens":0,"completion_tokens":3}),
+        ] {
+            let projected = transform_stream_run_events_for_client(
+                "run-malformed-usage",
+                vec![json!({"event_type":"run_finished", "data":data, "index":4})],
+            );
+            assert!(projected.iter().all(|event| event["type"] != "usage"));
+            assert!(
+                projected
+                    .iter()
+                    .any(|event| event["type"] == "run_finished")
+            );
+        }
     }
 
     #[test]
@@ -2092,7 +2312,6 @@ mod tests {
         assert_eq!(
             persisted_event_types,
             vec![
-                "run_started",
                 "tool_call",
                 "tool_call_end",
                 "approval_required",
@@ -2100,7 +2319,7 @@ mod tests {
                 "text_done",
                 "run_finished",
             ],
-            "cache-miss replay must be backed by semantic durable facts only"
+            "opening is virtual; later semantic facts remain physical"
         );
 
         let lifecycle = AgenticRunLifecycleService::new(
@@ -2345,14 +2564,8 @@ mod tests {
             json.pointer("/latest_checkpoint/checkpoint_version"),
             Some(&json!("checkpoint_v3"))
         );
-        assert_eq!(
-            json.pointer("/observability/projection_lag_events"),
-            Some(&json!(0))
-        );
-        assert_eq!(
-            json.pointer("/observability/has_durable_projection"),
-            Some(&json!(true))
-        );
+        assert_eq!(json.pointer("/observability/projection_lag_events"), None);
+        assert_eq!(json.pointer("/observability/has_durable_projection"), None);
         assert_eq!(
             json.pointer("/observability/observability_available"),
             Some(&json!(false))
@@ -2393,254 +2606,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_run_projection_http_rebuilds_and_returns_projection() {
-        use crate::server::run::engine::RunEngine;
-        use crate::server::run::lifecycle::AgenticRunLifecycleService;
-        use astra_services::runs::InMemoryRunStateStore;
-
-        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        let authority = engine
-            .start_run("run-projection-repair-http", "u1", "session-projection")
-            .await
-            .expect("start durable run");
-        engine
-            .transition_status_with_events_if_current_owner(
-                "u1",
-                "session-projection",
-                "run-projection-repair-http",
-                &[astra_core::STATUS_RUNNING],
-                authority.owner_generation,
-                astra_core::STATUS_FAILED,
-                None,
-                Some("boom"),
-                &[
-                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
-                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
-                ],
-            )
-            .await
-            .expect("persist terminal transition");
-
-        let lifecycle = AgenticRunLifecycleService::new(
-            test_matrixone(),
-            Arc::new(
-                crate::FernetTokenEncryptor::new("0123456789abcdef")
-                    .expect("test encryptor should initialize"),
-            ),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        );
-
+    async fn retired_display_repair_route_returns_not_found() {
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
+                .with_auth_service(Arc::new(StubAuthService)),
         );
-
-        let resp = app
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/chat/runs/run-projection-repair-http/projection/repair?recent_limit=2")
+                    .uri("/chat/runs/retired-display/projection/repair")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
-                    .expect("request should build"),
+                    .unwrap(),
             )
             .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("repair response should be valid json");
-        assert_eq!(json.get("repaired"), Some(&json!(true)));
-        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
-        assert_eq!(
-            json.pointer("/projection/latest_event_type"),
-            Some(&json!("run_finished"))
-        );
-        assert_eq!(
-            json.pointer("/projection/observability/projection_lag_events"),
-            Some(&json!(0))
-        );
-        assert_eq!(
-            json.pointer("/projection/observability/has_durable_projection"),
-            Some(&json!(true))
-        );
-        let recent_events = json
-            .pointer("/projection/recent_events")
-            .and_then(serde_json::Value::as_array)
-            .expect("recent events should be present");
-        assert_eq!(recent_events.len(), 2);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn repair_run_projection_http_repairs_real_database_projection() {
-        use crate::server::run::engine::RunEngine;
-        use crate::server::run::lifecycle::AgenticRunLifecycleService;
-        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
-        use sqlx::Row;
-        use uuid::Uuid;
-
-        let shared_pool = setup_http_run_db_it().await;
-        let settings = shared_pool.settings().clone();
-        let user_id = "u1";
-        let run_id = format!("run-http-it-{}", Uuid::new_v4());
-        let session_id = format!("session-http-it-{}", Uuid::new_v4());
-        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
-        crate::server::run::insert_active_run_session_fixture(&shared_pool, user_id, &session_id)
-            .await;
-
-        let store: Arc<dyn RunStateStore> = Arc::new(
-            DatabaseRunStateStore::new(shared_pool.clone())
-                .with_owner_pod_id("projection-repair-http-it-pod"),
-        );
-        let engine = RunEngine::new(store);
-        let authority = engine
-            .start_run(&run_id, user_id, &session_id)
-            .await
-            .expect("start durable DB run");
-        let checkpoint_saved = engine
-            .persist_checkpoint(
-                user_id,
-                &session_id,
-                &run_id,
-                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"http-repair-it"}"#,
-            )
-            .await
-            .expect("save checkpoint before terminal transition");
-        assert!(checkpoint_saved);
-        let transitioned = engine
-            .transition_status_with_events_if_current_owner(
-                user_id,
-                &session_id,
-                &run_id,
-                &[astra_core::STATUS_RUNNING],
-                authority.owner_generation,
-                astra_core::STATUS_FAILED,
-                None,
-                Some("boom"),
-                &[
-                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
-                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
-                ],
-            )
-            .await
-            .expect("persist terminal transition");
-        assert!(transitioned);
-
-        sqlx::query(
-            "UPDATE run_display_projections
-             SET status = 'running',
-                 error_message = NULL,
-                 projection_event_idx = -1,
-                 latest_event_type = 'stale_event',
-                 latest_checkpoint_id = NULL,
-                 latest_checkpoint_kind = NULL,
-                 latest_checkpoint_version = NULL
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(&run_id)
-        .execute(shared_pool.get())
-        .await
-        .expect("corrupt projection");
-
-        let lifecycle = AgenticRunLifecycleService::new(
-            settings,
-            Arc::new(
-                crate::FernetTokenEncryptor::new("0123456789abcdef")
-                    .expect("test encryptor should initialize"),
-            ),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        );
-
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_shared_pool(shared_pool.clone())
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "/chat/runs/{run_id}/projection/repair?recent_limit=2"
-                    ))
-                    .header("authorization", "Bearer good-token")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("repair response should be valid json");
-        assert_eq!(json.get("repaired"), Some(&json!(true)));
-        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
-        assert_eq!(
-            json.pointer("/projection/error_message"),
-            Some(&json!("boom"))
-        );
-        assert_eq!(
-            json.pointer("/projection/latest_event_type"),
-            Some(&json!("run_finished"))
-        );
-        assert_eq!(
-            json.pointer("/projection/latest_checkpoint/checkpoint_version"),
-            Some(&json!("checkpoint_v2"))
-        );
-        assert_eq!(
-            json.pointer("/projection/observability/projection_lag_events"),
-            Some(&json!(0))
-        );
-        let recent_events = json
-            .pointer("/projection/recent_events")
-            .and_then(serde_json::Value::as_array)
-            .expect("recent events should be present");
-        assert_eq!(recent_events.len(), 2);
-
-        let row = sqlx::query(
-            "SELECT status, error_message, projection_event_idx, latest_event_type,
-                    latest_checkpoint_version
-             FROM run_display_projections
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(&run_id)
-        .fetch_one(shared_pool.get())
-        .await
-        .expect("load repaired projection row");
-        let db_status: String = row.try_get("status").expect("status");
-        let db_error: Option<String> = row.try_get("error_message").expect("error_message");
-        let db_event_idx: i64 = row
-            .try_get("projection_event_idx")
-            .expect("projection_event_idx");
-        let db_latest_event: Option<String> =
-            row.try_get("latest_event_type").expect("latest_event_type");
-        let db_checkpoint_version: Option<String> = row
-            .try_get("latest_checkpoint_version")
-            .expect("latest_checkpoint_version");
-        assert_eq!(db_status, astra_core::STATUS_FAILED);
-        assert_eq!(db_error.as_deref(), Some("boom"));
-        // `RunEngine::start_run` persists `run_started` at index 0; the
-        // terminal batch then writes `run_error` and `run_finished`.
-        assert_eq!(db_event_idx, 2);
-        assert_eq!(db_latest_event.as_deref(), Some("run_finished"));
-        assert_eq!(db_checkpoint_version.as_deref(), Some("checkpoint_v2"));
-
-        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
-        crate::server::run::cleanup_run_session_fixture(&shared_pool, user_id, &session_id).await;
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2675,48 +2657,6 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/chat/runs/run-foreign/projection")
-                    .header("authorization", "Bearer good-token")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn repair_run_projection_http_hides_foreign_run() {
-        use crate::server::run::engine::RunEngine;
-        use crate::server::run::lifecycle::AgenticRunLifecycleService;
-        use astra_services::runs::InMemoryRunStateStore;
-
-        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
-            .start_run("run-foreign-repair", "u2", "session-foreign")
-            .await
-            .expect("start durable run");
-        let lifecycle = AgenticRunLifecycleService::new(
-            test_matrixone(),
-            Arc::new(
-                crate::FernetTokenEncryptor::new("0123456789abcdef")
-                    .expect("test encryptor should initialize"),
-            ),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        );
-
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/runs/run-foreign-repair/projection/repair")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
                     .expect("request should build"),

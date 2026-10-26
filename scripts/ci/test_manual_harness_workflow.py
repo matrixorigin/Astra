@@ -196,9 +196,49 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertIsNone(diagnostic["model_active"])
             self.assertEqual(diagnostic["preflight"]["failure"], {
                 "model": "glm-5.3", "stage": "execution", "exit_code": 3,
-                "error_kind": "api_error", "error_code": "execution_binding_provider_required"})
+                "error_kind": "api_error", "error_code": "execution_binding_provider_required",
+                "final_state": None, "interruption_kind": None})
             self.assertNotIn("sentinel-secret", (root / "harness/diagnostic.json").read_text()
                              + (root / "job-summary").read_text())
+
+    def test_preflight_terminal_categories_use_the_existing_closed_projection(self):
+        allowed = ("budget_exhausted", "empty_completion", "token_budget_exceeded",
+                   "rate_limited", "cooldown_rejected", "user_cancelled", "context_overflow",
+                   "auth_failure", "critical_verdict", "approval_rejected", "server_overload",
+                   "stream_transport", "stream_idle", "provider_deadline", "harness_blocked",
+                   "harness_paused", "interrupted", "execution_incomplete", "executor_dropped")
+        cases = [("execution", "interrupted", kind, kind) for kind in allowed]
+        cases += [("execution", "interrupted", kind, None) for kind in
+                  (None, [], {}, 1, "private_sentinel", "x" * 256)]
+        cases += [(stage, state, "provider_deadline", None) for stage, state in
+                  (("terminal_protocol", "interrupted"), ("probe_process", "interrupted"),
+                   ("session_cleanup", "interrupted"), ("execution", "completed"),
+                   ("execution", "failed"), ("execution", "private_sentinel"),
+                   ("execution", None), ("execution", {}))]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "harness").mkdir()
+            for stage, state, kind, expected in cases:
+                with self.subTest(stage=stage, state=state, kind=kind):
+                    (root / "harness/report.preflight.json").write_text(json.dumps({
+                        "status": "failed", "models": ["fixture-model"], "unavailable_model": None,
+                        "failure": {"model": "fixture-model", "stage": stage, "exit_code": 5,
+                                    "error_kind": "partial", "error_code": None,
+                                    "final_state": state, "interruption_kind": kind,
+                                    "text": "private_sentinel", "detail": "private_sentinel"}}))
+                    result = self.run_block("Diagnose failure without exposing provider responses", root,
+                        GITHUB_STEP_SUMMARY=str(root / "job-summary"), DIAGNOSTIC_HEALTH_STATUS="200",
+                        DIAGNOSTIC_MODEL_EXIT="0", MODEL_LOAD_OUTCOME="success", HARNESS_OUTCOME="failure")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    raw = (root / "harness/diagnostic.json").read_text()
+                    failure = json.loads(raw)["preflight"]["failure"]
+                    self.assertEqual(failure["exit_code"], 5)
+                    self.assertEqual(failure["interruption_kind"], expected)
+                    expected_state = state if (stage == "execution" and isinstance(state, str)
+                        and state in ("completed", "interrupted", "failed")) else None
+                    self.assertEqual(failure["final_state"], expected_state)
+                    self.assertNotIn("private_sentinel", raw + result.stdout + result.stderr
+                                     + (root / "job-summary").read_text())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):

@@ -12,6 +12,25 @@ use serde_json::{Value, json};
 // before emitting the typed answer; the Server still enforces its resource cap.
 const MIN_JUDGE_COMPLETION_TOKENS: usize = 2_048;
 
+/// A dash streams the same canonical JSON without the OS per-argument limit.
+/// Request validation and provider/resource admission remain Server-owned.
+pub(crate) fn read_message(message: String, input: impl std::io::Read) -> Result<String, String> {
+    let message = if message == "-" {
+        let mut message = String::new();
+        let mut input = input;
+        input
+            .read_to_string(&mut message)
+            .map_err(|error| format!("read judgment stdin: {error}"))?;
+        message
+    } else {
+        message
+    };
+    if message.trim().is_empty() {
+        return Err("judgment message must not be empty".into());
+    }
+    Ok(message)
+}
+
 fn client_failure_kind(error: &ThinClientError) -> ErrorKind {
     match error {
         ThinClientError::Api { body, .. } => serde_json::from_str::<ErrorResponse>(body)
@@ -211,6 +230,21 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn judgment_message_stdin_preserves_complete_json_and_reports_input_errors() {
+        let message = json!({"evidence":"界\"".repeat(100_000)}).to_string();
+        assert_eq!(
+            read_message("-".into(), message.as_bytes()).unwrap(),
+            message
+        );
+        assert_eq!(
+            read_message("literal".into(), std::io::empty()).unwrap(),
+            "literal"
+        );
+        assert!(read_message("-".into(), std::io::empty()).is_err());
+        assert!(read_message("-".into(), &[0xff][..]).is_err());
+    }
 
     const SESSION: &str = "6bca9f9c-6d18-4579-bce1-2b45f573a098";
 

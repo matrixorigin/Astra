@@ -89,7 +89,7 @@ If Edge/CLI and Server both provide the same capability, the user-bound Edge/CLI
 
 | Layer | Purpose | Examples |
 | --- | --- | --- |
-| C0 control | Durable runtime control state | sessions, runs, tasks, checkpoints, leases, execution slots |
+| C0 control | Durable runtime control state | sessions, runs, tasks, checkpoints, leases |
 | C1 transcript | User-visible conversation state | messages, assistant output, transcript items |
 | C2 audit facts | Durable facts for audit and replay | agent events, run events, permission decisions |
 | C3 trace facts | Structured execution trace | model rounds, tool lifecycle, retry/cache/provider/sync decisions |

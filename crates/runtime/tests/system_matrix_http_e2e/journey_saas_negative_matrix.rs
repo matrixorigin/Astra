@@ -163,8 +163,8 @@ pub async fn run_saas_auth_negative_paths() {
     ctx.close().await;
 }
 
-/// Resource governance negatives: non-admin override forbidden; token cap denies run;
-/// unlimited (0) allows run despite high usage.
+/// Resource governance: admin ACLs and Session creation limits remain enforced.
+/// Existing-session Runs retain their own usage with either daily mirror setting.
 pub async fn run_saas_resource_governance_negative_paths() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -193,7 +193,7 @@ pub async fn run_saas_resource_governance_negative_paths() {
     );
     grant_astra_admin_role(pool, user_id).await;
 
-    // N: token daily cap exhausted → POST /chat returns 429 with readable error
+    // A daily mirror still governs explicit Session creation, not an existing Run.
     let token_cap = 500_i64;
     let (st_cap, _) = put_json(
         app,
@@ -211,6 +211,18 @@ pub async fn run_saas_resource_governance_negative_paths() {
     assert_eq!(st_cap, StatusCode::OK, "set token cap");
     seed_resource_usage_tokens(pool, user_id, token_cap).await;
 
+    let (session_status, _) = post_json(app, "/sessions", Some(auth), json!({})).await;
+    assert_eq!(session_status, StatusCode::TOO_MANY_REQUESTS);
+    let provider_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth, vec![ProviderScript::new(
+        "ordinary Run ignores the daily token mirror",
+        move |request| request.body["model"] == provider_model,
+        (0..2).map(|_| ProviderResponse::OpenAi(json!({
+            "choices": [{"index":0,"message":{"role":"assistant","content":"Quota mirror does not gate this Run."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":15,"total_tokens":20}
+        }))).collect(),
+    )]).await;
+
     let (st_chat, chat_j) = post_json(
         app,
         "/chat",
@@ -225,16 +237,20 @@ pub async fn run_saas_resource_governance_negative_paths() {
     .await;
     assert_eq!(
         st_chat,
-        StatusCode::TOO_MANY_REQUESTS,
-        "token-exhausted chat: {chat_j}"
+        StatusCode::OK,
+        "existing chat with exhausted daily mirror: {chat_j}"
     );
-    let err = chat_j["detail"]
-        .as_str()
-        .or_else(|| chat_j["error"].as_str())
-        .unwrap_or("");
-    assert!(
-        err.to_ascii_lowercase().contains("token"),
-        "readable token denial: {chat_j}"
+    let first_run_id = chat_j["run_id"].as_str().expect("first Run").to_owned();
+    assert_eq!(
+        super::harness::wait_for_run_status(
+            app,
+            &first_run_id,
+            auth,
+            "completed",
+            std::time::Duration::from_secs(10)
+        )
+        .await,
+        "completed"
     );
 
     // B/P: max_tokens_per_day=0 (unlimited) → run not failed for token cap
@@ -270,6 +286,29 @@ pub async fn run_saas_resource_governance_negative_paths() {
     .await;
     assert_eq!(st_chat2, StatusCode::OK, "unlimited chat: {chat2}");
     assert!(chat2.get("run_id").is_some(), "run_id: {chat2}");
+    let second_run_id = chat2["run_id"].as_str().unwrap();
+    assert_eq!(
+        super::harness::wait_for_run_status(
+            app,
+            second_run_id,
+            auth,
+            "completed",
+            std::time::Duration::from_secs(10)
+        )
+        .await,
+        "completed"
+    );
+    for run_id in [first_run_id.as_str(), second_run_id] {
+        let usage: (i64, i64, i64) = sqlx::query_as(
+            "SELECT total_prompt_tokens, total_completion_tokens, total_tool_calls FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        ).bind(user_id).bind(&ctx.session_id).bind(run_id).fetch_one(pool).await.unwrap();
+        assert_eq!(
+            usage,
+            (5, 15, 0),
+            "canonical usage belongs to the actual Run"
+        );
+    }
+    assert_eq!(ctx.native_provider_requests().await.len(), 2);
 
     cleanup_resource_limits(pool, user_id).await;
     ctx.close().await;

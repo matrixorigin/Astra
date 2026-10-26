@@ -93,7 +93,15 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         .execute(pool)
         .await
         .unwrap();
-    let inactive = auth.current_principal(&headers).await.unwrap_err();
+    auth.current_principal(&headers)
+        .await
+        .expect("the ordinary identity snapshot is bounded, not instantly revoked across replicas");
+    let inactive = auth
+        .clone()
+        .with_pool(shared.clone())
+        .current_principal(&headers)
+        .await
+        .unwrap_err();
     assert_eq!(inactive.0, StatusCode::UNAUTHORIZED);
     assert_eq!(inactive.1.0.detail, "User is inactive");
     sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
@@ -101,7 +109,12 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         .execute(pool)
         .await
         .unwrap();
-    let expired = auth.current_principal(&headers).await.unwrap_err();
+    let expired = auth
+        .clone()
+        .with_pool(shared.clone())
+        .current_principal(&headers)
+        .await
+        .unwrap_err();
     assert_eq!(expired.0, StatusCode::UNAUTHORIZED);
     assert_eq!(
         expired.1.0.detail, "Session expired or revoked",
@@ -376,7 +389,12 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
     .await
     .unwrap();
     assert_eq!(
-        auth.current_user(&headers).await.unwrap_err().0,
+        auth.clone()
+            .with_pool(shared.clone())
+            .current_user(&headers)
+            .await
+            .unwrap_err()
+            .0,
         StatusCode::UNAUTHORIZED
     );
     sqlx::query("INSERT INTO auth_external_identities (provider_id, external_subject, astra_user_id) VALUES (?, ?, ?)")

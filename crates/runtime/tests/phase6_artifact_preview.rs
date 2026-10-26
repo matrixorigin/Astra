@@ -4,12 +4,11 @@ use test_support::require_db_it_env;
 
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
-    DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseSessionService,
-    DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
-    SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
-    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    SessionArtifactStoreError, SessionService, build_presigned_artifact_download,
-    runs::ToolOutputBatchItem,
+    DatabaseSessionArtifactStore, DatabaseSessionService, DatabaseStateProjectionStore,
+    SessionArtifactContentChunkV1, SessionArtifactContentDescriptorV1, SessionArtifactContentStore,
+    SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactReference,
+    SessionArtifactReferenceKind, SessionArtifactStoreError, SessionService,
+    build_presigned_artifact_download,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -936,116 +935,6 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
 
 shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_51_unknown_tool_uses_400b_fallback_without_warning_event() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, run_id) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let tool_name = format!("unknown_phase6_{}", Uuid::new_v4().simple());
-    store
-        .insert_tool_output_batch(
-            &format!("batch-{}", Uuid::new_v4()),
-            &session_id,
-            &run_id,
-            &user_id,
-            &[ToolOutputBatchItem {
-                output_id: format!("out-{}", Uuid::new_v4()),
-                tool_call_id: Some("call-1".to_string()),
-                tool_name: tool_name.clone(),
-                result: astra_turn_types::ToolInvocationResultPayload::new(
-                    "x".repeat(1_200),
-                    Default::default(),
-                    None,
-                )
-                .unwrap(),
-            }],
-        )
-        .await
-        .unwrap();
-    let row = sqlx::query(
-        "SELECT
-           (SELECT preview_status FROM session_tool_outputs WHERE user_id = ? AND session_id = ? AND tool_name = ? LIMIT 1) AS preview_status,
-           (SELECT CHAR_LENGTH(preview_text) FROM session_tool_outputs WHERE user_id = ? AND session_id = ? AND tool_name = ? LIMIT 1) AS preview_len,
-           (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'preview_template_missing' AND meta_tool_name = ?) AS warning_count",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&tool_name)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&tool_name)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&tool_name)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        row.try_get::<String, _>("preview_status").unwrap(),
-        "fallback"
-    );
-    assert!(row.try_get::<u64, _>("preview_len").unwrap() <= 400);
-    assert_eq!(row.try_get::<i64, _>("warning_count").unwrap(), 0);
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, run_id) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let output_id = format!("out-{}", Uuid::new_v4());
-    let raw = "CREATE TABLE t(a INT);\n".repeat(2_000);
-    store
-        .insert_tool_output_batch(
-            &format!("batch-{}", Uuid::new_v4()),
-            &session_id,
-            &run_id,
-            &user_id,
-            &[ToolOutputBatchItem {
-                output_id: output_id.clone(),
-                tool_call_id: Some("call-pg".to_string()),
-                tool_name: "pg_dump".to_string(),
-                result: astra_turn_types::ToolInvocationResultPayload::bounded_projection(
-                    raw,
-                    std::collections::BTreeMap::from([(
-                        "declared_size_bytes".to_string(),
-                        json!(3_221_225_472_u64),
-                    )]),
-                    None,
-                ),
-            }],
-        )
-        .await
-        .unwrap();
-    let row = sqlx::query(
-        "SELECT artifact_ref, CHAR_LENGTH(preview_text) AS preview_len, payload_bytes
-         FROM session_tool_outputs
-         WHERE user_id = ? AND session_id = ? AND output_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&output_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert!(
-        row.try_get::<Option<String>, _>("artifact_ref")
-            .unwrap()
-            .as_deref()
-            .is_some_and(|value| value.starts_with("tool_output://"))
-    );
-    assert!(row.try_get::<u64, _>("preview_len").unwrap() <= 1000);
-    assert!(row.try_get::<i64, _>("payload_bytes").unwrap() > 1000);
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
@@ -1142,95 +1031,6 @@ async fn l2_55_presigned_download_contains_ttl_and_signature() {
             || signed.download_url.contains("signature=sha256:")
     );
     assert!(signed.signature.starts_with("sha256:"));
-}
-
-}
-
-shared_db_test! {
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, run_id) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let artifact_ids = ["pg-dump", "tool-batch", "slowlog"]
-        .into_iter()
-        .map(|kind| format!("{kind}-{}", Uuid::new_v4()))
-        .collect::<Vec<_>>();
-    for (idx, artifact_id) in artifact_ids.iter().enumerate() {
-        insert_artifact(
-            &pool,
-            ArtifactSeed {
-                user_id: &user_id,
-                session_id: &session_id,
-                artifact_id,
-                kind: if idx == 2 { "slowlog" } else { "pg_dump" },
-                policy: "default",
-                status: "active",
-                retention_days: 1,
-                manifest_refs: if idx == 0 { 1 } else { 0 },
-            },
-        )
-        .await;
-    }
-
-    let store = DatabaseRunStateStore::new(pool.clone());
-    let mut items = Vec::with_capacity(500);
-    for i in 0..1_000 {
-        items.push(ToolOutputBatchItem {
-            output_id: format!("out-{i}-{}", Uuid::new_v4()),
-            tool_call_id: Some(format!("call-{i}")),
-            tool_name: "slow_query_analyzer".to_string(),
-            result: astra_turn_types::ToolInvocationResultPayload::new(
-                format!("slow query {i}"),
-                std::collections::BTreeMap::from([(
-                    "declared_size_bytes".to_string(),
-                    json!(838_860_800_u64),
-                )]),
-                None,
-            )
-            .unwrap(),
-        });
-        if items.len() == 500 {
-            store
-                .insert_tool_output_batch(
-                    &format!("batch-{i}-{}", Uuid::new_v4()),
-                    &session_id,
-                    &run_id,
-                    &user_id,
-                    &items,
-                )
-                .await
-                .unwrap();
-            items.clear();
-        }
-    }
-    let row = sqlx::query(
-        "SELECT
-          (SELECT COUNT(*) FROM session_tool_outputs FORCE INDEX (idx_tool_outputs_user_run_created) WHERE user_id = ? AND run_id = ?) AS output_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_session_artifacts_owner_kind_order) WHERE user_id = ? AND session_id = ? AND artifact_kind = 'pg_dump') AS dump_count,
-          (SELECT COUNT(*) FROM session_artifacts FORCE INDEX (idx_artifacts_retention) WHERE retention_until IS NOT NULL AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY) AND (status <=> 'active' OR status <=> 'expiring')) AS retention_count",
-    )
-    .bind(&user_id)
-    .bind(&run_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("output_count").unwrap(), 1_000);
-    assert!(row.try_get::<i64, _>("dump_count").unwrap() >= 2);
-    assert!(row.try_get::<i64, _>("retention_count").unwrap() >= 1);
-
-    let deadline_before =
-        artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    let _retention = run_artifact_retention_gc_once(pool.clone(), 100)
-        .await
-        .unwrap();
-    let (_, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    let deadline_after =
-        artifact_retention_until(&pool, &user_id, &session_id, &artifact_ids[0]).await;
-    assert_eq!(deadline_after, deadline_before);
-    assert_eq!(cold_ref, None, "sweeper must not fabricate cold storage");
 }
 
 }

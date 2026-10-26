@@ -124,10 +124,10 @@ async fn build_app_keeps_core_http_and_websocket_surfaces_registered() {
         ),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         segment_upload,
         StatusCode::NOT_FOUND,
-        "bounded immutable segment staging remains part of attach/fork hydration"
+        "Context content is committed with its manifest; standalone staging is retired"
     );
 
     let delegate = request_status(

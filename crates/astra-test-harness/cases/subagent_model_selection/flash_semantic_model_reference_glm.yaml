@@ -4,6 +4,7 @@ description: |
   against the authorized candidate catalog, not by a hard-coded alias.
 prompt: |
   请让 5.2glm 模型的子代理只回答 ASTRA-SEMANTIC-MODEL-OK，然后把它的回答告诉我。
+required_models: [glm-5.2]
 debug_log: true
 capability: delegation
 timeout_seconds: 180

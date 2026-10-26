@@ -1416,11 +1416,6 @@ pub struct ChatRequest {
     pub plan_subtask_id: Option<String>,
     #[serde(default)]
     pub is_plan_subtask: Option<bool>,
-    /// Server-issued canonical authority. Omitted on initial admission;
-    /// identity inside this envelope is never trusted without signature and
-    /// authenticated-owner validation.
-    #[serde(default)]
-    pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
 
 #[cfg(feature = "server")]
@@ -2515,7 +2510,6 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         explain: request.explain,
         interaction_mode: request.interaction_mode,
         interactive_client: request.interactive_client,
-        conversation_authority: request.conversation_authority,
     }
 }
 

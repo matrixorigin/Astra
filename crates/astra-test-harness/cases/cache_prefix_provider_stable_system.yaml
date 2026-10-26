@@ -1,18 +1,13 @@
 name: cache_prefix_provider_stable_system
 description: |
-  **What**: 4-turn session verifying that prefix-only providers (DeepSeek, GLM,
-  Qwen) achieve high cache hit rates because the system message is 100% stable.
-  **Tests**: Volatile content (self_awareness, session_anchor, tool_guidance)
-  is NOT in the system message — it's in a user/assistant preamble pair.
-  **Why**: Commit b70ced03 moved volatile content out of system message for
-  prefix providers. If someone reverts this or leaks volatile content back,
-  cache hits drop from ~10K+ to ~2.4K.
-  **Pass means**: each warm follow-up turn hard-requires cache_read >= 8000
-  (system prompt ~7K + tool schemas cached).
-  Previously this was ~2400 when volatile content broke the prefix.
-  **Fail means**: volatile content leaked back into system message, breaking
-  prefix cache. Investigate `context_assembly_trace.system_prompt.environment_tokens`
-  — if it changes between turns, something volatile is in the system message.
+  Four turns observing provider-reported cache reads across conversation turns.
+  Every warm follow-up must report a positive cache read independently; an
+  aggregate hit cannot hide a later zero or missing observation. Prompt size and
+  provider quantization do not define a fixed token floor.
+  This live case proves observed reuse, not high hit rate or stable system-prefix
+  contents. Typed context-layout tests own prefix/volatile-lane correctness.
+  Exact input cache-read ratio is a separate soft diagnostic; missing provider
+  buckets remain unavailable rather than being treated as zero.
 prompt: |
   Reply with the single word ACK. Do not call any tools.
 capability: custom:cache
@@ -26,22 +21,34 @@ steps:
       - type: all_of
         criteria:
           - type: prompt_cache_tokens
-            min_read: 8000
+            min_read: 1
             min_creation: 0
+      - type: provider_prompt_cache_read_ratio
+        min: 0.80
+        warmup_turns: 0
+        warmup_rounds: 0
   - prompt: 'Reply with the single word ACK. Do not call any tools.'
     criteria:
       - type: all_of
         criteria:
           - type: prompt_cache_tokens
-            min_read: 8000
+            min_read: 1
             min_creation: 0
+      - type: provider_prompt_cache_read_ratio
+        min: 0.80
+        warmup_turns: 0
+        warmup_rounds: 0
   - prompt: 'Reply with the single word ACK. Do not call any tools.'
     criteria:
       - type: all_of
         criteria:
           - type: prompt_cache_tokens
-            min_read: 8000
+            min_read: 1
             min_creation: 0
+      - type: provider_prompt_cache_read_ratio
+        min: 0.80
+        warmup_turns: 0
+        warmup_rounds: 0
 criteria:
   - type: exit_code
     code: 0

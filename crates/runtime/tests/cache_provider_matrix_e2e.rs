@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -356,7 +356,7 @@ async fn matrix_actual_tool_and_user_journeys_preserve_native_prefix_and_pairing
         std::fs::write(workspace.path().join("a.txt"), "actual evidence alpha\n").unwrap();
         std::fs::write(workspace.path().join("b.txt"), "actual evidence beta\n").unwrap();
         let session = format!("matrix-{}", uuid::Uuid::new_v4());
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let mut host = server_host_builder(
             &gateway,
             &ledger,
@@ -500,7 +500,7 @@ async fn matrix_runtime_injections_keep_canonical_history_and_delivery_policy() 
             vec![response(case, "The explanation is complete.", None)],
         )])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = format!("volatile-{}", uuid::Uuid::new_v4());
         let mut host = server_host_builder(
             &gateway,
@@ -617,7 +617,7 @@ async fn completed_read_state() -> astra_runtime::turn::agentic_loop::host::Agen
     )
     .unwrap();
     let session = format!("prefix-{}", uuid::Uuid::new_v4());
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let mut host =
         server_host_builder(&gateway, &ledger, &session, case.provider, case.model, None)
             .with_static_tool_catalog_admissible(true)
@@ -670,7 +670,7 @@ async fn deepseek_required_settlement_keeps_stable_system_prefix() {
         )])
         .await;
         let session = format!("settlement-{}", uuid::Uuid::new_v4());
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let mut host = server_host_builder(
             &gateway,
             &ledger,
@@ -761,7 +761,7 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         ],
     )])
     .await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("append-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -795,7 +795,6 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
     );
     assert_eq!(ledger.attempt_count(), 2);
     assert_eq!((state.total_prompt, state.total_completion), (84, 14));
-    assert_eq!(ledger.canonical_transition_hashes().len(), 2);
     ledger.assert_quiescent();
     gateway.assert_complete();
     assert_eq!(
@@ -885,7 +884,7 @@ async fn provider_switch_replaces_live_authority_without_leaking_frame_syntax() 
         ),
     ])
     .await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("switch-{}", uuid::Uuid::new_v4());
     let mut state = loop_state(
         &session,
@@ -916,7 +915,6 @@ async fn provider_switch_replaces_live_authority_without_leaking_frame_syntax() 
     state.record_local_llm_round();
     assert_eq!(gateway.requests.lock().await.len(), 1);
     assert_eq!(ledger.attempt_count(), 1);
-    assert_eq!(ledger.canonical_transition_hashes().len(), 1);
     ledger.assert_quiescent();
     let old_frame = state
         .messages
@@ -994,7 +992,7 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             ],
         )])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = state.current_session_id.clone().unwrap();
         let mut host = server_host_builder(
             &gateway,

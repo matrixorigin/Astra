@@ -8,6 +8,7 @@ prompt: |
   If GLM 5.2 is available, ask a GLM 5.2 subagent to reply exactly
   ASTRA-CATALOG-GLM-OK, then tell me its reply and which model it used.
   Do not inspect local configuration or workspace files to find models.
+required_models: [glm-5.2]
 debug_log: true
 capability: delegation
 timeout_seconds: 180

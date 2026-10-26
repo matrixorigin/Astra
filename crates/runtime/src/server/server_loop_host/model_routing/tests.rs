@@ -67,7 +67,7 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
             model.completions_url_override = Some(url.clone());
         }
         let baseline = catalog.models.read().unwrap()["strong"].clone();
-        let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -76,7 +76,7 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
         )
         .with_admitted_model_execution(Some(baseline))
         .with_model_service(Some(catalog.clone()))
-        .with_test_inference_ledger(ledger.clone())
+        .with_provider_observations(ledger.clone())
         .with_test_judgment_clients([
             Box::new(classification_client)
                 as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
@@ -444,6 +444,14 @@ async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
     );
 
     catalog.models.write().unwrap().remove("economy");
+    restored.revalidate_catalog_execution().await.unwrap();
+    restored
+        .admitted_model_execution
+        .as_mut()
+        .unwrap()
+        .admitted_at = Instant::now()
+        - super::super::RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+        - std::time::Duration::from_secs(1);
     assert!(restored.revalidate_catalog_execution().await.is_err());
 }
 
@@ -557,6 +565,14 @@ async fn changed_contract_is_rejected_but_rotated_credentials_are_reauthorized()
     host.revalidate_catalog_execution().await.unwrap();
     assert_eq!(
         host.admitted_model_execution.as_ref().unwrap().api_key,
+        "provider-secret"
+    );
+    host.admitted_model_execution.as_mut().unwrap().admitted_at = Instant::now()
+        - super::super::RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+        - std::time::Duration::from_secs(1);
+    host.revalidate_catalog_execution().await.unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().api_key,
         "rotated"
     );
     catalog
@@ -566,6 +582,9 @@ async fn changed_contract_is_rejected_but_rotated_credentials_are_reauthorized()
         .get_mut("economy")
         .unwrap()
         .wire_model_name = Some("different-revision".into());
+    host.admitted_model_execution.as_mut().unwrap().admitted_at = Instant::now()
+        - super::super::RESOLVED_TURN_LLM_CONFIG_CACHE_TTL
+        - std::time::Duration::from_secs(1);
     assert!(host.revalidate_catalog_execution().await.is_err());
     let mut restored = self::host(catalog, engine);
     assert!(

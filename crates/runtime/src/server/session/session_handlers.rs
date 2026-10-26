@@ -175,7 +175,6 @@ pub(crate) struct CanonicalHeadObservabilityResponse {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
-    pub active_run_projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
@@ -210,6 +209,9 @@ pub(crate) struct TranscriptQuery {
     pub before_seq: Option<i64>,
     pub run_id: Option<String>,
     pub scope: Option<TranscriptQueryScope>,
+    pub reuse_run_id: Option<String>,
+    #[serde(default)]
+    pub reuse_terminal: bool,
     #[serde(default = "default_transcript_limit")]
     pub limit: u32,
 }
@@ -221,6 +223,7 @@ pub(crate) struct TranscriptQuery {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TranscriptQueryScope {
     RootConversation,
+    Conversation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +237,10 @@ fn transcript_read_scope(
     query: &TranscriptQuery,
 ) -> Result<TranscriptReadScope<'_>, (StatusCode, Json<ErrorResponse>)> {
     match (query.scope, query.run_id.as_deref()) {
+        (Some(TranscriptQueryScope::Conversation), _) => Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "conversation scope cannot use raw filters",
+        )),
         (Some(TranscriptQueryScope::RootConversation), Some(_)) => Err(error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "transcript scope=root_conversation cannot be combined with run_id",
@@ -244,6 +251,13 @@ fn transcript_read_scope(
         (None, Some(run_id)) => Ok(TranscriptReadScope::Run(run_id)),
         (None, None) => Ok(TranscriptReadScope::Session),
     }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum TranscriptReadResponse {
+    Raw(TranscriptResponse),
+    Conversation(Box<super::conversation::ConversationResponse>),
 }
 
 #[derive(Serialize)]
@@ -623,13 +637,8 @@ pub(crate) async fn get_session_state_handler(
     let state_summary = load_state_summary(pool, &session.user_id, &session.session_id).await?;
     let artifact_previews =
         load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
-    let projection_observability = load_session_projection_observability(
-        pool,
-        &session.user_id,
-        &session.session_id,
-        active_run.as_ref(),
-    )
-    .await?;
+    let projection_observability =
+        load_session_projection_observability(pool, &session.user_id, &session.session_id).await?;
     let active_run = active_run.map(|mut run| {
         run.replay_required = run_event_replay_required;
         run.replay_start_event_idx = if run_event_replay_required {
@@ -677,10 +686,10 @@ pub(crate) async fn get_session_transcript_handler(
     Path(session_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<TranscriptQuery>,
-) -> Result<Json<TranscriptResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TranscriptReadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
-    let _ = state
+    let session = state
         .session_service
         .get_session(session_id.clone(), user_id.clone())
         .await?;
@@ -688,6 +697,39 @@ pub(crate) async fn get_session_transcript_handler(
         .shared_pool
         .as_ref()
         .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    if query.scope == Some(TranscriptQueryScope::Conversation)
+        && query.run_id.is_none()
+        && query.before_seq.is_none()
+    {
+        let (selected_root, items, raw_page, truncated, history_loaded) =
+            super::conversation::read_conversation(
+                pool,
+                &user_id,
+                &session_id,
+                query.limit as usize,
+                query.reuse_run_id.as_deref(),
+                query.reuse_terminal,
+            )
+            .await
+            .map_err(internal_error)?;
+        return Ok(Json(TranscriptReadResponse::Conversation(Box::new(
+            super::conversation::ConversationResponse {
+                kind: "conversation",
+                session: session.into(),
+                selected_root,
+                items,
+                history_loaded,
+                raw_page: history_loaded.then_some(raw_page),
+                truncated: history_loaded.then_some(truncated),
+            },
+        ))));
+    }
+    if query.reuse_run_id.is_some() || query.reuse_terminal {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "continuation filters require conversation scope without raw filters",
+        ));
+    }
     let scope = transcript_read_scope(&query)?;
     let limit = query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
     let before_seq = query.before_seq.unwrap_or(i64::MAX);
@@ -825,15 +867,15 @@ pub(crate) async fn get_session_transcript_handler(
     } else {
         false
     };
-    Ok(Json(TranscriptResponse {
+    Ok(Json(TranscriptReadResponse::Raw(TranscriptResponse {
         session_id,
         items,
         next_before_seq,
         has_more,
-    }))
+    })))
 }
 
-fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, String> {
+pub(super) fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, String> {
     let run_id = session_row_optional_string(row, "run_id")?;
     let role = session_row_string(row, "role")?;
     let payload = session_row_optional_string(row, "payload_json")?
@@ -885,7 +927,7 @@ fn attach_transcript_artifacts(
     }
 }
 
-async fn hydrate_transcript_artifacts(
+pub(super) async fn hydrate_transcript_artifacts(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
@@ -1024,28 +1066,7 @@ async fn load_session_projection_observability(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
-    active_run: Option<&ActiveRunProjection>,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
-    let active_run_projection_lag_events = if let Some(active_run) = active_run {
-        let row = sqlx::query(
-            "SELECT projection_event_idx
-             FROM run_display_projections
-             WHERE run_id = ? AND user_id = ?",
-        )
-        .bind(&active_run.run_id)
-        .bind(user_id)
-        .fetch_optional(pool.get())
-        .await
-        .map_err(internal_error)?;
-        let projection_event_idx = row
-            .map(|row| session_row_i64(&row, "projection_event_idx"))
-            .transpose()
-            .map_err(internal_error)?
-            .unwrap_or(-1);
-        (active_run.run_event_high_watermark - projection_event_idx).max(0)
-    } else {
-        0
-    };
     let prompt_request_count =
         astra_services::count_prompt_requests_for_session(pool, user_id, session_id)
             .await
@@ -1145,7 +1166,6 @@ async fn load_session_projection_observability(
         .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
-        active_run_projection_lag_events,
         prompt_request_count,
         latest_prompt_request,
         canonical_heads,
@@ -2032,23 +2052,12 @@ fn default_fork_list_limit() -> u32 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionSegmentBatchRequest {
-    pub segment_hashes: Vec<String>,
+    pub manifest_root: String,
 }
 
 #[derive(Serialize)]
 pub(crate) struct SessionSegmentBatchResponse {
     pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionSegmentUploadRequest {
-    pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct SessionSegmentUploadResponse {
-    pub stored_segment_hashes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -2717,53 +2726,13 @@ pub(crate) async fn get_session_segments_handler(
         .as_ref()
         .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
     let segments = coordinator
-        .load_segments(
+        .load_manifest_content(
             &server_session_key(&user.user_id, &session.session_id),
-            &request.segment_hashes,
+            &request.manifest_root,
         )
         .await
         .map_err(session_context_http_error)?;
     Ok(Json(SessionSegmentBatchResponse { segments }))
-}
-
-pub(crate) async fn upload_session_segments_handler(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<SessionSegmentUploadRequest>,
-) -> Result<Json<SessionSegmentUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let session = state
-        .session_service
-        .get_session(session_id, user.user_id.clone())
-        .await?;
-    let pool = state
-        .shared_pool
-        .as_ref()
-        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
-    let _device = verify_device_proof_from_headers(
-        pool,
-        &user.user_id,
-        &session.session_id,
-        &headers,
-        DeviceProofPurpose::Publish,
-    )
-    .await?;
-    let key = server_session_key(&user.user_id, &session.session_id);
-    state
-        .session_context_coordinator
-        .as_ref()
-        .ok_or_else(|| internal_error("session context coordinator is not configured"))?
-        .store_segments(&key, &request.segments)
-        .await
-        .map_err(session_context_http_error)?;
-    Ok(Json(SessionSegmentUploadResponse {
-        stored_segment_hashes: request
-            .segments
-            .into_iter()
-            .map(|segment| segment.segment_hash)
-            .collect(),
-    }))
 }
 
 pub(crate) async fn issue_session_execution_grant_handler(
@@ -2915,10 +2884,14 @@ fn session_context_http_error(
         astra_services::SessionContextCoordinatorError::Invalid(message) => {
             error_response(StatusCode::BAD_REQUEST, message)
         }
+        astra_services::SessionContextCoordinatorError::ResourceLimit(message) => {
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, message)
+        }
         astra_services::SessionContextCoordinatorError::SegmentNotFound => {
             error_response(StatusCode::NOT_FOUND, error.to_string())
         }
         astra_services::SessionContextCoordinatorError::Fenced
+        | astra_services::SessionContextCoordinatorError::ExecutionOccupied(_)
         | astra_services::SessionContextCoordinatorError::SessionLifecycleFenced
         | astra_services::SessionContextCoordinatorError::Expired => {
             error_response(StatusCode::CONFLICT, error.to_string())
@@ -4005,7 +3978,6 @@ mod tests {
             match column {
                 "item_seq" => Ok(7),
                 "last_monotonic_id" => Ok(42),
-                "projection_event_idx" => Ok(8),
                 "total" => Ok(4),
                 "total_estimated_tokens" => Ok(123),
                 "high_watermark" => Ok(11),
@@ -4427,23 +4399,29 @@ mod tests {
         };
         assert_eq!(state_err.0, StatusCode::FORBIDDEN);
 
-        let transcript_err = match get_session_transcript_handler(
-            State(state),
-            Path(session_id.clone()),
-            auth_headers(),
-            Query(TranscriptQuery::default()),
-        )
-        .await
-        {
-            Ok(_) => panic!("transcript should stop at session ownership check"),
-            Err(err) => err,
-        };
-        assert_eq!(transcript_err.0, StatusCode::FORBIDDEN);
+        for scope in [None, Some(TranscriptQueryScope::Conversation)] {
+            let transcript_err = match get_session_transcript_handler(
+                State(state.clone()),
+                Path(session_id.clone()),
+                auth_headers(),
+                Query(TranscriptQuery {
+                    scope,
+                    ..Default::default()
+                }),
+            )
+            .await
+            {
+                Ok(_) => panic!("transcript should stop at session ownership check"),
+                Err(err) => err,
+            };
+            assert_eq!(transcript_err.0, StatusCode::FORBIDDEN);
+        }
 
         let calls = session_service.get_session_calls.lock().await.clone();
         assert_eq!(
             calls,
             vec![
+                (session_id.clone(), "artifact-owner".to_string()),
                 (session_id.clone(), "artifact-owner".to_string()),
                 (session_id, "artifact-owner".to_string()),
             ],

@@ -47,6 +47,22 @@ Server inference requires admitted Offering material before using a cached
 request configuration. Legacy model-name fallback metadata does not authorize
 a route change. Rate-limit waits and physical retries retain the admitted route;
 a different Offering must pass model admission before execution.
+Within a live Server execution, an admitted Offering is reused for up to
+30 seconds across model and readonly-tool rounds. Config projection and cache
+hits do not renew this grant. On expiry, canonical admission refreshes the
+pinned Offering; failure blocks dispatch and identity drift requires explicit
+reselection. Route/credential changes can therefore take up to this interval
+to affect an already admitted execution. Resume and explicit model switches
+retain fresh admission. This model-config lifetime does not grant identity,
+permission, or execution custody.
+Model dispatch consumes the existing exact Run owner's confirmed lease window
+locally. Only the heartbeat renews that window; a model round never extends it.
+Expired, retired, mismatched or settling ownership blocks another dispatch.
+Local cancellation signals remain immediate. Cross-process control is observed
+by the existing two-second watcher, subject to read latency; it is not a new
+synchronous transaction at each model round. Effectful tools continue using
+transactional dispatch admission. Unchanged input watermarks avoid empty guidance
+reads; changed notifications and final settlement still reconcile durable input.
 The shared cooldown interface records errors and wait/reject decisions only;
 it does not select another model or maintain fallback state and counters.
 
@@ -60,10 +76,11 @@ configuration concurrency fence.
 ## Execution attribution
 
 Routing evaluation must join selection evidence to actual inference execution.
-The canonical inference ledger owns the admitted route, logical invocation,
-physical provider attempts, and their terminal outcomes. Request diagnostics
-project that attribution through `ModelRequestContextEvent.route`; they must
-not construct a second route or credential authority.
+Offering admission owns route and credential authority. Agent physical requests
+are observed in process under their existing Run authority; standalone completion
+and background-accounting requests retain the inference ledger. Diagnostics may
+project those facts, but must not become another route or execution authority.
+Agent request observations and usage are not guaranteed to survive process failure.
 
 A route identifier belongs to a logical invocation, not a whole user turn or
 an adaptive routing decision. Physical retries share its route and invocation
@@ -193,7 +210,7 @@ CLI/Web selectors and WebSocket chat continue to use explicit Offerings.
 The configured strong Offering is admitted for the authenticated principal
 first. Auto treats model selection as an explicit semantic-admission boundary:
 it starts or awaits the shared bounded Work-admission request before primary
-inference under the default capacity-aware policy, `boundary_only`, or `always`.
+inference under the default `boundary_only` policy, explicit `capacity_aware`, or `always`.
 It reuses an existing decision or in-flight request. `disabled` still suppresses
 the judge, and missing or unusable assessments retain strong. Ordinary non-Auto
 turns retain their existing admission timing. The pure policy
@@ -504,3 +521,13 @@ the dashboard and can receive reviewed outcomes; recovery cannot dispatch them.
 The decision also pins the review rubric. Delayed outcomes and identical retries
 remain valid after deployment replacement, using the original run's deployment
 and rubric. A historical critical report never stops a replacement deployment.
+
+Ordinary provider requests reuse their admitted model without loading or
+embedding the complete authorized model catalog in the prompt. Catalog
+observation is explicit through `model_catalog`; selecting an actual named
+child model uses the existing authorized selector at that admission boundary.
+Unused catalog services do not become dependencies of ordinary model rounds.
+
+Model execution material carries the original trusted admission time. Moving or
+cloning that material into another host does not restart its validity window;
+an expired catalog admission must refresh before the next model request.

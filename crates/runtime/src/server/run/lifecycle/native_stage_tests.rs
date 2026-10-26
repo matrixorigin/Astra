@@ -63,8 +63,8 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
     }
     let store = Arc::new(database);
     let engine = RunEngine::new(store.clone());
-    let parent_authority = engine.start_run(&parent, &user, &session).await.unwrap();
     let binding = collaborator_db_fixture::seed_execution_binding(&pool, &user, &session).await;
+    let parent_authority = engine.start_run(&parent, &user, &session).await.unwrap();
 
     let mut discovery = authenticated_edge_discovery_fixture();
     discovery.user_id = user.clone();
@@ -374,6 +374,9 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         Some(receipt) => receipt,
         None => {
             let mut resumed = make_config();
+            // Dropping the crashed executor cancels its process-local I/O token.
+            // Recovery owns a new token; this scenario is not user cancellation.
+            resumed.cancel_token = Some(Arc::new(CancellationToken::new()));
             let claimed = store
                 .claim_exact_recovery_candidate_for_test(&user, &child)
                 .await
@@ -406,20 +409,37 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
     );
     let durable = store.load_run(&user, &child).await.unwrap().unwrap();
     assert_eq!(durable.status, receipt.result.status);
-    let terminal = durable
-        .events
-        .iter()
-        .find(|e| e["type"] == "tool_call_end" || e["event_type"] == "tool_call_end")
-        .expect("terminal projection must be durable");
     assert_eq!(
         durable
             .events
             .iter()
-            .filter(|event| event["type"] == "tool_call_end")
+            .filter(|event| event["event_type"] == "run_finished")
             .count(),
         1
     );
     let recorded = ledger.get(&identity).await.unwrap().unwrap();
+    assert_eq!(recorded.attempt_count, 1);
+    assert_eq!(
+        recorded.dispatch_certainty,
+        astra_turn_types::DispatchCertainty::Dispatched
+    );
+    assert_eq!(
+        recorded.state,
+        if matches!(scenario, Scenario::BindingFailure) {
+            astra_turn_types::ToolInvocationState::Failed
+        } else {
+            astra_turn_types::ToolInvocationState::Succeeded
+        }
+    );
+    assert_eq!(
+        recorded
+            .outcome
+            .as_ref()
+            .expect("settled native outcome")
+            .result()
+            .output,
+        "Original delivered result."
+    );
     if let Some(before) = before_replay {
         assert_eq!(
             recorded, before,
@@ -427,15 +447,12 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         );
     }
     if mailbox_unknown {
-        assert_eq!(terminal["guidance_disposition"], "unconfirmed");
         let outcome = serde_json::to_value(&recorded.outcome).unwrap();
         assert_eq!(
             outcome.pointer("/result/metadata/guidance_disposition"),
             Some(&json!("unconfirmed"))
         );
     } else {
-        assert_eq!(terminal["native_session_binding"], "unconfirmed");
-        assert_eq!(terminal["native_session_binding_reason"], "persistence");
         let recreated = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(&owner);
         assert!(
             recreated

@@ -1302,7 +1302,7 @@ fn build_ws_chat_request(message: WsChatMessage) -> astra_services::runs::ChatRe
         execution_budget,
         execution_time_budget: None,
         admitted_execution_deadline: None,
-        conversation_authority: None,
+
         execution_policy: Default::default(),
         explain,
         interaction_mode,

@@ -435,6 +435,28 @@ describe("AstraClient — Runs", () => {
     ).toContain("last_index=5");
   });
 
+  test("getSessionConversation preserves typed input identity and raw cursors", async () => {
+    const body = { kind: "conversation", session: { session_id: "s1" },
+      selected_root: { run_id: "r1", status: "failed" },
+      items: [{ kind: "opening", id: "input:r1:source-1", run_id: "r1", content: " \n你好 ",
+        source_event_id: "source-1", created_at: "2026-10-25T03:00:00.123456Z" }],
+      history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false };
+    globalThis.fetch = mockFetch(200, body);
+    expect(await createClient().getSessionConversation("s1")).toEqual(body);
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("/sessions/s1/transcript?scope=conversation&limit=200");
+  });
+
+  test("getSessionConversation sends the reusable continuation and preserves explicit history omission", async () => {
+    const body = { kind: "conversation", session: { session_id: "s1" },
+      selected_root: { run_id: "r1", status: "completed" },
+      history_loaded: false, items: [], raw_page: null, truncated: null };
+    globalThis.fetch = mockFetch(200, body);
+    expect(await createClient().getSessionConversation("s1", 200, { runId: "r1", preserveTerminal: true })).toEqual(body);
+    const url = new URL((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    expect(url.searchParams.get("reuse_run_id")).toBe("r1");
+    expect(url.searchParams.get("reuse_terminal")).toBe("true");
+  });
+
   test("getRunProjection uses bounded projection endpoint", async () => {
     globalThis.fetch = mockFetch(200, {
       run_id: "r1",
@@ -457,16 +479,11 @@ describe("AstraClient — Runs", () => {
       transport: "edge_ws",
       fallback_policy: "disabled",
       run_event_high_watermark: 7,
-      projection_event_idx: 6,
-      projection_updated_at: "2026-06-10T00:00:00.000Z",
-      projection_hash: "hash",
       total_prompt_tokens: 1,
       total_completion_tokens: 2,
       total_tool_calls: 3,
       observability: {
-        has_durable_projection: true,
         observability_available: true,
-        projection_lag_events: 1,
         prompt_request_count: 0,
       },
       recent_events: [
@@ -488,41 +505,7 @@ describe("AstraClient — Runs", () => {
     expect(url).toContain("recent_limit=25");
   });
 
-  test("repairRunProjection posts to repair endpoint", async () => {
-    globalThis.fetch = mockFetch(200, {
-      repaired: true,
-      projection: {
-        run_id: "r1",
-        session_id: "s1",
-        status: "running",
-        run_event_high_watermark: 7,
-        projection_event_idx: 7,
-        projection_updated_at: "2026-06-10T00:00:00.000Z",
-        projection_hash: "hash",
-        total_prompt_tokens: 1,
-        total_completion_tokens: 2,
-        total_tool_calls: 3,
-        observability: {
-          has_durable_projection: true,
-          observability_available: true,
-          projection_lag_events: 0,
-          prompt_request_count: 0,
-        },
-        recent_events: [],
-      },
-    });
 
-    const repaired = await createClient().repairRunProjection("r1", {
-      recentLimit: 10,
-    });
-
-    expect(repaired.repaired).toBe(true);
-    expect(repaired.projection.projection_event_idx).toBe(7);
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toContain("/chat/runs/r1/projection/repair");
-    expect(call[0]).toContain("recent_limit=10");
-    expect(call[1].method).toBe("POST");
-  });
 
   test("listRuns normalizes snake_case runs", async () => {
     globalThis.fetch = mockFetch(200, {

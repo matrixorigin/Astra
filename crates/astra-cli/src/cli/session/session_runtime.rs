@@ -1462,53 +1462,6 @@ pub(crate) async fn presented_access_token(
         .ok_or(AccessMiss::NotLoggedIn)
 }
 
-/// Accounting and other best-effort reads must not start a refresh. A short
-/// deadline cancelling that refresh can persist `refresh_pending` without a
-/// settled result.
-pub(crate) async fn access_token_without_refresh(profile: Option<&str>) -> Option<String> {
-    if let Some(binding) = crate::cli::native_auth::active() {
-        // File locking stays on the blocking pool. A still-valid token is
-        // usable for this read even inside the refresh skew; do not rotate it.
-        let session = binding.snapshot_off_runtime().await.ok()?;
-        if session.refresh_pending {
-            return None;
-        }
-        let now = astra_credentials::native::unix_now().ok()?;
-        if session.expires_at <= now {
-            return None;
-        }
-        return Some(session.access_token);
-    }
-    let profile = profile.map(str::to_owned);
-    tokio::task::spawn_blocking(move || {
-        let now = chrono::Utc::now().timestamp();
-        if let Some(token) = active_env_access_token_if_unexpired(now) {
-            return Some(token);
-        }
-        let creds = load_credentials();
-        let name = profile_name(profile.as_deref(), &creds);
-        let token = creds.profiles.get(&name)?.access_token.clone()?;
-        access_token_unexpired(&token, now).then_some(token)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-fn access_token_unexpired(token: &str, now_epoch: i64) -> bool {
-    jwt_expiry_epoch(token)
-        .map(|exp| exp > now_epoch)
-        .unwrap_or(true)
-}
-
-fn active_env_access_token_if_unexpired(now_epoch: i64) -> Option<String> {
-    let token = std::env::var("ASTRA_ACCESS_TOKEN").ok()?;
-    if token.is_empty() || !access_token_unexpired(&token, now_epoch) {
-        return None;
-    }
-    Some(token)
-}
-
 pub(crate) fn initialize_session_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
@@ -2610,32 +2563,6 @@ mod tests {
                     std::env::remove_var(self.key);
                 },
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn accounting_read_keeps_a_token_inside_the_refresh_skew() {
-        let now = chrono::Utc::now().timestamp();
-        let soon = jwt_with_exp(now + 30);
-        let expired = jwt_with_exp(now - 5);
-        assert!(
-            super::access_token_unexpired(&soon, now),
-            "a token inside the 60s refresh skew is still valid"
-        );
-        assert!(
-            super::access_token_needs_refresh(&soon, now),
-            "the skew still decides when a refresh should start"
-        );
-        assert!(!super::access_token_unexpired(&expired, now));
-        if crate::cli::native_auth::active().is_none() {
-            let _g = isolate_credentials();
-            let _soon = EnvGuard::set("ASTRA_ACCESS_TOKEN", &soon);
-            assert_eq!(
-                super::access_token_without_refresh(None).await.as_deref(),
-                Some(soon.as_str())
-            );
-            let _expired = EnvGuard::set("ASTRA_ACCESS_TOKEN", &expired);
-            assert_eq!(super::access_token_without_refresh(None).await, None);
         }
     }
 

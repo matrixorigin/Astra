@@ -251,6 +251,10 @@ async fn insert_state_item(
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: run_id.to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
@@ -813,8 +817,6 @@ async fn cleanup_device_owner_fixture(pool: &SharedPool, user_id: &str, session_
 
 async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
-        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
-        "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
@@ -1027,11 +1029,11 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         .unwrap_or(Some(-1))
         .unwrap_or(-1);
     assert!(
-        min_idx == 0 && event_count == distinct_count && max_idx + 1 == event_count,
+        min_idx == 1 && event_count == distinct_count && max_idx == event_count,
         "S04 server event_idx must be monotonic/no-gap/no-duplicate; min={min_idx} max={max_idx} count={event_count} distinct={distinct_count}"
     );
     assert!(
-        seen.len() as i64 == event_count,
+        seen.len() as i64 == event_count + 1,
         "S04 client simulated IndexedDB watermark must include every server event; client={} server={event_count}",
         seen.len()
     );

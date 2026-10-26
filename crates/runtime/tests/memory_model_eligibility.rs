@@ -17,7 +17,9 @@ use axum::{
     Json, Router,
     routing::{get, post},
 };
+use futures_util::FutureExt;
 use serde_json::json;
+use sqlx::Connection;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -32,10 +34,54 @@ mod isolated_database;
 async fn readwrite_memoria_extraction_cannot_spend_deployment_credentials() {
     let settings = MatrixOneSettings::from_env();
     isolated_database::require_isolated_database(&settings.database);
-    astra_services::storage::ensure_core_schema(&settings, "mysql")
+    let mut admin_settings = settings.clone();
+    admin_settings.database = "mysql".into();
+    let mut admin = sqlx::MySqlConnection::connect(&admin_settings.database_url_with_password())
         .await
-        .unwrap();
-    let pool = SharedPool::new(&settings).await.unwrap();
+        .expect("isolated fixture admin connection");
+    let database = format!("astra_test_memory_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .expect("create owned Memory catalog");
+    let mut settings = settings;
+    settings.database = database.clone();
+    let mut owned_pool = None;
+    let mut provider_task = None;
+    let result = std::panic::AssertUnwindSafe(async {
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        owned_pool = Some(pool.clone());
+        check_memory_owner(&settings, pool, &mut provider_task).await;
+    })
+    .catch_unwind()
+    .await;
+    if let Some(task) = provider_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(pool) = owned_pool {
+        pool.close().await;
+    }
+    let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await;
+    if let Err(panic) = result {
+        if let Err(error) = cleanup {
+            eprintln!("owned Memory catalog cleanup failed: {error}");
+        }
+        std::panic::resume_unwind(panic);
+    }
+    cleanup.expect("drop only owned Memory catalog");
+}
+
+async fn check_memory_owner(
+    settings: &MatrixOneSettings,
+    pool: SharedPool,
+    provider_task: &mut Option<tokio::task::JoinHandle<()>>,
+) {
     let encryptor = Arc::new(FernetTokenEncryptor::new("memory-owner-test-encryption").unwrap());
     let subject = uuid::Uuid::new_v4().to_string();
     let whoami = json!({"user_id":subject, "key_id":"fresh-rw-key", "is_active":true, "is_master":false,
@@ -51,9 +97,9 @@ async fn readwrite_memoria_extraction_cannot_spend_deployment_credentials() {
         }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
+    *provider_task = Some(tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
-    });
+    }));
     let auth = DatabaseAuthService::new(
         settings.clone(),
         JwtSettings {
@@ -81,7 +127,10 @@ async fn readwrite_memoria_extraction_cannot_spend_deployment_credentials() {
     sqlx::query("INSERT INTO infra_llm_models (model_id,model_name,provider,base_url,is_active,context_window,api_key_encrypted,input_modalities,output_modalities,supported_parameters,pricing,tags,quirks) VALUES (?, ?, 'openai', ?, 1, 128000, ?, '[\"text\"]', '[\"text\"]', '[]', '{}', '[\"selector\"]', '{}')")
         .bind(&model_id).bind(&model_name).bind(format!("{base}/v1")).bind(encryptor.encrypt("deployment-only-key").unwrap())
         .execute(pool.get()).await.unwrap();
-    let resolver = Arc::new(PoolMemoryInferenceResolver::new(pool.clone(), encryptor));
+    let resolver = Arc::new(PoolMemoryInferenceResolver::new(
+        pool.clone(),
+        encryptor.clone(),
+    ));
     assert!(resolver.resolve_candidates(&user).await.is_empty());
     let scope = |owner: &str| InferenceInvocationScope::Session {
         session_id: owner.into(),
@@ -133,9 +182,18 @@ async fn readwrite_memoria_extraction_cannot_spend_deployment_credentials() {
     let control = format!("local-{}", uuid::Uuid::new_v4());
     sqlx::query("INSERT INTO auth_users (user_id, username, email, password_hash, is_active) VALUES (?, ?, ?, '', 1)")
         .bind(&control).bind(&control).bind(format!("{control}@test.invalid")).execute(pool.get()).await.unwrap();
+    let direct = astra_services::models::resolve_memory_offerings(
+        settings,
+        &encryptor,
+        &control,
+        Some(pool.get()),
+    )
+    .await
+    .expect("self-hosted control catalog must decode before adapter eligibility");
     let candidates = resolver.resolve_candidates(&control).await;
     if std::env::var("ASTRA_DEPLOYMENT_MODE").as_deref() == Ok("cloud-byok") {
         assert!(candidates.is_empty());
+        assert!(direct.is_empty());
     } else {
         let client = candidates
             .iter()
@@ -193,5 +251,4 @@ async fn readwrite_memoria_extraction_cannot_spend_deployment_credentials() {
         .await
         .unwrap();
     auth.disconnect_memoria(&user).await.unwrap();
-    server.abort();
 }

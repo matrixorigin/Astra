@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, query, query_scalar};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::RandomState},
+    hash::BuildHasher,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
@@ -891,6 +892,81 @@ pub fn is_safe_moi_model_gateway_error_code(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// Bounded recovery facts already sanitized by the negotiated model gateway.
+/// Provider bodies and arbitrary classified-error details never enter this value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelGatewayErrorMetadata {
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+}
+
+impl ModelGatewayErrorMetadata {
+    pub fn from_error(error: &astra_core::ClassifiedError) -> Option<Self> {
+        let details: serde_json::Value =
+            serde_json::from_str(error.details_json.as_deref()?).ok()?;
+        Self::from_details(details.as_object()?)
+    }
+
+    pub fn from_details(details: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        use serde_json::Value;
+        if details.get("source").and_then(Value::as_str) != Some(MOI_MODEL_GATEWAY_ERROR_SOURCE) {
+            return None;
+        }
+        Some(Self {
+            source: MOI_MODEL_GATEWAY_ERROR_SOURCE.into(),
+            retryable: details.get("retryable").and_then(Value::as_bool),
+            action: details
+                .get("action")
+                .and_then(Value::as_str)
+                .filter(|value| is_safe_moi_model_gateway_error_code(value))
+                .map(str::to_owned),
+            http_status: details
+                .get("http_status")
+                .and_then(Value::as_u64)
+                .filter(|status| (400..=599).contains(status))
+                .map(|status| status as u16),
+        })
+    }
+
+    /// Stored receipts must validate rather than sanitize corrupt recovery facts.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.source != MOI_MODEL_GATEWAY_ERROR_SOURCE
+            || self
+                .action
+                .as_deref()
+                .is_some_and(|action| !is_safe_moi_model_gateway_error_code(action))
+            || self
+                .http_status
+                .is_some_and(|status| !(400..=599).contains(&status))
+        {
+            return Err("invalid model gateway error metadata");
+        }
+        Ok(())
+    }
+
+    pub fn wire_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::Value;
+        let mut fields =
+            serde_json::Map::from_iter([("source".into(), Value::String(self.source.clone()))]);
+        if let Some(retryable) = self.retryable {
+            fields.insert("retryable".into(), retryable.into());
+        }
+        if let Some(action) = &self.action {
+            fields.insert("action".into(), action.clone().into());
+        }
+        if let Some(status) = self.http_status {
+            fields.insert("http_status".into(), status.into());
+        }
+        fields
+    }
+}
+
 impl ModelExecutionPlacement {
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -938,6 +1014,9 @@ impl RuntimeModelReasoningControl {
 /// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    /// Completion time of the trusted admission that produced this material.
+    /// Cloning or installing it in another execution must not renew the grant.
+    pub admitted_at: Instant,
     pub price_snapshot: Option<InferencePriceSnapshot>,
     pub offering_id: String,
     pub source_identity: Option<ResolvedModelSourceIdentity>,
@@ -992,6 +1071,7 @@ impl AdmittedModelExecution {
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
+            admitted_at: Instant::now(),
             price_snapshot: offering.model.price_snapshot,
             offering_id: offering.offering_id,
             source_identity: Some(ResolvedModelSourceIdentity {
@@ -1029,6 +1109,7 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            admitted_at: Instant::now(),
             price_snapshot: None,
             offering_id,
             source_identity: None,
@@ -1201,6 +1282,15 @@ impl ResolvedActiveLlmModel {
 }
 
 const ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(30);
+const ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES: usize = 256;
+const ACTIVE_LLM_MODEL_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ACTIVE_LLM_MODEL_CACHE_MAX_ENTRY_BYTES: usize = 128 * 1024;
+// hashbrown may grow after repeated remove/insert churn even at <=256 live
+// entries. Reserve 1024 buckets (including control/structural overhead), not
+// just the 512 buckets sufficient for an initially populated cache.
+const ACTIVE_LLM_MODEL_CACHE_CONTAINER_BYTES: usize = ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES
+    * 4
+    * (std::mem::size_of::<(ActiveLlmModelCacheKey, ActiveLlmModelCacheEntry)>() + 64);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ActiveLlmModelCacheKey {
@@ -1243,15 +1333,131 @@ impl ActiveLlmModelCacheKey {
     }
 }
 
-#[derive(Clone)]
 struct ActiveLlmModelCacheEntry {
     inserted_at: Instant,
-    model: ResolvedActiveLlmModel,
+    model: Arc<ResolvedActiveLlmModel>,
+    bytes: usize,
+}
+
+impl ActiveLlmModelCacheEntry {
+    fn new(
+        key: &ActiveLlmModelCacheKey,
+        model: ResolvedActiveLlmModel,
+        now: Instant,
+    ) -> Option<Self> {
+        let bytes = active_llm_model_cache_entry_bytes(key, &model)?;
+        Some(Self {
+            inserted_at: now,
+            model: Arc::new(model),
+            bytes,
+        })
+    }
+}
+
+/// Conservative retained-allocation accounting, not a process RSS measurement.
+/// Oversized configurations remain usable without entering the cache. Inspect
+/// owned capacities before taking the global lock; never serialize credentials.
+fn active_llm_model_cache_entry_bytes(
+    key: &ActiveLlmModelCacheKey,
+    model: &ResolvedActiveLlmModel,
+) -> Option<usize> {
+    fn charge(left: &mut usize, bytes: usize) -> Option<()> {
+        *left = left.checked_sub(bytes)?;
+        Some(())
+    }
+    fn object(map: &Map<String, Value>, left: &mut usize, depth: usize) -> Option<()> {
+        // serde_json currently uses BTreeMap. Reserve a full node per member,
+        // including small, sparsely occupied maps, rather than just JSON bytes.
+        charge(left, map.len().checked_mul(1024)?)?;
+        for (key, value) in map {
+            charge(left, key.capacity())?;
+            json(value, left, depth + 1)?;
+        }
+        Some(())
+    }
+    fn json(value: &Value, left: &mut usize, depth: usize) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        match value {
+            Value::String(text) => charge(left, text.capacity())?,
+            Value::Array(values) => {
+                charge(
+                    left,
+                    values
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<Value>())?,
+                )?;
+                for value in values {
+                    json(value, left, depth + 1)?;
+                }
+            }
+            Value::Object(map) => object(map, left, depth)?,
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+        Some(())
+    }
+    let mut left = ACTIVE_LLM_MODEL_CACHE_MAX_ENTRY_BYTES;
+    charge(
+        &mut left,
+        std::mem::size_of::<(ActiveLlmModelCacheKey, ActiveLlmModelCacheEntry)>()
+            + std::mem::size_of::<ResolvedActiveLlmModel>()
+            + 2 * std::mem::size_of::<usize>(),
+    )?;
+    let selector = match &key.selector {
+        ActiveLlmModelSelector::ModelName(value) | ActiveLlmModelSelector::OfferingId(value) => {
+            value
+        }
+    };
+    for value in [
+        &key.host,
+        &key.user,
+        &key.database,
+        selector,
+        &model.model_name,
+        &model.api_key,
+        &model.base_url,
+        &model.provider,
+    ] {
+        charge(&mut left, value.capacity())?;
+    }
+    if let Some(value) = &model.wire_model_name {
+        charge(&mut left, value.capacity())?;
+    }
+    if let Some(snapshot) = &model.price_snapshot {
+        let price = &snapshot.pricing;
+        for value in [
+            &price.currency,
+            &price.unit,
+            &price.source,
+            &price.configuration_updated_at,
+        ] {
+            charge(&mut left, value.capacity())?;
+        }
+    }
+    charge(
+        &mut left,
+        model
+            .tags
+            .capacity()
+            .checked_mul(std::mem::size_of::<String>())?,
+    )?;
+    for tag in &model.tags {
+        charge(&mut left, tag.capacity())?;
+    }
+    for map in [&model.request_body_overrides, &model.request_headers]
+        .into_iter()
+        .flatten()
+    {
+        object(map, &mut left, 0)?;
+    }
+    Some(ACTIVE_LLM_MODEL_CACHE_MAX_ENTRY_BYTES - left)
 }
 
 #[derive(Default)]
 struct ActiveLlmModelResolutionCache {
     entries: HashMap<ActiveLlmModelCacheKey, ActiveLlmModelCacheEntry>,
+    bytes: usize,
 }
 
 impl ActiveLlmModelResolutionCache {
@@ -1259,74 +1465,116 @@ impl ActiveLlmModelResolutionCache {
         &self,
         key: &ActiveLlmModelCacheKey,
         now: Instant,
-    ) -> Option<ResolvedActiveLlmModel> {
+    ) -> Option<Arc<ResolvedActiveLlmModel>> {
         let entry = self.entries.get(key)?;
-        if now.saturating_duration_since(entry.inserted_at) <= ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL
+        (now.saturating_duration_since(entry.inserted_at) <= ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL)
+            .then(|| Arc::clone(&entry.model))
+    }
+
+    fn get_stale(&self, key: &ActiveLlmModelCacheKey) -> Option<Arc<ResolvedActiveLlmModel>> {
+        self.entries.get(key).map(|entry| Arc::clone(&entry.model))
+    }
+
+    fn insert(&mut self, key: ActiveLlmModelCacheKey, entry: Option<ActiveLlmModelCacheEntry>) {
+        // A newly resolved but uncacheable value must not leave its old value
+        // available to a subsequent stale-if-DB-error lookup.
+        self.remove(&key);
+        let Some(entry) = entry else {
+            return;
+        };
+        while self.entries.len() >= ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES
+            || ACTIVE_LLM_MODEL_CACHE_CONTAINER_BYTES + self.bytes + entry.bytes
+                > ACTIVE_LLM_MODEL_CACHE_MAX_BYTES
         {
-            return Some(entry.model.clone());
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+                .expect("bounded cache has an eviction candidate");
+            self.remove(&oldest);
         }
-        None
+        self.bytes += entry.bytes;
+        self.entries.insert(key, entry);
     }
 
-    fn get_stale(&self, key: &ActiveLlmModelCacheKey) -> Option<ResolvedActiveLlmModel> {
-        self.entries.get(key).map(|entry| entry.model.clone())
-    }
-
-    fn insert(&mut self, key: ActiveLlmModelCacheKey, model: ResolvedActiveLlmModel, now: Instant) {
-        self.entries.insert(
-            key,
-            ActiveLlmModelCacheEntry {
-                inserted_at: now,
-                model,
-            },
-        );
+    fn remove(&mut self, key: &ActiveLlmModelCacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes -= entry.bytes;
+        }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.bytes = 0;
     }
 }
 
 static ACTIVE_LLM_MODEL_RESOLUTION_CACHE: LazyLock<Mutex<ActiveLlmModelResolutionCache>> =
     LazyLock::new(|| Mutex::new(ActiveLlmModelResolutionCache::default()));
 
-static ACTIVE_LLM_MODEL_RESOLUTION_LOCKS: LazyLock<
-    Mutex<HashMap<ActiveLlmModelCacheKey, Arc<tokio::sync::Mutex<()>>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Fixed local fill locks replace the per-key lock map. A cancelled holder or
+/// waiter leaves no key behind. Cache invalidation must not replace these locks
+/// and allow two concurrent fills for the same key. Colliding misses may wait;
+/// cache hits never acquire a stripe. These locks confer no execution authority.
+struct ActiveLlmModelResolutionFlights {
+    hasher: RandomState,
+    locks: [tokio::sync::Mutex<()>; 64],
+}
+
+impl Default for ActiveLlmModelResolutionFlights {
+    fn default() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+impl ActiveLlmModelResolutionFlights {
+    fn for_key(&self, key: &ActiveLlmModelCacheKey) -> &tokio::sync::Mutex<()> {
+        &self.locks[self.hasher.hash_one(key) as usize % self.locks.len()]
+    }
+}
+
+static ACTIVE_LLM_MODEL_RESOLUTION_LOCKS: LazyLock<ActiveLlmModelResolutionFlights> =
+    LazyLock::new(ActiveLlmModelResolutionFlights::default);
 
 fn active_llm_model_resolution_cache_lookup(
     key: &ActiveLlmModelCacheKey,
 ) -> Option<ResolvedActiveLlmModel> {
-    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+    let model = ACTIVE_LLM_MODEL_RESOLUTION_CACHE
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
-        .get_fresh(key, Instant::now())
+        .get_fresh(key, Instant::now());
+    model.map(|model| (*model).clone())
 }
 
 fn active_llm_model_resolution_cache_stale_lookup(
     key: &ActiveLlmModelCacheKey,
 ) -> Option<ResolvedActiveLlmModel> {
-    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+    let model = ACTIVE_LLM_MODEL_RESOLUTION_CACHE
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
-        .get_stale(key)
+        .get_stale(key);
+    model.map(|model| (*model).clone())
 }
 
 fn active_llm_model_resolution_cache_store(
     key: ActiveLlmModelCacheKey,
     model: ResolvedActiveLlmModel,
 ) {
+    let entry = ActiveLlmModelCacheEntry::new(&key, model, Instant::now());
     ACTIVE_LLM_MODEL_RESOLUTION_CACHE
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
-        .insert(key, model, Instant::now());
+        .insert(key, entry);
 }
 
 fn active_llm_model_resolution_cache_remove(key: &ActiveLlmModelCacheKey) {
     ACTIVE_LLM_MODEL_RESOLUTION_CACHE
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
-        .entries
         .remove(key);
 }
 
@@ -1342,22 +1590,6 @@ fn deployment_batch_query_error(
     ModelOfferingResolutionError::Backend(format!("DB query: {error}"))
 }
 
-fn active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) -> Arc<tokio::sync::Mutex<()>> {
-    ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
-        .lock()
-        .expect("active LLM model resolution lock map poisoned")
-        .entry(key.clone())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
-
-fn remove_active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) {
-    ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
-        .lock()
-        .expect("active LLM model resolution lock map poisoned")
-        .remove(key);
-}
-
 fn active_llm_model_resolution_error_allows_stale_cache(error: &str) -> bool {
     classify_model_resolution_error_message(error) == ErrorKind::DatabaseError
 }
@@ -1366,10 +1598,6 @@ pub fn invalidate_active_llm_model_resolution_cache() {
     ACTIVE_LLM_MODEL_RESOLUTION_CACHE
         .lock()
         .expect("active LLM model resolution cache lock poisoned")
-        .clear();
-    ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
-        .lock()
-        .expect("active LLM model resolution lock map poisoned")
         .clear();
 }
 
@@ -1596,8 +1824,10 @@ pub async fn resolve_active_llm_model(
         return Ok(cached);
     }
 
-    let singleflight = active_llm_model_resolution_lock(&cache_key);
-    let _singleflight_guard = singleflight.lock().await;
+    let _singleflight_guard = ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
+        .for_key(&cache_key)
+        .lock()
+        .await;
     if let Some(cached) = active_llm_model_resolution_cache_lookup(&cache_key) {
         return Ok(cached);
     }
@@ -1606,7 +1836,6 @@ pub async fn resolve_active_llm_model(
     match resolved {
         Ok(resolved) => {
             active_llm_model_resolution_cache_store(cache_key.clone(), resolved.clone());
-            remove_active_llm_model_resolution_lock(&cache_key);
             Ok(resolved)
         }
         Err(err) => {
@@ -1619,10 +1848,8 @@ pub async fn resolve_active_llm_model(
                     error = %err,
                     "active LLM model refresh failed; using stale cached model"
                 );
-                remove_active_llm_model_resolution_lock(&cache_key);
                 return Ok(stale);
             }
-            remove_active_llm_model_resolution_lock(&cache_key);
             Err(err)
         }
     }
@@ -1790,8 +2017,10 @@ pub async fn resolve_active_llm_offering(
         });
     }
 
-    let singleflight = active_llm_model_resolution_lock(&cache_key);
-    let _singleflight_guard = singleflight.lock().await;
+    let _singleflight_guard = ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
+        .for_key(&cache_key)
+        .lock()
+        .await;
     if let Some(model) = active_llm_model_resolution_cache_lookup(&cache_key) {
         return Ok(ResolvedModelOffering {
             offering_id: offering_id.to_string(),
@@ -1803,7 +2032,6 @@ pub async fn resolve_active_llm_offering(
     match resolved {
         Ok(model) => {
             active_llm_model_resolution_cache_store(cache_key.clone(), model.clone());
-            remove_active_llm_model_resolution_lock(&cache_key);
             Ok(ResolvedModelOffering {
                 offering_id: offering_id.to_string(),
                 model,
@@ -1819,13 +2047,11 @@ pub async fn resolve_active_llm_offering(
                     error = %error,
                     "Offering refresh failed; using stale cached model"
                 );
-                remove_active_llm_model_resolution_lock(&cache_key);
                 return Ok(ResolvedModelOffering {
                     offering_id: offering_id.to_string(),
                     model,
                 });
             }
-            remove_active_llm_model_resolution_lock(&cache_key);
             Err(error)
         }
     }
@@ -1932,71 +2158,73 @@ async fn revalidate_admitted_model_executions_with_access(
         .filter(|offering_id| seen.insert(*offering_id))
         .collect();
 
-    let mut personal_query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
-         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
+    // Resolve the exact requested IDs and their deployment eligibility in one
+    // database snapshot. The personal row retains precedence, including an
+    // inactive personal row; neither discovery nor a cached catalog grants
+    // access to a deployment credential.
+    let shared_enabled = match deployment_access {
+        Some(allowed) => allowed,
+        None => deployment_mode_allows_shared_models(
+            configured_deployment_mode()
+                .map_err(ModelOfferingResolutionError::Backend)?
+                .as_deref(),
+        )
+        .map_err(ModelOfferingResolutionError::Backend)?,
+    };
+    let mut query = QueryBuilder::<sqlx::MySql>::new(
+        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url,
+                context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
+                NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
+                NULL AS tags_json, CAST(NULL AS INT) AS max_completion_tokens, 1 AS personal
          FROM user_llm_models WHERE user_id = ",
     );
-    personal_query.push_bind(user_id).push(" AND model_id IN (");
+    query.push_bind(user_id).push(" AND model_id IN (");
     {
-        let mut separated = personal_query.separated(", ");
-        for offering_id in &unique {
-            separated.push_bind(*offering_id);
+        let mut ids = query.separated(", ");
+        for id in &unique {
+            ids.push_bind(*id);
         }
     }
-    personal_query.push(')');
+    query.push(") UNION ALL
+         SELECT model_id, model_name AS model_alias, model_name, provider, api_key_encrypted, base_url,
+                context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
+                CAST(updated_at AS CHAR) AS configuration_updated_at,
+                CAST(quirks AS CHAR) AS quirks_json, CAST(pricing AS CHAR) AS pricing_json,
+                CAST(tags AS CHAR) AS tags_json, max_completion_tokens, 0 AS personal
+         FROM infra_llm_models WHERE model_id IN (");
+    {
+        let mut ids = query.separated(", ");
+        for id in &unique {
+            ids.push_bind(*id);
+        }
+    }
+    query.push(") AND ").push_bind(shared_enabled);
+    if deployment_access.is_none() {
+        query
+            .push(
+                " AND NOT EXISTS (SELECT 1 FROM auth_external_identities
+                       WHERE astra_user_id = ",
+            )
+            .push_bind(user_id)
+            .push(" AND (provider_id LIKE 'memoria:%' OR provider_id LIKE 'uc:%'))");
+    }
     let mut personal = HashMap::new();
-    for row in personal_query
+    let mut deployment = HashMap::new();
+    for row in query
         .build()
         .fetch_all(&pool)
         .await
-        .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?
+        .map_err(|error| deployment_batch_query_error(matrixone, &unique, error))?
     {
         let id: String = row.try_get("model_id").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.model_id: {error}"
-            ))
+            ModelOfferingResolutionError::Backend(format!("invalid Offering model_id: {error}"))
         })?;
-        personal.insert(id, row);
-    }
-
-    let unresolved: Vec<&str> = unique
-        .iter()
-        .copied()
-        .filter(|id| !personal.contains_key(*id))
-        .collect();
-    let deployment_allowed = if unresolved.is_empty() {
-        false
-    } else if let Some(allowed) = deployment_access {
-        allowed
-    } else {
-        deployment_models_allowed(&pool, user_id)
-            .await
-            .map_err(ModelOfferingResolutionError::Backend)?
-    };
-    let mut deployment = HashMap::new();
-    if deployment_allowed {
-        let mut deployment_query = QueryBuilder::<sqlx::MySql>::new(format!(
-            "SELECT model_id, {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id IN ("
-        ));
-        {
-            let mut separated = deployment_query.separated(", ");
-            for offering_id in &unresolved {
-                separated.push_bind(*offering_id);
-            }
-        }
-        deployment_query.push(')');
-        let deployment_rows = deployment_query
-            .build()
-            .fetch_all(&pool)
-            .await
-            .map_err(|error| deployment_batch_query_error(matrixone, &unresolved, error))?;
-        for row in deployment_rows {
-            let id: String = row.try_get("model_id").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid infra_llm_models.model_id: {error}"
-                ))
-            })?;
+        let is_personal: i64 = row.try_get("personal").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!("invalid Offering source: {error}"))
+        })?;
+        if is_personal != 0 {
+            personal.insert(id, row);
+        } else {
             deployment.insert(id, row);
         }
     }
@@ -2103,6 +2331,7 @@ fn admitted_user_model_from_row(
     let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
     Ok(AdmittedModelExecution {
+        admitted_at: std::time::Instant::now(),
         price_snapshot: None,
         offering_id: offering_id.to_string(),
         source_identity: Some(ResolvedModelSourceIdentity {
@@ -6833,13 +7062,16 @@ mod tests {
 
         assert!(cache.get_fresh(&key, now).is_none());
         assert!(cache.get_stale(&key).is_none());
-        cache.insert(key.clone(), model.clone(), now);
+        cache.insert(
+            key.clone(),
+            ActiveLlmModelCacheEntry::new(&key, model.clone(), now),
+        );
 
-        assert_eq!(cache.get_fresh(&key, now).as_ref(), Some(&model));
+        assert_eq!(cache.get_fresh(&key, now).as_deref(), Some(&model));
         assert_eq!(
             cache
                 .get_fresh(&key, now + ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL)
-                .as_ref(),
+                .as_deref(),
             Some(&model)
         );
         assert!(
@@ -6851,10 +7083,297 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            cache.get_stale(&key).as_ref(),
+            cache.get_stale(&key).as_deref(),
             Some(&model),
             "expired entries remain available for stale-if-DB-error fallback"
         );
+    }
+
+    #[test]
+    fn model_cache_bounds_entries_and_bytes_and_releases_replaced_values() {
+        for content_bytes in [0, 64 * 1024] {
+            let mut cache = ActiveLlmModelResolutionCache::default();
+            let settings = MatrixOneSettings::mock();
+            let now = Instant::now();
+            for index in 0..300 {
+                let key = ActiveLlmModelCacheKey::new(&settings, &format!("model-{index}"));
+                let mut model = sample_resolved_active_model(&format!("model-{index}"));
+                model.api_key = "x".repeat(content_bytes);
+                let entry =
+                    ActiveLlmModelCacheEntry::new(&key, model, now + Duration::from_millis(index));
+                assert!(entry.is_some());
+                cache.insert(key, entry);
+                assert!(cache.entries.len() <= ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES);
+                assert!(
+                    ACTIVE_LLM_MODEL_CACHE_CONTAINER_BYTES + cache.bytes
+                        <= ACTIVE_LLM_MODEL_CACHE_MAX_BYTES
+                );
+            }
+            assert!(
+                cache
+                    .get_stale(&ActiveLlmModelCacheKey::new(&settings, "model-0"))
+                    .is_none()
+            );
+            let last = ActiveLlmModelCacheKey::new(&settings, "model-299");
+            let borrowed = cache.get_stale(&last).unwrap();
+            assert_eq!(borrowed.api_key.len(), content_bytes);
+            if content_bytes == 0 {
+                assert_eq!(cache.entries.len(), ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES);
+            } else {
+                assert!(cache.entries.len() < ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES);
+            }
+            let mut oversized = sample_resolved_active_model("updated");
+            oversized.api_key = "x".repeat(ACTIVE_LLM_MODEL_CACHE_MAX_ENTRY_BYTES);
+            let entry = ActiveLlmModelCacheEntry::new(&last, oversized, now);
+            assert!(entry.is_none());
+            cache.insert(last.clone(), entry);
+            assert!(cache.get_stale(&last).is_none());
+            assert_eq!(
+                cache.bytes,
+                cache
+                    .entries
+                    .values()
+                    .map(|entry| entry.bytes)
+                    .sum::<usize>()
+            );
+            // Exercise deletion churn and replacement against the actual map
+            // allocation, including storage retained by clear(). Live-entry
+            // byte sums alone cannot detect a too-small container allowance.
+            for index in 300..4300 {
+                let key = ActiveLlmModelCacheKey::new(&settings, &format!("model-{index}"));
+                let model = sample_resolved_active_model("churn");
+                cache.insert(
+                    key.clone(),
+                    ActiveLlmModelCacheEntry::new(&key, model.clone(), now),
+                );
+                cache.insert(key.clone(), ActiveLlmModelCacheEntry::new(&key, model, now));
+                assert!(cache.entries.capacity() <= 4 * ACTIVE_LLM_MODEL_CACHE_MAX_ENTRIES);
+                assert!(
+                    cache.entries.capacity()
+                        * (std::mem::size_of::<(ActiveLlmModelCacheKey, ActiveLlmModelCacheEntry)>(
+                        ) + 64)
+                        <= ACTIVE_LLM_MODEL_CACHE_CONTAINER_BYTES
+                );
+            }
+            let retained_capacity = cache.entries.capacity();
+            cache.clear();
+            // capacity() also includes tombstone-dependent growth headroom.
+            // After clear it reports the full retained allocation's capacity.
+            assert!(cache.entries.capacity() >= retained_capacity);
+            assert!(cache.entries.capacity() <= 896); // 1024 buckets at 7/8 load
+            let retained_buckets = (cache.entries.capacity() * 8).div_ceil(7);
+            assert!(
+                retained_buckets
+                    * (std::mem::size_of::<(ActiveLlmModelCacheKey, ActiveLlmModelCacheEntry)>()
+                        + 1)
+                    + 16
+                    <= ACTIVE_LLM_MODEL_CACHE_CONTAINER_BYTES
+            );
+            assert!(cache.entries.is_empty());
+            assert_eq!(cache.bytes, 0);
+            assert_eq!(
+                borrowed.model_name, "model-299",
+                "clear cannot revoke a borrowed configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn model_cache_accounts_spare_capacity_json_containers_and_depth() {
+        let key = ActiveLlmModelCacheKey::new(&MatrixOneSettings::mock(), "capacity");
+        let mut model = sample_resolved_active_model("capacity");
+        model.tags = Vec::with_capacity(
+            ACTIVE_LLM_MODEL_CACHE_MAX_ENTRY_BYTES / std::mem::size_of::<String>() + 1,
+        );
+        assert!(ActiveLlmModelCacheEntry::new(&key, model, Instant::now()).is_none());
+
+        let mut model = sample_resolved_active_model("capacity");
+        model.api_key = String::with_capacity(ACTIVE_LLM_MODEL_CACHE_MAX_ENTRY_BYTES);
+        assert!(ActiveLlmModelCacheEntry::new(&key, model, Instant::now()).is_none());
+
+        let mut model = sample_resolved_active_model("capacity");
+        model.request_headers = Some(Map::from_iter(
+            (0..256).map(|i| (format!("header-{i}"), Value::Bool(true))),
+        ));
+        assert!(ActiveLlmModelCacheEntry::new(&key, model, Instant::now()).is_none());
+
+        let mut model = sample_resolved_active_model("capacity");
+        model.request_body_overrides = Some(Map::from_iter([(
+            "array".into(),
+            Value::Array(Vec::with_capacity(16384)),
+        )]));
+        assert!(ActiveLlmModelCacheEntry::new(&key, model, Instant::now()).is_none());
+
+        let mut nested = Value::Null;
+        for _ in 0..70 {
+            nested = Value::Array(vec![nested]);
+        }
+        let mut model = sample_resolved_active_model("depth");
+        model.request_body_overrides = Some(Map::from_iter([("nested".into(), nested)]));
+        assert!(ActiveLlmModelCacheEntry::new(&key, model, Instant::now()).is_none());
+    }
+
+    #[tokio::test]
+    async fn real_model_resolvers_hit_cache_while_their_fill_stripe_is_held() {
+        let mut settings = MatrixOneSettings::mock();
+        settings.database = format!("cache_hit_{}", Uuid::new_v4());
+        let encryptor =
+            FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap();
+        // An unopened pool on an unreachable port proves neither entrypoint
+        // attempts database I/O for a hit; the held stripe catches a lock-first
+        // regression in the actual resolvers rather than an emulated flow.
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1:1/cache_hit")
+            .unwrap();
+        for offering in [false, true] {
+            let key = if offering {
+                ActiveLlmModelCacheKey::for_offering_id(&settings, "cached-model")
+            } else {
+                ActiveLlmModelCacheKey::new(&settings, "cached-model")
+            };
+            active_llm_model_resolution_cache_store(
+                key.clone(),
+                sample_resolved_active_model("cached-model"),
+            );
+            let _guard = ACTIVE_LLM_MODEL_RESOLUTION_LOCKS.for_key(&key).lock().await;
+            let model = tokio::time::timeout(Duration::from_secs(1), async {
+                if offering {
+                    resolve_active_llm_offering(&settings, &encryptor, "cached-model", Some(&pool))
+                        .await
+                        .unwrap()
+                        .model
+                } else {
+                    resolve_active_llm_model(
+                        &settings,
+                        &encryptor,
+                        Some("cached-model"),
+                        Some(&pool),
+                    )
+                    .await
+                    .unwrap()
+                }
+            })
+            .await
+            .expect("cached resolver must not wait for the held stripe");
+            assert_eq!(model.model_name, "cached-model");
+            assert_eq!(pool.size(), 0);
+            active_llm_model_resolution_cache_remove(&key);
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_cache_flights_coalesce_and_survive_cache_clear() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = Arc::new(Mutex::new(ActiveLlmModelResolutionCache::default()));
+        let flights = Arc::new(ActiveLlmModelResolutionFlights::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fills = Arc::new(AtomicUsize::new(0));
+        let key = ActiveLlmModelCacheKey::new(&MatrixOneSettings::mock(), "shared-model");
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (cache, flights, barrier, entered, release, fills, key) = (
+                cache.clone(),
+                flights.clone(),
+                barrier.clone(),
+                entered.clone(),
+                release.clone(),
+                fills.clone(),
+                key.clone(),
+            );
+            tasks.push(tokio::spawn(async move {
+                assert!(
+                    cache
+                        .lock()
+                        .unwrap()
+                        .get_fresh(&key, Instant::now())
+                        .is_none()
+                );
+                barrier.wait().await;
+                let _guard = flights.for_key(&key).lock().await;
+                let cached = cache.lock().unwrap().get_fresh(&key, Instant::now());
+                if let Some(model) = cached {
+                    return model;
+                }
+                assert_eq!(fills.fetch_add(1, Ordering::SeqCst), 0);
+                entered.notify_one();
+                release.notified().await;
+                let model = sample_resolved_active_model("shared-model");
+                let entry = ActiveLlmModelCacheEntry::new(&key, model, Instant::now());
+                let mut cache = cache.lock().unwrap();
+                cache.insert(key.clone(), entry);
+                cache.get_fresh(&key, Instant::now()).unwrap()
+            }));
+        }
+        entered.notified().await;
+        cache.lock().unwrap().clear();
+        assert!(
+            flights.for_key(&key).try_lock().is_err(),
+            "clear must not create a second fill lock"
+        );
+        let other = flights
+            .locks
+            .iter()
+            .find(|lock| !std::ptr::eq(*lock, flights.for_key(&key)))
+            .unwrap();
+        assert!(other.try_lock().is_ok(), "another stripe remains available");
+        release.notify_one();
+        for task in tasks {
+            assert_eq!(task.await.unwrap().model_name, "shared-model");
+        }
+        assert_eq!(fills.load(Ordering::SeqCst), 1);
+        let _guard = flights.for_key(&key).lock().await;
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .get_fresh(&key, Instant::now())
+                .is_some(),
+            "a hit does not acquire the fill lock"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_cache_flights_release_cancelled_waiters_and_holders() {
+        let flights = Arc::new(ActiveLlmModelResolutionFlights::default());
+        let key = ActiveLlmModelCacheKey::new(&MatrixOneSettings::mock(), "cancelled");
+        let held = flights.for_key(&key).lock().await;
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (worker_flights, worker_key) = (flights.clone(), key.clone());
+        let waiter = tokio::spawn(async move {
+            let lock = worker_flights.for_key(&worker_key).lock();
+            tokio::pin!(lock);
+            let mut started = Some(started);
+            let _guard = std::future::poll_fn(|cx| {
+                let state = std::future::Future::poll(lock.as_mut(), cx);
+                if state.is_pending()
+                    && let Some(started) = started.take()
+                {
+                    started.send(()).unwrap();
+                }
+                state
+            })
+            .await;
+        });
+        waiting.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        drop(held);
+        assert!(flights.for_key(&key).try_lock().is_ok());
+
+        let (started, holding) = tokio::sync::oneshot::channel();
+        let (worker_flights, worker_key) = (flights.clone(), key.clone());
+        let holder = tokio::spawn(async move {
+            let _guard = worker_flights.for_key(&worker_key).lock().await;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        holding.await.unwrap();
+        holder.abort();
+        assert!(holder.await.unwrap_err().is_cancelled());
+        assert!(flights.for_key(&key).try_lock().is_ok());
     }
 
     #[test]

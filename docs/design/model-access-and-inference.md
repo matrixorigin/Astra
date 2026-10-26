@@ -71,7 +71,7 @@ It does not own:
 - Astra can link a user or organization to TaaS without making TaaS a special agent runtime.
 - A user can explicitly choose Cloud BYOK, where Astra Server encrypts the provider credential and executes inference, or This device, where the secret is never uploaded.
 - Web, CLI, Server Only, and Edge + Server expose the same model and run semantics.
-- Every inference has an immutable execution placement, credential owner, billing owner, policy decision, and durable identity.
+- Every inference has an immutable execution placement, credential owner, billing owner, policy decision and causal owner. Agent calls reuse the durable Run; standalone accounting retains durable invocation identities.
 - Account, entitlement, credential, endpoint, and billing failures are visible and recoverable without corrupting run state.
 - Protocol compatibility and optional generation-parameter capability remain
   separate facts; an OpenAI-compatible route is never assumed to accept every
@@ -256,8 +256,12 @@ their own provider account.
   default selection and a hidden key. Explicit flags and `--api-key-stdin`
   support non-interactive configuration. Custom endpoints reuse the existing
   OpenAI transport; adding user ownership does not create another agent loop.
-- Inference admission revalidates `(user_id, offering_id, is_active)` and
-  decrypts the current credential immediately before provider execution.
+- Inference admission validates `(user_id, offering_id, is_active)` and
+  materializes the route and credential. Server agent Runs reuse that exact
+  admission for at most 30 seconds from its original admission timestamp;
+  configuration-cache hits do not extend it. At the next provider boundary
+  after expiry, owner-scoped revalidation refreshes or rejects the material.
+  Recovery and explicit selection changes require a new admission.
   Server child fanout admits a bounded set of distinct Offerings with batched
   owner-scoped and deployment reads, preserving per-Offering freshness without
   one database round trip per child. The all-or-nothing batch is validated
@@ -716,7 +720,8 @@ A logical inference and a physical provider request are distinct:
 - `InferenceInvocation` is the budget, lifecycle, and aggregate-usage unit.
 - `ProviderAttempt` is one actual request, including provider request ID and delivery certainty.
 
-Every invocation has exactly one durable owner scope:
+Every request has exactly one causal owner scope. A scope is attribution,
+not an additional lease or state machine:
 
 ```rust
 enum InferenceOwnerScope {
@@ -738,21 +743,41 @@ enum InferenceOwnerScope {
 }
 ```
 
-Primary agent and subagent inference is run-owned. Work that is genuinely
-outside an active run—such as pre-turn memory reranking or post-turn memory
-extraction—is session-owned. Both scopes verify the authenticated user's
-durable ownership before provider I/O. Producers must never invent a run ID to
+Primary agent, subagent, summary and classification calls within a Run reuse
+that Run's execution authority. Work outside an active Run, including standalone
+completion calls and post-turn extraction, retains its session-owned accounting
+boundary. Offering admission and authenticated ownership precede provider I/O. Producers must never invent a run ID to
 make auxiliary work billable, and consumers must never infer ownership from an
 operation label or prompt text.
 
-A forked skill retains its parent run/session and execution authority. Its
-inference operation identity derives from the canonical child turn chain,
-which includes the outer invocation identity. Distinct forks cannot alias the
-same inference invocation; replay of one outer invocation retains its identity.
+A forked skill retains its parent run/session and execution authority. Physical
+requests have request-local identities; they are observations, not durable
+execution grants. Tool invocation identity and custody remain durable.
 
-Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider.
+Standalone accounting persists invocation and provider-attempt identity before
+contacting the provider. Agent requests do not persist a second invocation,
+provider-attempt lease, request-context pair, canonical transition WAL or recovery
+debt. Their observations feed the existing trace and usage projection.
 
 Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.
+
+### Agent request execution boundary
+
+The canonical transport prepares immutable provider bytes once. The existing
+Run authority fences physical attempts using its shared cancellation, pause,
+lease-loss and deadline controls. Main responses and auxiliary summaries use
+the same transport observer; auxiliary calls do not allocate durable attempt
+pairs or retry database identity collisions. Offering revalidation and provider
+capacity policy remain at their existing owners.
+
+Physical attempts retain exact wire identity, dispatch, terminal and qualified
+usage observations in process. Missing usage remains unknown. Trace persistence
+must not become a prerequisite for consuming a model response. A process crash
+may lose in-flight model output and diagnostics; users may need to resend or
+continue. There is no per-model-request replay or recovery promise. Explicit
+handoff checkpoints carry their complete checked continuation without loading a
+provider-attempt WAL. Run/Context commits and tool side-effect admission and
+deduplication keep their independent contracts.
 
 ## Control plane and data plane
 
@@ -762,7 +787,7 @@ Client / Web / CLI
         ▼
 ┌──────────────── Astra control plane ────────────────┐
 │ principal · effective catalog · policy · resolver   │
-│ budget admission · durable route/invocation         │
+│ budget admission · Run execution authority         │
 └──────────────────────┬──────────────────────────────┘
                        │ canonical inference request
               ┌────────┴────────┐
@@ -1119,11 +1144,11 @@ the complete quirks object.
 
 `ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
 LLM budget, for no-tool introspection provider execution. It uses the existing
-provider-attempt deadline/settlement owner, not an outer cancelling timeout.
+shared transport budget and the existing Run cancellation/deadline authority.
 Primary and other purposes retain their budgets. This is **not** an eight-second
-end-to-end TTFT guarantee: pre-provider durable admission and post-provider
-logical settlement have their own lifecycle costs. Existing auxiliary failure
-handling remains responsible for degraded Work admission.
+end-to-end TTFT guarantee: Offering authorization and context assembly precede
+provider execution. Existing auxiliary failure handling remains responsible for
+degraded Work admission.
 The provider work allowance leaves a tail reserve for durable terminalization.
 That reserve is not a separate maximum for database settlement: an early provider
 response leaves its unused time available for settlement until the same logical
@@ -1476,26 +1501,30 @@ An extreme mode where prompt and agent state never reach Astra Server requires a
 - UI model changes affect only a later inference boundary, never an active provider request.
 - Subagents may use purpose-specific Offerings only within inherited data and billing policy.
 - If access expires, only branches needing another inference pause; completed transcript and task state remain readable.
-- Repair resumes from durable invocation state and does not relaunch completed children.
+- Repair uses Run checkpoints and durable tool custody; an in-flight model request
+  is not recoverable. Completed children are not relaunched.
 - Agent Workbench shows actual model, Model Access, state, and usage for each branch.
 
 ### Execution-authority boundaries
 
 The following boundaries are normative for every inference surface:
 
-1. **Offering admission owns route material.** A run may remember the selected
-   effective Offering ID, but it must not treat a previously decrypted route as
-   authorization for a later provider request. Immediately before each provider
-   request, Server revalidates the Offering and materializes the current route and
-   credential generation. This check occurs per request, never per streamed token.
-   A disabled Offering therefore blocks the next request; credential and endpoint
-   rotation therefore affect the next request without restarting the run.
-2. **The durable ledger owns inference termination.** Admission returns a
-   cancellation-safe invocation handle. Exactly one supervisor owns its deadline
-   and provider attempt. Dropping, aborting, or timing out the caller converges the
-   attempt to `DeliveryUnknown` after provider I/O begins, or `Cancelled` before
-   provider I/O begins, and then settles the logical invocation. Callers must not
-   wrap the same operation in an independent competing timeout.
+1. **Offering admission owns route material.** A Server agent Run may reuse
+   the exact admitted Offering, route and credential for at most 30 seconds from
+   the original admission. Every provider boundary checks that admission clock;
+   resolving a cached configuration or reconstructing a host cannot renew it.
+   After expiry, the next provider boundary performs owner-scoped revalidation:
+   a disabled Offering is rejected, and credential or endpoint rotation refreshes
+   the route without restarting the Run. Recovery and explicit selection changes
+   require new admission. Standalone inference surfaces retain their own fresh
+   request admission; neither a selection-cache hit nor an Offering ID alone
+   authorizes provider execution.
+2. **The existing execution owner controls inference.** Agent calls borrow the
+   Run's cancellation, pause, lease-loss and original deadline. They add no
+   persistent inference owner or settlement debt. Standalone accounting retains
+   its cancellation-safe invocation supervisor and truthful delivery uncertainty.
+   Dropped agent requests retain only observations already published; persistence
+   and exact request recovery are not a second execution authority.
 3. **Each API surface owns its producer identity.** Public completion proxy calls
    are session-owned auxiliary inference, not arbitrary internal run or harness
    work. Server derives their producer namespace, purpose, and durable scope from a
@@ -1538,8 +1567,8 @@ tests use MatrixOne plus a controllable mock provider and prove observable cause
   new material;
 - abort a non-streaming call after the provider accepts it and assert durable
   provider-attempt and logical-invocation terminals;
-- retry the same auxiliary request concurrently and assert one producer-owned
-  durable identity;
+- retry an agent auxiliary request concurrently and assert distinct observed
+  physical identities under the same Run authority, without an inference DB owner;
 - reject public attempts to claim run, harness, or internal producer ownership;
 - independently admit an explicitly selected child Offering, while an unselected
   child inherits the parent's Offering.
@@ -1608,6 +1637,23 @@ Server instances remain horizontally replaceable:
 - slow TaaS accounts, providers, Edge devices, or clients are isolated by connection/tenant admission;
 - no database query occurs per token or stream chunk;
 - hundreds of simultaneous sessions do not serialize on one global lock.
+
+Deployment-model selection currently uses a disposable 30-second cache, capped
+at 256 entries, 4 MiB of conservative retained-allocation accounting and 128 KiB
+per entry. Accounting includes keys, string/vector capacities and JSON container
+allowances; it is not a whole-process RSS limit. Larger configurations remain
+usable without being cached. Expired entries may supply the existing database-error
+fallback until eviction; inactive, missing or unauthorized selections do not gain
+that fallback. Model-name and Offering-ID namespaces remain distinct.
+
+Sixty-four fixed process-local mutexes coalesce selection misses without retaining
+per-key locks after cancellation. Hash collisions can serialize unrelated cold
+fills; cache hits do not wait for a fill lock. Existing caller deadlines and
+admission budgets still apply. Invalidation clears values without replacing locks
+or cancelling in-flight fills, and is not a cross-Server revocation protocol.
+The selection cache is not execution authority. Provider execution requires an
+admitted execution; Server agent Runs reuse it only within the original
+30-second admission window, then perform owner-scoped database revalidation.
 
 Prompt-cache identity includes actual provider, upstream model, connection, trust scope, and cache protocol. Per-turn runtime feedback remains outside the stable prompt prefix.
 
@@ -1726,9 +1772,12 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
 - All inference purposes use one resolver and invocation contract.
 - OpenAI-compatible protocol selection alone never authorizes an optional
   provider request field or value.
-- Every upstream request is attributable to a durable provider attempt.
+- Every upstream request has exact physical-attempt observations under its causal
+  owner. Agent observations may be lost on process failure; standalone accounting
+  retains durable provider attempts.
 - No client can select an endpoint, credential, or placement directly.
-- Refresh, reconnect, process crash, credential rotation, and Server failover preserve truthful run state.
+- Refresh and reconnect preserve committed Run state. Process failure does not
+  manufacture model delivery, usage or output that was not committed.
 - Online tests validate multi-tenant isolation and actual TaaS/MatrixOne contracts.
 
 Cache-break diagnosis consumes dispatched provider-attempt receipts with exact

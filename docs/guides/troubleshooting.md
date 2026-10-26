@@ -47,5 +47,7 @@ a Linux binary built for a different platform.
 
 ## Stale Run Projection
 
-If a run list or projection response looks stale while the durable run status is
-correct, use the [run projection repair runbook](run-projection-repair.md).
+Refresh `GET /chat/runs/{run_id}/projection` to read the canonical Run, events,
+and checkpoint summary. Display data is derived on read; there is no stored
+projection to rebuild. If values keep changing, check whether the Run is still
+active before investigating the underlying Run or checkpoint facts.

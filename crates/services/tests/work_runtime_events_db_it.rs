@@ -16,6 +16,10 @@ fn work_run(
     branch_id: &str,
 ) -> DurableRunRecord {
     DurableRunRecord {
+        opening: None,
+        opening_hash: None,
+        context_admission_hash: None,
+        terminal_receipt_json: None,
         run_id: run_id.to_owned(),
         user_id: owner_id.to_owned(),
         session_id: session_id.to_owned(),
@@ -177,6 +181,13 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
             .projected,
         0,
         "same terminal fact must not create a second semantic event"
+    );
+
+    assert!(
+        store
+            .release_owner_lease(&owner_id, &session_id, &first_run_id, 0)
+            .await
+            .unwrap()
     );
 
     store

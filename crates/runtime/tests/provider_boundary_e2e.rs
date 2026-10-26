@@ -3,7 +3,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript, loop_state,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript, loop_state,
     server_host_builder,
 };
 use astra_runtime::turn::agentic_loop::finalization::run_agentic_loop_with_host;
@@ -39,7 +39,7 @@ async fn run_text_only(cache: Option<astra_services::models::PromptCacheCapabili
             "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
         }))],
     )]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("provider-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -64,10 +64,6 @@ async fn run_text_only(cache: Option<astra_services::models::PromptCacheCapabili
     assert_eq!(state.total_completion, 7);
     assert_eq!(gateway.requests.lock().await.len(), 1);
     assert_eq!(ledger.attempt_count(), 1);
-    assert_eq!(
-        ledger.canonical_transition_hashes().len(),
-        usize::from(cache.is_some())
-    );
     ledger.assert_quiescent();
     gateway.assert_complete();
 }
@@ -97,7 +93,7 @@ async fn anthropic_and_bedrock_use_native_transport_and_real_settlement() {
             vec![response],
         )])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = format!("native-fixture-{}", uuid::Uuid::new_v4());
         let mut host = server_host_builder(
             &gateway,

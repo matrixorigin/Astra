@@ -8,6 +8,7 @@ prompt: |
   NATURAL-FLASH-HIGH-MARKER-OK。你可以继续独立工作；等他们完成后，
   告诉我两个原样标记。模型身份和思考档位请以运行时工具回执为准，不要要求
   子代理自报或核验模型/档位。不要读取文件、联网或调用诊断工具。
+required_models: [deepseek-v4-flash, glm-5.2]
 debug_log: true
 capability: delegation
 timeout_seconds: 180

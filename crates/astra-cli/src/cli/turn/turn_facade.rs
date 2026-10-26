@@ -261,6 +261,7 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
     }
     match result {
         Err(mut turn_failure) => {
+            turn_failure.partial.failed_run_terminal = None;
             let callback_detach_without_binding =
                 binding_failure.is_none() && turn_failure.partial.callback_client_detached;
             let mut error = if let Some(failure) = binding_failure {

@@ -90,6 +90,70 @@ uses economy only for confidently easy, read-only tasks with compatible model
 contracts. See [model routing](../design/model-routing.md#deterministic-auto-selection-stage-3)
 for configuration, coverage, and persistence semantics.
 
+## Run history reads
+
+`GET /runs` keeps its compact owner-scoped keyset pagination (`limit`,
+`after_updated_at`, `after_run_id`).
+
+`GET /sessions/{session_id}/transcript?scope=conversation&limit=200` returns a
+bounded display view for the authenticated Session owner:
+
+```json
+{
+  "kind": "conversation",
+  "session": { "session_id": "...", "metadata": {}, "status": "active" },
+  "selected_root": { "run_id": "...", "status": "failed", "waiting_for": null, "created_at": "2026-10-25T03:00:00.123456Z" },
+  "items": [{ "kind": "opening", "id": "input:...", "run_id": "...", "source_event_id": "trace:user:...", "created_at": "2026-10-25T03:00:00.123456Z", "content": "exact submitted text" }],
+  "history_loaded": true,
+  "raw_page": { "next_before_seq": null, "has_more": false },
+  "truncated": false
+}
+```
+
+`session` contains the ordinary Session metadata fields (abbreviated above).
+`selected_root` can be terminal or null. `items` contain either an opening input or
+`kind: "raw"` with the ordinary transcript fields. Exact committed original-input
+rows suppress their matching opening; conflicting identity/content fails the read.
+Children and foreign Sessions are excluded before the history window. Input time
+is immutable UTC admission time, preserving microseconds. Context authority is
+never included.
+
+The view retains up to 200 display items and examines at most 200 historical
+opening candidates plus the selected root. Historical opening payload has a
+256 KiB budget applied in SQL before body transfer and decoding. It counts both
+stored opening JSON bodies plus a conservative display envelope; the most recent
+continuous prefix is retained. The selected input is retained exactly under the
+existing 8 MiB opening limit. Strings are never truncated. `truncated` signals
+older omitted history. Only raw rows have `item_seq`; `raw_page` describes the raw
+page independently of composed display items. Continue older raw history through
+the existing raw scopes. Conversation scope rejects `run_id` and `before_seq`;
+other transcript scopes and cursors are unchanged.
+
+Root status and raw history are read in one database statement snapshot. Session
+metadata and artifact previews use their existing separate read boundaries.
+Selected detail refreshes perform a fresh bounded read. A client with a reusable
+continuation can send `reuse_run_id` and `reuse_terminal=true` while retaining
+that continuation until its actual stream terminal. If the snapshot selects that
+same Run and it is active (or terminal preservation was requested), the response
+has `history_loaded:false`, `items:[]`, `raw_page:null`, and `truncated:null`.
+These nulls mean unexamined history, not an empty transcript. A successor returns
+full bounded history in the same read. Clients must recheck their continuation
+after awaiting the response; an invalidated parser cannot use omitted history to
+rebuild a cold view. Continuation parameters are rejected outside conversation scope.
+
+Web metadata mutations commit only their changed fields after backend success
+and invalidate overlapping older detail/directory reads. A failed workspace update
+does not roll back another successful selection. This fences one Web store's
+concurrent publication; it does not promise linearizable caches across Web servers.
+
+The Web `POST /api/chats/{chat_id}/messages` JSON endpoint shares the streaming
+message/parser owner. Concurrent observation does not discard its pending input
+or result. If its stream is interrupted after Run admission, it returns HTTP 502
+with `code: "stream_observation_interrupted"`; the admitted Run and cursor remain
+available for stream reconnection. Failures before an admission acknowledgement
+remain failed local assistant messages. Stop, Session deletion and a selected successor prevent late
+responses from changing the current view.
+
 ## Active run permission mode
 
 ### POST /chat/runs/{run_id}/permission-mode
@@ -412,3 +476,12 @@ use `/live` and `/ready` for orchestrator probes.
 | 404 | Resource not found |
 | 429 | Rate limited (60 req/min) |
 | 500 | Server error |
+
+### Server chat execution authority
+
+`POST /chat` and `POST /chat/stream` own their Server execution. The request
+field `conversation_authority` is unsupported and rejected as
+`chat_request_invalid`, including when its value is `null`, before Session or
+Run admission. A caller must finish or release an outstanding standalone
+Controller writer before starting Server chat. Session/Work Controller APIs
+and their signed execution grants remain separate supported contracts.

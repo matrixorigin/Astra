@@ -451,6 +451,10 @@ pub(crate) struct PartialTurnData {
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
     pub partial_text: String,
+    pub partial_text_model_item_id: Option<String>,
+    /// Already accepted physical-root failure, moved from the shared SSE owner.
+    /// This observation is not another execution or resume authority.
+    pub failed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
     /// Exact prompt-history items captured before the failed runtime loop
     /// returned. This survives independently of `partial_text`, which is only
     /// a user-facing suffix and cannot represent tools or reasoning.
@@ -537,7 +541,8 @@ impl TurnFailure {
     /// A local cancellation may recover its observed prefix only when no
     /// harder admission, callback, output or remote-cleanup failure survived.
     pub(crate) fn is_clean_local_cancel(&self) -> bool {
-        self.partial.failure_kind == Some(astra_core::ErrorKind::Cancelled)
+        self.partial.failed_run_terminal.is_none()
+            && self.partial.failure_kind == Some(astra_core::ErrorKind::Cancelled)
             && self.partial.error_code.is_none()
             && !self.partial.remote_cancel_required
             && !self.partial.admission_rejected
@@ -549,7 +554,8 @@ impl TurnFailure {
     /// cancel the durable run. This only classifies the failure; callers must
     /// still enforce their own identity/lease boundary before releasing it.
     pub(crate) fn is_clean_internal_stream_detach(&self) -> bool {
-        self.partial.remote_cancel_required
+        self.partial.failed_run_terminal.is_none()
+            && self.partial.remote_cancel_required
             && !self.partial.callback_client_detached
             && self.partial.output_transport_failure.is_none()
             && self.partial.interruption.as_ref().is_some_and(|record| {
@@ -604,70 +610,6 @@ mod internal_detach_tests {
         failure.partial.interruption = Some(serde_json::json!({"kind": "cancelled"}));
         assert!(!failure.is_clean_internal_stream_detach());
     }
-}
-
-/// Promote a typed, resumable runtime interruption into the same terminal
-/// shape used by the normal stream path.
-///
-/// A `TurnFailure` is still a hard error unless the runtime supplied a known
-/// interruption record marked resumable.  In particular, this deliberately
-/// refuses to infer lifecycle state from free-form provider error text, so
-/// authentication, harness, and unknown failures remain fail-closed.
-pub(crate) fn stream_result_from_resumable_turn_failure(
-    failure: &TurnFailure,
-) -> Option<StreamResult> {
-    let interruption = failure.partial.interruption.as_ref()?;
-    let kind_label = interruption.get("kind")?.as_str()?;
-    let kind = astra_turn_core::interruption::InterruptionKind::from_label(kind_label)?;
-    if !kind.is_resumable()
-        || interruption
-            .get("resumable")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-    {
-        return None;
-    }
-
-    let mut full_text = failure.partial.partial_text.clone();
-    if full_text.trim().is_empty() {
-        full_text = interruption
-            .get("user_message")
-            .and_then(serde_json::Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                format!("The turn was interrupted ({kind_label}) and can be continued.")
-            });
-    }
-
-    Some(StreamResult {
-        session_id: failure.partial.session_id.clone(),
-        run_id: failure.partial.run_id.clone(),
-        full_text,
-        prompt_tokens: failure.partial.prompt_tokens,
-        completion_tokens: failure.partial.completion_tokens,
-        cache_read_tokens: failure.partial.cache_read_tokens,
-        cache_creation_tokens: failure.partial.cache_creation_tokens,
-        qualified_usage: failure.partial.qualified_usage,
-        usage_attribution: failure.partial.usage_attribution.clone(),
-        tool_calls_count: failure.partial.tool_calls_count,
-        llm_rounds: failure.partial.llm_rounds,
-        token_usage_coverage: failure.partial.token_usage_coverage,
-        tools_used: failure.partial.tools_used.clone(),
-        tool_call_records: failure.partial.tool_call_records.clone(),
-        stall_events: failure.partial.stall_events.clone(),
-        verdict_events: failure.partial.verdict_events.clone(),
-        last_heavy_checkpoint: failure.partial.last_heavy_checkpoint.clone(),
-        interruption: Some(interruption.clone()),
-        final_state: "interrupted".to_string(),
-        interruption_kind: Some(kind.label().to_string()),
-        // A failed loop has not produced a verified terminal envelope.  Keep
-        // this fact explicit even when the interruption is resumable.
-        server_terminal_unverified: true,
-        tool_record_coverage_partial: true,
-        run_transcript_messages: failure.partial.run_transcript_messages.clone(),
-        ..StreamResult::default()
-    })
 }
 
 impl std::fmt::Display for TurnFailure {
@@ -1652,12 +1594,8 @@ impl Default for StreamResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PartialTurnData, TurnFailure, apply_partial_turn_data_to_error_event,
-        stream_result_from_resumable_turn_failure,
-    };
+    use super::{PartialTurnData, apply_partial_turn_data_to_error_event};
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
-    use serde_json::json;
 
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
@@ -1710,63 +1648,5 @@ mod tests {
         assert_eq!(event.cache_creation_tokens, Some(4));
         assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
         assert_eq!(event.metadata.as_ref().unwrap()["run_id"], "run-123");
-    }
-
-    #[test]
-    fn resumable_turn_failure_becomes_typed_partial_result() {
-        let failure = TurnFailure {
-            error: "[server_error] [budget_exhausted] provider budget exhausted".into(),
-            partial: PartialTurnData {
-                session_id: Some("session-1".into()),
-                run_id: Some("run-1".into()),
-                prompt_tokens: 123,
-                completion_tokens: 45,
-                tool_calls_count: 2,
-                partial_text: "partial answer".into(),
-                interruption: Some(json!({
-                    "kind": "budget_exhausted",
-                    "resumable": true,
-                    "user_message": "Continue to resume.",
-                })),
-                ..Default::default()
-            },
-        };
-
-        let result = stream_result_from_resumable_turn_failure(&failure)
-            .expect("typed resumable interruptions should be preserved");
-        assert_eq!(result.final_state, "interrupted");
-        assert_eq!(
-            result.interruption_kind.as_deref(),
-            Some("budget_exhausted")
-        );
-        assert_eq!(result.session_id.as_deref(), Some("session-1"));
-        assert_eq!(result.run_id.as_deref(), Some("run-1"));
-        assert_eq!(result.prompt_tokens, 123);
-        assert_eq!(result.completion_tokens, 45);
-        assert_eq!(result.tool_calls_count, 2);
-        assert_eq!(result.full_text, "partial answer");
-        assert!(result.server_terminal_unverified);
-        assert!(result.tool_record_coverage_partial);
-    }
-
-    #[test]
-    fn non_resumable_or_untyped_failure_stays_hard_error() {
-        for interruption in [
-            json!({"kind": "auth_failure", "resumable": false}),
-            json!({"kind": "budget_exhausted", "resumable": false}),
-            json!({"kind": "unknown_future_kind", "resumable": true}),
-        ] {
-            let failure = TurnFailure {
-                error: "provider failure".into(),
-                partial: PartialTurnData {
-                    interruption: Some(interruption),
-                    ..Default::default()
-                },
-            };
-            assert!(
-                stream_result_from_resumable_turn_failure(&failure).is_none(),
-                "untrusted interruption must not be promoted"
-            );
-        }
     }
 }

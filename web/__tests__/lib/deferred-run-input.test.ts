@@ -437,31 +437,29 @@ describe('queueDeferredRunInput', () => {
       total: 1,
       limit: 200,
     });
-    const getSessionTranscript = vi.fn().mockResolvedValue({
-      items: [],
-      total: 0,
-      limit: 200,
-      offset: 0,
-    });
+    const getSessionConversation = vi.fn().mockImplementation(async () => ({
+      kind: 'conversation', session: { session_id: 'chat-open', status: 'active', metadata: { source: 'web_v1', current_model: 'sonnet-4.6-adaptive' } },
+      selected_root: { run_id: 'run-open', status: 'input-queued', waiting_for: 'user_input' },
+      items: [], history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false,
+    }));
 
     mockGetRuntimeClient.mockResolvedValue({
       sdk: {
         listRuntimeSessions,
         listRuns,
-        getSessionTranscript,
+        getSessionConversation,
+        getRunStatus: vi.fn().mockResolvedValue({ runId: 'run-open', sessionId: 'chat-open', status: 'input-queued' }),
       },
     } as never);
 
     const result = await getChatHydrated('user-a', 'chat-open');
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
-    expect(listRuns).toHaveBeenCalledWith({ limit: 200 });
-    expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', {
-      limit: 200,
-    });
+    expect(listRuns).not.toHaveBeenCalled();
+    expect(getSessionConversation).toHaveBeenCalledWith('chat-open', 200, undefined);
     expect(result?.chat.id).toBe('chat-open');
     expect(result?.chat.model).toBe('sonnet-4.6-adaptive');
-    expect(result?.activeRun).toEqual({
+    expect(result?.activeRun).toMatchObject({
       runId: 'run-open',
       status: 'input-queued',
       waitingFor: 'user_input',
@@ -818,14 +816,15 @@ describe('queueDeferredRunInput', () => {
       total: 1,
       limit: 200,
     });
-    const getSessionTranscript = vi.fn().mockResolvedValue({
-      items: [],
-      total: 0,
-      limit: 200,
-      offset: 0,
-    });
+    const getSessionConversation = vi.fn().mockImplementation(async () => ({
+      kind: 'conversation', session: { session_id: 'chat-stop', status: 'active', metadata: { source: 'web_v1', current_model: 'sonnet-4.6-adaptive' } },
+      selected_root: { run_id: 'run-stop', status: 'running', waiting_for: null },
+      items: [], history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false,
+    }));
     mockGetRuntimeClient.mockResolvedValue({
-      sdk: { listRuntimeSessions, listRuns, getSessionTranscript },
+      sdk: { listRuntimeSessions, listRuns, getSessionConversation,
+        getRunStatus: vi.fn().mockResolvedValue({ runId: 'run-stop', sessionId: 'chat-stop', status: 'running' }),
+      },
     } as never);
 
     const store = getStore('user-a');
@@ -854,12 +853,12 @@ describe('queueDeferredRunInput', () => {
     });
 
     const detail = await getChatHydrated('user-a', 'chat-stop');
-    expect(detail?.activeRun).toEqual({
+    expect(detail?.activeRun).toMatchObject({
       runId: 'run-stop',
       status: 'cancelling',
       waitingFor: 'cancel_requested',
     });
-    expect(listRuns).toHaveBeenCalled();
+    expect(getSessionConversation).toHaveBeenCalled();
   });
 
   it('expires stale local cancelling UI while still suppressing the stopped backend run', async () => {
@@ -903,14 +902,13 @@ describe('queueDeferredRunInput', () => {
       total: 1,
       limit: 200,
     });
-    const getSessionTranscript = vi.fn().mockResolvedValue({
-      items: [],
-      total: 0,
-      limit: 200,
-      offset: 0,
-    });
+    const getSessionConversation = vi.fn().mockImplementation(async () => ({
+      kind: 'conversation', session: { session_id: 'chat-stop', status: 'active', metadata: { source: 'web_v1', current_model: 'sonnet-4.6-adaptive' } },
+      selected_root: { run_id: 'run-stop', status: 'running', waiting_for: null },
+      items: [], history_loaded: true, raw_page: { has_more: false, next_before_seq: null }, truncated: false,
+    }));
     mockGetRuntimeClient.mockResolvedValue({
-      sdk: { listRuntimeSessions, listRuns, getSessionTranscript },
+      sdk: { listRuntimeSessions, listRuns, getSessionConversation },
     } as never);
 
     const store = getStore('user-a');
@@ -945,7 +943,7 @@ describe('queueDeferredRunInput', () => {
 
     expect(detail?.activeRun).toBeUndefined();
     expect(store.chats[0].locallyStoppedRuns?.['run-stop']).toBeDefined();
-    expect(listRuns).toHaveBeenCalled();
+    expect(getSessionConversation).toHaveBeenCalled();
   });
 
   it('hydrates a lost paused run before resuming it', async () => {

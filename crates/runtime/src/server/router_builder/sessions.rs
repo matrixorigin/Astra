@@ -82,10 +82,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::get_session_segments_handler),
         )
         .route(
-            "/sessions/{session_id}/context/segments:upload",
-            post(session::session_handlers::upload_session_segments_handler),
-        )
-        .route(
             "/sessions/{session_id}/execution-grants",
             post(session::session_handlers::issue_session_execution_grant_handler),
         )

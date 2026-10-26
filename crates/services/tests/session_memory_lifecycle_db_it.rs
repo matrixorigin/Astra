@@ -646,23 +646,14 @@ async fn large_json_journal_survives_close_status_claim_and_recovery_reads() {
 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn close_during_resumed_turn_recovers_after_prior_exit_finalization() {
+async fn close_during_controller_turn_recovers_after_prior_exit_finalization() {
     for missed_handoff in [false, true] {
-        assert_resumed_turn_close_recovers(missed_handoff, false).await;
+        assert_controller_turn_close_recovers(missed_handoff).await;
     }
 }
 
-#[tokio::test]
-#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn close_after_terminal_slot_release_waits_for_canonical_commit() {
-    assert_resumed_turn_close_recovers(true, true).await;
-}
-
-async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before_close: bool) {
-    use astra_services::{
-        AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator,
-        runs::{DatabaseRunStateStore, RunStateStore},
-    };
+async fn assert_controller_turn_close_recovers(missed_handoff: bool) {
+    use astra_services::{AcquireWriterAndReserveTurnOutcome, SessionContextCoordinator};
     use astra_turn_types::{
         ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
     };
@@ -690,12 +681,6 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
         false
     );
 
-    // Admit through the actual Run store: a resumable Session remains
-    // active after CLI-exit maintenance and acquires its execution slot.
-    let runs = DatabaseRunStateStore::new(pool.clone());
-    let run = common::collaborator_fixture::record(&user, &session, None);
-    let run_id = run.run_id.clone();
-    runs.insert_run(run).await.unwrap();
     let key = SessionKeyV1::owner_session("server", &user, &session, "main");
     let actor = ActorContextV1::owner_user(
         &user,
@@ -721,47 +706,6 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
     let AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } = ready else {
         panic!("follow-up admission must succeed: {ready:?}")
     };
-    let release_slot = || async {
-        assert!(
-            runs.update_run_status_with_events_if_current(
-                &user,
-                &session,
-                &run_id,
-                &["running"],
-                None,
-                "completed",
-                None,
-                None,
-                &[]
-            )
-            .await
-            .unwrap()
-        );
-    };
-    if release_before_close {
-        // Production ordering: terminal status commits and removes the slot
-        // while the canonical turn is still reserved and the handoff was lost.
-        release_slot().await;
-        let slots: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&user)
-        .bind(&session)
-        .fetch_one(pool.get())
-        .await
-        .unwrap();
-        assert_eq!(slots, 0);
-        assert_eq!(
-            coordinator
-                .load_head(&key)
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor
-                .completed_turn,
-            1
-        );
-    }
     let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
     close_owned_session(&sessions, &user, &session).await;
     let status = store.status(&user, &session).await.unwrap();
@@ -795,9 +739,6 @@ async fn assert_resumed_turn_close_recovers(missed_handoff: bool, release_before
             .await
             .unwrap();
         store.request_extraction(&user, &session).await.unwrap();
-    }
-    if !release_before_close {
-        release_slot().await;
     }
     coordinator
         .commit_turn(&reservation, canonical_delta(2), "follow-up-commit")

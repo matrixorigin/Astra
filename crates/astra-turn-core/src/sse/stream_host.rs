@@ -877,7 +877,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 token.cancel();
                             }
                             abort = durable_terminal_abort_kind(&terminal);
-                            accum.run_terminal = Some(terminal);
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -889,7 +888,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             }
                         }
                     }
-                    if abort.is_none() {
+                    if abort_message.is_none() {
                         match framer.take_trailing_dispatch_blob() {
                             Ok(tail) if !tail.trim().is_empty() => {
                                 match process_sse_event_block(
@@ -1119,7 +1118,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 if let Err(error) = read_ahead.push_bytes(&bytes, strict_read_ahead_json) {
                                     abort = Some(astra_core::ErrorKind::StreamTransport);
                                     abort_message = Some(format!("Error: {error}"));
-                                    accum.run_terminal = Some(terminal);
                                 } else {
                                     read_ahead_terminal = Some(terminal);
                                 }
@@ -1208,6 +1206,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 }
                 // Only real EOF makes an unterminated final block observable.
                 if read_ahead_eof
+                    && abort_message.is_none()
                     && !accum.run_terminal.as_ref().is_some_and(|observed| {
                         observed.run_id == terminal.run_id && observed.status.is_unsuccessful()
                     })
@@ -1251,7 +1250,29 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     token.cancel();
                 }
                 abort = durable_terminal_abort_kind(&terminal);
-                accum.run_terminal = Some(terminal);
+                match framer.take_trailing_dispatch_blob() {
+                    Ok(tail) => {
+                        if let Err(error) = process_sse_event_block(
+                            &tail,
+                            host,
+                            &mut accum,
+                            &mut pending,
+                            &mut first_sse_frame_seen,
+                            &mut reported_session_id,
+                        )
+                        .await
+                        {
+                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort_message =
+                                Some(format!("Error: invalid terminal SSE prefix: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        abort = Some(astra_core::ErrorKind::StreamTransport);
+                        abort_message =
+                            Some(format!("Error: invalid terminal SSE prefix: {error}"));
+                    }
+                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -1264,23 +1285,37 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         }
     }
 
-    // Every abort is terminal for this physical stream.  Tombstone partial
-    // output and pending Edge work for exact durable error kinds too; limiting
-    // this cleanup to transport/cancellation used to leak state when a typed
-    // budget or auth failure closed the root run.
+    // A validated root failure retains observed output. Local transport and
+    // protocol failures still tombstone it; all aborts discard executable work.
     if abort.is_some() {
+        let preserve_failed_output = abort_message.is_none()
+            && accum.has_authoritative_failed_terminal()
+            && accum
+                .run_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_kind)
+                == abort;
         accum.stream_complete = false;
+        if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+            abort = accum.error_kind;
+        }
         accum.error_kind = abort;
         // A canonical save failure invalidates completion, not text already
         // received. Keep its partial display while discarding executable work.
-        if accum.error_code.as_deref() != Some("canonical_persistence_failed") {
+        if !preserve_failed_output
+            && accum.error_code.as_deref() != Some("canonical_persistence_failed")
+        {
             accum.full_text.clear();
             accum.reasoning_content.clear();
         }
         accum.tool_calls.clear();
         pending.clear();
         let msg = match abort {
-            Some(astra_core::ErrorKind::StreamIdle) => {
+            Some(astra_core::ErrorKind::ContractViolation) => accum
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Invalid durable root terminal".to_string()),
+            Some(astra_core::ErrorKind::StreamIdle) if !preserve_failed_output => {
                 let timeout_used = if first_sse_frame_seen {
                     idle_post
                 } else {
@@ -1908,6 +1943,7 @@ struct RecordingSseStreamHost {
     agent_live_gaps: Vec<AgentLiveGap>,
     strict_sse_json: bool,
     accepted_sse_events: Vec<Value>,
+    rejected_sse_event_type: Option<&'static str>,
     done_count: usize,
     stream_completed: bool,
 }
@@ -1932,6 +1968,7 @@ impl RecordingSseStreamHost {
             agent_live_gaps: Vec::new(),
             strict_sse_json: false,
             accepted_sse_events: Vec::new(),
+            rejected_sse_event_type: None,
             done_count: 0,
             stream_completed: false,
         }
@@ -1975,6 +2012,11 @@ impl SseStreamHost for RecordingSseStreamHost {
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        if event.get("type").and_then(Value::as_str) == self.rejected_sse_event_type
+            && self.rejected_sse_event_type.is_some()
+        {
+            return Err("injected observation callback failure".into());
+        }
         self.accepted_sse_events.push(event.clone());
         if let Some(cancel) = &self.cancel_after_accepted_event {
             cancel.cancel();
@@ -2637,6 +2679,245 @@ mod tests {
                 Some(astra_core::ErrorKind::BudgetExhausted)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn classified_root_failure_retains_observed_output_across_framing_boundaries() {
+        for kind in [
+            astra_core::ErrorKind::StreamTransport,
+            astra_core::ErrorKind::StreamIdle,
+        ] {
+            let frames = [
+                sse_event(
+                    "session_info",
+                    ",\"session_id\":\"session-1\",\"run_id\":\"root-run\"",
+                ),
+                sse_event(
+                    "text_done",
+                    ",\"full_text\":\"  actual partial bytes\\n\",\"model_item_id\":\"answer-1\",\"partial\":true",
+                ),
+                sse_event(
+                    "run_error",
+                    ",\"run_id\":\"root-run\",\"error\":\"provider stream stopped\",\"error_code\":\"stream_transport\"",
+                ),
+                // Even a producer that queues work after final failure cannot execute it.
+                sse_event(
+                    "tool_request",
+                    ",\"request_id\":\"late-tool\",\"tool\":\"read_file\",\"args\":{}",
+                ),
+                sse_event(
+                    "approval_required",
+                    ",\"request_id\":\"late-approval\",\"tool\":\"bash\"",
+                ),
+                sse_event(
+                    "usage",
+                    ",\"input_tokens\":17,\"output_tokens\":3,\"usage_scope\":\"run_total\",\"qualified_usage\":{\"input_tokens\":17,\"output_tokens\":3}",
+                ),
+                sse_event(
+                    "run_finished",
+                    ",\"run_id\":\"root-run\",\"owner_generation\":4,\"status\":\"failed\",\"error\":\"provider stream stopped\",\"error_code\":\"stream_transport\"",
+                ),
+            ];
+            let frames = frames.map(|frame| frame.replace("stream_transport", kind.as_str()));
+            let all = frames.concat();
+            let cases = [
+                frames
+                    .iter()
+                    .map(|frame| Ok(frame.as_bytes().to_vec()))
+                    .collect::<Vec<_>>(),
+                vec![Ok(all.as_bytes().to_vec())],
+                all.as_bytes()
+                    .chunks(7)
+                    .map(|part| Ok(part.to_vec()))
+                    .collect(),
+                vec![Ok(all.trim_end().as_bytes().to_vec())],
+            ];
+            for chunks in cases {
+                let mut source = stream::iter(chunks);
+                let mut host = RecordingSseStreamHost::new();
+                let (result, abort) =
+                    consume_sse_stream(&mut source, &mut host, std::time::Duration::from_secs(1))
+                        .await;
+                assert_eq!(abort, Some(kind));
+                let accum = result.accum;
+                assert!(accum.has_authoritative_failed_terminal());
+                assert!(!accum.stream_complete);
+                assert!(!accum.server_loop_terminal);
+                assert!(accum.server_execution_summary.is_none());
+                assert_eq!(accum.full_text, "  actual partial bytes\n");
+                assert_eq!(accum.model_item_id.as_deref(), Some("answer-1"));
+                assert_eq!(accum.accounted_usage().unwrap().input_tokens(), Some(17));
+                assert_eq!(accum.accounted_usage().unwrap().output_tokens(), Some(3));
+                assert_eq!(
+                    accum.error_message.as_deref(),
+                    Some("provider stream stopped")
+                );
+                assert!(result.tool_results.is_empty());
+                assert!(host.approval_kinds.is_empty());
+                assert_eq!(host.done_count, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_output_requires_valid_physical_root_evidence() {
+        let prefix = format!(
+            "{}{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event("text_delta", ",\"content\":\"must be discarded\""),
+            sse_event(
+                "run_error",
+                ",\"run_id\":\"root-run\",\"error\":\"stream failed\",\"error_code\":\"stream_transport\""
+            ),
+        );
+        for terminal in [
+            serde_json::json!({"type":"run_finished","run_id":"foreign","owner_generation":4,"status":"failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"run_finished","run_id":"root-run","status":"failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"completed"}),
+            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_kind":"not_a_kind","error_code":"stream_transport"}),
+            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_code":"stream_transport","turn_evaluation":false}),
+            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_code":"stream_idle"}),
+        ] {
+            let mut source = stream::iter(vec![Ok(
+                format!("{prefix}data: {terminal}\n\n").into_bytes()
+            )]);
+            let mut host = RecordingSseStreamHost::new();
+            host.strict_sse_json = true;
+            let (result, abort) =
+                consume_sse_stream(&mut source, &mut host, std::time::Duration::from_secs(1)).await;
+            assert!(abort.is_some());
+            assert!(
+                !result.accum.has_authoritative_failed_terminal(),
+                "{terminal}"
+            );
+            assert!(result.accum.full_text.is_empty(), "{terminal}");
+            assert!(!result.accum.stream_complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_ahead_overflow_cannot_accept_a_probe_only_failed_terminal() {
+        let (tx, mut source) = test_channel();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = RecordingSseStreamHost::new();
+        host.tool_gate = Some((started.clone(), cancel.clone()));
+        let bridge = tokio::spawn(async move {
+            tx.send(Ok(format!(
+                "{}{}",
+                sse_event(
+                    "session_info",
+                    ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+                ),
+                sse_event(
+                    "tool_request",
+                    ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{}"
+                ),
+            )
+            .into_bytes()))
+                .await
+                .unwrap();
+            started.notified().await;
+            let output = "x".repeat(MAX_EDGE_EXECUTION_READ_AHEAD_BYTES + 1);
+            let overflow = sse_event("context_meta", &format!(",\"large\":{output:?}"));
+            let failed = sse_event(
+                "run_finished",
+                ",\"run_id\":\"root-run\",\"owner_generation\":4,\"status\":\"failed\",\"error_code\":\"stream_transport\"",
+            );
+            tx.send(Ok(format!("{overflow}{failed}").into_bytes()))
+                .await
+                .unwrap();
+        });
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consume_sse_stream_cancellable(
+                &mut source,
+                &mut host,
+                stream_idle_timeout(),
+                Some(&cancel),
+                None,
+            ),
+        )
+        .await
+        .expect("overflow must settle the active callback");
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("read-ahead exceeded")
+        );
+        assert!(result.accum.run_terminal.is_none());
+        assert!(!result.accum.has_authoritative_failed_terminal());
+        bridge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_ahead_callback_failure_cannot_accept_an_eof_terminal() {
+        let (tx, mut source) = test_channel();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = RecordingSseStreamHost::new();
+        host.tool_gate = Some((started.clone(), cancel.clone()));
+        host.rejected_sse_event_type = Some("text_delta");
+        let bridge = tokio::spawn(async move {
+            tx.send(Ok(format!(
+                "{}{}",
+                sse_event(
+                    "session_info",
+                    ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+                ),
+                sse_event(
+                    "tool_request",
+                    ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{}"
+                ),
+            )
+            .into_bytes()))
+                .await
+                .unwrap();
+            started.notified().await;
+            let prefix = sse_event(
+                "text_delta",
+                ",\"content\":\"observed but callback failed\"",
+            );
+            let terminal = sse_event(
+                "run_finished",
+                ",\"run_id\":\"root-run\",\"owner_generation\":4,\"status\":\"failed\",\"error_code\":\"stream_transport\"",
+            );
+            tx.send(Ok(format!("{prefix}{}", terminal.trim_end()).into_bytes()))
+                .await
+                .unwrap();
+        });
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consume_sse_stream_cancellable(
+                &mut source,
+                &mut host,
+                stream_idle_timeout(),
+                Some(&cancel),
+                None,
+            ),
+        )
+        .await
+        .expect("terminal observation must settle the active callback");
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("injected observation callback failure")
+        );
+        assert!(result.accum.run_terminal.is_none());
+        assert!(!result.accum.has_authoritative_failed_terminal());
+        assert!(result.accum.full_text.is_empty());
+        bridge.await.unwrap();
     }
 
     #[tokio::test]

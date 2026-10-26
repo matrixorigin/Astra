@@ -2,7 +2,7 @@
 #![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
     bind_server_workspace, loop_state, server_host_builder,
 };
 use astra_runtime::server::tool_transport::{
@@ -35,7 +35,7 @@ async fn server_lifecycle_parallel_reads_preserve_actual_results_and_pairing() {
                 "usage":{"prompt_tokens":52,"completion_tokens":11,"total_tokens":63}})),
         ]
     )]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("tool-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -219,7 +219,7 @@ async fn server_lifecycle_cancellation_settles_a_live_provider_stream() {
             release_before_chunk: Some((1, release.clone())),
         }],
     )]).await;
-    let ledger = InferenceLedgerFixture::default();
+    let ledger = ProviderObservationsFixture::default();
     let session = format!("cancel-fixture-{}", uuid::Uuid::new_v4());
     let mut host = server_host_builder(
         &gateway,
@@ -306,7 +306,7 @@ async fn server_lifecycle_cancellation_settles_a_live_provider_stream() {
     assert_eq!((state.total_prompt, state.total_completion), (40, 6));
     assert_eq!(ledger.attempt_count(), 3);
     assert!(
-        ledger.wait_for_settlements(Duration::from_secs(5)).await,
+        ledger.wait_for_completion(Duration::from_secs(5)).await,
         "detached settlement owner must finish"
     );
     ledger.assert_quiescent();

@@ -123,7 +123,6 @@ pub(crate) mod tool_route_boundary;
 pub(crate) mod tool_route_runtime;
 pub(crate) mod tool_route_selection;
 pub(crate) mod tool_session_config;
-pub(crate) mod tool_session_history;
 pub(crate) mod tool_session_runtime;
 pub(crate) mod tool_session_state_rollback;
 pub mod tool_transport;

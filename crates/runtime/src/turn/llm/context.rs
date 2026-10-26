@@ -655,100 +655,15 @@ impl LlmContextManifestTrace {
     }
 }
 
-fn manifest_u64(trace: &Value, pointer: &str) -> Option<u64> {
-    trace.pointer(pointer).and_then(Value::as_u64)
-}
-
-fn manifest_string(trace: &Value, pointer: &str) -> Option<String> {
-    trace
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn model_request_rollout_stage() -> astra_services::ModelRequestRolloutStage {
-    use std::sync::OnceLock;
-    static STAGE: OnceLock<astra_services::ModelRequestRolloutStage> = OnceLock::new();
-    *STAGE.get_or_init(|| {
-        match std::env::var("ASTRA_MODEL_REQUEST_CONTEXT_ROLLOUT")
-            .ok()
-            .as_deref()
-        {
-            Some("opt_in") => astra_services::ModelRequestRolloutStage::OptIn,
-            Some("topology_canary") => astra_services::ModelRequestRolloutStage::TopologyCanary,
-            Some("default") => astra_services::ModelRequestRolloutStage::Default,
-            // Missing and invalid configuration both fail closed to shadow.
-            Some("shadow") | None | Some(_) => astra_services::ModelRequestRolloutStage::Shadow,
-        }
-    })
-}
-
-/// Convert the shared assembly manifest into the content-free seed persisted
-/// at the physical provider boundary.
+/// Attach every observed physical request, its exact serialized
+/// provider-body composition, and its complete terminal when present.
 ///
-/// Every lookup is an exact schema path. Unknown facts stay absent; provider
-/// or model names are never interpreted to manufacture lineage or budgets.
-pub(crate) fn model_request_context_seed_from_manifest(
-    topology: astra_services::ModelRequestTopology,
-    trace: Option<&Value>,
-) -> astra_services::ModelRequestContextSeed {
-    let (interaction_owner, loop_owner, execution_binding) = match topology {
-        astra_services::ModelRequestTopology::CliServer => ("cli", "server", "server"),
-        astra_services::ModelRequestTopology::EdgeServer => ("edge", "server", "edge"),
-        astra_services::ModelRequestTopology::ServerOnly => ("server", "server", "server"),
-    };
-    let mut seed = astra_services::ModelRequestContextSeed::server_default();
-    seed.topology = topology;
-    seed.rollout_stage = model_request_rollout_stage();
-    seed.interaction_owner = interaction_owner.to_string();
-    seed.loop_owner = loop_owner.to_string();
-    seed.execution_binding = execution_binding.to_string();
-    let Some(trace) = trace else {
-        return seed;
-    };
-
-    seed.budget.raw_context_window_tokens =
-        manifest_u64(trace, "/context_window_policy/raw_context_window_tokens")
-            .or_else(|| manifest_u64(trace, "/model_context_window_tokens"));
-    seed.budget.usable_input_limit_tokens =
-        manifest_u64(trace, "/context_window_policy/usable_input_limit_tokens")
-            .or_else(|| manifest_u64(trace, "/wire/budget/effective_input_limit"));
-    seed.budget.reserved_output_tokens =
-        manifest_u64(trace, "/context_window_policy/reserved_output_tokens")
-            .or_else(|| manifest_u64(trace, "/wire/budget/requested_output_tokens"));
-    seed.budget.reserved_summary_tokens =
-        manifest_u64(trace, "/context_window_policy/reserved_summary_tokens");
-    seed.budget.reserved_protocol_tokens =
-        manifest_u64(trace, "/context_window_policy/reserved_protocol_tokens")
-            .or_else(|| manifest_u64(trace, "/wire/budget/reserved_protocol_tokens"));
-    seed.budget.compact_trigger_tokens =
-        manifest_u64(trace, "/context_window_policy/auto_compact_trigger_tokens");
-    seed.budget.hard_limit_tokens =
-        manifest_u64(trace, "/context_window_policy/hard_input_limit_tokens")
-            .or_else(|| manifest_u64(trace, "/wire/budget/model_limit"));
-    seed.budget.estimated_input_tokens = manifest_u64(trace, "/wire/budget/estimated_input_tokens");
-    seed.budget.usage_source = Some("pre_provider_estimate".to_string());
-
-    seed.composition.stable_system_tokens = manifest_u64(trace, "/system_prompt_tokens");
-    seed.cache.layout = manifest_string(
-        trace,
-        "/wire/fingerprint/prompt_cache_identity/cache_layout",
-    );
-    seed.cache.current_identity =
-        manifest_string(trace, "/wire/fingerprint/prompt_cache_identity/content_id");
-    seed.compaction.tier = manifest_string(trace, "/compaction_tier");
-    seed
-}
-
-/// Attach every durably admitted physical request, its exact serialized
-/// provider-body composition, and its complete durable terminal when present.
-///
-/// Each durable attempt is admitted from the same immutable bytes used by its
-/// HTTP body. The complete array is authoritative; `request_identity` is only
+/// Each physical attempt is observed from the same immutable bytes used by its
+/// HTTP body. The complete array preserves the in-process observations; `request_identity` is only
 /// a latest-attempt projection for the existing turn-trace summary.
 pub(crate) fn augment_manifest_trace_with_provider_attempts(
     trace: &mut Value,
-    attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
+    attempts: &[crate::turn::llm::client::ProviderAttemptObservation],
     round: u32,
 ) {
     let Some(latest) = attempts.last() else {
@@ -5290,11 +5205,11 @@ mod context_cache_contract_tests {
             )
             .expect("prepare provider body once");
             let wire = prepared.identity();
-            attempts.push(crate::turn::llm::durable::DurableProviderAttemptFact {
+            attempts.push(crate::turn::llm::client::ProviderAttemptObservation {
                 qualified_usage: Some(
                     astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
                 ),
-                request: crate::turn::llm::durable::DurableProviderRequestIdentity {
+                request: crate::turn::llm::client::ProviderRequestObservation {
                     request_id: format!("attempt-{attempt}"),
                     request_hash: wire.provider_wire_hash.clone(),
                     attempt,
@@ -5676,109 +5591,6 @@ mod context_cache_contract_tests {
             traced["wire"]["message_count"], 3,
             "wire metrics must still describe the final provider projection"
         );
-    }
-
-    #[test]
-    fn model_request_seed_reads_only_exact_manifest_contract_fields() {
-        let trace = json!({
-            "model_context_window_tokens": 1_000_000,
-            "context_window_policy": {
-                "raw_context_window_tokens": 1_000_000,
-                "usable_input_limit_tokens": 910_000,
-                "reserved_output_tokens": 64_000,
-                "reserved_summary_tokens": 24_000,
-                "reserved_protocol_tokens": 2_000,
-                "auto_compact_trigger_tokens": 728_000,
-                "hard_input_limit_tokens": 934_000
-            },
-            "system_prompt_tokens": 12_000,
-            "compaction_tier": "normal",
-            "wire": {
-                "budget": {
-                    "estimated_input_tokens": 700_000
-                },
-                "fingerprint": {
-                    "prompt_cache_identity": {
-                        "cache_layout": "provider-prefix-v1",
-                        "content_id": "sha256:stable"
-                    }
-                }
-            }
-        });
-
-        let seed = model_request_context_seed_from_manifest(
-            astra_services::ModelRequestTopology::CliServer,
-            Some(&trace),
-        );
-        assert_eq!(
-            seed.topology,
-            astra_services::ModelRequestTopology::CliServer
-        );
-        assert_eq!(seed.interaction_owner, "cli");
-        assert_eq!(seed.loop_owner, "server");
-        assert_eq!(seed.budget.raw_context_window_tokens, Some(1_000_000));
-        assert_eq!(seed.budget.usable_input_limit_tokens, Some(910_000));
-        assert_eq!(seed.budget.estimated_input_tokens, Some(700_000));
-        assert_eq!(seed.composition.stable_system_tokens, Some(12_000));
-        assert_eq!(
-            seed.cache.current_identity.as_deref(),
-            Some("sha256:stable")
-        );
-    }
-
-    #[test]
-    fn topology_changes_surface_attribution_not_assembled_request_facts() {
-        let trace = json!({
-            "context_window_policy": {
-                "raw_context_window_tokens": 1_000_000,
-                "usable_input_limit_tokens": 910_000,
-                "reserved_output_tokens": 64_000,
-                "reserved_summary_tokens": 24_000,
-                "reserved_protocol_tokens": 2_000,
-                "auto_compact_trigger_tokens": 728_000,
-                "hard_input_limit_tokens": 934_000
-            },
-            "system_prompt_tokens": 12_000,
-            "compaction_tier": "normal",
-            "wire": {
-                "budget": {"estimated_input_tokens": 700_000},
-                "fingerprint": {
-                    "prompt_cache_identity": {
-                        "cache_layout": "provider-prefix-v1",
-                        "content_id": "sha256:stable"
-                    }
-                }
-            }
-        });
-
-        let cli = model_request_context_seed_from_manifest(
-            astra_services::ModelRequestTopology::CliServer,
-            Some(&trace),
-        );
-        let server = model_request_context_seed_from_manifest(
-            astra_services::ModelRequestTopology::ServerOnly,
-            Some(&trace),
-        );
-        let edge = model_request_context_seed_from_manifest(
-            astra_services::ModelRequestTopology::EdgeServer,
-            Some(&trace),
-        );
-
-        for candidate in [&server, &edge] {
-            assert_eq!(candidate.rollout_stage, cli.rollout_stage);
-            assert_eq!(candidate.model_family, cli.model_family);
-            assert_eq!(candidate.lineage, cli.lineage);
-            assert_eq!(candidate.budget, cli.budget);
-            assert_eq!(candidate.composition, cli.composition);
-            assert_eq!(candidate.cache, cli.cache);
-            assert_eq!(candidate.compaction, cli.compaction);
-        }
-        assert_eq!(cli.interaction_owner, "cli");
-        assert_eq!(server.interaction_owner, "server");
-        assert_eq!(edge.interaction_owner, "edge");
-        assert_eq!(cli.loop_owner, "server");
-        assert_eq!(server.loop_owner, "server");
-        assert_eq!(edge.loop_owner, "server");
     }
 
     #[test]

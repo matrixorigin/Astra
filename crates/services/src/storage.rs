@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-17-v105";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v110";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -168,6 +168,11 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     resolved_model_name VARCHAR(255) NULL,
     runtime_profile VARCHAR(64) NULL,
     start_request_fingerprint VARCHAR(64) NULL,
+    opening_events_json LONGTEXT NULL,
+    opening_context_json LONGTEXT NULL,
+    opening_hash VARCHAR(64) NULL,
+    context_admission_hash VARCHAR(64) NULL,
+    terminal_receipt_json LONGTEXT NULL,
     work_id VARCHAR(64) NULL,
     work_branch_id VARCHAR(64) NULL,
     work_graph_revision BIGINT NULL,
@@ -196,6 +201,8 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
     INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
     INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
+    INDEX idx_agent_runs_session_lease (user_id, session_id, owner_lease_expires_at),
+    INDEX idx_agent_runs_session_activity (user_id, session_id, status, waiting_for),
     INDEX idx_agent_runs_binding (agent_binding_id, created_at),
     INDEX idx_agent_runs_model_offering (model_offering_id, created_at),
     INDEX idx_agent_runs_owner_work_branch_created (
@@ -210,6 +217,11 @@ const AGENT_RUNS_RUNTIME_AUTHORITY_COLUMNS: &[&str] = &[
     "model_offering_id",
     "resolved_model_name",
     "start_request_fingerprint",
+    "opening_events_json",
+    "opening_context_json",
+    "opening_hash",
+    "context_admission_hash",
+    "terminal_receipt_json",
 ];
 const AGENT_RUNS_WORK_BINDING_COLUMNS: &[&str] =
     &["work_id", "work_branch_id", "work_graph_revision"];
@@ -996,30 +1008,17 @@ impl SessionWriteAdmissionFacts {
     }
 }
 
-/// Facts established by the canonical session -> execution-slot admission
-/// order. The slot tuple is already protected by the transaction's row/key
-/// lock and can be reused by the immediate run mutation for this exact
-/// session. It must not outlive that transaction or be reused after the slot
-/// is mutated.
+/// Transaction-local identity and status protected by lifecycle -> Session
+/// admission. Actual Runs and invocation custody own execution occupancy.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionExecutionAdmissionFacts {
     user_id: String,
     session_id: String,
-    session_status: String,
-    slot: Option<(String, chrono::NaiveDateTime)>,
 }
 
 impl SessionExecutionAdmissionFacts {
     pub(crate) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
         self.user_id == user_id && self.session_id == session_id
-    }
-
-    pub(crate) fn session_is_active(&self) -> bool {
-        self.session_status == "active"
-    }
-
-    pub(crate) fn slot(&self) -> Option<&(String, chrono::NaiveDateTime)> {
-        self.slot.as_ref()
     }
 }
 
@@ -1119,8 +1118,7 @@ where
 /// run and any session-scoped execution authority derived from it.
 ///
 /// The caller supplies the session identity it already owns. We first fence
-/// the active, non-deleted session, then the session execution slot, and
-/// only then may the caller lock run rows. Sessions without an active run
+/// the active, non-deleted session, then may the caller lock or mutate Run rows. Sessions without an active run
 /// still use this fence, so run creation cannot race an idle handoff check.
 pub async fn admit_session_execution_write<T>(
     tx: &mut T,
@@ -1135,9 +1133,8 @@ where
         .map(|_| ())
 }
 
-/// Establish the session and execution-slot locks once and return the facts
-/// needed by the immediate mutation. The returned slot is not a cache; it is
-/// a transaction-local snapshot protected by the locks acquired below.
+/// Establish lifecycle and owned Session admission once. Ordinary mutations
+/// do not rediscover occupancy; independent creation checks actual owners.
 pub(crate) async fn admit_session_execution_write_with_facts<T>(
     tx: &mut T,
     session_id: &str,
@@ -1146,35 +1143,159 @@ pub(crate) async fn admit_session_execution_write_with_facts<T>(
 where
     T: TransactionConnection,
 {
-    let session = admit_session_event_write_with_facts(tx, session_id, user_id, false).await?;
+    admit_session_event_write(tx, session_id, user_id, false).await?;
 
-    // Lock the derived slot before any run row. A missing slot is a valid
-    // state; the SELECT still establishes the canonical access order for
-    // engines that protect the key range on FOR UPDATE.
-    let slot = query(
-        "SELECT run_id, updated_at FROM agent_session_execution_slots
-         WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+    Ok(SessionExecutionAdmissionFacts {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+    })
+}
+
+/// A standalone Context root need not have a Server display Session. Lock an
+/// existing display row when present, preserving the same deletion/Session order;
+/// absence never becomes an active-Session proof usable to create a Run.
+pub(crate) async fn admit_context_execution_write_with_facts<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+) -> Result<SessionExecutionAdmissionFacts, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    match lock_agent_session_write_fence_state(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => {}
+        AgentSessionWriteFenceState::PendingDelete
+        | AgentSessionWriteFenceState::CompletedDelete => return Err(sqlx::Error::RowNotFound),
+        AgentSessionWriteFenceState::Missing => {
+            return Err(sqlx::Error::Protocol(
+                "session lifecycle fence disappeared before it could be locked".into(),
+            ));
+        }
+    }
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&mut **tx)
-    .await?
-    .map(|row| {
-        Ok::<_, sqlx::Error>((
-            row.try_get::<String, _>("run_id")?,
-            row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
-        ))
-    })
-    .transpose()?;
+    .await?;
+    if status.as_deref() == Some("deleting") {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(SessionExecutionAdmissionFacts {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
-        session_status: session.session_status,
-        slot,
     })
 }
 
-/// Admit a session/slot and require an exact run when the caller has no
+/// Read the actual execution owners for one explicit user/Session. Each inner
+/// query must bind its own scope: MatrixOne may otherwise apply LIMIT before
+/// decorrelating an EXISTS, letting another Session hide this one's owner.
+/// Callers retain the lifecycle/Session fence and current-read locks.
+fn push_session_execution_activity(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    query.push("CAST((EXISTS (SELECT 1 FROM agent_runs activity WHERE activity.user_id = ")
+        .push_bind(user_id).push(" AND activity.session_id = ").push_bind(session_id)
+        .push(" AND (activity.status IN ('running', 'waiting') OR (activity.status = 'paused' AND activity.waiting_for IS NOT NULL))");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND activity.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE) OR EXISTS (SELECT 1 FROM agent_runs executor WHERE executor.user_id = ")
+        .push_bind(user_id).push(" AND executor.session_id = ").push_bind(session_id)
+        .push(" AND executor.owner_lease_expires_at >= NOW(6) AND executor.owner_pod_id IS NOT NULL");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND executor.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active, CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ")
+        .push_bind(user_id).push(" AND custody.session_id = ").push_bind(session_id)
+        .push(" AND custody.state IN ('prepared', 'dispatched', 'outcome_unknown')");
+    if let Some(run_id) = except_run_id {
+        query.push(" AND custody.run_id <> ").push_bind(run_id);
+    }
+    query.push(" LIMIT 1 FOR UPDATE) AS SIGNED) AS execution_debt");
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionExecutionActivity {
+    pub(crate) active_run: bool,
+    pub(crate) unresolved_invocations: bool,
+}
+
+impl SessionExecutionActivity {
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.active_run && !self.unresolved_invocations
+    }
+
+    fn from_row(row: &sqlx::mysql::MySqlRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            active_run: row.try_get::<i64, _>("execution_active")? != 0,
+            unresolved_invocations: row.try_get::<i64, _>("execution_debt")? != 0,
+        })
+    }
+}
+
+/// New independent executions check occupancy in their existing owned Session
+/// read, before inserting a Run. Excluding the requested Run key permits only
+/// the unique-key replay path; a duplicate never returns a new execution grant.
+pub(crate) async fn admit_independent_run_creation<T>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    run_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    lock_agent_session_write_fence(tx, session_id, user_id)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::Protocol(message) if message == "session has a durable deletion fence" => {
+                sqlx::Error::RowNotFound
+            }
+            error => error,
+        })?;
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT session.status, ");
+    push_session_execution_activity(&mut query, user_id, session_id, Some(run_id));
+    query
+        .push(" FROM agent_sessions session WHERE session.user_id = ")
+        .push_bind(user_id)
+        .push(" AND session.session_id = ")
+        .push_bind(session_id)
+        .push(" LIMIT 1 FOR UPDATE");
+    let row = query
+        .build()
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    let status: String = row.try_get("status")?;
+    if status != "active" {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(SessionExecutionActivity::from_row(&row)?.is_idle())
+}
+
+/// Read actual Run/lease/effect custody under an already held Session fence.
+/// Resume may exclude its exact Run only after checkpoint/custody validation.
+pub(crate) async fn session_execution_activity<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<SessionExecutionActivity, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_execution_activity(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    SessionExecutionActivity::from_row(&row)
+}
+
+/// Admit a Session and require an exact run when the caller has no
 /// authoritative run lookup of its own. Callers that read the run should use
 /// session/execution admission followed by that locking read, not both.
 pub async fn admit_session_scoped_run_write<T>(
@@ -1872,55 +1993,6 @@ async fn existing_table_columns(
     .collect::<Result<BTreeSet<_>, _>>()
 }
 
-#[derive(Clone, Debug)]
-struct WeightedAdmissionColumnShape {
-    data_type: String,
-    numeric_precision: Option<i64>,
-    numeric_scale: Option<i64>,
-    nullable: bool,
-}
-
-async fn weighted_admission_table_shapes(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-    table: &str,
-) -> Result<BTreeMap<String, WeightedAdmissionColumnShape>, sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    validate_schema_identifier(table, "matrixone table")?;
-    let rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let name: String = row.try_get("COLUMN_NAME")?;
-            let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-                "YES" => true,
-                "NO" => false,
-                value => {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                    )));
-                }
-            };
-            Ok((
-                name,
-                WeightedAdmissionColumnShape {
-                    data_type: row.try_get("DATA_TYPE")?,
-                    numeric_precision: row.try_get("NUMERIC_PRECISION")?,
-                    numeric_scale: row.try_get("NUMERIC_SCALE")?,
-                    nullable,
-                },
-            ))
-        })
-        .collect()
-}
-
 async fn table_exists(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -1937,153 +2009,6 @@ async fn table_exists(
     .fetch_optional(pool)
     .await
     .map(|row| row.is_some())
-}
-
-/// The current admission protocol stores materialized usage beside the
-/// durable gate. `CREATE TABLE IF NOT EXISTS` cannot add those columns to a
-/// database created by an older contract, and this branch intentionally has
-/// no compatibility migration. Refuse that physical schema explicitly before
-/// publishing a new readiness marker; operators must recreate the database
-/// with the current contract instead.
-async fn reject_obsolete_weighted_admission_schema(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    const GATE: &str = "session_weighted_admission_gates";
-    const OWNER_USAGE: &str = "session_weighted_admission_owner_usage";
-    const REQUIRED_GATE_COLUMNS: &[&str] = &[
-        "usage_initialized",
-        "earliest_expiry_at",
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ];
-
-    if !table_exists(pool, database, GATE).await? {
-        // A brand-new database has no admission tables yet; the bootstrap DDL
-        // below will create the complete current shape.
-        return Ok(());
-    }
-
-    let gate_columns = weighted_admission_table_shapes(pool, database, GATE).await?;
-    let missing = REQUIRED_GATE_COLUMNS
-        .iter()
-        .filter(|column| !gate_columns.contains_key(**column))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema does not match the current contract; missing {}. Recreate database {database} with the current schema",
-            missing.join(", ")
-        )));
-    }
-    if !table_exists(pool, database, OWNER_USAGE).await? {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is incomplete; missing table {OWNER_USAGE}. Recreate database {database} with the current schema"
-        )));
-    }
-
-    let mut mismatches = Vec::new();
-    if let Some(column) = gate_columns.get("earliest_expiry_at")
-        && (!column.data_type.eq_ignore_ascii_case("datetime") || !column.nullable)
-    {
-        mismatches.push(format!(
-            "{GATE}.earliest_expiry_at must be nullable DATETIME"
-        ));
-    }
-    if let Some(column) = gate_columns.get("usage_initialized")
-        && (!column.data_type.eq_ignore_ascii_case("tinyint") || column.nullable)
-    {
-        mismatches.push(format!(
-            "{GATE}.usage_initialized must be NOT NULL TINYINT (found {}{})",
-            column.data_type,
-            if column.nullable { " NULL" } else { "" }
-        ));
-    }
-    for name in [
-        "used_resident_bytes",
-        "used_context_tokens",
-        "used_provider_slots",
-        "used_cpu_units",
-        "used_io_bytes",
-        "allocated_resident_bytes",
-        "allocated_context_tokens",
-        "allocated_provider_slots",
-        "allocated_cpu_units",
-        "allocated_io_bytes",
-    ] {
-        if let Some(column) = gate_columns.get(name)
-            && (!column.data_type.eq_ignore_ascii_case("decimal")
-                || column.numeric_precision != Some(20)
-                || column.numeric_scale != Some(0)
-                || column.nullable)
-        {
-            mismatches.push(format!(
-                "{GATE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
-                column.data_type,
-                column.numeric_precision,
-                column.numeric_scale,
-                if column.nullable { " NULL" } else { "" }
-            ));
-        }
-    }
-
-    let owner_columns = weighted_admission_table_shapes(pool, database, OWNER_USAGE).await?;
-    for name in [
-        "resident_bytes",
-        "context_tokens",
-        "provider_slots",
-        "cpu_units",
-        "io_bytes",
-    ] {
-        match owner_columns.get(name) {
-            None => mismatches.push(format!("{OWNER_USAGE}.{name} is missing")),
-            Some(column)
-                if !column.data_type.eq_ignore_ascii_case("decimal")
-                    || column.numeric_precision != Some(20)
-                    || column.numeric_scale != Some(0)
-                    || column.nullable =>
-            {
-                mismatches.push(format!(
-                    "{OWNER_USAGE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
-                    column.data_type,
-                    column.numeric_precision,
-                    column.numeric_scale,
-                    if column.nullable { " NULL" } else { "" }
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    if !mismatches.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema does not match the current physical shape: {}. Recreate database {database} with the current schema",
-            mismatches.join(", ")
-        )));
-    }
-    let reservation_columns =
-        weighted_admission_table_shapes(pool, database, "session_weighted_admission_reservations")
-            .await?;
-    // Interrupted fresh bootstrap may not have created this table yet.
-    if !reservation_columns.is_empty()
-        && !reservation_columns
-            .get("idempotency_hash")
-            .is_some_and(|column| {
-                column.data_type.eq_ignore_ascii_case("varchar") && !column.nullable
-            })
-    {
-        return Err(sqlx::Error::Protocol(format!(
-            "weighted admission idempotency_hash must be NOT NULL VARCHAR; recreate database {database} with the current schema"
-        )));
-    }
-    Ok(())
 }
 
 fn agent_runs_canonical_columns() -> BTreeSet<String> {
@@ -2353,6 +2278,14 @@ async fn verify_agent_runs_canonical_schema(
             &["owner_pod_id", "owner_lease_expires_at"],
         ),
         (
+            "idx_agent_runs_session_activity",
+            &["user_id", "session_id", "status", "waiting_for"],
+        ),
+        (
+            "idx_agent_runs_session_lease",
+            &["user_id", "session_id", "owner_lease_expires_at"],
+        ),
+        (
             "idx_agent_runs_binding",
             &["agent_binding_id", "created_at"],
         ),
@@ -2573,34 +2506,6 @@ fn inference_provider_attempt_schema_mismatches(
         None => reasons.push("missing nullable column context_expired_at".to_string()),
     }
 
-    for (name, expected_type, expected_width) in [
-        ("canonical_transition_id", "char", Some(64_i64)),
-        ("canonical_parent_transition_id", "char", Some(64_i64)),
-        ("canonical_transition_hash", "char", Some(64_i64)),
-    ] {
-        let Some(column) = columns.get(name) else {
-            reasons.push(format!("missing nullable column {name}"));
-            continue;
-        };
-        if !column.nullable {
-            reasons.push(format!("non-nullable column {name}"));
-        }
-        if !column.data_type.eq_ignore_ascii_case(expected_type) {
-            reasons.push(format!(
-                "column {name} has type {}, expected {expected_type}",
-                column.data_type
-            ));
-        }
-        if let Some(expected_width) = expected_width
-            && column.character_maximum_length != Some(expected_width)
-        {
-            reasons.push(format!(
-                "column {name} has width {:?}, expected {expected_width}",
-                column.character_maximum_length
-            ));
-        }
-    }
-
     for (name, expected_columns) in [
         ("PRIMARY", &["user_id", "attempt_id"][..]),
         (
@@ -2629,207 +2534,6 @@ fn inference_provider_attempt_schema_mismatches(
         }
     }
     reasons
-}
-
-fn inference_canonical_transition_head_schema_mismatches(
-    columns: &BTreeMap<String, ObservedColumnShape>,
-    indexes: &BTreeMap<String, ObservedIndexShape>,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    for (name, expected_type, expected_width) in [
-        ("user_id", "varchar", Some(128_i64)),
-        ("session_id", "varchar", Some(64_i64)),
-        ("turn_index", "bigint", None),
-        ("head_transition_id", "char", Some(64_i64)),
-        ("head_attempt_id", "varchar", Some(64_i64)),
-        ("head_result_count", "bigint", None),
-        ("head_result_root_hash", "char", Some(64_i64)),
-        ("chain_length", "bigint", None),
-        ("chain_payload_bytes", "bigint", None),
-        ("updated_at", "datetime", None),
-    ] {
-        let Some(column) = columns.get(name) else {
-            reasons.push(format!("missing NOT NULL column {name}"));
-            continue;
-        };
-        if column.nullable {
-            reasons.push(format!("nullable column {name}"));
-        }
-        if !column.data_type.eq_ignore_ascii_case(expected_type) {
-            reasons.push(format!(
-                "column {name} has type {}, expected {expected_type}",
-                column.data_type
-            ));
-        }
-        if let Some(expected_width) = expected_width
-            && column.character_maximum_length != Some(expected_width)
-        {
-            reasons.push(format!(
-                "column {name} has width {:?}, expected {expected_width}",
-                column.character_maximum_length
-            ));
-        }
-    }
-    for (name, expected_columns) in [
-        ("PRIMARY", &["user_id", "session_id", "turn_index"][..]),
-        (
-            "uq_inference_canonical_head_attempt",
-            &["user_id", "head_attempt_id"][..],
-        ),
-    ] {
-        let Some(index) = indexes.get(name) else {
-            reasons.push(format!("missing unique constraint {name}"));
-            continue;
-        };
-        if index.non_unique {
-            reasons.push(format!("constraint {name} is not unique"));
-        }
-        if !index
-            .columns
-            .iter()
-            .map(String::as_str)
-            .eq(expected_columns.iter().copied())
-        {
-            reasons.push(format!(
-                "constraint {name} has columns ({}), expected ({})",
-                index.columns.join(", "),
-                expected_columns.join(", ")
-            ));
-        }
-    }
-    reasons
-}
-
-fn inference_canonical_transition_wal_schema_mismatches(
-    columns: &BTreeMap<String, ObservedColumnShape>,
-    indexes: &BTreeMap<String, ObservedIndexShape>,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-    for (name, expected_type, expected_width, nullable) in [
-        ("user_id", "varchar", Some(128_i64), false),
-        ("session_id", "varchar", Some(64_i64), false),
-        ("turn_index", "bigint", None, false),
-        ("round_index", "bigint", None, false),
-        ("logical_attempt", "bigint", None, false),
-        ("physical_attempt", "bigint", None, false),
-        ("transition_id", "char", Some(64_i64), false),
-        ("parent_transition_id", "char", Some(64_i64), true),
-        ("attempt_id", "varchar", Some(64_i64), false),
-        ("payload_hash", "char", Some(64_i64), false),
-        ("payload_bytes", "bigint", None, false),
-        ("predecessor_count", "bigint", None, false),
-        ("predecessor_root_hash", "char", Some(64_i64), false),
-        ("result_count", "bigint", None, false),
-        ("result_root_hash", "char", Some(64_i64), false),
-        ("recovery_mode", "varchar", Some(32_i64), false),
-        ("created_at", "datetime", None, false),
-    ] {
-        let Some(column) = columns.get(name) else {
-            reasons.push(format!("missing column {name}"));
-            continue;
-        };
-        if column.nullable != nullable {
-            reasons.push(format!(
-                "column {name} has nullable={}, expected {nullable}",
-                column.nullable
-            ));
-        }
-        if !column.data_type.eq_ignore_ascii_case(expected_type) {
-            reasons.push(format!(
-                "column {name} has type {}, expected {expected_type}",
-                column.data_type
-            ));
-        }
-        if let Some(expected_width) = expected_width
-            && column.character_maximum_length != Some(expected_width)
-        {
-            reasons.push(format!(
-                "column {name} has width {:?}, expected {expected_width}",
-                column.character_maximum_length
-            ));
-        }
-    }
-    match columns.get("payload_json") {
-        Some(column)
-            if !column.nullable
-                && (column.data_type.eq_ignore_ascii_case("text")
-                    || column.data_type.eq_ignore_ascii_case("longtext")) => {}
-        Some(column) if column.nullable => {
-            reasons.push("nullable column payload_json".to_string());
-        }
-        Some(column) => reasons.push(format!(
-            "column payload_json has type {}, expected text-compatible storage",
-            column.data_type
-        )),
-        None => reasons.push("missing NOT NULL column payload_json".to_string()),
-    }
-    for (name, expected_columns, expected_non_unique) in [
-        (
-            "PRIMARY",
-            &["user_id", "session_id", "turn_index", "transition_id"][..],
-            false,
-        ),
-        (
-            "uq_inference_canonical_wal_attempt",
-            &["user_id", "attempt_id"][..],
-            false,
-        ),
-        (
-            "idx_inference_canonical_wal_parent",
-            &[
-                "user_id",
-                "session_id",
-                "turn_index",
-                "parent_transition_id",
-            ][..],
-            true,
-        ),
-    ] {
-        let Some(index) = indexes.get(name) else {
-            reasons.push(format!("missing index {name}"));
-            continue;
-        };
-        if index.non_unique != expected_non_unique {
-            reasons.push(format!(
-                "index {name} has non_unique={}, expected {expected_non_unique}",
-                index.non_unique
-            ));
-        }
-        if !index
-            .columns
-            .iter()
-            .map(String::as_str)
-            .eq(expected_columns.iter().copied())
-        {
-            reasons.push(format!(
-                "index {name} has columns ({}), expected ({})",
-                index.columns.join(", "),
-                expected_columns.join(", ")
-            ));
-        }
-    }
-    reasons
-}
-
-fn inference_canonical_transition_wal_definition_mismatches(create_sql: &str) -> Vec<String> {
-    let normalized = create_sql.to_ascii_lowercase();
-    if normalized.contains("'checkpoint_from_parent'") {
-        Vec::new()
-    } else {
-        vec![
-            "recovery-mode CHECK does not admit checkpoint_from_parent; rebuild this pre-release WAL table before startup"
-                .to_string(),
-        ]
-    }
-}
-
-fn database_reports_check_constraints_in_show_create(version: &str) -> bool {
-    // MatrixOne currently accepts CHECK syntax but omits CHECK clauses from
-    // SHOW CREATE TABLE. Treating the omitted text as proof of an obsolete
-    // table makes every freshly bootstrapped MatrixOne database fail startup.
-    // MySQL-compatible engines that do report the definition retain the
-    // strict recovery-mode contract check below.
-    !version.to_ascii_lowercase().contains("matrixone")
 }
 
 fn inference_invocation_schema_mismatches(
@@ -2994,184 +2698,6 @@ async fn verify_inference_provider_attempt_schema_contract(
     }
 
     let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
-    if reasons.is_empty() {
-        return Ok(());
-    }
-    Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
-        reasons.join(", ")
-    )))
-}
-
-async fn verify_inference_canonical_transition_head_schema_contract(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    let table = "inference_canonical_transition_heads";
-    let column_rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut columns = BTreeMap::new();
-    for row in column_rows {
-        let name: String = row.try_get("COLUMN_NAME")?;
-        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-            "YES" => true,
-            "NO" => false,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                )));
-            }
-        };
-        columns.insert(
-            name,
-            ObservedColumnShape {
-                data_type: row.try_get("DATA_TYPE")?,
-                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
-                nullable,
-            },
-        );
-    }
-    let index_rows = query(
-        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
-         FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_canonical_head_attempt')
-         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
-    for row in index_rows {
-        let name: String = row.try_get("INDEX_NAME")?;
-        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
-            0 => false,
-            1 => true,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
-                )));
-            }
-        };
-        let column: String = row.try_get("COLUMN_NAME")?;
-        let index = indexes
-            .entry(name.clone())
-            .or_insert_with(|| ObservedIndexShape {
-                columns: Vec::new(),
-                non_unique,
-            });
-        if index.non_unique != non_unique {
-            return Err(sqlx::Error::Protocol(format!(
-                "schema constraint {table}.{name} reports inconsistent uniqueness"
-            )));
-        }
-        index.columns.push(column);
-    }
-    let reasons = inference_canonical_transition_head_schema_mismatches(&columns, &indexes);
-    if reasons.is_empty() {
-        return Ok(());
-    }
-    Err(sqlx::Error::Protocol(format!(
-        "obsolete core schema table {table} is unsupported; recreate the database before startup: {}",
-        reasons.join(", ")
-    )))
-}
-
-async fn verify_inference_canonical_transition_wal_schema_contract(
-    pool: &sqlx::Pool<MySql>,
-    database: &str,
-) -> Result<(), sqlx::Error> {
-    validate_schema_identifier(database, "matrixone database")?;
-    let table = "inference_canonical_transition_wal";
-    let column_rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-         FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut columns = BTreeMap::new();
-    for row in column_rows {
-        let name: String = row.try_get("COLUMN_NAME")?;
-        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
-            "YES" => true,
-            "NO" => false,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
-                )));
-            }
-        };
-        columns.insert(
-            name,
-            ObservedColumnShape {
-                data_type: row.try_get("DATA_TYPE")?,
-                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
-                nullable,
-            },
-        );
-    }
-    let index_rows = query(
-        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
-         FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_canonical_wal_attempt',
-                              'idx_inference_canonical_wal_parent')
-         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
-    for row in index_rows {
-        let name: String = row.try_get("INDEX_NAME")?;
-        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
-            0 => false,
-            1 => true,
-            value => {
-                return Err(sqlx::Error::Protocol(format!(
-                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
-                )));
-            }
-        };
-        let column: String = row.try_get("COLUMN_NAME")?;
-        let index = indexes
-            .entry(name.clone())
-            .or_insert_with(|| ObservedIndexShape {
-                columns: Vec::new(),
-                non_unique,
-            });
-        if index.non_unique != non_unique {
-            return Err(sqlx::Error::Protocol(format!(
-                "schema constraint {table}.{name} reports inconsistent uniqueness"
-            )));
-        }
-        index.columns.push(column);
-    }
-    let mut reasons = inference_canonical_transition_wal_schema_mismatches(&columns, &indexes);
-    let show_create = format!("SHOW CREATE TABLE `{database}`.`{table}`");
-    let create_row = query(sqlx::AssertSqlSafe(show_create))
-        .fetch_one(pool)
-        .await?;
-    let create_sql: String = create_row.try_get(1_usize)?;
-    let database_version: String = query_scalar("SELECT VERSION()").fetch_one(pool).await?;
-    if database_reports_check_constraints_in_show_create(&database_version) {
-        reasons.extend(inference_canonical_transition_wal_definition_mismatches(
-            &create_sql,
-        ));
-    }
     if reasons.is_empty() {
         return Ok(());
     }
@@ -3747,23 +3273,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "agent_session_execution_slots",
-        "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id),
-            INDEX idx_session_execution_slots_run (user_id, run_id),
-            INDEX idx_session_execution_slots_updated (updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "session_context_heads",
         "CREATE TABLE IF NOT EXISTS session_context_heads (
             isolation_domain VARCHAR(128) NOT NULL,
@@ -3845,25 +3354,6 @@ async fn ensure_core_schema_while_leased(
                 (owner_user_id, session_id, branch_id, updated_at),
             CONSTRAINT chk_session_execution_switch_expected_generation CHECK (expected_generation > 0),
             CONSTRAINT chk_session_execution_switch_switching_generation CHECK (switching_generation > 0)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "conversation_segments",
-        "CREATE TABLE IF NOT EXISTS conversation_segments (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            segment_hash CHAR(64) NOT NULL,
-            canonical_root_hash CHAR(64) NOT NULL,
-            canonical_bytes BIGINT NOT NULL,
-            message_count BIGINT NOT NULL,
-            segment_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, segment_hash),
-            INDEX idx_conversation_segments_created (created_at)
         )",
     )
     .execute(&pool)
@@ -3965,42 +3455,12 @@ async fn ensure_core_schema_while_leased(
             canonical_segment_bytes BIGINT NOT NULL,
             total_canonical_bytes BIGINT NOT NULL,
             total_message_count BIGINT NOT NULL,
-            reachable TINYINT NOT NULL DEFAULT 0,
+            reachable TINYINT NOT NULL DEFAULT 1,
             manifest_json LONGTEXT NOT NULL,
+            content_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
-            INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
-            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq),
-            INDEX idx_context_manifest_reachable_sequence (isolation_domain, owner_user_id, session_id, branch_id, reachable, conversation_seq),
-            INDEX idx_context_manifest_generation_sequence (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, reachable, conversation_seq)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "conversation_manifest_segments",
-        "CREATE TABLE IF NOT EXISTS conversation_manifest_segments (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            manifest_root CHAR(64) NOT NULL,
-            segment_position BIGINT NOT NULL,
-            segment_hash CHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (
-                isolation_domain, owner_user_id, session_id, branch_id,
-                manifest_root, segment_position
-            ),
-            INDEX idx_manifest_segments_hash (
-                isolation_domain, owner_user_id, segment_hash, manifest_root
-            ),
-            INDEX idx_manifest_segments_session (
-                owner_user_id, session_id, branch_id, manifest_root
-            ),
-            INDEX idx_manifest_segments_created (created_at)
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, conversation_seq),
+            UNIQUE KEY uq_context_manifest_root (manifest_root)
         )",
     )
     .execute(&pool)
@@ -4181,91 +3641,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_owner_usage",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_owner_usage (
-            scope_name VARCHAR(64) NOT NULL,
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
-            resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, isolation_domain, owner_user_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Both admission tables must validate before readiness is published.
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_gates",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
-            scope_name VARCHAR(64) NOT NULL,
-            capacity_hash CHAR(64) NULL,
-            usage_initialized TINYINT NOT NULL DEFAULT 0,
-            earliest_expiry_at DATETIME(6) NULL,
-            used_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            used_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            allocated_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    let mut gates = sqlx::QueryBuilder::<MySql>::new(
-        "INSERT IGNORE INTO session_weighted_admission_gates (scope_name) ",
-    );
-    gates.push_values(
-        0..crate::weighted_admission::DISTRIBUTED_ADMISSION_PARTITIONS,
-        |mut row, partition| {
-            row.push_bind(crate::weighted_admission::distributed_admission_scope(
-                partition,
-            ));
-        },
-    );
-    gates.build().execute(&pool).await?;
-
-    core_schema_create!(
-        pool,
-        "session_weighted_admission_reservations",
-        "CREATE TABLE IF NOT EXISTS session_weighted_admission_reservations (
-            scope_name VARCHAR(64) NOT NULL,
-            reservation_id CHAR(36) NOT NULL,
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            idempotency_hash VARCHAR(64) NOT NULL,
-            resident_bytes BIGINT NOT NULL,
-            context_tokens BIGINT NOT NULL,
-            provider_slots BIGINT NOT NULL,
-            cpu_units BIGINT NOT NULL,
-            io_bytes BIGINT NOT NULL,
-            expires_at DATETIME(6) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, isolation_domain, owner_user_id, idempotency_hash),
-            UNIQUE KEY uq_weighted_admission_reservation (scope_name, reservation_id),
-            INDEX idx_weighted_admission_expiry (scope_name, expires_at),
-            INDEX idx_weighted_admission_owner_expiry
-                (scope_name, isolation_domain, owner_user_id, expires_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "agent_run_events",
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
@@ -4317,82 +3692,6 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uniq_run_checkpoint_idem (user_id, run_id, checkpoint_kind, idempotency_key),
             INDEX idx_run_checkpoints_user_run_created (user_id, run_id, created_at),
             INDEX idx_run_checkpoints_session_kind_created (user_id, session_id, checkpoint_kind, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "run_display_projections",
-        "CREATE TABLE IF NOT EXISTS run_display_projections (
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL,
-            waiting_for VARCHAR(64) NULL,
-            error_message TEXT NULL,
-            projection_event_idx BIGINT NOT NULL DEFAULT -1,
-            latest_event_type VARCHAR(64) NULL,
-            latest_checkpoint_id VARCHAR(64) NULL,
-            latest_checkpoint_kind VARCHAR(32) NULL,
-            latest_checkpoint_version VARCHAR(32) NULL,
-            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
-            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
-            total_tool_calls BIGINT NOT NULL DEFAULT 0,
-            projection_hash VARCHAR(64) NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, run_id),
-            INDEX idx_run_display_projections_owner_session_updated (user_id, session_id, updated_at),
-            INDEX idx_run_display_projections_user_updated (user_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_tool_output_batches",
-        "CREATE TABLE IF NOT EXISTS session_tool_output_batches (
-            batch_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            output_count INT NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'committed',
-            request_id VARCHAR(64) NULL,
-            trace_id VARCHAR(64) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, batch_id),
-            INDEX idx_tool_output_batches_user_run_created (user_id, run_id, created_at, batch_id),
-            INDEX idx_tool_output_batches_user_session_created (user_id, session_id, created_at, batch_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "session_tool_outputs",
-        "CREATE TABLE IF NOT EXISTS session_tool_outputs (
-            output_id VARCHAR(64) NOT NULL,
-            batch_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            output_idx INT NOT NULL,
-            parent_output_id VARCHAR(64) NULL,
-            tool_call_id VARCHAR(128) NULL,
-            tool_name VARCHAR(128) NOT NULL,
-            output_json LONGTEXT NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            preview_text LONGTEXT NULL,
-            preview_status VARCHAR(32) NOT NULL DEFAULT 'template',
-            artifact_ref VARCHAR(255) NULL,
-            content_hash VARCHAR(128) NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'raw_v1',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, output_id),
-            UNIQUE KEY uq_tool_outputs_batch_idx (user_id, session_id, batch_id, output_idx),
-            INDEX idx_tool_outputs_user_run_created (user_id, run_id, created_at, output_id),
-            INDEX idx_tool_outputs_user_session_created (user_id, session_id, created_at, output_id),
-            INDEX idx_tool_outputs_parent (user_id, parent_output_id),
-            INDEX idx_tool_outputs_artifact_ref (user_id, artifact_ref)
         )",
     )
     .execute(&pool)
@@ -4517,29 +3816,9 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, item_seq),
             INDEX idx_transcript_owner_run (user_id, run_id),
-            INDEX idx_transcript_owner_session_source_event (user_id, session_id, source_event_id),
+            UNIQUE KEY uq_transcript_owner_session_source_event (user_id, session_id, source_event_id),
             INDEX idx_transcript_owner_session_commit_item
                 (user_id, session_id, canonical_completed_turn, item_seq)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "session_transcript_projection_heads",
-        "CREATE TABLE IF NOT EXISTS session_transcript_projection_heads (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            completed_turn BIGINT NOT NULL,
-            journal_event_seq BIGINT NOT NULL,
-            conversation_seq BIGINT NOT NULL,
-            canonical_root_hash VARCHAR(64) NOT NULL,
-            projection_schema BIGINT NOT NULL,
-            compaction_generation BIGINT NOT NULL,
-            config_version_id VARCHAR(128) NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id)
         )",
     )
     .execute(&pool)
@@ -5145,9 +4424,6 @@ async fn ensure_core_schema_while_leased(
             provider_protocol VARCHAR(32) NOT NULL,
             provider_wire_hash CHAR(64) NOT NULL,
             provider_wire_bytes BIGINT NOT NULL,
-            canonical_transition_id CHAR(64) NULL,
-            canonical_parent_transition_id CHAR(64) NULL,
-            canonical_transition_hash CHAR(64) NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
             usage_status VARCHAR(32) NOT NULL,
@@ -5172,62 +4448,6 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "inference_canonical_transition_heads",
-        "CREATE TABLE IF NOT EXISTS inference_canonical_transition_heads (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            turn_index BIGINT NOT NULL,
-            head_transition_id CHAR(64) NOT NULL,
-            head_attempt_id VARCHAR(64) NOT NULL,
-            head_result_count BIGINT NOT NULL,
-            head_result_root_hash CHAR(64) NOT NULL,
-            chain_length BIGINT NOT NULL,
-            chain_payload_bytes BIGINT NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, turn_index),
-            UNIQUE KEY uq_inference_canonical_head_attempt (user_id, head_attempt_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "inference_canonical_transition_wal",
-        "CREATE TABLE IF NOT EXISTS inference_canonical_transition_wal (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            turn_index BIGINT NOT NULL,
-            round_index BIGINT NOT NULL,
-            logical_attempt BIGINT NOT NULL,
-            physical_attempt BIGINT NOT NULL,
-            transition_id CHAR(64) NOT NULL,
-            parent_transition_id CHAR(64) NULL,
-            attempt_id VARCHAR(64) NOT NULL,
-            payload_json LONGTEXT NOT NULL,
-            payload_hash CHAR(64) NOT NULL,
-            payload_bytes BIGINT NOT NULL,
-            predecessor_count BIGINT NOT NULL,
-            predecessor_root_hash CHAR(64) NOT NULL,
-            result_count BIGINT NOT NULL,
-            result_root_hash CHAR(64) NOT NULL,
-            recovery_mode VARCHAR(32) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, turn_index, transition_id),
-            UNIQUE KEY uq_inference_canonical_wal_attempt (user_id, attempt_id),
-            INDEX idx_inference_canonical_wal_parent
-                (user_id, session_id, turn_index, parent_transition_id),
-            CONSTRAINT chk_inference_canonical_wal_recovery_mode
-                CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base')),
-            CONSTRAINT chk_inference_canonical_wal_bounds
-                CHECK (payload_bytes > 0 AND predecessor_count >= 0 AND result_count >= 0)
         )",
     )
     .execute(&pool)
@@ -6111,7 +5331,6 @@ async fn verify_core_schema_shape(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
-    reject_obsolete_weighted_admission_schema(pool, database).await?;
     validate_schema_identifier(database, "matrixone database")?;
     // CREATE IF NOT EXISTS does not validate existing tables. Reject missing
     // runtime fields without restoring the historical ALTER/repair path.
@@ -6171,13 +5390,13 @@ async fn verify_core_schema_shape(
         (
             "conversation_manifest_nodes",
             &[
+                "content_json",
                 "total_canonical_bytes",
                 "total_message_count",
                 "reachable",
                 "compaction_generation",
             ][..],
         ),
-        ("session_weighted_admission_gates", &["capacity_hash"][..]),
         (
             "agent_run_events",
             &[
@@ -6253,15 +5472,33 @@ async fn verify_core_schema_shape(
     }
     let mut indexes: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for row in query(
-        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
+        "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE FROM information_schema.STATISTICS
          WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
     )
     .bind(database)
     .fetch_all(pool)
     .await?
     {
+        let table: String = row.try_get("TABLE_NAME")?;
+        let index: String = row.try_get("INDEX_NAME")?;
+        if table == "session_transcript_items"
+            && index == "uq_transcript_owner_session_source_event"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "transcript source identity requires a unique owner/session/source constraint; recreate the database".into(),
+            ));
+        }
+        if table == "conversation_manifest_nodes"
+            && index == "uq_context_manifest_root"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "conversation_manifest_nodes.uq_context_manifest_root must be unique; recreate the database".into(),
+            ));
+        }
         indexes
-            .entry((row.try_get("TABLE_NAME")?, row.try_get("INDEX_NAME")?))
+            .entry((table, index))
             .or_default()
             .push(row.try_get("COLUMN_NAME")?);
     }
@@ -6275,23 +5512,6 @@ async fn verify_core_schema_shape(
         &["uq_auth_user_roles_user_role"],
     )
     .await?;
-    ensure_index_shape(
-        &indexes,
-        "session_weighted_admission_reservations",
-        "PRIMARY",
-        &[
-            "scope_name",
-            "isolation_domain",
-            "owner_user_id",
-            "idempotency_hash",
-        ],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_weighted_admission_reservations",
-        "uq_weighted_admission_reservation",
-        &["scope_name", "reservation_id"],
-    )?;
     ensure_index_shape(
         &indexes,
         "auth_user_roles",
@@ -6437,48 +5657,22 @@ async fn verify_core_schema_shape(
     .await?;
     ensure_index_shape(
         &indexes,
-        "agent_session_execution_slots",
+        "conversation_manifest_nodes",
         "PRIMARY",
-        &["user_id", "session_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_run",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "agent_session_execution_slots",
-        "idx_session_execution_slots_updated",
-        &["updated_at"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_reachable_sequence",
-        &[
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "reachable",
-            "conversation_seq",
-        ],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "conversation_manifest_nodes",
-        "idx_context_manifest_generation_sequence",
         &[
             "isolation_domain",
             "owner_user_id",
             "session_id",
             "branch_id",
             "compaction_generation",
-            "reachable",
             "conversation_seq",
         ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "conversation_manifest_nodes",
+        "uq_context_manifest_root",
+        &["manifest_root"],
     )?;
     for (index, expected_columns) in [
         ("uq_run_event_idx", &["user_id", "run_id", "event_idx"][..]),
@@ -6545,73 +5739,7 @@ async fn verify_core_schema_shape(
         "idx_run_checkpoints_session_kind_created",
         &["user_id", "session_id", "checkpoint_kind", "created_at"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "run_display_projections",
-        "PRIMARY",
-        &["user_id", "run_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "run_display_projections",
-        "idx_run_display_projections_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_tool_output_batches",
-        "PRIMARY",
-        &["user_id", "session_id", "batch_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_tool_output_batches_user_run_created",
-            &["user_id", "run_id", "created_at", "batch_id"][..],
-        ),
-        (
-            "idx_tool_output_batches_user_session_created",
-            &["user_id", "session_id", "created_at", "batch_id"][..],
-        ),
-    ] {
-        ensure_index_shape(
-            &indexes,
-            "session_tool_output_batches",
-            index,
-            expected_columns,
-        )?;
-    }
-    ensure_index_shape(
-        &indexes,
-        "session_tool_outputs",
-        "PRIMARY",
-        &["user_id", "session_id", "output_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "session_tool_outputs",
-        "uq_tool_outputs_batch_idx",
-        &["user_id", "session_id", "batch_id", "output_idx"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_tool_outputs_user_run_created",
-            &["user_id", "run_id", "created_at", "output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_user_session_created",
-            &["user_id", "session_id", "created_at", "output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_parent",
-            &["user_id", "parent_output_id"][..],
-        ),
-        (
-            "idx_tool_outputs_artifact_ref",
-            &["user_id", "artifact_ref"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "session_tool_outputs", index, expected_columns)?;
-    }
+
     fail_if_required_columns_missing_or_nullable(
         pool,
         database,
@@ -6682,7 +5810,7 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "session_transcript_items",
-        "idx_transcript_owner_session_source_event",
+        "uq_transcript_owner_session_source_event",
         &["user_id", "session_id", "source_event_id"],
     )?;
     ensure_index_shape(
@@ -7187,8 +6315,6 @@ async fn verify_core_schema_shape(
     .await?;
     verify_inference_invocation_schema_contract(pool, database).await?;
     verify_inference_provider_attempt_schema_contract(pool, database).await?;
-    verify_inference_canonical_transition_head_schema_contract(pool, database).await?;
-    verify_inference_canonical_transition_wal_schema_contract(pool, database).await?;
     for (table, nullable_columns) in [
         ("inference_routes", &["run_id"][..]),
         ("inference_invocations", &["run_id"][..]),
@@ -8322,30 +7448,6 @@ mod tests {
                 },
             ),
             (
-                "canonical_transition_id",
-                ObservedColumnShape {
-                    data_type: "char".to_string(),
-                    character_maximum_length: Some(64),
-                    nullable: true,
-                },
-            ),
-            (
-                "canonical_parent_transition_id",
-                ObservedColumnShape {
-                    data_type: "char".to_string(),
-                    character_maximum_length: Some(64),
-                    nullable: true,
-                },
-            ),
-            (
-                "canonical_transition_hash",
-                ObservedColumnShape {
-                    data_type: "char".to_string(),
-                    character_maximum_length: Some(64),
-                    nullable: true,
-                },
-            ),
-            (
                 "usage_status",
                 ObservedColumnShape {
                     data_type: "varchar".to_string(),
@@ -8385,125 +7487,6 @@ mod tests {
         .collect()
     }
 
-    fn canonical_transition_head_columns() -> BTreeMap<String, ObservedColumnShape> {
-        [
-            ("user_id", "varchar", Some(128), false),
-            ("session_id", "varchar", Some(64), false),
-            ("turn_index", "bigint", None, false),
-            ("head_transition_id", "char", Some(64), false),
-            ("head_attempt_id", "varchar", Some(64), false),
-            ("head_result_count", "bigint", None, false),
-            ("head_result_root_hash", "char", Some(64), false),
-            ("chain_length", "bigint", None, false),
-            ("chain_payload_bytes", "bigint", None, false),
-            ("updated_at", "datetime", None, false),
-        ]
-        .into_iter()
-        .map(|(name, data_type, character_maximum_length, nullable)| {
-            (
-                name.to_string(),
-                ObservedColumnShape {
-                    data_type: data_type.to_string(),
-                    character_maximum_length,
-                    nullable,
-                },
-            )
-        })
-        .collect()
-    }
-
-    fn canonical_transition_head_indexes() -> BTreeMap<String, ObservedIndexShape> {
-        [
-            ("PRIMARY", vec!["user_id", "session_id", "turn_index"]),
-            (
-                "uq_inference_canonical_head_attempt",
-                vec!["user_id", "head_attempt_id"],
-            ),
-        ]
-        .into_iter()
-        .map(|(name, columns)| {
-            (
-                name.to_string(),
-                ObservedIndexShape {
-                    columns: columns.into_iter().map(str::to_string).collect(),
-                    non_unique: false,
-                },
-            )
-        })
-        .collect()
-    }
-
-    fn canonical_transition_wal_columns() -> BTreeMap<String, ObservedColumnShape> {
-        [
-            ("user_id", "varchar", Some(128), false),
-            ("session_id", "varchar", Some(64), false),
-            ("turn_index", "bigint", None, false),
-            ("round_index", "bigint", None, false),
-            ("logical_attempt", "bigint", None, false),
-            ("physical_attempt", "bigint", None, false),
-            ("transition_id", "char", Some(64), false),
-            ("parent_transition_id", "char", Some(64), true),
-            ("attempt_id", "varchar", Some(64), false),
-            ("payload_json", "text", None, false),
-            ("payload_hash", "char", Some(64), false),
-            ("payload_bytes", "bigint", None, false),
-            ("predecessor_count", "bigint", None, false),
-            ("predecessor_root_hash", "char", Some(64), false),
-            ("result_count", "bigint", None, false),
-            ("result_root_hash", "char", Some(64), false),
-            ("recovery_mode", "varchar", Some(32), false),
-            ("created_at", "datetime", None, false),
-        ]
-        .into_iter()
-        .map(|(name, data_type, character_maximum_length, nullable)| {
-            (
-                name.to_string(),
-                ObservedColumnShape {
-                    data_type: data_type.to_string(),
-                    character_maximum_length,
-                    nullable,
-                },
-            )
-        })
-        .collect()
-    }
-
-    fn canonical_transition_wal_indexes() -> BTreeMap<String, ObservedIndexShape> {
-        [
-            (
-                "PRIMARY",
-                vec!["user_id", "session_id", "turn_index", "transition_id"],
-                false,
-            ),
-            (
-                "uq_inference_canonical_wal_attempt",
-                vec!["user_id", "attempt_id"],
-                false,
-            ),
-            (
-                "idx_inference_canonical_wal_parent",
-                vec![
-                    "user_id",
-                    "session_id",
-                    "turn_index",
-                    "parent_transition_id",
-                ],
-                true,
-            ),
-        ]
-        .into_iter()
-        .map(|(name, columns, non_unique)| {
-            (
-                name.to_string(),
-                ObservedIndexShape {
-                    columns: columns.into_iter().map(str::to_string).collect(),
-                    non_unique,
-                },
-            )
-        })
-        .collect()
-    }
-
     #[test]
     fn provider_attempt_schema_contract_accepts_the_exact_wire_shape() {
         assert!(
@@ -8512,109 +7495,6 @@ mod tests {
                 &canonical_provider_attempt_indexes(),
             )
             .is_empty()
-        );
-    }
-
-    #[test]
-    fn canonical_transition_head_schema_contract_is_exact_and_fail_closed() {
-        let exact_columns = canonical_transition_head_columns();
-        let exact_indexes = canonical_transition_head_indexes();
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&exact_columns, &exact_indexes,)
-                .is_empty()
-        );
-
-        let mut missing_id = exact_columns.clone();
-        missing_id.remove("head_transition_id");
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&missing_id, &exact_indexes)
-                .iter()
-                .any(|reason| reason.contains("missing NOT NULL column head_transition_id"))
-        );
-
-        let mut wrong_width = exact_columns.clone();
-        wrong_width
-            .get_mut("head_transition_id")
-            .unwrap()
-            .character_maximum_length = Some(32);
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&wrong_width, &exact_indexes)
-                .iter()
-                .any(|reason| reason.contains("head_transition_id has width Some(32)"))
-        );
-
-        let mut wrong_primary = exact_indexes;
-        wrong_primary.get_mut("PRIMARY").unwrap().columns.swap(1, 2);
-        assert!(
-            inference_canonical_transition_head_schema_mismatches(&exact_columns, &wrong_primary)
-                .iter()
-                .any(|reason| reason.contains("constraint PRIMARY has columns"))
-        );
-    }
-
-    #[test]
-    fn canonical_transition_wal_schema_contract_is_exact_and_fail_closed() {
-        assert!(!database_reports_check_constraints_in_show_create(
-            "8.0.30-MatrixOne-v2.1.0"
-        ));
-        assert!(database_reports_check_constraints_in_show_create(
-            "8.0.36 MySQL Community Server"
-        ));
-        let exact_columns = canonical_transition_wal_columns();
-        let exact_indexes = canonical_transition_wal_indexes();
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(&exact_columns, &exact_indexes,)
-                .is_empty()
-        );
-        assert!(
-            inference_canonical_transition_wal_definition_mismatches(
-                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base'))"
-            )
-            .is_empty()
-        );
-        assert!(
-            inference_canonical_transition_wal_definition_mismatches(
-                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'replace_from_durable_base'))"
-            )
-            .iter()
-            .any(|reason| reason.contains("does not admit checkpoint_from_parent"))
-        );
-
-        let mut nullable_owner = exact_columns.clone();
-        nullable_owner.get_mut("user_id").unwrap().nullable = true;
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(&nullable_owner, &exact_indexes,)
-                .iter()
-                .any(|reason| reason.contains("user_id has nullable=true"))
-        );
-
-        let mut wrong_parent_index = exact_indexes.clone();
-        wrong_parent_index
-            .get_mut("idx_inference_canonical_wal_parent")
-            .unwrap()
-            .columns
-            .remove(0);
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(
-                &exact_columns,
-                &wrong_parent_index,
-            )
-            .iter()
-            .any(|reason| reason.contains("idx_inference_canonical_wal_parent has columns"))
-        );
-
-        let mut non_unique_attempt = exact_indexes;
-        non_unique_attempt
-            .get_mut("uq_inference_canonical_wal_attempt")
-            .unwrap()
-            .non_unique = true;
-        assert!(
-            inference_canonical_transition_wal_schema_mismatches(
-                &exact_columns,
-                &non_unique_attempt,
-            )
-            .iter()
-            .any(|reason| reason.contains("uq_inference_canonical_wal_attempt has non_unique=true"))
         );
     }
 
@@ -8739,58 +7619,6 @@ mod tests {
         columns.get_mut("provider_wire_bytes").unwrap().data_type = "int".to_string();
         cases.push((
             "provider_wire_bytes has type int",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns.remove("canonical_transition_id");
-        cases.push((
-            "missing nullable column canonical_transition_id",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_parent_transition_id")
-            .unwrap()
-            .nullable = false;
-        cases.push((
-            "non-nullable column canonical_parent_transition_id",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_transition_id")
-            .unwrap()
-            .character_maximum_length = Some(32);
-        cases.push((
-            "canonical_transition_id has width Some(32)",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_transition_hash")
-            .unwrap()
-            .nullable = false;
-        cases.push((
-            "non-nullable column canonical_transition_hash",
-            columns,
-            exact_indexes.clone(),
-        ));
-
-        let mut columns = exact_columns.clone();
-        columns
-            .get_mut("canonical_transition_hash")
-            .unwrap()
-            .character_maximum_length = Some(32);
-        cases.push((
-            "canonical_transition_hash has width Some(32)",
             columns,
             exact_indexes.clone(),
         ));

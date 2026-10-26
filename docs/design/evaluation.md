@@ -57,6 +57,14 @@ a separate required semantic judgment. An omitted child `expected_result` must
 be paired with a required judge. Both built-in and external judges receive the
 same complete, verified child bodies and identities, separately from parent
 claims. Missing, oversized, or contradictory evidence cannot authorize a pass.
+The built-in judge streams its complete JSON request through CLI stdin, rather
+than imposing an OS argument-size budget on valid child evidence. The existing
+Server request and Offering admission boundaries still apply; rejection or
+missing evidence never becomes a passing verdict. The external-command protocol
+retains its own 64 KiB serialized-envelope limit.
+User-visible response requirements apply to the assistant response in its labelled
+exchange, while user prompts and tool/diagnostic records establish context and
+execution facts. They must not be attributed to the assistant's answer.
 Explicit text and JSON expectations remain available for actual output-format
 contracts; they must not be imposed accidentally on general collaboration tests.
 
@@ -102,14 +110,22 @@ those thresholds with the original execution facts; later configuration edits
 do not reinterpret an in-flight run or replenish its recovery permissions.
 Tool batches perform no configuration file I/O.
 
-The Server terminal owner evaluates the complete settled tool and child evidence
-once, before committing `run_finished`. Its `turn_evaluation` carries the
-original journal event, session/run identity, execution generation, frozen
-thresholds and final status. Live delivery and replay project the same fact.
-CLI journals and feedback consume it without re-evaluating partial stream
-records or loading local thresholds. Missing evaluation remains unknown;
-conflicting or incorrectly scoped evaluation is a protocol error.
+The Server may evaluate the complete settled tool and child evidence once.
+`turn_evaluation` is optional diagnostic evidence; canonical Run completion and
+cold replay do not depend on persisting it. A live evaluation can therefore be
+absent from cold replay. When supplied, it carries the original journal event,
+session/run identity, execution generation, frozen thresholds and final status.
+Missing evaluation remains unknown; conflicting or incorrectly scoped evidence
+is a protocol error. CLI journals and feedback do not manufacture an evaluation
+from partial stream records or reload local thresholds to fill that gap.
 
 The CLI sidecar journal adds only its existing projection ID/index for retry
 reconciliation. The Server timestamp, canonical turn, producer scope and
 evaluation metadata remain unchanged; projection retries never re-evaluate.
+
+Child-result adoption checks use the canonical Run tree for completion, model
+identity and parentage, terminal transcript content for the actual result, and
+parent-owned adoption facts for content digests, complete result windows and
+adoption-before-finalization ordering. Provider request diagnostics are optional
+observations, not an additional execution authority or prerequisite for adoption
+verification. Missing canonical result or adoption evidence still fails closed.

@@ -190,7 +190,11 @@ pub(super) async fn inspect(
             false,
         );
     }
-    let Some(binding) = executor.work_binding.get() else {
+    let resolved_binding = match executor.resolve_work_binding().await {
+        Ok(binding) => binding,
+        Err(error) => return error,
+    };
+    let Some(binding) = resolved_binding else {
         return criteria_error(
             "work_criteria_binding_required",
             "This session has no validated canonical Work binding",
@@ -399,13 +403,6 @@ pub(super) async fn propose(
             true,
         );
     }
-    let Some(binding) = executor.work_binding.get() else {
-        return criteria_error(
-            "work_criteria_binding_required",
-            "This session has no validated canonical Work binding",
-            false,
-        );
-    };
     let mut args: ProposeWorkCriteriaArgs = match serde_json::from_value(args.clone()) {
         Ok(args) => args,
         Err(_) => {
@@ -438,6 +435,17 @@ pub(super) async fn propose(
                 true,
             );
         }
+    };
+    let resolved_binding = match executor.resolve_work_binding().await {
+        Ok(binding) => binding,
+        Err(error) => return error,
+    };
+    let Some(binding) = resolved_binding else {
+        return criteria_error(
+            "work_criteria_binding_required",
+            "This session has no validated canonical Work binding",
+            false,
+        );
     };
     let (proposal_id, source_ref) = match invocation_identity(
         binding,
@@ -634,6 +642,15 @@ mod tests {
                 "work_criteria_cancelled"
             );
         }
+        for args in [Value::Null, json!({"context_id":"context", "members":[]})] {
+            let result = propose(&executor, &args, ToolInvocationMetadata::default(), None).await;
+            assert!(result.is_error);
+            assert_eq!(
+                serde_json::from_str::<Value>(&result.output).unwrap()["error"]["code"],
+                "work_criteria_arguments_invalid"
+            );
+            assert!(executor.work_binding.get().is_none());
+        }
     }
 
     #[tokio::test]
@@ -675,18 +692,32 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
+        let closed_pool = SharedPool::new(pool.settings())
+            .await
+            .expect("independent pool");
+        closed_pool.close().await;
+        executor.set_context_manifest_pool(closed_pool);
+        let rejected = propose(
+            &executor,
+            &json!({"context_id":"context", "members":[]}),
+            invocation("invalid-arguments"),
+            None,
+        )
+        .await;
+        assert!(rejected.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected.output).unwrap()["error"]["code"],
+            "work_criteria_arguments_invalid"
+        );
+        assert!(
+            executor.work_binding.get().is_none(),
+            "invalid arguments must not install authority"
+        );
         executor.set_context_manifest_pool(pool.clone());
-        executor.set_work_binding(WorkRuntimeBinding::new(
-            pool.clone(),
-            owner.clone(),
-            session.clone(),
-            work.clone(),
-            branch.clone(),
-        ));
+        assert!(executor.work_binding.get().is_none());
+        let inspected = inspect(&executor, &json!({}), None).await;
         assert!(executor.supports_server_tool_name("inspect_work_criteria"));
         assert!(executor.supports_server_tool_name("propose_work_criteria"));
-
-        let inspected = inspect(&executor, &json!({}), None).await;
         assert!(!inspected.is_error, "inspect failed: {inspected:?}");
         let inspected: Value = serde_json::from_str(&inspected.output).expect("context JSON");
         assert_eq!(inspected["criteria"]["total"], 0);

@@ -306,11 +306,21 @@ impl ToolRequirements {
 pub struct ToolSpec {
     pub name: String,
     pub load_policy: ToolLoadPolicy,
+    /// Only a canonical, replay-safe observation may omit an effect receipt.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub run_observation: bool,
     pub effect: ToolEffect,
     pub required: ToolRequirements,
 }
 
 impl ToolSpec {
+    /// A read-only execution ceiling permits lifecycle controls too. Those
+    /// controls still require receipts; only explicitly observational contracts
+    /// with no effectful requirements can use live Run observations.
+    pub fn is_run_observation(&self) -> bool {
+        self.run_observation && self.is_read_only_execution_capability()
+    }
+
     /// Whether this is an optional external capability that an embedding
     /// product must explicitly enable. This is derived from semantic
     /// requirements, not from a parallel hand-maintained tool-name list.
@@ -518,7 +528,10 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         server_service("memory", ToolLoadPolicy::Deferred),
         server_service("mo_query", ToolLoadPolicy::Deferred),
         server_service("rollback_database_snapshots", ToolLoadPolicy::Deferred),
-        control_plane("tool_search", ToolLoadPolicy::AlwaysLoad),
+        ToolSpec {
+            run_observation: true,
+            ..control_plane("tool_search", ToolLoadPolicy::AlwaysLoad)
+        },
         shared_network("web_search", ToolLoadPolicy::Deferred),
         shared_network("web_fetch", ToolLoadPolicy::Deferred),
         project_write("publish_artifact", ToolLoadPolicy::Deferred),
@@ -1374,6 +1387,7 @@ fn provider_selection_is_unambiguous(
 
 fn control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect::none(),
@@ -1383,6 +1397,7 @@ fn control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn work_coordinator_control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect::none(),
@@ -1395,6 +1410,7 @@ fn work_coordinator_or_primary_attempt_control_plane(
     load_policy: ToolLoadPolicy,
 ) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         required: ToolRequirements {
@@ -1407,6 +1423,7 @@ fn work_coordinator_or_primary_attempt_control_plane(
 
 fn work_attempt_control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         required: ToolRequirements {
@@ -1419,6 +1436,7 @@ fn work_attempt_control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSp
 
 fn server_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect::none(),
@@ -1428,6 +1446,7 @@ fn server_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn shared_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: true,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1440,6 +1459,7 @@ fn shared_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn request_scoped_mcp(name: &str) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy: ToolLoadPolicy::Deferred,
         effect: ToolEffect::none(),
@@ -1460,6 +1480,7 @@ fn lsp_action_requires_write(args: &Value) -> bool {
 
 fn project_read(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: true,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1472,6 +1493,7 @@ fn project_read(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn project_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1485,6 +1507,7 @@ fn project_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1498,6 +1521,7 @@ fn shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn project_script(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1512,6 +1536,7 @@ fn project_script(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn background_shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1525,6 +1550,7 @@ fn background_shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn background_control(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect::none(),
@@ -1534,6 +1560,7 @@ fn background_control(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn git_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1548,6 +1575,7 @@ fn git_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn git_clone(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1563,6 +1591,7 @@ fn git_clone(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
 
 fn lsp(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
+        run_observation: false,
         name: name.to_string(),
         load_policy,
         effect: ToolEffect {
@@ -1661,6 +1690,28 @@ mod tests {
         workspace_writer.required.filesystem_write = true;
         workspace_writer.required.workspace = RequiredWorkspace::ReadWrite;
         assert!(!workspace_writer.is_read_only_network_capability());
+    }
+
+    #[test]
+    fn observations_exclude_lifecycle_controls_and_effectful_contracts() {
+        let registry = registry();
+        for name in ["tool_search", "read_file", "web_fetch", "grep"] {
+            assert!(registry.get(name).unwrap().is_run_observation(), "{name}");
+        }
+        for name in [
+            "agent",
+            "ask_user",
+            "start_work",
+            "settle_work_item",
+            "memory",
+            "bash",
+            "write_file",
+        ] {
+            assert!(!registry.get(name).unwrap().is_run_observation(), "{name}");
+        }
+        let mut reader = registry.get("read_file").unwrap().clone();
+        reader.effect.mutates_external_state = true;
+        assert!(!reader.is_run_observation());
     }
 
     #[test]

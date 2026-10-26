@@ -103,10 +103,8 @@ async fn reserve(
 
 async fn cleanup(pool: &SharedPool, owner: &str) {
     for (table, column) in [
-        ("run_display_projections", "user_id"),
         ("agent_run_events", "user_id"),
         ("tool_invocation_ledger", "user_id"),
-        ("agent_session_execution_slots", "user_id"),
         ("agent_runs", "user_id"),
         ("session_execution_bindings", "owner_user_id"),
         ("session_context_operation_receipts", "owner_user_id"),

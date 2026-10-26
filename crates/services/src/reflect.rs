@@ -2519,10 +2519,10 @@ impl ReflectService for DatabaseReflectService {
         .map_err(|e| internal_error(format!("agent delivery query: {e}")))?;
         let agent_delivery = agent_delivery_rollup_from_row(&agent_delivery_row)?;
 
-        // The request-context ledger is the authoritative, content-free
-        // source for prompt-cache accounting. Read a bounded session window
-        // only for an explicit reflection request; this keeps the hot turn
-        // path untouched while making cache misses explainable to the user.
+        // Read optional request-context diagnostics for inference paths that
+        // retain them (standalone completion and background inference). Agent
+        // inference uses Run authority and may have no entries in this ledger;
+        // absence is not evidence of missing execution or result adoption.
         let model_requests = if let Some(shared_pool) = self.pool.as_ref() {
             let result = crate::model_request_context::list_model_request_context_events(
                 shared_pool,

@@ -23,6 +23,10 @@ name = "system_matrix_http_e2e"
 path = "tests/system_matrix_http_e2e/main.rs"
 required-features = ["e2e-hooks"]
 
+[[test]]
+name = "chat_sql_budget"
+required-features = ["e2e-hooks"]
+
 [[bin]]
 name = "astra-server"
 path = "src/main.rs"
