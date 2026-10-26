@@ -7,9 +7,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
-use astra_core::{
-    SharedPool, matrixone_statement_with_null_shape, push_matrixone_bound_string_set,
-};
+use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{
     ActorContextV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
     CanonicalTurnDeltaV1, ContextManifestNodeV1, ConversationSegmentV1, ConversationWriterLeaseV1,
@@ -21,6 +19,7 @@ use astra_turn_types::{
     canonical_conversation_root, canonical_conversation_serialized_len,
 };
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,9 +36,7 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionExecutionBlocker {
-    ExecutionSlot,
     ActiveRun,
-    SettlementPending,
     WriterOrReservation,
     BindingNotReady,
     UnresolvedTool,
@@ -49,9 +46,7 @@ pub enum SessionExecutionBlocker {
 impl SessionExecutionBlocker {
     pub fn explanation(self) -> &'static str {
         match self {
-            Self::ExecutionSlot => "an execution still holds the Session execution slot",
             Self::ActiveRun => "a run or child task has not stopped",
-            Self::SettlementPending => "execution stopped but its durable settlement is incomplete",
             Self::WriterOrReservation => {
                 "a conversation write or turn admission is still in progress"
             }
@@ -67,12 +62,11 @@ impl SessionExecutionBlocker {
 
     pub fn recovery_action(self) -> &'static str {
         match self {
-            Self::ExecutionSlot | Self::ActiveRun => "wait_or_cancel_session",
+            Self::ActiveRun => "wait_or_cancel_session",
             Self::WriterOrReservation => "retry_session",
-            Self::BindingNotReady
-            | Self::UnresolvedTool
-            | Self::OwnerUnavailable
-            | Self::SettlementPending => "inspect_session",
+            Self::BindingNotReady | Self::UnresolvedTool | Self::OwnerUnavailable => {
+                "inspect_session"
+            }
         }
     }
 
@@ -94,8 +88,8 @@ impl SessionExecutionBlocker {
 }
 const COORDINATOR_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_SEGMENT_BATCH: usize = 256;
-const MAX_STAGED_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_STAGED_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CONTEXT_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONTEXT_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
 // Execution-binding generations are strictly positive in durable rows. Zero
@@ -111,10 +105,14 @@ pub enum SessionContextCoordinatorError {
     Unauthorized,
     #[error("invalid coordinator request: {0}")]
     Invalid(String),
+    #[error("canonical Context resource limit: {0}")]
+    ResourceLimit(&'static str),
     #[error("writer authority was fenced by a newer epoch")]
     Fenced,
     #[error("session is being deleted or is no longer writable")]
     SessionLifecycleFenced,
+    #[error("session execution is occupied: {0:?}")]
+    ExecutionOccupied(SessionExecutionBlocker),
     #[error("writer lease or turn reservation expired")]
     Expired,
     #[error("idempotency key was reused for a different request")]
@@ -430,25 +428,23 @@ pub struct ResumedExecutionTurnRequest<'a> {
     pub run_id: &'a str,
     pub expected_owner_generation: u64,
     pub checkpoint_id: &'a str,
-    pub source: &'a TurnReservationV1,
-    pub actor: &'a ActorContextV1,
+    pub source: &'a RunContextAuthority,
+    pub opening_hash: &'a str,
     pub owner_pod_id: &'a str,
-    pub ttl: Duration,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResumedExecutionTurnReceipt {
-    pub source: TurnReservationV1,
-    pub writer_lease: ConversationWriterLeaseV1,
-    pub turn_reservation: TurnReservationV1,
+    pub source: RunContextAuthority,
+    pub authority: RunContextAuthority,
     pub run_id: String,
     pub run_generation: u64,
     pub producer_generation: u64,
     pub checkpoint_id: String,
 }
 
-/// Constructed only after the run, slot and turn authority commit together.
+/// Constructed only after Run ownership, slot and checkpoint custody commit together.
 /// A deserialized receipt alone cannot authorize restoration or execution.
 #[derive(Debug)]
 pub struct ResumedExecutionTurn {
@@ -552,25 +548,13 @@ pub trait SessionContextCoordinator: Send + Sync {
         after_manifest_root: Option<&str>,
     ) -> Result<ManifestDeltaV1, SessionContextCoordinatorError>;
 
-    /// Fetch an explicitly requested, bounded set of immutable payloads.
-    /// Request order is preserved so clients can checkpoint resumable
-    /// hydration without loading unrelated history.
-    async fn load_segments(
+    /// Read a complete node's payloads through its authenticated manifest
+    /// locator. A retained fork prefix may supply an inherited node.
+    async fn load_manifest_content(
         &self,
         key: &SessionKeyV1,
-        segment_hashes: &[String],
+        manifest_root: &str,
     ) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError>;
-
-    /// Idempotently stage a bounded batch of owner-scoped immutable payloads.
-    ///
-    /// Staging never changes a branch head or writer authority. A separate
-    /// canonical journal import must prove the ordered lineage before any
-    /// staged payload becomes reachable from a head.
-    async fn store_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError>;
 
     async fn load_authority_epochs(
         &self,
@@ -678,6 +662,292 @@ pub struct DatabaseSessionContextCoordinator {
     pool: SharedPool,
 }
 
+/// Frozen opening facts, not an execution grant. Context mutation additionally
+/// requires the store's exact Run/generation terminal admission in the same Tx.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunContextAuthority {
+    pub key: SessionKeyV1,
+    pub run_id: String,
+    pub generation: u64,
+    pub row_exists: bool,
+    pub base_head: Option<SessionContextHeadV1>,
+    pub turn: u32,
+    pub writer_epoch: u64,
+    pub authority_epochs: AuthorityEpochsV1,
+    pub binding: RunContextBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunContextBinding {
+    Absent,
+    Present { generation: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "owner",
+    content = "facts",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ContextCommitAuthority {
+    Run(Box<RunContextAuthority>),
+    Controller(Box<TurnReservationV1>),
+}
+
+impl RunContextAuthority {
+    fn validate(&self) -> Result<(), SessionContextCoordinatorError> {
+        let invalid = |detail: &str| SessionContextCoordinatorError::Invalid(detail.into());
+        self.key
+            .validate()
+            .map_err(|error| invalid(&error.to_string()))?;
+        if self.key.isolation_domain != "server"
+            || self.key.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            || self.run_id.is_empty()
+            || self.generation > i64::MAX as u64
+            || self.base_head.is_some() && !self.row_exists
+        {
+            return Err(invalid("invalid Server Run context identity"));
+        }
+        if let Some(head) = &self.base_head {
+            validate_head(head)?;
+            if head.key != self.key || head.writer_epoch > self.writer_epoch {
+                return Err(invalid("Run context base belongs to another authority"));
+            }
+        } else if !self.row_exists
+            && (self.writer_epoch != 0 || self.authority_epochs != AuthorityEpochsV1::default())
+        {
+            return Err(invalid("absent context row cannot carry authority epochs"));
+        }
+        let expected = self
+            .base_head
+            .as_ref()
+            .map_or(Some(1), |head| head.cursor.completed_turn.checked_add(1));
+        if expected != Some(self.turn) {
+            return Err(invalid(
+                "Run context turn does not advance its admitted base",
+            ));
+        }
+        for epoch in [
+            self.writer_epoch,
+            self.authority_epochs.authorization_epoch,
+            self.authority_epochs.device_trust_epoch,
+            self.authority_epochs.permission_epoch,
+        ] {
+            i64_from_u64("Run context epoch", epoch)?;
+        }
+        if let RunContextBinding::Present { generation } = self.binding {
+            if generation == 0 {
+                return Err(invalid("binding generation must be positive"));
+            }
+            i64_from_u64("Run context binding generation", generation)?;
+        }
+        Ok(())
+    }
+    /// Stable admitted base identity; current generation is separately fenced
+    /// by the store-created Run mutation proof on every write.
+    pub fn admission_fingerprint(&self) -> String {
+        let mut facts = serde_json::to_value(self).expect("serializable Run Context facts");
+        facts
+            .as_object_mut()
+            .expect("Run Context facts are an object")
+            .remove("generation");
+        let mut digest = Sha256::new();
+        digest.update(b"astra.run-context-admission.v1\0");
+        digest.update(astra_core::canonical_json_string(&facts).as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+}
+
+impl ContextCommitAuthority {
+    pub fn key(&self) -> &SessionKeyV1 {
+        match self {
+            Self::Run(authority) => &authority.key,
+            Self::Controller(reservation) => &reservation.key,
+        }
+    }
+    pub fn base_cursor(&self) -> Option<&SessionCursorV1> {
+        match self {
+            Self::Run(authority) => authority.base_head.as_ref().map(|head| &head.cursor),
+            Self::Controller(reservation) => reservation.expected_cursor.as_ref(),
+        }
+    }
+
+    pub fn turn(&self) -> u32 {
+        match self {
+            Self::Run(authority) => authority.turn,
+            Self::Controller(reservation) => reservation.reserved_turn,
+        }
+    }
+}
+
+/// Immutable, validated input to one canonical Context commit. Preparing it
+/// performs no I/O and grants no authority. Its cursor and request identity can
+/// be bound to the Run terminal receipt before either is written.
+#[derive(Debug)]
+pub struct PreparedSessionContextCommit {
+    authority: ContextCommitAuthority,
+    opening_hash: Option<String>,
+    delta: CanonicalTurnDeltaV1,
+    idempotency_key: String,
+    release_writer: bool,
+    request_hash: String,
+    segments: Vec<ConversationSegmentV1>,
+    node: ContextManifestNodeV1,
+    content_json: String,
+}
+
+impl PreparedSessionContextCommit {
+    pub fn new(
+        reservation: &TurnReservationV1,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+        release_writer: bool,
+    ) -> Result<Self, SessionContextCoordinatorError> {
+        Self::prepare(
+            ContextCommitAuthority::Controller(Box::new(reservation.clone())),
+            delta,
+            idempotency_key,
+            release_writer,
+            None,
+        )
+    }
+
+    pub fn for_run(
+        authority: &RunContextAuthority,
+        opening_hash: &str,
+        delta: CanonicalTurnDeltaV1,
+    ) -> Result<Self, SessionContextCoordinatorError> {
+        authority.validate()?;
+        if opening_hash.len() != 64 || !opening_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Run opening hash is invalid".into(),
+            ));
+        }
+        validate_delta_advance(authority.base_head.as_ref(), authority.turn, &delta)?;
+        let key = format!("run:{}:{}:terminal", authority.run_id, authority.generation);
+        Self::prepare(
+            ContextCommitAuthority::Run(Box::new(authority.clone())),
+            delta,
+            &key,
+            false,
+            Some(opening_hash),
+        )
+    }
+
+    fn prepare(
+        authority: ContextCommitAuthority,
+        delta: CanonicalTurnDeltaV1,
+        idempotency_key: &str,
+        release_writer: bool,
+        opening_hash: Option<&str>,
+    ) -> Result<Self, SessionContextCoordinatorError> {
+        delta
+            .validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_idempotency_key(idempotency_key)?;
+        let content_json = encode_manifest_content(&delta.logical_segments)?;
+        let key = authority.key();
+        let segments = delta
+            .logical_segments
+            .iter()
+            .cloned()
+            .map(|messages| ConversationSegmentV1::new(key, messages))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let node = manifest_node_for_delta(
+            key,
+            authority
+                .base_cursor()
+                .map(|cursor| cursor.canonical_root_hash.clone()),
+            &delta,
+            &segments,
+        )
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let request_hash = match &authority {
+            ContextCommitAuthority::Controller(reservation) => {
+                commit_request_hash(reservation, &delta)
+            }
+            ContextCommitAuthority::Run(_) => {
+                let value = serde_json::to_value((&authority, &delta, opening_hash))
+                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+                format!(
+                    "{:x}",
+                    Sha256::digest(astra_core::canonical_json_string(&value).as_bytes())
+                )
+            }
+        };
+        Ok(Self {
+            authority,
+            opening_hash: opening_hash.map(str::to_owned),
+            delta,
+            idempotency_key: idempotency_key.to_owned(),
+            release_writer,
+            request_hash,
+            segments,
+            node,
+            content_json,
+        })
+    }
+
+    pub fn cursor(&self) -> SessionCursorV1 {
+        self.node.cursor()
+    }
+
+    pub fn run_context_authority(&self) -> Option<&RunContextAuthority> {
+        match &self.authority {
+            ContextCommitAuthority::Run(authority) => Some(authority),
+            _ => None,
+        }
+    }
+
+    pub fn opening_hash(&self) -> Option<&str> {
+        self.opening_hash.as_deref()
+    }
+
+    pub fn request_hash(&self) -> &str {
+        &self.request_hash
+    }
+
+    pub fn terminal_binding(&self) -> Value {
+        serde_json::json!({
+            "opening_hash": self.opening_hash,
+            "request_hash": self.request_hash,
+            "idempotency_key": self.idempotency_key,
+            "release_writer": self.release_writer,
+            "cursor": self.cursor(),
+        })
+    }
+}
+
+pub struct WriterTurnReservationRequest<'a> {
+    pub key: &'a SessionKeyV1,
+    pub expected_cursor: Option<&'a SessionCursorV1>,
+    pub actor: &'a ActorContextV1,
+    pub ttl: Duration,
+    pub writer_idempotency_key: &'a str,
+    pub reservation_idempotency_key: &'a str,
+    pub expected_execution_binding_generation: Option<u64>,
+}
+
+// A standalone rejected authority operation commits its rejection audit. In a
+// terminal transaction the same rejection must roll back the entire settlement.
+enum StagedCoordinatorMutation<T> {
+    Mutation(T),
+    Rejected(SessionContextCoordinatorError),
+}
+
+impl<T> StagedCoordinatorMutation<T> {
+    fn into_result(self) -> Result<T, SessionContextCoordinatorError> {
+        match self {
+            Self::Mutation(mutation) => Ok(mutation),
+            Self::Rejected(error) => Err(error),
+        }
+    }
+}
+
 impl DatabaseSessionContextCoordinator {
     async fn commit_turn_inner(
         &self,
@@ -686,18 +956,15 @@ impl DatabaseSessionContextCoordinator {
         idempotency_key: &str,
         release_writer: bool,
     ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
-        delta
-            .validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        validate_idempotency_key(idempotency_key)?;
-        let request_hash = commit_request_hash(reservation, &delta);
-        let mut segments = Vec::with_capacity(delta.logical_segments.len());
-        for messages in delta.logical_segments.iter().cloned() {
-            segments.push(
-                ConversationSegmentV1::new(&reservation.key, messages)
-                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?,
-            );
-        }
+        let prepared =
+            PreparedSessionContextCommit::new(reservation, delta, idempotency_key, release_writer)?;
+        self.commit_prepared_turn(&prepared).await
+    }
+
+    pub async fn commit_prepared_turn(
+        &self,
+        prepared: &PreparedSessionContextCommit,
+    ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_commit_turn", source))?;
@@ -705,14 +972,508 @@ impl DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_commit_turn", source))?;
-        admit_session_lifecycle_write(&mut tx, &reservation.key).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
+        if matches!(&prepared.authority, ContextCommitAuthority::Run(_)) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Run Context commit requires its terminal transaction proof".into(),
+            ));
+        }
+        admit_controller_context_write(&mut tx, prepared.authority.key()).await?;
+        let outcome = self.stage_turn_commit(&mut tx, prepared).await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_turn", source))?;
+        connection.release();
+        outcome.into_result()
+    }
+
+    /// Stage canonical Context under the same session/execution/run locks as
+    /// the terminal. The caller owns COMMIT; any rejection aborts that terminal.
+    pub async fn commit_turn_in_terminal_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        prepared: &PreparedSessionContextCommit,
+        admission: &crate::runs::RunMutationAdmission,
+    ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
+        if !admission.owns_session(
+            &prepared.authority.key().owner_user_id,
+            &prepared.authority.key().session_id,
+        ) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "terminal admission does not own the canonical context".into(),
+            ));
+        }
+        if let ContextCommitAuthority::Run(authority) = &prepared.authority {
+            return self
+                .stage_run_context_commit(tx, prepared, authority, admission)
+                .await;
+        }
+        match self.stage_turn_commit(tx, prepared).await?.into_result()? {
+            CoordinatorMutationV1::Applied { cursor }
+            | CoordinatorMutationV1::AlreadyApplied { cursor } => Ok(cursor),
+            CoordinatorMutationV1::Conflict { .. } => Err(SessionContextCoordinatorError::Invalid(
+                "canonical session head changed before terminal commit".into(),
+            )),
+            CoordinatorMutationV1::NeedsRepair { reason, .. } => {
+                Err(SessionContextCoordinatorError::NeedsRepair(reason))
+            }
+        }
+    }
+
+    /// A legitimate empty delta commits no cursor. Validate the exact admitted
+    /// base through the same snapshot owner, under the terminal's Session fence.
+    pub async fn validate_unchanged_run_context_in_terminal_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        authority: &RunContextAuthority,
+        opening_hash: &str,
+        admission: &crate::runs::RunMutationAdmission,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        authority.validate()?;
+        if !admission.authorizes_context_terminal(
+            &authority.key.owner_user_id,
+            &authority.key.session_id,
+            &authority.run_id,
+            authority.generation,
+            &authority.admission_fingerprint(),
+            opening_hash,
+        ) {
+            return Err(SessionContextCoordinatorError::Unauthorized);
+        }
+        let expected_binding = match authority.binding {
+            RunContextBinding::Absent => 0,
+            RunContextBinding::Present { generation } => generation,
+        };
+        let current = self
+            .capture_run_context_snapshot_tx(
+                tx,
+                &authority.key,
+                &authority.run_id,
+                authority.generation,
+                Some(expected_binding),
+            )
+            .await?;
+        if current.admission_fingerprint() != authority.admission_fingerprint() {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Context base changed before empty terminal".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Capture the Context base under the Run store's opening fence. This
+    /// creates no Controller lease, reservation, audit receipt, or empty head.
+    /// The store must include the result in the same immutable Run INSERT.
+    pub async fn capture_run_opening_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        admission: &crate::runs::RunMutationAdmission,
+        key: &SessionKeyV1,
+        run_id: &str,
+        generation: u64,
+        expected_binding_generation: Option<u64>,
+    ) -> Result<RunContextAuthority, SessionContextCoordinatorError> {
+        if !admission.authorizes_context_opening(
+            &key.owner_user_id,
+            &key.session_id,
+            run_id,
+            generation,
+        ) {
+            return Err(SessionContextCoordinatorError::Unauthorized);
+        }
+        self.capture_run_context_snapshot_tx(
+            tx,
+            key,
+            run_id,
+            generation,
+            expected_binding_generation,
+        )
+        .await
+    }
+
+    // Only callers that already hold the canonical Session/Run admission may
+    // use this snapshot. It is data, not an execution or mutation grant.
+    async fn capture_run_context_snapshot_tx(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        key: &SessionKeyV1,
+        run_id: &str,
+        generation: u64,
+        expected_binding_generation: Option<u64>,
+    ) -> Result<RunContextAuthority, SessionContextCoordinatorError> {
+        // All competing writers take the lifecycle fence first. The caller
+        // already owns it, including for absent rows.
+        let row = sqlx::query(
+            "SELECT h.owner_user_id AS head_owner, h.head_json, h.writer_epoch,
+                    h.authorization_epoch, h.device_trust_epoch, h.permission_epoch,
+                    h.active_writer_expires_at_ms, h.active_reservation_expires_at_ms,
+                    CAST(h.active_writer_json IS NOT NULL OR h.active_reservation_json IS NOT NULL AS SIGNED) AS controller_authority_present,
+                    b.generation, b.binding_json,
+                    CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
+             FROM (SELECT 1 AS seed) seed
+             LEFT JOIN session_context_heads h ON h.isolation_domain = ? AND h.owner_user_id = ?
+                  AND h.session_id = ? AND h.branch_id = ?
+             LEFT JOIN session_execution_bindings b ON b.isolation_domain = ? AND b.owner_user_id = ?
+                  AND b.session_id = ? AND b.branch_id = ?",
+        ).bind(&key.isolation_domain).bind(&key.owner_user_id).bind(&key.session_id).bind(&key.branch_id)
+         .bind(&key.isolation_domain).bind(&key.owner_user_id).bind(&key.session_id).bind(&key.branch_id)
+         .fetch_one(&mut **tx).await.map_err(|source| database_error("capture_Run_context", source))?;
+        let optional = |column: &'static str| {
+            row.try_get::<Option<i64>, _>(column)
+                .map_err(|source| database_error("decode_Run_context", source))
+        };
+        let now: i64 = row
+            .try_get("database_now_unix_ms")
+            .map_err(|source| database_error("decode_Run_context_time", source))?;
+        if optional("active_writer_expires_at_ms")?.is_some_and(|expiry| expiry > now)
+            || optional("active_reservation_expires_at_ms")?.is_some_and(|expiry| expiry > now)
+        {
+            return Err(SessionContextCoordinatorError::ExecutionOccupied(
+                SessionExecutionBlocker::WriterOrReservation,
+            ));
+        }
+        if optional("controller_authority_present")? == Some(1) {
+            // Only expired Controller residue reaches this cold branch. Reuse
+            // its canonical cleanup owner before admitting a Run whose later
+            // head CAS requires absent grants. Ordinary Run opening stays read-only.
+            let (mut state, locked_now) = lock_database_state_at_now(tx, key).await?;
+            if state
+                .active_writer
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at_unix_ms > locked_now)
+                || state
+                    .active_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.expires_at_unix_ms > locked_now)
+            {
+                return Err(SessionContextCoordinatorError::ExecutionOccupied(
+                    SessionExecutionBlocker::WriterOrReservation,
+                ));
+            }
+            clear_writer_authority_in_tx(tx, &mut state).await?;
+        }
+        let row_exists = row
+            .try_get::<Option<String>, _>("head_owner")
+            .map_err(|source| database_error("decode_Run_context_owner", source))?
+            .is_some();
+        let base_head: Option<SessionContextHeadV1> = row
+            .try_get::<Option<String>, _>("head_json")
+            .map_err(|source| database_error("decode_Run_context_head", source))?
+            .as_deref()
+            .map(|json| database_json("Run_context_base", json))
+            .transpose()?;
+        let epoch = |column| -> Result<u64, SessionContextCoordinatorError> {
+            match optional(column)? {
+                Some(value) => u64::try_from(value).map_err(|_| {
+                    SessionContextCoordinatorError::NeedsRepair("negative Context epoch".into())
+                }),
+                None if !row_exists => Ok(0),
+                None => Err(SessionContextCoordinatorError::NeedsRepair(
+                    "missing Context epoch".into(),
+                )),
+            }
+        };
+        let binding = match optional("generation")? {
+            Some(_) => {
+                let current = decode_execution_binding_row(&row)?;
+                if expected_binding_generation == Some(0) {
+                    return Err(SessionContextCoordinatorError::ExecutionBindingPresent {
+                        generation: current.generation,
+                    });
+                }
+                if expected_binding_generation
+                    .is_some_and(|expected| expected != current.generation)
+                {
+                    return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+                        expected: expected_binding_generation.unwrap(),
+                        current: Some(current.generation),
+                    });
+                }
+                if current.state != SessionExecutionBindingStateV1::Ready {
+                    return Err(SessionContextCoordinatorError::ExecutionBindingNotReady(
+                        current.state,
+                    ));
+                }
+                RunContextBinding::Present {
+                    generation: current.generation,
+                }
+            }
+            None if expected_binding_generation.is_some_and(|expected| expected > 0) => {
+                return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+                    expected: expected_binding_generation.unwrap(),
+                    current: None,
+                });
+            }
+            None => RunContextBinding::Absent,
+        };
+        let authority = RunContextAuthority {
+            key: key.clone(),
+            run_id: run_id.to_owned(),
+            generation,
+            row_exists,
+            turn: base_head
+                .as_ref()
+                .map_or(Some(1), |head| head.cursor.completed_turn.checked_add(1))
+                .ok_or_else(|| {
+                    SessionContextCoordinatorError::NeedsRepair("completed turn overflow".into())
+                })?,
+            base_head,
+            writer_epoch: epoch("writer_epoch")?,
+            authority_epochs: AuthorityEpochsV1 {
+                authorization_epoch: epoch("authorization_epoch")?,
+                device_trust_epoch: epoch("device_trust_epoch")?,
+                permission_epoch: epoch("permission_epoch")?,
+            },
+            binding,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    async fn stage_run_context_commit(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        prepared: &PreparedSessionContextCommit,
+        authority: &RunContextAuthority,
+        admission: &crate::runs::RunMutationAdmission,
+    ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
+        authority.validate()?;
+        let key = &authority.key;
+        if !admission.authorizes_context_terminal(
+            &key.owner_user_id,
+            &key.session_id,
+            &authority.run_id,
+            authority.generation,
+            &authority.admission_fingerprint(),
+            prepared.opening_hash().ok_or_else(|| {
+                SessionContextCoordinatorError::Invalid(
+                    "Run Context has no opening identity".into(),
+                )
+            })?,
+        ) {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Context requires the exact Run terminal claim".into(),
+            ));
+        }
+        validate_delta_advance(
+            authority.base_head.as_ref(),
+            authority.turn,
+            &prepared.delta,
+        )?;
+        let (bytes, messages) = next_head_totals(
+            authority.base_head.as_ref(),
+            &prepared.segments,
+            prepared.delta.mode,
+        )?;
+        self.persist_database_immutables_in_tx(
+            tx,
+            key,
+            &prepared.node,
+            &prepared.content_json,
+            bytes,
+            messages,
+        )
+        .await?;
+        let head = SessionContextHeadV1 {
+            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+            key: key.clone(),
+            cursor: prepared.node.cursor(),
+            latest_manifest_root: prepared.node.manifest_root.clone(),
+            total_canonical_bytes: bytes,
+            total_message_count: messages,
+            writer_epoch: authority.writer_epoch,
+        };
+        let head_json = database_to_json("Run context head", &head)?;
+        let mut write = if authority.row_exists {
+            let mut write =
+                QueryBuilder::<MySql>::new("UPDATE session_context_heads SET head_json = ");
+            write
+                .push_bind(&head_json)
+                .push(", canonical_root_hash = ")
+                .push_bind(&head.cursor.canonical_root_hash)
+                .push(", latest_manifest_root = ")
+                .push_bind(&head.latest_manifest_root)
+                .push(", total_canonical_bytes = ")
+                .push_bind(i64_from_u64("canonical bytes", bytes)?)
+                .push(", total_message_count = ")
+                .push_bind(i64_from_u64("message count", messages)?)
+                .push(", completed_turn = ")
+                .push_bind(i64::from(head.cursor.completed_turn))
+                .push(", journal_event_seq = ")
+                .push_bind(i64_from_u64(
+                    "journal sequence",
+                    head.cursor.journal_event_seq,
+                )?)
+                .push(", conversation_seq = ")
+                .push_bind(i64_from_u64(
+                    "conversation sequence",
+                    head.cursor.conversation_seq,
+                )?)
+                .push(", projection_schema = ")
+                .push_bind(i64::from(head.cursor.projection_schema))
+                .push(", compaction_generation = ")
+                .push_bind(i64_from_u64(
+                    "compaction generation",
+                    head.cursor.compaction_generation,
+                )?)
+                .push(", updated_at = NOW(6) WHERE isolation_domain = ")
+                .push_bind(&key.isolation_domain)
+                .push(" AND owner_user_id = ")
+                .push_bind(&key.owner_user_id)
+                .push(" AND session_id = ")
+                .push_bind(&key.session_id)
+                .push(" AND branch_id = ")
+                .push_bind(&key.branch_id)
+                .push(" AND writer_epoch = ")
+                .push_bind(i64_from_u64("writer epoch", authority.writer_epoch)?)
+                .push(" AND authorization_epoch = ")
+                .push_bind(i64_from_u64(
+                    "authorization epoch",
+                    authority.authority_epochs.authorization_epoch,
+                )?)
+                .push(" AND device_trust_epoch = ")
+                .push_bind(i64_from_u64(
+                    "device epoch",
+                    authority.authority_epochs.device_trust_epoch,
+                )?)
+                .push(" AND permission_epoch = ")
+                .push_bind(i64_from_u64(
+                    "permission epoch",
+                    authority.authority_epochs.permission_epoch,
+                )?)
+                .push(" AND active_writer_json IS NULL AND active_reservation_json IS NULL");
+            if let Some(base) = &authority.base_head {
+                write
+                    .push(" AND head_json IS NOT NULL AND canonical_root_hash = ")
+                    .push_bind(&base.cursor.canonical_root_hash)
+                    .push(" AND latest_manifest_root = ")
+                    .push_bind(&base.latest_manifest_root)
+                    .push(" AND completed_turn = ")
+                    .push_bind(i64::from(base.cursor.completed_turn))
+                    .push(" AND journal_event_seq = ")
+                    .push_bind(i64_from_u64(
+                        "base journal sequence",
+                        base.cursor.journal_event_seq,
+                    )?)
+                    .push(" AND conversation_seq = ")
+                    .push_bind(i64_from_u64(
+                        "base conversation sequence",
+                        base.cursor.conversation_seq,
+                    )?)
+                    .push(" AND compaction_generation = ")
+                    .push_bind(i64_from_u64(
+                        "base compaction generation",
+                        base.cursor.compaction_generation,
+                    )?)
+                    .push(" AND projection_schema = ")
+                    .push_bind(i64::from(base.cursor.projection_schema))
+                    .push(" AND total_canonical_bytes = ")
+                    .push_bind(i64_from_u64("base bytes", base.total_canonical_bytes)?)
+                    .push(" AND total_message_count = ")
+                    .push_bind(i64_from_u64("base messages", base.total_message_count)?);
+            } else {
+                write.push(
+                    " AND head_json IS NULL AND canonical_root_hash IS NULL
+                    AND completed_turn = 0 AND journal_event_seq = 0 AND conversation_seq = 0
+                    AND total_canonical_bytes = 0 AND total_message_count = 0",
+                );
+            }
+            write
+        } else {
+            let mut write = QueryBuilder::<MySql>::new("INSERT INTO session_context_heads
+                (isolation_domain,owner_user_id,session_id,branch_id,head_json,canonical_root_hash,latest_manifest_root,
+                 total_canonical_bytes,total_message_count,completed_turn,journal_event_seq,conversation_seq,
+                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch)
+                 SELECT ");
+            let mut fields = write.separated(", ");
+            fields
+                .push_bind(&key.isolation_domain)
+                .push_bind(&key.owner_user_id)
+                .push_bind(&key.session_id)
+                .push_bind(&key.branch_id)
+                .push_bind(&head_json)
+                .push_bind(&head.cursor.canonical_root_hash)
+                .push_bind(&head.latest_manifest_root)
+                .push_bind(i64_from_u64("canonical bytes", bytes)?)
+                .push_bind(i64_from_u64("message count", messages)?)
+                .push_bind(i64::from(head.cursor.completed_turn))
+                .push_bind(i64_from_u64(
+                    "journal sequence",
+                    head.cursor.journal_event_seq,
+                )?)
+                .push_bind(i64_from_u64(
+                    "conversation sequence",
+                    head.cursor.conversation_seq,
+                )?)
+                .push_bind(i64::from(head.cursor.projection_schema))
+                .push_bind(i64_from_u64(
+                    "compaction generation",
+                    head.cursor.compaction_generation,
+                )?)
+                .push_bind(i64_from_u64("writer epoch", authority.writer_epoch)?)
+                .push_bind(i64_from_u64(
+                    "authorization epoch",
+                    authority.authority_epochs.authorization_epoch,
+                )?)
+                .push_bind(i64_from_u64(
+                    "device epoch",
+                    authority.authority_epochs.device_trust_epoch,
+                )?)
+                .push_bind(i64_from_u64(
+                    "permission epoch",
+                    authority.authority_epochs.permission_epoch,
+                )?);
+            write.push(" WHERE NOT EXISTS (SELECT 1 FROM session_context_heads existing WHERE isolation_domain = ")
+                .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
+                .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id).push(")");
+            write
+        };
+        let present = matches!(authority.binding, RunContextBinding::Present { .. });
+        write.push(if present {" AND EXISTS (SELECT 1 FROM session_execution_bindings binding WHERE isolation_domain = "}
+            else {" AND NOT EXISTS (SELECT 1 FROM session_execution_bindings binding WHERE isolation_domain = "})
+            .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
+            .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id);
+        if let RunContextBinding::Present { generation } = authority.binding {
+            write
+                .push(" AND generation = ")
+                .push_bind(i64_from_u64("binding generation", generation)?)
+                .push(" AND JSON_UNQUOTE(JSON_EXTRACT(binding_json, '$.state')) = 'ready'");
+        }
+        write.push(")");
+        let affected = write
+            .build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| database_error("advance_Run_context_head", source))?
+            .rows_affected();
+        if affected != 1 {
+            return Err(SessionContextCoordinatorError::Fenced);
+        }
+        Ok(head.cursor)
+    }
+
+    async fn stage_turn_commit(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        prepared: &PreparedSessionContextCommit,
+    ) -> Result<StagedCoordinatorMutation<CoordinatorMutationV1>, SessionContextCoordinatorError>
+    {
+        let ContextCommitAuthority::Controller(reservation) = &prepared.authority else {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "controller commit requires its real reservation".into(),
+            ));
+        };
+        let delta = &prepared.delta;
+        let idempotency_key = prepared.idempotency_key.as_str();
+        let request_hash = &prepared.request_hash;
+        let segments = &prepared.segments;
+        let release_writer = prepared.release_writer;
+        let (mut state, now) = lock_database_state_at_now(tx, &reservation.key).await?;
         if let Some(last) = state.last_commit.clone()
             && last.idempotency_key == idempotency_key
         {
-            validate_commit_request(&last, reservation, &delta)?;
+            validate_commit_request(&last, reservation, delta)?;
             record_database_authority_event(
-                &mut tx,
+                tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "commit_turn",
@@ -725,31 +1486,30 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
             if release_writer {
-                release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?;
+                release_committed_writer_in_tx(tx, &mut state, reservation).await?;
             }
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_retry", source))?;
-            connection.release();
-            return Ok(CoordinatorMutationV1::AlreadyApplied {
-                cursor: last.cursor.clone(),
-            });
+
+            return Ok(StagedCoordinatorMutation::Mutation(
+                CoordinatorMutationV1::AlreadyApplied {
+                    cursor: last.cursor.clone(),
+                },
+            ));
         }
         if let Err(error) = validate_active_reservation(&state, reservation, now) {
             // Archived receipts are only relevant when this is not the current
             // active reservation. The successful hot path already proves that
             // the commit has not been applied, so avoid an extra database read.
             if let Some(receipt) = load_database_receipt::<CommitReceiptV1>(
-                &mut tx,
+                tx,
                 &reservation.key,
                 "commit",
                 idempotency_key,
-                &request_hash,
+                request_hash,
             )
             .await?
             {
                 record_database_authority_event(
-                    &mut tx,
+                    tx,
                     &state,
                     AuthorityAuditFact {
                         operation: "commit_turn",
@@ -762,18 +1522,17 @@ impl DatabaseSessionContextCoordinator {
                 )
                 .await?;
                 if release_writer {
-                    release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?;
+                    release_committed_writer_in_tx(tx, &mut state, reservation).await?;
                 }
-                tx.commit()
-                    .await
-                    .map_err(|source| database_error("commit_turn_replay", source))?;
-                connection.release();
-                return Ok(CoordinatorMutationV1::AlreadyApplied {
-                    cursor: receipt.cursor,
-                });
+
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    CoordinatorMutationV1::AlreadyApplied {
+                        cursor: receipt.cursor,
+                    },
+                ));
             }
             record_database_authority_event(
-                &mut tx,
+                tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "commit_turn",
@@ -785,16 +1544,13 @@ impl DatabaseSessionContextCoordinator {
                 },
             )
             .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_rejection_audit", source))?;
-            connection.release();
-            return Err(error);
+
+            return Ok(StagedCoordinatorMutation::Rejected(error));
         }
         if state.head.as_ref().map(|head| &head.cursor) != reservation.expected_cursor.as_ref() {
             let current_cursor = state.head.as_ref().map(|head| head.cursor.clone());
             record_database_authority_event(
-                &mut tx,
+                tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "commit_turn",
@@ -806,45 +1562,39 @@ impl DatabaseSessionContextCoordinator {
                 },
             )
             .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_turn_conflict", source))?;
-            connection.release();
-            return Ok(CoordinatorMutationV1::Conflict {
-                current_cursor,
-                safe_options: vec![
-                    CoordinatorConflictOptionV1::Refresh,
-                    CoordinatorConflictOptionV1::Fork,
-                ],
-            });
+
+            return Ok(StagedCoordinatorMutation::Mutation(
+                CoordinatorMutationV1::Conflict {
+                    current_cursor,
+                    safe_options: vec![
+                        CoordinatorConflictOptionV1::Refresh,
+                        CoordinatorConflictOptionV1::Fork,
+                    ],
+                },
+            ));
         }
-        validate_delta_advance(state.head.as_ref(), reservation, &delta)?;
-        // Build and persist immutable canonical objects from the head held by
-        // this transaction. This removes the duplicate pre-BEGIN head read
-        // while retaining the same row-lock fence.
-        let node =
-            manifest_node_for_delta(&reservation.key, state.head.as_ref(), &delta, &segments)
-                .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_delta_advance(state.head.as_ref(), reservation.reserved_turn, delta)?;
+        let node = &prepared.node;
         let (total_canonical_bytes, total_message_count) =
-            next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
+            next_head_totals(state.head.as_ref(), segments, delta.mode)?;
         self.persist_database_immutables_in_tx(
-            &mut tx,
+            tx,
             &reservation.key,
-            &segments,
-            &node,
+            node,
+            &prepared.content_json,
             total_canonical_bytes,
             total_message_count,
         )
         .await?;
         if let Some(previous) = &state.last_commit {
-            archive_database_commit(&mut tx, previous).await?;
+            archive_database_commit(tx, previous).await?;
         }
         let cursor = node.cursor();
         state.head = Some(SessionContextHeadV1 {
             schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
             key: reservation.key.clone(),
             cursor: cursor.clone(),
-            latest_manifest_root: node.manifest_root,
+            latest_manifest_root: node.manifest_root.clone(),
             total_canonical_bytes,
             total_message_count,
             writer_epoch: reservation.writer_epoch,
@@ -852,15 +1602,15 @@ impl DatabaseSessionContextCoordinator {
         state.last_commit = Some(CommitReceiptV1 {
             idempotency_key: idempotency_key.to_owned(),
             reservation_id: reservation.reservation_id.clone(),
-            reservation: reservation.clone(),
-            delta_hash: turn_delta_hash(&delta),
+            reservation: reservation.as_ref().clone(),
+            delta_hash: turn_delta_hash(delta),
             cursor: cursor.clone(),
         });
         state.active_reservation = None;
         // Capture the commit audit before clearing its writer: the audit
         // owner and commit-before-release order must remain unchanged.
         record_database_authority_event(
-            &mut tx,
+            tx,
             &state,
             AuthorityAuditFact {
                 operation: "commit_turn",
@@ -872,16 +1622,13 @@ impl DatabaseSessionContextCoordinator {
             },
         )
         .await?;
-        if !release_writer
-            || !release_committed_writer_in_tx(&mut tx, &mut state, reservation).await?
-        {
-            update_database_state(&mut tx, &state).await?;
+        if !release_writer || !release_committed_writer_in_tx(tx, &mut state, reservation).await? {
+            update_database_state(tx, &state).await?;
         }
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_turn", source))?;
-        connection.release();
-        Ok(CoordinatorMutationV1::Applied { cursor })
+
+        Ok(StagedCoordinatorMutation::Mutation(
+            CoordinatorMutationV1::Applied { cursor },
+        ))
     }
 
     pub fn new(pool: SharedPool) -> Self {
@@ -911,111 +1658,6 @@ impl DatabaseSessionContextCoordinator {
         Ok(blocker)
     }
 
-    /// Retire only an internally acquired turn writer whose exact Run
-    /// generation is terminal and no longer leased. Run recovery, new
-    /// admission, and writer transfer cannot interleave with this proof.
-    pub async fn release_terminal_execution_writer(
-        &self,
-        lease: &ConversationWriterLeaseV1,
-        run_id: &str,
-        expected_run_generation: u64,
-    ) -> Result<bool, SessionContextCoordinatorError> {
-        let key = &lease.key;
-        key.validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        if lease.actor.actor_kind != astra_turn_types::ActorKindV1::Server
-            || lease.actor.actor_id != format!("server-run:{run_id}")
-            || lease.idempotency_key != format!("server-run:{run_id}:writer")
-        {
-            return Ok(false);
-        }
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| database_error("acquire_terminal_writer_release", source))?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| database_error("begin_terminal_writer_release", source))?;
-        crate::storage::admit_session_execution_write(&mut tx, &key.session_id, &key.owner_user_id)
-            .await
-            .map_err(|source| database_error("fence_terminal_writer_release", source))?;
-        let run = sqlx::query(
-            "SELECT status, run_generation,
-                    CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_live
-             FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE",
-        ).bind(&key.owner_user_id).bind(&key.session_id).bind(run_id)
-            .fetch_optional(&mut *tx).await
-            .map_err(|source| database_error("lock_terminal_writer_run", source))?;
-        let Some(run) = run else {
-            return Ok(false);
-        };
-        let status: String = run
-            .try_get("status")
-            .map_err(|source| database_error("decode_terminal_writer_status", source))?;
-        let generation: i64 = run
-            .try_get("run_generation")
-            .map_err(|source| database_error("decode_terminal_writer_generation", source))?;
-        let owner_live: Option<i64> = run
-            .try_get("owner_live")
-            .map_err(|source| database_error("decode_terminal_writer_owner", source))?;
-        if !crate::runs::durable_run_status_is_terminal(&status)
-            || u64::try_from(generation).ok() != Some(expected_run_generation)
-            || owner_live == Some(1)
-        {
-            return Ok(false);
-        }
-        if crate::runs::run_has_open_settlement_in_tx(
-            &mut tx,
-            &key.owner_user_id,
-            run_id,
-            expected_run_generation,
-        )
-        .await
-        .map_err(|source| database_error("lock_terminal_writer_settlement", source))?
-        {
-            return Ok(false);
-        }
-        let mut state = lock_database_state(&mut tx, key).await?;
-        if !state
-            .active_writer
-            .as_ref()
-            .is_some_and(|active| active == lease)
-        {
-            return Ok(false);
-        }
-        if state
-            .active_reservation
-            .as_ref()
-            .is_some_and(|reservation| {
-                reservation.key != *key
-                    || reservation.lease_id != lease.lease_id
-                    || reservation.writer_epoch != lease.writer_epoch
-                    || reservation.idempotency_key != format!("server-run:{run_id}:turn")
-            })
-        {
-            return Ok(false);
-        }
-        clear_writer_authority_in_tx(&mut tx, &mut state).await?;
-        record_database_authority_event(
-            &mut tx,
-            &state,
-            AuthorityAuditFact {
-                operation: "release_terminal_run_writer",
-                outcome: "released",
-                actor: Some(&lease.actor),
-                lease_id: Some(&lease.lease_id),
-                reservation_id: None,
-                expected_cursor: lease.expected_cursor.as_ref(),
-            },
-        )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_terminal_writer_release", source))?;
-        connection.release();
-        Ok(true)
-    }
-
     /// Load the provider selection for one Work Session, creating the supplied
     /// server-owned initial binding exactly once when upgrading an existing
     /// Work branch. Session-head locking serializes concurrent first reads
@@ -1040,20 +1682,7 @@ impl DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_binding_initialize", source))?;
-        ensure_database_state(&mut tx, key, AuthorityEpochsV1::default()).await?;
-        let (state, now) = lock_database_state_at_now(&mut tx, key).await?;
-        if state
-            .active_writer
-            .as_ref()
-            .is_some_and(|lease| lease.expires_at_unix_ms > now)
-            || state
-                .active_reservation
-                .as_ref()
-                .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-        {
-            return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
-        }
-
+        admit_session_lifecycle_write(&mut tx, key).await?;
         if let Some(binding) = load_execution_binding_in_tx(&mut tx, key, true).await? {
             if binding.logical_workspace_id != initial.logical_workspace_id {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
@@ -1065,6 +1694,21 @@ impl DatabaseSessionContextCoordinator {
                 .map_err(|source| database_error("commit_execution_binding_existing", source))?;
             connection.release();
             return Ok(binding);
+        }
+
+        admit_controller_context_write(&mut tx, key).await?;
+        ensure_database_state_admitted(&mut tx, key, AuthorityEpochsV1::default()).await?;
+        let (state, now) = lock_database_state_at_now(&mut tx, key).await?;
+        if state
+            .active_writer
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at_unix_ms > now)
+            || state
+                .active_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+        {
+            return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
         }
 
         let binding_json = database_to_json("session_execution_binding", initial)?;
@@ -1192,8 +1836,15 @@ impl DatabaseSessionContextCoordinator {
                 .active_reservation
                 .as_ref()
                 .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-            || session_execution_slot_exists(&mut tx, key).await?
-            || unresolved_session_invocation_exists(&mut tx, key).await?
+            || !crate::storage::session_execution_activity(
+                &mut tx,
+                &key.owner_user_id,
+                &key.session_id,
+                None,
+            )
+            .await
+            .map_err(|source| database_error("check_execution_switch_activity", source))?
+            .is_idle()
         {
             return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
         }
@@ -1413,8 +2064,15 @@ impl DatabaseSessionContextCoordinator {
                 .active_reservation
                 .as_ref()
                 .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-            || session_execution_slot_exists(&mut tx, key).await?
-            || unresolved_session_invocation_exists(&mut tx, key).await?
+            || !crate::storage::session_execution_activity(
+                &mut tx,
+                &key.owner_user_id,
+                &key.session_id,
+                None,
+            )
+            .await
+            .map_err(|source| database_error("check_execution_switch_activity", source))?
+            .is_idle()
         {
             return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
         }
@@ -1606,36 +2264,15 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         request: ResumedExecutionTurnRequest<'_>,
     ) -> Result<ResumedExecutionTurn, SessionContextCoordinatorError> {
         let key = &request.source.key;
-        validate_ttl(request.ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
+        request.source.validate()?;
         validate_idempotency_key(request.owner_pod_id)?;
         validate_idempotency_key(request.checkpoint_id)?;
-        request
-            .actor
-            .validate_for(key)
-            .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
-        validate_optional_cursor(key, request.source.expected_cursor.as_ref())?;
         if key.owner_user_id != request.user_id
             || key.session_id != request.session_id
-            || request.source.schema_version != SESSION_COORDINATION_SCHEMA_VERSION
-            || request.source.reserved_turn == 0
+            || request.source.run_id != request.run_id
         {
             return Err(SessionContextCoordinatorError::Unauthorized);
         }
-        let idempotency_key = format!(
-            "execution-resume:{}:{}",
-            request.run_id, request.expected_owner_generation
-        );
-        validate_idempotency_key(&idempotency_key)?;
-        let request_hash = {
-            let mut digest = Sha256::new();
-            digest.update(b"astra.resume-execution-turn.v1\0");
-            digest.update(database_to_json("execution_resume_source", request.source)?.as_bytes());
-            digest.update(database_to_json("execution_resume_actor", request.actor)?.as_bytes());
-            hash_field(&mut digest, request.owner_pod_id);
-            hash_field(&mut digest, request.checkpoint_id);
-            digest.update(request.ttl.as_millis().to_be_bytes());
-            format!("{:x}", digest.finalize())
-        };
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_execution_resume", source))?;
@@ -1643,133 +2280,47 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_resume", source))?;
-        let staged =
-            async {
-                let (mut run, checkpoint) =
-                    crate::runs::lock_execution_resume_tx(&mut tx, &request)
-                        .await
-                        .map_err(execution_resume_storage_error)?;
-                #[derive(Deserialize)]
-                struct OriginalReservation {
-                    reservation: TurnReservationV1,
-                }
-                let crate::runs::DurableExecutionHandoff::V1 {
-                    producer_run_id,
-                    producer_owner_generation,
-                    heavy,
-                } = database_json::<crate::runs::DurableExecutionHandoff<OriginalReservation>>(
-                    "execution_handoff",
-                    &checkpoint.checkpoint_json,
-                )?;
-                let source = heavy.reservation;
-                if source != *request.source
-                    || producer_run_id != request.run_id
-                    || checkpoint.checkpoint_id != request.checkpoint_id
-                    || checkpoint.idempotency_key
-                        != format!(
-                            "checkpoint:{}:execution_handoff:{}",
-                            request.run_id, producer_owner_generation
-                        )
-                {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-                let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
-                if state.authority_epochs != request.actor.authority_epochs {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-                let binding_generation = run
-                    .original_admission_data()
-                    .map_err(|source| SessionContextCoordinatorError::DatabaseJson {
-                        entity: "original_execution_admission",
-                        source,
-                    })?
-                    .get("execution_binding_generation")
-                    .map(|value| {
-                        value
-                            .as_u64()
-                            .filter(|generation| *generation > 0)
-                            .ok_or_else(|| {
-                                SessionContextCoordinatorError::Invalid(
-                                    "original execution binding generation is malformed".into(),
-                                )
-                            })
-                    })
-                    .transpose()?
-                    .unwrap_or(NO_EXECUTION_BINDING_EXPECTATION);
-                validate_execution_binding_generation_in_tx(&mut tx, key, Some(binding_generation))
-                    .await?;
-                if let Some(mut receipt) = load_database_receipt::<ResumedExecutionTurnReceipt>(
-                    &mut tx,
-                    key,
-                    "resume_execution",
-                    &idempotency_key,
-                    &request_hash,
-                )
-                .await?
-                {
-                    let live_owner: bool = sqlx::query_scalar(
-                    "SELECT COALESCE(owner_pod_id = ? AND owner_lease_expires_at >= NOW(6), FALSE)
-                     FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
-                ).bind(request.owner_pod_id).bind(request.user_id).bind(request.session_id)
-                    .bind(request.run_id).fetch_one(&mut *tx).await
-                    .map_err(|source| database_error("validate_resumed_run_owner", source))?;
-                    if run.status != astra_core::STATUS_RUNNING
-                        || !live_owner
-                        || receipt.source != source
-                        || receipt.run_id != run.run_id
-                        || receipt.run_generation != run.run_generation
-                        || request.expected_owner_generation.checked_add(1)
-                            != Some(receipt.run_generation)
-                        || receipt.checkpoint_id != checkpoint.checkpoint_id
-                        || receipt.producer_generation != producer_owner_generation
-                        || state.head.as_ref().map(|head| &head.cursor)
-                            != receipt.turn_reservation.expected_cursor.as_ref()
-                    {
-                        return Err(SessionContextCoordinatorError::Fenced);
-                    }
-                    validate_active_lease(&state, &receipt.writer_lease, now)?;
-                    validate_active_reservation(&state, &receipt.turn_reservation, now)?;
-                    validate_lease_request(
-                        state
-                            .active_writer
-                            .as_ref()
-                            .ok_or(SessionContextCoordinatorError::Fenced)?,
-                        key,
-                        &receipt.writer_lease.expected_cursor,
-                        request.actor,
-                    )?;
-                    if !same_reservation_origin(
-                        state
-                            .active_reservation
-                            .as_ref()
-                            .ok_or(SessionContextCoordinatorError::Fenced)?,
-                        &receipt.turn_reservation,
-                    ) {
-                        return Err(SessionContextCoordinatorError::Fenced);
-                    }
-                    // The existing heartbeat may have renewed the pair since the
-                    // receipt was written. Return current expiry without granting
-                    // a new epoch, run generation or reservation identity.
-                    receipt.writer_lease = state
-                        .active_writer
-                        .clone()
-                        .ok_or(SessionContextCoordinatorError::Fenced)?;
-                    receipt.turn_reservation = state
-                        .active_reservation
-                        .clone()
-                        .ok_or(SessionContextCoordinatorError::Fenced)?;
-                    run.checkpoint_json = None;
-                    return Ok(ResumedExecutionTurn {
-                        run,
-                        checkpoint,
-                        receipt,
-                    });
-                }
-                if run.run_generation != request.expected_owner_generation {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-                // Stage activation first so a later head/receipt rejection proves
-                // rollback covers ownership and the session slot as well.
+        let staged = async {
+            let (mut run, checkpoint) = crate::runs::lock_execution_resume_tx(&mut tx, &request)
+                .await
+                .map_err(execution_resume_storage_error)?;
+            #[derive(Deserialize)]
+            struct OriginalContext {
+                context_authority: RunContextAuthority,
+            }
+            let crate::runs::DurableExecutionHandoff::V1 {
+                producer_run_id,
+                producer_owner_generation,
+                heavy,
+            } = database_json::<crate::runs::DurableExecutionHandoff<OriginalContext>>(
+                "execution_handoff",
+                &checkpoint.checkpoint_json,
+            )?;
+            let source = heavy.context_authority;
+            let admitted = run
+                .opening
+                .as_ref()
+                .and_then(crate::runs::DurableRunOpening::context_authority)
+                .ok_or(SessionContextCoordinatorError::Fenced)?;
+            if source != *request.source
+                || source.generation != producer_owner_generation
+                || producer_run_id != request.run_id
+                || checkpoint.checkpoint_id != request.checkpoint_id
+                || checkpoint.idempotency_key
+                    != format!(
+                        "checkpoint:{}:execution_handoff:{}",
+                        request.run_id, producer_owner_generation
+                    )
+                || run.opening_hash.as_deref() != Some(request.opening_hash)
+                || run.context_admission_hash.as_deref()
+                    != Some(source.admission_fingerprint().as_str())
+                || admitted.admission_fingerprint() != source.admission_fingerprint()
+            {
+                return Err(SessionContextCoordinatorError::Fenced);
+            }
+            if run.run_generation == request.expected_owner_generation {
+                // The existing custody operation performs the only ownership
+                // CAS and immutable checkpoint association.
                 crate::runs::activate_execution_resume_tx(
                     &mut tx,
                     &mut run,
@@ -1778,129 +2329,58 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 )
                 .await
                 .map_err(execution_resume_storage_error)?;
-                let archived = load_database_receipt::<ReservationReceiptV1>(
-                    &mut tx,
-                    key,
-                    "reserve",
-                    &source.idempotency_key,
-                    &reservation_identity_hash(
-                        key,
-                        &source.lease_id,
-                        source.writer_epoch,
-                        source.expected_cursor.as_ref(),
-                    ),
+            } else {
+                // lock_execution_resume_tx has proven the exact tail custody
+                // claim. Also require its current live owner;
+                // a metadata-only checkpoint receipt never authorizes replay.
+                let live: i64 = sqlx::query_scalar(
+                    "SELECT CAST(COALESCE(status = 'running' AND owner_pod_id = ?
+                       AND owner_lease_expires_at >= NOW(6), FALSE) AS SIGNED)
+                     FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
                 )
-                .await?;
-                let original = state
-                    .active_reservation
-                    .as_ref()
-                    .filter(|reservation| same_reservation_origin(reservation, &source))
-                    .or_else(|| {
-                        archived
-                            .as_ref()
-                            .map(|receipt| &receipt.reservation)
-                            .filter(|reservation| same_reservation_origin(reservation, &source))
-                    })
-                    .or_else(|| {
-                        state
-                            .last_commit
-                            .as_ref()
-                            .map(|receipt| &receipt.reservation)
-                            .filter(|reservation| same_reservation_origin(reservation, &source))
-                    })
-                    .ok_or(SessionContextCoordinatorError::Fenced)?;
-                if !same_reservation_origin(original, &source) {
+                .bind(request.owner_pod_id)
+                .bind(request.user_id)
+                .bind(request.session_id)
+                .bind(request.run_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|source| database_error("validate_resumed_run_owner", source))?;
+                if live != 1 {
                     return Err(SessionContextCoordinatorError::Fenced);
                 }
-                let cursor = state.head.as_ref().map(|head| &head.cursor);
-                let source_committed_here = state.last_commit.as_ref().is_some_and(|commit| {
-                    same_reservation_origin(&commit.reservation, &source)
-                        && cursor == Some(&commit.cursor)
-                        && commit.cursor.completed_turn == source.reserved_turn
-                });
-                if cursor != source.expected_cursor.as_ref() && !source_committed_here
-                    || state
-                        .active_writer
-                        .as_ref()
-                        .is_some_and(|lease| lease.expires_at_unix_ms > now)
-                    || state
-                        .active_reservation
-                        .as_ref()
-                        .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-                {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-                let expected_cursor = cursor.cloned();
-                archive_database_state_receipts(&mut tx, &state).await?;
-                state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
-                })?;
-                let expires_at = checked_expiry(now, request.ttl)?;
-                let writer_lease = ConversationWriterLeaseV1 {
-                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                    key: key.clone(),
-                    lease_id: Uuid::new_v4().to_string(),
-                    writer_epoch: state.writer_epoch,
-                    actor: request.actor.clone(),
-                    expected_cursor: expected_cursor.clone(),
-                    acquired_at_unix_ms: now,
-                    expires_at_unix_ms: expires_at,
-                    idempotency_key: format!("server-run:{}:writer", request.run_id),
-                };
-                let turn_reservation = TurnReservationV1 {
-                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                    key: key.clone(),
-                    reservation_id: Uuid::new_v4().to_string(),
-                    lease_id: writer_lease.lease_id.clone(),
-                    writer_epoch: writer_lease.writer_epoch,
-                    expected_cursor,
-                    reserved_turn: source.reserved_turn,
-                    created_at_unix_ms: now,
-                    expires_at_unix_ms: expires_at,
-                    idempotency_key: format!("{idempotency_key}:turn"),
-                };
-                state.active_writer = Some(writer_lease.clone());
-                state.active_reservation = Some(turn_reservation.clone());
-                let receipt = ResumedExecutionTurnReceipt {
-                    source,
-                    writer_lease,
-                    turn_reservation,
-                    run_id: run.run_id.clone(),
-                    run_generation: run.run_generation,
-                    producer_generation: producer_owner_generation,
-                    checkpoint_id: checkpoint.checkpoint_id.clone(),
-                };
-                update_database_state(&mut tx, &state).await?;
-                store_database_receipt(
-                    &mut tx,
-                    key,
-                    "resume_execution",
-                    &idempotency_key,
-                    &request_hash,
-                    &receipt,
-                )
-                .await?;
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "resume_execution_turn",
-                        outcome: "resumed",
-                        actor: Some(request.actor),
-                        lease_id: Some(&receipt.writer_lease.lease_id),
-                        reservation_id: Some(&receipt.turn_reservation.reservation_id),
-                        expected_cursor: receipt.turn_reservation.expected_cursor.as_ref(),
-                    },
-                )
-                .await?;
-                run.checkpoint_json = None;
-                Ok(ResumedExecutionTurn {
-                    run,
-                    checkpoint,
-                    receipt,
-                })
             }
-            .await;
+            let binding = match source.binding {
+                RunContextBinding::Absent => 0,
+                RunContextBinding::Present { generation } => generation,
+            };
+            let authority = self
+                .capture_run_context_snapshot_tx(
+                    &mut tx,
+                    key,
+                    request.run_id,
+                    run.run_generation,
+                    Some(binding),
+                )
+                .await?;
+            if authority.admission_fingerprint() != source.admission_fingerprint() {
+                return Err(SessionContextCoordinatorError::Fenced);
+            }
+            let receipt = ResumedExecutionTurnReceipt {
+                source,
+                authority,
+                run_id: run.run_id.clone(),
+                run_generation: run.run_generation,
+                producer_generation: producer_owner_generation,
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+            };
+            run.checkpoint_json = None;
+            Ok(ResumedExecutionTurn {
+                run,
+                checkpoint,
+                receipt,
+            })
+        }
+        .await;
         let proof = match staged {
             Ok(proof) => proof,
             Err(error) => {
@@ -1911,8 +2391,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 return Err(error);
             }
         };
-        // An unknown COMMIT acknowledgement does not grant execution or prove
-        // rollback. The existing receipt lets an exact retry resolve custody.
+        // The exact existing Run custody claim resolves an ambiguous ACK.
+        // No Controller grant or second receipt protocol is issued here.
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_resume", source))?;
@@ -2035,85 +2515,37 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         head: &SessionContextHeadV1,
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
-        let fork_base = self.load_fork_prefix(&head.key).await?;
-        let mut rows = sqlx::query(
-            "SELECT manifest_json FROM conversation_manifest_nodes
-             WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ?
-               AND compaction_generation = ? AND reachable = 1",
-        )
-        .bind(&head.key.isolation_domain)
-        .bind(&head.key.owner_user_id)
-        .bind(&head.key.session_id)
-        .bind(&head.key.branch_id)
-        .bind(i64_from_u64(
-            "head compaction generation",
+        let mut nodes = std::collections::HashMap::new();
+        self.load_manifest_contents_through(
+            &head.key,
             head.cursor.compaction_generation,
-        )?)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| database_error("load_manifests", source))?;
-        if let Some(prefix) = &fork_base
-            && prefix.parent_cursor.compaction_generation == head.cursor.compaction_generation
-        {
-            rows.extend(
-                sqlx::query(
-                    "SELECT manifest_json FROM conversation_manifest_nodes
-                     WHERE isolation_domain = ? AND owner_user_id = ?
-                       AND session_id = ? AND branch_id = ?
-                       AND compaction_generation = ? AND reachable = 1
-                       AND conversation_seq <= ?",
-                )
-                .bind(&prefix.parent_key.isolation_domain)
-                .bind(&prefix.parent_key.owner_user_id)
-                .bind(&prefix.parent_key.session_id)
-                .bind(&prefix.parent_key.branch_id)
-                .bind(i64_from_u64(
-                    "fork parent compaction generation",
-                    prefix.parent_cursor.compaction_generation,
-                )?)
-                .bind(i64_from_u64(
-                    "fork parent conversation sequence",
-                    prefix.parent_cursor.conversation_seq,
-                )?)
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| database_error("load_fork_parent_manifests", source))?,
-            );
-        }
-        let mut nodes = std::collections::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let json = row
-                .try_get::<String, _>("manifest_json")
-                .map_err(|source| database_error("decode_manifest_row", source))?;
-            let node: ContextManifestNodeV1 = database_json("manifest", &json)?;
-            node.validate()
-                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            if node.key != head.key
-                && fork_base
-                    .as_ref()
-                    .is_none_or(|prefix| node.key != prefix.parent_key)
-            {
+            head.cursor.conversation_seq,
+            &mut nodes,
+        )
+        .await?;
+        let mut scope = head.key.clone();
+        let mut through = head.cursor.conversation_seq;
+        let mut visited = HashSet::from([scope.clone()]);
+        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
+            if prefix.parent_cursor.compaction_generation != head.cursor.compaction_generation {
+                break;
+            }
+            if !visited.insert(prefix.parent_key.clone()) {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "database manifest owner or branch mismatch".into(),
+                    "cyclic fork lineage".into(),
                 ));
             }
-            nodes.insert(node.manifest_root.clone(), node);
-        }
-
-        let ordered_nodes = order_manifest_chain(head, nodes)?;
-        let mut unique_hashes = HashSet::new();
-        for node in &ordered_nodes {
-            unique_hashes.extend(
-                node.appended_segments
-                    .iter()
-                    .map(|segment| segment.segment_hash.clone()),
-            );
-        }
-        let mut segment_map = self
-            .load_database_segments(&head.key, unique_hashes.into_iter().collect())
+            through = through.min(prefix.parent_cursor.conversation_seq);
+            self.load_manifest_contents_through(
+                &prefix.parent_key,
+                prefix.parent_cursor.compaction_generation,
+                through,
+                &mut nodes,
+            )
             .await?;
-        materialize_nodes(head, ordered_nodes, &mut segment_map)
+            scope = prefix.parent_key;
+        }
+        materialize_nodes(head, order_manifest_chain(head, nodes)?)
     }
 
     async fn load_manifest_delta(
@@ -2161,6 +2593,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 } else {
                     let row = sqlx::query(
                         "SELECT conversation_seq FROM conversation_manifest_nodes
+                         FORCE INDEX (uq_context_manifest_root)
                          WHERE isolation_domain = ? AND owner_user_id = ?
                            AND session_id = ? AND branch_id = ?
                            AND manifest_root = ? AND reachable = 1",
@@ -2258,32 +2691,50 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         )
     }
 
-    async fn load_segments(
+    async fn load_manifest_content(
         &self,
         key: &SessionKeyV1,
-        segment_hashes: &[String],
+        manifest_root: &str,
     ) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError> {
-        validate_segment_batch(key, segment_hashes)?;
-        let mut segments = self
-            .load_database_segments(key, segment_hashes.to_vec())
-            .await?;
-        segment_hashes
-            .iter()
-            .map(|hash| {
-                segments
-                    .remove(hash)
-                    .ok_or(SessionContextCoordinatorError::SegmentNotFound)
-            })
-            .collect()
-    }
-
-    async fn store_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        validate_segment_upload(key, segments)?;
-        self.persist_database_segments(key, segments).await
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_optional_manifest_root(Some(manifest_root))?;
+        if let Some(content) = self
+            .load_manifest_content_at(key, manifest_root, None)
+            .await?
+        {
+            return Ok(content.segments);
+        }
+        // A fork retains its captured parent prefix even after the parent
+        // Session is deleted. The prefix, not a caller-supplied owner/key,
+        // scopes this inherited read.
+        let mut scope = key.clone();
+        let mut bounds: Option<(u64, u64)> = None;
+        let mut visited = HashSet::from([scope.clone()]);
+        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
+            let generation = prefix.parent_cursor.compaction_generation;
+            let mut through = prefix.parent_cursor.conversation_seq;
+            if let Some((prior_generation, prior_through)) = bounds {
+                if generation != prior_generation {
+                    break;
+                }
+                through = through.min(prior_through);
+            }
+            if !visited.insert(prefix.parent_key.clone()) {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "cyclic fork lineage".into(),
+                ));
+            }
+            bounds = Some((generation, through));
+            if let Some(content) = self
+                .load_manifest_content_at(&prefix.parent_key, manifest_root, bounds)
+                .await?
+            {
+                return Ok(content.segments);
+            }
+            scope = prefix.parent_key;
+        }
+        Err(SessionContextCoordinatorError::SegmentNotFound)
     }
 
     async fn load_authority_epochs(
@@ -2375,9 +2826,9 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         let row = sqlx::query(
-            "SELECT fork_base_json FROM session_context_heads
+            "SELECT manifest_json FROM session_forks
              WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ?",
+               AND child_session_id = ? AND child_branch_id = ? AND state = 'active'",
         )
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
@@ -2386,22 +2837,25 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .fetch_optional(self.pool.get())
         .await
         .map_err(|source| database_error("load_fork_prefix", source))?;
-        let prefix = row
-            .map(|row| {
-                row.try_get::<Option<String>, _>("fork_base_json")
-                    .map_err(|source| database_error("decode_fork_prefix", source))?
-                    .as_deref()
-                    .map(|json| database_json::<SharedManifestPrefixV1>("fork_prefix", json))
-                    .transpose()
-            })
-            .transpose()?
-            .flatten();
-        if let Some(prefix) = &prefix {
-            prefix
-                .validate_for_child(key)
+        // Fork records and their ancestor pins survive Session deletion while
+        // an active descendant still uses them. Heads do not, so lineage reads
+        // use the existing fork owner and its unique child key.
+        row.map(|row| {
+            let json: String = row
+                .try_get("manifest_json")
+                .map_err(|source| database_error("decode_fork_prefix", source))?;
+            let manifest: SessionForkManifestV1 = database_json("fork_prefix", &json)?;
+            manifest
+                .validate()
                 .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-        }
-        Ok(prefix)
+            if manifest.child_key != *key || manifest.state != SessionForkStateV1::Active {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "fork lineage identity or state mismatch".into(),
+                ));
+            }
+            Ok(manifest.shared_prefix())
+        })
+        .transpose()
     }
 
     async fn activate_fork(
@@ -2489,12 +2943,21 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
                AND session_id = ? AND branch_id = ?
+               AND compaction_generation = ? AND conversation_seq = ?
                AND manifest_root = ? AND reachable = 1",
         )
         .bind(&manifest.parent_key.isolation_domain)
         .bind(&manifest.parent_key.owner_user_id)
         .bind(&manifest.parent_key.session_id)
         .bind(&manifest.parent_key.branch_id)
+        .bind(i64_from_u64(
+            "fork parent compaction generation",
+            manifest.parent_head.cursor.compaction_generation,
+        )?)
+        .bind(i64_from_u64(
+            "fork parent conversation sequence",
+            manifest.parent_head.cursor.conversation_seq,
+        )?)
         .bind(&manifest.parent_head.latest_manifest_root)
         .fetch_optional(&mut *tx)
         .await
@@ -2619,7 +3082,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_acquire_writer", source))?;
-        ensure_database_state(&mut tx, key, actor.authority_epochs).await?;
+        admit_controller_context_write(&mut tx, key).await?;
+        ensure_database_state_admitted(&mut tx, key, actor.authority_epochs).await?;
         let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
         let expires_at = checked_expiry(now, ttl)?;
         let request_hash = lease_request_hash(key, expected_cursor, actor);
@@ -2807,7 +3271,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_turn_authority", source))?;
-        admit_session_lifecycle_write(&mut tx, &lease.key).await?;
+        admit_controller_context_write(&mut tx, &lease.key).await?;
         let now = database_now_ms(&mut tx).await?;
         let mut state = lock_database_state(&mut tx, &lease.key).await?;
         let validation = validate_active_lease(&state, lease, now)
@@ -2877,7 +3341,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_release_writer", source))?;
-        admit_session_lifecycle_write(&mut tx, &lease.key).await?;
+        admit_controller_context_write(&mut tx, &lease.key).await?;
         let mut state = lock_database_state(&mut tx, &lease.key).await?;
         let outcome = if state.active_writer.as_ref().is_some_and(|active| {
             active.lease_id == lease.lease_id && active.writer_epoch == lease.writer_epoch
@@ -2941,7 +3405,23 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_transfer_writer", source))?;
-        admit_session_lifecycle_write(&mut tx, &request.key).await?;
+        if request.mode == SessionHandoffModeV1::Forced {
+            // Authorization was validated above. Revoking an old writer must
+            // precede effect sealing; it does not admit new execution or
+            // claim that the previous execution/unknown effects have stopped.
+            crate::storage::admit_context_execution_write_with_facts(
+                &mut tx,
+                &request.key.session_id,
+                &request.key.owner_user_id,
+            )
+            .await
+            .map_err(|source| match source {
+                sqlx::Error::RowNotFound => SessionContextCoordinatorError::SessionLifecycleFenced,
+                source => database_error("admit_forced_writer_fence", source),
+            })?;
+        } else {
+            admit_controller_context_write(&mut tx, &request.key).await?;
+        }
         let now = database_now_ms(&mut tx).await?;
         let expires_at = checked_expiry(now, ttl)?;
         let mut state = lock_database_state(&mut tx, &request.key).await?;
@@ -3172,9 +3652,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         idempotency_key: &str,
         expected_execution_binding_generation: Option<u64>,
     ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        validate_idempotency_key(idempotency_key)?;
-        validate_optional_cursor(&lease.key, expected_cursor)?;
+        validate_turn_reservation_inputs(lease, expected_cursor, ttl, idempotency_key)?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_reserve_turn", source))?;
@@ -3182,210 +3660,22 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_reserve_turn", source))?;
-        admit_session_lifecycle_write(&mut tx, &lease.key).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
-        validate_execution_binding_generation_in_tx(
-            &mut tx,
-            &lease.key,
-            expected_execution_binding_generation,
-        )
-        .await?;
-        let request_hash = reservation_request_hash(lease, expected_cursor);
-        if let Some(receipt) = load_database_receipt::<ReservationReceiptV1>(
-            &mut tx,
-            &lease.key,
-            "reserve",
-            idempotency_key,
-            &request_hash,
-        )
-        .await?
-        {
-            record_database_authority_event(
+        admit_controller_context_write(&mut tx, &lease.key).await?;
+        let staged = self
+            .stage_reserve_turn(
                 &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "idempotent_replay",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&receipt.reservation.reservation_id),
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reservation_replay", source))?;
-            connection.release();
-            return Ok(ReserveTurnOutcome::AlreadyReserved(receipt.reservation));
-        }
-        if let Some(active) = state.active_reservation.clone()
-            && active.idempotency_key == idempotency_key
-        {
-            validate_reservation_request(&active, lease, &expected_cursor.cloned())?;
-            validate_active_lease(&state, lease, now)?;
-            if fence_expired_reservation_authority(&mut state, lease, now) {
-                // The preceding acquire_writer replay can have refreshed the
-                // writer. Fence that refresh in this transaction when its
-                // paired reservation has already expired.
-                update_database_state(&mut tx, &state).await?;
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "reserve_turn",
-                        outcome: "expired_authority_fenced",
-                        actor: Some(&lease.actor),
-                        lease_id: Some(&lease.lease_id),
-                        reservation_id: Some(&active.reservation_id),
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit()
-                    .await
-                    .map_err(|source| database_error("commit_reservation_expiry_fence", source))?;
-                connection.release();
-                return Err(SessionContextCoordinatorError::Expired);
-            }
-            let expires_at = refreshed_live_expiry(
-                now,
-                ttl,
-                active.expires_at_unix_ms,
-                Some(lease.expires_at_unix_ms),
-            )?;
-            let refreshed = state
-                .active_reservation
-                .as_mut()
-                .expect("matched active reservation");
-            refreshed.expires_at_unix_ms = expires_at;
-            let refreshed = refreshed.clone();
-            update_database_state(&mut tx, &state).await?;
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "idempotent_refreshed",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&refreshed.reservation_id),
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reservation_retry", source))?;
-            connection.release();
-            return Ok(ReserveTurnOutcome::AlreadyReserved(refreshed));
-        }
-        if let Err(error) = validate_active_lease(&state, lease, now) {
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: authority_error_outcome(&error),
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reserve_turn_audit", source))?;
-            connection.release();
-            return Err(error);
-        }
-        if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
-            let outcome = ReserveTurnOutcome::Conflict {
-                current_head: state.head.clone(),
-            };
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "cursor_conflict",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_reservation_conflict", source))?;
-            connection.release();
-            return Ok(outcome);
-        }
-        if state
-            .active_reservation
-            .as_ref()
-            .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-        {
-            let outcome = ReserveTurnOutcome::Conflict {
-                current_head: state.head.clone(),
-            };
-            record_database_authority_event(
-                &mut tx,
-                &state,
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: "reservation_conflict",
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
-                    expected_cursor,
-                },
-            )
-            .await?;
-            tx.commit()
-                .await
-                .map_err(|source| database_error("commit_active_reservation_conflict", source))?;
-            connection.release();
-            return Ok(outcome);
-        }
-        if let Some(previous) = &state.active_reservation {
-            archive_database_reservation(&mut tx, previous).await?;
-        }
-        let reservation = TurnReservationV1 {
-            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-            reservation_id: Uuid::new_v4().to_string(),
-            key: lease.key.clone(),
-            lease_id: lease.lease_id.clone(),
-            writer_epoch: lease.writer_epoch,
-            expected_cursor: expected_cursor.cloned(),
-            reserved_turn: expected_cursor
-                .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
-            created_at_unix_ms: now,
-            expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
-            idempotency_key: idempotency_key.to_owned(),
-        };
-        state.active_reservation = Some(reservation.clone());
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_event(
-            &mut tx,
-            &state,
-            AuthorityAuditFact {
-                operation: "reserve_turn",
-                outcome: "reserved",
-                actor: Some(&lease.actor),
-                lease_id: Some(&lease.lease_id),
-                reservation_id: Some(&reservation.reservation_id),
+                lease,
                 expected_cursor,
-            },
-        )
-        .await?;
+                ttl,
+                idempotency_key,
+                expected_execution_binding_generation,
+            )
+            .await?;
         tx.commit()
             .await
             .map_err(|source| database_error("commit_reserve_turn", source))?;
         connection.release();
-        Ok(ReserveTurnOutcome::Reserved(reservation))
+        staged.into_result()
     }
 
     async fn acquire_writer_and_reserve_turn(
@@ -3398,262 +3688,41 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         reservation_idempotency_key: &str,
         expected_execution_binding_generation: Option<u64>,
     ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
-        validate_idempotency_key(writer_idempotency_key)?;
-        validate_idempotency_key(reservation_idempotency_key)?;
-        actor
-            .validate_for(key)
-            .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
-        validate_optional_cursor(key, expected_cursor)?;
-
+        validate_writer_turn_inputs(
+            key,
+            expected_cursor,
+            actor,
+            ttl,
+            writer_idempotency_key,
+            reservation_idempotency_key,
+        )?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
-            .map_err(|source| database_error("acquire_and_reserve_turn", source))?;
+            .map_err(|source| database_error("acquire_acquire_writer_and_reserve_turn", source))?;
         let mut tx = connection
             .begin()
             .await
-            .map_err(|source| database_error("begin_acquire_and_reserve_turn", source))?;
-        ensure_database_state(&mut tx, key, actor.authority_epochs).await?;
-        let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
-        validate_execution_binding_generation_in_tx(
-            &mut tx,
-            key,
-            expected_execution_binding_generation,
-        )
-        .await?;
-        let expected_cursor_owned = expected_cursor.cloned();
-
-        let (lease, acquire_outcome) = if let Some(active) = state.active_writer.clone()
-            && active.idempotency_key == writer_idempotency_key
-        {
-            validate_lease_request(&active, key, &expected_cursor_owned, actor)?;
-            let expires_at = refreshed_live_expiry(now, ttl, active.expires_at_unix_ms, None)?;
-            let refreshed = state
-                .active_writer
-                .as_mut()
-                .expect("matched active writer lease");
-            refreshed.expires_at_unix_ms = expires_at;
-            (refreshed.clone(), "idempotent_refreshed")
-        } else {
-            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
-                let current_head = state.head.clone();
-                let active_lease_expires_at_unix_ms = state
-                    .active_writer
-                    .as_ref()
-                    .filter(|lease| lease.expires_at_unix_ms > now)
-                    .map(|lease| lease.expires_at_unix_ms);
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "acquire_writer",
-                        outcome: "cursor_conflict",
-                        actor: Some(actor),
-                        lease_id: None,
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_conflict", source)
-                })?;
-                connection.release();
-                return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
-                    current_head,
-                    active_lease_expires_at_unix_ms,
-                });
-            }
-            if state
-                .active_writer
-                .as_ref()
-                .is_some_and(|lease| lease.expires_at_unix_ms > now)
-            {
-                let current_head = state.head.clone();
-                let active_lease_expires_at_unix_ms = state
-                    .active_writer
-                    .as_ref()
-                    .map(|lease| lease.expires_at_unix_ms);
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "acquire_writer",
-                        outcome: "writer_conflict",
-                        actor: Some(actor),
-                        lease_id: None,
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_conflict", source)
-                })?;
-                connection.release();
-                return Ok(AcquireWriterAndReserveTurnOutcome::WriterConflict {
-                    current_head,
-                    active_lease_expires_at_unix_ms,
-                });
-            }
-            if actor.authority_epochs != state.authority_epochs {
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "acquire_writer",
-                        outcome: "stale_fenced",
-                        actor: Some(actor),
-                        lease_id: None,
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_fenced", source)
-                })?;
-                connection.release();
-                return Err(SessionContextCoordinatorError::Fenced);
-            }
-            archive_database_state_receipts(&mut tx, &state).await?;
-            state.active_reservation = None;
-            state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
-                SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
-            })?;
-            let lease = ConversationWriterLeaseV1 {
-                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                key: key.clone(),
-                lease_id: Uuid::new_v4().to_string(),
-                writer_epoch: state.writer_epoch,
-                actor: actor.clone(),
-                expected_cursor: expected_cursor_owned.clone(),
-                acquired_at_unix_ms: now,
-                expires_at_unix_ms: checked_expiry(now, ttl)?,
-                idempotency_key: writer_idempotency_key.to_owned(),
-            };
-            state.active_writer = Some(lease.clone());
-            (lease, "acquired")
-        };
-
-        let (reservation, reserve_outcome) = if let Some(active) = state.active_reservation.clone()
-            && active.idempotency_key == reservation_idempotency_key
-        {
-            validate_reservation_request(&active, &lease, &expected_cursor_owned)?;
-            validate_active_lease(&state, &lease, now)?;
-            if fence_expired_reservation_authority(&mut state, &lease, now) {
-                update_database_state(&mut tx, &state).await?;
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "reserve_turn",
-                        outcome: "expired_authority_fenced",
-                        actor: Some(&lease.actor),
-                        lease_id: Some(&lease.lease_id),
-                        reservation_id: Some(&active.reservation_id),
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_expiry_fence", source)
-                })?;
-                connection.release();
-                return Err(SessionContextCoordinatorError::Expired);
-            }
-            let expires_at = refreshed_live_expiry(
-                now,
-                ttl,
-                active.expires_at_unix_ms,
-                Some(lease.expires_at_unix_ms),
-            )?;
-            let refreshed = state
-                .active_reservation
-                .as_mut()
-                .expect("matched active turn reservation");
-            refreshed.expires_at_unix_ms = expires_at;
-            (refreshed.clone(), "idempotent_refreshed")
-        } else {
-            validate_active_lease(&state, &lease, now)?;
-            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor
-                || state
-                    .active_reservation
-                    .as_ref()
-                    .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-            {
-                let current_head = state.head.clone();
-                record_database_authority_event(
-                    &mut tx,
-                    &state,
-                    AuthorityAuditFact {
-                        operation: "reserve_turn",
-                        outcome: "reservation_conflict",
-                        actor: Some(&lease.actor),
-                        lease_id: Some(&lease.lease_id),
-                        reservation_id: None,
-                        expected_cursor,
-                    },
-                )
-                .await?;
-                tx.commit().await.map_err(|source| {
-                    database_error("commit_acquire_and_reserve_conflict", source)
-                })?;
-                connection.release();
-                return Ok(AcquireWriterAndReserveTurnOutcome::ReservationConflict {
-                    lease,
-                    current_head,
-                });
-            }
-            if let Some(previous) = &state.active_reservation {
-                archive_database_reservation(&mut tx, previous).await?;
-            }
-            let reservation = TurnReservationV1 {
-                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                reservation_id: Uuid::new_v4().to_string(),
-                key: lease.key.clone(),
-                lease_id: lease.lease_id.clone(),
-                writer_epoch: lease.writer_epoch,
-                expected_cursor: expected_cursor_owned,
-                reserved_turn: expected_cursor
-                    .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
-                created_at_unix_ms: now,
-                expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
-                idempotency_key: reservation_idempotency_key.to_owned(),
-            };
-            state.active_reservation = Some(reservation.clone());
-            (reservation, "reserved")
-        };
-
-        update_database_state(&mut tx, &state).await?;
-        record_database_authority_events(
-            &mut tx,
-            &state,
-            &[
-                AuthorityAuditFact {
-                    operation: "acquire_writer",
-                    outcome: acquire_outcome,
-                    actor: Some(actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: None,
+            .map_err(|source| database_error("begin_acquire_writer_and_reserve_turn", source))?;
+        admit_controller_context_write(&mut tx, key).await?;
+        let staged = self
+            .stage_acquire_writer_and_reserve_turn(
+                &mut tx,
+                WriterTurnReservationRequest {
+                    key,
                     expected_cursor,
+                    actor,
+                    ttl,
+                    writer_idempotency_key,
+                    reservation_idempotency_key,
+                    expected_execution_binding_generation,
                 },
-                AuthorityAuditFact {
-                    operation: "reserve_turn",
-                    outcome: reserve_outcome,
-                    actor: Some(&lease.actor),
-                    lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&reservation.reservation_id),
-                    expected_cursor,
-                },
-            ],
-        )
-        .await?;
+            )
+            .await?;
         tx.commit()
             .await
-            .map_err(|source| database_error("commit_acquire_and_reserve_turn", source))?;
+            .map_err(|source| database_error("commit_acquire_writer_and_reserve_turn", source))?;
         connection.release();
-        Ok(AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation })
+        staged.into_result()
     }
 
     async fn commit_turn(
@@ -3752,85 +3821,184 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
 }
 
 impl DatabaseSessionContextCoordinator {
-    async fn load_database_segments(
+    /// Verify immutable evidence of an exact Run commit after an unknown ACK.
+    /// Historical Context remains valid after a newer head or compaction;
+    /// this method neither consults mutable authority nor repairs storage.
+    pub async fn verify_prepared_run_context_commit(
+        &self,
+        prepared: &PreparedSessionContextCommit,
+        cursor: &SessionCursorV1,
+        commit_hash: &str,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        let authority = prepared.run_context_authority().ok_or_else(|| {
+            SessionContextCoordinatorError::Invalid(
+                "exact Run verification requires Run Context".into(),
+            )
+        })?;
+        if prepared.cursor() != *cursor || prepared.request_hash() != commit_hash {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "terminal Context identity does not match its prepared commit".into(),
+            ));
+        }
+        let key = &authority.key;
+        let node = &prepared.node;
+        let (bytes, messages) = next_head_totals(
+            authority.base_head.as_ref(),
+            &prepared.segments,
+            prepared.delta.mode,
+        )?;
+        let canonical_segment_bytes =
+            node.appended_segments
+                .iter()
+                .try_fold(0_u64, |sum, segment| {
+                    sum.checked_add(segment.canonical_bytes).ok_or_else(|| {
+                        SessionContextCoordinatorError::Invalid(
+                            "manifest segment byte count overflow".into(),
+                        )
+                    })
+                })?;
+        let stored = sqlx::query(
+            "SELECT parent_manifest_root, completed_turn, conversation_seq,
+                    compaction_generation, canonical_segment_bytes, total_canonical_bytes,
+                    total_message_count, manifest_root, manifest_json, content_json, reachable
+             FROM conversation_manifest_nodes
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?
+               AND compaction_generation = ? AND conversation_seq = ? AND manifest_root = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(i64_from_u64(
+            "manifest compaction generation",
+            node.compaction_generation,
+        )?)
+        .bind(i64_from_u64(
+            "manifest conversation sequence",
+            node.conversation_seq,
+        )?)
+        .bind(&node.manifest_root)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("verify_committed_Run_manifest", source))?
+        .ok_or_else(|| {
+            SessionContextCoordinatorError::NeedsRepair(
+                "committed Context manifest is missing".into(),
+            )
+        })?;
+        validate_stored_manifest(&stored, node, canonical_segment_bytes, bytes, messages)?;
+        let content = decode_stored_manifest_content(&stored, key)?;
+        if content.segments != prepared.segments {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "committed Context differs from its prepared content".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn load_manifest_content_at(
         &self,
         key: &SessionKeyV1,
-        hashes: Vec<String>,
-    ) -> Result<
-        std::collections::HashMap<String, ConversationSegmentV1>,
-        SessionContextCoordinatorError,
-    > {
-        let mut segments = std::collections::HashMap::with_capacity(hashes.len());
-        for chunk in hashes.chunks(256) {
-            let mut query = QueryBuilder::<MySql>::new(
-                "SELECT segment_hash, segment_json FROM conversation_segments \
-                 INNER JOIN ",
-            );
-            push_matrixone_bound_string_set(&mut query, chunk.iter().map(String::as_str));
-            query
-                .push(" AS requested_segment ON requested_segment.value = segment_hash")
-                .push(" WHERE isolation_domain = ")
-                .push_bind(&key.isolation_domain)
-                .push(" AND owner_user_id = ")
-                .push_bind(&key.owner_user_id);
-            let rows = query
-                .build()
-                .fetch_all(self.pool.get())
-                .await
-                .map_err(|source| database_error("load_segments", source))?;
-            for row in rows {
-                let stored_hash = row
-                    .try_get::<String, _>("segment_hash")
-                    .map_err(|source| database_error("decode_segment_hash", source))?;
-                let json = row
-                    .try_get::<String, _>("segment_json")
-                    .map_err(|source| database_error("decode_segment_json", source))?;
-                let segment: ConversationSegmentV1 = database_json("segment", &json)?;
-                segment.validate_for(key).map_err(|error| {
-                    SessionContextCoordinatorError::NeedsRepair(error.to_string())
-                })?;
-                if segment.segment_hash != stored_hash {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "database segment key does not match content".into(),
-                    ));
-                }
-                segments.insert(stored_hash, segment);
+        manifest_root: &str,
+        inherited_bounds: Option<(u64, u64)>,
+    ) -> Result<Option<StoredManifestContent>, SessionContextCoordinatorError> {
+        let mut sql = format!(
+            "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes FORCE INDEX (uq_context_manifest_root)
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND manifest_root = ? AND reachable = 1"
+        );
+        if inherited_bounds.is_some() {
+            sql.push_str(" AND compaction_generation = ? AND conversation_seq <= ?");
+        }
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .bind(manifest_root);
+        if let Some((generation, through)) = inherited_bounds {
+            query = query
+                .bind(i64_from_u64("inherited compaction generation", generation)?)
+                .bind(i64_from_u64("inherited conversation sequence", through)?);
+        }
+        let row = query
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| database_error("load_manifest_content", source))?;
+        row.map(|row| decode_stored_manifest_content(&row, key))
+            .transpose()
+    }
+
+    async fn load_manifest_contents_through(
+        &self,
+        key: &SessionKeyV1,
+        generation: u64,
+        through: u64,
+        nodes: &mut std::collections::HashMap<String, StoredManifestContent>,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        let sql = format!(
+            "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND compaction_generation = ? AND reachable = 1
+               AND conversation_seq <= ?"
+        );
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .bind(i64_from_u64("head compaction generation", generation)?)
+            .bind(i64_from_u64("head conversation sequence", through)?);
+        // Consume each bounded body once rather than retaining every SQL row
+        // and then allocating a second global segment-hash projection.
+        let mut rows = query.fetch(self.pool.get());
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|source| database_error("load_manifest_contents", source))?
+        {
+            let content = decode_stored_manifest_content(&row, key)?;
+            if nodes
+                .insert(content.node.manifest_root.clone(), content)
+                .is_some()
+            {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "duplicate manifest identity".into(),
+                ));
             }
         }
-        Ok(segments)
+        Ok(())
     }
 
     async fn persist_database_immutables_in_tx(
         &self,
         tx: &mut Transaction<'_, MySql>,
         key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
         node: &ContextManifestNodeV1,
+        content_json: &str,
         total_canonical_bytes: u64,
         total_message_count: u64,
     ) -> Result<(), SessionContextCoordinatorError> {
-        self.persist_database_segments_in_tx(tx, key, segments)
-            .await?;
-        let canonical_segment_bytes =
-            node.appended_segments
-                .iter()
-                .try_fold(0_u64, |total, segment| {
-                    total.checked_add(segment.canonical_bytes).ok_or_else(|| {
-                        SessionContextCoordinatorError::Invalid(
-                            "manifest segment byte count overflow".into(),
-                        )
-                    })
-                })?;
-        let manifest_insert_sql = matrixone_statement_with_null_shape(
+        let canonical_segment_bytes = node
+            .appended_segments
+            .iter()
+            .try_fold(0_u64, |sum, segment| {
+                sum.checked_add(segment.canonical_bytes)
+            })
+            .ok_or_else(|| {
+                SessionContextCoordinatorError::Invalid("manifest byte count overflow".into())
+            })?;
+        let sql = matrixone_statement_with_null_shape(
             "INSERT INTO conversation_manifest_nodes
              (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
-              parent_manifest_root, completed_turn, conversation_seq,
-              compaction_generation, canonical_segment_bytes, total_canonical_bytes,
-              total_message_count, manifest_json, reachable)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+              parent_manifest_root, completed_turn, conversation_seq, compaction_generation,
+              canonical_segment_bytes, total_canonical_bytes, total_message_count,
+              manifest_json, content_json, reachable)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             [node.parent_manifest_root.is_some()],
         );
-        let manifest_already_exists = match sqlx::query(manifest_insert_sql)
+        let result = sqlx::query(sql)
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -3850,282 +4018,63 @@ impl DatabaseSessionContextCoordinator {
                 "manifest segment bytes",
                 canonical_segment_bytes,
             )?)
+            .bind(i64_from_u64("manifest total bytes", total_canonical_bytes)?)
             .bind(i64_from_u64(
-                "manifest total canonical bytes",
-                total_canonical_bytes,
-            )?)
-            .bind(i64_from_u64(
-                "manifest total message count",
+                "manifest total messages",
                 total_message_count,
             )?)
             .bind(database_to_json("manifest", node)?)
+            .bind(content_json)
             .execute(&mut **tx)
-            .await
-        {
-            Ok(_) => false,
-            Err(source) if astra_core::is_duplicate_key_error(&source) => true,
-            Err(source) => return Err(database_error("persist_manifest", source)),
-        };
-        let existing_manifest_reachable = if manifest_already_exists {
-            let stored = sqlx::query(
-                "SELECT parent_manifest_root, completed_turn, conversation_seq,
-                        compaction_generation, canonical_segment_bytes,
-                        total_canonical_bytes, total_message_count, manifest_json, reachable
-                 FROM conversation_manifest_nodes
-                 WHERE isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ? AND manifest_root = ?
-                 FOR UPDATE",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&key.session_id)
-            .bind(&key.branch_id)
-            .bind(&node.manifest_root)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(|source| database_error("verify_existing_manifest", source))?;
-            let stored_manifest = stored
-                .try_get::<String, _>("manifest_json")
-                .map_err(|source| database_error("decode_existing_manifest", source))?;
-            let stored_manifest: ContextManifestNodeV1 =
-                database_json("existing_manifest", &stored_manifest)?;
-            let stored_parent = stored
-                .try_get::<Option<String>, _>("parent_manifest_root")
-                .map_err(|source| database_error("decode_existing_manifest_parent", source))?;
-            if stored_manifest != *node
-                || stored_parent != node.parent_manifest_root
-                || database_u64(&stored, "completed_turn")? != u64::from(node.completed_turn)
-                || database_u64(&stored, "conversation_seq")? != node.conversation_seq
-                || database_u64(&stored, "compaction_generation")? != node.compaction_generation
-                || database_u64(&stored, "canonical_segment_bytes")? != canonical_segment_bytes
-                || database_u64(&stored, "total_canonical_bytes")? != total_canonical_bytes
-                || database_u64(&stored, "total_message_count")? != total_message_count
-            {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "existing immutable manifest does not match its content-addressed key".into(),
-                ));
-            }
-            Some(database_u64(&stored, "reachable")?)
-        } else {
-            None
-        };
-
-        let mut insert_references = QueryBuilder::<MySql>::new(
-            "INSERT IGNORE INTO conversation_manifest_segments
-             (isolation_domain, owner_user_id, session_id, branch_id,
-              manifest_root, segment_position, segment_hash) ",
-        );
-        insert_references.push_values(
-            node.appended_segments.iter().enumerate(),
-            |mut values, (position, segment)| {
-                values
-                    .push_bind(&key.isolation_domain)
-                    .push_bind(&key.owner_user_id)
-                    .push_bind(&key.session_id)
-                    .push_bind(&key.branch_id)
-                    .push_bind(&node.manifest_root)
-                    .push_bind(i64::try_from(position).unwrap_or(i64::MAX))
-                    .push_bind(&segment.segment_hash);
-            },
-        );
-        let inserted_references = insert_references
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| database_error("persist_manifest_segment_references", source))?;
-        if manifest_already_exists
-            || inserted_references.rows_affected()
-                != u64::try_from(node.appended_segments.len()).unwrap_or(u64::MAX)
-        {
-            let stored_references = sqlx::query(
-                "SELECT segment_position, segment_hash
-                 FROM conversation_manifest_segments
-                 WHERE isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ? AND manifest_root = ?
-                 ORDER BY segment_position ASC FOR UPDATE",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&key.session_id)
-            .bind(&key.branch_id)
-            .bind(&node.manifest_root)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|source| database_error("verify_manifest_segment_references", source))?;
-            if stored_references.len() != node.appended_segments.len() {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "immutable manifest segment reference count is inconsistent".into(),
-                ));
-            }
-            for (position, row) in stored_references.iter().enumerate() {
-                let stored_position = database_u64(row, "segment_position")?;
-                let stored_hash = row.try_get::<String, _>("segment_hash").map_err(|source| {
-                    database_error("decode_manifest_segment_reference", source)
-                })?;
-                if stored_position != u64::try_from(position).unwrap_or(u64::MAX)
-                    || stored_hash != node.appended_segments[position].segment_hash
-                {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "immutable manifest segment reference does not match the manifest".into(),
-                    ));
-                }
-            }
-        }
-        if let Some(reachable) = existing_manifest_reachable {
-            match reachable {
-                0 => {
-                    let activated = sqlx::query(
-                        "UPDATE conversation_manifest_nodes SET reachable = 1
-                         WHERE isolation_domain = ? AND owner_user_id = ?
-                           AND session_id = ? AND branch_id = ? AND manifest_root = ?
-                           AND reachable = 0 AND compaction_generation = ?
-                           AND canonical_segment_bytes = ? AND total_canonical_bytes = ?
-                           AND total_message_count = ?",
-                    )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(source) if astra_core::is_duplicate_key_error(&source) => {
+                let sql = format!(
+                    "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes
+                     WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+                       AND branch_id = ? AND compaction_generation = ? AND conversation_seq = ? FOR UPDATE"
+                );
+                let row = sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(&key.isolation_domain)
                     .bind(&key.owner_user_id)
                     .bind(&key.session_id)
                     .bind(&key.branch_id)
-                    .bind(&node.manifest_root)
                     .bind(i64_from_u64(
                         "manifest compaction generation",
                         node.compaction_generation,
                     )?)
                     .bind(i64_from_u64(
-                        "manifest segment bytes",
-                        canonical_segment_bytes,
+                        "manifest conversation sequence",
+                        node.conversation_seq,
                     )?)
-                    .bind(i64_from_u64(
-                        "manifest total canonical bytes",
-                        total_canonical_bytes,
-                    )?)
-                    .bind(i64_from_u64(
-                        "manifest total message count",
-                        total_message_count,
-                    )?)
-                    .execute(&mut **tx)
+                    .fetch_optional(&mut **tx)
                     .await
-                    .map_err(|source| database_error("activate_existing_manifest", source))?;
-                    if activated.rows_affected() != 1 {
-                        return Err(SessionContextCoordinatorError::NeedsRepair(
-                            "verified staged manifest could not be activated".into(),
-                        ));
-                    }
-                }
-                1 => {}
-                _ => {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "existing immutable manifest has an invalid reachability state".into(),
-                    ));
-                }
+                    .map_err(|source| database_error("verify_existing_manifest", source))?
+                    .ok_or_else(|| {
+                        SessionContextCoordinatorError::NeedsRepair(
+                            "immutable manifest identity conflicts with another coordinate".into(),
+                        )
+                    })?;
+                validate_stored_manifest(
+                    &row,
+                    node,
+                    canonical_segment_bytes,
+                    total_canonical_bytes,
+                    total_message_count,
+                )?;
+                decode_stored_manifest_content(&row, key)?;
+                Ok(())
             }
+            Err(source) => Err(database_error("persist_manifest", source)),
         }
-        Ok(())
-    }
-
-    async fn persist_database_segments_in_tx(
-        &self,
-        tx: &mut Transaction<'_, MySql>,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        for segment in segments {
-            let json = database_to_json("segment", segment)?;
-            let result = sqlx::query(
-                "INSERT IGNORE INTO conversation_segments
-                 (isolation_domain, owner_user_id, segment_hash, canonical_root_hash,
-                  canonical_bytes, message_count, segment_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&segment.segment_hash)
-            .bind(&segment.canonical_root_hash)
-            .bind(i64_from_u64("segment bytes", segment.canonical_bytes)?)
-            .bind(i64::from(segment.message_count))
-            .bind(json)
-            .execute(&mut **tx)
-            .await
-            .map_err(|source| database_error("persist_segment", source))?;
-            if result.rows_affected() == 0 {
-                let stored = sqlx::query(
-                    "SELECT segment_json FROM conversation_segments
-                     WHERE isolation_domain = ? AND owner_user_id = ? AND segment_hash = ?
-                     FOR UPDATE",
-                )
-                .bind(&key.isolation_domain)
-                .bind(&key.owner_user_id)
-                .bind(&segment.segment_hash)
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(|source| database_error("verify_existing_segment", source))?
-                .try_get::<String, _>("segment_json")
-                .map_err(|source| database_error("decode_existing_segment", source))?;
-                let stored: ConversationSegmentV1 = database_json("existing_segment", &stored)?;
-                if stored != *segment {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "existing immutable segment does not match its content-addressed key"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn persist_database_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        for segment in segments {
-            let json = database_to_json("segment", segment)?;
-            let result = sqlx::query(
-                "INSERT IGNORE INTO conversation_segments
-                 (isolation_domain, owner_user_id, segment_hash, canonical_root_hash,
-                  canonical_bytes, message_count, segment_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&key.isolation_domain)
-            .bind(&key.owner_user_id)
-            .bind(&segment.segment_hash)
-            .bind(&segment.canonical_root_hash)
-            .bind(i64_from_u64("segment bytes", segment.canonical_bytes)?)
-            .bind(i64::from(segment.message_count))
-            .bind(json)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| database_error("persist_segment", source))?;
-            if result.rows_affected() == 0 {
-                let stored = sqlx::query(
-                    "SELECT segment_json FROM conversation_segments
-                     WHERE isolation_domain = ? AND owner_user_id = ? AND segment_hash = ?",
-                )
-                .bind(&key.isolation_domain)
-                .bind(&key.owner_user_id)
-                .bind(&segment.segment_hash)
-                .fetch_one(self.pool.get())
-                .await
-                .map_err(|source| database_error("verify_existing_segment", source))?
-                .try_get::<String, _>("segment_json")
-                .map_err(|source| database_error("decode_existing_segment", source))?;
-                let stored: ConversationSegmentV1 = database_json("existing_segment", &stored)?;
-                if stored != *segment {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "existing immutable segment does not match its content-addressed key"
-                            .into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }
 
 fn order_manifest_chain(
     head: &SessionContextHeadV1,
-    mut nodes: std::collections::HashMap<String, ContextManifestNodeV1>,
-) -> Result<Vec<ContextManifestNodeV1>, SessionContextCoordinatorError> {
+    mut nodes: std::collections::HashMap<String, StoredManifestContent>,
+) -> Result<Vec<StoredManifestContent>, SessionContextCoordinatorError> {
     let mut root = Some(head.latest_manifest_root.clone());
     let mut seen = HashSet::new();
     let mut reverse = Vec::new();
@@ -4138,17 +4087,17 @@ fn order_manifest_chain(
         let node = nodes.remove(&current).ok_or_else(|| {
             SessionContextCoordinatorError::NeedsRepair(format!("missing manifest {current}"))
         })?;
-        root = if node.replaces_history {
+        root = if node.node.replaces_history {
             None
         } else {
-            node.parent_manifest_root.clone()
+            node.node.parent_manifest_root.clone()
         };
         reverse.push(node);
     }
     reverse.reverse();
     if reverse
         .last()
-        .is_none_or(|node| !cursor_projection_matches_head(&node.cursor(), &head.cursor))
+        .is_none_or(|node| !cursor_projection_matches_head(&node.node.cursor(), &head.cursor))
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "head cursor does not match database manifest".into(),
@@ -4260,79 +4209,37 @@ fn manifest_delta(
 
 fn materialize_nodes(
     head: &SessionContextHeadV1,
-    nodes: Vec<ContextManifestNodeV1>,
-    segments: &mut std::collections::HashMap<String, ConversationSegmentV1>,
+    nodes: Vec<StoredManifestContent>,
 ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
-    let mut use_counts = std::collections::HashMap::<String, usize>::new();
-    for node in &nodes {
-        for segment in &node.appended_segments {
-            *use_counts.entry(segment.segment_hash.clone()).or_default() += 1;
-        }
-    }
     let mut messages = Vec::new();
     let mut logical_segment_count = 0_u64;
     let mut canonical_segment_bytes = 0_u64;
     let mut prior_cursor = None;
-    for node in nodes {
-        validate_manifest_advance(prior_cursor.as_ref(), &node)?;
-        let cursor = node.cursor();
-        for segment_ref in node.appended_segments {
-            let remaining = use_counts
-                .get_mut(&segment_ref.segment_hash)
+    for content in nodes {
+        validate_manifest_advance(prior_cursor.as_ref(), &content.node)?;
+        for segment in content.segments {
+            canonical_segment_bytes = canonical_segment_bytes
+                .checked_add(segment.canonical_bytes)
                 .ok_or_else(|| {
                     SessionContextCoordinatorError::NeedsRepair(
-                        "manifest segment use count is missing".into(),
+                        "materialized byte count overflow".into(),
                     )
                 })?;
-            *remaining -= 1;
-            if *remaining == 0 {
-                let segment = segments.remove(&segment_ref.segment_hash).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair(format!(
-                        "missing segment {}",
-                        segment_ref.segment_hash
-                    ))
-                })?;
-                if segment.reference() != segment_ref {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "segment metadata does not match manifest reference".into(),
-                    ));
-                }
-                canonical_segment_bytes = canonical_segment_bytes
-                    .checked_add(segment.canonical_bytes)
-                    .ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair(
-                            "materialized byte count overflow".into(),
-                        )
-                    })?;
-                messages.extend(segment.messages);
-            } else {
-                let segment = segments.get(&segment_ref.segment_hash).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair(format!(
-                        "missing segment {}",
-                        segment_ref.segment_hash
-                    ))
-                })?;
-                if segment.reference() != segment_ref {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "segment metadata does not match manifest reference".into(),
-                    ));
-                }
-                canonical_segment_bytes = canonical_segment_bytes
-                    .checked_add(segment.canonical_bytes)
-                    .ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair(
-                            "materialized byte count overflow".into(),
-                        )
-                    })?;
-                messages.extend(segment.messages.iter().cloned());
-            }
             logical_segment_count = logical_segment_count.checked_add(1).ok_or_else(|| {
                 SessionContextCoordinatorError::NeedsRepair(
                     "materialized segment count overflow".into(),
                 )
             })?;
+            messages.extend(segment.messages);
         }
-        prior_cursor = Some(cursor);
+        if content.total_canonical_bytes != canonical_segment_bytes
+            || content.total_message_count != u64::try_from(messages.len()).unwrap_or(u64::MAX)
+        {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "manifest totals do not match its content".into(),
+            ));
+        }
+        prior_cursor = Some(content.node.cursor());
     }
     if canonical_segment_bytes != head.total_canonical_bytes
         || u64::try_from(messages.len()).ok() != Some(head.total_message_count)
@@ -4445,12 +4352,488 @@ struct WriterTransferReceiptV1 {
     lease: ConversationWriterLeaseV1,
 }
 
+fn validate_turn_reservation_inputs(
+    lease: &ConversationWriterLeaseV1,
+    expected_cursor: Option<&SessionCursorV1>,
+    ttl: Duration,
+    idempotency_key: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    validate_ttl(ttl, MAX_RESERVATION_TTL)?;
+    validate_idempotency_key(idempotency_key)?;
+    validate_optional_cursor(&lease.key, expected_cursor)
+}
+
+fn validate_writer_turn_inputs(
+    key: &SessionKeyV1,
+    expected_cursor: Option<&SessionCursorV1>,
+    actor: &ActorContextV1,
+    ttl: Duration,
+    writer_key: &str,
+    reservation_key: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    validate_ttl(ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
+    validate_idempotency_key(writer_key)?;
+    validate_idempotency_key(reservation_key)?;
+    actor
+        .validate_for(key)
+        .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
+    validate_optional_cursor(key, expected_cursor)
+}
+
+impl DatabaseSessionContextCoordinator {
+    async fn stage_reserve_turn(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        lease: &ConversationWriterLeaseV1,
+        expected_cursor: Option<&SessionCursorV1>,
+        ttl: Duration,
+        idempotency_key: &str,
+        expected_execution_binding_generation: Option<u64>,
+    ) -> Result<StagedCoordinatorMutation<ReserveTurnOutcome>, SessionContextCoordinatorError> {
+        let (mut state, now) = lock_database_state_at_now(tx, &lease.key).await?;
+        validate_execution_binding_generation_in_tx(
+            tx,
+            &lease.key,
+            expected_execution_binding_generation,
+        )
+        .await?;
+        let request_hash = reservation_request_hash(lease, expected_cursor);
+        if let Some(receipt) = load_database_receipt::<ReservationReceiptV1>(
+            tx,
+            &lease.key,
+            "reserve",
+            idempotency_key,
+            &request_hash,
+        )
+        .await?
+        {
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "idempotent_replay",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&receipt.reservation.reservation_id),
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(
+                ReserveTurnOutcome::AlreadyReserved(receipt.reservation),
+            ));
+        }
+        if let Some(active) = state.active_reservation.clone()
+            && active.idempotency_key == idempotency_key
+        {
+            validate_reservation_request(&active, lease, &expected_cursor.cloned())?;
+            validate_active_lease(&state, lease, now)?;
+            if fence_expired_reservation_authority(&mut state, lease, now) {
+                // The preceding acquire_writer replay can have refreshed the
+                // writer. Fence that refresh in this transaction when its
+                // paired reservation has already expired.
+                update_database_state(tx, &state).await?;
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "expired_authority_fenced",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: Some(&active.reservation_id),
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Rejected(
+                    SessionContextCoordinatorError::Expired,
+                ));
+            }
+            let expires_at = refreshed_live_expiry(
+                now,
+                ttl,
+                active.expires_at_unix_ms,
+                Some(lease.expires_at_unix_ms),
+            )?;
+            let refreshed = state
+                .active_reservation
+                .as_mut()
+                .expect("matched active reservation");
+            refreshed.expires_at_unix_ms = expires_at;
+            let refreshed = refreshed.clone();
+            update_database_state(tx, &state).await?;
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "idempotent_refreshed",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&refreshed.reservation_id),
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(
+                ReserveTurnOutcome::AlreadyReserved(refreshed),
+            ));
+        }
+        if let Err(error) = validate_active_lease(&state, lease, now) {
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: authority_error_outcome(&error),
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Rejected(error));
+        }
+        if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
+            let outcome = ReserveTurnOutcome::Conflict {
+                current_head: state.head.clone(),
+            };
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "cursor_conflict",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(outcome));
+        }
+        if state
+            .active_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+        {
+            let outcome = ReserveTurnOutcome::Conflict {
+                current_head: state.head.clone(),
+            };
+            record_database_authority_event(
+                tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: "reservation_conflict",
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+            )
+            .await?;
+            return Ok(StagedCoordinatorMutation::Mutation(outcome));
+        }
+        if let Some(previous) = &state.active_reservation {
+            archive_database_reservation(tx, previous).await?;
+        }
+        let reservation = TurnReservationV1 {
+            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+            reservation_id: Uuid::new_v4().to_string(),
+            key: lease.key.clone(),
+            lease_id: lease.lease_id.clone(),
+            writer_epoch: lease.writer_epoch,
+            expected_cursor: expected_cursor.cloned(),
+            reserved_turn: expected_cursor
+                .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
+            created_at_unix_ms: now,
+            expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
+            idempotency_key: idempotency_key.to_owned(),
+        };
+        state.active_reservation = Some(reservation.clone());
+        update_database_state(tx, &state).await?;
+        record_database_authority_event(
+            tx,
+            &state,
+            AuthorityAuditFact {
+                operation: "reserve_turn",
+                outcome: "reserved",
+                actor: Some(&lease.actor),
+                lease_id: Some(&lease.lease_id),
+                reservation_id: Some(&reservation.reservation_id),
+                expected_cursor,
+            },
+        )
+        .await?;
+        Ok(StagedCoordinatorMutation::Mutation(
+            ReserveTurnOutcome::Reserved(reservation),
+        ))
+    }
+
+    async fn stage_acquire_writer_and_reserve_turn(
+        &self,
+        tx: &mut Transaction<'_, MySql>,
+        request: WriterTurnReservationRequest<'_>,
+    ) -> Result<
+        StagedCoordinatorMutation<AcquireWriterAndReserveTurnOutcome>,
+        SessionContextCoordinatorError,
+    > {
+        let WriterTurnReservationRequest {
+            key,
+            expected_cursor,
+            actor,
+            ttl,
+            writer_idempotency_key,
+            reservation_idempotency_key,
+            expected_execution_binding_generation,
+        } = request;
+        ensure_database_state_admitted(tx, key, actor.authority_epochs).await?;
+        let (mut state, now) = lock_database_state_at_now(tx, key).await?;
+        validate_execution_binding_generation_in_tx(tx, key, expected_execution_binding_generation)
+            .await?;
+        let expected_cursor_owned = expected_cursor.cloned();
+
+        let (lease, acquire_outcome) = if let Some(active) = state.active_writer.clone()
+            && active.idempotency_key == writer_idempotency_key
+        {
+            validate_lease_request(&active, key, &expected_cursor_owned, actor)?;
+            let expires_at = refreshed_live_expiry(now, ttl, active.expires_at_unix_ms, None)?;
+            let refreshed = state
+                .active_writer
+                .as_mut()
+                .expect("matched active writer lease");
+            refreshed.expires_at_unix_ms = expires_at;
+            (refreshed.clone(), "idempotent_refreshed")
+        } else {
+            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
+                let current_head = state.head.clone();
+                let active_lease_expires_at_unix_ms = state
+                    .active_writer
+                    .as_ref()
+                    .filter(|lease| lease.expires_at_unix_ms > now)
+                    .map(|lease| lease.expires_at_unix_ms);
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "acquire_writer",
+                        outcome: "cursor_conflict",
+                        actor: Some(actor),
+                        lease_id: None,
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        current_head,
+                        active_lease_expires_at_unix_ms,
+                    },
+                ));
+            }
+            if state
+                .active_writer
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at_unix_ms > now)
+            {
+                let current_head = state.head.clone();
+                let active_lease_expires_at_unix_ms = state
+                    .active_writer
+                    .as_ref()
+                    .map(|lease| lease.expires_at_unix_ms);
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "acquire_writer",
+                        outcome: "writer_conflict",
+                        actor: Some(actor),
+                        lease_id: None,
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        current_head,
+                        active_lease_expires_at_unix_ms,
+                    },
+                ));
+            }
+            if actor.authority_epochs != state.authority_epochs {
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "acquire_writer",
+                        outcome: "stale_fenced",
+                        actor: Some(actor),
+                        lease_id: None,
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Rejected(
+                    SessionContextCoordinatorError::Fenced,
+                ));
+            }
+            archive_database_state_receipts(tx, &state).await?;
+            state.active_reservation = None;
+            state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
+                SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
+            })?;
+            let lease = ConversationWriterLeaseV1 {
+                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                key: key.clone(),
+                lease_id: Uuid::new_v4().to_string(),
+                writer_epoch: state.writer_epoch,
+                actor: actor.clone(),
+                expected_cursor: expected_cursor_owned.clone(),
+                acquired_at_unix_ms: now,
+                expires_at_unix_ms: checked_expiry(now, ttl)?,
+                idempotency_key: writer_idempotency_key.to_owned(),
+            };
+            state.active_writer = Some(lease.clone());
+            (lease, "acquired")
+        };
+
+        let (reservation, reserve_outcome) = if let Some(active) = state.active_reservation.clone()
+            && active.idempotency_key == reservation_idempotency_key
+        {
+            validate_reservation_request(&active, &lease, &expected_cursor_owned)?;
+            validate_active_lease(&state, &lease, now)?;
+            if fence_expired_reservation_authority(&mut state, &lease, now) {
+                update_database_state(tx, &state).await?;
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "expired_authority_fenced",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: Some(&active.reservation_id),
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Rejected(
+                    SessionContextCoordinatorError::Expired,
+                ));
+            }
+            let expires_at = refreshed_live_expiry(
+                now,
+                ttl,
+                active.expires_at_unix_ms,
+                Some(lease.expires_at_unix_ms),
+            )?;
+            let refreshed = state
+                .active_reservation
+                .as_mut()
+                .expect("matched active turn reservation");
+            refreshed.expires_at_unix_ms = expires_at;
+            (refreshed.clone(), "idempotent_refreshed")
+        } else {
+            validate_active_lease(&state, &lease, now)?;
+            if state.head.as_ref().map(|head| &head.cursor) != expected_cursor
+                || state
+                    .active_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+            {
+                let current_head = state.head.clone();
+                record_database_authority_event(
+                    tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "reservation_conflict",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: None,
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                return Ok(StagedCoordinatorMutation::Mutation(
+                    AcquireWriterAndReserveTurnOutcome::ReservationConflict {
+                        lease,
+                        current_head,
+                    },
+                ));
+            }
+            if let Some(previous) = &state.active_reservation {
+                archive_database_reservation(tx, previous).await?;
+            }
+            let reservation = TurnReservationV1 {
+                schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                reservation_id: Uuid::new_v4().to_string(),
+                key: lease.key.clone(),
+                lease_id: lease.lease_id.clone(),
+                writer_epoch: lease.writer_epoch,
+                expected_cursor: expected_cursor_owned,
+                reserved_turn: expected_cursor
+                    .map_or(1, |cursor| cursor.completed_turn.saturating_add(1)),
+                created_at_unix_ms: now,
+                expires_at_unix_ms: checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms),
+                idempotency_key: reservation_idempotency_key.to_owned(),
+            };
+            state.active_reservation = Some(reservation.clone());
+            (reservation, "reserved")
+        };
+
+        update_database_state(tx, &state).await?;
+        record_database_authority_events(
+            tx,
+            &state,
+            &[
+                AuthorityAuditFact {
+                    operation: "acquire_writer",
+                    outcome: acquire_outcome,
+                    actor: Some(actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: None,
+                    expected_cursor,
+                },
+                AuthorityAuditFact {
+                    operation: "reserve_turn",
+                    outcome: reserve_outcome,
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&reservation.reservation_id),
+                    expected_cursor,
+                },
+            ],
+        )
+        .await?;
+        Ok(StagedCoordinatorMutation::Mutation(
+            AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation },
+        ))
+    }
+}
+
 async fn ensure_database_state(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
     epochs: AuthorityEpochsV1,
 ) -> Result<(), SessionContextCoordinatorError> {
     admit_session_lifecycle_write(tx, key).await?;
+    ensure_database_state_admitted(tx, key, epochs).await
+}
+
+async fn ensure_database_state_admitted(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    epochs: AuthorityEpochsV1,
+) -> Result<(), SessionContextCoordinatorError> {
     sqlx::query(
         "INSERT IGNORE INTO session_context_heads
          (isolation_domain, owner_user_id, session_id, branch_id,
@@ -4506,6 +4889,28 @@ async fn admit_session_lifecycle_write(
     }
 }
 
+/// Standalone Context writers share the Run admission lock order. A vacant
+/// Controller lease does not establish that the Session has stopped executing.
+async fn admit_controller_context_write(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    let facts = crate::storage::admit_context_execution_write_with_facts(
+        tx,
+        &key.session_id,
+        &key.owner_user_id,
+    )
+    .await
+    .map_err(|source| match source {
+        sqlx::Error::RowNotFound => SessionContextCoordinatorError::SessionLifecycleFenced,
+        source => database_error("admit_controller_context_write", source),
+    })?;
+    if let Some(blocker) = lock_session_run_execution_blocker(tx, key, &facts).await? {
+        return Err(SessionContextCoordinatorError::ExecutionOccupied(blocker));
+    }
+    Ok(())
+}
+
 /// Fork activation touches two sessions. Acquire their shared lifecycle
 /// fences in a deterministic owner/session order before locking fork or
 /// manifest rows, otherwise two cross-session activations could deadlock.
@@ -4526,7 +4931,7 @@ pub(crate) async fn admit_session_lifecycle_writes(
             ))
     });
     for key in keys {
-        admit_session_lifecycle_write(tx, key).await?;
+        admit_controller_context_write(tx, key).await?;
     }
     Ok(())
 }
@@ -4589,66 +4994,56 @@ async fn clear_writer_authority_in_tx(
     update_database_state(tx, state).await
 }
 
+/// Inspect actual execution under lifecycle/Session admission. Writer absence
+/// is not idle proof: include children, terminal executors still unwinding and
+/// uncertain external effects regardless of Run status.
+pub(crate) async fn lock_session_run_execution_blocker<T>(
+    tx: &mut T,
+    key: &SessionKeyV1,
+    facts: &crate::storage::SessionExecutionAdmissionFacts,
+) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError>
+where
+    T: crate::cancellation_safe_db::TransactionConnection,
+{
+    if !facts.belongs_to(&key.owner_user_id, &key.session_id) {
+        return Err(SessionContextCoordinatorError::Unauthorized);
+    }
+    let activity =
+        crate::storage::session_execution_activity(tx, &key.owner_user_id, &key.session_id, None)
+            .await
+            .map_err(|source| database_error("read_session_execution_activity", source))?;
+    Ok(if activity.unresolved_invocations {
+        Some(SessionExecutionBlocker::UnresolvedTool)
+    } else if activity.active_run {
+        Some(SessionExecutionBlocker::ActiveRun)
+    } else {
+        None
+    })
+}
+
 /// One owner-scoped current-read proof for cancellation and provider handoff.
 /// A physical workspace is intentionally absent from this proof: independent
 /// Sessions may share it, while each Session's own execution state remains
-/// fenced by its Session head, Run slot, and binding generation.
+/// fenced by its Session head, Run ownership, invocation custody and binding generation.
 async fn locked_execution_reuse_blocker(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
 ) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError> {
-    match crate::storage::admit_session_execution_write(tx, &key.session_id, &key.owner_user_id)
-        .await
+    let facts = match crate::storage::admit_session_execution_write_with_facts(
+        tx,
+        &key.session_id,
+        &key.owner_user_id,
+    )
+    .await
     {
-        Ok(()) => {}
+        Ok(facts) => facts,
         Err(sqlx::Error::RowNotFound) => {
             return Ok(Some(SessionExecutionBlocker::OwnerUnavailable));
         }
         Err(source) => return Err(database_error("fence_idle_workspace_session", source)),
-    }
-    let slot = sqlx::query("SELECT 1 FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE")
-        .bind(&key.owner_user_id).bind(&key.session_id).fetch_optional(&mut **tx).await
-        .map_err(|source| database_error("lock_idle_workspace_slot", source))?;
-    if slot.is_some() {
-        return Ok(Some(SessionExecutionBlocker::ExecutionSlot));
-    }
-    // Terminal executors may still be unwinding. Their owner lease remains
-    // relevant even though active-status discovery no longer includes them.
-    let running = sqlx::query(
-        "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ?
-         AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)
-              OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))
-         LIMIT 1 FOR UPDATE",
-    )
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| database_error("lock_idle_workspace_runs", source))?;
-    if running.is_some() {
-        return Ok(Some(SessionExecutionBlocker::ActiveRun));
-    }
-    // An executor may release its lease after failed closure. The durable
-    // generation-scoped fence survives pod loss and is still execution debt.
-    let settling = sqlx::query(
-        "SELECT run_id, run_generation FROM agent_runs r WHERE user_id = ? AND session_id = ?
-         AND EXISTS (SELECT 1 FROM agent_run_events e WHERE e.user_id = r.user_id AND e.run_id = r.run_id
-                     AND e.idempotency_key = CONCAT('run-settlement-started:', r.run_generation))
-         AND NOT EXISTS (SELECT 1 FROM agent_run_events e WHERE e.user_id = r.user_id AND e.run_id = r.run_id
-                         AND e.idempotency_key IN (CONCAT('run-settlement-finished:', r.run_generation), CONCAT('run-accounting-finalized:', r.run_generation))) FOR UPDATE",
-    ).bind(&key.owner_user_id).bind(&key.session_id).fetch_all(&mut **tx).await
-        .map_err(|source| database_error("lock_idle_workspace_settlement_runs", source))?;
-    for run in settling {
-        let run_id: String = run
-            .try_get("run_id")
-            .map_err(|source| database_error("decode_idle_settlement_run", source))?;
-        let generation = database_u64(&run, "run_generation")?;
-        if crate::runs::run_has_open_settlement_in_tx(tx, &key.owner_user_id, &run_id, generation)
-            .await
-            .map_err(|source| database_error("lock_idle_workspace_settlement", source))?
-        {
-            return Ok(Some(SessionExecutionBlocker::SettlementPending));
-        }
+    };
+    if let Some(blocker) = lock_session_run_execution_blocker(tx, key, &facts).await? {
+        return Ok(Some(blocker));
     }
     let head_exists = sqlx::query(
         "SELECT 1 FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ? FOR UPDATE",
@@ -4764,6 +5159,7 @@ async fn lock_database_state_at_now(
 pub(crate) struct RecoveryContextFactsV1 {
     pub(crate) head: SessionContextHeadV1,
     pub(crate) execution_binding: Option<SessionExecutionBindingV1>,
+    pub(crate) execution_blocker: Option<SessionExecutionBlocker>,
     pub(crate) has_active_reservation: bool,
     pub(crate) has_unresolved_invocations: bool,
 }
@@ -4771,9 +5167,11 @@ pub(crate) struct RecoveryContextFactsV1 {
 pub(crate) async fn lock_recovery_context_in_transaction(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
+    admission: &crate::storage::SessionExecutionAdmissionFacts,
 ) -> Result<RecoveryContextFactsV1, SessionContextCoordinatorError> {
     key.validate()
         .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+    let execution_blocker = lock_session_run_execution_blocker(tx, key, admission).await?;
     let (state, now) = lock_database_state_at_now(tx, key).await?;
     let head = state.head.ok_or_else(|| {
         SessionContextCoordinatorError::NeedsRepair(
@@ -4788,6 +5186,7 @@ pub(crate) async fn lock_recovery_context_in_transaction(
     let execution_binding = load_execution_binding_in_tx(tx, key, true).await?;
     Ok(RecoveryContextFactsV1 {
         head,
+        execution_blocker,
         execution_binding,
         has_active_reservation,
         has_unresolved_invocations,
@@ -5335,22 +5734,6 @@ async fn validate_no_execution_binding_in_tx(
     Ok(())
 }
 
-async fn session_execution_slot_exists(
-    tx: &mut Transaction<'_, MySql>,
-    key: &SessionKeyV1,
-) -> Result<bool, SessionContextCoordinatorError> {
-    let row = sqlx::query(
-        "SELECT 1 FROM agent_session_execution_slots \
-         WHERE user_id = ? AND session_id = ? LIMIT 1",
-    )
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| database_error("check_session_execution_slot", source))?;
-    Ok(row.is_some())
-}
-
 async fn unresolved_session_invocation_exists(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
@@ -5835,11 +6218,10 @@ fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, SessionContextCo
 
 fn manifest_node_for_delta(
     key: &SessionKeyV1,
-    head: Option<&SessionContextHeadV1>,
+    parent: Option<String>,
     delta: &CanonicalTurnDeltaV1,
     segments: &[ConversationSegmentV1],
 ) -> Result<ContextManifestNodeV1, SessionCoordinationValidationError> {
-    let parent = head.map(|head| head.latest_manifest_root.clone());
     let references = segments
         .iter()
         .map(ConversationSegmentV1::reference)
@@ -5949,17 +6331,168 @@ fn execution_resume_storage_error(
     }
 }
 
-// Renewals change expiry, not the identity of the original reserved turn.
-fn same_reservation_origin(left: &TurnReservationV1, right: &TurnReservationV1) -> bool {
-    left.schema_version == right.schema_version
-        && left.key == right.key
-        && left.reservation_id == right.reservation_id
-        && left.lease_id == right.lease_id
-        && left.writer_epoch == right.writer_epoch
-        && left.expected_cursor == right.expected_cursor
-        && left.reserved_turn == right.reserved_turn
-        && left.created_at_unix_ms == right.created_at_unix_ms
-        && left.idempotency_key == right.idempotency_key
+fn validate_stored_manifest(
+    stored: &sqlx::mysql::MySqlRow,
+    node: &ContextManifestNodeV1,
+    canonical_segment_bytes: u64,
+    total_canonical_bytes: u64,
+    total_message_count: u64,
+) -> Result<(), SessionContextCoordinatorError> {
+    let stored_manifest = stored
+        .try_get::<String, _>("manifest_json")
+        .map_err(|source| database_error("decode_existing_manifest", source))?;
+    let stored_manifest: ContextManifestNodeV1 =
+        database_json("existing_manifest", &stored_manifest)?;
+    let stored_parent = stored
+        .try_get::<Option<String>, _>("parent_manifest_root")
+        .map_err(|source| database_error("decode_existing_manifest_parent", source))?;
+    if stored_manifest != *node
+        || stored_parent != node.parent_manifest_root
+        || database_u64(stored, "completed_turn")? != u64::from(node.completed_turn)
+        || database_u64(stored, "conversation_seq")? != node.conversation_seq
+        || database_u64(stored, "compaction_generation")? != node.compaction_generation
+        || database_u64(stored, "canonical_segment_bytes")? != canonical_segment_bytes
+        || database_u64(stored, "total_canonical_bytes")? != total_canonical_bytes
+        || database_u64(stored, "total_message_count")? != total_message_count
+    {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "existing immutable manifest does not match its content-addressed key".into(),
+        ));
+    }
+    Ok(())
+}
+
+const MANIFEST_CONTENT_COLUMNS: &str = "manifest_root, parent_manifest_root, completed_turn,
+    conversation_seq, compaction_generation, canonical_segment_bytes,
+    total_canonical_bytes, total_message_count, manifest_json, content_json, reachable";
+
+struct StoredManifestContent {
+    node: ContextManifestNodeV1,
+    segments: Vec<ConversationSegmentV1>,
+    total_canonical_bytes: u64,
+    total_message_count: u64,
+}
+
+fn encode_manifest_content(
+    content: &[Vec<Value>],
+) -> Result<String, SessionContextCoordinatorError> {
+    if content.len() > MAX_SEGMENT_BATCH {
+        return Err(SessionContextCoordinatorError::ResourceLimit(
+            "too many Context segments",
+        ));
+    }
+    // Bound the whole frame before any canonical traversal, sorting or hashing.
+    // In particular, a batch of individually valid segments must stop counting
+    // at 32 MiB instead of canonicalizing up to 256 * 8 MiB first.
+    if !astra_turn_types::json_serialized_fits(content, MAX_CONTEXT_CONTENT_BYTES)
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?
+    {
+        return Err(SessionContextCoordinatorError::ResourceLimit(
+            "encoded Context content exceeds byte budget",
+        ));
+    }
+    for messages in content {
+        if !astra_turn_types::json_serialized_fits(messages, MAX_CONTEXT_SEGMENT_BYTES)
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?
+            || canonical_conversation_serialized_len(messages) > MAX_CONTEXT_SEGMENT_BYTES
+        {
+            return Err(SessionContextCoordinatorError::ResourceLimit(
+                "Context segment exceeds byte budget",
+            ));
+        }
+    }
+    // Counting stops at the bound before allocating. This buffer is encoded
+    // once and reused by the existing transaction, including commit retries.
+    database_to_json("manifest content", &content)
+}
+
+fn decode_manifest_content(
+    node: &ContextManifestNodeV1,
+    json: &str,
+) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError> {
+    let invalid = |detail: &str| SessionContextCoordinatorError::NeedsRepair(detail.into());
+    node.validate()
+        .map_err(|error| invalid(&error.to_string()))?;
+    if json.len() > MAX_CONTEXT_CONTENT_BYTES as usize
+        || node.appended_segments.len() > MAX_SEGMENT_BATCH
+    {
+        return Err(invalid("stored Context exceeds byte budget"));
+    }
+    let content: Vec<Vec<Value>> = database_json("manifest content", json)?;
+    if content.len() != node.appended_segments.len() {
+        return Err(invalid("manifest content segment count mismatch"));
+    }
+    content
+        .into_iter()
+        .zip(&node.appended_segments)
+        .map(|(messages, expected)| {
+            if !astra_turn_types::json_serialized_fits(&messages, MAX_CONTEXT_SEGMENT_BYTES)
+                .map_err(|error| invalid(&error.to_string()))?
+            {
+                return Err(invalid(
+                    "stored Context segment exceeds encoded byte budget",
+                ));
+            }
+            let segment = ConversationSegmentV1::new(&node.key, messages)
+                .map_err(|error| invalid(&error.to_string()))?;
+            if segment.canonical_bytes > MAX_CONTEXT_SEGMENT_BYTES
+                || segment.reference() != *expected
+            {
+                return Err(invalid(
+                    "manifest content does not match its ordered reference",
+                ));
+            }
+            Ok(segment)
+        })
+        .collect()
+}
+
+fn decode_stored_manifest_content(
+    row: &sqlx::mysql::MySqlRow,
+    key: &SessionKeyV1,
+) -> Result<StoredManifestContent, SessionContextCoordinatorError> {
+    let json: String = row
+        .try_get("manifest_json")
+        .map_err(|source| database_error("decode_manifest", source))?;
+    let node: ContextManifestNodeV1 = database_json("manifest", &json)?;
+    let stored_root: String = row
+        .try_get("manifest_root")
+        .map_err(|source| database_error("decode_manifest_root", source))?;
+    if node.key != *key || node.manifest_root != stored_root || database_u64(row, "reachable")? != 1
+    {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "manifest scope or reachability mismatch".into(),
+        ));
+    }
+    let content_json: String = row
+        .try_get("content_json")
+        .map_err(|source| database_error("decode_manifest_content", source))?;
+    let segments = decode_manifest_content(&node, &content_json)?;
+    let total_canonical_bytes = database_u64(row, "total_canonical_bytes")?;
+    let total_message_count = database_u64(row, "total_message_count")?;
+    let canonical_bytes = segments
+        .iter()
+        .try_fold(0_u64, |sum, segment| {
+            sum.checked_add(segment.canonical_bytes)
+        })
+        .ok_or_else(|| {
+            SessionContextCoordinatorError::NeedsRepair(
+                "manifest content byte count overflow".into(),
+            )
+        })?;
+    validate_stored_manifest(
+        row,
+        &node,
+        canonical_bytes,
+        total_canonical_bytes,
+        total_message_count,
+    )?;
+    Ok(StoredManifestContent {
+        node,
+        segments,
+        total_canonical_bytes,
+        total_message_count,
+    })
 }
 
 fn validate_optional_manifest_root(
@@ -5974,64 +6507,6 @@ fn validate_optional_manifest_root(
         return Err(SessionContextCoordinatorError::Invalid(
             "manifest root must be a lowercase SHA-256 digest".into(),
         ));
-    }
-    Ok(())
-}
-
-fn validate_segment_batch(
-    key: &SessionKeyV1,
-    segment_hashes: &[String],
-) -> Result<(), SessionContextCoordinatorError> {
-    key.validate()
-        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-    if segment_hashes.is_empty() || segment_hashes.len() > MAX_SEGMENT_BATCH {
-        return Err(SessionContextCoordinatorError::Invalid(format!(
-            "segment batch must contain between 1 and {MAX_SEGMENT_BATCH} identities"
-        )));
-    }
-    let mut unique = HashSet::with_capacity(segment_hashes.len());
-    for hash in segment_hashes {
-        validate_optional_manifest_root(Some(hash))?;
-        if !unique.insert(hash) {
-            return Err(SessionContextCoordinatorError::Invalid(
-                "segment batch contains duplicate identities".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_segment_upload(
-    key: &SessionKeyV1,
-    segments: &[ConversationSegmentV1],
-) -> Result<(), SessionContextCoordinatorError> {
-    let hashes = segments
-        .iter()
-        .map(|segment| segment.segment_hash.clone())
-        .collect::<Vec<_>>();
-    validate_segment_batch(key, &hashes)?;
-    let mut total_bytes = 0_u64;
-    for segment in segments {
-        segment
-            .validate_for(key)
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        if segment.canonical_bytes > MAX_STAGED_SEGMENT_BYTES {
-            return Err(SessionContextCoordinatorError::Invalid(format!(
-                "conversation segment exceeds {MAX_STAGED_SEGMENT_BYTES} canonical bytes"
-            )));
-        }
-        total_bytes = total_bytes
-            .checked_add(segment.canonical_bytes)
-            .ok_or_else(|| {
-                SessionContextCoordinatorError::Invalid(
-                    "conversation segment batch byte count overflow".into(),
-                )
-            })?;
-    }
-    if total_bytes > MAX_STAGED_BATCH_BYTES {
-        return Err(SessionContextCoordinatorError::Invalid(format!(
-            "conversation segment batch exceeds {MAX_STAGED_BATCH_BYTES} canonical bytes"
-        )));
     }
     Ok(())
 }
@@ -6268,11 +6743,11 @@ fn validate_active_reservation(
 
 fn validate_delta_advance(
     head: Option<&SessionContextHeadV1>,
-    reservation: &TurnReservationV1,
+    reserved_turn: u32,
     delta: &CanonicalTurnDeltaV1,
 ) -> Result<(), SessionContextCoordinatorError> {
     if delta.schema_version != CANONICAL_TURN_DELTA_SCHEMA_VERSION
-        || delta.completed_turn != reservation.reserved_turn
+        || delta.completed_turn != reserved_turn
     {
         return Err(SessionContextCoordinatorError::Invalid(
             "turn delta does not match its reservation".into(),
@@ -6609,22 +7084,170 @@ mod adoption_tests {
     use super::*;
 
     #[test]
+    fn node_content_preserves_duplicate_references_and_rejects_changed_order() {
+        let key = SessionKeyV1::owner_session("server", "owner", "session", "main");
+        let first = vec![serde_json::json!({"role":"user","content":"中文🙂\n\t\"\\"})];
+        let second = vec![serde_json::json!({"role":"assistant","content":"answer"})];
+        for content in [
+            vec![first.clone(), first.clone()],
+            vec![first.clone(), second.clone()],
+        ] {
+            let segments: Vec<_> = content
+                .iter()
+                .map(|messages| ConversationSegmentV1::new(&key, messages.clone()).unwrap())
+                .collect();
+            let node = ContextManifestNodeV1::new(
+                key.clone(),
+                None,
+                1,
+                1,
+                1,
+                0,
+                None,
+                segments
+                    .iter()
+                    .map(ConversationSegmentV1::reference)
+                    .collect(),
+            )
+            .unwrap();
+            let encoded = encode_manifest_content(&content).unwrap();
+            assert_eq!(decode_manifest_content(&node, &encoded).unwrap(), segments);
+            for malformed in ["null", "[]", "[[]]"] {
+                assert!(decode_manifest_content(&node, malformed).is_err());
+            }
+            let mut changed = content.clone();
+            changed[0][0]["content"] = "changed".into();
+            assert!(
+                decode_manifest_content(&node, &serde_json::to_string(&changed).unwrap()).is_err()
+            );
+        }
+        let segments = [
+            ConversationSegmentV1::new(&key, first.clone()).unwrap(),
+            ConversationSegmentV1::new(&key, second.clone()).unwrap(),
+        ];
+        let node = ContextManifestNodeV1::new(
+            key,
+            None,
+            1,
+            1,
+            1,
+            0,
+            None,
+            segments
+                .iter()
+                .map(ConversationSegmentV1::reference)
+                .collect(),
+        )
+        .unwrap();
+        let reversed = encode_manifest_content(&[second, first]).unwrap();
+        assert!(decode_manifest_content(&node, &reversed).is_err());
+    }
+
+    #[test]
+    fn ordinary_context_preparation_enforces_segment_and_encoded_frame_limits() {
+        let authority = RunContextAuthority {
+            key: SessionKeyV1::owner_session("server", "owner", "session", "main"),
+            run_id: "run".into(),
+            generation: 0,
+            row_exists: false,
+            base_head: None,
+            turn: 1,
+            writer_epoch: 0,
+            authority_epochs: AuthorityEpochsV1::default(),
+            binding: RunContextBinding::Absent,
+        };
+        let delta = |logical_segments| CanonicalTurnDeltaV1 {
+            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            compaction_generation: 0,
+            config_version_id: None,
+            mode: CanonicalDeltaModeV1::Append,
+            logical_segments,
+        };
+        let input = vec![serde_json::json!({"role":"user","content":""})];
+        let overhead = serde_json::to_vec(&input).unwrap().len();
+        let at_limit = vec![
+            serde_json::json!({"role":"user","content":"x".repeat(MAX_CONTEXT_SEGMENT_BYTES as usize - overhead)}),
+        ];
+        assert!(
+            PreparedSessionContextCommit::for_run(
+                &authority,
+                &"a".repeat(64),
+                delta(vec![at_limit.clone()])
+            )
+            .is_ok()
+        );
+        for content in [
+            vec![input; MAX_SEGMENT_BATCH + 1],
+            vec![vec![
+                serde_json::json!({"role":"user","content":"x".repeat(MAX_CONTEXT_SEGMENT_BYTES as usize)}),
+            ]],
+            vec![at_limit; 4], // Four individually legal segments exceed the whole-frame budget including brackets/commas.
+        ] {
+            assert!(matches!(
+                PreparedSessionContextCommit::for_run(&authority, &"a".repeat(64), delta(content)),
+                Err(SessionContextCoordinatorError::ResourceLimit(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn run_context_preparation_accepts_initial_run_generation_and_fences_binding_generation() {
+        let mut authority = RunContextAuthority {
+            key: SessionKeyV1::owner_session(
+                "server",
+                "owner",
+                "session",
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+            ),
+            run_id: "run".into(),
+            generation: 0,
+            row_exists: false,
+            base_head: None,
+            turn: 1,
+            writer_epoch: 0,
+            authority_epochs: AuthorityEpochsV1::default(),
+            binding: RunContextBinding::Absent,
+        };
+        let delta = CanonicalTurnDeltaV1 {
+            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            compaction_generation: 0,
+            config_version_id: None,
+            mode: CanonicalDeltaModeV1::Append,
+            logical_segments: vec![vec![serde_json::json!({"role":"user","content":"hi"})]],
+        };
+        let prepared =
+            PreparedSessionContextCommit::for_run(&authority, &"a".repeat(64), delta.clone())
+                .unwrap();
+        assert_eq!(prepared.cursor().completed_turn, 1);
+        let admitted = authority.admission_fingerprint();
+        authority.generation = 1;
+        assert_eq!(authority.admission_fingerprint(), admitted);
+        authority.authority_epochs.permission_epoch = 1;
+        assert_ne!(authority.admission_fingerprint(), admitted);
+        authority.authority_epochs.permission_epoch = 0;
+        authority.binding = RunContextBinding::Present { generation: 0 };
+        assert!(
+            PreparedSessionContextCommit::for_run(&authority, &"a".repeat(64), delta.clone())
+                .is_err()
+        );
+        authority.binding = RunContextBinding::Absent;
+        authority.generation = i64::MAX as u64 + 1;
+        assert!(PreparedSessionContextCommit::for_run(&authority, &"a".repeat(64), delta).is_err());
+    }
+
+    #[test]
     fn session_execution_blockers_preserve_evidence_and_do_not_require_history_deletion() {
         for (blocker, wire, recovery) in [
-            (
-                SessionExecutionBlocker::ExecutionSlot,
-                "execution_slot",
-                "wait_or_cancel_session",
-            ),
             (
                 SessionExecutionBlocker::ActiveRun,
                 "active_run",
                 "wait_or_cancel_session",
-            ),
-            (
-                SessionExecutionBlocker::SettlementPending,
-                "settlement_pending",
-                "inspect_session",
             ),
             (
                 SessionExecutionBlocker::WriterOrReservation,

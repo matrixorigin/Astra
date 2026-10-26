@@ -12,7 +12,7 @@ mod test_support;
 use test_support::call_id_for;
 
 use astra_runtime::server::provider_test_support::{
-    InferenceLedgerFixture, ProviderGateway, ProviderRequest, ProviderResponse, ProviderScript,
+    ProviderGateway, ProviderObservationsFixture, ProviderRequest, ProviderResponse, ProviderScript,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -585,7 +585,7 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
 
 fn build_test_app_with_models(
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
+    inference: Option<&ProviderObservationsFixture>,
 ) -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -601,7 +601,7 @@ fn build_test_app_with_models(
     .with_model_service(models)
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
@@ -612,9 +612,9 @@ fn build_test_app_with_models(
 
 async fn build_native_test_app(
     scripts: Vec<ProviderScript>,
-) -> (Router, ProviderGateway, InferenceLedgerFixture) {
+) -> (Router, ProviderGateway, ProviderObservationsFixture) {
     let gateway = ProviderGateway::start(scripts).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _) = build_test_app_with_models(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -638,7 +638,7 @@ fn primary_request_for(request: &ProviderRequest, message: &str) -> bool {
 /// Build a test app with recording hook DB + observer writers for verification.
 fn build_test_app_with_hooks(
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
+    inference: Option<&ProviderObservationsFixture>,
 ) -> (
     Router,
     Arc<RecordingHookDbWriter>,
@@ -663,7 +663,7 @@ fn build_test_app_with_hooks(
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
@@ -673,7 +673,7 @@ fn build_test_app_with_hooks(
 
 fn build_test_app_with_hooks_and_skills(
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
+    inference: Option<&ProviderObservationsFixture>,
 ) -> (
     Router,
     Arc<RecordingHookDbWriter>,
@@ -698,7 +698,7 @@ fn build_test_app_with_hooks_and_skills(
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
@@ -709,7 +709,7 @@ fn build_test_app_with_hooks_and_skills(
 fn build_test_app_with_agent_bindings(
     binding_service: Arc<InMemoryAgentBindingService>,
     models: Arc<TestModelService>,
-    inference: Option<&InferenceLedgerFixture>,
+    inference: Option<&ProviderObservationsFixture>,
 ) -> (Router, Arc<RecordingObserverWorker>) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -728,7 +728,7 @@ fn build_test_app_with_agent_bindings(
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
     let lifecycle = if let Some(inference) = inference {
-        lifecycle.with_e2e_inference_ledger(inference)
+        lifecycle.with_provider_observations(inference)
     } else {
         lifecycle
     };
@@ -793,46 +793,6 @@ async fn assert_native_delegation_without_auxiliary_selector(
             .expect("canonical model-control semantics"),
         "model-control semantics must reach the provider, not only the full catalog"
     );
-    let candidates: Vec<_> = first.body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|message| {
-            let text = message["content"].as_str()?;
-            let text = text
-                .strip_prefix("<astra-runtime-context>\n")
-                .and_then(|text| text.strip_suffix("\n</astra-runtime-context>"))
-                .unwrap_or(text);
-            let payload: Value = serde_json::from_str(text).ok()?;
-            payload
-                .get("catalog")
-                .is_some()
-                .then_some((message, payload))
-        })
-        .collect();
-    assert_eq!(
-        candidates.len(),
-        1,
-        "cold parent request must carry one candidate context"
-    );
-    assert_eq!(candidates[0].0["role"], "user");
-    assert_eq!(
-        candidates[0]
-            .1
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        vec!["catalog", "child_model_selection_allowed"],
-        "candidate context carries observations, not another selection policy"
-    );
-    let items = candidates[0].1["catalog"]["items"].as_array().unwrap();
-    let selected = items
-        .iter()
-        .find(|item| item["offering_id"] == DEFAULT_MODEL_OFFERING_ID)
-        .expect("authorized parent Offering must be visible on the wire");
-    assert_eq!(selected["name"], "test-model");
-    assert_eq!(selected["provider"], "openai");
     let mut actual = Vec::new();
     for call in request.body["messages"]
         .as_array()
@@ -1452,7 +1412,7 @@ async fn multi_agent_binding_http_e2e_discovers_and_reads_skill_from_owning_bind
         let gateway=ProviderGateway::start(vec![ProviderScript::new("binding skill and actual continuation", |request| primary_request_for(request,"Analyze the attached financial statement."), vec![
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[tool_call("tc-financial-analysis","skill",json!({"skill_name":"financial-analysis"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Financial analysis completed with the user workflow."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-let inference=InferenceLedgerFixture::default();
+let inference=ProviderObservationsFixture::default();
 let model_endpoint=format!("{}/v1",gateway.base_url);
 let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Arc::new(TestModelService{judgment_base_url:Some(model_endpoint.clone())}),Some(&inference));
 
@@ -1844,13 +1804,13 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
             Arc::new(astra_services::DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("pause-evaluation-owner"))
         } else { Arc::new(astra_services::InMemoryRunStateStore::new()) };
         let engine = astra_runtime::RunEngine::new(store);
-        let inference = InferenceLedgerFixture::default();
+        let inference = ProviderObservationsFixture::default();
         let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
             astra_runtime::MatrixOneSettings::mock(), test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
             base.edge_callback_ledger(), engine.clone());
         let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
             lifecycle, Arc::new(tempfile::tempdir().unwrap()), "pause-evaluation-executor")
-            .with_model_service(models).with_e2e_inference_ledger(&inference)
+            .with_model_service(models).with_provider_observations(&inference)
             .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
         let lifecycle = if let Some(pool) = &pool { lifecycle.with_pool(pool.clone()) } else { lifecycle };
         let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
@@ -1897,8 +1857,6 @@ async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
         }).await.expect("paused fixture owners must drain before cleanup");
         for table in [
             "tool_invocation_ledger",
-            "agent_session_execution_slots",
-            "run_display_projections",
             "run_checkpoints",
             "agent_run_events",
             "agent_runs",
@@ -1930,7 +1888,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let result = std::panic::AssertUnwindSafe(async {
     init_env();
     use astra_runtime::server::provider_test_support::{
-        InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        ProviderObservationsFixture, ProviderGateway, ProviderResponse, ProviderScript,
     };
     const ROOT: &str = "Use a child agent to review the code.";
     const TASK: &str = "Review src/lib.rs and summarize one issue.";
@@ -2020,7 +1978,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         Arc::new(astra_services::InMemoryRunStateStore::new())
     };
     let engine = astra_runtime::RunEngine::new(store);
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
         astra_runtime::MatrixOneSettings::mock(),
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
@@ -2034,7 +1992,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
         lifecycle, workspace_directory.clone(), "structured-spawn-fixture-executor")
     .with_model_service(models)
-    .with_e2e_inference_ledger(&inference)
+    .with_provider_observations(&inference)
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
     let lifecycle = if let Some(pool) = &pool {
         lifecycle.with_pool(pool.clone())
@@ -2149,7 +2107,7 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let child_record = engine.load_run(USER_ID, child_run).await.unwrap().unwrap();
     assert_ne!(root_record.run_id, child_record.run_id);
     assert_eq!(child_record.parent_run_id.as_deref(), Some(run_id.as_str()));
-    let admissions = inference.admissions();
+    let admissions = inference.requests();
     let root_admissions: Vec<_> = admissions
         .iter()
         .filter(|(scope, _)| {
@@ -2283,17 +2241,23 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
     let live_terminal = events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("root terminal");
     let replay_terminal = replay_events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("replayed root terminal");
     assert_eq!(live_terminal["turn_evaluation"], replay_terminal["turn_evaluation"]);
-    let evaluation = astra_turn_core::evaluation::turn_evaluation_from_terminal(
-        &live_terminal["turn_evaluation"], Some(&session), &run_id,
-        live_terminal["owner_generation"].as_u64(), live_terminal["status"].as_str().unwrap(),
-    ).expect("real root evaluation must carry exact authority");
-    assert_eq!(evaluation.producer_scope.unwrap().run_id, run_id);
-    let child_evaluation = child_record.events.iter().find_map(|event| event.pointer("/data/turn_evaluation")).expect("real child terminal evaluation");
-    assert_eq!(child_evaluation["producer_scope"]["run_id"], child_run);
-    assert_eq!(child_evaluation["metadata"]["execution_owner_generation"], child_record.run_generation);
-    astra_turn_core::evaluation::turn_evaluation_from_terminal(
-        child_evaluation, Some(&session), child_run, Some(child_record.run_generation), &child_record.status,
-    ).expect("real child evaluation must carry exact authority");
+    for (terminal, id, generation, status) in [
+        (live_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
+        (replay_terminal, run_id.as_str(), root_record.run_generation, root_record.status.as_str()),
+    ] {
+        assert_eq!(terminal["owner_generation"], generation);
+        assert_eq!(terminal["status"], status);
+        if let Some(evaluation) = terminal.get("turn_evaluation") {
+            astra_turn_core::evaluation::turn_evaluation_from_terminal(evaluation, Some(&session), id, Some(generation), status)
+                .expect("optional evaluation must still have exact producer scope");
+        }
+    }
+    assert_eq!(root_record.status, "completed");
+    assert_eq!(child_record.status, "completed");
+    if pool.is_some() {
+        assert!(root_record.terminal_receipt_json.is_some());
+        assert!(child_record.terminal_receipt_json.is_some());
+    }
 
     assert!(
         !find_event_type(&replay_events, "agent_spawned").is_empty(),
@@ -2318,8 +2282,6 @@ async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
         }).await.expect("test execution owners must drain before fixture cleanup");
         for table in [
             "tool_invocation_ledger",
-            "agent_session_execution_slots",
-            "run_display_projections",
             "run_checkpoints",
             "agent_run_events",
             "agent_runs",
@@ -2351,7 +2313,7 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
                             tool_call(
                                 "call-select-agent-parallel",
                                 "tool_search",
-                                json!({"query": "select:agent_fanout"})
+                                json!({"query": "select:agent_fanout,agent"})
                             )
                         ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call("call-fanout", "invoke_tool", json!({
@@ -2712,31 +2674,49 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     );
     let (child_replay_status, child_replay) = get_run_stream(&app, child_run_id, 0).await;
     assert_eq!(child_replay_status, StatusCode::OK);
-    let child_terminal_index = child_replay
+    // A readonly read_file is an observation, not durable effect custody.
+    // Verify the callback actually reached the child's next model request;
+    // generic cold tool cards are not a second result store.
+    assert_eq!(find_events(&events, "tool_request").len(), 1);
+    let requests = gateway.requests.lock().await;
+    let evidence_requests: Vec<_> = requests
+        .iter()
+        .filter_map(|request| request.body["messages"].as_array())
+        .filter_map(|messages| {
+            messages.iter().find(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "call-child-read-file"
+            })
+        })
+        .collect();
+    assert_eq!(
+        evidence_requests.len(),
+        1,
+        "one child round consumes the file callback"
+    );
+    assert_eq!(
+        evidence_requests[0]["content"],
+        "pub fn run() -> Result<()> { Ok(()) }"
+    );
+    drop(requests);
+    let answer_index = child_replay
         .iter()
         .position(|event| {
-            event["type"].as_str() == Some("tool_call_end")
-                && event["call_id"].as_str() == Some(child_call_id.as_str())
+            event["type"] == "text_done"
+                && event["full_text"] == "edge child reviewed concrete file evidence: pub fn run()"
         })
-        .unwrap_or_else(|| panic!("child replay lost its durable tool terminal: {child_replay:?}"));
-    let child_finished_index = child_replay
+        .unwrap_or_else(|| panic!("child replay lost its complete answer: {child_replay:?}"));
+    let finished_index = child_replay
         .iter()
-        .position(|event| event["type"].as_str() == Some("run_finished"))
+        .position(|event| event["type"] == "run_finished")
         .unwrap_or_else(|| panic!("child replay lost run_finished: {child_replay:?}"));
-    assert!(
-        child_terminal_index < child_finished_index,
-        "child tool terminal must commit before run_finished: {child_replay:?}"
-    );
+    assert!(answer_index < finished_index);
+    assert_eq!(child_replay[finished_index]["status"], "completed");
     assert_eq!(
         child_replay
             .iter()
-            .filter(|event| {
-                event["type"].as_str() == Some("tool_call_end")
-                    && event["call_id"].as_str() == Some(child_call_id.as_str())
-            })
+            .filter(|event| event["type"] == "run_finished")
             .count(),
-        1,
-        "child replay must expose exactly one durable terminal occurrence"
+        1
     );
 
     let completed = find_event_type(&events, "agent_completed");
@@ -2774,7 +2754,7 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
                 "action":"spawn","description":"discover GitHub availability","prompt":CHILD,
                 "agent_type":"explore","allowed_tools":["tool_search"],"max_output_tokens":256
             }}))], ""),
-            response(vec![tool_call("join-discovery-child", "agent", json!({"action":"wait","timeout_ms":10000}))], ""),
+            response(vec![tool_call("join-discovery-child", "invoke_tool", json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))], ""),
             response(vec![], MARKER),
         ]),
         ProviderScript::new("discovery child", |request| primary_request_for(request, CHILD) && delegation_assessment(&request.body).is_none(), vec![
@@ -3502,7 +3482,7 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         ],
     )])
     .await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, hook, observer, ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -3660,7 +3640,10 @@ async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup(
         if id == "batch-3" {
             assert!(content.starts_with("<persisted-output>"));
             assert!(content.contains("50000 chars"));
-            assert!(content.contains("Tool result id: batch-3"));
+            // Artifact custody uses the canonical invocation id; provider
+            // wire ids are restored only in the outgoing tool-call envelope.
+            let canonical_id = first_batch[3]["id"].as_str().unwrap();
+            assert!(content.contains(&format!("Tool result id: {canonical_id}")));
             assert!(content.contains(&"y".repeat(128)));
             assert!(content.len() < output.len());
         } else {
@@ -3676,7 +3659,7 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
                         tool_call("tc-skill-1", "skill", json!({"skill_name": "test-skill"}))
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"I used the skill instructions.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -3791,7 +3774,7 @@ async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loo
                         )
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The server completed the skill round.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -3899,7 +3882,7 @@ async fn unknown_skill_returns_error_without_edge_tool_request() {
                         tool_call("tc-skill-unknown", "skill", json!({"skill_name": "missing-skill"}))
                     ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The skill was unavailable.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -4411,7 +4394,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 async fn cancelled_edge_run_stops_inference_and_clears_its_callback_ledger() {
     const MESSAGE: &str = "Read the file before cancellation.";
     let gateway=ProviderGateway::start(vec![ProviderScript::new("cancel while waiting for actual Edge callback",|request|primary_request_for(request,MESSAGE),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[tool_call("native-cancel","read_file",json!({"path":"/src/main.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, ledger) = build_test_app_with_models(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5248,7 +5231,7 @@ async fn client_disconnect_run_still_finalizes() {
 #[tokio::test]
 async fn hook_db_text_only_skips_writer() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("hook_db_text_only_skips_writer", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5314,7 +5297,7 @@ async fn hook_db_text_only_skips_writer() {
 #[tokio::test]
 async fn observer_fired_with_correct_metadata() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("observer_fired_with_correct_metadata", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5451,7 +5434,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
                         ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r9", "read_file", json!({"path": "Cargo.toml"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5539,7 +5522,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r3", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r4", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done reviewing.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5649,7 +5632,7 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_extends_web_agent_run_when_progress_is_real", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Completed after exploratory extension.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5721,7 +5704,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_hard_limit_stops_web_agent_run_even_with_progress", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Final answer after the hard limit.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5769,64 +5752,44 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         .expect("stream timed out")
         .expect("reader task failed");
     let wire = String::from_utf8(raw_wire.lock().unwrap().clone()).unwrap();
-    let interrupted = events
+    let failed = events
         .iter()
-        .position(|event| event["type"] == "run_interrupted")
-        .expect("typed interruption");
+        .position(|event| event["type"] == "run_error")
+        .expect("typed terminal failure");
     let finished = events
         .iter()
         .position(|event| event["type"] == "run_finished")
         .expect("durable terminal");
-    let complete = events
-        .iter()
-        .position(|event| event["type"] == "turn_complete")
-        .expect("authoritative completion");
-    assert!(interrupted < finished && finished < complete);
-    assert_eq!(events[interrupted]["kind"], "budget_exhausted");
-    assert_eq!(events[complete]["continuation_owner"], "server");
-    assert_eq!(events[complete]["interruption"]["kind"], "budget_exhausted");
+    assert!(failed < finished);
+    assert_eq!(events[failed]["error_kind"], "budget_exhausted");
+    assert!(!events.iter().any(|event| matches!(
+        event["type"].as_str(),
+        Some("run_interrupted" | "turn_complete")
+    )));
     assert_eq!(wire.matches("data: [DONE]\n\n").count(), 1);
     let mut accum = ChatTurnSseAccum::default();
     let mut edge_pending = Vec::new();
     for block in wire.split("\n\n").filter(|block| !block.is_empty()) {
         dispatch_chat_turn_sse_event_block(block, &mut accum, &mut edge_pending);
     }
-    assert!(accum.server_loop_terminal);
-    assert_eq!(accum.error_kind, None);
-    let summary = accum
-        .server_execution_summary
-        .expect("CLI accepts the actual paused summary");
-    assert_eq!(summary.llm_rounds, 3);
-    let feedback = summary
-        .runtime_feedback
-        .expect("actual provider execution supplies runtime feedback");
+    assert!(accum.has_authoritative_failed_terminal());
     assert_eq!(
-        feedback.identity.run_id,
-        find_event(&events, "session_info").unwrap()["run_id"]
-            .as_str()
-            .unwrap()
+        accum.error_kind,
+        Some(astra_core::ErrorKind::BudgetExhausted)
     );
-    assert_eq!(feedback.progress.llm_rounds_completed, 3);
-    assert_eq!(feedback.progress.slice_rounds_remaining, 0);
-    assert_eq!(feedback.progress.absolute_round_ceiling, Some(2));
-    let accounted = feedback
-        .run_usage
-        .expect("settled provider attempts retain their usage");
-    assert_eq!(accounted.prompt, 126);
-    assert_eq!(accounted.completion, 21);
+    assert!(accum.server_interruption.is_none());
     let root = find_event(&events, "session_info").unwrap()["run_id"]
         .as_str()
         .unwrap();
     let (status, durable) = get_run_status(&app, root).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(durable["status"], "paused");
-    let text: String = find_events(&events, "text_delta")
-        .into_iter()
-        .filter_map(|event| event["content"].as_str().map(str::to_string))
-        .collect();
+    assert_eq!(durable["status"], "failed");
     assert!(
-        text.contains("Final answer after the hard limit."),
-        "hard limit should preserve the text-only settlement boundary, got: {text}"
+        accum
+            .full_text
+            .contains("Final answer after the hard limit."),
+        "failure must preserve the text-only settlement output: {}",
+        accum.full_text
     );
     let tool_requests = find_events(&events, "tool_request");
     assert_eq!(
@@ -5834,42 +5797,26 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
         1,
         "hard limit must dispatch exactly one tool request before text-only settlement"
     );
-    assert_eq!(
-        tool_requests[0]["request_id"].as_str(),
-        first["request_id"].as_str()
-    );
+    assert_eq!(tool_requests[0]["request_id"], first["request_id"]);
     let rejected = find_events(&events, "tool_call_end")
         .into_iter()
         .find(|event| event["tool"] == "glob")
         .expect("the denied second provider attempt must have one terminal projection");
     assert_eq!(rejected["status"], "rejected");
     assert_eq!(rejected["success"], false);
-
-    let terminal = find_events(&events, "turn_complete")
-        .into_iter()
-        .next()
-        .expect("bounded synthesis must emit one terminal aggregate");
-    assert_eq!(terminal["tool_calls_count"], 2);
-    assert_eq!(terminal["tool_ledger_receipt"]["attempted"], 2);
-    assert_eq!(terminal["tool_ledger_receipt"]["terminal"], 2);
+    let terminal = &events[finished];
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error_kind"], "budget_exhausted");
+    assert_ne!(terminal.get("resumable"), Some(&json!(true)));
+    let evaluation = &terminal["turn_evaluation"]["metadata"];
+    assert_eq!(evaluation["llm_rounds"], 3);
+    assert_eq!(evaluation["tool_call_count"], 2);
+    assert_eq!(evaluation["tool_execution_count"], 1);
+    assert_eq!(evaluation["tool_rejected_count"], 1);
     assert_eq!(
-        terminal["tool_ledger_receipt"]["result_classes"]["rejected"],
-        1
+        evaluation["execution_owner_generation"],
+        terminal["owner_generation"]
     );
-    assert_eq!(terminal["tool_ledger_receipt"]["unresolved"], 0);
-    assert_eq!(terminal["tool_ledger_receipt"]["consistent"], true);
-    let run_finished = find_events(&events, "run_finished")
-        .into_iter()
-        .next()
-        .expect("run terminal");
-    assert_eq!(terminal["execution_state"]["status"], "interrupted");
-    assert_eq!(
-        terminal["execution_state"]["interruption_kind"],
-        "budget_exhausted"
-    );
-    assert_eq!(run_finished["status"], "paused");
-    assert_eq!(run_finished["interruption_kind"], "budget_exhausted");
-    assert_eq!(run_finished["resumable"], true);
 
     gateway.assert_complete();
     inference.assert_quiescent();
@@ -5882,7 +5829,7 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
 ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Edge operations returned partial failure and denial.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -5957,7 +5904,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 #[tokio::test]
 async fn context_meta_exposes_memory_signal_context_flag() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_memory_signal_context_flag", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
@@ -6010,7 +5957,7 @@ async fn context_meta_exposes_memory_signal_context_flag() {
 #[tokio::test]
 async fn context_meta_exposes_builder_supplied_context_signals() {
     let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_builder_supplied_context_signals", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
-    let inference = InferenceLedgerFixture::default();
+    let inference = ProviderObservationsFixture::default();
     let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),

@@ -806,7 +806,7 @@ pub(crate) enum SessionCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct SessionJudgeArgs {
-    /// JudgmentRequest JSON with shared evidence and typed questions (no agent task)
+    /// JudgmentRequest JSON with shared evidence and typed questions; use - to read stdin
     #[arg(short, long)]
     pub message: String,
     /// Active Server model selector

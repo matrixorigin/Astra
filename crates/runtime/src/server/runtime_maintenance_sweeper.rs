@@ -59,8 +59,6 @@ pub(crate) fn spawn_runtime_maintenance_sweeper(
                         expired_fork_pins_released = result.expired_fork_pins_released,
                         orphaned_forks_collected = result.orphaned_forks_collected,
                         orphaned_manifests_collected = result.orphaned_manifests_collected,
-                        orphaned_manifest_references_collected = result.orphaned_manifest_references_collected,
-                        unreferenced_segments_collected = result.unreferenced_segments_collected,
                         cleanup_error_count = result.cleanup_errors.len(),
                         "runtime storage maintenance sweep"
                     );

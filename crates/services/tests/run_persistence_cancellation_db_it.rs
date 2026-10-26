@@ -85,7 +85,6 @@ async fn hold_pool_checkouts(
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for statement in [
-        "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
     ] {

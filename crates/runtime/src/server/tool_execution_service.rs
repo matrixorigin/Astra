@@ -542,6 +542,86 @@ impl ToolExecutionService {
         )
     }
 
+    /// Resolve only the registered builtin implementation selected by the
+    /// canonical provider binding. Names, caller effect fields, and a local-
+    /// looking route cannot turn a provider or Runner call into an observation.
+    fn selected_builtin_spec<'a>(
+        &'a self,
+        request: &ToolExecutionRequest,
+    ) -> Option<&'a astra_runtime_env::ToolSpec> {
+        use std::sync::LazyLock;
+        static BUILTINS: LazyLock<astra_runtime_env::ToolRegistry> =
+            LazyLock::new(astra_runtime_env::ToolRegistry::builtins);
+        if request.policy.resolved_provider_policy.is_some()
+            || request.policy.delegation_model_admission.is_some()
+            || request.runtime_process_authorization_required
+            || request.runtime_process_authorization.is_some()
+            || request.runtime_edge_dispatch_authorization_required
+            || request.runtime_edge_dispatch_authorization.is_some()
+        {
+            return None;
+        }
+        let route = self.routing_decision(request);
+        let provider_id = match route {
+            ToolExecutionRouteKind::ServerControlPlane => "server-control-plane".to_owned(),
+            ToolExecutionRouteKind::ServerLocal | ToolExecutionRouteKind::ServerRuntime => {
+                super::tool_execution_binding::runtime_execution_provider_id_for_executor(
+                    &request.executor,
+                )
+            }
+            _ => return None,
+        };
+        let selected = request.selected_offer.as_ref()?;
+        if selected.provider_id != provider_id || selected.route != route {
+            return None;
+        }
+        let spec = self.tool_registry.get(&request.tool_name)?;
+        (BUILTINS.get(&request.tool_name) == Some(spec)).then_some(spec)
+    }
+
+    pub(crate) fn builtin_agent_invocation_semantics(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Result<Option<astra_turn_types::agent_tool_contract::AgentInvocationSemantics>, String>
+    {
+        let Some(spec) = self.selected_builtin_spec(request) else {
+            return Ok(None);
+        };
+        if self.routing_decision(request) != ToolExecutionRouteKind::ServerControlPlane
+            || spec.required != astra_runtime_env::ToolRequirements::control_plane()
+            || !spec.is_read_only_execution_capability()
+        {
+            return Ok(None);
+        }
+        astra_turn_types::agent_tool_contract::agent_invocation_semantics(
+            &request.tool_name,
+            &request.args,
+        )
+    }
+
+    pub(crate) fn is_run_observation(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Result<bool, astra_tools::ToolResult> {
+        let Some(spec) = self.selected_builtin_spec(request) else {
+            return Ok(false);
+        };
+        let semantics = self.builtin_agent_invocation_semantics(request);
+        if spec.is_run_observation() || !matches!(semantics, Ok(None)) {
+            // Reuse the execution schema owner and its structured recovery
+            // evidence before granting the observation exemption. Invalid
+            // builtin calls create neither invocation custody nor effects.
+            astra_tools::schemas::validate_tool_arguments(&request.tool_name, &request.args)
+                .map_err(|error| error.into_tool_result())?;
+        }
+        // The schema and action parser share the canonical action contract.
+        // A disagreement remains governed; it can never grant an exemption.
+        Ok(semantics.ok().flatten().map_or_else(
+            || spec.is_run_observation(),
+            |semantics| semantics.run_observation,
+        ))
+    }
+
     pub(crate) fn cancelled_before_route_result(
         &self,
         request: &ToolExecutionRequest,
@@ -1182,6 +1262,76 @@ fn no_workspace() -> WorkspaceBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_requires_the_selected_builtin_and_canonical_action() {
+        use super::super::tool_execution_binding::{
+            ExecutionBindingState, SelectedToolOfferSnapshot,
+        };
+        let service = ToolExecutionService::new_for_test();
+        let mut request = ExecutionBindingState::none().tool_execution_request(
+            "owner",
+            "session",
+            "agent",
+            &serde_json::json!({"action":"list"}),
+        );
+        assert!(
+            !service.is_run_observation(&request).unwrap(),
+            "a name without implementation provenance is insufficient"
+        );
+        request.selected_offer = Some(SelectedToolOfferSnapshot::new_with_route(
+            "agent",
+            "server-control-plane",
+            ToolExecutionRouteKind::ServerControlPlane,
+        ));
+        assert!(service.is_run_observation(&request).unwrap());
+        assert!(
+            !service
+                .builtin_agent_invocation_semantics(&request)
+                .unwrap()
+                .unwrap()
+                .receive_inbox
+        );
+        for action in astra_turn_types::agent_tool_contract::AGENT_ACTIONS {
+            request.args = serde_json::json!({"action":action});
+            let semantics = service
+                .builtin_agent_invocation_semantics(&request)
+                .unwrap()
+                .unwrap();
+            assert_eq!(semantics.run_observation, *action == "list");
+            assert_eq!(semantics.receive_inbox, *action != "list");
+        }
+        request.args = serde_json::json!({"action":"unknown"});
+        assert!(service.is_run_observation(&request).is_err());
+        request.args = serde_json::json!({"action":"list","_parse_error":"broken"});
+        assert!(service.is_run_observation(&request).is_err());
+        request.args = serde_json::json!({"action":"list"});
+        request.selected_offer.as_mut().unwrap().provider_id = "mcp:lookalike".into();
+        assert!(
+            !service.is_run_observation(&request).unwrap(),
+            "a provider cannot borrow builtin semantics through local-looking routing"
+        );
+        request.selected_offer.as_mut().unwrap().provider_id = "server-control-plane".into();
+        request.runtime_edge_dispatch_authorization_required = true;
+        assert!(
+            !service.is_run_observation(&request).unwrap(),
+            "Runner custody cannot become local observation"
+        );
+        request.runtime_edge_dispatch_authorization_required = false;
+        let mut forged = astra_runtime_env::ToolRegistry::builtins()
+            .get("agent")
+            .unwrap()
+            .clone();
+        forged.run_observation = true;
+        forged.effect.spawns_process = true;
+        let forged_service = ToolExecutionService::builder()
+            .tool_registry(astra_runtime_env::ToolRegistry::new(vec![forged]))
+            .build();
+        assert!(
+            !forged_service.is_run_observation(&request).unwrap(),
+            "effect metadata cannot grant observation provenance"
+        );
+    }
 
     #[tokio::test]
     async fn disabled_tool_offers_are_offer_ids_with_idempotent_updates() {

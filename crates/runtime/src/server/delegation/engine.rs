@@ -2475,6 +2475,7 @@ impl DelegationEngine {
         delegation_id: &str,
         agent_id: &str,
         retry_of: Option<&str>,
+        original_input: &str,
         interaction_mode: RequestedTurnInteractionMode,
         request_constraints: &RequestConstraints,
         execution_restrictions: astra_services::runs::DurableExecutionRestrictions,
@@ -2507,6 +2508,7 @@ impl DelegationEngine {
                 Some(agent_id),
                 retry_of,
                 crate::server::run::engine::RunStartContext {
+                    original_input: Some(original_input.to_owned()),
                     interaction_mode,
                     execution_restrictions: Some(execution_restrictions),
                     execution_metadata: execution_metadata
@@ -3620,6 +3622,17 @@ impl DelegationEngine {
                 break;
             }
             let sub_run_id = uuid::Uuid::new_v4().to_string();
+            // Inject coordination prompt into task.
+            let coordination_prompt = coordination_prompts::fan_out_agent_prompt(
+                &agent_id,
+                &agent_id_strs,
+                aggregation_name,
+            );
+            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
+                &coordination_prompt,
+                &request.task,
+            );
+
             let delegation_authority = DelegationAuthority::Allowed;
             let execution_authority = match self
                 .start_delegated_run(
@@ -3630,6 +3643,7 @@ impl DelegationEngine {
                     &request.delegation_id,
                     &agent_id,
                     None,
+                    &enhanced_task,
                     interaction_mode,
                     &slot_constraints,
                     slot_constraints.durable_execution_restrictions(
@@ -3745,17 +3759,6 @@ impl DelegationEngine {
                 .get_mut(&sub_run_id)
                 .expect("admitted child generation")
                 .1 = MailboxRetirement::from_mailbox(&self.mailbox_router, mailbox.as_ref());
-
-            // Inject coordination prompt into task.
-            let coordination_prompt = coordination_prompts::fan_out_agent_prompt(
-                &agent_id,
-                &agent_id_strs,
-                aggregation_name,
-            );
-            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
-                &coordination_prompt,
-                &request.task,
-            );
 
             let inherited_prefix = prepared_model.as_ref().and_then(|model| {
                 self.resolve_inherited_prefix_for_delegate(
@@ -4008,6 +4011,20 @@ impl DelegationEngine {
                 }
             };
 
+            // Inject sequential coordination prompt
+            let has_prev = previous_output.is_some();
+            let coordination_prompt = coordination_prompts::sequential_stage_prompt(
+                stage_index,
+                total_stages,
+                agent_id,
+                has_prev,
+                stop_on_success,
+            );
+            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
+                &coordination_prompt,
+                &request.task,
+            );
+
             let delegation_authority = DelegationAuthority::Allowed;
             let execution_authority = match self
                 .start_delegated_run(
@@ -4018,6 +4035,7 @@ impl DelegationEngine {
                     &request.delegation_id,
                     agent_id,
                     None,
+                    &enhanced_task,
                     interaction_mode,
                     &slot_constraints,
                     slot_constraints.durable_execution_restrictions(
@@ -4173,20 +4191,6 @@ impl DelegationEngine {
             } else {
                 None
             };
-
-            // Inject sequential coordination prompt
-            let has_prev = previous_output.is_some();
-            let coordination_prompt = coordination_prompts::sequential_stage_prompt(
-                stage_index,
-                total_stages,
-                agent_id,
-                has_prev,
-                stop_on_success,
-            );
-            let enhanced_task = coordination_prompts::wrap_task_with_coordination(
-                &coordination_prompt,
-                &request.task,
-            );
 
             let config = SubRunConfig {
                 execution_contract: Some(execution_contract.clone()),
@@ -4384,6 +4388,12 @@ impl DelegationEngine {
                 break;
             }
             let run_id = uuid::Uuid::new_v4().to_string();
+            let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
+            let fork_coordination =
+                coordination_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx);
+            let fork_task =
+                coordination_prompts::wrap_task_with_coordination(&fork_coordination, task);
+
             let execution_authority = match self
                 .start_delegated_run(
                     &run_id,
@@ -4393,6 +4403,7 @@ impl DelegationEngine {
                     &request.delegation_id,
                     agent_id,
                     None,
+                    &fork_task,
                     interaction_mode,
                     &request_constraints,
                     request_constraints.durable_execution_restrictions(
@@ -4549,12 +4560,6 @@ impl DelegationEngine {
                 ),
             );
             fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
-
-            let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
-            let fork_coordination =
-                coordination_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx);
-            let fork_task =
-                coordination_prompts::wrap_task_with_coordination(&fork_coordination, task);
 
             let mut fork_profile = profile.clone();
             fork_profile.can_delegate = false;
@@ -5374,6 +5379,7 @@ mod tests {
                 &request.delegation_id,
                 "coder",
                 None,
+                "unlaunched task",
                 RequestedTurnInteractionMode::Auto,
                 &RequestConstraints::default(),
                 RequestConstraints::default().durable_execution_restrictions(None, None),
@@ -5749,6 +5755,7 @@ mod tests {
                 "delegation",
                 "reviewer",
                 None,
+                "child task",
                 RequestedTurnInteractionMode::Auto,
                 &constraints,
                 restrictions.clone(),
@@ -5762,6 +5769,12 @@ mod tests {
             .await
             .unwrap();
         let child = run_engine.load_run("user", "child").await.unwrap().unwrap();
+        let input = child.opening.as_ref().unwrap().input().unwrap();
+        assert_eq!(input.original_input, "child task");
+        assert!(
+            input.context_authority.is_none(),
+            "a child input is not a Root Context grant"
+        );
         assert_eq!(child.execution_restrictions().unwrap(), Some(restrictions));
         assert_eq!(
             crate::server::run::engine::durable_run_delegated_model_requirements(&child).unwrap(),
@@ -9753,6 +9766,10 @@ mod tests {
 
         let records = vec![
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
                 run_id: "sub-1".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9790,6 +9807,10 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
                 run_id: "sub-2".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9827,6 +9848,10 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
                 run_id: "sub-3".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),
@@ -9865,6 +9890,10 @@ mod tests {
             },
             // Root run — should be skipped
             DurableRunRecord {
+                opening: None,
+                opening_hash: None,
+                context_admission_hash: None,
+                terminal_receipt_json: None,
                 run_id: "root-run".into(),
                 user_id: "u1".into(),
                 session_id: "s1".into(),

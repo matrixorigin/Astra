@@ -478,11 +478,9 @@ function applyRunFinished(
 ): WorkSurfaceState {
   const status = stringField(event, "status") ?? "completed";
   const timestamp = timestampFromEvent(event);
-  const tools = state.tools.map((tool) =>
-    tool.status === "running"
-      ? finalizeRunningToolForRunStatus(tool, status, event, timestamp)
-      : tool,
-  );
+  // A Run terminal is not evidence of a tool outcome. Optional live cards
+  // without their own ending disappear rather than implying execution success.
+  const tools = state.tools.filter((tool) => tool.status !== "running");
   const agents = state.agents.map((agent) =>
     isAgentSurfaceActive(agent.status)
       ? finalizeActiveAgentForRunStatus(agent, status, event, timestamp)
@@ -1280,48 +1278,6 @@ function agentProgressDetail(agent: AgentSurfaceItem) {
 
 function isAgentSurfaceActive(status: string) {
   return ACTIVE_AGENT_SURFACE_STATUSES.has(status);
-}
-
-function finalizeRunningToolForRunStatus(
-  tool: ToolSurfaceItem,
-  runStatus: string,
-  event: Record<string, unknown>,
-  timestamp: number,
-): ToolSurfaceItem {
-  if (runStatus === "completed") {
-    return {
-      ...tool,
-      status: "done",
-      result:
-        tool.result ??
-        "Run completed before this tool emitted a final transport result.",
-      finishedAt: tool.finishedAt ?? timestamp,
-    };
-  }
-  if (runStatus === "paused" || runStatus === "interrupted") {
-    return {
-      ...tool,
-      status: "skipped",
-      errorKind: tool.errorKind,
-      result: tool.result ?? defaultRunPausedToolMessage(),
-      finishedAt: tool.finishedAt ?? timestamp,
-    };
-  }
-  const errorKind =
-    runStatus === "cancelled"
-      ? "cancelled"
-      : (stringField(event, "error_kind") ?? runStatus);
-  return {
-    ...tool,
-    status: runStatus === "cancelled" ? "cancelled" : "error",
-    errorKind: tool.errorKind ?? errorKind,
-    result:
-      tool.result ??
-      stringField(event, "error") ??
-      stringField(event, "message") ??
-      defaultRunFinishedToolMessage(runStatus),
-    finishedAt: tool.finishedAt ?? timestamp,
-  };
 }
 
 function finalizeActiveAgentForRunStatus(

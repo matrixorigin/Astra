@@ -9,7 +9,7 @@ prompt: |
   Call `agent` exactly once with:
     action: "spawn"
     description: "Verify bounded child output"
-    prompt: "Reply with the exact text: small-budget-ok. Do not use tools."
+    prompt: "Reply with exactly \"small-budget-ok\" and no surrounding quotes or punctuation. Do not use tools."
     max_output_tokens: 256
 
   Return the child's exact reply. Do not retry and do not use other tools.

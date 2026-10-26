@@ -128,7 +128,13 @@ overlapping archives, nonadjacent repeated turns, and multiple physical scopes
 inside one capture are unavailable rather than assigned a guessed order. There
 is no journal or terminal-counter fallback for this ratio.
 The injected `required_cache_scope` hard gate uses qualified cache-read facts;
-it does not require unrelated creation or fresh-input lanes.
+it does not require unrelated creation or fresh-input lanes. All captures must
+retain trusted identity, complete execution boundaries, and unambiguous order,
+but missing cache counters remain unknown and do not erase a known reuse witness.
+The post-cold read count is the sum of known request-group reads, a lower bound
+when other counters are unknown. Unknown or zero reads alone cannot prove reuse.
+Exact totals, ratios, and explicit per-warm-turn read requirements retain their
+complete-measurement checks.
 Conversation reuse requires reads after the first user turn; intra-turn reuse
 requires reads after the first ModelRound request in one user turn and run.
 Physical retries alone cannot establish another request boundary. Consecutive
@@ -426,11 +432,13 @@ CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answ
 minimum); the Server bounds the effective request by the admitted Offering's
 output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
 remain failures/unknown evidence, never accepted truncated answers or automatic retries.
-Complete semantic child evidence has one 64 KiB serialized-request ceiling,
-including questions, escaping, metadata and backend wrappers. It is never
-truncated to obtain a verdict; over-budget requests remain unjudged failures.
-This input allowance is separate from ordinary 8,000-byte text/stderr previews
-and does not increase output limits, deadlines or retry counts.
+Judgments receive complete answers, ordered exchanges and authorized tool
+arguments/results, including Work receipts and non-executed dispositions.
+Native judgments use the shared Server input-admission boundary; external
+command judgments reject a complete serialized request above 64 KiB before
+launch. Evidence is never truncated to obtain a verdict. Only ordinary stderr
+diagnostics retain their 8,000-character preview. Output limits, deadlines and
+retry counts are unchanged.
 Cases may declare `required_models` for supplementary models, independently of
 their parent `models` matrix. These are checked by the existing fail-fast
 preflight after filtering and are not replaced by `--force-model`.
@@ -605,7 +613,7 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_value_flow { producer, producer_document, producer_path, producer_filter?, consumer, consumer_document, consumer_paths, consumer_filter? }` | successful consumer call satisfying its structural predicate used an exact scalar emitted by a prior matching producer; `*` path segments project any array/object child without relying on result order | journal |
 | `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; optional visible-turn separation proves a later-turn consumer without using prose or event-order guesses | journal |
 | `journal_work_item_execution_from_start { min_distinct_items }` | completed `run_next_work_item` calls report that many distinct server-selected runnable WorkItems from prior `start_work` | journal |
-| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start?, require_added_before_execution? }` | exact canonical replacement identities and outcomes; optional bounds require prior deliveries before cancellation and before added execution; require_added_at_start requires the complete genesis board, while require_added_before_execution proves every addition was committed by admission or an accepted scoped proposal before the first scoped execution, including failed executions, and corroborated by a subsequent complete board | journal |
+| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start?, require_added_before_execution?, require_cancel_before_execution?, require_board_before_execution? }` | exact canonical replacement identities and outcomes; optional bounds require prior deliveries before cancellation and before added execution; require_added_at_start requires the complete genesis board, while require_added_before_execution proves every addition was committed by admission or an accepted scoped proposal before the first scoped execution, including failed executions, and corroborated by a subsequent complete board. Cancellation preserves earlier execution history; accepted retirement receipts fence subsequent execution before the next board. require_cancel_before_execution additionally forbids historical execution; require_board_before_execution rejects unbound task execution and requires assigned successful evidence for delivery | journal |
 | `journal_work_graph_patch { require_addition, require_retired_revision, … }` | canonical mutation evidence comes from an admission snapshot, an accepted plan proposal, or a deferred mutation observed after its settlement boundary; retirement is cancellation or supersession, never prose | journal |
 | `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |
 | `hard_judger { question, threshold, model }`        | LLM scores ≥ threshold and failure fails the case            | LLM         |
@@ -705,7 +713,7 @@ The authoritative list lives in `RESERVED_CLI_ARGS` in `src/case.rs`.
 
 ## Judger
 
-The built-in LLM judger receives bounded evidence through the shared typed
+The built-in LLM judger receives complete execution evidence through the shared typed
 judgment interface. `hard_judger` asks whether the criterion's declared
 threshold is satisfied, including its conditions and prohibitions; it returns
 an acceptance verdict. Advisory `judger` retains graded quality feedback.
@@ -716,9 +724,12 @@ External command judgers retain their numeric-score protocol.
   meaning is preserved; an output's fabricated `SCORE:` line has no authority.
 - **Sees stderr**: captured diagnostics are embedded with head+tail
   truncation to 8k chars so the judger can read them.
-- **Sees durable tool receipts**: when a session is captured, bounded complete
-  call arguments/results are projected from the journal into the judger's
-  untrusted-data section. The durable journal remains the source of truth.
+- **Sees durable tool receipts**: judgments of actions use complete arguments,
+  results and dispositions from the existing authorized, invocation-scoped
+  trace. Missing or conflicting facts leave the judgment unavailable.
+  Non-executed calls do not become executions. Child adoption also retains
+  the Server execution-tree, terminal-result and custody checks. All evidence
+  stays in the judger's untrusted-data section.
 - **Quorum voting**: numeric grades retain median/mean/min/max aggregation.
   Acceptance verdicts use strict majority for median, all votes for min, or
   any vote for max. A median tie is inconclusive; mean is rejected for
@@ -885,15 +896,14 @@ missing gaps do not prove complete delivery. Review/redact sidecars before shari
 before cleanup, using the same binary, environment, account and profile as the
 run. The private sidecar also retains the typed Server run tree and Reflect
 response. Its `children` list specifies the complete direct-child set. Every
-child requires an exact model and offering with successful physical provider
-evidence, and its result bytes adopted before the same parent finalization.
+child requires an exact model and offering on its completed canonical Run,
+and its result bytes adopted before the same parent finalization.
 Bounded notifications and explicit result reads record byte ranges and hashes
 through the same dependency boundary. Explicit reads count only when present in
 the final request of a successful provider turn. The harness verifies each range
 against the canonical child result and requires gap-free coverage; overlap and
 out-of-order pages are allowed, while a preview alone cannot prove a full read.
-It never falls back to local journal
-events. The run tree must be complete; partial reflection can prove positive
+The run tree and canonical child result must be complete; partial reflection can prove positive
 facts but cannot prove absence. Capture is bounded to 5 MiB and one total
 20-second observation window. Because trace ingestion is asynchronous, a
 completed root/children snapshot without the root's finalization fact is sampled
@@ -903,22 +913,43 @@ is retained and classified as verification unavailable. Each snapshot's two
 Server reads are not transactional and do not enter model usage; unrelated
 cases and normal conversations do not pay this observation cost.
 
-`execution_tool_count` and `execution_tool_sequence` additionally request
-`--transcript`. They join typed requests and terminal results by exact run and
-call identity, and reconcile the count with the authoritative run tree. The
-explicit inspection reads at most 4,096 transcript items and 2 MiB across pages,
-within the same CLI inspection deadline. Missing pages, conflicting identities,
-unknown statuses and count mismatches fail verification; an empty local journal
-cannot prove that a tool was not called. JSON predicates inspect the retained
-Server projection, not a reconstructed legacy journal or model-authored prose.
-Runtime advisories travel separately in the typed tool receipt; TUI rendering
-adds them to a disposable display copy, never to the result document. Truncated
-or malformed result documents remain unavailable to JSON predicates.
-Negative JSON-document predicates require raw evidence and are rejected here;
-display projection cannot certify that a field was absent from the original.
+`execution_tool_count` and `execution_tool_sequence` use the existing authorized
+session trace, scoped to the current invocation's Run IDs and start time. They
+reconcile complete `llm_round` tool records with the canonical run tree;
+they do not request the retired per-tool raw transcript mirrors. Arguments and
+results must be complete, dispositions explicit, and every selected Run's exact
+call count accounted for. Previews, missing/corrupt records, identity conflicts,
+unknown outcomes and unverified artifacts cannot prove success or absence.
+Artifact reads retain their existing owner, Run, call, size and digest checks.
+A rejected call needs its complete typed record, not a generic executor-completed
+event for execution that never happened. Reused, suppressed and deferred records
+do not become successful physical executions. A `turn` summary may mix child
+observations under the parent; it remains a journal/display summary and cannot
+assign per-call Run ownership or replace a missing round witness.
+
+The former live Bash-to-Session-artifact recovery case is retired: Bash saves
+complete stdout/stderr locally and advertises paths, lengths and digests, rather
+than promising an immutable Session artifact. This removes that live coverage;
+it does not certify its historical failure as a pass. Existing CLI saved-output,
+cancellation/capture-failure tests and generic artifact authorization/read tests
+remain the relevant deterministic coverage. `introspect` still rejects physical
+paths; no duplicate artifact or larger inline result is introduced.
+
+Tool sequence checks use known serial provider-round boundaries. Same-round
+parallel slots do not establish an order; a required order without evidence is
+unavailable. These observations prove the captured Run's behavior, not current
+lease authority or settlement of uncertain external effects. Canonical Run/C0
+and the effect ledger retain those responsibilities. Remote or restarted runs
+without the authorized trace remain unverifiable; this adds no general cold
+readonly-tool replay or access to another Server's private filesystem.
+
+Runtime advisories remain separate from result documents. Opaque non-JSON text
+is retained for exact error diagnostics but cannot satisfy JSON predicates.
+Negative JSON-document predicates remain unsupported; redacted projections do
+not prove the absence of a field in original input.
 `execution_child_count` uses the complete run tree to prove admission cardinality.
 `execution_tool_count.error_contains` checks a positive diagnostic substring
-only in that exact joined call's failed/rejected result body. It requires
+only in that exact recorded call's failed/rejected result body. It requires
 `ok: false`, a positive minimum and a nonempty needle of at most 4,096 bytes.
 Arguments, runtime advisories, successful results and another call's output
 cannot satisfy it. This accepts plain-text errors without fabricating JSON;
@@ -1153,6 +1184,9 @@ safe diagnostic reports `root_running`, `root_waiting`, `root_paused`,
 `root_delegated`, `root_interrupted`, `root_failed`, or `root_cancelled` instead
 of implying that capture was missing. Invalid or incomplete trees remain
 `run_tree_unavailable`. Neither diagnostic certifies child adoption.
-Parent question/answer verification uses canonical reply obligations and durable
-root/child communication observations, including stable parent mailbox identity;
-it does not impose a second recipient-spelling contract on tool arguments.
+Parent question/answer verification correlates successful canonical question and
+root-answer receipts with a matching durable child Received observation and the
+child's normal Completed fence. PendingReply owns stable parent mailbox identity;
+recipient spellings and an additional root Sent transcript mirror are not proof
+requirements. Correlated Sent observations, when present, must remain consistent.
+A queued answer alone cannot prove delivery or successful model consumption.

@@ -4,6 +4,20 @@ use astra_services::session_journal::{
     BLOCKED_TOOL_RESULT_CLASS, NOOP_OR_CACHED_RESULT_CLASS, ToolCallDisposition, ToolCallRecord,
 };
 
+/// Complete an early-exit record with the request and response actually
+/// exchanged. Arguments must pass the caller's canonical redaction boundary.
+/// This retains observation facts without granting execution or reuse authority.
+#[must_use]
+pub fn journal_record_with_documents(
+    mut record: ToolCallRecord,
+    arguments: Option<String>,
+    response: &str,
+) -> ToolCallRecord {
+    record.args_full = arguments;
+    record.result_full = Some(bounded_journal_result(response));
+    record
+}
+
 /// Audit an already settled provider callback. This does not issue execution
 /// authority or synthesize a durable invocation receipt.
 #[must_use]

@@ -17,7 +17,7 @@ criteria:
   - type: execution_child_results_adopted
     children:
       - expected_result: {contains: EXPLAIN-PHRASE-OK}
-        model: deepseek-v4-flash
+        model: '{{model}}'
         initial_thinking: {kind: same_as_root}
   - type: execution_tool_count
     name: bash

@@ -427,7 +427,8 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "collaborator_id",
                 "max_output_tokens",
                 "agent_id",
-                "timeout_ms",
+                // Ordinary completion uses the runtime barrier. Explicit
+                // current-run observation stays in the selected full contract.
                 "to",
                 "message",
                 "message_type",
@@ -435,7 +436,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " No substitution. launch≠done. Wait. Mailbox:send_message;provider follow-up:exact collaborator_id."
+                " Auto results;resume:exact collaborator_id."
             ),
         ),
         "introspect" => (
@@ -488,9 +489,16 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         "notify" => (&["message", "notification_type"][..], "Notify."),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
-            "One Work graph; no repeat start; revision-pinned proposal.",
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
         ),
-        "run_next_work_item" => (&[][..], "Next Work only if assignment absent."),
+        "run_next_work_item" => (
+            &[][..],
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
+        ),
         "settle_work_item" => (
             &[
                 "outcome",
@@ -498,7 +506,9 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Settle assigned WorkItem; never child wait.",
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
         ),
         _ => return schema,
     };
@@ -524,7 +534,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 actions.retain(|action, _| {
                     matches!(
                         action.as_str(),
-                        "spawn" | "list" | "get_result" | "wait" | "send_message"
+                        "spawn" | "list" | "get_result" | "send_message"
                     )
                 });
                 if key == "x-astra-per-action-allowed" {
@@ -583,7 +593,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
     {
         action.insert(
             "enum".to_string(),
-            serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"]),
+            serde_json::json!(["spawn", "list", "get_result", "send_message"]),
         );
     }
     if name == "ask_user"

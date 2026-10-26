@@ -34,11 +34,11 @@ criteria:
     children:
       - slot_index: 0
         expected_result: {text: FLASH-SLOT-ALPHA}
-        model: deepseek-v4-flash
+        model: '{{model}}'
         initial_thinking: {kind: exact, config: {mode: model_default}}
       - slot_index: 1
         expected_result: {text: FLASH-SLOT-BETA}
-        model: deepseek-v4-flash
+        model: '{{model}}'
         initial_thinking: {kind: exact, config: {mode: model_default}}
   - type: text_contains
     needle: FLASH-SLOT-ALPHA

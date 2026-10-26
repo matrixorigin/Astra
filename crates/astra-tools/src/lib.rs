@@ -9,6 +9,7 @@
 //! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
 
 pub mod agent_tool_contract;
+pub use astra_turn_types::agent_parent_scope_guidance;
 pub mod char_boundary;
 pub use char_boundary::CharBoundaryExt;
 

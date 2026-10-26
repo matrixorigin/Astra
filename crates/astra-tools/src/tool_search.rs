@@ -1265,6 +1265,12 @@ mod tests {
             assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
             for selected in parsed["matches"].as_array().unwrap() {
                 let parameters = &selected["parameters"]["properties"];
+                if selected["name"] == "agent" {
+                    assert_eq!(
+                        parameters["agent_id"]["description"],
+                        "get_result/list only."
+                    );
+                }
                 let brief = if selected["name"] == "agent" {
                     &parameters["prompt"]
                 } else {
@@ -1276,7 +1282,7 @@ mod tests {
                     normalized.contains("exact output")
                         || normalized.contains("exact child output")
                 );
-                assert!(guidance.contains("parent uses model/status receipts"));
+                assert!(guidance.contains("parent") && guidance.contains("model/status receipts"));
                 assert!(brief.get("x-astra-discovery-summary").is_none());
                 let reasoning = if selected["name"] == "agent" {
                     vec![&parameters["reasoning"]]
@@ -1287,7 +1293,16 @@ mod tests {
                     ]
                 };
                 for control in reasoning {
-                    assert_eq!(control["description"], "Omit outside user-requested scope.");
+                    let guidance = control["description"].as_str().unwrap();
+                    for term in [
+                        "User scope only",
+                        "mode=adaptive",
+                        "effort",
+                        "mode=enabled",
+                        "budget_tokens",
+                    ] {
+                        assert!(guidance.contains(term));
+                    }
                     assert!(control.get("x-astra-discovery-summary").is_none());
                 }
                 let policies = if selected["name"] == "agent" {
@@ -1298,7 +1313,28 @@ mod tests {
                         &parameters["slots"]["items"]["properties"]["requested_model_policy"],
                     ]
                 };
+                let executions = if selected["name"] == "agent" {
+                    vec![&parameters["execution"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["execution"],
+                        &parameters["slots"]["items"]["properties"]["execution"],
+                    ]
+                };
+                for execution in executions {
+                    let guidance = execution["description"].as_str().expect(
+                        "selected execution must distinguish provider collaborators from Chat Offerings",
+                    );
+                    assert!(guidance.contains("provider directory"));
+                    assert!(guidance.contains("requested_model_policy"));
+                    assert!(execution.get("x-astra-discovery-summary").is_none());
+                }
                 for policy in policies {
+                    let guidance = policy["description"].as_str().unwrap();
+                    assert!(guidance.contains("inherit"));
+                    assert!(guidance.contains("model_catalog"));
+                    assert!(guidance.contains("fixed"));
+                    assert!(guidance.contains("User model override"));
                     let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
                         ["source"];
                     assert_eq!(source["description"], "Exact provider/access_label.");

@@ -291,80 +291,6 @@ async fn catalog_cache_failure_is_request_local_and_refresh_observes_revocation(
 }
 
 #[tokio::test]
-async fn catalog_context_projects_safe_stable_candidates_and_partial_coverage() {
-    let models = Arc::new(CatalogSpy::default());
-    *models.items.lock().unwrap() = vec![fixture(0)];
-    let reader = AuthorizedModelCatalogReader::new(
-        models.clone(),
-        Arc::new(ScopedAuthSpy::default()),
-        principal(false),
-    );
-    let host = super::super::server_loop_host::ServerAgenticLoopHostBuilder::new(
-        crate::MatrixOneSettings::default(),
-        Arc::new(crate::FernetTokenEncryptor::new("catalog-test-only").unwrap()),
-        "owner".into(),
-        "session".into(),
-    )
-    .with_model_catalog_reader(Some(reader.clone()))
-    .build();
-    let before_tools = host.valid_tool_names();
-    let first = host.model_catalog_context().await.unwrap();
-    assert_eq!(first, host.model_catalog_context().await.unwrap());
-    assert_eq!(models.reads.load(Ordering::SeqCst), 1);
-    assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-        &first
-    ));
-    let content = first["content"].as_str().unwrap();
-    let projected: Value = serde_json::from_str(content).unwrap();
-    assert_eq!(
-        projected.as_object().unwrap().keys().collect::<Vec<_>>(),
-        vec!["catalog", "child_model_selection_allowed"]
-    );
-    assert_eq!(projected["catalog"]["coverage"], "complete");
-    assert_eq!(projected["child_model_selection_allowed"], true);
-    assert_eq!(projected["catalog"]["items"][0]["offering_id"], "id-000");
-    assert!(projected["catalog"]["observed_at"].is_null());
-    assert!(!content.contains("private"));
-    assert_eq!(
-        before_tools,
-        host.valid_tool_names(),
-        "observing candidates never mutates tool authority or stable schemas"
-    );
-    *models.items.lock().unwrap() = (0..20).map(fixture).collect();
-    reader.read_fresh_items().await.unwrap();
-    let partial = host.model_catalog_context().await.unwrap();
-    let projected: Value = serde_json::from_str(partial["content"].as_str().unwrap()).unwrap();
-    assert_eq!(projected["catalog"]["coverage"], "page");
-    assert_eq!(projected["catalog"]["returned"], 16);
-    assert!(projected["catalog"]["next_cursor"].is_string());
-    assert_eq!(models.reads.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn catalog_context_keeps_provider_child_selection_ceiling() {
-    let models = Arc::new(CatalogSpy::default());
-    let auth = Arc::new(ScopedAuthSpy::default());
-    for principal in [principal(true), runtime_provider_principal()] {
-        let reader = AuthorizedModelCatalogReader::new(models.clone(), auth.clone(), principal);
-        let host = super::super::server_loop_host::ServerAgenticLoopHostBuilder::new(
-            crate::MatrixOneSettings::default(),
-            Arc::new(crate::FernetTokenEncryptor::new("catalog-test-only").unwrap()),
-            "owner".into(),
-            "session".into(),
-        )
-        .with_model_catalog_reader(Some(reader))
-        .build();
-        let context = host.model_catalog_context().await.unwrap();
-        let projected: Value = serde_json::from_str(context["content"].as_str().unwrap()).unwrap();
-        assert_eq!(projected["catalog"]["coverage"], "complete");
-        assert_eq!(projected["child_model_selection_allowed"], false);
-        assert!(!context.to_string().contains("private"));
-    }
-    assert_eq!(models.reads.load(Ordering::SeqCst), 0);
-    assert_eq!(auth.reads.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
 async fn catalog_observation_cache_does_not_retain_oversized_catalogs() {
     let models = Arc::new(CatalogSpy::default());
     let mut item = fixture(0);
@@ -656,4 +582,72 @@ async fn admission_snapshot_is_shared_across_reader_clones() {
     assert_eq!(first.unwrap().len(), 1);
     assert_eq!(second.unwrap().len(), 1);
     assert_eq!(models.reads.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "e2e-hooks")]
+#[tokio::test]
+async fn ordinary_provider_rounds_do_not_load_the_bound_catalog() {
+    use crate::server::provider_test_support::{
+        ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+        admitted_execution, loop_state,
+    };
+    let models = Arc::new(CatalogSpy::default());
+    let auth = Arc::new(ScopedAuthSpy::default());
+    let reader = AuthorizedModelCatalogReader::new(models.clone(), auth.clone(), principal(false));
+    let gateway = ProviderGateway::start(vec![ProviderScript::new(
+        "ordinary replies need only the admitted model",
+        |request| request.body["model"] == "ordinary-model",
+        (0..2).map(|_| ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Done."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+        }))).collect(),
+    )]).await;
+    let observations = ProviderObservationsFixture::default();
+    let mut host = super::super::server_loop_host::ServerAgenticLoopHostBuilder::new(
+        crate::MatrixOneSettings {
+            host: "127.0.0.1".into(),
+            port: 9,
+            password: String::new(),
+            ..Default::default()
+        },
+        Arc::new(crate::FernetTokenEncryptor::new("catalog-test-only").unwrap()),
+        "owner".into(),
+        "ordinary-catalog-session".into(),
+    )
+    .with_model_service(Some(models.clone()))
+    .with_model_catalog_reader(Some(reader))
+    .with_admitted_model_execution(Some(admitted_execution(
+        &gateway,
+        "openai",
+        "ordinary-model",
+        None,
+    )))
+    .with_provider_observations(observations.clone())
+    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+    .with_static_tool_catalog_admissible(false)
+    .build();
+    let mut state = loop_state(
+        "ordinary-catalog-session",
+        Vec::new(),
+        "A simple conversation.",
+    );
+    host.prepare_model_selection(&mut state).await.unwrap();
+    for round in 0..2 {
+        state.current_round_index = round;
+        assert_eq!(
+            host.execute_turn(&mut state).await.unwrap().accum.full_text,
+            "Done."
+        );
+        state.commit_volatile_attempt_lease();
+    }
+    assert_eq!(
+        models.reads.load(Ordering::SeqCst),
+        0,
+        "catalog discovery must be explicit"
+    );
+    assert_eq!(auth.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
+    observations.assert_quiescent();
+    gateway.assert_complete();
 }

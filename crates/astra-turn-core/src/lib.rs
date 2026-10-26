@@ -90,7 +90,7 @@ pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;
 pub mod tool_allowlist;
-pub mod tool_ledger_receipt;
+pub use astra_turn_types::tool_ledger_receipt;
 pub mod trace_alert;
 pub mod turn_event_sink;
 pub mod turn_metrics;

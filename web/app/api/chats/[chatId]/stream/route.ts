@@ -12,6 +12,8 @@ import { WebApiError, streamObservationInterrupted } from "@/lib/api/errors";
 import {
   beginStreamingMessage,
   claimChatStreamProjection,
+  normalizedActiveSkills,
+  normalizedActiveTools,
   withChatStreamProjection,
   releaseChatStreamProjection,
   ChatStreamProjectionError,
@@ -56,27 +58,6 @@ function sseFrame(event: unknown) {
 
 function eventFromSseFrame(frame: string, strict = false): import("@astra/sdk").StreamEvent | null {
   return parseChatSseFrame(frame, strict) as import("@astra/sdk").StreamEvent | null;
-}
-
-function normalizedActiveSkills(skills?: string[]) {
-  if (!Array.isArray(skills)) {
-    return [];
-  }
-  return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
-    (left, right) => left.localeCompare(right),
-  );
-}
-
-function normalizedActiveTools(tools?: string[], webSearch = false) {
-  const normalized = Array.isArray(tools)
-    ? tools.map((tool) => tool.trim()).filter(Boolean)
-    : [];
-  if (webSearch) {
-    normalized.push("web_search", "web_fetch");
-  }
-  return [...new Set(normalized)].sort((left, right) =>
-    left.localeCompare(right),
-  );
 }
 
 async function readSendMessageRequest(
@@ -652,10 +633,16 @@ export async function POST(
   let runtimeSessionId = chatId;
   const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
 
-  const started = beginStreamingMessage(ownerUserId, chatId, {
-    ...body,
-    workspaceSelection: workspaceSelection ?? undefined,
-  });
+  let started;
+  try {
+    started = beginStreamingMessage(ownerUserId, chatId, {
+      ...body,
+      workspaceSelection: workspaceSelection ?? undefined,
+    });
+  } catch (error) {
+    if (!(error instanceof ChatStreamProjectionError)) throw error;
+    return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
+  }
   if (!started) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }

@@ -116,14 +116,6 @@ probe. This is one test of a general selector, not a
 license to add an alias for that string. Run alongside ambiguous, unavailable,
 and source-qualified controls before claiming semantic-selection quality.
 
-`flash_scoped_child_and_parent` uses a family-only model reference and separately
-assigns work to the child and primary agent, without tool syntax or instructions
-forbidding discovery. Run it only with exactly one authorized GLM candidate
-identity. Its oracle checks actual child inference, adoption, both results,
-zero discovery/file/network tools, and at most three primary rounds. Explicit
-version cases do not establish family-reference quality; this case must pass
-alongside ambiguous and unavailable candidate controls, not replace them.
-
 `flash_discover_then_delegate_glm` exercises authorized Chat availability and
 delegation. A complete supplied catalog can avoid another `model_catalog` call.
 The oracle retains zero failed discovery calls, a real GLM child provider
@@ -153,14 +145,17 @@ selector admission (`invalid_request`, `executed: false`) and hard-requirement
 binding (`delegation_model_scope_unresolved`, `advisory.executed: false`). Both
 must report `failed` and create zero children. Malformed arguments, unrelated
 failures, a substituted model, omission, and a parent-only explanation cannot
-pass. The near-version and parent-tool recovery controls use the same contract.
+pass. The parent-tool recovery control uses the same contract.
 These explicit protocol prompts do not certify natural-language model selection;
 the separate catalog and model-selection journeys cover that user behavior.
-`flash_near_version_must_not_substitute` checks the harder adjacent-version
-case: where the authorized catalog has GLM 5.2 but no GLM 5.3, a direct request
-for 5.3 must be rejected before execution and must not spawn a 5.2 child or
-inspect local configuration files. Skip this case if GLM 5.3 is actually
-offered.
+The old adjacent-version negative and single-GLM-family live cases are retired:
+their catalog-absence assumptions conflict with the full suite's positive model
+requirements. Exact unavailable-selector rejection remains covered by the two
+`glm-99.99` controls and the deterministic selector tests. This reduces those
+special-catalog live scenarios; it does not claim their coverage from another
+model. Positive fixed-model cases declare `required_models`. Inherited child
+identity uses `{{model}}`, so `--force-model` preserves its meaning without
+rewriting an explicit child-model request.
 
 `flash_fanout_two_models_high` is the fixed-model control journey: one slot
 uses GLM-5.2 and another uses DeepSeek Flash with adaptive high reasoning.
@@ -208,8 +203,14 @@ savings.
 
 `flash_child_question_parent_answer` checks exactly one spawned child, one
 successful child-owned question and root-owned answer with the exact request
-ID, and typed durable Sent/Received evidence binding both parties and the
-answer message ID. The same child must complete, execute on GLM, and have its
+ID, and a matching typed durable child Received observation binding both parties
+and the answer message ID. Canonical reply obligations own the stable parent
+mailbox identity; an extra root Sent mirror is unnecessary. Present correlated
+observations must still agree. Attempts explicitly reported as unexecuted do
+not create questions or answers, so a rejected attempt followed by a successful
+correction does not count as two answers. Unknown execution and genuinely
+duplicated answers still fail closed. The same child must complete on the selected
+model and have its
 complete raw result digest adopted before parent finalization. A queued answer
 alone is insufficient. Ordinary `send_message` text (including
 `message_type=result`) is not terminal-result evidence.

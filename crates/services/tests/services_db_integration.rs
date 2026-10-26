@@ -25,8 +25,7 @@ use astra_services::session_audit::{
     SessionAuditService,
 };
 use astra_services::session_restore::{
-    COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND, HybridRestoreService, SessionRestoreService,
-    persist_remote_composite_snapshot_index, pull_step_checkpoint_from_cloud,
+    HybridRestoreService, SessionRestoreService, pull_step_checkpoint_from_cloud,
 };
 use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSurface, WORKSPACE_METADATA_ARTIFACT_KIND,
@@ -1986,7 +1985,6 @@ async fn cleanup_session_delete_fixture_for_owner(
         "conversation_log",
         "agent_event_edges",
         "agent_events",
-        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
     ] {
@@ -2313,34 +2311,6 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
         &[&owner_user_id, &other_user_id],
     )
     .await;
-}
-
-async fn force_session_artifacts_created_at(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    artifact_ids: &[String],
-    created_at: &str,
-) {
-    for artifact_id in artifact_ids {
-        let result = sqlx::query(
-            "UPDATE session_artifacts
-             SET created_at = ?
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-        )
-        .bind(created_at)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(artifact_id)
-        .execute(pool)
-        .await
-        .expect("force tied artifact timestamp");
-        assert_eq!(
-            result.rows_affected(),
-            1,
-            "test fixture must update exactly one artifact timestamp for {artifact_id}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -5048,15 +5018,24 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         .iter()
         .find(|session| session.session_id == session_a)
         .expect("session A listed");
-    assert_eq!(listed_a.turn_count, 2);
+    assert_eq!(
+        listed_a.turn_count, 0,
+        "directory requires a canonical head"
+    );
     assert_eq!(listed_a.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(listed_a.git_branch.as_deref(), Some("feature/cloud-sync"));
     let listed_b = resumable
         .iter()
         .find(|session| session.session_id == session_b)
         .expect("session B listed");
-    assert_eq!(listed_b.turn_count, 1);
-    assert_eq!(listed_b.model.as_deref(), Some("claude-sonnet-4.5"));
+    assert_eq!(
+        listed_b.turn_count, 0,
+        "diagnostic events do not supply directory turns"
+    );
+    assert!(
+        listed_b.model.is_none(),
+        "directory does not infer a model from events"
+    );
     assert_eq!(listed_b.git_branch.as_deref(), Some("legacy-fallback"));
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_a, session_b]).await;
@@ -5167,8 +5146,8 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         .find(|session| session.session_id == session_id)
         .expect("sparse-turn session listed");
     assert_eq!(
-        listed_session.turn_count, 4,
-        "list_resumable_sessions must use the same turn high watermark as restore_session"
+        listed_session.turn_count, 0,
+        "directory omits diagnostic turn counts; selected detail recovery retains its high watermark"
     );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
@@ -5381,184 +5360,6 @@ async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_
     assert!(restored.model.is_none());
     assert!(restored.last_context_trace.is_none());
     assert!(restored.workspace.is_none());
-
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_on_live_matrixone()
-{
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-
-    cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
-
-    let local_index_path = astra_services::local_session_artifact_store()
-        .session_path(&session_id, "step_checkpoints/composite_snapshots.json")
-        .expect("composite snapshot index path");
-    assert!(
-        !local_index_path.exists(),
-        "fixture should prove remote composite snapshot persistence without local composite_snapshots.json"
-    );
-
-    seed_restore_session_fixture(&pool, &user_id, &session_id, serde_json::json!({"git_branch": Some("feature/remote-composite"), "model": Some("gpt-5.4")})).await;
-    seed_restore_checkpoint_fixture(
-        &pool,
-        &user_id,
-        &session_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 3,
-            turn: 7,
-            title: "remote composite checkpoint".into(),
-            summary: "checkpoint only exists in MatrixOne".into(),
-            tools_used: vec!["bash".into(), "rg".into()],
-            total_tokens: 321,
-            had_stalls: false,
-            error_count: 0,
-        },
-        None,
-    )
-    .await;
-
-    let build_index = |label: &str, branch: &str, git_commit: &str, created_at: &str| {
-        let data_snapshot = astra_services::DataSnapshotRef {
-            snapshot_name: format!("snapshot-{session_id}-{label}"),
-            databases: vec!["app_db".into()],
-            timestamp: Some("2026-09-08T10:00:00Z".into()),
-            branch_name: Some(branch.into()),
-        };
-        let mut composite_snapshot =
-            astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&session_id, 7)
-                .label(label)
-                .session_state("000003-heavy.json")
-                .data_snapshot(data_snapshot.clone())
-                .git_commit(git_commit)
-                .workspace_state(&session_id)
-                .build();
-        composite_snapshot.created_at = created_at.into();
-        let mut index = astra_services::CompositeSnapshotIndex::default();
-        index
-            .append(&mut composite_snapshot)
-            .expect("append composite snapshot");
-        (index, composite_snapshot, data_snapshot)
-    };
-
-    let old_git_commit = "0123456789abcdef0123456789abcdef01234567";
-    let new_git_commit = "fedcba9876543210fedcba9876543210fedcba98";
-    let (old_index, _old_snapshot, _old_data_snapshot) = build_index(
-        "remote-composite-old",
-        "feature/remote-composite-old",
-        old_git_commit,
-        "2026-09-08T09:59:59Z",
-    );
-    let (new_index, new_snapshot, new_data_snapshot) = build_index(
-        "remote-composite-new",
-        "feature/remote-composite-new",
-        new_git_commit,
-        "2026-09-08T10:00:00Z",
-    );
-
-    let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
-    let (old_artifact, new_artifact) = tokio::join!(
-        persist_remote_composite_snapshot_index(&session_id, &user_id, &old_index, &artifact_store),
-        persist_remote_composite_snapshot_index(&session_id, &user_id, &new_index, &artifact_store)
-    );
-    let old_artifact = old_artifact.expect("persist old remote composite snapshot index");
-    let new_artifact = new_artifact.expect("persist newest remote composite snapshot index");
-    force_session_artifacts_created_at(
-        &pool,
-        &user_id,
-        &session_id,
-        &[
-            old_artifact.artifact_id.clone(),
-            new_artifact.artifact_id.clone(),
-        ],
-        "2026-09-08 10:00:00.123456",
-    )
-    .await;
-
-    assert_eq!(old_artifact.artifact_id, new_artifact.artifact_id);
-    assert_eq!(
-        new_artifact.artifact_id,
-        astra_services::session_restore::COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID
-    );
-    let projection_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_artifacts \
-         WHERE user_id = ? AND session_id = ? AND artifact_kind = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND)
-    .fetch_one(&pool)
-    .await
-    .expect("count composite snapshot projection rows");
-    assert_eq!(
-        projection_rows, 1,
-        "mutable composite snapshot state must occupy exactly one row"
-    );
-    let expected_artifact = &new_artifact;
-    let expected_index = old_index.clone().merge_by_identity(new_index.clone());
-    let expected_snapshot = &new_snapshot;
-    let expected_data_snapshot = &new_data_snapshot;
-    let expected_git = new_git_commit;
-
-    let latest_artifact = artifact_store
-        .load_latest_json_artifact(
-            &user_id,
-            &session_id,
-            COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND,
-        )
-        .await
-        .expect("load latest remote composite snapshot artifact")
-        .expect("remote composite snapshot artifact exists");
-    assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
-
-    let listed: astra_services::CompositeSnapshotIndex =
-        serde_json::from_value(latest_artifact.content).expect("decode persisted composite index");
-    assert_eq!(listed.snapshots.len(), expected_index.snapshots.len());
-    assert_eq!(listed.current_version(), expected_index.current_version());
-    let listed_snapshot = listed
-        .snapshots
-        .iter()
-        .find(|snapshot| snapshot.snapshot_id == expected_snapshot.snapshot_id)
-        .expect("newest snapshot remains present after projection merge");
-    assert_eq!(listed_snapshot.snapshot_id, expected_snapshot.snapshot_id);
-    assert_eq!(
-        listed_snapshot.label.as_deref(),
-        expected_snapshot.label.as_deref()
-    );
-    assert_eq!(listed_snapshot.turn, expected_snapshot.turn);
-
-    assert_eq!(listed_snapshot.git_commit(), Some(expected_git));
-    assert_eq!(
-        listed_snapshot.data_snapshot(),
-        Some(expected_data_snapshot)
-    );
-
-    let restore = HybridRestoreService::new(pool.clone());
-    let checkpoints = restore
-        .list_checkpoints(&user_id, &session_id)
-        .await
-        .expect("list ordinary remote checkpoint");
-    assert_eq!(checkpoints.len(), 1);
-    let checkpoint = &checkpoints[0];
-    assert_eq!(checkpoint.number, 3);
-    assert_eq!(checkpoint.turn, 7);
-    assert_eq!(checkpoint.total_tokens, 321);
-    assert_eq!(checkpoint.title, "remote composite checkpoint");
-    assert_eq!(checkpoint.summary, "checkpoint only exists in MatrixOne");
-    assert!(
-        restore
-            .list_checkpoints(&Uuid::new_v4().to_string(), &session_id)
-            .await
-            .expect("foreign owner checkpoint query")
-            .is_empty(),
-        "checkpoint listing must not expose another owner's records"
-    );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -7843,23 +7644,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             .expect("insert skill evaluation");
     }
 
-    for (user_id, run_id) in [
-        (&owner_user_id, &owner_run_id),
-        (&other_user_id, &foreign_run_id),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_session_execution_slots
-             (user_id, session_id, run_id, acquired_at, updated_at)
-             VALUES (?, ?, ?, NOW(6), NOW(6))",
-        )
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .execute(&pool)
-        .await
-        .expect("insert session execution slot");
-    }
-
     for (user_id, run_id, artifact_id, marker) in [
         (&owner_user_id, &owner_run_id, &owner_artifact_id, "owner"),
         (
@@ -8054,10 +7838,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 1);
-    assert_eq!(
-        deleted_rows_for_table(&delete_audit, "agent_session_execution_slots"),
-        1
-    );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
@@ -8075,10 +7855,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     for (label, table) in [
         ("agent_sessions", "agent_sessions"),
         ("agent_events", "agent_events"),
-        (
-            "agent_session_execution_slots",
-            "agent_session_execution_slots",
-        ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
         ("ctx_snapshots", "ctx_snapshots"),

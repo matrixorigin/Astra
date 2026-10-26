@@ -90,10 +90,6 @@ contract and its tests live in [`scripts/ci/`](scripts/ci/).
 The frozen MOI consumer compatibility test runs independently of this routing
 on every Test Suite run. The required online core aggregate also requires that
 fresh-database journey to pass; see the testing guide for its exact scope.
-The Terminal-Bench fresh-database contract derives admission gate names and
-cardinality from the source-owned partition count and scope formatter. It
-requires the exact ordered gate inventory; missing, duplicate, legacy or
-unknown rows and unsupported source declarations fail closed.
 
 CLI tests build and run all library/binary unit tests plus the offline
 `cli_pipe`, `process_supervisor`, `shell_execution_boundaries`, and

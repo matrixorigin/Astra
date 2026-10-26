@@ -55,6 +55,7 @@ criteria:
     added_items: 1
     delivered_items: 2
     cancellation_after_deliveries: 1
+    require_cancel_before_execution: true
   - type: journal_tool_call_count
     name: ask_user
     min: 0

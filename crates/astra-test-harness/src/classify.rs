@@ -172,9 +172,10 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if judger_unavailable {
         return FailureClass::InfraVerificationUnavailable;
     }
-    if criteria_results.iter().any(|result| {
-        !result.passed && crate::criteria::execution_verification_unavailable(result, outcome)
-    }) {
+    if criteria_results
+        .iter()
+        .any(|result| !result.passed && crate::criteria::execution_verification_unavailable(result))
+    {
         return FailureClass::InfraVerificationUnavailable;
     }
     if criteria_results.iter().any(|result| {
@@ -275,7 +276,7 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
     if tools_count_failed {
         let exceeded_max = criteria_results.iter().any(|r| {
             if let Criterion::ToolsCountBetween { max, .. } = &r.criterion {
-                !r.passed && outcome.total_tool_calls.max(outcome.tool_calls_count) > *max
+                !r.passed && outcome.observed_tool_calls() > *max
             } else {
                 false
             }

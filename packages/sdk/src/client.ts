@@ -28,7 +28,6 @@ import type {
   RunListCursor,
   RunListParams,
   RunListResponse,
-  RunProjectionRepairResponse,
   RunProjectionResponse,
   RunStatus,
   RuntimeChatResponse,
@@ -48,6 +47,7 @@ import type {
   RuntimeSessionUpdateBody,
   RuntimeTranscriptParams,
   RuntimeTranscriptResponse,
+  RuntimeConversationResponse,
   ReauthenticationProof,
   ReauthenticationPurpose,
   SessionActivityCursor,
@@ -174,7 +174,6 @@ import {
   chatRunPath,
   chatRunPausePath,
   chatRunProjectionPath,
-  chatRunProjectionRepairPath,
   chatRunResumePath,
   chatRunStreamPath,
   chatSessionDecisionTracePath,
@@ -2800,6 +2799,15 @@ export class AstraClient {
     return this.put<RuntimeSessionResponse>(sessionPath(sessionId), body);
   }
 
+  /** Current root and bounded conversation facts from one database snapshot. */
+  async getSessionConversation(sessionId: string, limit = 200,
+    continuation?: { runId: string; preserveTerminal: boolean }): Promise<RuntimeConversationResponse> {
+    return this.fetch<RuntimeConversationResponse>(
+      `${sessionTranscriptPath(sessionId)}${buildQueryString({ scope: "conversation", limit,
+        ...(continuation ? { reuse_run_id: continuation.runId, reuse_terminal: String(continuation.preserveTerminal) } : {}) })}`,
+    );
+  }
+
   async getSessionTranscript(
     sessionId: string,
     params: RuntimeTranscriptParams = {},
@@ -3080,7 +3088,7 @@ export class AstraClient {
   }
 
   /**
-   * Fetch the bounded durable projection for a run without attaching to its
+   * Fetch the bounded canonical snapshot for a run without attaching to its
    * live SSE stream.
    */
   async getRunProjection(
@@ -3097,22 +3105,7 @@ export class AstraClient {
     );
   }
 
-  /**
-   * Rebuild the durable projection for a run from authoritative facts.
-   */
-  async repairRunProjection(
-    runId: string,
-    opts?: { recentLimit?: number },
-  ): Promise<RunProjectionRepairResponse> {
-    const q = buildQueryString({
-      ...(opts?.recentLimit !== undefined
-        ? { recent_limit: opts.recentLimit }
-        : {}),
-    });
-    return this.post<RunProjectionRepairResponse>(
-      `${chatRunProjectionRepairPath(runId)}${q}`,
-    );
-  }
+
 
   /** `GET /runs` — list durable runs for the current user. */
   async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {

@@ -4,7 +4,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use astra_services::resource_governor::ResourceGovernor;
 use serde_json::{Value, json};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -87,28 +86,6 @@ pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
         ("execution_started".to_string(), json!(false)),
     ]));
     result
-}
-
-pub(crate) fn spawn_resource_tool_call_recording(
-    user_id: &str,
-    resource_governor: Option<&Arc<dyn ResourceGovernor>>,
-) -> bool {
-    let Some(governor) = resource_governor.cloned() else {
-        return false;
-    };
-    let user_id = user_id.to_string();
-    tokio::spawn(
-        async move {
-            governor.record_tool_calls(&user_id, 1).await;
-            tracing::debug!(
-                target: "astra_runtime::local_tool",
-                user_id = %user_id,
-                "resource governor tool call recorded"
-            );
-        }
-        .in_current_span(),
-    );
-    true
 }
 
 pub(crate) fn memory_args_with_context(
@@ -270,11 +247,6 @@ mod tests {
         );
         assert_eq!(metadata["disposition"], "rejected");
         assert_eq!(metadata["execution_started"], false);
-    }
-
-    #[test]
-    fn resource_tool_call_recording_skips_missing_governor() {
-        assert!(!spawn_resource_tool_call_recording("user-1", None));
     }
 
     #[test]

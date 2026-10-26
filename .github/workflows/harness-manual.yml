@@ -270,6 +270,18 @@ jobs:
                           preflight["failure"] = {"model": failure["model"], "stage": stage}
                           code = failure.get("exit_code")
                           preflight["failure"]["exit_code"] = code if type(code) is int and -255 <= code <= 255 else None
+                          state = failure.get("final_state")
+                          state = state if (stage == "execution" and isinstance(state, str)
+                              and state in ("completed", "interrupted", "failed")) else None
+                          preflight["failure"]["final_state"] = state
+                          kind = failure.get("interruption_kind")
+                          preflight["failure"]["interruption_kind"] = kind if (state == "interrupted"
+                              and isinstance(kind, str) and kind in (
+                                  "budget_exhausted", "empty_completion", "token_budget_exceeded",
+                                  "rate_limited", "cooldown_rejected", "user_cancelled", "context_overflow",
+                                  "auth_failure", "critical_verdict", "approval_rejected", "server_overload",
+                                  "stream_transport", "stream_idle", "provider_deadline", "harness_blocked",
+                                  "harness_paused", "interrupted", "execution_incomplete", "executor_dropped")) else None
                           for key in ("error_kind", "error_code"):
                               value = failure.get(key)
                               preflight["failure"][key] = value if (isinstance(value, str) and 0 < len(value) <= 128

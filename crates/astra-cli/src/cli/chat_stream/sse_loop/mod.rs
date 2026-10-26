@@ -618,6 +618,7 @@ async fn stream_chat_sse_inner(
         callback_client_detached: false,
         remote_cancel_run_id: None,
         last_physical_run_id: None,
+        failed_run_terminal: None,
         turn_evaluation: None,
         last_error_code: None,
         last_error_metadata: None,
@@ -881,7 +882,10 @@ async fn stream_chat_sse_inner(
                 qualified_usage: state.qualified_usage,
                 usage_attribution,
                 tool_calls_count,
-                llm_rounds: Some(state.llm_rounds_completed),
+                llm_rounds: state
+                    .remote_summary
+                    .as_ref()
+                    .map(|summary| summary.llm_rounds),
                 token_usage_coverage: state.token_usage_coverage(),
                 tool_outcomes: Some(tool_outcomes),
                 applied_user_intents: state
@@ -911,6 +915,8 @@ async fn stream_chat_sse_inner(
                 server_admission_not_dispatched: false,
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
+                partial_text_model_item_id: state.final_text_model_item_id.take(),
+                failed_run_terminal: host.failed_run_terminal.take(),
                 run_transcript_messages: state.take_run_transcript_capture(),
                 remote_cancel_required: host.remote_cancel_required,
                 callback_client_detached: host.callback_client_detached,

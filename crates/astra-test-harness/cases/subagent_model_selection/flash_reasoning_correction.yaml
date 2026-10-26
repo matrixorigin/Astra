@@ -17,7 +17,7 @@ criteria:
   - type: execution_child_results_adopted
     children:
       - expected_result: {text: REASONING-CORRECTION-OK}
-        model: deepseek-v4-flash
+        model: '{{model}}'
         initial_thinking: {kind: exact, config: {mode: adaptive, effort: medium}}
   - type: execution_tool_count
     name: bash

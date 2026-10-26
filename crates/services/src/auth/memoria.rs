@@ -559,6 +559,7 @@ impl DatabaseAuthService {
         {
             return Err("UC built-in memory requires MEMORIA_BASE_URL and MEMORIA_MASTER_KEY, without MEMORIA_WEB_URL".into());
         }
+        self.authentication_cache = std::sync::Arc::default();
         self.memoria_provider = Some(MemoriaProvider::new(settings)?);
         Ok(self)
     }
@@ -604,6 +605,13 @@ impl DatabaseAuthService {
         .fetch_optional(pool)
         .await
         .map_err(internal_error)?;
+        self.validate_memoria_identity(identity)
+    }
+
+    pub(super) fn validate_memoria_identity(
+        &self,
+        identity: Option<(String, String)>,
+    ) -> Result<Option<String>, AuthHttpError> {
         if let Some((provider, subject)) = identity {
             if self
                 .memoria_provider
@@ -672,6 +680,9 @@ impl DatabaseAuthService {
         ciphertext: &str,
         key: &str,
     ) -> Result<AuthTokenRecord, AuthHttpError> {
+        // Initial upstream verification already succeeded. Clear observations
+        // around the transaction, including uncertain commit/cancellation.
+        let _invalidation = self.authentication_cache.mutation();
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let user = self
             .resolve_verified_provider_identity(

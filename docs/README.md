@@ -45,7 +45,6 @@ source snapshot used for that version.
 | [Deployment guide](guides/deployment.md) | Recommended operational path and health verification |
 | [Configuration reference](reference/configuration.md) | Server, database, authentication, model, Runner, and observability settings |
 | [Troubleshooting](guides/troubleshooting.md) | First diagnostics for dependencies, server startup, and tests |
-| [Run projection repair](guides/run-projection-repair.md) | Repair procedure when a derived run view is stale |
 
 ## Develop and contribute
 

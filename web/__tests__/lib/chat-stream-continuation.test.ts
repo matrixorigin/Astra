@@ -265,8 +265,12 @@ it("fences aborted writers and stale releases and retires state when a new messa
   expect(withChatStreamProjection(old, mutate)).toBe(false);
   releaseChatStreamProjection(old);
   expect(withChatStreamProjection(next, mutate)).toBe(true);
-  beginStreamingMessage("owner", "chat", { content: "next" });
-  expect(next.writer.signal.aborted).toBe(true);
+  expect(() => beginStreamingMessage("owner", "chat", { content: "next" }))
+    .toThrow("already being observed");
+  expect(withChatStreamProjection(next, mutate)).toBe(true);
+  releaseChatStreamProjection(next);
+  const selected = beginStreamingMessage("owner", "chat", { content: "next" })!;
+  expect(selected.assistantMessage.id).not.toBe(assistantId);
   expect(withChatStreamProjection(next, mutate)).toBe(false);
 });
 
@@ -597,17 +601,11 @@ it("hydrates status without advancing the genuine projection cursor", async () =
     { type: "text_delta", content: " continued", index: 9 },
     { type: "run_waiting", run_id: "root", reason: "waiting: tool_approval", index: 11 }]));
   vi.mocked(getStoreRuntimeClient).mockResolvedValue(client);
-  vi.spyOn(client.sdk, "listRuntimeSessions").mockResolvedValue({ sessions: [{
-    session_id: "session", status: "active", metadata: { source: "web_v1" },
-    created_at: "2026-10-21T00:00:00Z", updated_at: "2026-10-21T00:00:02Z",
-  }], total: 1, limit: 200, next_cursor: null } as never);
-  vi.spyOn(client.sdk, "listRuns").mockResolvedValue({ runs: [{
-    runId: "root", sessionId: "session", parentRunId: null, rootRunId: "root", depth: 0,
-    status: "waiting", waitingFor: "tool_approval", eventsCount: 12,
-  }], total: 1, limit: 200 } as never);
-  vi.spyOn(client.sdk, "getSessionTranscript").mockResolvedValue({ items: [
-    { item_seq: 1, role: "user", content: "start", created_at: "2026-10-21T00:00:00Z" },
-  ], total: 1, limit: 200, offset: 0 } as never);
+  vi.spyOn(client.sdk, "getSessionConversation").mockResolvedValue({ kind: "conversation",
+    session: { session_id: "session", status: "active", metadata: { source: "web_v1" }, created_at: "2026-10-21T00:00:00Z" },
+    selected_root: { run_id: "root", status: "waiting", waiting_for: "tool_approval", created_at: "2026-10-21T00:00:00Z" },
+    items: [], history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false,
+  });
   const detail = await getChatHydrated("owner", "chat");
   expect(detail?.activeRun).toMatchObject({ status: "waiting", nextEventIndex: 9, assistantMessageId: assistantId });
   vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(detail!.activeRun!.nextEventIndex!));

@@ -8,6 +8,7 @@ prompt: |
   它完成计算后最终只回复结果整数，不要输出算式、步骤、解释、标记或其他内容，
   也不要在任务中泄露计算结果。等子代理完成并采用它的结果后，你也只输出这个整数，
   不要解释或标点。
+required_models: [glm-5.2]
 debug_log: true
 capability: delegation
 timeout_seconds: 120

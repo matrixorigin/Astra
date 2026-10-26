@@ -259,6 +259,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "sqlx-core",
  "temp-env",
  "tempfile",
  "tokio",
@@ -6290,8 +6291,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
+source = "git+https://github.com/launchbadge/sqlx?rev=6e57d05490859f31aa364ca69fcb379f3a2995e6#6e57d05490859f31aa364ca69fcb379f3a2995e6"
 dependencies = [
  "base64",
  "bytes",
@@ -6314,7 +6314,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",

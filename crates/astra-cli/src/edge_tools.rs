@@ -3628,111 +3628,6 @@ impl ToolExecutor {
         .to_string()
     }
 
-    // ── Session history: recall past conversation turns ──────────────────────
-
-    fn render_session_history(&self, args: &Value) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let query = args
-            .get("pattern")
-            .or_else(|| args.get("query"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-
-        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
-
-        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
-            Ok(content) => content
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-            Err(_) => return "Error: journal not found.".to_string(),
-        };
-
-        // Extract turn events with user_input + assistant_output
-        let mut turns: Vec<(u32, &str, &str)> = Vec::new();
-        for evt in &events {
-            if evt.get("type").and_then(|v| v.as_str()) != Some("turn") {
-                continue;
-            }
-            let turn_num = evt.get("turn").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let user = evt.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
-            let assistant = evt
-                .get("assistant_output")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !user.is_empty() || !assistant.is_empty() {
-                turns.push((turn_num, user, assistant));
-            }
-        }
-
-        // Filter by query if provided
-        let filtered: Vec<&(u32, &str, &str)> = if query.is_empty() {
-            turns.iter().collect()
-        } else {
-            let q_lower = query.to_lowercase();
-            turns
-                .iter()
-                .filter(|(_, u, a)| {
-                    u.to_lowercase().contains(&q_lower) || a.to_lowercase().contains(&q_lower)
-                })
-                .collect()
-        };
-
-        if filtered.is_empty() {
-            return if query.is_empty() {
-                "No conversation history in this session.".to_string()
-            } else {
-                format!("No turns matching '{query}' found.")
-            };
-        }
-
-        // Take last N
-        let shown: &[&(u32, &str, &str)] = if filtered.len() > limit {
-            &filtered[filtered.len() - limit..]
-        } else {
-            &filtered
-        };
-
-        let mut out = format!(
-            "## Conversation History ({} turns{})\n",
-            filtered.len(),
-            if !query.is_empty() {
-                format!(" matching '{query}'")
-            } else {
-                String::new()
-            }
-        );
-        for (turn_num, user, assistant) in shown {
-            let user_safe =
-                astra_text_utils::credential_redaction::redact_credentials_for_display(user).0;
-            let assistant_safe =
-                astra_text_utils::credential_redaction::redact_credentials_for_display(assistant).0;
-            let user_preview: String = user_safe.chars().take(120).collect();
-            let assist_preview: String = assistant_safe.chars().take(200).collect();
-            out.push_str(&format!("\n**T{turn_num} User**: {user_preview}"));
-            if user.len() > 120 {
-                out.push('…');
-            }
-            out.push_str(&format!("\n**T{turn_num} Assistant**: {assist_preview}"));
-            if assistant.len() > 200 {
-                out.push('…');
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    fn render_session_history_around(&self, args: &Value) -> String {
-        if args.get("item_seq").and_then(Value::as_u64).is_none() {
-            return "Error: history_around requires item_seq.".to_string();
-        }
-        "Error: session history_around requires server-backed transcript item_seq support in this runtime. Use history_page or history_search in local CLI mode.".to_string()
-    }
-
     // ── Env tool: environment variable management ─────────────────────────────
 
     /// Environment variable management tool — delegated to `env_tools` module.
@@ -5580,13 +5475,6 @@ impl ToolExecutor {
                         }
                         astra_tools::session_tool_contract::SessionAction::Sleep => {
                             self.sleep_tool(args).await
-                        }
-                        astra_tools::session_tool_contract::SessionAction::HistoryPage
-                        | astra_tools::session_tool_contract::SessionAction::HistorySearch => {
-                            self.render_session_history(args)
-                        }
-                        astra_tools::session_tool_contract::SessionAction::HistoryAround => {
-                            self.render_session_history_around(args)
                         }
                     }
                 }
@@ -9715,7 +9603,10 @@ pub(crate) mod tests {
         ]));
 
         for (tool, args) in [
-            ("session", serde_json::json!({"action": "history_page"})),
+            (
+                "session",
+                serde_json::json!({"action": "sleep", "duration_ms": 0}),
+            ),
             (
                 "web_fetch",
                 serde_json::json!({"url": "https://example.com"}),

@@ -184,22 +184,20 @@ pub use events::{
 };
 pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use inference_execution::{
-    AuxiliaryExecutionAttemptFact, InferenceCanonicalTransitionReceipt,
-    InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
-    InferenceInvocationTerminal, InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan,
-    InferenceProviderDeliveryState, InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
-    InferenceScopeRejection, InferenceSettlementReconcileOutcome, InferenceTerminalStatus,
-    InferenceUsage, InferenceUsageStatus, SessionAuxiliaryUsageCapture, admit_inference_invocation,
+    AuxiliaryExecutionAttemptFact, InferenceInvocationAdmissionResolution,
+    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
+    InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan, InferenceProviderDeliveryState,
+    InferenceProviderWireIdentity, InferenceRunAdmissionAuthority, InferenceScopeRejection,
+    InferenceSettlementReconcileOutcome, InferenceTerminalStatus, InferenceUsage,
+    InferenceUsageStatus, SessionAuxiliaryUsageCapture, admit_inference_invocation,
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
-    finish_successful_inference_provider_attempt_and_invocation,
-    load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
+    finish_successful_inference_provider_attempt_and_invocation, load_session_auxiliary_capture,
     next_inference_logical_attempt_pair_base, plan_inference_invocation,
     plan_inference_provider_attempt, plan_inference_provider_attempt_with_context,
     reconcile_inference_settlement, reconcile_inference_settlements,
-    renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
-    settle_uncertain_inference_admission,
+    renew_inference_invocation_owner, settle_uncertain_inference_admission,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
@@ -374,9 +372,8 @@ pub use verification::{
     VerificationCriterion, VerificationResult, VerificationRunner, VerifierKind,
 };
 pub use weighted_admission::{
-    AdmissionWork, DatabaseWeightedAdmissionController, DistributedAdmissionError,
-    DistributedAdmissionPermit, DistributedAdmissionReservation, WeightedAdmissionController,
-    WeightedAdmissionError, WeightedAdmissionLimits, WeightedAdmissionPermit,
+    AdmissionWork, WeightedAdmissionController, WeightedAdmissionError, WeightedAdmissionLimits,
+    WeightedAdmissionPermit,
 };
 pub use workspace_records::{
     DatabaseWorkspaceRecordStore, InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtEntry,

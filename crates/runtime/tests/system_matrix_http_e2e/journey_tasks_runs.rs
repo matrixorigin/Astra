@@ -27,6 +27,10 @@ async fn seed_orphan_cancel_race_run(
         .with_owner_pod_id(fixture_owner.clone());
     store
         .insert_run(DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
+            terminal_receipt_json: None,
             run_id: run_id.clone(),
             user_id: ctx.user_id.clone(),
             session_id: ctx.session_id.clone(),
@@ -442,7 +446,7 @@ pub async fn run_chat_run_pause_resume_http() {
             );
 
             let durable_slot_owner: Option<String> = sqlx::query_scalar(
-                "SELECT run_id FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+                "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))",
             )
             .bind(&ctx.user_id)
             .bind(&session_id)
@@ -516,8 +520,6 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
     use astra_services::runs::{CheckpointWriteAuthority, RunCheckpointWriteRequest};
     use futures_util::FutureExt;
     use serde_json::Value;
-    use sha2::{Digest, Sha256};
-    use sqlx::Row;
     use std::{panic::AssertUnwindSafe, sync::Arc, task::Poll, time::Duration};
     use tokio::sync::Notify;
 
@@ -638,8 +640,8 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(handoff["producer_run_id"], run_id);
         assert_eq!(handoff["producer_owner_generation"], original.run_generation);
         let payload = &handoff["heavy"];
-        let source = &payload["reservation"];
-        let turn = source["reserved_turn"].as_u64().expect("original turn");
+        let source = &payload["context_authority"];
+        let turn = source["turn"].as_u64().expect("original turn");
         let budget = &payload["heavy"]["run_execution_budget"];
         assert_eq!(budget["charged_iterations"], 1);
         assert_eq!(budget["remaining_iterations"], 3);
@@ -647,7 +649,6 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(payload["original_facts"]["total_prompt"], 42);
         assert_eq!(payload["original_facts"]["total_completion"], 7);
         assert_eq!(payload["original_facts"]["total_tool_calls"], 1);
-        assert!(payload["original_facts"]["canonical_turn_started_at"].is_string());
         assert!(payload["execution_deadline"]["deadline_unix_ms"].as_u64().is_some());
         assert!(payload["continuation"].is_object());
         let before_restart = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
@@ -656,13 +657,13 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let released: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?
-                     AND active_writer_json IS NULL AND active_reservation_json IS NULL"
-                ).bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
+                    "SELECT CAST(owner_pod_id IS NULL AND owner_lease_expires_at IS NULL AS SIGNED)
+                     FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?"
+                ).bind(&ctx.user_id).bind(&ctx.session_id).bind(&run_id).fetch_one(&ctx.pool).await.unwrap();
                 if released == 1 { break; }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("producer Drop releases canonical writer before pool shutdown");
+        }).await.expect("producer exit releases its actual Run lease before pool shutdown");
         drop(store);
         ctx.restart_after_execution_handoff().await;
         let store = DatabaseRunStateStore::new(ctx.shared_pool.clone());
@@ -688,22 +689,16 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let active = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(active.run_generation, recovered.run_generation + 1);
         assert_eq!(active.original_admission_data().unwrap(), &original_admission);
-        let receipts: Vec<String> = sqlx::query_scalar(
-            "SELECT receipt_json FROM session_context_operation_receipts
-             WHERE owner_user_id = ? AND session_id = ? AND operation_kind = 'resume_execution'"
-        ).bind(&ctx.user_id).bind(&ctx.session_id).fetch_all(&ctx.pool).await.unwrap();
-        assert_eq!(receipts.len(), 1);
-        let receipt: Value = serde_json::from_str(&receipts[0]).unwrap();
-        assert_eq!(receipt["run_id"], run_id);
-        assert_eq!(receipt["run_generation"], active.run_generation);
-        assert_eq!(receipt["checkpoint_id"], checkpoint.checkpoint_id);
-        assert_eq!(receipt["producer_generation"], original.run_generation);
-        assert_eq!(&receipt["source"], source);
-        assert_eq!(receipt["turn_reservation"]["reserved_turn"], turn);
-        assert!(receipt["writer_lease"]["writer_epoch"].as_u64().unwrap()
-            > source["writer_epoch"].as_u64().unwrap());
+        assert_eq!(active.opening_hash, original.opening_hash);
+        assert_eq!(active.context_admission_hash, original.context_admission_hash);
+        for table in ["session_context_heads", "session_context_operation_receipts", "session_context_authority_events"] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE owner_user_id = ? AND session_id = ?"
+            ))).bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
+            assert_eq!(count, 0, "Run restore must not install a Controller protocol in {table}");
+        }
         let slot: String = sqlx::query_scalar(
-            "SELECT run_id FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?"
+            "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))"
         ).bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
         assert_eq!(slot, run_id);
 
@@ -718,9 +713,9 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         }).await.unwrap().is_none(), "old producer cannot republish its checkpoint");
         assert!(!store.append_events_if_current_generation_and_status(
             &ctx.user_id, &ctx.session_id, &run_id, original.run_generation, &["running"],
-            &[json!({"event_type":"run_accounting_finalized","idempotency_key":"stale-handoff-accounting",
-                "data":{"prompt_tokens":999}})],
-        ).await.unwrap(), "old producer cannot settle resumed usage");
+            &[json!({"event_type":"communication","idempotency_key":"stale-handoff-message",
+                "data":{"from":"parent","to":"parent","message":"stale producer cannot publish"}})],
+        ).await.unwrap(), "old producer cannot append to the resumed event frontier");
         assert_eq!(store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap().run_generation,
             active.run_generation);
         assert_eq!(store.load_latest_checkpoint(&ctx.user_id, &run_id, Some("execution_handoff"))
@@ -728,7 +723,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let requests = ctx.native_provider_requests().await;
         assert_eq!(requests.len(), 2, "one physical request before and after restart");
         let messages = requests[1].body["messages"].as_array().unwrap();
-        assert_eq!(payload["original_user_message"], message);
+        assert_eq!(original.opening.as_ref().unwrap().input().unwrap().original_input, message);
         assert_eq!(requests[0].body["messages"].as_array().unwrap().iter()
             .filter(|m| m["role"] == "user" && m["content"] == message.trim()).count(), 1);
         assert_eq!(messages.iter().filter(|m| m["role"] == "user" && m["content"] == message.trim()).count(), 1);
@@ -747,35 +742,39 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let saved_result = saved_messages.iter()
             .find(|m| m["role"] == "tool" && m["tool_call_id"] == *saved_id).unwrap();
         assert_eq!(results[0]["content"], saved_result["content"], "restore exact settled tool output");
-        // Run accounting settles independently of the canonical turn. Hold
-        // its actual head so this ordering cannot depend on database timing.
-        let canonical_key: astra_turn_types::SessionKeyV1 =
-            serde_json::from_value(source["key"].clone()).unwrap();
-        let mut canonical_head = ctx.pool.begin().await.unwrap();
-        let blocked_turn: i64 = sqlx::query_scalar(
-            "SELECT completed_turn FROM session_context_heads
-             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ? FOR UPDATE"
+        // Block the actual terminal transaction's first admission fence.
+        // Startup/resume no longer create an empty Controller head. The
+        // standalone raw-collision tests cover rollback after a terminal claim;
+        // here public observation must see no terminal before its Tx can run.
+        let canonical_key: astra_turn_types::SessionKeyV1 = serde_json::from_value(source["key"].clone()).unwrap();
+        let blocked_turn: Option<i64> = sqlx::query_scalar(
+            "SELECT completed_turn FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?"
         ).bind(&canonical_key.isolation_domain).bind(&canonical_key.owner_user_id)
             .bind(&canonical_key.session_id).bind(&canonical_key.branch_id)
-            .fetch_one(&mut *canonical_head).await.unwrap();
+            .fetch_optional(&ctx.pool).await.unwrap();
+        let mut terminal_fence = ctx.shared_pool.get().begin().await.unwrap();
+        sqlx::query("SELECT user_id FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ? FOR UPDATE")
+            .bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&mut *terminal_fence).await.unwrap();
         gates.0[1].notify_one();
-        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+        let await_terminal = || async {
             loop {
                 let terminal = store.load_run(&ctx.user_id, &run_id).await?
                     .ok_or_else(|| "resumed run disappeared before settlement".to_string())?;
-                if terminal.events.iter().any(|event| event["event_type"] == "run_settlement_finished"
-                    && event["data"]["owner_generation"] == active.run_generation) {
+                if terminal.status == "completed" && terminal.run_generation == active.run_generation
+                    && terminal.terminal_receipt_json.is_some() {
                     break Ok::<_, String>(terminal);
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await;
-        // Release even when the bounded observation failed, before unwrapping
-        // it, so fixture teardown cannot wait on our own projection lock.
-        canonical_head.rollback().await.expect("release canonical commit barrier");
-        let terminal = terminal.expect("run accounting settles while canonical commit is blocked")
+        };
+        let blocked_terminal = tokio::time::timeout(Duration::from_millis(200), await_terminal()).await;
+        // Always release the barrier before assertions and fixture teardown.
+        terminal_fence.rollback().await.expect("release canonical commit barrier");
+        assert!(blocked_terminal.is_err(), "Run terminal cannot precede the atomic Context commit");
+        let terminal = tokio::time::timeout(Duration::from_secs(15), await_terminal()).await
+            .expect("atomic terminal settles after releasing Context head")
             .expect("read exact-generation terminal settlement");
-        assert_eq!(blocked_turn + 1, turn as i64,
+        assert_eq!(blocked_turn.unwrap_or(0) + 1, turn as i64,
             "the reserved canonical turn was still uncommitted at run settlement");
         assert_eq!(harness::wait_for_run_status(&ctx.app, &run_id, auth, "completed", Duration::from_secs(15)).await,
             "completed");
@@ -785,9 +784,8 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(completed["accounting"]["completion_tokens"], 18);
         assert_eq!(completed["accounting"]["cache_read_tokens"], 0);
         assert_eq!(completed["accounting"]["cache_creation_tokens"], 0);
-        assert_eq!(completed["accounting"]["tool_outcomes"]["succeeded"], 1);
-        assert_eq!(completed["accounting"]["last_request_usage"]["prompt_tokens"], 52);
-        assert_eq!(completed["accounting"]["last_request_usage"]["completion_tokens"], 11);
+        assert_eq!(completed["accounting"]["tool_ledger_receipt"]["result_classes"]["succeeded"], 1);
+        assert!(completed["accounting"].get("last_request_usage").is_none());
         assert_eq!((terminal.total_prompt_tokens, terminal.total_completion_tokens), (94, 18));
         assert_eq!(terminal.total_tool_calls, 1, "settled discovery cannot execute again on restore");
         assert_eq!(terminal.events.iter().filter(|e| e["event_type"] == "run_started").count(), 1);
@@ -797,7 +795,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(finished[0]["data"]["status"], "completed");
         assert_eq!(finished[0]["data"]["prompt_tokens"], 94);
         assert_eq!(finished[0]["data"]["completion_tokens"], 18);
-        assert_eq!(finished[0]["data"]["last_request_usage"]["prompt_tokens"], 52);
+        assert!(finished[0]["data"].get("last_request_usage").is_none());
         assert_eq!(terminal.events.iter().filter(|e| e["event_type"] == "run_accounting_finalized").count(), 0,
             "normal atomic completion needs no control-terminal accounting correction");
         assert!(terminal.events.iter().any(|e| e["event_type"] == "text_done"
@@ -805,7 +803,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let roots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ?")
             .bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
         assert_eq!(roots, 1, "resume cannot admit a replacement run or delegate");
-        let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+        let slots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ? AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL) OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))")
             .bind(&ctx.user_id).bind(&ctx.session_id).fetch_one(&ctx.pool).await.unwrap();
         assert_eq!(slots, 0);
         let mut observed_head = None;
@@ -839,42 +837,15 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         assert_eq!(final_budget["remaining_iterations"], 2);
         assert_eq!(final_budget["effective_hard_turn_limit"], 4);
 
-        // Correlate each physical call with its canonical inference and route
-        // instead of accepting aggregate run totals as provider evidence.
-        let attempts = sqlx::query(
-            "SELECT a.attempt_id, a.status, a.usage_status, a.input_tokens, a.output_tokens,
-                    a.session_id, a.run_id, a.provider_wire_bytes, a.provider_wire_hash,
-                    i.invocation_id, i.turn_index, i.round_index,
-                    i.session_id AS invocation_session, i.run_id AS invocation_run,
-                    r.session_id AS route_session, r.run_id AS route_run,
-                    r.offering_id, r.resolved_model_name
-             FROM inference_provider_attempts a
-             JOIN inference_invocations i ON i.user_id = a.user_id AND i.invocation_id = a.invocation_id
-             JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id
-             WHERE a.user_id = ? AND a.run_id = ? AND i.purpose = 'primary_agent'
-             ORDER BY i.round_index, a.attempt_index"
-        ).bind(&ctx.user_id).bind(&run_id).fetch_all(&ctx.pool).await.unwrap();
-        assert_eq!(attempts.len(), 2);
-        for (index, row) in attempts.iter().enumerate() {
-            for column in ["session_id", "invocation_session", "route_session"] {
-                assert_eq!(row.get::<String, _>(column), ctx.session_id);
-            }
-            for column in ["run_id", "invocation_run", "route_run"] {
-                assert_eq!(row.get::<String, _>(column), run_id);
-            }
-            assert_eq!(row.get::<String, _>("offering_id"), ctx.model_offering_id);
-            assert_eq!(row.get::<String, _>("resolved_model_name"), format!("mock-{}", ctx.suffix));
-            assert_eq!(row.get::<String, _>("status"), "succeeded");
-            assert_eq!(row.get::<String, _>("usage_status"), "provider_exact");
-            assert_eq!(row.get::<i64, _>("turn_index"), turn as i64);
-            assert_eq!((row.get::<i64, _>("input_tokens"), row.get::<i64, _>("output_tokens")), [(42, 7), (52, 11)][index]);
-            assert_eq!(row.get::<i64, _>("provider_wire_bytes"), requests[index].raw_body.len() as i64);
-            assert_eq!(row.get::<String, _>("provider_wire_hash"), format!("{:x}", Sha256::digest(&requests[index].raw_body)),
-                "database attempt identifies the exact captured provider body");
-        }
-        assert_ne!(attempts[0].get::<String, _>("attempt_id"), attempts[1].get::<String, _>("attempt_id"));
-        assert_ne!(attempts[0].get::<String, _>("invocation_id"), attempts[1].get::<String, _>("invocation_id"));
-        assert_eq!(attempts[1].get::<i64, _>("round_index"), attempts[0].get::<i64, _>("round_index") + 1);
+        // Actual HTTP requests prove both dispatches and restored input. Run
+        // accounting above preserves cumulative usage; ordinary restoration
+        // does not reconstruct or ingest a duplicate per-round trace.
+        let diagnostics: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?
+               AND event_type IN ('trace_span', 'llm_round', 'llm_round_completed')"
+        ).bind(&ctx.user_id).bind(&ctx.session_id)
+            .fetch_one(&ctx.pool).await.unwrap();
+        assert_eq!(diagnostics, 0, "ordinary restoration must not ingest round diagnostics");
         assert_eq!(store.load_latest_checkpoint(&ctx.user_id, &run_id, Some("execution_handoff"))
             .await.unwrap().unwrap(), checkpoint);
         }).await.expect("bounded public execution handoff regression");
@@ -914,170 +885,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
     catalog_closed.expect("bounded catalog connection close");
 }
 
-pub async fn run_paused_accounting_generation_fence_http() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let run_id = format!("run-paused-accounting-{}", ctx.suffix);
-    let now = chrono::Utc::now().to_rfc3339();
-    let generation = 7;
-    let store = DatabaseRunStateStore::new(ctx.shared_pool.clone())
-        .with_owner_pod_id("different-from-draining-executor");
-    store
-        .insert_run(DurableRunRecord {
-            run_id: run_id.clone(),
-            user_id: ctx.user_id.clone(),
-            session_id: ctx.session_id.clone(),
-            parent_run_id: None,
-            root_run_id: Some(run_id.clone()),
-            ancestor_path: Some(run_id.clone()),
-            depth: 0,
-            delegation_id: None,
-            agent_id: Some("paused-accounting-fixture".into()),
-            retry_of: None,
-            retry_scope: Some("node".into()),
-            status: "paused".into(),
-            waiting_for: None,
-            owner_pod_id: None,
-            owner_lease_expires_at: None,
-            run_generation: generation,
-            last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
-            error_code: None,
-            error_message: None,
-
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_tool_calls: 0,
-            agent_binding_id: None,
-            agent_binding_name: None,
-            agent_binding_schema_version: None,
-            model_offering_id: None,
-            resolved_model_name: None,
-            runtime_profile: None,
-            start_request_fingerprint: None,
-            work_binding: None,
-            events: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
-        })
-        .await
-        .expect("seed paused accounting run");
-    let accounting = json!({
-        "event_type": "run_accounting_finalized",
-        "idempotency_key": format!("run-accounting-finalized:{generation}"),
-        "data": {
-            "prompt_tokens": 101,
-            "cache_read_tokens": 202,
-            "cache_creation_tokens": 303,
-            "completion_tokens": 404,
-            "tool_call_count": 1,
-            "usage_scope": "run_total",
-            "last_request_usage": {
-                "prompt_tokens": 11,
-                "cache_read_tokens": 22,
-                "cache_creation_tokens": 33,
-                "completion_tokens": 44
-            },
-            "tool_outcomes": {
-                "requested": 1,
-                "executed": 1,
-                "succeeded": 1,
-                "failed": 0,
-                "rejected": 0,
-                "reused": 0,
-                "suppressed": 0,
-                "deferred": 0
-            }
-        }
-    });
-    assert!(
-        store
-            .append_events_if_current_generation_and_status(
-                &ctx.user_id,
-                &ctx.session_id,
-                &run_id,
-                generation,
-                &["paused"],
-                std::slice::from_ref(&accounting),
-            )
-            .await
-            .expect("append paused accounting")
-    );
-    assert!(
-        store
-            .append_events_if_current_generation_and_status(
-                &ctx.user_id,
-                &ctx.session_id,
-                &run_id,
-                generation,
-                &["paused"],
-                std::slice::from_ref(&accounting),
-            )
-            .await
-            .expect("retry paused accounting")
-    );
-    let mut conflicting = accounting.clone();
-    conflicting["data"]["prompt_tokens"] = json!(999);
-    store
-        .append_events_if_current_generation_and_status(
-            &ctx.user_id,
-            &ctx.session_id,
-            &run_id,
-            generation,
-            &["paused"],
-            &[conflicting],
-        )
-        .await
-        .expect_err("MatrixOne must reject conflicting immutable accounting");
-    assert!(
-        !store
-            .append_events_if_current_generation_and_status(
-                &ctx.user_id,
-                &ctx.session_id,
-                &run_id,
-                generation + 1,
-                &["paused"],
-                std::slice::from_ref(&accounting),
-            )
-            .await
-            .expect("reject stale accounting generation")
-    );
-
-    let (status, body) = get_json(
-        &ctx.app,
-        &format!("/chat/runs/{run_id}"),
-        Some(&b.auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "GET paused accounting run: {body}");
-    assert_eq!(body["status"], "paused");
-    assert!(body["waiting_for"].is_null());
-    assert_eq!(body["accounting"]["prompt_tokens"], 101);
-    assert_eq!(body["accounting"]["cache_read_tokens"], 202);
-    assert_eq!(body["accounting"]["cache_creation_tokens"], 303);
-    assert_eq!(body["accounting"]["completion_tokens"], 404);
-    assert_eq!(
-        body["accounting"]["last_request_usage"]["prompt_tokens"],
-        11
-    );
-    assert_eq!(body["accounting"]["tool_outcomes"]["succeeded"], 1);
-    let finalized_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_run_events
-         WHERE user_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'",
-    )
-    .bind(&ctx.user_id)
-    .bind(&run_id)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("count generation-fenced accounting facts");
-    assert_eq!(finalized_count, 1);
-
-    ctx.close().await;
-}
-
-pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
+pub async fn run_live_resume_commits_through_the_current_owner() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let session_id = ctx.session_id.clone();
@@ -1137,9 +945,9 @@ pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
     .await;
     assert_eq!(pause_status, StatusCode::OK, "pause barrier run: {pause}");
 
-    // Resume immediately, before the deliberately delayed settlement can
-    // publish its marker. The API must wait for the atomic buffered terminal
-    // batch instead of manufacturing a session-continuation directive.
+    // Explicitly resume the still-live owner. Its actual terminal commit
+    // completes afterward; the API must not promote an in-memory buffered
+    // completion or manufacture a new Session turn.
     let (resume_status, resume) = post_empty(
         &ctx.app,
         &format!("/chat/runs/{run_id}/resume"),
@@ -1153,9 +961,20 @@ pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
     );
     assert_eq!(
         resume["disposition"], "applied",
-        "resume must promote the already-buffered completion: {resume}"
+        "resume must reauthorize the existing live owner: {resume}"
     );
-    assert_eq!(resume["status"], "completed");
+    assert_eq!(resume["status"], "running");
+    assert_eq!(
+        harness::wait_for_run_status(
+            &ctx.app,
+            &run_id,
+            &b.auth_header,
+            "completed",
+            std::time::Duration::from_secs(10)
+        )
+        .await,
+        "completed"
+    );
     let (source_status, source) = get_json(
         &ctx.app,
         &format!("/chat/runs/{run_id}"),
@@ -1170,11 +989,8 @@ pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
     assert_eq!(source["accounting"]["cache_read_tokens"], 202);
     assert_eq!(source["accounting"]["cache_creation_tokens"], 303);
     assert_eq!(source["accounting"]["completion_tokens"], 404);
-    assert_eq!(
-        source["accounting"]["last_request_usage"]["prompt_tokens"],
-        101
-    );
-    assert_eq!(source["accounting"]["tool_outcomes"]["requested"], 0);
+    assert!(source["accounting"].get("last_request_usage").is_none());
+    assert_eq!(source["accounting"]["tool_ledger_receipt"]["attempted"], 0);
     let finalized_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_run_events
          WHERE user_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'",
@@ -1184,16 +1000,19 @@ pub async fn run_live_pause_wins_post_loop_settlement_accounting() {
     .fetch_one(&ctx.pool)
     .await
     .expect("count live paused accounting facts");
-    assert_eq!(finalized_count, 1);
+    assert_eq!(
+        finalized_count, 0,
+        "canonical completion has no separate accounting marker"
+    );
 
     let fixture_model = format!("mock-{}", ctx.suffix);
-    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("settlement accounting through actual provider",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="start a follow-up after promoting the paused completion")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"continuation completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("settlement accounting through actual provider",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="start a follow-up after resuming the live owner")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"continuation completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let (continuation_status, continuation) = post_json(
         &ctx.app,
         "/chat",
         Some(&b.auth_header),
         json!({
-            "message": "start a follow-up after promoting the paused completion",
+            "message": "start a follow-up after resuming the live owner",
         "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "session_id": session_id,
             "model_selection": seeded_model_selection(ctx),

@@ -115,18 +115,23 @@ bounded diagnostic data in report details, never interpreted as a valid score.
 Truncated, filtered, or unknown completion endings are rejected even if their
 text contains a score. External `--judger-cmd` process timeout behavior is unchanged.
 
-Live quality judging uses a bounded projection of the durable tool
-journal. It preserves canonical run, turn, round, batch, and parallel metadata
-when present; missing identity stays unknown and cannot prove batching. It
-reserves room for call identities and statuses before sharing the
-remaining budget across arguments and results, so a large early response does
-not hide later verification. Truncated fields report their original and omitted
-character counts; if even the call identities exceed the budget, the envelope
-reports omitted calls. The projection fits the final judge prompt's existing
-budget. Raw reports and deterministic checks retain the original evidence.
-An inconclusive quality judgment caused by omitted evidence is not proof that
-the agent's claimed result is false, and a passing exit code is not a substitute
-for inspecting quality failures.
+Live quality judging receives complete invocation-scoped tool documents from
+its authorized trace, including identities, dispositions, arguments, results
+and Work receipts. Rejected and suppressed requests stay non-executions.
+Child-result judging additionally retains the existing Server custody gates.
+Tool evidence and ordered user/assistant exchanges are structured input, not
+stderr excerpts. The harness does not truncate or repack them to obtain a
+verdict: built-in requests use the existing governed Server admission boundary,
+while an external command rejects a complete serialized envelope above 64 KiB
+before spawning. Stderr remains bounded diagnostic text. Inconclusive judgments
+and input-limit failures stay unavailable; they are never converted to passes.
+
+An owned archived invocation can be replayed without another model call using
+`ASTRA_TEST_JUDGER_REPLAY=/path/to/fixture.json cargo test -p astra-test-harness
+recorded_action_documents_reach_actual_judgment_request -- --ignored`.
+The private fixture contains `outcome`, machine `stream_capture` identity and
+`session` trace; the check compares every complete tool document with the actual
+judgment request. Store captured fixtures outside tracked source.
 
 Harness cleanup cancels only the exact server-issued Session observed by its
 CLI invocation. `astra session cancel` waits up to 10 seconds for the Server's
@@ -144,6 +149,13 @@ non-passing interrupted result. The case watchdog also covers stdout/stderr
 and machine-event drain after the CLI process exits; a descendant holding a
 pipe open cannot turn an incomplete capture into a passing result or leave the
 harness waiting without a bound.
+
+Execution preflight failures retain only categorical `final_state` and
+`interruption_kind` alongside the existing safe stage and error identifiers.
+These facts require a strictly parsed CLI terminal matching the process exit;
+unknown interruption labels, protocol failures and older sidecars produce null
+fields. An interrupted preflight remains a failed gate, with zero cases run.
+The report never includes provider text, interruption reasons or raw envelopes.
 
 Live agent cases require exit 0 by default. A negative test can explicitly
 expect a nonzero terminal code using `exit_code`, together with the expected
@@ -182,13 +194,18 @@ edges too before claiming the entire combined graph is acyclic.
 
 `journal_work_replacement_lifecycle` checks exact initial, cancelled, added, and
 delivered item counts using canonical Work and branch identities. It allows any
-unexecuted initial item to be cancelled, requires fresh addition identities, and
+initial item without a delivered outcome to be cancelled, requires fresh addition identities, and
 checks that the remaining initial items and additions each have a delivered
 settlement. Replays of the same execution do not count twice. Its optional
 `cancellation_after_deliveries` minimum requires causal evidence that the target
-remained unstarted until the preceding deliveries; a late snapshot alone is not
+remained active until the preceding deliveries; a late snapshot alone is not
 proof of deferred cancellation. Natural requests with unspecified cancellation
-targets and requests for an explicit deferred replacement use separate cases.
+targets and requests for an explicit deferred replacement use separate cases. Cancellation permits execution under an earlier active revision;
+accepted retirement receipts must fence later execution even before another
+complete board arrives. Use `require_cancel_before_execution` when the user
+requires the item never to start. Use `require_board_before_execution` to reject
+unbound pre-reads and require successful evidence under the delivered assignment.
+Parallel batch position alone does not prove cancellation/execution ordering.
 
 ## MOI consumer compatibility with a fresh Astra database
 
@@ -504,22 +521,18 @@ and latency measurements.
 
 ### Sustained ingestion and shared-pool pressure
 
-The collision-receipt and canonical-WAL tests separate database contracts from
-full-scale diagnostics. The normal collision contract still processes 1,024
-distinct conflicting payloads through the bounded batch writer, plus concurrent
-single-receipt checks. The normal WAL contract runs 32 rounds with the same
-retry ownership, stale-parent rollback, linear payload, recovery, and retirement
-assertions. To retain the original 1,024 **independent transactions contending
-on one identity** and 300-round WAL workload, opt in explicitly:
+The collision-receipt test separates the normal database contract from scale
+diagnostics. Its normal workload processes 1,024 distinct conflicting payloads
+through the bounded batch writer, plus concurrent single-receipt checks. To run
+1,024 independent transactions contending on one identity, opt in explicitly:
 
 ```bash
 # Use a dedicated test database and credentials from your environment/.env.
 ASTRA_TEST_DB_IT=1 ASTRA_TEST_STORAGE_SCALE=1 \
-cargo nextest run -p astra-services \
-  --test observation_capture_db_it --test inference_execution_db_it \
+cargo nextest run -p astra-services --test observation_capture_db_it \
   --run-ignored all --profile strict-online-ci --test-threads 1 \
   --success-output immediate \
-  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners) | test(canonical_transition_wal_is_linear_and_recoverable_across_many_rounds)'
+  -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners)'
 ```
 
 The scale mode retains the same 60-second online hard deadline and fails on timeout;

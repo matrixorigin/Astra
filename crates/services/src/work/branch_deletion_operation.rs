@@ -101,13 +101,12 @@ pub enum WorkBranchDeletionError {
     #[error("branch session cleanup failed: {0}")]
     SessionCleanup(String),
     #[error(
-        "branch lineage cleanup is not terminal (manifests={orphaned_manifests}, pins={orphaned_pins}, forks={orphaned_forks}, references={orphaned_references})"
+        "branch lineage cleanup is not terminal (manifests={orphaned_manifests}, pins={orphaned_pins}, forks={orphaned_forks})"
     )]
     LineagePending {
         orphaned_manifests: i64,
         orphaned_pins: i64,
         orphaned_forks: i64,
-        orphaned_references: i64,
     },
     #[error("branch deletion operation was not found")]
     OperationNotFound,
@@ -535,12 +534,9 @@ impl DatabaseWorkBranchDeletionService {
         Ok(())
     }
 
-    /// Fences the session only after its durable execution slot is empty.
-    ///
-    /// The session row and context head share this transaction with the
-    /// operation phase. Run-slot admission locks the same session row, so no
-    /// new run can enter between the empty-slot proof and the writer epoch
-    /// advance. Old writer leases and turn reservations then fail closed.
+    /// Fence only an idle Session under lifecycle -> Session admission.
+    /// Actual Run status, leases and invocation custody must settle before
+    /// this transaction advances the operation and revokes Context writers.
     pub async fn fence_session(
         &self,
         owner_id: &WorkOwnerId,
@@ -549,7 +545,34 @@ impl DatabaseWorkBranchDeletionService {
         operation_id: &str,
         executor_token: &str,
     ) -> Result<WorkBranchDeletionOperation, WorkBranchDeletionError> {
+        // The operation's Session identity is immutable. Discover it before
+        // locking, then revalidate under the operation lock. This preserves
+        // lifecycle -> Session/operation order against Run admission.
+        let observed = sqlx::query(
+            "SELECT * FROM work_branch_deletion_operations
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?",
+        )
+        .bind(owner_id.as_str())
+        .bind(work_id.as_str())
+        .bind(branch_id.as_str())
+        .bind(operation_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("find deletion fence Session", source))?
+        .ok_or(WorkBranchDeletionError::OperationNotFound)?;
+        let observed = decode_admission(&observed)?;
+        let needs_fence = observed.operation.state == WorkBranchDeletionState::Pending
+            && observed.operation.phase == WorkBranchDeletionPhase::Fence;
         let mut tx = self.begin("begin branch deletion fence").await?;
+        if needs_fence {
+            crate::storage::lock_agent_session_write_fence(
+                &mut tx,
+                observed.session_id.as_str(),
+                owner_id.as_str(),
+            )
+            .await
+            .map_err(|source| database_error("lock branch deletion lifecycle", source))?;
+        }
         let row = sqlx::query(
             "SELECT * FROM work_branch_deletion_operations
              WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?
@@ -572,6 +595,11 @@ impl DatabaseWorkBranchDeletionService {
                 .map_err(|source| database_error("commit replayed deletion fence", source))?;
             return Ok(admission.operation);
         }
+        if !needs_fence || observed.session_id != admission.session_id {
+            return Err(WorkBranchDeletionError::NeedsRepair(
+                "deletion fence identity or phase changed".into(),
+            ));
+        }
         verify_executor(&row, executor_token)?;
         let session = sqlx::query(
             "SELECT status FROM agent_sessions
@@ -590,16 +618,16 @@ impl DatabaseWorkBranchDeletionService {
         let _status: String = session
             .try_get("status")
             .map_err(|source| database_error("decode branch session status", source))?;
-        let active_slot: Option<String> = sqlx::query_scalar(
-            "SELECT run_id FROM agent_session_execution_slots
-             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+        if !crate::storage::session_execution_activity(
+            &mut tx,
+            owner_id.as_str(),
+            admission.session_id.as_str(),
+            None,
         )
-        .bind(owner_id.as_str())
-        .bind(admission.session_id.as_str())
-        .fetch_optional(&mut *tx)
         .await
-        .map_err(|source| database_error("check branch session execution slot", source))?;
-        if active_slot.is_some() {
+        .map_err(|source| database_error("check branch session execution", source))?
+        .is_idle()
+        {
             return Err(WorkBranchDeletionError::ActiveRuns);
         }
         sqlx::query(
@@ -923,9 +951,8 @@ impl DatabaseWorkBranchDeletionService {
 
     /// Proves that every retained lineage object is still owned by a valid
     /// descendant fork before branch-local records may disappear. Shared
-    /// immutable payloads are intentionally not deleted here: owner-level
-    /// segment GC remains bounded in the production reaper and may be shared
-    /// by unrelated branches.
+    /// node payloads remain under the existing fork/pin retention owner and
+    /// are collected with their node once the last descendant releases them.
     pub async fn reconcile_lineage(
         &self,
         owner_id: &WorkOwnerId,
@@ -1001,40 +1028,26 @@ impl DatabaseWorkBranchDeletionService {
         .map_err(|source| database_error("verify retained branch pins", source))?;
         let orphaned_forks: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM session_forks fork
-             WHERE fork.owner_user_id = ? AND fork.child_session_id = ?",
-        )
-        .bind(owner_id.as_str())
-        .bind(admission.session_id.as_str())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|source| database_error("verify deleted child forks", source))?;
-        let orphaned_references: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_manifest_segments segment
-             WHERE segment.owner_user_id = ? AND segment.session_id = ?
+             WHERE fork.owner_user_id = ? AND fork.child_session_id = ?
                AND NOT EXISTS (
-                   SELECT 1 FROM conversation_manifest_nodes node
-                   WHERE node.isolation_domain = segment.isolation_domain
-                     AND node.owner_user_id = segment.owner_user_id
-                     AND node.session_id = segment.session_id
-                     AND node.branch_id = segment.branch_id
-                     AND node.manifest_root = segment.manifest_root
+                   SELECT 1 FROM session_forks descendants
+                   WHERE descendants.isolation_domain = fork.isolation_domain
+                     AND descendants.owner_user_id = fork.owner_user_id
+                     AND descendants.parent_session_id = fork.child_session_id
+                     AND descendants.parent_branch_id = fork.child_branch_id
+                     AND descendants.state IN ('prepared', 'active')
                )",
         )
         .bind(owner_id.as_str())
         .bind(admission.session_id.as_str())
         .fetch_one(&mut *tx)
         .await
-        .map_err(|source| database_error("verify branch manifest references", source))?;
-        if orphaned_manifests != 0
-            || orphaned_pins != 0
-            || orphaned_forks != 0
-            || orphaned_references != 0
-        {
+        .map_err(|source| database_error("verify deleted child forks", source))?;
+        if orphaned_manifests != 0 || orphaned_pins != 0 || orphaned_forks != 0 {
             return Err(WorkBranchDeletionError::LineagePending {
                 orphaned_manifests,
                 orphaned_pins,
                 orphaned_forks,
-                orphaned_references,
             });
         }
         let updated = sqlx::query(

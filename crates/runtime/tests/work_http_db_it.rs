@@ -339,17 +339,14 @@ fn assert_field_absent(value: &Value, forbidden: &str) {
 
 async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
     for (table, owner_column) in [
-        ("session_transcript_projection_heads", "user_id"),
         ("session_transcript_items", "user_id"),
         ("session_context_operation_receipts", "owner_user_id"),
         ("session_context_authority_events", "owner_user_id"),
         ("session_fork_events", "owner_user_id"),
         ("session_forks", "owner_user_id"),
-        ("conversation_manifest_segments", "owner_user_id"),
         ("conversation_manifest_pins", "owner_user_id"),
         ("conversation_manifest_nodes", "owner_user_id"),
         ("session_context_heads", "owner_user_id"),
-        ("conversation_segments", "owner_user_id"),
         ("session_handoff_events", "owner_user_id"),
         ("session_handoffs", "owner_user_id"),
         ("session_attachments", "owner_user_id"),
@@ -359,7 +356,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("work_branch_creation_operations", "owner_id"),
         ("work_branch_control_operations", "owner_id"),
         ("work_branch_deletion_operations", "owner_id"),
-        ("agent_session_execution_slots", "user_id"),
         ("tool_invocation_ledger", "user_id"),
         ("agent_runs", "user_id"),
         ("work_item_attempts", "owner_id"),
@@ -2286,6 +2282,10 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     let now = chrono::Utc::now().to_rfc3339();
     DatabaseRunStateStore::new(pool.clone())
         .insert_run(DurableRunRecord {
+            opening: None,
+            opening_hash: None,
+            context_admission_hash: None,
+            terminal_receipt_json: None,
             run_id: active_run_id.clone(),
             user_id: owner_id.clone(),
             session_id: binding.session_id.as_str().to_string(),
@@ -3513,8 +3513,13 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
                 None,
             )
             .await,
-        Err(astra_services::SessionContextCoordinatorError::Fenced)
+        Err(astra_services::SessionContextCoordinatorError::ExecutionOccupied(
+            astra_services::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool
+        ))
     ));
+    assert!(
+        recovered["control_basis"]["writer_epoch"].as_u64().unwrap() > source_lease.writer_epoch
+    );
 
     let (abandoned_status, abandoned) = post_work_control(
         app.clone(),
@@ -3923,25 +3928,6 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
     let session_id = binding.session_id.as_str();
     let first_cursor = commit_test_conversation_turn(&pool, &owner_id, session_id, None, 1).await;
 
-    sqlx::query(
-        "INSERT INTO session_transcript_projection_heads
-         (user_id, session_id, completed_turn, journal_event_seq, conversation_seq,
-          canonical_root_hash, projection_schema, compaction_generation,
-          config_version_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(&owner_id)
-    .bind(session_id)
-    .bind(i64::from(first_cursor.completed_turn))
-    .bind(i64::try_from(first_cursor.journal_event_seq).unwrap())
-    .bind(i64::try_from(first_cursor.conversation_seq).unwrap())
-    .bind(&first_cursor.canonical_root_hash)
-    .bind(i64::from(first_cursor.projection_schema))
-    .bind(i64::try_from(first_cursor.compaction_generation).unwrap())
-    .bind(&first_cursor.config_version_id)
-    .execute(pool.get())
-    .await
-    .expect("insert transcript projection head");
     let large_content = "x".repeat(9_000);
     let large_payload = serde_json::json!({"detail": "y".repeat(17_000)}).to_string();
     for (item_seq, content, payload, committed_turn) in [
@@ -4014,9 +4000,9 @@ async fn work_transcript_is_bounded_committed_owner_scoped_and_causally_honest()
     let (stale_status, stale, _) =
         get_work_transcript(app.clone(), &owner_id, work_id, branch_id, "?limit=10").await;
     assert_eq!(stale_status, StatusCode::OK);
-    assert_eq!(stale["sync"], "projection_stale");
+    assert_eq!(stale["sync"], "current");
     assert_eq!(stale["canonical_head"]["completed_turn"], 2);
-    assert_eq!(stale["transcript_cursor"]["completed_turn"], 1);
+    assert_eq!(stale["transcript_cursor"]["completed_turn"], 2);
     assert_eq!(
         stale["canonical_head"]["canonical_root_hash"],
         second_cursor.canonical_root_hash
@@ -5849,18 +5835,9 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
         .expect("existing session fixture");
     }
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'active-run')",
-    )
-    .bind(&owner_id)
-    .bind(&busy_session_id)
-    .execute(pool.get())
-    .await
-    .expect("active run fixture");
-    sqlx::query(
         "INSERT INTO agent_runs
-         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status)
-         VALUES ('active-run', ?, ?, 'active-run', 'active-run', 0, 'running')",
+         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status, owner_pod_id, owner_lease_expires_at)
+         VALUES ('active-run', ?, ?, 'active-run', 'active-run', 0, 'running', 'live-work-owner', DATE_ADD(NOW(6), INTERVAL 60 SECOND))",
     )
     .bind(&owner_id)
     .bind(&busy_session_id)
@@ -5868,14 +5845,17 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     .await
     .expect("active durable run fixture");
     sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'missing-durable-run')",
+        "INSERT INTO tool_invocation_ledger
+         (user_id, session_id, run_id, turn_chain_id, invocation_id, identity_key,
+          fingerprint_json, decision_json, state, dispatch_certainty, attempt_count)
+         VALUES (?, ?, 'missing-durable-run', 'orphan-turn', 'orphan-call', 'orphan-effect',
+                 '{}', '{}', 'outcome_unknown', 'unknown', 1)",
     )
     .bind(&owner_id)
     .bind(&orphan_run_session_id)
     .execute(pool.get())
     .await
-    .expect("orphan execution slot fixture");
+    .expect("orphan unresolved effect fixture");
 
     let request = serde_json::json!({
         "request_id": "promote-current-session",
@@ -5943,25 +5923,14 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     assert_eq!(second_status, StatusCode::CONFLICT);
     assert_eq!(second["code"], "work_session_already_bound");
 
-    sqlx::query(
-        "INSERT INTO agent_session_execution_slots (user_id, session_id, run_id)
-         VALUES (?, ?, 'later-run')",
-    )
-    .bind(&owner_id)
-    .bind(&session_id)
-    .execute(pool.get())
-    .await
-    .expect("later active run fixture");
+    astra_runtime::RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())))
+        .start_run("later-run", &owner_id, &session_id)
+        .await
+        .expect("later active Run fixture");
     let (busy_replay_status, busy_replay) =
         post_work_session_binding(app.clone(), &owner_id, &session_id, request.clone()).await;
     assert_eq!(busy_replay_status, StatusCode::CREATED);
     assert_eq!(busy_replay, left.1, "exact replay survives a later run");
-    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
-        .bind(&owner_id)
-        .bind(&session_id)
-        .execute(pool.get())
-        .await
-        .expect("remove later active run fixture");
     sqlx::query("UPDATE agent_sessions SET status = 'closed' WHERE user_id = ? AND session_id = ?")
         .bind(&owner_id)
         .bind(&session_id)
@@ -6036,7 +6005,7 @@ async fn existing_session_promotion_is_atomic_idle_only_and_exactly_idempotent()
     let running_created = repository
         .create_genesis_in_running_session(running_genesis, "active-run")
         .await
-        .expect("the exact slot-owning run may establish Work");
+        .expect("the exact live coordinator may establish Work");
     assert_eq!(
         running_created.delivery_branch.parts().session_id.as_str(),
         busy_session_id

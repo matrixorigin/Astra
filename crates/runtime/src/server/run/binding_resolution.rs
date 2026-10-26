@@ -310,6 +310,8 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        original_input: Some(request.message.clone()),
+        initial_execution_contract: None,
         execution_authentication: request.execution_authentication.clone(),
         delegation_authority: crate::orchestration::DelegationAuthority::Allowed,
         delegated_model_requirements: None,
@@ -654,7 +656,7 @@ mod tests {
             completion_checks: None,
             model_catalog_reader: None,
             message: message.to_string(),
-            conversation_authority: None,
+
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),

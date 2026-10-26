@@ -223,16 +223,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_messaging::db_transport",
         product_owner="distributed agent mailbox discovery and lease recovery",
     ),
-    "agent_session_execution_slots": TableMetadata(
-        semantic_owner="astra_services::runs::DatabaseRunStateStore",
-        state_class="session-scoped execution exclusion fact",
-        primary_query="single active run claim and stale-owner recovery by user_id, session_id, run_id, and updated_at",
-        retention_policy="retain only while a session run owns the execution slot; release on terminal transition and remove with session hard delete",
-        rebuildability="not safely rebuildable from run status during concurrent execution because it is the serialization authority",
-        merge_guidance="keep separate from agent_runs; the composite session key is the storage-enforced exclusivity boundary across competing run rows",
-        migration_owner="astra_services::runs",
-        product_owner="session run exclusivity, resume, and crash recovery",
-    ),
     "session_execution_bindings": TableMetadata(
         semantic_owner="astra_services::session_context_coordinator",
         state_class="durable canonical Session execution-provider authority",
@@ -302,26 +292,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from provider attempts; one logical invocation may have multiple bounded delivery attempts without changing its owner or admitted route",
         migration_owner="astra_services::storage / inference_execution",
         product_owner="inference durability, usage attribution, billing, and recovery",
-    ),
-    "inference_canonical_transition_heads": TableMetadata(
-        semantic_owner="astra_services::inference_execution",
-        state_class="durable per-turn canonical provider transition lineage head",
-        primary_query="lock or load the single current head, result identity, chain length, and byte budget by user_id, session_id, and turn_index",
-        retention_policy="retain until the canonical coordinator absorbs the turn; retirement removes the head and its dedicated WAL rows through the absorbed turn",
-        rebuildability="not safely rebuildable while an unabsorbed provider delivery exists because message values and provider responses do not identify the sole recoverable lineage leaf",
-        merge_guidance="keep separate from immutable provider attempts; the composite primary key serializes one mutable head per session turn while the unique attempt key prevents ambiguous lineage",
-        migration_owner="astra_services::storage / inference_execution",
-        product_owner="provider canonical context durability, crash recovery, and fork prevention",
-    ),
-    "inference_canonical_transition_wal": TableMetadata(
-        semantic_owner="astra_services::inference_execution",
-        state_class="bounded append-only per-turn provider canonical recovery WAL",
-        primary_query="load one owner/session/turn chain by transition identity and walk parent links from the authoritative head",
-        retention_policy="retain only until canonical commit absorbs the turn; replacement checkpoints atomically truncate preceding deltas",
-        rebuildability="not safely rebuildable after provider delivery because the exact admitted canonical append is the crash-recovery authority",
-        merge_guidance="keep payloads out of provider-attempt audit rows; immutable deltas make hot-path write volume linear while the separate head serializes lineage",
-        migration_owner="astra_services::storage / inference_execution",
-        product_owner="provider canonical context durability, bounded recovery, and multi-session isolation",
     ),
     "inference_provider_attempts": TableMetadata(
         semantic_owner="astra_services::inference_execution",
@@ -489,7 +459,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         primary_query="run ownership, status, owner lease recovery, session active lists, retry lineage, and cursor pagination by user_id, run_id, session_id, status, updated_at, owner_pod_id, and owner_lease_expires_at",
         retention_policy="retain while run replay, recovery, pause/cancel, billing counters, retry lineage, and user-visible run history are needed; session hard delete prunes owner/session run rows after dependent run events, checkpoints, projections, prompts, and tool outputs are reconciled",
         rebuildability="not rebuildable from events without losing terminal status, owner lease generation, checkpoint pointer, counters, error state, runtime profile, and admission/recovery authority",
-        merge_guidance="do not merge into agent_run_events or run_display_projections; this table owns mutable run authority while events own replay and projections own repairable display state",
+        merge_guidance="do not merge into agent_run_events; this table owns mutable run authority while events own replay; display snapshots are derived on read",
         migration_owner="astra_services::runs",
         product_owner="runtime recovery, run lifecycle, run lists, billing counters",
     ),
@@ -497,21 +467,11 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::runs::DatabaseRunStateStore",
         state_class="durable run checkpoint fact",
         primary_query="latest and idempotent checkpoint lookup by user_id, run_id, checkpoint_kind, idempotency_key, node_seq, created_at, and session_id",
-        retention_policy="no independent age-based TTL: retain while recovery, resume, retry, replay, or projection repair may need typed checkpoint payloads; session hard delete prunes owner/session checkpoints in ordered bounded batches after checkpoint consumers are inactive",
+        retention_policy="no independent age-based TTL: retain while recovery, resume, retry, replay, or display snapshots may need typed checkpoint payloads; session hard delete prunes owner/session checkpoints in ordered bounded batches after checkpoint consumers are inactive",
         rebuildability="not rebuildable once checkpoint_json is removed because it may contain compacted runtime state that is intentionally not present in event logs",
         merge_guidance="do not merge into agent_runs; checkpoints are typed, idempotent, multi-version payload facts with different cardinality and retention pressure",
         migration_owner="astra_services::runs",
-        product_owner="run recovery, resume, retry, projection repair",
-    ),
-    "run_display_projections": TableMetadata(
-        semantic_owner="astra_services::runs::DatabaseRunStateStore",
-        state_class="derived run display projection",
-        primary_query="hot run list and display hydration by user_id, run_id, session_id, updated_at, projection_event_idx, and latest checkpoint metadata",
-        retention_policy="retain as a hot projection while run lists and display hydration need low-latency reads; repair jobs may clear and rebuild it from agent_runs, agent_run_events, and latest run_checkpoints",
-        rebuildability="rebuildable from agent_runs, agent_run_events, and latest run_checkpoints when repair tooling is available",
-        merge_guidance="do not merge into agent_runs; this is intentionally repairable display state rather than run lifecycle authority",
-        migration_owner="astra_services::runs",
-        product_owner="run list UI, display hydration, projection repair",
+        product_owner="run recovery, resume, retry, display snapshots",
     ),
     "conversation_log": TableMetadata(
         semantic_owner="astra_turn_core::conversation_log::db_store",
@@ -562,26 +522,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from prompt_request_records because chunk cardinality grows per prompt and must be pruned with its parent",
         migration_owner="astra_services::storage / prompt_delta",
         product_owner="prompt diffing and LLM request diagnostics",
-    ),
-    "session_tool_output_batches": TableMetadata(
-        semantic_owner="astra_services::runs::insert_tool_output_batch",
-        state_class="durable tool-output batch metadata",
-        primary_query="batch commit metadata by user_id, session_id, batch_id",
-        retention_policy="no independent age-based TTL: retain with tool outputs; session reaper invokes session hard delete to prune owner/session rows in ordered bounded batches after output rows",
-        rebuildability="rebuildable only if every individual output row remains intact",
-        merge_guidance="keep separate from session_tool_outputs; it bounds batch writes and records batch status/bytes",
-        migration_owner="astra_services::runs",
-        product_owner="tool output persistence and audit",
-    ),
-    "session_tool_outputs": TableMetadata(
-        semantic_owner="astra_services::runs::insert_tool_output_batch",
-        state_class="durable large payload fact",
-        primary_query="tool output lookup by user_id, session_id, output_id and batch order",
-        retention_policy="no independent age-based TTL: high-growth payload table is not rebuildable and may be referenced by previews/artifact refs; session reaper invokes session hard delete to prune owner/session rows in ordered bounded batches and cleanup must still respect unfinished runs",
-        rebuildability="not rebuildable once external or ephemeral tool output is gone",
-        merge_guidance="do not merge into agent_run_events; large payload retention and indexing are separate concerns",
-        migration_owner="astra_services::runs",
-        product_owner="tool output history, previews, and artifacts",
     ),
     "tool_invocation_ledger": TableMetadata(
         semantic_owner="astra_services::tool_invocation_ledger",
@@ -1433,23 +1373,14 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / auth",
         product_owner="reauthentication and step-up authorization",
     ),
-    "conversation_segments": TableMetadata(
-        semantic_owner="astra_services::context::conversation_segments",
-        state_class="immutable content-addressed conversation segment fact",
-        primary_query="segment content by isolation_domain, owner_user_id, segment_hash, or canonical_root_hash",
-        retention_policy="retain while a manifest or transcript references the canonical segment; remove unreferenced content only through bounded context cleanup",
-        rebuildability="rebuildable only from the original canonical transcript bytes, not from a current projection or manifest head",
-        merge_guidance="keep separate from conversation_manifest_nodes and conversation_manifest_segments; content-addressed payloads, manifest graph nodes, and ordered links have different authorities",
-        migration_owner="astra_services::storage / context",
-        product_owner="canonical conversation context storage and deduplicated segment reuse",
-    ),
+
     "conversation_manifest_nodes": TableMetadata(
         semantic_owner="astra_services::context::manifest",
-        state_class="durable immutable context manifest graph authority",
-        primary_query="manifest root and parent lineage by owner session/branch, conversation_seq, compaction_generation, and reachable state",
+        state_class="durable immutable context manifest and inline node content",
+        primary_query="manifest root and parent lineage by owner session/branch, conversation_seq, compaction_generation, and reachable state; current committed manifest creation time supplies Session read recency",
         retention_policy="retain reachable manifests and their lineage while session context can be restored; garbage-collect unreachable nodes only after pins and heads no longer reference them",
         rebuildability="not rebuildable from session_context_heads alone because parent lineage, root hashes, and reachability are manifest authority",
-        merge_guidance="keep separate from session_context_heads, manifest segments, events, and receipts; the manifest graph is immutable context authority, not a current projection or operation acknowledgment",
+        merge_guidance="keep immutable node metadata and ordered content in one row; the branch head, events and operation receipts retain their own owners",
         migration_owner="astra_services::storage / context",
         product_owner="canonical context manifest lineage, compaction, and recovery",
     ),
@@ -1463,16 +1394,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / context",
         product_owner="context retention pins, fork safety, and manifest garbage collection",
     ),
-    "conversation_manifest_segments": TableMetadata(
-        semantic_owner="astra_services::context::manifest",
-        state_class="durable ordered manifest-to-segment projection",
-        primary_query="ordered segment links by owner session/branch, manifest_root, and segment_position",
-        retention_policy="retain with each reachable manifest root; delete links only after the manifest is unreachable and pins/heads permit cleanup",
-        rebuildability="rebuildable from the immutable manifest node and segment content when both remain available",
-        merge_guidance="keep separate from conversation_segments and manifest nodes; ordered fanout is a projection of a manifest root, not segment content or graph lineage",
-        migration_owner="astra_services::storage / context",
-        product_owner="ordered context materialization and manifest segment traversal",
-    ),
+
     "inference_invocation_settlement_debts": TableMetadata(
         semantic_owner="astra_services::inference_execution::settlement",
         state_class="durable inference settlement recovery authority",
@@ -1536,7 +1458,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "session_context_heads": TableMetadata(
         semantic_owner="astra_services::context::heads",
         state_class="mixed current context projection plus live coordination/fencing authority",
-        primary_query="current context head by owner session/branch, latest_manifest_root, canonical_root_hash, completed_turn, and sequence counters",
+        primary_query="current context head by owner session/branch, latest_manifest_root, canonical_root_hash, completed_turn, and sequence counters; selected manifest joins provide Session read recency without controller timestamps",
         retention_policy="retain the current head while the session/branch is live; replace transactionally and delete with the owning session after manifest/event cleanup",
         rebuildability="manifest/sequence projection and root are repairable from manifests, authority events, and receipts; while active writer/reservation leases, expiry, writer_epoch, or authority epochs are live, the entire row is not safely rebuildable",
         merge_guidance="keep separate from manifest/events/receipts: heads are a current projection, manifests own canonical lineage, events own authority history, and receipts own idempotency outcomes; active writer, reservation, and fencing coordination remain distinct from repairable projection state",
@@ -1612,46 +1534,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from handoff events and handoff slots; lifecycle/idempotency, immutable history, and hot current coordination have separate boundaries",
         migration_owner="astra_services::storage / context",
         product_owner="session handoff lifecycle and recovery",
-    ),
-    "session_transcript_projection_heads": TableMetadata(
-        semantic_owner="astra_services::context::transcript_projection",
-        state_class="durable transcript projection sequence head",
-        primary_query="transcript projection head by user_id/session_id, completed_turn, journal_event_seq, conversation_seq, and canonical_root_hash",
-        retention_policy="retain the current projection checkpoint while transcript replay and compaction need it; replace during projection repair and remove with session cleanup",
-        rebuildability="advance only through contiguous canonical cursor promotion with complete materialized evidence; MAX(item_seq) cannot certify commitment",
-        merge_guidance="keep separate from session_context_heads, transcript items, manifests, and events; this is transcript projection state keyed by projection sequence, not canonical history",
-        migration_owner="astra_services::storage / context",
-        product_owner="transcript materialization, compaction, and projection recovery",
-    ),
-    "session_weighted_admission_gates": TableMetadata(
-        semantic_owner="astra_services::weighted_admission",
-        state_class="durable hot admission coordination gate",
-        primary_query="scope-level admission gate by scope_name and updated_at",
-        retention_policy="retain one gate per configured scope while admission coordination is enabled; recreate or remove with scope configuration",
-        rebuildability="fully rebuildable by admission bootstrap because it is coordination state rather than context history",
-        merge_guidance="keep separate from weighted reservations; the gate serializes scope coordination while reservations own capacity claims and expiry",
-        migration_owner="astra_services::storage / context",
-        product_owner="weighted context admission hot coordination",
-    ),
-    "session_weighted_admission_owner_usage": TableMetadata(
-        semantic_owner="astra_services::weighted_admission",
-        state_class="durable per-owner materialized admission usage projection",
-        primary_query="owner usage by scope_name, isolation_domain, owner_user_id, and resident/context/provider/cpu/io totals",
-        retention_policy="retain one row while the owner has active reservations; rows are maintained transactionally under the durable gate, zero-usage rows are removed on release, and all rows rebuild from live reservations after bootstrap or cleanup",
-        rebuildability="fully rebuildable from active weighted reservations in the same transaction as the global gate because this row is a materialized projection, not capacity authority",
-        merge_guidance="keep separate from weighted gates and reservations; the owner row accelerates per-owner limits while the gate coordinates the scope and reservations remain the fencing and expiry authority",
-        migration_owner="astra_services::storage / context",
-        product_owner="per-owner weighted admission usage and multi-session fairness",
-    ),
-    "session_weighted_admission_reservations": TableMetadata(
-        semantic_owner="astra_services::weighted_admission",
-        state_class="durable capacity reservation and fencing fact",
-        primary_query="active reservation by scope_name, reservation_id, owner session/branch, idempotency_hash, and expires_at",
-        retention_policy="retain reservations until expiry or release, then prune expired capacity claims in bounded batches",
-        rebuildability="not safely rebuildable during an active admission window because reserved bytes/tokens/slots and idempotency are capacity authority",
-        merge_guidance="keep separate from weighted gates and context heads; reservations own trust/fencing/capacity claims while gates coordinate and heads project context",
-        migration_owner="astra_services::storage / context",
-        product_owner="weighted admission capacity, idempotency, and recovery",
     ),
     "mcp_servers": TableMetadata(
         semantic_owner="astra_services::mcp_registry",
@@ -1750,14 +1632,14 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="session_history_chunks",
         decision="removed",
         current_read_paths=[
-            "none; history page/search/around now use session_transcript_items as the canonical history source"
+            "none; the secondary chunk reader and optional model-facing history actions are retired"
         ],
         current_write_paths=[
             "none in production; repository writes were confined to ignored fixtures and obsolete benchmarks"
         ],
         user_api_impact=(
-            "history tools retain canonical transcript paging, root-run filtering, search, and around-turn "
-            "behavior; obsolete chunk-only rows are not part of the supported history API"
+            "model-facing session history actions are retired; local journal commands and authenticated "
+            "Run reads retain their existing owners"
         ),
         migration_backfill=(
             "no compatibility backfill; the current schema contract excludes this unsupported "
@@ -1769,8 +1651,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
         test_evidence=[
             "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
-            "crates/runtime/src/server/tool_session_history.rs::history_search",
-            "crates/runtime/src/server/tool_session_history.rs::session_history_tools_filter_child_agent_rows_on_matrixone",
+            "crates/astra-tools/src/session_tool_contract.rs::action_contract_is_schema_surface_only",
         ],
         rationale=(
             "the chunk projection had a production reader but no production population path; it added a "

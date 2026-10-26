@@ -183,9 +183,6 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("memory_search", RO, ME),
     tool("memory_retrieve", RO, ME),
     tool("memory_profile", RO, ME),
-    tool("session_history_page", RO, ME),
-    tool("session_history_search", RO, ME),
-    tool("session_history_around", RO, ME),
     // ── Memory (action-aware) ────────────────────────────────────────
     //
     // Single consolidated entry. The `action` arg determines read vs write.
@@ -328,7 +325,7 @@ impl ToolRegistry {
     /// Returns the effective `ToolCategory` after inspecting `args` for
     /// consolidated tools.
     pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
-        if name == "memory" {
+        if name == "memory" || astra_turn_types::agent_tool_contract::is_agent_runtime_tool(name) {
             return classify(name, args).category;
         }
         self.category(name)
@@ -596,6 +593,15 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
+    if args.is_some_and(|args| {
+        astra_turn_types::agent_tool_contract::agent_invocation_semantics(name, args)
+            .ok()
+            .flatten()
+            .is_some_and(|semantics| semantics.run_observation)
+    }) {
+        meta_category = ToolCategory::ReadOnly;
+    }
+
     let shell_read_only = meta_category.is_shell()
         && args
             .and_then(|a| a.get("command"))
@@ -631,7 +637,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
     let idempotency = if shell_read_only || matches!(name, "task_output" | "task_list") {
         ToolIdempotency::PureRead
     } else {
-        r.idempotency(name)
+        r.idempotency_for(name, args)
     };
 
     ToolClassification {

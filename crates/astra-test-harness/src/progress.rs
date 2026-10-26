@@ -16,7 +16,11 @@ use tokio::sync::broadcast;
 pub const SCHEMA: &str = "astra.harness_progress.v5";
 pub const MAX_RECORD_BYTES: usize = 262_144;
 
-fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<Value>> {
+fn criteria(
+    values: &[CriterionResult],
+    outcome: &RunOutcome,
+    session: Option<&crate::session_capture::SessionCapture>,
+) -> io::Result<Vec<Value>> {
     values
         .iter()
         .map(|c| {
@@ -31,13 +35,13 @@ fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<
                 | Criterion::ExecutionToolSequence { .. }
                 | Criterion::ExecutionChildCount { .. }
                 | Criterion::ExecutionChildResultsAdopted { .. } =>
-                    crate::criteria::execution_contract_proof(&c.criterion, outcome)
+                    crate::criteria::execution_contract_proof(&c.criterion, outcome, session)
                         .map(|(_, diagnostic)| diagnostic)
                         .unwrap_or_else(|failure| failure.diagnostic()),
                 Criterion::DurationBetween { min_ms, max_ms } =>
                     json!({"kind":"count", "min":min_ms, "max":max_ms, "actual":outcome.duration_ms}),
                 Criterion::ToolsCountBetween { min, max } =>
-                    json!({"kind":"count", "min":min, "max":max, "actual":outcome.tool_calls_count}),
+                    json!({"kind":"count", "min":min, "max":max, "actual":outcome.observed_tool_calls()}),
                 Criterion::TurnRoundsBetween { min, max } =>
                     json!({"kind":"count", "min":min, "max":max, "actual":outcome.turn_rounds}),
                 Criterion::ExitCode { code } =>
@@ -62,7 +66,7 @@ fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<
                     let nested = c.full_detail.as_deref()
                         .and_then(|raw| serde_json::from_str::<Vec<CriterionResult>>(raw).ok());
                     match nested {
-                        Some(nested) => json!({"kind":"composite", "checks":criteria(&nested, outcome)?}),
+                        Some(nested) => json!({"kind":"composite", "checks":criteria(&nested, outcome, session)?}),
                         None => Value::Null,
                     }
                 }
@@ -91,7 +95,7 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         .map(|s| {
             Ok(json!({
                 "step_index":s.step_index, "passed":s.passed, "duration_ms":s.duration_ms,
-                "criteria":criteria(&s.criteria, &s.outcome)?
+                "criteria":criteria(&s.criteria, &s.outcome, report.session.as_ref())?
             }))
         })
         .collect();
@@ -99,7 +103,7 @@ fn row(report: &CaseRunReport) -> io::Result<Value> {
         json!({"case":report.case_name, "model":report.model, "run_index":report.run_index,
         "status":report.status, "has_warnings":report.has_warnings,
         "failure_class":failure, "exit_code":o.exit_code,
-        "criteria":criteria(&report.criteria, o)?, "steps":steps?,
+        "criteria":criteria(&report.criteria, o, report.session.as_ref())?, "steps":steps?,
         "token_usage_coverage":o.token_usage_coverage,
         "terminal_reported":{"duration_ms":o.duration_ms, "ttft_ms":o.ttft_ms,
             "turn_rounds":o.turn_rounds, "tool_calls_count":o.tool_calls_count,
@@ -236,17 +240,58 @@ mod tests {
     use super::*;
     use crate::{report::StepResult, runner::RunOutcome};
 
+    fn fixture_evaluate(criteria: &[Criterion], outcome: &RunOutcome) -> Vec<CriterionResult> {
+        let trace = outcome
+            .stream_capture
+            .as_ref()
+            .and_then(|s| s.execution.as_ref())
+            .map(crate::execution_capture::tests::trace);
+        crate::criteria::evaluate_deterministic_with_session(criteria, outcome, trace.as_ref())
+    }
+
+    fn fixture_criteria(
+        values: &[CriterionResult],
+        outcome: &RunOutcome,
+    ) -> io::Result<Vec<Value>> {
+        let trace = outcome
+            .stream_capture
+            .as_ref()
+            .and_then(|s| s.execution.as_ref())
+            .map(crate::execution_capture::tests::trace);
+        super::criteria(values, outcome, trace.as_ref())
+    }
+
+    #[test]
+    fn tool_budget_progress_reports_the_same_count_as_the_verdict() {
+        for (terminal, archive, expected, passed) in
+            [(7, 30, 30, false), (30, 7, 30, false), (8, 7, 8, true)]
+        {
+            let outcome = RunOutcome {
+                tool_calls_count: terminal,
+                total_tool_calls: archive,
+                ..RunOutcome::new("model")
+            };
+            let checks = fixture_evaluate(
+                &[Criterion::ToolsCountBetween { min: 4, max: 18 }],
+                &outcome,
+            );
+            let projected = fixture_criteria(&checks, &outcome).unwrap();
+            assert_eq!(projected[0]["passed"], passed);
+            assert_eq!(projected[0]["diagnostic"]["actual"], expected);
+        }
+    }
+
     #[test]
     fn missing_cache_scope_evidence_is_explained_without_publishing_private_data() {
         let mut outcome = RunOutcome::new("private-sentinel");
         outcome.stderr = "private-sentinel".into();
-        let checks = crate::criteria::evaluate_deterministic(
+        let checks = fixture_evaluate(
             &[Criterion::PromptCacheReuseScope {
                 scope: crate::case::PromptCacheReuseScope::ConversationTurns,
             }],
             &outcome,
         );
-        let projected = criteria(&checks, &outcome).unwrap();
+        let projected = fixture_criteria(&checks, &outcome).unwrap();
         assert_eq!(projected[0]["passed"], false);
         assert_eq!(projected[0]["diagnostic"]["kind"], "cache_scope");
         assert_eq!(projected[0]["diagnostic"]["observations"], Value::Null);
@@ -264,7 +309,7 @@ mod tests {
             serde_json::from_str(bad[0].full_detail.as_deref().unwrap()).unwrap();
         diagnostic["post_cold_cache_read_tokens"] = json!("private-sentinel");
         bad[0].full_detail = Some(diagnostic.to_string());
-        assert!(criteria(&bad, &outcome).is_err());
+        assert!(fixture_criteria(&bad, &outcome).is_err());
     }
 
     #[test]
@@ -306,8 +351,8 @@ mod tests {
                 "type":"execution_tool_count", "name":"agent", "min":1,"max":1,"root_only":true,
                 "predicates":[{"document":"arguments","path":"/requested_model_policy","equals":policy}]
             })).unwrap();
-            let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
-            let projected = criteria(&results, &outcome).unwrap();
+            let results = fixture_evaluate(&[criterion], &outcome);
+            let projected = fixture_criteria(&results, &outcome).unwrap();
             assert_eq!(projected[0]["passed"], false);
             let diagnostic = &projected[0]["diagnostic"];
             assert_eq!(diagnostic["actual"], 0);
@@ -347,8 +392,8 @@ mod tests {
                 {"document":"result","path":"/status","equals":"failed"}
             ]
         })).unwrap();
-        let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
-        let projected = criteria(&results, &outcome).unwrap();
+        let results = fixture_evaluate(&[criterion], &outcome);
+        let projected = fixture_criteria(&results, &outcome).unwrap();
         assert_eq!(projected[0]["passed"], false);
         assert_eq!(
             projected[0]["diagnostic"],
@@ -421,7 +466,7 @@ mod tests {
                 .unwrap()
                 .items[1]
                 .content = content.into();
-            let value = criteria(&results, &outcome).unwrap();
+            let value = fixture_criteria(&results, &outcome).unwrap();
             let observed = &value[0]["diagnostic"]["observed_outcomes"][0]["outcome"];
             assert_eq!(observed["status"], status);
             assert_eq!(observed["error_kind"], error);
@@ -434,7 +479,7 @@ mod tests {
         }
         outcome.stream_capture = None;
         assert_eq!(
-            criteria(&results, &outcome).unwrap()[0]["diagnostic"]["kind"],
+            fixture_criteria(&results, &outcome).unwrap()[0]["diagnostic"]["kind"],
             "unavailable"
         );
 
@@ -450,8 +495,8 @@ mod tests {
                 },
             ],
         };
-        let results = crate::criteria::evaluate_deterministic(&[composite], &outcome);
-        let nested = criteria(&results, &outcome).unwrap();
+        let results = fixture_evaluate(&[composite], &outcome);
+        let nested = fixture_criteria(&results, &outcome).unwrap();
         assert_eq!(
             nested[0]["diagnostic"]["checks"][1]["diagnostic"],
             json!({"kind":"count", "min":0,"max":45_000,"actual":80_000})
@@ -478,8 +523,8 @@ mod tests {
         let criterion: Criterion = serde_json::from_value(json!({"type":"execution_tool_count",
             "name":"agent","min":1,"max":1,"ok":true,"root_only":true}))
         .unwrap();
-        let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
-        let projected = criteria(&results, &outcome).unwrap();
+        let results = fixture_evaluate(&[criterion], &outcome);
+        let projected = fixture_criteria(&results, &outcome).unwrap();
         assert_eq!(projected[0]["passed"], false);
         let observed = &projected[0]["diagnostic"]["observed_outcomes"][0]["outcome"];
         assert_eq!(observed["validation"], receipt["validation"]);
@@ -567,8 +612,8 @@ mod tests {
                 serde_json::from_value(json!({"type":"execution_tool_count",
             "name":"agent", "min":1,"max":1,"ok":true,"root_only":true}))
                 .unwrap();
-            let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
-            let projected = criteria(&results, &outcome).unwrap();
+            let results = fixture_evaluate(&[criterion], &outcome);
+            let projected = fixture_criteria(&results, &outcome).unwrap();
             let diagnostic = &projected[0]["diagnostic"];
             assert_eq!(diagnostic["considered"], 20);
             assert_eq!(diagnostic["actual"], 0);
@@ -623,11 +668,6 @@ mod tests {
                 "missing-finalization",
                 "unavailable",
                 Some("finalization_unavailable"),
-            ),
-            (
-                "physical",
-                "unavailable",
-                Some("physical_execution_unavailable"),
             ),
             (
                 "window-identity",
@@ -739,9 +779,6 @@ mod tests {
                     capture["transcript"]["items"][0]["tool_calls"][0]["arguments"] =
                         args.to_string().into();
                 }
-                "physical" => {
-                    capture["reflection"]["model_requests"]["terminal"]["groups"] = json!([])
-                }
                 "window-identity" | "window-digest" | "window-invalid" | "window-shape" => {
                     let entry = &mut capture.pointer_mut(facts).unwrap()[1]["children"][0];
                     entry["result_truncated"] = true.into();
@@ -783,14 +820,14 @@ mod tests {
             stream.execution = Some(serde_json::from_value(capture).unwrap());
             outcome.stream_capture = Some(stream);
             let criterion: Criterion = serde_json::from_value(criterion).unwrap();
-            let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+            let results = fixture_evaluate(&[criterion], &outcome);
             assert_eq!(results[0].passed, status == "proven", "{fault}");
             assert_eq!(
-                crate::criteria::execution_verification_unavailable(&results[0], &outcome),
+                crate::criteria::execution_verification_unavailable(&results[0]),
                 status == "unavailable",
                 "{fault}"
             );
-            let projected = criteria(&results, &outcome).unwrap();
+            let projected = fixture_criteria(&results, &outcome).unwrap();
             assert_eq!(
                 projected[0]["diagnostic"],
                 json!({
@@ -843,7 +880,7 @@ mod tests {
                 crate::judger::evaluate_judger(&Judge(unavailable), &criterion, &outcome, None)
                     .await
                     .unwrap();
-            let projected = criteria(&[result], &outcome).unwrap();
+            let projected = fixture_criteria(&[result], &outcome).unwrap();
             assert_eq!(projected[0]["passed"], false);
             assert_eq!(projected[0]["diagnostic"]["assessment"], expected);
             assert!(
@@ -891,7 +928,7 @@ mod tests {
                     .unwrap()
                     .contains("private-sentinel")
             );
-            let projected = criteria(&[result], &outcome).unwrap();
+            let projected = fixture_criteria(&[result], &outcome).unwrap();
             assert_eq!(
                 projected[0]["diagnostic"],
                 json!({

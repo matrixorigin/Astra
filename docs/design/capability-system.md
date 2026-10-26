@@ -146,9 +146,15 @@ set, not a catalog of every useful workflow. Artifact-result recovery through
 remain eager as compact read-only observation operations. Their resident
 projections expose only the ordinary call shape; advanced reflection fields
 remain available through explicit typed `tool_search`/`invoke_tool` selection.
+Ordinary child delegation uses automatic result delivery at the runtime completion
+barrier. The resident `agent` schema exposes spawn, status, result access, and
+messaging; explicit `wait` observation is available through typed
+`tool_search`/`invoke_tool` selection of the canonical `agent` contract. It
+observes current-run activity and accepts no child ID. This projection adds no
+waiting loop, lifecycle state, database read, or execution path.
 Fan-out, advanced memory operations, and graph-maintenance schemas remain
 discoverable through the deferred surface. The resident compact-JSON schema
-projection has an 8 KiB regression budget for the actual serialized schema
+projection has a 9 KiB regression budget for the actual serialized schema
 array, without reserving space for hypothetical future fields; explicit user-
 pinned tools may exceed it. This budget excludes the rest of the provider
 request. Ordinary workspace navigation (`read_file`,

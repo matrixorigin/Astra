@@ -137,6 +137,12 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
+    /// The terminal summary and step-event archive overlap. A partial source
+    /// must not lower the observed total used by budgets and their diagnostics.
+    pub(crate) fn observed_tool_calls(&self) -> u32 {
+        self.total_tool_calls.max(self.tool_calls_count)
+    }
+
     /// A local failure has no physical execution to bind, inspect, or cancel.
     pub(crate) fn is_pre_execution_failure(&self) -> bool {
         self.server_admission_not_dispatched

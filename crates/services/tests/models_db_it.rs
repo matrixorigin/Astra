@@ -194,6 +194,11 @@ async fn batch_admission_is_ordered_owner_scoped_and_fresh() {
             .await
             .unwrap();
     }
+    sqlx::query("UPDATE infra_llm_models SET max_completion_tokens = 1024 WHERE model_id = ?")
+        .bind(&infra_a)
+        .execute(&pool)
+        .await
+        .unwrap();
     let personal = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO user_llm_models \
@@ -225,6 +230,14 @@ async fn batch_admission_is_ordered_owner_scoped_and_fresh() {
             .map(|item| item.offering_id.as_str())
             .collect::<Vec<_>>(),
         requested.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|item| item.max_completion_tokens)
+            .collect::<Vec<_>>(),
+        vec![Some(1024), None, None, None],
+        "deployment INT and personal/unspecified NULL limits retain their types"
     );
     assert_eq!(admitted[0].api_key, "infra-a-secret");
     assert_eq!(admitted[1].api_key, "personal-secret");

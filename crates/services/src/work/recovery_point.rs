@@ -17,7 +17,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, QueryBuilder, Row, query};
 
-use crate::runs::durable_run_status_blocks_session;
 use crate::session_context_coordinator::{
     SessionContextCoordinatorError, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
     lock_recovery_context_in_transaction,
@@ -261,7 +260,7 @@ impl DatabaseWorkRecoveryPointRepository {
 
         // The execution slot is the canonical between-Run fence. It is locked
         // before Work/branch rows, matching promotion's Session-first order.
-        crate::storage::admit_session_execution_write(
+        let execution_admission = crate::storage::admit_session_execution_write_with_facts(
             &mut transaction,
             &branch_session_id,
             request.owner_id.as_str(),
@@ -386,85 +385,29 @@ impl DatabaseWorkRecoveryPointRepository {
             ));
         }
 
-        // The Session/slot lock above prevents a new Run from racing this
-        // capture. Inspect the slot owner while that fence is held.
-        let active_run = query(
-            "SELECT r.run_id, r.status, r.waiting_for, r.parent_run_id,
-                    r.work_id, r.work_branch_id
-             FROM agent_session_execution_slots slot
-             LEFT JOIN agent_runs r
-               ON r.user_id = slot.user_id AND r.run_id = slot.run_id
-             WHERE slot.user_id = ? AND slot.session_id = ?
-             LIMIT 1
-             FOR UPDATE",
-        )
-        .bind(request.owner_id.as_str())
-        .bind(&branch_session_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| WorkRepositoryError::persistence("check active Work Run", source))?;
-        if let Some(run) = active_run {
-            let run_id = run
-                .try_get::<Option<String>, _>("run_id")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?
-                .ok_or(WorkRepositoryError::RecoveryPointNotCapturable {
-                    reason: super::repository::WorkRecoveryPointBlocker::DanglingRunSlot,
-                })?;
-            let status = run
-                .try_get::<Option<String>, _>("status")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?
-                .ok_or(WorkRepositoryError::RecoveryPointNotCapturable {
-                    reason: super::repository::WorkRecoveryPointBlocker::RunStatusMissing,
-                })?;
-            let waiting_for = run
-                .try_get::<Option<String>, _>("waiting_for")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
-            let work_id = run
-                .try_get::<Option<String>, _>("work_id")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
-            let work_branch_id = run
-                .try_get::<Option<String>, _>("work_branch_id")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
-            let parent_run_id = run
-                .try_get::<Option<String>, _>("parent_run_id")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery Run", source))?;
-            if parent_run_id.is_some()
-                || work_id.as_deref() != Some(request.work_id.as_str())
-                || work_branch_id.as_deref() != Some(request.branch_id.as_str())
-            {
-                return Err(WorkRepositoryError::corrupt(
-                    "Work recovery Run",
-                    std::io::Error::other("execution slot owner is not this Work root Run"),
-                ));
-            }
-            if durable_run_status_blocks_session(&status, waiting_for.as_deref()) {
-                return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                    reason: super::repository::WorkRecoveryPointBlocker::ActiveRun,
-                });
-            }
-            tracing::debug!(
-                run_id,
-                "ignoring non-blocking terminal Run during recovery capture"
-            );
-        }
-
         let key = SessionKeyV1::owner_session(
             "server",
             request.owner_id.as_str(),
             &branch_session_id,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
-        let context = lock_recovery_context_in_transaction(&mut transaction, &key)
-            .await
-            .map_err(map_context_verification_error)?;
-        if context.has_active_reservation {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::ActiveReservation,
-            });
-        }
+        let context =
+            lock_recovery_context_in_transaction(&mut transaction, &key, &execution_admission)
+                .await
+                .map_err(map_context_verification_error)?;
         if context.has_unresolved_invocations {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
                 reason: super::repository::WorkRecoveryPointBlocker::UnresolvedInvocation,
+            });
+        }
+        if context.execution_blocker.is_some() {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::ActiveRun,
+            });
+        }
+        if context.has_active_reservation {
+            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
+                reason: super::repository::WorkRecoveryPointBlocker::ActiveReservation,
             });
         }
         let execution = canonical_execution_binding(&key, context.execution_binding.as_ref())?;

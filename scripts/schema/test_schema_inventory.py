@@ -366,11 +366,8 @@ fn char_literal() { let slash = '/'; }
             "agent_sessions",
             "agent_runs",
             "run_checkpoints",
-            "run_display_projections",
             "conversation_log",
             "session_transcript_items",
-            "session_tool_output_batches",
-            "session_tool_outputs",
             "tool_invocation_ledger",
             "semantic_read_observations",
         }
@@ -403,24 +400,12 @@ fn char_literal() { let slash = '/'; }
             self.tables["agent_run_events"]["merge_guidance"],
         )
         self.assertIn(
-            "large payload",
-            self.tables["session_tool_outputs"]["state_class"],
-        )
-        self.assertIn(
             "owner lease recovery",
             self.tables["agent_runs"]["primary_query"],
         )
         self.assertIn(
             "not rebuildable from events",
             self.tables["agent_runs"]["rebuildability"],
-        )
-        self.assertIn(
-            "do not merge into agent_runs",
-            self.tables["run_display_projections"]["merge_guidance"],
-        )
-        self.assertIn(
-            "rebuildable from agent_runs",
-            self.tables["run_display_projections"]["rebuildability"],
         )
         self.assertIn(
             "do not merge into agent_runs",
@@ -431,7 +416,7 @@ fn char_literal() { let slash = '/'; }
         sessions = self.tables["agent_sessions"]
         runs = self.tables["agent_runs"]
         checkpoints = self.tables["run_checkpoints"]
-        projections = self.tables["run_display_projections"]
+        self.assertNotIn("run_display_projections", self.tables)
 
         self.assertIn("parent lifecycle row", sessions["retention_policy"])
         self.assertIn("cleanup boundary", sessions["merge_guidance"])
@@ -441,15 +426,12 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("pause/cancel", runs["retention_policy"])
         self.assertIn("owner lease generation", runs["rebuildability"])
         self.assertIn("events own replay", runs["merge_guidance"])
-        self.assertIn("projections own repairable display state", runs["merge_guidance"])
+        self.assertIn("display snapshots are derived on read", runs["merge_guidance"])
 
         self.assertIn("no independent age-based TTL", checkpoints["retention_policy"])
         self.assertIn("checkpoint_json", checkpoints["rebuildability"])
         self.assertIn("typed, idempotent, multi-version", checkpoints["merge_guidance"])
 
-        self.assertIn("derived run display projection", projections["state_class"])
-        self.assertIn("clear and rebuild", projections["retention_policy"])
-        self.assertIn("repairable display state", projections["merge_guidance"])
 
     def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
         second_batch = {
@@ -748,7 +730,6 @@ fn char_literal() { let slash = '/'; }
             "agent_run_events",
             "run_checkpoints",
             "conversation_log",
-            "session_tool_outputs",
             "prompt_request_records",
             "prompt_deltas",
             "agent_message_queue",
@@ -935,26 +916,17 @@ fn char_literal() { let slash = '/'; }
         for table in [
             "agent_events",
             "agent_run_events",
-            "session_tool_output_batches",
-            "session_tool_outputs",
         ]:
             with self.subTest(table=table):
                 policy = self.tables[table]["retention_policy"]
                 self.assertIn("session hard delete", policy)
                 self.assertIn("ordered bounded batches", policy)
 
-    def test_replay_and_tool_output_tables_do_not_have_independent_age_ttl(self) -> None:
+    def test_replay_tables_do_not_have_independent_age_ttl(self) -> None:
         run_events = self.tables["agent_run_events"]
         self.assertIn("no independent age-based TTL", run_events["retention_policy"])
         self.assertIn("projection repair", run_events["retention_policy"])
         self.assertIn("not rebuildable", run_events["rebuildability"])
-
-        batches = self.tables["session_tool_output_batches"]
-        outputs = self.tables["session_tool_outputs"]
-        self.assertIn("no independent age-based TTL", batches["retention_policy"])
-        self.assertIn("no independent age-based TTL", outputs["retention_policy"])
-        self.assertIn("artifact refs", outputs["retention_policy"])
-        self.assertIn("not rebuildable", outputs["rebuildability"])
 
     def test_external_hot_coordination_tables_have_semantic_metadata(self) -> None:
         for table in [

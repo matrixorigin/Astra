@@ -1490,7 +1490,7 @@ fn chat_request_into_data_maps_all_fields() {
     let req = ChatRequest {
         completion_checks: Some(serde_json::from_value(declarations.clone()).unwrap()),
         message: "hello".into(),
-        conversation_authority: None,
+
         user_intent: Some("pure hello".into()),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
@@ -1704,7 +1704,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
         completion_checks: None,
         message: "do step".into(),
-        conversation_authority: None,
+
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),

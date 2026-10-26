@@ -44,6 +44,25 @@ interruptions cannot mask later failures or cancellation. Final error exits clos
 current inner step through the shared finalization owner, including admission
 and guidance failures; they do not create a step if none began.
 
+Server Runs that exhaust automatic provider recovery settle as `failed`, retaining
+actual partial assistant text in the canonical transcript and Context. Diagnostic
+interruption hints do not grant durable resume authority. Failed settlement uses
+the existing C0 transaction, including cancellation arbitration, accepted-input
+disposition and exact owner retirement; it adds no separate pause protocol or
+query. An explicit new user message starts a new Run. Real input/approval waits,
+debugger pauses, confirmed handoff custody and ownership fencing retain their
+existing owners. A failed Run does not confirm unknown external effects or clear
+their admission debt. Shared stream consumers retain observed partial text and
+usage only after accepting the exact root's classified Failed terminal. That
+failure closes client admission without fabricating a successful completion,
+tool receipt or another provider request; malformed or missing terminal evidence
+still fails closed. CLI errors remain failed through the final text/JSON boundary;
+recovery hints cannot promote them into resumable completions. Failure reports
+retain observed qualified usage and model identity without polling Run accounting.
+Totals lost with the stream remain unknown locally; C0 remains the final accounting
+owner, and explicit Run queries remain available. Guidance disposition and exact
+cancellation/effect settlement keep their existing owners.
+
 ## Source API retirement
 
 The unused `LoopDispatcher` source API is retired; production hosts invoke the
@@ -172,6 +191,67 @@ test-only alternate approval submission protocol are retired; tests use the
 same fenced transition and atomic batch registration as production.
 
 ## Run
+
+Database-backed fresh root admission commits the Run identity, owner generation,
+initial lease and immutable opening in the existing Run transaction. The opening
+holds the exact original user input. Ordinary Agent turns acquire no Controller
+writer or turn reservation and write no admission transcript, audit input mirror,
+event counter or derived Session execution-slot row. The opening identity and
+hash bind commit-acknowledgement recovery to that transaction. Observation grants
+neither execution authority nor capacity.
+
+Immutable history preparation and process-local capacity admission happen before
+the transaction. Each attempt owns its RAII permit; a lost claim or rollback drops
+only that permit. Canonical lifecycle/Session/Run locks arbitrate actual execution
+and effect custody. No workspace, provider or tool operation occurs inside the
+transaction. Execution starts only within the original committed owner lease
+window. Prior-history restoration excludes the current Run's opening input, which
+becomes history for subsequent Runs.
+
+Selected Web detail reads use `GET /sessions/{id}/transcript?scope=conversation`.
+The transcript owner composes committed root/runless history and immutable root
+opening inputs by Session/Run/source identity. Early failure or cancellation
+requires no additional write. Root selection and raw rows share one SQL statement
+snapshot; Session metadata and artifact enrichment retain their existing separate
+read boundaries. They do not determine Run completion or execution authority.
+Raw scopes and their sequence cursors remain unchanged; projected opening inputs
+have no raw sequence. The conversation read selects at most 200 historical roots
+plus the current root, budgets serialized historical input at 256 KiB, and retains
+the selected input exactly within the existing opening-size limit. Display history
+is limited to 200 items; the live assistant placeholder is additional. Failed
+Runs project their public outcome from the same statement snapshot, including
+roots reached only by the raw-history window. The terminal receipt identifies
+the exact partial assistant row; completed intermediate replies stay complete.
+A failure without that visible row becomes a stable display notice without a
+raw sequence. Notices count toward the existing display limit. Public error
+detail is limited to 256 characters before transfer and charged conservatively
+against historical input admission; omitted detail retains failed status and a
+bounded generic message, and reports truncation. These are read projections,
+with no new persistence or per-Run lookup. Limits bound
+returned work, not rows examined by the database.
+
+Every selected detail refresh obtains this bounded view, including idle and warm
+pages. It does not enumerate the owner's Runs. An active Run initializes the
+existing stream parser at cursor zero even with empty raw history. A valid warm
+parser retains the entire in-flight conversation, including deferred guidance,
+until its actual stream terminal. Recovery discards responses if the Session, Run,
+assistant or parser binding changes during a read. Selecting another Run retires
+the previous stream writer before publishing that selection. No freshness state,
+input mirror or second lifecycle is introduced.
+
+The Web synchronous messages endpoint uses the same message, parser and writer
+lease as streaming requests. It claims that lease before admission awaits and
+binds the acknowledged Session/Run before observing events. Detail refreshes
+preserve this owner; Stop, deletion and successor selection retire its mutation
+authority. Observation loss after admission keeps the existing continuation for
+reconnection rather than treating the Run as failed or dispatching another turn.
+
+The shared loop exit owns terminal rendering, SessionFacts and the final
+checkpoint. Canonical Context retains conversation input; memory extraction
+is owned by explicit Session close/finalize, without a second per-turn handoff. Execution/tool phases return outcomes;
+they do not independently finalize the same turn. A retained input wait keeps
+its unfinished execution and is not a terminal settlement. SessionEnd is emitted
+once at that shared boundary, after cancellation and final text normalization.
 
 A run is a durable execution attempt inside a session. It owns status, owner lease, checkpoint lineage, current stage, and terminal outcome.
 
@@ -638,6 +718,29 @@ mode refreshes the next provider request and the host permission gate. Trusted
 approval clears the complete plan hint, including its multiline guidance, while
 other turn-start facts remain fixed. Model tool arguments cannot approve a plan.
 
+A live Server control watcher owns cross-pod pause/cancel polling and updates
+shared execution flags. Model boundaries consume those observations without
+another status query. If the watcher exits, boundaries restore the ordinary
+control read. Permission choices use the existing control wake watermark to
+refresh a round-local snapshot; the exact durable owner must still acknowledge
+every newly applied choice. A failed read or closed notification channel keeps
+authoritative refresh available.
+
+Root message inboxes activate when an admitted `agent` or `agent_fanout` call
+needs messaging/delegation. Ordinary chat and unrelated read tools create no
+mailbox subscription, empty poll, or mailbox cleanup writes. Late child messages
+retain their existing transport identity and are consumed by a later messaging
+turn; they do not inject unsolicited context into an unrelated ordinary turn.
+Existing child result/status readers remain available.
+
+Guidance admission is owned by the active Run and its execution lease. There
+is no separate input closing/reopening journal. A final boundary applies input
+already observed through the existing wake path; the atomic terminal
+transaction returns any later accepted but unapplied input to its submitting
+client. The client keeps its original identity and can queue it for the next
+turn. A terminal Run rejects new guidance while exact retries still reconcile
+an earlier committed acceptance.
+
 ## Cancellation
 
 Cancellation is a state transition with cleanup obligations:
@@ -720,25 +823,17 @@ Active-run enumeration is insufficient: terminal runs can retain live
 executors, owner leases, tool invocations or canonical turn authority. Retries
 rediscover that retained authority and preserve the targets observed while
 waiting. The coordinator owns one fenced Session execution-settlement proof,
-including slots, active execution, generation-scoped durable settlement fences
-(started without finished or accounting-finalized), writer/reservation authority,
-unresolved invocations and unfinished execution-binding switches. Run statuses
-remain truthful when completion wins a cancellation race.
+including active Run status, live execution leases, unresolved invocations and
+unfinished execution-binding switches. Run statuses remain truthful when
+completion wins a cancellation race. Per-provider request settlement markers are
+not ordinary Agent execution debt.
 
-At normal completion, a Server-owned turn commits its canonical context and
-releases its internally acquired writer in one coordinator transaction. Both
-authority audit facts remain durable with that commit. Externally retained
-writers keep the ordinary commit-without-release contract. An exact commit
-replay cannot release a newer writer or a later reservation held by the same
-writer; failure or cancellation cannot expose a half-committed context/release.
-
-An orphan's terminal transition does not itself retire its canonical writer.
-Cleanup rechecks the terminal Run generation and owner under the Session
-execution fence, then releases only the exact internally acquired writer and
-matching reservation. A newer writer, recovered generation or externally
-supplied controller lease is not released. A writer acquired before its Run
-exists remains pending. Cleanup is idempotent and can resume after a failed or
-unacknowledged attempt without replaying execution.
+Normal Server completion commits its Run-owned canonical context, exact raw
+conversation, terminal Run facts and owner retirement through the existing atomic
+settlement owner. It does not acquire or release a Controller writer. Orphan
+cleanup fences the actual Run generation and effect custody; terminal status or
+lease expiry alone cannot prove that an external effect stopped. The standalone
+Controller lease/reserve/commit APIs retain their own exact authority contracts.
 
 Cancellation invokes the existing terminal tool reconciler promptly. A
 prepared invocation with no dispatch attempts becomes a durable rejection;
@@ -830,7 +925,7 @@ Runtime lifecycle migration should proceed in stages:
 | Resume after compaction | Rebuild from checkpoint, transcript, tasks, provider state. |
 | Deleted task in old UI cache | Durable projection wins; task remains hidden. |
 | Owner lease expired | New owner may recover without double-executing non-idempotent side effects. |
-| Buffered completion exists | Finalize without resuming execution when safe. |
+| Buffered answer exists | Resume through current authorization, custody and Run execution guards; cached events never authorize completion. |
 
 The legacy webhook and schedule trigger APIs are retired. They did not admit a Run: webhook firing only returned `fired: true`, and stored cron expressions had no scheduler consumer. Executed work uses the existing Run admission and lifecycle boundaries.
 
@@ -873,35 +968,39 @@ admission. Cancellation and completion use the same slot as task startup.
 
 The source-only turn core/tool event writers, activity writer, and reflection
 state/lesson writer assembly are retired. Canonical loop append and atomic
-terminal settlement own the transcript, accepted trace-event projections, and
-the terminal display projection in one authoritative transaction; a terminal
-projection must preserve the latest committed checkpoint metadata. The
-resolution path rereads the committed projection hash after a lost commit
-acknowledgement instead of synthesizing one.
+terminal settlement own raw conversation history and canonical Run facts in one
+transaction. GET `/chat/runs/{run_id}/projection` renders the existing public
+snapshot from canonical Run/events and checkpoint metadata. There is no stored
+display projection, mirror hash or POST projection-repair API. A checkpoint
+summary may advance between display reads; only the exact checkpoint owner can
+admit resume. Lost-ACK terminal resolution retains exact generation, outcome,
+usage, event/batch identities and raw/Context evidence, with no display dependency.
 
 Terminal evidence admission reads exact run metadata and its cancellation
 marker under the session/execution/run locks once. Settlement consumes those
 transaction-owned facts; a root's already-locked marker is its complete
 cancellation lineage, while children still validate and lock their ancestors.
-Provider admission likewise needs no later-guidance lookup when its admitted
-control epoch equals the current locked run event frontier. Event append and
-frontier advance remain atomic; a lagging epoch retains the indexed guidance
-query and all owner/generation/lease/cancellation checks still apply.
+Agent model requests reuse the Run's local cancellation, pause, execution-lease
+loss and original deadline controls. They do not create a durable per-request
+owner, provider WAL or settlement debt. Main and auxiliary calls use the same
+transport observations. Offering authorization and durable tool invocation
+admission remain mandatory; losing model output on a process crash may require
+a user to resend or continue.
 
-The completed stream follows the durable terminal, canonical conversation
-commit and exact writer release. After its remaining projections and hooks, the
-owning run task drops the resident context and its interaction sender handles,
-then releases distributed capacity and retires absorbed provider WAL payloads.
-Until that cleanup completes, capacity is conservatively reserved. Existing
-permit-drop and expiry handling recover an
-interrupted release, while a later session boundary retries WAL retirement.
-An empty retirement on a writable owned session needs no child-write transaction;
-nonempty or unavailable snapshots retain the canonical lifecycle lock and checks.
+The completed stream follows the atomic durable terminal and canonical
+conversation commit. After remaining derived consumers and hooks, the owning task
+drops its resident context and interaction senders, then drops its process-local
+capacity permit. There is no distributed capacity release or expiry repair.
+Agent cleanup does not query or retire per-model WAL payloads because Agent
+execution no longer produces them.
 
 The Explain Analyze graph is produced only for a root run that explicitly
-requested it. Ordinary runs keep their lifecycle, transcript, trace, and
-recovery events; they do not create the second product graph stream, persist
-its typed graph facts, or publish a graph artifact. Resume carries the run's
+requested it. Ordinary runs retain canonical Context, raw conversation history,
+Run lifecycle/recovery events and real effect receipts. Optional database model,
+tool and Context diagnostics use the existing ingestion owner only for explicit
+root Explain; ordinary execution and children do not capture duplicate rows or
+run a separate diagnostic repair transaction. They do not create the product
+graph stream, persist its typed facts, or publish a graph artifact. Resume carries the run's
 durable Explain request so recovery cannot accidentally change that capture
 policy. Delegated child runs do not inherit the root's Explain request.
 hook DB writes, observer extraction, and auxiliary events keep their existing
@@ -936,3 +1035,28 @@ never authorizes a receipt. Abort guards retain supervised provenance while
 an owner is handed to a worker, and output pumps use the existing bounded
 drain on error as well as timeout. Operation timeouts and sandbox authority
 are unchanged.
+
+
+Server conversation continuation uses the canonical Context admitted for that
+Run. An absent head is an empty conversation; neither CSL nor raw transcript
+projections are alternate prompt-recovery authorities. The Server no longer
+loads, repairs, or persists a second CSL conversation projection. Advisory step
+checkpoint state may warm a continuation with canonical history, but cannot
+reconstruct same-Run execution custody. Explicit Run resume retains its exact
+checkpoint and generation validation.
+
+
+The production history-work baseline records the canonical Run event watermark,
+completion, owner/model correlation and actual provider usage. It no longer
+measures a duplicate display frontier or projection lag. Its report contract is
+`astra.history_work.production_baseline.v5`; process captures use
+`astra.history_work.production_process_capture.v4`. Older report shapes are
+rejected rather than interpreted as current evidence.
+
+Ordinary Server Run admission uses process capacity, weighted resident-work
+admission, and the selected model/provider's existing authorization. It does not
+consult or update the daily `resource_usage` token mirror. Qualified usage is
+committed on Run with its canonical terminal. A global daily token quota is not
+a Server chat admission guarantee. The resource governor remains the owner of
+explicit Session-creation limits; per-turn budgets, provider admission, policy,
+approval, and side-effect custody are unchanged.

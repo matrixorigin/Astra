@@ -650,7 +650,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
         # default user role plus the one bootstrap admin role.
         counts["auth_roles"] = 2
         counts["auth_user_roles"] = 2
-        counts["session_weighted_admission_gates"] = 16
         contract._validate_closed_schema_counts(canonical, canonical, counts)
         changed_bootstrap_auth = {**counts, "auth_users": 2}
         with self.assertRaisesRegex(contract.ContractError, "auth_users"):
@@ -669,76 +668,10 @@ class FreshDatabaseContractTests(unittest.TestCase):
                     contract._validate_closed_schema_counts(
                         canonical, canonical, changed
                     )
-        with self.assertRaisesRegex(
-            contract.ContractError, "session_weighted_admission_gates"
-        ):
-            contract._validate_closed_schema_counts(
-                canonical,
-                canonical,
-                {**counts, "session_weighted_admission_gates": 2},
-            )
         with self.assertRaisesRegex(contract.ContractError, "unknown"):
             contract._validate_closed_schema_counts(
                 canonical, canonical | {"unknown_runtime_table"}, counts
             )
-
-    def test_distributed_admission_scope_is_source_owned(self):
-        repo = MODULE_PATH.parents[2]
-        self.assertEqual(
-            contract._distributed_admission_scopes(repo),
-            [f"canonical_turn_v2_{partition:02}" for partition in range(16)],
-        )
-
-    def test_distributed_admission_scope_changes_follow_source_and_fail_closed(self):
-        source = (MODULE_PATH.parents[2] / "crates/services/src/weighted_admission.rs").read_text()
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            path = repo / "crates/services/src/weighted_admission.rs"
-            path.parent.mkdir(parents=True)
-            changed = source.replace("PARTITIONS: usize = 16;", "PARTITIONS: usize = 3;").replace(
-                "canonical_turn_v2_{partition:02}", "fixture_scope_{partition:02}_gate"
-            )
-            path.write_text(changed)
-            self.assertEqual(contract._distributed_admission_scopes(repo), [
-                "fixture_scope_00_gate", "fixture_scope_01_gate", "fixture_scope_02_gate",
-            ])
-            counts = {table: 1 for table in (
-                "astra_schema_contracts", "astra_schema_table_contracts", "infra_llm_models",
-                "maintenance_sweep_cursors", "sweeper_leases",
-            )}
-            counts["session_weighted_admission_gates"] = 3
-            contract._validate_closed_schema_counts(set(counts), set(counts), counts, repo=repo)
-            for wrong_count in (0, 1, 2, 4, 16):
-                with self.subTest(count=wrong_count):
-                    with self.assertRaisesRegex(contract.ContractError, "session_weighted_admission_gates"):
-                        contract._validate_closed_schema_counts(
-                            set(counts), set(counts),
-                            {**counts, "session_weighted_admission_gates": wrong_count}, repo=repo,
-                        )
-            for invalid in (
-                changed.replace("PARTITIONS: usize = 3;", "PARTITIONS: usize = 0;"),
-                changed.replace("PARTITIONS: usize = 3;", "PARTITIONS: usize = N;"),
-                changed.replace("{partition:02}", "{partition}"),
-                changed.replace('format!("fixture_scope_{partition:02}_gate")', 'other_scope(partition)'),
-                changed + '\npub(crate) const DISTRIBUTED_ADMISSION_PARTITIONS: usize = 4;\n',
-                "",
-            ):
-                with self.subTest(source=invalid[-100:]):
-                    path.write_text(invalid)
-                    with self.assertRaisesRegex(contract.ContractError, "source-owned"):
-                        contract._distributed_admission_scopes(repo)
-
-    def test_admission_gate_rows_require_the_exact_partition_inventory(self):
-        repo = MODULE_PATH.parents[2]
-        rows = [[scope] for scope in contract._distributed_admission_scopes(repo)]
-        contract._validate_admission_gates(rows, repo)
-        for invalid in (
-            [], rows[:-1], rows + [rows[0]], rows[:-1] + [rows[0]], [["canonical_turn_v1"]],
-            rows[:-1] + [["unknown_scope"]], [[rows[0][0], "extra_column"]] + rows[1:],
-        ):
-            with self.subTest(rows=invalid):
-                with self.assertRaisesRegex(contract.ContractError, "exact source scopes"):
-                    contract._validate_admission_gates(invalid, repo)
 
     def test_default_server_schema_allows_only_source_classified_conditional_tables(
         self,
@@ -762,7 +695,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 "astra_schema_table_contracts": 1,
                 "infra_llm_models": 1,
                 "maintenance_sweep_cursors": 1,
-                "session_weighted_admission_gates": 16,
                 "sweeper_leases": 1,
             }
         )

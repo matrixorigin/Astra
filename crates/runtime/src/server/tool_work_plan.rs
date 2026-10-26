@@ -320,7 +320,11 @@ pub(super) async fn inspect(
             false,
         );
     }
-    let Some(binding) = executor.work_binding.get() else {
+    let resolved_binding = match executor.resolve_work_binding().await {
+        Ok(binding) => binding,
+        Err(error) => return error,
+    };
+    let Some(binding) = resolved_binding else {
         return work_plan_error(
             "work_plan_binding_required",
             "This session has no validated canonical Work binding",
@@ -709,13 +713,6 @@ pub(super) async fn propose(
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         return cancelled();
     }
-    let Some(binding) = executor.work_binding.get() else {
-        return work_plan_error(
-            "work_plan_binding_required",
-            "This session has no validated canonical Work binding",
-            false,
-        );
-    };
     let mut args: ProposeWorkPlanArgs = match serde_json::from_value(args.clone()) {
         Ok(args) => args,
         Err(_) => {
@@ -791,6 +788,17 @@ pub(super) async fn propose(
                 true,
             );
         }
+    };
+    let resolved_binding = match executor.resolve_work_binding().await {
+        Ok(binding) => binding,
+        Err(error) => return error,
+    };
+    let Some(binding) = resolved_binding else {
+        return work_plan_error(
+            "work_plan_binding_required",
+            "This session has no validated canonical Work binding",
+            false,
+        );
     };
     let (proposal_id, source_ref) = match invocation_identity(
         binding,
@@ -1297,6 +1305,18 @@ mod tests {
                 "work_plan_cancelled"
             );
         }
+        for args in [
+            Value::Null,
+            json!({"context_id":"context", "reason":"invalid empty mutation", "additions":[], "revisions":[], "dependencies":[], "dependency_removals":[]}),
+        ] {
+            let result = propose(&executor, &args, ToolInvocationMetadata::default(), None).await;
+            assert!(result.is_error);
+            assert_eq!(
+                serde_json::from_str::<Value>(&result.output).unwrap()["error"]["code"],
+                "work_plan_arguments_invalid"
+            );
+            assert!(executor.work_binding.get().is_none());
+        }
     }
 
     #[tokio::test]
@@ -1340,18 +1360,33 @@ mod tests {
             true, false,
         ));
         assert!(!executor.supports_server_tool_name("inspect_work_plan"));
+        let closed_pool = SharedPool::new(pool.settings())
+            .await
+            .expect("independent pool");
+        closed_pool.close().await;
+        executor.set_context_manifest_pool(closed_pool);
+        let rejected = propose(&executor, &json!({"context_id":"context", "reason":"invalid empty mutation", "additions":[], "revisions":[], "dependencies":[], "dependency_removals":[]}), invocation("invalid-arguments"), None).await;
+        assert!(rejected.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected.output).unwrap()["error"]["code"],
+            "work_plan_arguments_invalid"
+        );
+        assert!(
+            executor.work_binding.get().is_none(),
+            "invalid arguments must not install authority"
+        );
         executor.set_context_manifest_pool(pool.clone());
-        executor.set_work_binding(WorkRuntimeBinding::new(
-            pool.clone(),
-            owner.clone(),
-            session.clone(),
-            work.clone(),
-            branch.clone(),
-        ));
+        assert!(executor.work_binding.get().is_none());
+        // A new executor represents the next turn or another Server. Two
+        // concurrent explicit reads must recover the same persisted identity.
+        let args = json!({});
+        let (inspected, concurrent) = tokio::join!(
+            inspect(&executor, &args, None),
+            inspect(&executor, &args, None),
+        );
+        assert!(!concurrent.is_error, "concurrent restore: {concurrent:?}");
         assert!(executor.supports_server_tool_name("inspect_work_plan"));
         assert!(executor.supports_server_tool_name("propose_work_plan"));
-
-        let inspected = inspect(&executor, &json!({}), None).await;
         assert!(!inspected.is_error, "inspect failed: {inspected:?}");
         let inspected: Value = serde_json::from_str(&inspected.output).expect("context JSON");
         assert_eq!(inspected["observation"]["coherence"], "coherent");
@@ -1805,13 +1840,7 @@ mod tests {
             None,
         );
         second_executor.set_context_manifest_pool(pool.clone());
-        second_executor.set_work_binding(WorkRuntimeBinding::new(
-            pool.clone(),
-            owner.clone(),
-            second_session,
-            second_work,
-            second_branch,
-        ));
+        assert!(second_executor.work_binding.get().is_none());
         let first_session_args = json!({});
         let second_session_args = json!({});
         let (first_session_read, second_session_read) = tokio::join!(

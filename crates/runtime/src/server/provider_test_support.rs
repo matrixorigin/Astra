@@ -525,36 +525,97 @@ pub(crate) fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Reuse the real inference ledger's existing test persistence implementation.
-/// This supplies invocation/attempt settlement, never a simulated host loop.
+/// Observations of the production transport. This fixture provides no model
+/// admission, storage, lease or settlement implementation.
 #[derive(Clone, Default)]
-pub struct InferenceLedgerFixture {
-    pub(crate) persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
+pub struct ProviderObservationsFixture {
+    calls: Arc<Mutex<std::collections::BTreeMap<String, ObservedCall>>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
-impl InferenceLedgerFixture {
-    #[cfg(feature = "e2e-hooks")]
-    pub fn admissions(
+struct ObservedCall {
+    scope: astra_turn_types::InferenceInvocationScope,
+    authority: astra_services::InferenceRunAdmissionAuthority,
+    attempts: Vec<crate::turn::llm::client::ProviderAttemptObservation>,
+    finished: bool,
+}
+
+impl ProviderObservationsFixture {
+    pub(crate) fn record(
+        &self,
+        id: &str,
+        scope: &astra_turn_types::InferenceInvocationScope,
+        authority: &astra_services::InferenceRunAdmissionAuthority,
+        attempts: Vec<crate::turn::llm::client::ProviderAttemptObservation>,
+        finished: bool,
+    ) {
+        if attempts.is_empty() {
+            return;
+        }
+        self.calls.lock().unwrap().insert(
+            id.to_string(),
+            ObservedCall {
+                scope: scope.clone(),
+                authority: authority.clone(),
+                attempts,
+                finished,
+            },
+        );
+        self.changed.notify_one();
+    }
+
+    pub fn requests(
         &self,
     ) -> Vec<(
         astra_turn_types::InferenceInvocationScope,
         Option<astra_services::InferenceRunAdmissionAuthority>,
     )> {
-        self.persistence.admissions()
+        self.calls
+            .lock()
+            .unwrap()
+            .values()
+            .map(|call| (call.scope.clone(), Some(call.authority.clone())))
+            .collect()
     }
-    /// Await the existing settlement owner without closing provider admission.
-    /// Cancellation returns after handoff; logical ledger settlement may follow.
-    pub async fn wait_for_settlements(&self, timeout: std::time::Duration) -> bool {
-        crate::turn::llm::durable::wait_for_provider_settlement_coordinator(timeout).await
+
+    pub async fn wait_for_completion(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.changed.notified();
+                if self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|call| call.finished)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok()
     }
+
     pub fn assert_quiescent(&self) {
-        self.persistence.assert_quiescent();
+        assert!(
+            self.calls
+                .lock()
+                .unwrap()
+                .values()
+                .all(|call| call.finished),
+            "provider transport still has an active request"
+        );
     }
+
     pub fn attempt_count(&self) -> usize {
-        self.persistence.attempt_count()
-    }
-    pub fn canonical_transition_hashes(&self) -> Vec<String> {
-        self.persistence.canonical_transition_hashes()
+        self.calls
+            .lock()
+            .unwrap()
+            .values()
+            .map(|call| call.attempts.len())
+            .sum()
     }
 }
 
@@ -598,7 +659,7 @@ pub fn admitted_execution(
 /// these defaults exercise primary request/response execution only.
 pub fn server_host_builder(
     gateway: &ProviderGateway,
-    ledger: &InferenceLedgerFixture,
+    ledger: &ProviderObservationsFixture,
     session_id: &str,
     provider: &str,
     model: &str,
@@ -627,7 +688,7 @@ pub fn server_host_builder(
         "provider-fixture-user".into(),
         session_id.into(),
     )
-    .with_test_inference_ledger(ledger.persistence.clone())
+    .with_provider_observations(ledger.clone())
     .with_model_service(Some(Arc::new(OfferingCatalogFixture {
         execution: execution.clone(),
     })))
@@ -833,7 +894,7 @@ mod tests {
                 vec![response],
             )])
             .await;
-            let ledger = InferenceLedgerFixture::default();
+            let ledger = ProviderObservationsFixture::default();
             let session = format!("child-read-{}", uuid::Uuid::new_v4());
             let mut host =
                 server_host_builder(&gateway, &ledger, &session, "openai", "fixture-model", None)
@@ -898,7 +959,7 @@ mod tests {
 
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn execute_turn_replans_tier_after_compaction_memory_refresh() {
+    async fn execute_turn_refreshes_memory_only_during_real_compaction() {
         use crate::session_memory::runner::{SESSION_MEMORY_PREFIX, encode_session_memory_entry};
         use crate::turn::agentic_loop::host::AgenticLoopHost;
         use astra_memoria::{MemoriaMemory, MemoriaOperationError, MemoriaPort};
@@ -907,7 +968,6 @@ mod tests {
 
         struct RefreshingSessionMemory {
             session_id: String,
-            initial: String,
             refreshed: String,
             snapshot_reads: Mutex<Vec<bool>>,
         }
@@ -935,19 +995,16 @@ mod tests {
             ) -> Result<Vec<MemoriaMemory>, MemoriaOperationError> {
                 assert_eq!(session_id, Some(self.session_id.as_str()));
                 assert!(filter_session);
-                // Initial prompt recall and snapshot loading run concurrently.
-                // Identify the canonical snapshot query, never their call order.
-                let initial = query.starts_with(SESSION_MEMORY_PREFIX);
-                self.snapshot_reads.lock().unwrap().push(initial);
+                assert!(
+                    !query.starts_with(SESSION_MEMORY_PREFIX),
+                    "ordinary preparation must not load an implicit memory snapshot"
+                );
+                self.snapshot_reads.lock().unwrap().push(false);
                 Ok(vec![MemoriaMemory {
                     memory_id: "session-snapshot".into(),
                     session_id: Some(self.session_id.clone()),
                     memory_type: "working".into(),
-                    content: if initial {
-                        self.initial.clone()
-                    } else {
-                        self.refreshed.clone()
-                    },
+                    content: self.refreshed.clone(),
                     ..Default::default()
                 }])
             }
@@ -994,19 +1051,10 @@ mod tests {
             ),
         ])
         .await;
-        let ledger = InferenceLedgerFixture::default();
+        let ledger = ProviderObservationsFixture::default();
         let session = format!("memory-refresh-{}", uuid::Uuid::new_v4());
         let memory = Arc::new(RefreshingSessionMemory {
             session_id: session.clone(),
-            // The initial bound snapshot alone exceeds the Offering's input
-            // window; the refreshed snapshot leaves this fixed history small.
-            initial: encode_session_memory_entry(
-                &session,
-                &format!(
-                    "## Current State\n- Initial snapshot: {}",
-                    "earlier detail ".repeat(40_000)
-                ),
-            ),
             refreshed: encode_session_memory_entry(
                 &session,
                 "## Current State\n- Refreshed snapshot: review remains active.",
@@ -1020,7 +1068,7 @@ mod tests {
         let history = (0..12)
             .map(|index| json!({
                 "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(200)),
+                "content": format!("Historical exchange {index}: {}", "review evidence ".repeat(if index < 4 { 30_000 } else { 32 })),
             }))
             .collect();
         let mut state = loop_state(&session, history, "Summarize the review evidence.");
@@ -1030,13 +1078,9 @@ mod tests {
             .await
             .expect("refreshed turn must finish");
 
-        // Compaction retrieves only at a non-Normal initial tier. Ending at
-        // Normal proves the real execute_turn rerun crossed the old assertion.
-        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [true, false]);
-        assert_eq!(
-            state.last_llm_context_manifest_trace.as_ref().unwrap()["compaction_tier"],
-            "Normal"
-        );
+        // A real history compaction owns the only memory read; ordinary
+        // preparation does not fetch a session snapshot before it.
+        assert_eq!(*memory.snapshot_reads.lock().unwrap(), [false]);
         assert_eq!(state.compact_tier_applied, CompactionTier::AggressivePrune);
         assert_eq!(result.accum.full_text, "Review complete.");
         assert_eq!(result.accum.finish_reason.as_deref(), Some("stop"));

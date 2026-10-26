@@ -590,6 +590,17 @@ impl DatabaseSessionHandoffService {
     ) -> Result<ClaimSessionControllerOutcomeV1, SessionHandoffError> {
         validate_key_and_id(key, attachment_id)?;
         let mut tx = self.begin("begin_claim_controller").await?;
+        let execution = crate::storage::admit_session_execution_write_with_facts(
+            &mut tx,
+            &key.session_id,
+            &key.owner_user_id,
+        )
+        .await
+        .map_err(|source| database_error("admit_controller_claim", source))?;
+        let run_blocker = crate::session_context_coordinator::lock_session_run_execution_blocker(
+            &mut tx, key, &execution,
+        )
+        .await?;
         let now = database_now_ms(&mut tx).await?;
         let active_handoff_id: Option<String> = sqlx::query_scalar(
             "SELECT active_handoff_id FROM session_handoff_slots
@@ -632,7 +643,7 @@ impl DatabaseSessionHandoffService {
             return Ok(outcome);
         }
 
-        if lock_active_writer_fact(&mut tx, key, now).await? {
+        if run_blocker.is_some() || lock_active_writer_fact(&mut tx, key, now).await? {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_controller_writer_conflict", source))?;
@@ -658,9 +669,17 @@ impl DatabaseSessionHandoffService {
     ) -> Result<ClaimSessionControllerOutcomeV1, SessionHandoffError> {
         validate_key_and_id(key, attachment_id)?;
         let mut tx = self.begin("begin_take_idle_controller").await?;
+        let execution = crate::storage::admit_session_execution_write_with_facts(
+            &mut tx,
+            &key.session_id,
+            &key.owner_user_id,
+        )
+        .await
+        .map_err(|source| database_error("admit_idle_controller", source))?;
         let outcome = mutate_idle_controller_in_transaction(
             &mut tx,
             key,
+            &execution,
             attachment_id,
             IdleControllerMutationV1::Acquire,
             None,
@@ -694,9 +713,17 @@ impl DatabaseSessionHandoffService {
     ) -> Result<ReleaseSessionControllerOutcomeV1, SessionHandoffError> {
         validate_key_and_id(key, attachment_id)?;
         let mut tx = self.begin("begin_release_idle_controller").await?;
+        let execution = crate::storage::admit_session_execution_write_with_facts(
+            &mut tx,
+            &key.session_id,
+            &key.owner_user_id,
+        )
+        .await
+        .map_err(|source| database_error("admit_idle_controller", source))?;
         let outcome = mutate_idle_controller_in_transaction(
             &mut tx,
             key,
+            &execution,
             attachment_id,
             IdleControllerMutationV1::Release,
             None,
@@ -1991,11 +2018,15 @@ async fn lock_active_controllers(
 pub(crate) async fn mutate_idle_controller_in_transaction(
     tx: &mut CancellationSafeTransaction,
     key: &SessionKeyV1,
+    execution: &crate::storage::SessionExecutionAdmissionFacts,
     attachment_id: &str,
     mutation: IdleControllerMutationV1,
     expected_basis: Option<&SessionControllerBasisV1>,
 ) -> Result<IdleControllerMutationOutcomeV1, SessionHandoffError> {
     validate_key_and_id(key, attachment_id)?;
+    let run_blocker =
+        crate::session_context_coordinator::lock_session_run_execution_blocker(tx, key, execution)
+            .await?;
     let now = database_now_ms(tx).await?;
     if lock_active_handoff(tx, key).await?.is_some() {
         return Ok(IdleControllerMutationOutcomeV1::Conflict);
@@ -2035,7 +2066,7 @@ pub(crate) async fn mutate_idle_controller_in_transaction(
         }
         _ => {}
     }
-    if writer.active {
+    if run_blocker.is_some() || writer.active {
         return Ok(IdleControllerMutationOutcomeV1::Conflict);
     }
     match mutation {
@@ -2611,7 +2642,6 @@ mod tests {
 
     async fn cleanup(pool: &SharedPool, key: &SessionKeyV1) {
         for table in [
-            "agent_session_execution_slots",
             "run_checkpoints",
             "tool_invocation_ledger",
             "agent_run_events",
@@ -2650,15 +2680,6 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
         }
-        sqlx::query(
-            "DELETE FROM conversation_segments
-             WHERE isolation_domain = ? AND owner_user_id = ?",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .execute(pool.get())
-        .await
-        .expect("cleanup segments");
     }
 
     async fn create_session_root(pool: &SharedPool, key: &SessionKeyV1) {
@@ -2765,6 +2786,7 @@ mod tests {
             "main",
         );
         cleanup(&pool, &key).await;
+        create_session_root(&pool, &key).await;
         let coordinator: Arc<dyn SessionContextCoordinator> =
             Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
         let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
@@ -2884,6 +2906,52 @@ mod tests {
             .release_writer(&writer)
             .await
             .expect("release writer");
+        // Controller leases are absent here. Actual execution still blocks
+        // changing control, including a terminal executor which is unwinding.
+        let run_id = format!("controller-run-{suffix}");
+        for (status, waiting, live_owner) in [
+            ("running", None, false),
+            ("paused", Some("approval"), false),
+            ("completed", None, true),
+        ] {
+            sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, waiting_for, owner_pod_id, owner_lease_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL 60 SECOND))")
+                .bind(&key.owner_user_id).bind(&key.session_id).bind(&run_id)
+                .bind(&run_id).bind(&run_id).bind(status).bind(waiting).bind(live_owner.then_some("live-executor"))
+                .execute(pool.get()).await.unwrap();
+            assert_eq!(
+                service
+                    .take_idle_controller(&key, &source.attachment_id)
+                    .await
+                    .unwrap(),
+                ClaimSessionControllerOutcomeV1::Conflict,
+                "Run {status}/{waiting:?}/live_owner={live_owner}"
+            );
+            assert_eq!(
+                service
+                    .release_idle_controller(&key, &target.attachment_id)
+                    .await
+                    .unwrap(),
+                ReleaseSessionControllerOutcomeV1::Conflict
+            );
+            assert_eq!(
+                service
+                    .load_attachment(&key, &target.attachment_id)
+                    .await
+                    .unwrap()
+                    .mode,
+                SessionAttachmentModeV1::Controller
+            );
+            for table in ["agent_runs"] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+                )))
+                .bind(&key.owner_user_id)
+                .bind(&key.session_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            }
+        }
         assert!(matches!(
             service
                 .release_idle_controller(&key, &target.attachment_id)
@@ -2898,6 +2966,30 @@ mod tests {
                 .expect("retry release idle control"),
             ReleaseSessionControllerOutcomeV1::AlreadyReleased(_)
         ));
+
+        sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, owner_pod_id, owner_lease_expires_at) VALUES (?, ?, 'unsettled-execution', 'unsettled-execution', 'unsettled-execution', 'completed', 'unwinding-owner', DATE_ADD(NOW(6), INTERVAL 60 SECOND))")
+            .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            service
+                .claim_idle_controller(&key, &source.attachment_id)
+                .await
+                .unwrap(),
+            ClaimSessionControllerOutcomeV1::Conflict,
+            "no writer or controller does not prove the executor has retired"
+        );
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = 'unsettled-execution'")
+            .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+        assert!(matches!(
+            service
+                .claim_idle_controller(&key, &source.attachment_id)
+                .await
+                .unwrap(),
+            ClaimSessionControllerOutcomeV1::Acquired(_)
+        ));
+        service
+            .release_idle_controller(&key, &source.attachment_id)
+            .await
+            .unwrap();
 
         let expired = service
             .attach_read_only(
@@ -3480,6 +3572,12 @@ mod tests {
                     recovered.run.checkpoint_json.as_deref(),
                     Some(next_payload.as_str())
                 );
+                assert!(
+                    store
+                        .release_owner_lease(&key.owner_user_id, &key.session_id, &competing_run, 4)
+                        .await
+                        .unwrap()
+                );
                 receipt.checkpoint_id
             } else {
                 sqlx::query(
@@ -3793,20 +3891,6 @@ mod tests {
             })
             .await
             .expect("validate forced handoff");
-        let fenced = service
-            .fence_writer(
-                &key,
-                &handoff.handoff_id,
-                None,
-                None,
-                Duration::from_secs(60),
-                "forced-fence",
-            )
-            .await
-            .expect("fence forced writer")
-            .handoff;
-        assert!(!fenced.risk.effects_are_sealed());
-
         let run_id = format!("run-{suffix}");
         sqlx::query(
             "INSERT INTO agent_runs
@@ -3857,6 +3941,20 @@ mod tests {
             .await
             .expect("insert invocation evidence");
         }
+
+        let fenced = service
+            .fence_writer(
+                &key,
+                &handoff.handoff_id,
+                None,
+                None,
+                Duration::from_secs(60),
+                "forced-fence",
+            )
+            .await
+            .expect("fence forced writer")
+            .handoff;
+        assert!(!fenced.risk.effects_are_sealed());
 
         let hydrate_request = TransitionSessionHandoffV1 {
             idempotency_key: "forced-hydrate".into(),

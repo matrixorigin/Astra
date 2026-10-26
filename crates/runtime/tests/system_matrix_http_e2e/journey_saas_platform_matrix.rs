@@ -12,9 +12,9 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role,
-    load_durable_interaction_event, model_selection, post_empty, post_json, put_json,
-    revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
+    E2E_PASSWORD, ProviderResponse, ProviderScript, bootstrap, delete_json, get_json,
+    grant_astra_admin_role, load_durable_interaction_event, model_selection, post_empty, post_json,
+    put_json, revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
 use astra_services::{ADMIN_CONFIG_KEY_REASONING_OFFERING, RunStateStore};
@@ -1398,6 +1398,15 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
     let model_offering_id = ctx.model_offering_id.clone();
+    let model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth, vec![ProviderScript::new(
+        "explicit diagnostic API observation",
+        move |request| request.body["model"] == model && request.body["stream"] == true,
+        vec![ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Observed diagnostic fixture."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}
+        }))],
+    )]).await;
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1405,6 +1414,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         Some(auth),
         json!({
             "message": "session audit probe",
+            "explain": true,
             "session_id": session_id,
             "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
@@ -1417,7 +1427,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         &ctx.pool,
         &ctx.user_id,
         session_id,
-        &["user_query"],
+        &["trace_span"],
         std::time::Duration::from_secs(10),
     )
     .await;
@@ -1453,7 +1463,6 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
         format!("/sessions/{session_id}/audit/tools"),
         format!("/sessions/{session_id}/audit/errors"),
-        format!("/sessions/{session_id}/audit/turns/1"),
         "/audit/stats".to_string(),
         "/audit/tools".to_string(),
     ] {
@@ -1476,6 +1485,34 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
             assert_eq!(payload["data"]["sentinel"], "complete-json-tail");
         }
     }
+
+    let (status, _) = get_json(
+        app,
+        &format!("/sessions/{session_id}/audit/turns/1"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "Server chat does not synthesize a legacy audit root"
+    );
+    let (status, transcript) = get_json(
+        app,
+        &format!("/sessions/{session_id}/transcript?limit=20"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["content"] == "session audit probe")
+    );
 
     ctx.close().await;
 }
@@ -1547,6 +1584,15 @@ pub async fn run_saas_events_session_after_chat_positive() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.as_str();
     let model_offering_id = ctx.model_offering_id.clone();
+    let model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth, vec![ProviderScript::new(
+        "explicit diagnostic API observation",
+        move |request| request.body["model"] == model && request.body["stream"] == true,
+        vec![ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Observed diagnostic fixture."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}
+        }))],
+    )]).await;
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -1554,6 +1600,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
         Some(auth),
         json!({
             "message": "events session probe",
+            "explain": true,
             "session_id": session_id,
             "model_selection": model_selection(model_offering_id.clone()),
             "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
@@ -1566,7 +1613,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
         &ctx.pool,
         ctx.user_id.as_str(),
         session_id,
-        &["user_query"],
+        &["trace_span"],
         std::time::Duration::from_secs(10),
     )
     .await;
