@@ -35514,8 +35514,10 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             .await
             .unwrap();
         assert!(history_loaded);
+        let selected = selected.unwrap();
+        assert_eq!(selected.run_id, run);
         assert_eq!(
-            selected.unwrap().status,
+            selected.status,
             if cancelled {
                 STATUS_CANCELLED
             } else {
@@ -35523,12 +35525,28 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             }
         );
         let json = serde_json::to_value(items).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            if cancelled { 1 } else { 2 }
+        );
+        assert_eq!(json[0]["kind"], "opening");
+        assert_eq!(json[0]["run_id"], run);
         assert_eq!(json[0]["content"], request.message);
         assert_eq!(
             json[0]["source_event_id"],
             persistence::server_input_source_event_id(&session, &run)
         );
+        if !cancelled {
+            assert_eq!(json[1]["kind"], "failure");
+            assert_eq!(json[1]["id"], format!("failure:{run}"));
+            assert_eq!(json[1]["run_id"], run);
+            assert_eq!(json[1]["failure"]["error_code"], "run_admission_timeout");
+            assert_eq!(
+                json[1]["failure"]["message"],
+                "server capacity timeout before streaming agentic loop start"
+            );
+            assert!(json[1].get("item_seq").is_none());
+        }
         assert_eq!(raw_page.next_before_seq, None);
         assert!(!raw_page.has_more);
         let raw_count: i64 = sqlx::query_scalar(
