@@ -1510,12 +1510,15 @@ export type RuntimeTranscriptResponse = {
 };
 
 /** Bounded display projection; opening inputs never acquire raw item sequences. */
+export type RuntimeConversationFailure = { message: string; error_code: string | null };
 export type RuntimeConversationResponse = {
   kind: "conversation";
   session: RuntimeSessionResponse;
   selected_root: { run_id: string; status: string; waiting_for: string | null; created_at: string } | null;
-  items: Array<({ kind: "raw" } & RuntimeTranscriptItemResponse) | {
+  items: Array<({ kind: "raw"; failure?: RuntimeConversationFailure } & RuntimeTranscriptItemResponse) | {
     kind: "opening"; id: string; run_id: string; source_event_id: string; created_at: string; content: string;
+  } | {
+    kind: "failure"; id: string; run_id: string; created_at: string; failure: RuntimeConversationFailure;
   }>;
   history_loaded: boolean;
   raw_page: { next_before_seq: number | null; has_more: boolean } | null;

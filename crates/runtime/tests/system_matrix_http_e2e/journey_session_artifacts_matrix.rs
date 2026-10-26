@@ -745,6 +745,42 @@ async fn assert_failed_run(
         i64::from(partial.is_some()),
         "store only the actual partial answer"
     );
+    let (status, _, display) = get_bytes(
+        &ctx.app,
+        &format!("/sessions/{session}/transcript?scope=conversation"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let display: Value = serde_json::from_slice(&display).unwrap();
+    assert_eq!(display["selected_root"]["status"], "failed");
+    let failures: Vec<_> = display["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item.get("failure").is_some())
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one durable failure survives cold history reads"
+    );
+    let expected_error: String = run
+        .error_message
+        .as_ref()
+        .unwrap()
+        .chars()
+        .take(256)
+        .collect();
+    assert_eq!(failures[0]["failure"]["message"], expected_error);
+    if let Some(partial) = partial {
+        assert_eq!(failures[0]["kind"], "raw");
+        assert_eq!(failures[0]["content"], partial);
+    } else {
+        assert_eq!(failures[0]["kind"], "failure");
+        assert!(failures[0].get("item_seq").is_none());
+    }
     let (status, _, replay) = get_bytes(
         &ctx.app,
         &format!("/chat/runs/{id}/stream?last_index=0&replay_only=true"),

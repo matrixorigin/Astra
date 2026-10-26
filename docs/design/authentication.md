@@ -61,6 +61,12 @@ commits. Other processes and out-of-band account/session mutations can take up
 to 30 seconds to affect ordinary request admission. Expired observations require
 a successful fresh lookup; database errors do not enable stale fallback.
 
+A successful database snapshot authenticates a request overlapping logout;
+cache invalidation prevents retaining that observation and does not reject an
+unrelated principal. Absolute token, observed Session and Memoria access expiry
+are checked again after awaited validation. A request starting after a local
+logout cannot reuse an invalidated observation.
+
 This cache observes identity, not operation permissions. Memory operations
 continue resolving scoped credentials through the canonical credential resolver;
 provider-request replay checks, sensitive reauthentication and execution-handoff

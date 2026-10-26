@@ -12,6 +12,20 @@ use sqlx::Row;
 const HISTORY_LIMIT: usize = 200;
 const HISTORICAL_INPUT_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Serialize)]
+pub(crate) struct ConversationFailure {
+    pub message: String,
+    pub error_code: Option<String>,
+}
+
+struct RunFailure {
+    run_id: String,
+    created_at: String,
+    terminal_assistant_source: Option<String>,
+    failure: ConversationFailure,
+    detail_truncated: bool,
+}
+
 #[derive(Serialize)]
 pub(crate) struct ConversationResponse {
     pub kind: &'static str,
@@ -37,6 +51,8 @@ pub(crate) enum ConversationItem {
     Raw {
         #[serde(flatten)]
         item: Box<TranscriptItemResponse>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<ConversationFailure>,
     },
     Opening {
         id: String,
@@ -45,18 +61,25 @@ pub(crate) enum ConversationItem {
         created_at: String,
         content: String,
     },
+    Failure {
+        id: String,
+        run_id: String,
+        created_at: String,
+        failure: ConversationFailure,
+    },
 }
 
 impl ConversationItem {
     fn run_id(&self) -> Option<&str> {
         match self {
-            Self::Raw { item } => item.run_id.as_deref(),
-            Self::Opening { run_id, .. } => Some(run_id),
+            Self::Raw { item, .. } => item.run_id.as_deref(),
+            Self::Opening { run_id, .. } | Self::Failure { run_id, .. } => Some(run_id),
         }
     }
     fn source(&self) -> Option<&str> {
         match self {
-            Self::Raw { item } => item.source_event_id.as_deref(),
+            Self::Raw { item, .. } => item.source_event_id.as_deref(),
+            Self::Failure { .. } => None,
             Self::Opening {
                 source_event_id, ..
             } => Some(source_event_id),
@@ -64,8 +87,8 @@ impl ConversationItem {
     }
     fn created_at(&self) -> &str {
         match self {
-            Self::Raw { item } => &item.created_at,
-            Self::Opening { created_at, .. } => created_at,
+            Self::Raw { item, .. } => &item.created_at,
+            Self::Opening { created_at, .. } | Self::Failure { created_at, .. } => created_at,
         }
     }
 }
@@ -106,14 +129,24 @@ WITH roots AS (
     SELECT r.*, b.opening_hash, b.context_admission_hash,
            COALESCE(OCTET_LENGTH(b.opening_events_json), 0) +
                COALESCE(OCTET_LENGTH(b.opening_context_json), 4) AS stored_bytes,
-           s.history_loaded
+           s.history_loaded,
+           CASE WHEN r.status = 'failed' THEN LEFT(b.error_message, 256) ELSE NULL END AS failure_message,
+           CASE WHEN r.status = 'failed' THEN b.error_code ELSE NULL END AS failure_code,
+           CASE WHEN r.status = 'failed' THEN
+               NULLIF(JSON_UNQUOTE(JSON_EXTRACT(b.terminal_receipt_json, '$.receipt.transcript.assistant_source_event_id')), 'null')
+               ELSE NULL END AS terminal_assistant_source,
+           CASE WHEN r.status = 'failed' AND CHAR_LENGTH(b.error_message) > 256 THEN 1 ELSE 0 END AS failure_detail_truncated
     FROM roots r JOIN agent_runs b ON b.user_id = r.user_id AND b.run_id = r.run_id
     CROSS JOIN selection s
     WHERE b.user_id = ? AND b.session_id = ? AND (history_rank <= 201 OR selected_rank = 1)
       AND (s.history_loaded = 1 OR selected_rank = 1)
 ), budgeted AS (
     SELECT c.*, SUM(CASE WHEN selected_rank = 1 THEN 0 ELSE
-        stored_bytes + 512 + 12 * OCTET_LENGTH(run_id) END)
+        stored_bytes + 512 + 12 * OCTET_LENGTH(run_id) +
+        CASE WHEN status = 'failed' THEN 1024 + 6 *
+            (COALESCE(OCTET_LENGTH(failure_message), 0) +
+             COALESCE(OCTET_LENGTH(failure_code), 0) +
+             COALESCE(OCTET_LENGTH(terminal_assistant_source), 0)) ELSE 0 END END)
         OVER (PARTITION BY user_id, session_id ORDER BY history_rank ROWS UNBOUNDED PRECEDING) AS history_bytes
     FROM candidates c
 ), admitted AS (
@@ -137,18 +170,28 @@ SELECT 'root' AS record_kind, r.session_id, r.run_id, r.status, r.waiting_for,
        CASE WHEN body_loaded = 1 THEN b.opening_events_json ELSE CAST(NULL AS CHAR) END AS opening_events_json,
        CASE WHEN body_loaded = 1 THEN b.opening_context_json ELSE CAST(NULL AS CHAR) END AS opening_context_json,
        body_loaded AS opening_body_loaded, stored_bytes, history_loaded,
+       CASE WHEN body_loaded = 1 THEN failure_message ELSE NULL END AS failure_message,
+       failure_code, terminal_assistant_source,
+       CASE WHEN failure_detail_truncated = 1 OR (body_loaded = 0 AND failure_message IS NOT NULL)
+            THEN 1 ELSE 0 END AS failure_detail_truncated,
        CAST(NULL AS SIGNED) AS item_seq, CAST(NULL AS CHAR) AS role,
        CAST(NULL AS CHAR) AS content, CAST(NULL AS CHAR) AS payload_json, CAST(NULL AS CHAR) AS source_event_id
 FROM admitted r JOIN agent_runs b
  ON b.user_id = r.user_id AND b.session_id = r.session_id AND b.run_id = r.run_id
 UNION ALL
-SELECT 'raw', t.session_id, t.run_id, CAST(NULL AS CHAR), CAST(NULL AS CHAR),
+SELECT 'raw', t.session_id, t.run_id, r.status, CAST(NULL AS CHAR),
        DATE_FORMAT(t.created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
        CAST(0 AS SIGNED), CAST(0 AS SIGNED),
        CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(NULL AS CHAR), CAST(0 AS SIGNED), CAST(0 AS SIGNED), CAST(1 AS SIGNED),
+       CAST(NULL AS CHAR), CASE WHEN r.status = 'failed' THEN r.error_code ELSE NULL END,
+       CASE WHEN r.status = 'failed' THEN
+           NULLIF(JSON_UNQUOTE(JSON_EXTRACT(r.terminal_receipt_json, '$.receipt.transcript.assistant_source_event_id')), 'null')
+           ELSE NULL END,
+       CASE WHEN r.status = 'failed' AND r.error_message IS NOT NULL THEN 1 ELSE 0 END,
        t.item_seq, t.role, t.content, t.payload_json, t.source_event_id
 FROM raw_items p JOIN session_transcript_items t
  ON t.user_id = p.user_id AND t.session_id = p.session_id AND t.item_seq = p.item_seq
+LEFT JOIN agent_runs r ON r.user_id = p.user_id AND r.session_id = p.session_id AND r.run_id = t.run_id
 WHERE t.user_id = ? AND t.session_id = ?
 "#;
 
@@ -204,9 +247,45 @@ pub(crate) async fn read_conversation(
     let mut selected = None;
     let mut openings = Vec::new();
     let mut raw = Vec::new();
+    let mut failures = std::collections::HashMap::new();
     let mut truncated = false;
     let mut history_loaded = true;
     for row in rows {
+        if row
+            .try_get::<Option<String>, _>("status")
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            == Some("failed")
+        {
+            let run_id: String = row.try_get("run_id").map_err(|e| e.to_string())?;
+            let message: Option<String> =
+                row.try_get("failure_message").map_err(|e| e.to_string())?;
+            let detail_truncated = row
+                .try_get::<i64, _>("failure_detail_truncated")
+                .map_err(|e| e.to_string())?
+                == 1;
+            // A raw page can reach a Run outside the bounded opening window.
+            // Its compact outcome still comes from this statement snapshot.
+            if message.is_some() || !failures.contains_key(&run_id) {
+                failures.insert(
+                    run_id.clone(),
+                    RunFailure {
+                        run_id,
+                        created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
+                        terminal_assistant_source: row
+                            .try_get("terminal_assistant_source")
+                            .map_err(|e| e.to_string())?,
+                        detail_truncated,
+                        failure: ConversationFailure {
+                            message: message
+                                .filter(|text| !text.trim().is_empty())
+                                .unwrap_or_else(|| "Astra run failed.".into()),
+                            error_code: row.try_get("failure_code").map_err(|e| e.to_string())?,
+                        },
+                    },
+                );
+            }
+        }
         if row
             .try_get::<String, _>("record_kind")
             .map_err(|e| e.to_string())?
@@ -280,6 +359,7 @@ pub(crate) async fn read_conversation(
             selected = Some(root);
         }
     }
+    truncated |= failures.values().any(|failure| failure.detail_truncated);
     raw.sort_by_key(|item| item.item_seq);
     let has_more = raw.len() > limit;
     if has_more {
@@ -293,6 +373,11 @@ pub(crate) async fn read_conversation(
     let (items, omitted) = compose_conversation(
         raw,
         openings,
+        if history_loaded {
+            failures.into_values().collect()
+        } else {
+            Vec::new()
+        },
         selected.as_ref().map(|root| root.run_id.as_str()),
         limit,
     )?;
@@ -308,6 +393,7 @@ pub(crate) async fn read_conversation(
 fn compose_conversation(
     raw: Vec<TranscriptItemResponse>,
     mut openings: Vec<ConversationItem>,
+    mut failures: Vec<RunFailure>,
     selected: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<ConversationItem>, bool), String> {
@@ -332,6 +418,7 @@ fn compose_conversation(
         .into_iter()
         .map(|item| ConversationItem::Raw {
             item: Box::new(item),
+            failure: None,
         })
         .collect();
     let mut omitted = false;
@@ -351,7 +438,7 @@ fn compose_conversation(
             .iter()
             .find(|item| item.source() == Some(source_event_id))
         {
-            if !matches!(stored, ConversationItem::Raw { item } if item.run_id.as_ref() == Some(run_id) && item.role == "user" && item.content == *content)
+            if !matches!(stored, ConversationItem::Raw { item, .. } if item.run_id.as_ref() == Some(run_id) && item.role == "user" && item.content == *content)
             {
                 return Err(format!("conflicting transcript input for Run {run_id}"));
             }
@@ -378,8 +465,8 @@ fn compose_conversation(
     }
     // Invisible tool scaffolding must not consume the Web's display window.
     entries.retain(|entry| match entry {
-        ConversationItem::Opening { .. } => true,
-        ConversationItem::Raw { item } => {
+        ConversationItem::Opening { .. } | ConversationItem::Failure { .. } => true,
+        ConversationItem::Raw { item, .. } => {
             matches!(item.role.as_str(), "user" | "system")
                 || item.role == "assistant"
                     && (!item.content.trim().is_empty()
@@ -390,6 +477,30 @@ fn compose_conversation(
                         || !item.artifacts.is_empty())
         }
     });
+    failures.sort_by(|a, b| (&a.created_at, &a.run_id).cmp(&(&b.created_at, &b.run_id)));
+    for outcome in failures {
+        if let Some(ConversationItem::Raw { failure, .. }) = entries.iter_mut().find(|entry| {
+            matches!(entry, ConversationItem::Raw { item, .. } if item.role == "assistant"
+                && item.run_id.as_deref() == Some(&outcome.run_id)
+                && outcome.terminal_assistant_source.is_some()
+                && item.source_event_id == outcome.terminal_assistant_source)
+        }) {
+            *failure = Some(outcome.failure);
+        } else if let Some(index) = entries
+            .iter()
+            .rposition(|entry| entry.run_id() == Some(&outcome.run_id))
+        {
+            entries.insert(
+                index + 1,
+                ConversationItem::Failure {
+                    id: format!("failure:{}", outcome.run_id),
+                    run_id: outcome.run_id,
+                    created_at: outcome.created_at,
+                    failure: outcome.failure,
+                },
+            );
+        }
+    }
     if entries.len() > limit {
         omitted = true;
         let start = entries.len() - limit;
@@ -451,7 +562,8 @@ mod tests {
             .iter()
             .map(|item| match item {
                 ConversationItem::Opening { content, .. } => content.as_str(),
-                ConversationItem::Raw { item } => item.content.as_str(),
+                ConversationItem::Raw { item, .. } => item.content.as_str(),
+                ConversationItem::Failure { failure, .. } => &failure.message,
             })
             .collect()
     }
@@ -505,7 +617,8 @@ mod tests {
             opening("a", "2026-10-25T03:00:00.100001Z", "same"),
             opening("c", "2026-10-25T03:00:00.100003Z", "third"),
         ];
-        let (items, omitted) = compose_conversation(raw, openings, Some("d"), 200).unwrap();
+        let (items, omitted) =
+            compose_conversation(raw, openings, Vec::new(), Some("d"), 200).unwrap();
         assert!(!omitted);
         assert_eq!(
             contents(&items),
@@ -516,7 +629,7 @@ mod tests {
         let seqs: Vec<_> = items
             .iter()
             .filter_map(|item| match item {
-                ConversationItem::Raw { item } => Some(item.item_seq),
+                ConversationItem::Raw { item, .. } => Some(item.item_seq),
                 _ => None,
             })
             .collect();
@@ -541,6 +654,7 @@ mod tests {
                     "time",
                 )],
                 vec![opening("current", "time", "exact")],
+                Vec::new(),
                 Some("current"),
                 200,
             );
@@ -594,6 +708,7 @@ mod tests {
             let (items, omitted) = compose_conversation(
                 rows,
                 vec![opening("current", "first", "")],
+                Vec::new(),
                 Some("current"),
                 200,
             )
@@ -604,5 +719,116 @@ mod tests {
             assert_eq!(items[0].source(), Some("source:current"));
             assert_eq!(items.last().unwrap().run_id(), Some("current"));
         }
+    }
+
+    #[test]
+    fn failure_projection_uses_exact_terminal_identity_and_preserves_intermediate_replies() {
+        for terminal in [Some("terminal"), None, Some("not-in-this-page")] {
+            let rows = vec![
+                raw(
+                    1,
+                    Some("old"),
+                    Some("earlier"),
+                    "assistant",
+                    "completed reply",
+                    "first",
+                ),
+                raw(
+                    2,
+                    Some("old"),
+                    Some("terminal"),
+                    "assistant",
+                    "partial answer",
+                    "second",
+                ),
+                raw(
+                    3,
+                    Some("next"),
+                    Some("next-answer"),
+                    "assistant",
+                    "new answer",
+                    "third",
+                ),
+            ];
+            let (items, omitted) = compose_conversation(
+                rows,
+                vec![
+                    opening("old", "first", "old input"),
+                    opening("next", "third", "next input"),
+                ],
+                vec![RunFailure {
+                    run_id: "old".into(),
+                    created_at: "first".into(),
+                    terminal_assistant_source: terminal.map(str::to_owned),
+                    detail_truncated: false,
+                    failure: ConversationFailure {
+                        message: "provider disconnected".into(),
+                        error_code: Some("stream_transport".into()),
+                    },
+                }],
+                Some("next"),
+                200,
+            )
+            .unwrap();
+            assert!(!omitted);
+            let wire = serde_json::to_value(&items).unwrap();
+            assert!(
+                wire[1].get("failure").is_none(),
+                "completed intermediate reply stays complete"
+            );
+            if terminal == Some("terminal") {
+                assert_eq!(wire[2]["failure"]["message"], "provider disconnected");
+                assert_eq!(wire[2]["content"], "partial answer");
+                assert_eq!(
+                    wire.as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item.get("failure").is_some())
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(wire[2].get("failure").is_none());
+                assert_eq!(wire[3]["kind"], "failure");
+                assert!(wire[3].get("item_seq").is_none());
+            }
+            assert!(
+                wire.as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .get("failure")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn opening_only_failure_notice_obeys_the_display_window_and_preserves_selected_input() {
+        let (items, truncated) = compose_conversation(
+            Vec::new(),
+            vec![
+                opening("old", "first", "old input"),
+                opening("current", "second", "exact input"),
+            ],
+            vec![RunFailure {
+                run_id: "current".into(),
+                created_at: "second".into(),
+                terminal_assistant_source: None,
+                detail_truncated: false,
+                failure: ConversationFailure {
+                    message: "failure".into(),
+                    error_code: None,
+                },
+            }],
+            Some("current"),
+            2,
+        )
+        .unwrap();
+        assert!(truncated);
+        assert_eq!(contents(&items), ["exact input", "failure"]);
+        let wire = serde_json::to_value(items).unwrap();
+        assert_eq!(wire[1]["id"], "failure:current");
+        assert!(wire[1].get("item_seq").is_none());
     }
 }

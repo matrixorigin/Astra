@@ -32404,13 +32404,12 @@ mod tests {
             .expect("final server agent schema");
         assert_eq!(
             agent.pointer("/function/parameters/properties/action/enum"),
-            Some(&json!([
-                "spawn",
-                "list",
-                "get_result",
-                "wait",
-                "send_message"
-            ]))
+            Some(&json!(["spawn", "list", "get_result", "send_message"]))
+        );
+        assert!(
+            agent
+                .pointer("/function/parameters/properties/timeout_ms")
+                .is_none()
         );
         assert!(
             agent
@@ -32669,7 +32668,12 @@ mod tests {
             .expect("ordinary spawn is resident when delegation is authorized");
         assert_eq!(
             resident["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["spawn", "list", "get_result", "wait", "send_message"])
+            json!(["spawn", "list", "get_result", "send_message"])
+        );
+        assert!(
+            resident
+                .pointer("/function/parameters/properties/timeout_ms")
+                .is_none()
         );
         assert!(!host.current_deferred_tool_names.contains("agent"));
         let result = executor
@@ -32678,6 +32682,12 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result.output).expect("tool_search JSON");
         assert_eq!(parsed["status"], "completed");
         assert_eq!(parsed["matches"][0]["name"], "agent");
+        assert!(
+            parsed["matches"][0]["parameters"]["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("wait"))
+        );
 
         state.deferred_tool_activations =
             astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(
@@ -32686,6 +32696,57 @@ mod tests {
         assert_eq!(state.deferred_tool_activations.len(), 1);
         let selected = state.deferred_tool_activations.clone();
         host.bind_deferred_tool_activations(&mut state, &selected);
+        assert_eq!(
+            host.visible_turn_tools(&mut state),
+            visible,
+            "selection must not expand the resident tools prefix"
+        );
+        for (deferred, targeted) in [(false, false), (true, false), (true, true)] {
+            let mut arguments = json!({"action":"wait", "timeout_ms":1});
+            if targeted {
+                arguments["agent_id"] = json!("not-a-wait-target");
+            }
+            let call = json!({"id":"observation-wire-call", "type":"function", "function":{
+                "name":if deferred {"invoke_tool"} else {"agent"},
+                "arguments":if deferred {json!({"name":"agent", "arguments":arguments}).to_string()}
+                    else {arguments.to_string()}
+            }});
+            let mut admission = host.resolve_deferred_tool_admission(
+                &state,
+                crate::turn::agentic::tool_interception::admit_tool_calls(
+                    &[call],
+                    Some("tool_calls"),
+                ),
+            );
+            ServerAgenticLoopHost::reject_calls_outside_wire_schema(&mut admission, &visible);
+            assert_eq!(admission.admitted.len(), usize::from(deferred));
+            assert_eq!(admission.rejected.len(), usize::from(!deferred));
+            if deferred {
+                let invocation = &admission.admitted[0];
+                assert!(invocation.activation().is_some());
+                assert_eq!(
+                    astra_turn_core::tool::args::shape::tool_call_arguments_value(
+                        invocation.logical_target_call()
+                    ),
+                    arguments
+                );
+                if targeted {
+                    let result = executor.execute_with_metadata("agent", &arguments).await;
+                    assert!(result.is_error);
+                    let metadata = result
+                        .metadata
+                        .as_ref()
+                        .expect("canonical preflight evidence");
+                    assert_eq!(metadata.get("execution_started"), Some(&Value::Bool(false)));
+                    assert_eq!(
+                        metadata.get("error_kind").and_then(Value::as_str),
+                        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+                    );
+                } else {
+                    astra_tools::schemas::validate_tool_arguments("agent", &arguments).unwrap();
+                }
+            }
+        }
         for agent_type in [json!("member-x7"), json!(""), json!(["member-x7"])] {
             let valid = agent_type == json!("member-x7");
             let arguments = json!({

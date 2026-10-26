@@ -1,5 +1,5 @@
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
-import { resumeStreamProjection } from "@/lib/api/stream-event-helpers";
+import { appendRunFailure, resumeStreamProjection } from "@/lib/api/stream-event-helpers";
 import { AstraApiError, isArtifactPublicationV1 } from "@astra/sdk";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
@@ -2127,7 +2127,14 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
     record.messages = parsed.items.flatMap(item => {
       if (item.kind === "opening") return [{ id: item.id, role: "user" as const,
         content: item.content, createdAt: item.created_at, status: "complete" as const }];
+      if (item.kind === "failure") return [{ id: item.id, role: "assistant" as const,
+        content: item.failure.message, createdAt: item.created_at, status: "failed" as const }];
       const message = transcriptItemToMessage(record.id, item);
+      if (message && item.failure) {
+        message.status = "failed";
+        message.content = appendRunFailure(message.content, item.failure.message);
+        message.reasoningStatus = undefined;
+      }
       return message ? [message] : [];
     });
     if (record.activeRun) {

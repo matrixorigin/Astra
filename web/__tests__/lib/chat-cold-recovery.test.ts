@@ -15,11 +15,14 @@ import { AstraApiError, type RuntimeConversationResponse } from "@astra/sdk";
 
 const session = { session_id: "session", created_at: "2026-10-25T03:00:00Z", status: "active", metadata: { source: "web_v1" } };
 function conversation(runId = "run", status = "running", content = "original request"): RuntimeConversationResponse {
-  return { kind: "conversation", session,
+  const snapshot: RuntimeConversationResponse = { kind: "conversation", session,
     selected_root: { run_id: runId, status, waiting_for: null, created_at: "2026-10-25T03:00:00.123456Z" },
     items: [{ kind: "opening", id: `input:${runId}`, run_id: runId, source_event_id: `source:${runId}`,
       created_at: "2026-10-25T03:00:00.123456Z", content }],
     history_loaded: true, raw_page: { next_before_seq: null, has_more: false }, truncated: false };
+  if (status === "failed") snapshot.items.push({kind: "failure", id: `failure:${runId}`, run_id:runId,
+    created_at:"2026-10-25T03:00:00.123456Z", failure:{message:"Astra run failed.", error_code:null}});
+  return snapshot;
 }
 function setup() {
   globalThis.__astraWebStores = undefined;
@@ -48,6 +51,40 @@ function setup() {
   vi.mocked(requireRuntimeClient).mockResolvedValue(runtime as never);
   return runtime;
 }
+it.each(["warm", "cold", "successor"])("preserves failed partial answers across %s detail refreshes", async mode => {
+  const runtime = setup();
+  await getChatHydrated("owner", "session");
+  runtime.fetchResponse.mockResolvedValue(new Response([
+    { type: "run_started", run_id: "run", index: 0 },
+    { type: "text_delta", content: "Only the first half", index: 1 },
+    { type: "run_error", run_id: "run", error: "Provider connection lost", error_code: "stream_transport", index: 2 },
+    { type: "run_finished", run_id: "run", status: "failed", owner_generation: 0, index: 3 },
+  ].map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    headers: { "x-astra-agent-interaction-api-major": "3" },
+  }));
+  const live = await stream();
+  expect(live.status).toBe(200);
+  await live.text();
+  expect(getChat("owner", "session")?.messages.at(-1)).toMatchObject({ status: "failed" });
+  const persisted = conversation("run", "failed");
+  persisted.items = persisted.items.filter(item => item.kind !== "failure");
+  persisted.items.push({ kind: "raw", session_id: "session", item_seq: 2, run_id: "run", role: "assistant", content: "Only the first half", created_at:"2026-10-25T03:01:00Z", failure: { message: "Provider connection lost", error_code: "stream_transport" } });
+  if (mode === "cold") globalThis.__astraWebStores = undefined;
+  if (mode === "successor") {
+    const next = conversation("next", "completed", "next request");
+    next.items.unshift(...persisted.items);
+    next.items.push({ kind: "raw", session_id: "session", item_seq: 3, run_id: "next", role: "assistant", content: "new complete answer", created_at:"2026-10-25T03:02:00Z" });
+    runtime.sdk.getSessionConversation.mockResolvedValue(next);
+  } else runtime.sdk.getSessionConversation.mockResolvedValue(persisted);
+  const detail = await GETDetail({} as never, { params: Promise.resolve({ chatId: "session" }) });
+  expect(detail.status).toBe(200);
+  const body = await detail.json();
+  expect(body.messages.find((message: {content: string}) => message.content.startsWith("Only the first half"))).toMatchObject({ content: "Only the first half\n\nProvider connection lost", status: "failed" });
+  const again = await GETDetail({} as never, { params: Promise.resolve({chatId: "session"}) });
+  expect((await again.json()).messages).toEqual(body.messages);
+  if (mode === "successor") expect(body.messages.at(-1)).toMatchObject({ content: "new complete answer", status: "complete" });
+});
+
 async function stream() {
   return GET({ nextUrl: new URL("http://web.test/api/chats/session/stream?runId=run&last_index=0") } as never,
     { params: Promise.resolve({ chatId: "session" }) });
@@ -66,7 +103,7 @@ it("hydrates an opening-only Run and actually resumes its stream to completion",
   expect(completed?.activeRun).toBeUndefined();
 });
 
-it("retains the exact warm parser and deferred guidance when the database terminal arrives first", async () => {
+it.each(["completed", "failed"])("retains the exact warm parser and deferred guidance when database %s arrives first", async terminalStatus => {
   const runtime = setup();
   const first = await getChatHydrated("owner", "session");
   updateStreamingAssistantMessage("owner", "session", first!.activeRun!.assistantMessageId!, { content: "first partial" });
@@ -74,7 +111,7 @@ it("retains the exact warm parser and deferred guidance when the database termin
   updateStreamingAssistantMessage("owner", "session", next!.assistantMessage.id, { content: "second partial" });
   const before = getChat("owner", "session")!.messages;
   const parser = getStore("owner").chats[0].streamProjection;
-  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("run", "completed"));
+  runtime.sdk.getSessionConversation.mockResolvedValue(conversation("run", terminalStatus));
   const hydrated = await getChatHydrated("owner", "session");
   expect(hydrated?.messages).toBe(before);
   expect(getStore("owner").chats[0].streamProjection).toBe(parser);
@@ -90,7 +127,7 @@ it.each(["failed", "cancelled"])("keeps the exact accepted input on a cold %s Ru
   const runtime = setup();
   runtime.sdk.getSessionConversation.mockResolvedValue(conversation("run", status, " \n你好 "));
   const detail = await getChatHydrated("owner", "session");
-  expect(detail?.messages.map(message => message.content)).toEqual([" \n你好 "]);
+  expect(detail?.messages.map(message => message.content)).toEqual(status === "failed" ? [" \n你好 ", "Astra run failed."] : [" \n你好 "]);
   expect(detail?.activeRun).toBeUndefined();
   expect(runtime.sdk.getRunStatus).not.toHaveBeenCalled();
 });
@@ -100,11 +137,11 @@ it("discovers an externally completed successor from a nonempty opening-only idl
   runtime.sdk.getSessionConversation.mockResolvedValue(conversation("run", "failed"));
   await getChatHydrated("owner", "session");
   const next = conversation("next", "completed", "next request");
-  next.items.unshift(conversation().items[0]);
+  next.items.unshift(...conversation("run", "failed").items);
   next.items.push({ kind: "raw", session_id: "session", item_seq: 2, run_id: "next", role: "assistant", content: "new answer" });
   runtime.sdk.getSessionConversation.mockResolvedValue(next);
   const detail = await getChatHydrated("owner", "session");
-  expect(detail?.messages.map(message => message.content)).toEqual(["original request", "next request", "new answer"]);
+  expect(detail?.messages.map(message => message.content)).toEqual(["original request", "Astra run failed.", "next request", "new answer"]);
   expect(detail?.activeRun).toBeUndefined();
 });
 
@@ -715,7 +752,7 @@ it("keeps a warm parser on an explicitly omitted history and cold-loads a succes
   runtime.sdk.getSessionConversation.mockResolvedValueOnce({ ...conversation(), history_loaded: false, items: [], raw_page: null, truncated: null });
   expect((await getChatHydrated("owner", "session"))?.messages).toBe(before);
   runtime.sdk.getSessionConversation.mockResolvedValueOnce(conversation("successor", "failed", "new accepted input"));
-  expect((await getChatHydrated("owner", "session"))?.messages.map(item => item.content)).toEqual(["new accepted input"]);
+  expect((await getChatHydrated("owner", "session"))?.messages.map(item => item.content)).toEqual(["new accepted input", "Astra run failed."]);
 });
 
 it("binds the current shell after Session creation overlaps a metadata commit and reuses it on the next POST", async () => {

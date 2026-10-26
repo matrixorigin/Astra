@@ -122,6 +122,7 @@ export type {
   RuntimeTranscriptItemResponse,
   RuntimeTranscriptResponse,
   RuntimeConversationResponse,
+  RuntimeConversationFailure,
   RuntimeTranscriptParams,
   RuntimeModelAccessKind,
   RuntimeModelExecutionPlacement,

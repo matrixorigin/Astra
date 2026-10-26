@@ -37202,6 +37202,57 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
         "imported without Run"
     );
 
+    // A retained raw page may reach a failed root beyond the opening window.
+    // Read only its compact outcome in the same prepared statement, not its
+    // large error or an entire terminal receipt.
+    let old = Uuid::new_v4().to_string();
+    let error = "错误\n".repeat(2000);
+    let receipt =
+        json!({"receipt":{"transcript":{"assistant_source_event_id":"old-terminal"}}}).to_string();
+    sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status,opening_events_json,opening_context_json,opening_hash,error_message,error_code,terminal_receipt_json,created_at) SELECT user_id,?,?,?,?, 'failed',opening_events_json,opening_context_json,opening_hash,?,'stream_transport',?,'2025-01-01' FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&session).bind(&old).bind(&old).bind(&old).bind(&error).bind(&receipt).bind(&user).bind(&template).execute(pool.get()).await.unwrap();
+    sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash,source_event_id) VALUES (?,?,210,?,'assistant','old partial answer','fixture','old-terminal')")
+        .bind(&user).bind(&session).bind(&old).execute(pool.get()).await.unwrap();
+    let (_, items, _, truncated, _) = read_conversation(&pool, &user, &session, 200, None, false)
+        .await
+        .unwrap();
+    assert!(truncated);
+    let wire = serde_json::to_value(items).unwrap();
+    let old_answer = wire
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["item_seq"] == 210)
+        .unwrap();
+    assert_eq!(old_answer["failure"]["message"], "Astra run failed.");
+    assert_eq!(old_answer["failure"]["error_code"], "stream_transport");
+    assert!(!wire.to_string().contains(&error));
+    sqlx::query(
+        "UPDATE agent_runs SET terminal_receipt_json = NULL WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&old)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let (_, items, _, _, _) = read_conversation(&pool, &user, &session, 200, None, false)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(items).unwrap();
+    let old_items: Vec<_> = wire
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["run_id"] == old)
+        .collect();
+    assert_eq!(old_items.len(), 2);
+    assert!(
+        old_items[0].get("failure").is_none(),
+        "a prior reply is not the terminal answer"
+    );
+    assert_eq!(old_items[1]["kind"], "failure");
+    assert!(old_items[1].get("item_seq").is_none());
+
     // Identity conflicts fail rather than replacing the accepted input silently.
     sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash,source_event_id) VALUES (?,?,208,?,'user','altered','fixture',?)")
         .bind(&user).bind(&session).bind(&current).bind(persistence::server_input_source_event_id(&session, &current)).execute(pool.get()).await.unwrap();

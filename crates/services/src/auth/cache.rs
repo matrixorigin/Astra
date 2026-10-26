@@ -64,9 +64,8 @@ impl AuthenticationCache {
         )
     }
 
-    /// Checking the epoch also fences the caller's return of a request-local
-    /// result when it is too large to retain. A late fill cannot resurrect a
-    /// logout/disconnect that completed while its SQL was in flight.
+    /// Retention is independent of the caller's successful authentication
+    /// snapshot. A late fill cannot resurrect a logout/disconnect in the cache.
     pub(super) fn publish(
         &self,
         key: [u8; 32],
@@ -89,7 +88,7 @@ impl AuthenticationCache {
         }
         let bytes = principal_bytes(principal);
         if bytes > MAX_ENTRY_BYTES {
-            return true;
+            return false;
         }
         if let Some(previous) = state.entries.remove(&key) {
             state.bytes -= previous.bytes;
@@ -189,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn freshness_is_absolute_and_invalidated_fills_cannot_return() {
+    fn freshness_is_absolute_and_invalidated_fills_cannot_repopulate() {
         let cache = Arc::new(AuthenticationCache::default());
         let key = AuthenticationCache::key("bearer-one");
         let (_, generation) = cache.lookup(&key);
@@ -268,7 +267,7 @@ mod tests {
         let mut large = principal();
         large.user.display_name = Some("x".repeat(MAX_ENTRY_BYTES));
         let key = AuthenticationCache::key("oversized");
-        assert!(cache.publish(
+        assert!(!cache.publish(
             key,
             0,
             Instant::now(),

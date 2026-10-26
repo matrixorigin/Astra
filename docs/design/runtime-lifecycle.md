@@ -218,7 +218,16 @@ Raw scopes and their sequence cursors remain unchanged; projected opening inputs
 have no raw sequence. The conversation read selects at most 200 historical roots
 plus the current root, budgets serialized historical input at 256 KiB, and retains
 the selected input exactly within the existing opening-size limit. Display history
-is limited to 200 items; the live assistant placeholder is additional. Limits bound
+is limited to 200 items; the live assistant placeholder is additional. Failed
+Runs project their public outcome from the same statement snapshot, including
+roots reached only by the raw-history window. The terminal receipt identifies
+the exact partial assistant row; completed intermediate replies stay complete.
+A failure without that visible row becomes a stable display notice without a
+raw sequence. Notices count toward the existing display limit. Public error
+detail is limited to 256 characters before transfer and charged conservatively
+against historical input admission; omitted detail retains failed status and a
+bounded generic message, and reports truncation. These are read projections,
+with no new persistence or per-Run lookup. Limits bound
 returned work, not rows examined by the database.
 
 Every selected detail refresh obtains this bounded view, including idle and warm

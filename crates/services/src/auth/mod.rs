@@ -2338,18 +2338,17 @@ impl AuthService for DatabaseAuthService {
             );
             AuthPrincipal::from_local_jwt(user, session_id, execution_continuation)
         };
-        if !self.authentication_cache.publish(
-            key,
-            generation,
-            checked_at,
-            expires_at_unix,
-            &principal,
-        ) {
+        // The successful database snapshot authenticates this overlapping
+        // request. An unrelated cache invalidation only prevents retaining it.
+        // All awaited checks are complete; absolute expiry still applies now.
+        if Utc::now().timestamp() >= expires_at_unix {
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
-                "Authentication changed or expired; retry the request",
+                "Authentication expired",
             ));
         }
+        self.authentication_cache
+            .publish(key, generation, checked_at, expires_at_unix, &principal);
         Ok(principal)
     }
 
