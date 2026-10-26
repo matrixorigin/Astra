@@ -436,7 +436,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " No substitution. spawn needs description+prompt. Results arrive automatically. Resume:exact collaborator_id."
+                " Auto results;resume:exact collaborator_id."
             ),
         ),
         "introspect" => (
@@ -489,9 +489,16 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         "notify" => (&["message", "notification_type"][..], "Notify."),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
-            "One Work graph; no repeat start; revision-pinned proposal.",
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
         ),
-        "run_next_work_item" => (&[][..], "Next Work only if assignment absent."),
+        "run_next_work_item" => (
+            &[][..],
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
+        ),
         "settle_work_item" => (
             &[
                 "outcome",
@@ -499,7 +506,9 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Settle assigned WorkItem; never child wait.",
+            function["parameters"]["x-astra-discovery-summary"]
+                .as_str()
+                .unwrap_or_default(),
         ),
         _ => return schema,
     };

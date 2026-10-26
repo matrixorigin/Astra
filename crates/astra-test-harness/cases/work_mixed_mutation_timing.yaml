@@ -13,6 +13,7 @@ criteria:
   added_items: 1
   delivered_items: 2
   cancellation_after_deliveries: 1
+  require_cancel_before_execution: true
   added_execution_after_initial_deliveries: 1
   require_added_before_execution: true
 - type: hard_judger

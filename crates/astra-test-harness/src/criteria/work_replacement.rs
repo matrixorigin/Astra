@@ -62,6 +62,8 @@ pub(super) struct Timing {
     pub added_execution_after_initial_deliveries: usize,
     pub require_added_at_start: bool,
     pub require_added_before_execution: bool,
+    pub require_cancel_before_execution: bool,
+    pub require_board_before_execution: bool,
 }
 
 fn validate_added_before_execution(
@@ -112,33 +114,10 @@ fn validate_added_before_execution(
         if additions.is_empty() {
             continue;
         }
-        let context = string(args, "context_id")?;
-        let inspection = prefix[..index]
-            .iter()
-            .rev()
-            .find_map(|inspection| {
-                if inspection.name != "inspect_work_plan"
-                    || inspection.ok != Some(true)
-                    || inspection.run_id.as_deref() != Some(producer)
-                {
-                    return None;
-                }
-                inspection
-                    .result
-                    .as_ref()
-                    .filter(|result| result["context_id"] == context)
-            })
-            .ok_or("accepted addition lacks its prior inspection context")?;
-        let basis = &inspection["basis"];
-        if call.run_id.as_deref() != Some(producer)
-            || string(basis, "work_id")? != scope.0
-            || string(basis, "branch_id")? != scope.1
-            || revision(result, "result_graph_revision")? <= revision(basis, "graph_revision")?
-        {
-            return Err(
-                "accepted addition crosses scope or does not advance its inspection basis".into(),
-            );
+        if call.run_id.as_deref() != Some(producer) {
+            return Err("accepted addition crosses execution producer".into());
         }
+        accepted_basis(calls, index, scope)?;
         let mut requested = BTreeSet::new();
         for addition in additions {
             let id = string(addition, "item_id")?;
@@ -177,6 +156,64 @@ fn validate_added_before_execution(
     Ok(added)
 }
 
+// An accepted mutation is authoritative before the next complete board.
+// Resolve its existing inspection receipt, rather than guessing revisions.
+fn accepted_basis<'a>(
+    calls: &'a [JournalToolCall],
+    index: usize,
+    scope: &(String, String),
+) -> Result<&'a Value, String> {
+    let call = &calls[index];
+    let producer = call
+        .run_id
+        .as_deref()
+        .ok_or("accepted mutation lacks producer")?;
+    let args = call
+        .arguments
+        .as_ref()
+        .ok_or("accepted mutation lacks arguments")?;
+    let context = string(args, "context_id")?;
+    let inspection = calls[..index]
+        .iter()
+        .rev()
+        .find_map(|inspection| {
+            if inspection.name != "inspect_work_plan"
+                || inspection.ok != Some(true)
+                || inspection.run_id.as_deref() != Some(producer)
+            {
+                return None;
+            }
+            inspection
+                .result
+                .as_ref()
+                .filter(|result| result["context_id"] == context)
+        })
+        .ok_or("accepted mutation lacks its prior inspection context")?;
+    let basis = &inspection["basis"];
+    let result = call
+        .result
+        .as_ref()
+        .ok_or("accepted mutation lacks receipt")?;
+    if string(basis, "work_id")? != scope.0
+        || string(basis, "branch_id")? != scope.1
+        || revision(result, "result_graph_revision")? <= revision(basis, "graph_revision")?
+    {
+        return Err(
+            "accepted mutation crosses scope or does not advance its inspection basis".into(),
+        );
+    }
+    Ok(basis)
+}
+
+fn causally_before(before: &JournalToolCall, after: &JournalToolCall) -> bool {
+    before.run_id.is_some()
+        && before.run_id == after.run_id
+        && match (before.turn, before.round, after.turn, after.round) {
+            (Some(bt), Some(br), Some(at), Some(ar)) => (bt, br) < (at, ar),
+            _ => false,
+        }
+}
+
 pub(super) fn verify(
     session: &SessionCapture,
     initial_count: usize,
@@ -190,6 +227,8 @@ pub(super) fn verify(
         added_execution_after_initial_deliveries: added_after_initial_deliveries,
         require_added_at_start,
         require_added_before_execution,
+        require_cancel_before_execution,
+        require_board_before_execution,
     } = timing;
     if session.has_integrity_errors() || session.skipped_lines > 0 || session.dropped_lines > 0 {
         return Err("replacement lifecycle requires an intact, complete journal".into());
@@ -203,6 +242,8 @@ pub(super) fn verify(
     let mut pre_execution_additions = None;
     let mut assigned_attempts = BTreeMap::new();
     let mut cancelled = BTreeSet::new();
+    let mut retirements: BTreeMap<String, (u64, u64, usize)> = BTreeMap::new();
+    let mut invocation_history: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     // One item may have an idempotently replayed settlement, but cannot count
     // as delivered again under a different execution attempt or revision.
     let mut delivered: BTreeMap<String, (u64, String)> = BTreeMap::new();
@@ -251,6 +292,15 @@ pub(super) fn verify(
                             );
                         }
                         let item = binding.item.expect("validated attempt contains an item");
+                        if let Some((_, _, boundary)) = retirements.get(&item.item_id)
+                            && !causally_before(call, &calls[*boundary])
+                        {
+                            return Err("executed invocation uses retired authority or ambiguous cancellation ordering".into());
+                        }
+                        invocation_history
+                            .entry(item.item_id.clone())
+                            .or_default()
+                            .push(call_index);
                         let selected = previous
                             .get(&item.item_id)
                             .ok_or("executed invocation references an absent item")?;
@@ -294,6 +344,11 @@ pub(super) fn verify(
                     astra_services::runs::WorkInvocationAttribution::Unknown => {
                         return Err("executed invocation has unknown Work attribution".into());
                     }
+                    astra_services::runs::WorkInvocationAttribution::Unbound
+                        if require_board_before_execution =>
+                    {
+                        return Err("task execution precedes its canonical Work assignment".into());
+                    }
                     astra_services::runs::WorkInvocationAttribution::Control
                     | astra_services::runs::WorkInvocationAttribution::Unbound => {}
                 }
@@ -305,12 +360,89 @@ pub(super) fn verify(
             continue;
         }
         if call.name == "propose_work_plan" {
-            intervening_mutation |= call
-                .result
-                .as_ref()
-                .and_then(|result| result.get("status"))
-                .and_then(Value::as_str)
-                == Some("accepted");
+            let result = call.result.as_ref().ok_or("proposal lacks receipt")?;
+            if result["status"] == "accepted" {
+                intervening_mutation = true;
+                let args = call
+                    .arguments
+                    .as_ref()
+                    .ok_or("accepted mutation lacks revision arguments")?;
+                let requested = args["revisions"]
+                    .as_array()
+                    .ok_or("accepted mutation lacks revision arguments")?;
+                let applied = result["applied_mutations"]["revised_items"]
+                    .as_array()
+                    .ok_or("accepted mutation lacks applied revision receipts")?;
+                let cancelled_ids = |items: &[Value]| -> Result<BTreeSet<String>, String> {
+                    let mut cancelled = BTreeSet::new();
+                    for item in items {
+                        let id = string(item, "item_id")?;
+                        match string(item, "declaration_state")? {
+                            "cancelled" => {
+                                cancelled.insert(id.to_owned());
+                            }
+                            "active" | "superseded" => {}
+                            _ => {
+                                return Err(
+                                    "accepted mutation has an unknown declaration state".into()
+                                );
+                            }
+                        }
+                    }
+                    Ok(cancelled)
+                };
+                if cancelled_ids(requested)? != cancelled_ids(applied)? {
+                    return Err("retirement arguments disagree with applied receipts".into());
+                }
+                let retiring: Vec<_> = applied
+                    .iter()
+                    .filter(|item| item["declaration_state"] == "cancelled")
+                    .collect();
+                if !retiring.is_empty() {
+                    let scope = identity.as_ref().ok_or("retirement precedes genesis")?;
+                    accepted_basis(&calls, call_index, scope)?;
+                    let graph = revision(result, "result_graph_revision")?;
+                    for item in retiring {
+                        let id = string(item, "item_id")?;
+                        let from = revision(item, "from_revision")?;
+                        if !requested.iter().any(|request| {
+                            request["item_id"] == id
+                                && request["expected_revision"].as_u64() == Some(from)
+                                && request["declaration_state"] == "cancelled"
+                        }) {
+                            return Err(
+                                "retirement arguments disagree with applied receipts".into()
+                            );
+                        }
+                        if !previous
+                            .get(id)
+                            .is_some_and(|old| old.declaration == "active" && old.revision == from)
+                            || retirements.contains_key(id)
+                        {
+                            return Err(
+                                "retirement references absent, stale, or already retired authority"
+                                    .into(),
+                            );
+                        }
+                        if invocation_history.get(id).is_some_and(|history| {
+                            history
+                                .iter()
+                                .any(|index| !causally_before(&calls[*index], call))
+                        }) {
+                            return Err("execution and cancellation lack causal ordering".into());
+                        }
+                        if require_cancel_before_execution && executed.contains(id) {
+                            return Err(
+                                "strict cancellation has prior execution/delivery evidence".into(),
+                            );
+                        }
+                        if delivered.len() < after_deliveries {
+                            return Err("cancellation precedes required deliveries".into());
+                        }
+                        retirements.insert(id.to_owned(), (from, graph, call_index));
+                    }
+                }
+            }
             continue;
         }
         // These producers publish complete canonical boards. Arbitrary
@@ -442,6 +574,15 @@ pub(super) fn verify(
                 return Err("complete board omitted an item or regressed its revision".into());
             }
         }
+        for (id, (from, accepted_graph, _)) in &retirements {
+            if graph < *accepted_graph
+                || !items
+                    .get(id)
+                    .is_some_and(|item| item.revision > *from && item.declaration == "cancelled")
+            {
+                return Err("complete board does not corroborate accepted retirement".into());
+            }
+        }
         let prior_deliveries = delivered.len();
         let mut new_delivery = false;
         for assignment in std::iter::once(result)
@@ -457,7 +598,7 @@ pub(super) fn verify(
                 if revision(assignment, "item_revision")? != selected.revision {
                     return Err("assignment revision disagrees with its board".into());
                 }
-                if selected.declaration != "active" {
+                if selected.declaration != "active" || retirements.contains_key(id) {
                     return Err("assignment references a retired item".into());
                 }
                 assigned_attempts.insert(id.to_owned(), (selected.revision, attempt.to_owned()));
@@ -474,6 +615,9 @@ pub(super) fn verify(
                 return Err("replacement contains a non-delivered canonical settlement".into());
             }
             let id = string(result, "item_id")?;
+            if retirements.contains_key(id) || cancelled.contains(id) {
+                return Err("settlement uses retired authority".into());
+            }
             let item_revision = revision(result, "item_revision")?;
             if string(transition, "item_id")? != id
                 || revision(transition, "item_revision")? != item_revision
@@ -481,9 +625,24 @@ pub(super) fn verify(
                 return Err("settlement identity disagrees with its canonical transition".into());
             }
             let execution = (item_revision, string(result, "attempt_id")?.to_owned());
-            if assigned_attempts
-                .get(id)
-                .is_some_and(|assigned| assigned != &execution)
+            if require_board_before_execution
+                && !invocation_history.get(id).is_some_and(|history| {
+                    history.iter().any(|index| {
+                        let call = &calls[*index];
+                        let item = &call.runtime_metadata["work_attribution"]["binding"]["item"];
+                        call.ok == Some(true)
+                            && item["item_revision"].as_u64() == Some(execution.0)
+                            && item["attempt_id"].as_str() == Some(execution.1.as_str())
+                    })
+                })
+            {
+                return Err("delivery lacks successful assigned execution evidence".into());
+            }
+
+            if (require_board_before_execution && assigned_attempts.get(id) != Some(&execution))
+                || assigned_attempts
+                    .get(id)
+                    .is_some_and(|assigned| assigned != &execution)
             {
                 return Err("settlement does not match the assigned execution attempt".into());
             }
@@ -508,15 +667,21 @@ pub(super) fn verify(
                 if item.revision <= *base
                     || item.execution != "not_started"
                     || item.delivery != "unreported"
-                    || executed.contains(id)
+                    || (require_cancel_before_execution && executed.contains(id))
                 {
                     return Err("cancelled initial item has execution/delivery evidence or lacks retirement revision".into());
                 }
-                if !cancelled.contains(id) && after_deliveries > 0 {
+                if let Some((from, accepted_graph, _)) = retirements.get(id)
+                    && (item.revision <= *from || graph < *accepted_graph)
+                {
+                    return Err("complete board does not corroborate accepted retirement".into());
+                }
+                if !cancelled.contains(id) && after_deliveries > 0 && !retirements.contains_key(id)
+                {
                     let previously_waiting = previous.get(id).is_some_and(|old| {
                         old.declaration == "active"
                             && matches!(old.execution.as_str(), "not_started" | "running")
-                            && !executed.contains(id)
+                            && (!require_cancel_before_execution || !executed.contains(id))
                             && old.delivery == "unreported"
                     });
                     // A complete prior snapshot after N deliveries proves the
@@ -600,7 +765,7 @@ pub(super) fn verify(
         }
     }
     Ok(format!(
-        "canonical replacement lifecycle verified: {initial_count} initial, {cancelled_count} cancelled without execution, {added_count} fresh, {delivered_count} delivered"
+        "canonical replacement lifecycle verified: {initial_count} initial, {cancelled_count} retired, {added_count} fresh, {delivered_count} delivered"
     ))
 }
 
@@ -626,9 +791,204 @@ mod tests {
             delivered,
             Timing {
                 cancellation_after_deliveries: after,
+                require_cancel_before_execution: true,
                 ..Default::default()
             },
         )
+    }
+
+    fn stamp_rounds(capture: &mut SessionCapture) {
+        for (index, event) in capture.events.iter_mut().enumerate() {
+            event.raw["producer_scope"] = json!({"run_id":"producer"});
+            event.raw["turn"] = json!(1);
+            event.raw["round"] = json!(index);
+            let call = &mut event.raw["tool_calls"][0];
+            if call.get("disposition").is_none() {
+                call["disposition"] = json!("executed");
+            }
+            if call.get("work_attribution").is_none() {
+                call["work_attribution"] = json!({"state":"control"});
+            }
+        }
+    }
+
+    fn invocation(id: &str, attempt: &str) -> JournalEvent {
+        JournalEvent {
+            event_type: "llm_round".into(),
+            raw: json!({"tool_calls":[{
+                "tool_call_id":format!("execute-{id}"), "name":"read_file", "ok":false,
+                "disposition":"executed", "work_attribution":{
+                    "state":"attempt", "producer_run_id":"producer", "binding":{
+                        "work_id":"work", "branch_id":"branch", "item":{
+                            "item_id":id,"item_revision":1,"attempt_id":attempt
+                        }
+                    }
+                }
+            }]}),
+        }
+    }
+
+    #[test]
+    fn accepted_retirement_preserves_history_and_closes_pre_board_execution_gap() {
+        let mut capture = fixture(false, true);
+        result(&mut capture, 0)["initial_task"] = json!({"status":"assigned", "item_id":"beta", "item_revision":1,"attempt_id":"attempt-beta"});
+        result(&mut capture, 0)["task_board_update"]["tasks"][1]["execution_status"] =
+            json!("running");
+        // Repository revisions need not be from_revision + 1.
+        for index in [1, 2] {
+            result(&mut capture, index)["task_board_update"]["tasks"][1]["item_revision"] =
+                json!(9);
+        }
+        let inspection = JournalEvent {
+            event_type: "llm_round".into(),
+            raw: json!({"tool_calls":[{
+                "tool_call_id":"inspection","name":"inspect_work_plan","ok":true,
+                "result_full":{"context_id":"ctx","basis":{"work_id":"work","branch_id":"branch","graph_revision":1}}
+            }]}),
+        };
+        let proposal = JournalEvent {
+            event_type: "llm_round".into(),
+            raw: json!({"tool_calls":[{
+                "tool_call_id":"retire","name":"propose_work_plan","ok":true,
+                "args_full":{"context_id":"ctx","revisions":[{"item_id":"beta","expected_revision":1,"declaration_state":"cancelled"}]},
+                "result_full":{"status":"accepted","result_graph_revision":2,"applied_mutations":{
+                    "revised_items":[{"item_id":"beta","from_revision":1,"declaration_state":"cancelled"}]
+                }}
+            }]}),
+        };
+        capture.events.splice(
+            1..1,
+            [invocation("beta", "attempt-beta"), inspection, proposal],
+        );
+        stamp_rounds(&mut capture);
+        let generic = || Timing::default();
+        assert!(super::verify(&capture, 2, 1, 1, 2, generic()).is_ok());
+        assert!(
+            super::verify(
+                &capture,
+                2,
+                1,
+                1,
+                2,
+                Timing {
+                    require_cancel_before_execution: true,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        let mut stale = capture.clone();
+        stale.events.insert(4, invocation("beta", "attempt-beta"));
+        stale.events[4].raw["tool_calls"][0]["tool_call_id"] = json!("stale-execution");
+        stamp_rounds(&mut stale);
+        assert!(
+            super::verify(&stale, 2, 1, 1, 2, generic())
+                .unwrap_err()
+                .contains("retired authority")
+        );
+        stale.events[4].raw["tool_calls"][0]["disposition"] = json!("rejected");
+        assert!(super::verify(&stale, 2, 1, 1, 2, generic()).is_ok());
+        for missing in ["arguments", "applied", "both"] {
+            let mut incomplete = capture.clone();
+            let proposal = &mut incomplete.events[3].raw["tool_calls"][0];
+            if missing != "applied" {
+                proposal.as_object_mut().unwrap().remove("args_full");
+            }
+            if missing != "arguments" {
+                proposal["result_full"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("applied_mutations");
+            }
+            let mut stale = invocation("beta", "attempt-beta");
+            stale.raw["tool_calls"][0]["tool_call_id"] =
+                json!("execution-after-incomplete-receipt");
+            incomplete.events.insert(4, stale);
+            stamp_rounds(&mut incomplete);
+            assert!(
+                super::verify(&incomplete, 2, 1, 1, 2, generic()).is_err(),
+                "missing {missing}"
+            );
+        }
+        for state in [Value::Null, json!("unknown")] {
+            let mut incomplete = capture.clone();
+            let proposal = &mut incomplete.events[3].raw["tool_calls"][0];
+            proposal["args_full"]["revisions"][0]["declaration_state"] = state.clone();
+            proposal["result_full"]["applied_mutations"]["revised_items"][0]["declaration_state"] =
+                state;
+            let mut stale = invocation("beta", "attempt-beta");
+            stale.raw["tool_calls"][0]["tool_call_id"] = json!("execution-after-untyped-receipt");
+            incomplete.events.insert(4, stale);
+            stamp_rounds(&mut incomplete);
+            assert!(super::verify(&incomplete, 2, 1, 1, 2, generic()).is_err());
+        }
+        let mut parallel = capture.clone();
+        parallel.events[1].raw["round"] = parallel.events[3].raw["round"].clone();
+        assert!(
+            super::verify(&parallel, 2, 1, 1, 2, generic())
+                .unwrap_err()
+                .contains("causal ordering")
+        );
+        for (event, path, value) in [
+            (2, "/result_full/basis/work_id", json!("foreign")),
+            (3, "/args_full/context_id", json!("forged")),
+            (3, "/args_full/revisions/0/expected_revision", json!(2)),
+            (
+                3,
+                "/result_full/applied_mutations/revised_items/0/from_revision",
+                json!(2),
+            ),
+            (
+                4,
+                "/result_full/task_board_update/tasks/1/declaration_state",
+                json!("active"),
+            ),
+        ] {
+            let mut invalid = capture.clone();
+            *invalid.events[event].raw["tool_calls"][0]
+                .pointer_mut(path)
+                .unwrap() = value;
+            assert!(
+                super::verify(&invalid, 2, 1, 1, 2, generic()).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn board_first_requires_actual_assignment_and_rejects_unbound_prereads() {
+        let mut capture = fixture(false, false);
+        result(&mut capture, 0)["initial_task"] = json!({"status":"assigned","item_id":"alpha","item_revision":1,"attempt_id":"attempt-a"});
+        result(&mut capture, 1)["next_task"] = json!({"status":"assigned","item_id":"fresh","item_revision":1,"attempt_id":"attempt-b"});
+        capture.events.insert(1, invocation("alpha", "attempt-a"));
+        capture.events.insert(3, invocation("fresh", "attempt-b"));
+        for index in [1, 3] {
+            capture.events[index].raw["tool_calls"][0]["ok"] = json!(true);
+        }
+        stamp_rounds(&mut capture);
+        let timing = || Timing {
+            require_board_before_execution: true,
+            require_cancel_before_execution: true,
+            ..Default::default()
+        };
+        assert!(super::verify(&capture, 2, 1, 1, 2, timing()).is_ok());
+        let mut unbound = invocation("alpha", "attempt-a");
+        unbound.raw["tool_calls"][0]["tool_call_id"] = json!("unbound-preread");
+        unbound.raw["tool_calls"][0]["work_attribution"] = json!({"state":"unbound"});
+        capture.events.insert(0, unbound);
+        stamp_rounds(&mut capture);
+        assert!(
+            super::verify(&capture, 2, 1, 1, 2, timing())
+                .unwrap_err()
+                .contains("precedes")
+        );
+        capture.events[0].raw["tool_calls"][0]["work_attribution"] = json!({"state":"control"});
+        assert!(super::verify(&capture, 2, 1, 1, 2, timing()).is_ok());
+        capture.events[1].raw["tool_calls"][0]["result_full"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_task");
+        assert!(super::verify(&capture, 2, 1, 1, 2, timing()).is_err());
     }
 
     #[test]
@@ -716,10 +1076,10 @@ mod tests {
         let addition = event(
             "propose_work_plan",
             json!({
-                "context_id":"context", "additions":[{"item_id":"fresh"}]
+                "context_id":"context", "additions":[{"item_id":"fresh"}], "revisions":[]
             }),
             json!({"status":"accepted","result_graph_revision":2,
-            "applied_mutations":{"added_items":[{"item_id":"fresh","revision":1}]}}),
+            "applied_mutations":{"added_items":[{"item_id":"fresh","revision":1}],"revised_items":[]}}),
         );
         let execution = |id: &str, attempt: &str| {
             let mut call = event("read_file", json!({"path":"evidence"}), json!("observed"));
@@ -743,8 +1103,8 @@ mod tests {
             first_settlement,
             event(
                 "propose_work_plan",
-                json!({"additions":[]}),
-                json!({"status":"accepted"}),
+                json!({"additions":[],"revisions":[]}),
+                json!({"status":"accepted","applied_mutations":{"revised_items":[]}}),
             ),
             event(
                 "run_next_work_item",

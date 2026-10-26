@@ -177,6 +177,8 @@ pub struct ValidationIssue {
     pub code: ValidationCode,
     location: Vec<String>,
     message: String,
+    guidance: Option<String>,
+    unmatched_union: bool,
 }
 
 impl ValidationIssue {
@@ -185,13 +187,27 @@ impl ValidationIssue {
             code,
             location: location.to_vec(),
             message,
+            guidance: None,
+            unmatched_union: false,
         }
+    }
+
+    fn with_guidance(mut self, guidance: Option<&str>) -> Self {
+        self.guidance = guidance.map(|text| bounded_text(text, 400));
+        self
     }
 }
 
 impl fmt::Display for ValidationIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&bounded_text(&self.message, 900))?;
+        if self.unmatched_union {
+            f.write_str("; no union alternative matched; these diagnostics describe the best-ranked alternative")?;
+        }
+        if let Some(guidance) = &self.guidance {
+            write!(f, "; usage: {guidance}")?;
+        }
+        Ok(())
     }
 }
 
@@ -290,19 +306,31 @@ pub struct ToolArgumentValidationError {
 
 impl fmt::Display for ToolArgumentValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Invalid arguments for tool `{}`", self.tool_name)?;
-        if let Some(action) = self.action.as_deref() {
-            write!(formatter, " (action `{action}`)")?;
-        }
         write!(
             formatter,
-            ": {}",
-            self.issues
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
+            "Invalid arguments for tool `{}`",
+            bounded_text(&self.tool_name, 80)
+        )?;
+        if let Some(action) = self.action.as_deref() {
+            write!(formatter, " (action `{}`)", bounded_text(action, 80))?;
+        }
+        let mut feedback = String::new();
+        let mut rendered = 0;
+        for issue in self.issues.iter().take(8) {
+            let remaining = 3800_usize.saturating_sub(feedback.len());
+            if remaining < 40 {
+                break;
+            }
+            if !feedback.is_empty() {
+                feedback.push_str("; ");
+            }
+            feedback.push_str(&bounded_text(&issue.to_string(), (remaining - 2).min(1100)));
+            rendered += 1;
+        }
+        if rendered < self.issues.len() {
+            feedback.push_str("; … additional issues omitted");
+        }
+        write!(formatter, ": {feedback}")
     }
 }
 
@@ -342,7 +370,7 @@ impl ToolArgumentValidationError {
                 "error": "Tool arguments were not valid JSON; the tool was not executed.",
                 "advisory": {
                     "kind": "malformed_tool_arguments",
-                    "tool": self.tool_name,
+                    "tool": bounded_text(&self.tool_name, 80),
                     "executed": false,
                     "next_step": "If the task permits another call, retry with one complete JSON argument object matching this invocation's advertised schema.",
                 },
@@ -542,21 +570,67 @@ fn field_path(parent: &str, field: &str) -> String {
     }
 }
 
+// Rejection hints describe schema expectations, never submitted values. Bounds
+// apply at each level so malformed third-party schemas cannot dump large bodies.
+fn bounded_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit.saturating_sub(3);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+// Literal facts only: do not reconstruct another representation of the schema.
+fn schema_literal(value: &Value) -> String {
+    match value {
+        Value::String(text) if text.len() <= 80 => {
+            let escaped = serde_json::to_string(text).expect("string serializes");
+            if escaped.len() <= 100 {
+                escaped
+            } else {
+                "<oversized literal omitted>".into()
+            }
+        }
+        Value::String(_) => "<oversized literal omitted>".into(),
+        Value::Bool(_) | Value::Number(_) | Value::Null => value.to_string(),
+        _ => "<composite literal omitted>".into(),
+    }
+}
+
+fn enum_expectation(values: &[Value]) -> String {
+    let mut literals: Vec<_> = values.iter().take(8).map(schema_literal).collect();
+    if values.len() > 8 {
+        literals.push("… additional values omitted".into());
+    }
+    literals.join(", ")
+}
+
 fn validate_schema_value(
     value: &Value,
     schema: &Value,
     path: &str,
     check_required: bool,
+    inherited_guidance: Option<&str>,
     location: &mut Vec<String>,
     issues: &mut Vec<ValidationIssue>,
 ) {
+    let guidance = schema
+        .get("x-astra-discovery-summary")
+        .and_then(Value::as_str)
+        .or(inherited_guidance);
+    let diagnostic = |code, location: &[String], message| {
+        ValidationIssue::new(code, location, message).with_guidance(guidance)
+    };
     // A shared outer type applies to every alternative. Reject it before
     // evaluating branches so a type error is not reported as an ambiguous
     // union, and invalid scalar input cannot trigger redundant branch work.
     if let Some(expected) = schema.get("type")
         && !schema_type_matches(value, expected)
     {
-        issues.push(ValidationIssue::new(
+        issues.push(diagnostic(
             ValidationCode::Type,
             location,
             format!(
@@ -591,6 +665,7 @@ fn validate_schema_value(
                 candidate,
                 path,
                 true,
+                guidance,
                 location,
                 &mut candidate_issues,
             );
@@ -632,17 +707,21 @@ fn validate_schema_value(
             }
         }
         if matches == 0 {
-            issues.extend(best_failure.map(|(_, issues)| issues).unwrap_or_else(|| {
-                vec![ValidationIssue::new(
+            let mut failures = best_failure.map(|(_, issues)| issues).unwrap_or_else(|| {
+                vec![diagnostic(
                     ValidationCode::Union,
                     location,
                     format!("{path} has no matching {keyword} branch"),
                 )]
-            }));
+            });
+            if let Some(first) = failures.first_mut() {
+                first.unmatched_union = true;
+            }
+            issues.extend(failures);
             return;
         }
         if keyword == "oneOf" && matches != 1 {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::Union,
                 location,
                 format!("{path} must match exactly one advertised branch"),
@@ -653,19 +732,22 @@ fn validate_schema_value(
     if let Some(expected) = schema.get("const")
         && value != expected
     {
-        issues.push(ValidationIssue::new(
+        issues.push(diagnostic(
             ValidationCode::Const,
             location,
-            format!("{path} must be {expected}"),
+            format!("{path} must be {}", schema_literal(expected)),
         ));
     }
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
         && !allowed.contains(value)
     {
-        issues.push(ValidationIssue::new(
+        issues.push(diagnostic(
             ValidationCode::Enum,
             location,
-            format!("{path} is outside its advertised enum"),
+            format!(
+                "{path} is outside its advertised enum; expected {}",
+                enum_expectation(allowed)
+            ),
         ));
     }
 
@@ -674,7 +756,7 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
             && (length < minimum || (minimum > 0 && text.trim().chars().count() < minimum as usize))
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::MinLength,
                 location,
                 format!("{path} requires at least {minimum} character(s)"),
@@ -683,7 +765,7 @@ fn validate_schema_value(
         if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
             && length > maximum
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::MaxLength,
                 location,
                 format!("{path} accepts at most {maximum} character(s)"),
@@ -695,7 +777,7 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
             && number < minimum
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::Minimum,
                 location,
                 format!("{path} must be at least {minimum}"),
@@ -704,7 +786,7 @@ fn validate_schema_value(
         if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
             && number > maximum
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::Maximum,
                 location,
                 format!("{path} must be at most {maximum}"),
@@ -719,7 +801,7 @@ fn validate_schema_value(
                 .enumerate()
                 .any(|(index, value)| values[..index].contains(value))
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::UniqueItems,
                 location,
                 format!("{path} requires unique items"),
@@ -728,7 +810,7 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
             && values.len() < minimum as usize
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::MinItems,
                 location,
                 format!("{path} requires at least {minimum} item(s)"),
@@ -737,7 +819,7 @@ fn validate_schema_value(
         if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
             && values.len() > maximum as usize
         {
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::MaxItems,
                 location,
                 format!("{path} accepts at most {maximum} item(s)"),
@@ -747,9 +829,17 @@ fn validate_schema_value(
             location.push("*".into());
             for (index, item) in values.iter().enumerate() {
                 let item_path = format!("{path} item {index}");
-                validate_schema_value(item, item_schema, &item_path, true, location, issues);
+                validate_schema_value(
+                    item,
+                    item_schema,
+                    &item_path,
+                    true,
+                    guidance,
+                    location,
+                    issues,
+                );
                 if item.as_str().is_some_and(|item| item.trim().is_empty()) {
-                    issues.push(ValidationIssue::new(
+                    issues.push(diagnostic(
                         ValidationCode::Required,
                         location,
                         format!("{item_path} must be non-empty"),
@@ -772,7 +862,7 @@ fn validate_schema_value(
                     format!("{path} ")
                 };
                 location.push(field.into());
-                issues.push(ValidationIssue::new(
+                issues.push(diagnostic(
                     ValidationCode::Required,
                     location,
                     format!("{prefix}missing non-empty required field `{field}`"),
@@ -797,7 +887,7 @@ fn validate_schema_value(
             } else {
                 format!("{path} has unknown field(s)")
             };
-            issues.push(ValidationIssue::new(
+            issues.push(diagnostic(
                 ValidationCode::AdditionalProperties,
                 location,
                 format!("{label}: {}", unknown.join(", ")),
@@ -813,6 +903,7 @@ fn validate_schema_value(
                     child_schema,
                     &field_path(path, field),
                     true,
+                    guidance,
                     location,
                     issues,
                 );
@@ -961,6 +1052,7 @@ pub fn validate_tool_arguments_against_schema(
         parameter_schema,
         "",
         false,
+        None,
         &mut Vec::new(),
         &mut issues,
     );
@@ -992,8 +1084,8 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
 ];
 
 fn start_work_schema() -> Value {
-    let tasks = "Known acceptance units incl. dependents; no report subtasks.";
-    let prerequisites = "1-based output prerequisites; no order/text edges. Omit if independent.";
+    let tasks = "Outcomes/dependents; no reports.";
+    let prerequisites = "1-based output prerequisites; omit independent.";
     json!({
         "type": "function",
         "function": {
@@ -1002,7 +1094,7 @@ fn start_work_schema() -> Value {
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
-                "x-astra-discovery-summary": "Declare known outcomes, including dependencies. Omit later decisions/additions/replacements. Use exactly N named initial tracks. start returns the first assignment.",
+                "x-astra-discovery-summary": "Explicit multi-outcome Work: before exploration; one start. N known outcomes=N tasks incl.dependents; omit later choices. activation=start: execute initial_task directly.",
                 "properties": {
                     "goal": {
                         "type": "string",
@@ -1053,6 +1145,7 @@ fn run_next_work_item_schema() -> Value {
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
+                "x-astra-discovery-summary": "Select if unassigned; initial_task/next_task execute directly.",
                 "properties": {}
             }
         }
@@ -1064,10 +1157,11 @@ fn settle_work_item_schema() -> Value {
         "type": "function",
         "function": {
             "name": "settle_work_item",
-            "description": "Report the typed delivery outcome for the exact canonical WorkItem attempt assigned to this run. Call exactly once after attempting the task and before the final response. Runtime completion is not delivery: use delivered only after a literal gap check proves that direct evidence contains every payload and verification field in expected_result. Every explicit conjunct, including a named behavior check, command, test, or observable workflow, requires direct successful evidence; an unrun or failed check remains a gap, and compilation, imports, or adjacent smoke checks do not substitute for it. A reachable/index/home page, category list, or successful action does not substitute for a requested item, value, article, result, or source. If any required field is absent, continue the focused evidence path; use blocked with a structured blocker when the dependency/capability is unavailable, or failed when execution itself failed. None of these outcomes means cancelled: a requested cancellation is a canonical graph revision with declaration_state=cancelled through the inspect/propose path, never a word in this summary. The summary is a derived progress note, not an authoritative evidence source: include every required observed payload field, copy exact values faithfully, identify direct tool/artifact sources when material, and never replace conflicting direct evidence with the summary. The server derives Work/item/attempt identity from the trusted current run. A successful result may atomically include next_task; when present, execute that assignment directly instead of calling run_next_work_item again.",
+            "description": "Report the typed delivery outcome for the exact canonical WorkItem attempt assigned to this run. Call exactly once after attempting the task and before the final response. Delivered requires successful execution evidence from this current assignment; earlier unbound work, other assignments, and discovery/control observations cannot supply it. Runtime completion is not delivery: use delivered only after a literal gap check proves that direct evidence contains every payload and verification field in expected_result. Every explicit conjunct, including a named behavior check, command, test, or observable workflow, requires direct successful evidence; an unrun or failed check remains a gap, and compilation, imports, or adjacent smoke checks do not substitute for it. A reachable/index/home page, category list, or successful action does not substitute for a requested item, value, article, result, or source. If any required field is absent, continue the focused evidence path; use blocked with a structured blocker when the dependency/capability is unavailable, or failed when execution itself failed. None of these outcomes means cancelled: a requested cancellation is a canonical graph revision with declaration_state=cancelled through the inspect/propose path, never a word in this summary. The summary is a derived progress note, not an authoritative evidence source: include every required observed payload field, copy exact values faithfully, identify direct tool/artifact sources when material, and never replace conflicting direct evidence with the summary. The server derives Work/item/attempt identity from the trusted current run. A successful result may atomically include next_task; when present, execute that assignment directly instead of calling run_next_work_item again.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
+                "x-astra-discovery-summary": "delivered needs current-attempt successful expected_result evidence, not unbound/prior/control. Else blocked/failed. Execute next_task directly; no child wait.",
                 "properties": {
                     "outcome": {"type": "string", "enum": ["delivered", "blocked", "failed"]},
                     "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
@@ -1687,7 +1781,7 @@ fn delegation_agent_type_schema() -> Value {
         "type": "string",
         "minLength": 1,
         "description": selection,
-        "x-astra-discovery-summary": "Omit for read-only; use task/general-purpose for shell or mutation.",
+        "x-astra-discovery-summary": "Read-only:omit; shell/mutation:task/general-purpose.",
     })
 }
 
@@ -1696,7 +1790,7 @@ fn requested_model_policy_schema() -> Value {
         "Exact catalog provider/access_label only; omit unless user specifies one.";
     json!({
         "type": "object",
-        "x-astra-discovery-summary": "Not task/output text; inherit unless user picks execution model. Chat: mode=fixed + exact model_catalog Offering ID/name; omit execution. Preserve model/source.",
+        "x-astra-discovery-summary": "User model override; omit to inherit. mode=fixed,selector={kind:offering_id,offering_id:ID}|{kind:configured_name,model_name:NAME,source?:SOURCE}. model_catalog only; no config/substitution/execution.",
         "description": "Optional execution-model override, distinct from the resolved Offering. Omit to inherit the parent Offering. Set a fixed selector only when the user requests an execution-model override, using an exact authorized Offering ID or configured name. If those choices are unknown, use model_catalog, never workspace configuration. Preserve requested versions and sources; never substitute a nearby model or invent an Offering ID. Names in quoted output or task content are not overrides. Runtime validates the selector against the authorized catalog before any child starts. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
         "oneOf": [
             {
@@ -1751,7 +1845,7 @@ fn provider_child_execution_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "x-astra-discovery-summary": "External collaborator only: copy exact tool/model from the current provider directory. Chat Offerings use requested_model_policy; omit execution. Never combine the two.",
+        "x-astra-discovery-summary": "Exact provider directory only. Chat: requested_model_policy, never execution.",
         "description": "Use a currently available provider-owned agent tool when the user names that provider/protocol or when the requested model uniquely matches a model in the current provider directory. Choose the exact tool and, when supplied, exact model selector from that directory; do not inspect workspace configuration or use Bash to discover it. A plain model request that matches an authorized Astra Offering uses requested_model_policy and omits execution. If a request matches neither, or matches multiple capacities, ask once for the missing choice. Omit for normal internal model execution. Do not combine with requested_model_policy.",
         "properties": {
             "tool": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Exact tool name from the current capability surface; never a shell command or executable path."},
@@ -1770,7 +1864,7 @@ fn collaborator_identity_schema() -> Value {
 fn fanout_reasoning_schema() -> Value {
     json!({
         "description": "Optional user-requested reasoning override. Effort uses mode=adaptive with effort=low|medium|high|max; native xhigh uses max. Token budgets use mode=enabled with budget_tokens, never effort. Omit to inherit thinking for the same Offering; different Offerings use their own defaults. Apply only to children covered by the user's request.",
-        "x-astra-discovery-summary": "Omit outside user-requested scope.",
+        "x-astra-discovery-summary": "User scope only; inherit same Offering/default otherwise. mode=adaptive+effort=low|medium|high|max(xhigh=max); mode=enabled+budget_tokens.",
         "type": "object",
         "required": ["mode"],
         "oneOf": [
@@ -1827,7 +1921,7 @@ fn agent_parameters_schema() -> Value {
                 }
             },
             "description": {"type": "string", "description": "Short task label for spawn or run_chain. Put task instructions in prompt or steps.", "x-astra-discovery-summary": "Short task label."},
-            "prompt": {"type": "string", "description": "A self-contained objective, constraints, conditional mappings and exact output requirements, with bounded evidence locations rather than pasted file contents or prior tool output. The child reads its own evidence. Keep parent-only reporting outside the brief: report execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; evidence locations, not copied contents; parent uses model/status receipts."},
+            "prompt": {"type": "string", "description": "A self-contained objective, constraints, conditional mappings and exact output requirements, with bounded evidence locations rather than pasted file contents or prior tool output. The child reads its own evidence. Keep parent-only reporting outside the brief: report execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; evidence paths only; parent model/status receipts."},
             "agent_type": delegation_agent_type_schema(),
             "requested_model_policy": requested_model_policy_schema(),
             "reasoning": fanout_reasoning_schema(),
@@ -1837,7 +1931,7 @@ fn agent_parameters_schema() -> Value {
             "input": {"type": "object", "description": "Optional run_chain template input."},
             "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
             "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional first execution slice; renewable while progress continues. This is not a hard limit. When complexity is also present, the smaller initial slice wins."},
-            "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first internal child request output-token ceiling. Current provider-owned native execution cannot honor this limit and rejects it before launch; omit it for that execution, or report that a required limit is unsupported.", "x-astra-discovery-summary": "Internal only; native execution rejects output caps."},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first internal child request output-token ceiling. Current provider-owned native execution cannot honor this limit and rejects it before launch; omit it for that execution, or report that a required limit is unsupported.", "x-astra-discovery-summary": "Internal; native:no caps."},
             "inherit_prefix": {
                 "type": ["object", "null"],
                 "description": "Parent prefix inheritance request. The Server child executor does not support inheritance and rejects explicit requests regardless of required. Omit for a fresh child context.",
@@ -1863,7 +1957,7 @@ fn agent_parameters_schema() -> Value {
             "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn.", "x-astra-discovery-summary": "get_result/list only."},
             "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
             "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
-            "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Default text. Provider-owned native stages accept text guidance, not structured requests such as question or shutdown_request. Shutdown is cooperative messaging, not runtime cancellation; queued never proves the recipient stopped. Hard cancellation belongs to the authenticated run/session control.", "x-astra-discovery-summary": "Native stages accept text only. Shutdown is cooperative, not cancellation; queued is not stopped."},
+            "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Default text. Provider-owned native stages accept text guidance, not structured requests such as question or shutdown_request. Shutdown is cooperative messaging, not runtime cancellation; queued never proves the recipient stopped. Hard cancellation belongs to the authenticated run/session control.", "x-astra-discovery-summary": "Native:text only; cooperative shutdown; queued isn't stopped."},
             "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
         },
         "required": ["action"],
@@ -1924,7 +2018,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
-                        "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files.", "x-astra-discovery-summary": "Omit for inspection/diagnostics; verify needs unchanged-workspace proof after edits."},
+                        "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files.", "x-astra-discovery-summary": "Omit inspection; verify unchanged workspace after edits."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
                         "source_artifacts": {
@@ -2473,7 +2567,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Preserve user constraints and exact output in each brief. Keep parent-only reporting outside: use runtime model/status receipts, not child self-report. Inherits provider bindings; use only exposed tools. Never paste files, diffs, or prior tool output.", "x-astra-discovery-summary": "Preserve exact child output; parent uses model/status receipts."},
                                     "agent_type": delegation_agent_type_schema(),
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
-                                    "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal only; native execution rejects output caps."},
+                                    "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal; native:no caps."},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                     "allowed_tools": {"type": "array", "items": {"type": "string"}},
@@ -2492,7 +2586,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "properties": {
                                 "agent_type": delegation_agent_type_schema(),
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
-                                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal only; native execution rejects output caps."},
+                                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal; native:no caps."},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
@@ -2904,6 +2998,252 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn rejected_execution_controls_explain_legal_shapes_without_execution() {
+        let base =
+            json!({"action":"spawn", "description":"bounded task", "prompt":"return a value"});
+        for (field, invalid, expected) in [
+            (
+                "reasoning",
+                json!({"mode":"medium"}),
+                vec!["adaptive", "effort", "enabled", "budget_tokens"],
+            ),
+            (
+                "reasoning",
+                json!({"mode":"adaptive"}),
+                vec!["effort", "adaptive"],
+            ),
+            (
+                "requested_model_policy",
+                json!({"mode":"fixed","model":"wrong"}),
+                vec!["selector", "offering_id", "configured_name"],
+            ),
+            (
+                "requested_model_policy",
+                json!({"mode":"fixed","selector":"wrong"}),
+                vec!["selector", "offering_id", "configured_name"],
+            ),
+        ] {
+            let mut arguments = base.clone();
+            arguments[field] = invalid;
+            let error = validate_tool_arguments("agent", &arguments).unwrap_err();
+            let rejection = error.rejection_output();
+            assert_eq!(rejection["executed"], false);
+            assert_eq!(rejection["retryable"], false);
+            let output = error.output();
+            for term in expected {
+                assert!(output.contains(term), "missing {term}: {output}");
+            }
+            assert!(output.len() < 4600);
+            assert!(!error.diagnostic().to_string().contains("expected"));
+        }
+        for (field, valid) in [
+            ("reasoning", json!({"mode":"adaptive","effort":"medium"})),
+            ("reasoning", json!({"mode":"enabled","budget_tokens":2048})),
+            (
+                "requested_model_policy",
+                json!({"mode":"fixed","selector":{"kind":"offering_id","offering_id":"authorized-id"}}),
+            ),
+            (
+                "requested_model_policy",
+                json!({"mode":"fixed","selector":{"kind":"configured_name","model_name":"exact-name"}}),
+            ),
+        ] {
+            let mut arguments = base.clone();
+            arguments[field] = valid;
+            validate_tool_arguments("agent", &arguments).unwrap();
+        }
+    }
+
+    #[test]
+    fn correction_hints_preserve_leaf_facts_and_qualify_union_uncertainty() {
+        for reasoning in [
+            json!({"mode":"adaptive"}),
+            json!({"mode":"adaptive","effort":"invalid"}),
+        ] {
+            let error = validate_tool_arguments("agent", &json!({"action":"spawn", "description":"test", "prompt":"test", "reasoning":reasoning})).unwrap_err();
+            let output = error.output();
+            assert!(output.contains("adaptive") && output.contains("effort"));
+            assert!(output.contains("no union alternative matched"), "{output}");
+            assert!(
+                error
+                    .issues
+                    .iter()
+                    .any(|issue| issue.location == ["reasoning", "effort"])
+            );
+        }
+        let schema = json!({"function":{"parameters":{"oneOf":[
+            {"properties":{"kind":{"const":"record"},"left":{"type":"string"}},"required":["kind","left"]},
+            {"properties":{"kind":{"const":"record"},"right":{"type":"string"}},"required":["kind","right"]}
+        ]}}});
+        let output =
+            validate_tool_arguments_against_schema("dynamic", &json!({"kind":"record"}), &schema)
+                .unwrap_err()
+                .output();
+        assert!(
+            output.contains("required field `left`") && output.contains("best-ranked alternative")
+        );
+        assert!(!output.contains("required field `right`"));
+        validate_tool_arguments_against_schema(
+            "dynamic",
+            &json!({"kind":"record","left":"ok"}),
+            &schema,
+        )
+        .unwrap();
+        assert!(
+            validate_tool_arguments_against_schema(
+                "dynamic",
+                &json!({"kind":"record","left":"ok","right":"ok"}),
+                &schema
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn union_leaf_correction_survives_many_variants_and_large_optional_fields() {
+        for singleton in [true, false] {
+            for padding in [None, Some(0), Some(3)] {
+                let branches: Vec<_> = (0..4).map(|index| {
+                    let modes = if singleton { vec![format!("variant-{index}")] }
+                        else { vec![format!("variant-{index}"), format!("alias-{index}")] };
+                    let mut branch = json!({"properties":{
+                        "mode":{"enum":modes},
+                        "choice":{"enum":[format!("value-{index}-a"),format!("value-{index}-b")]}
+                    },"required":["mode","choice"],"additionalProperties":false});
+                    if padding == Some(index) {
+                        for field in ["a_padding", "b_padding"] {
+                            branch["properties"][field] = json!({"enum":(0..8).map(|n|format!("padding-{n}-{}","x".repeat(80))).collect::<Vec<_>>()});
+                        }
+                    }
+                    branch
+                }).collect();
+                let schema = json!({"function":{"parameters":{"type":"object","oneOf":branches}}});
+                let args = json!({"mode":"variant-3","choice":"invalid"});
+                let error =
+                    validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap_err();
+                assert_eq!(error.issues[0].code, ValidationCode::Enum);
+                assert_eq!(error.issues[0].location, ["choice"]);
+                let output = error.output();
+                assert!(
+                    output.contains("value-3-a") && output.contains("value-3-b"),
+                    "singleton={singleton} padding={padding:?}: {output}"
+                );
+                assert!(output.len() < 4600);
+                assert_eq!(error.rejection_output()["executed"], false);
+                let mut corrected = args;
+                corrected["choice"] = json!("value-3-a");
+                validate_tool_arguments_against_schema("dynamic", &corrected, &schema).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_required_fields_remain_authoritative() {
+        let error = validate_tool_arguments("agent", &json!({"action":"spawn","description":"test","prompt":"test","reasoning":{"mode":"adaptive"}})).unwrap_err();
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::Required
+                    && issue.location == ["reasoning", "effort"])
+        );
+        assert!(error.output().contains("required field `effort`"));
+        assert!(error.output().contains("mode=adaptive+effort="));
+        for (reasoning, accepted) in [
+            (json!({"mode":"adaptive","effort":"medium"}), true),
+            (json!({"effort":"medium"}), false),
+            (json!({"mode":"enabled","budget_tokens":2048}), true),
+            (json!({"budget_tokens":2048}), false),
+        ] {
+            assert_eq!(validate_tool_arguments("agent",&json!({"action":"spawn","description":"test","prompt":"test","reasoning":reasoning})).is_ok(),accepted);
+        }
+    }
+
+    #[test]
+    fn rejection_rendering_is_bounded_even_for_external_names_and_many_issues() {
+        let error = ToolArgumentValidationError {
+            tool_name: "界".repeat(5000),
+            action: Some("界".repeat(5000)),
+            issues: (0..20)
+                .map(|_| ValidationIssue::new(ValidationCode::Type, &[], "界".repeat(5000)))
+                .collect(),
+            malformed_parse_error: None,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.len() <= 4096);
+        assert!(rendered.contains("omitted"));
+        assert!(error.diagnostic().to_string().len() <= 4096);
+    }
+
+    #[test]
+    fn leaf_feedback_uses_nearest_guidance_and_escaped_bounded_literals() {
+        let literal = "quote\" and newline\n";
+        let schema = json!({"function":{"parameters":{"type":"object", "x-astra-discovery-summary":"root guidance", "properties":{
+            "outer":{"type":"object", "x-astra-discovery-summary":"outer guidance", "properties":{
+                "choice":{"enum":[literal], "x-astra-discovery-summary":"nearest guidance"},
+                "count":{"type":"integer"}
+            }},
+            "fixed":{"const":{"large":"界".repeat(4096)}},
+            "long":{"enum":["界".repeat(4096)]},
+            "flag":{"const":true}
+        }}}});
+        let error = validate_tool_arguments_against_schema("dynamic", &json!({"outer":{"choice":"private payload", "count":"private payload"}, "fixed":null, "long":null, "flag":false}), &schema).unwrap_err();
+        let choice = error
+            .issues
+            .iter()
+            .find(|issue| issue.location == ["outer", "choice"])
+            .unwrap()
+            .to_string();
+        assert!(choice.contains(&serde_json::to_string(literal).unwrap()));
+        assert!(choice.contains("nearest guidance"));
+        assert!(!choice.contains("outer guidance") && !choice.contains("root guidance"));
+        let count = error
+            .issues
+            .iter()
+            .find(|issue| issue.location == ["outer", "count"])
+            .unwrap()
+            .to_string();
+        assert!(count.contains("outer guidance") && !count.contains("root guidance"));
+        let output = error.output();
+        assert!(
+            output.contains("composite literal omitted")
+                && output.contains("oversized literal omitted")
+        );
+        assert!(output.contains("must be true"));
+        assert!(!output.contains("private payload") && !output.contains("界"));
+        assert!(output.len() < 4600);
+        assert!(!error.diagnostic().to_string().contains("guidance"));
+        let malformed = validate_tool_arguments_against_schema(
+            &"界".repeat(5000),
+            &json!({"_parse_error":{"kind":"invalid_json"}}),
+            &schema,
+        )
+        .unwrap_err();
+        assert!(malformed.output().len() < 1000);
+        assert_eq!(
+            serde_json::from_str::<Value>(&malformed.output()).unwrap()["advisory"]["executed"],
+            false
+        );
+    }
+
+    #[test]
+    fn correction_hints_bound_large_schema_and_preserve_sanitized_diagnostics() {
+        let schema = json!({"function":{"parameters":{"type":"object", "properties":{
+            "value":{"enum":(0..100).map(|n| format!("{n}{}", "界".repeat(4096))).collect::<Vec<_>>()}
+        }}}});
+        let error = validate_tool_arguments_against_schema(
+            "custom",
+            &json!({"value":"private-user-value"}),
+            &schema,
+        )
+        .unwrap_err();
+        assert!(error.output().len() < 4600);
+        assert!(error.output().contains("omitted"));
+        assert!(!error.output().contains("private-user-value"));
+        assert!(!error.diagnostic().to_string().contains("界"));
+    }
 
     #[test]
     fn union_diagnostics_prefer_matching_tags_over_fewer_errors() {
@@ -3865,9 +4205,9 @@ mod tests {
             "load-bearing Work chronology must survive deferred discovery"
         );
         assert!(selection["description"].as_str().is_some_and(|summary| {
-            summary.contains("Declare known outcomes, including dependencies")
-                && summary.contains("Omit later decisions/additions/replacements")
-                && summary.contains("exactly N named initial tracks")
+            summary.contains("before exploration")
+                && summary.contains("N known outcomes=N tasks")
+                && summary.contains("execute initial_task directly")
         }));
         let prerequisite_path =
             "/properties/tasks/items/properties/after_initial_tasks/description";
@@ -5281,15 +5621,8 @@ mod tests {
             &json!({"questions": [{"question": "Proceed?", "options": [{"description": "missing label"}]}]}),
         )
         .unwrap_err();
-        assert_eq!(
-            error
-                .issues
-                .iter()
-                .map(|issue| issue.message.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "field `questions` item 0 field `options` item 0 missing non-empty required field `label`"
-            ]
-        );
+        assert_eq!(error.issues[0].code, ValidationCode::Required);
+        assert!(error.output().contains("required field `label`"));
+        assert!(error.output().contains("no union alternative matched"));
     }
 }

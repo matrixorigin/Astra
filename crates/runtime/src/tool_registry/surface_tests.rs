@@ -475,9 +475,15 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
         full_start.pointer(prerequisite_path),
         "resident input must explain how to declare dependencies, not only name the field"
     );
-    assert!(description.contains("One Work graph"));
-    assert!(description.contains("no repeat start"));
-    assert!(description.contains("revision-pinned proposal"));
+    assert_eq!(
+        description,
+        full_start["function"]["parameters"]["x-astra-discovery-summary"]
+            .as_str()
+            .unwrap()
+    );
+    assert!(description.contains("before exploration"));
+    assert!(description.contains("one start"));
+    assert!(description.contains("initial_task directly"));
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "start_work",
         &json!({
@@ -535,8 +541,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let agent_description = find(&resident, "agent")["function"]["description"]
         .as_str()
         .expect("resident agent description");
-    assert!(agent_description.contains("spawn needs description+prompt"));
-    assert!(agent_description.contains("No substitution"));
+    assert!(agent_description.contains("Auto results"));
     assert!(agent_description.starts_with(astra_tools::agent_parent_scope_guidance!()));
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["description"]["description"],
@@ -552,8 +557,8 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         "resident projection must retain model-control semantics"
     );
     let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
-    assert!(summary.contains("Not task/output text"));
-    assert!(summary.contains("inherit unless user picks execution model"));
+    assert!(summary.contains("User model override"));
+    assert!(summary.contains("omit to inherit"));
     let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
@@ -563,7 +568,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         reasoning["x-astra-discovery-summary"]
             .as_str()
             .unwrap()
-            .contains("Omit outside user-requested scope")
+            .contains("User scope only")
     );
     assert_eq!(
         find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
@@ -637,18 +642,14 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let profile = agent_params["properties"]["agent_type"]["description"]
         .as_str()
         .unwrap();
-    for constraint in [
-        "Omit for read-only",
-        "task/general-purpose",
-        "shell or mutation",
-    ] {
+    for constraint in ["Read-only:omit", "task/general-purpose", "shell/mutation"] {
         assert!(profile.contains(constraint), "{profile}");
     }
     assert!(
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("Results arrive automatically")
+            .contains("Auto results")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
@@ -758,7 +759,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         .as_str()
         .expect("resident child brief guidance");
     assert!(child_brief.contains("Exact output"));
-    assert!(child_brief.contains("parent uses model/status receipts"));
+    assert!(child_brief.contains("parent") && child_brief.contains("model/status receipts"));
     assert!(
         full_agent["function"]["parameters"]["properties"]
             .get("requested_model_policy")

@@ -1282,7 +1282,7 @@ mod tests {
                     normalized.contains("exact output")
                         || normalized.contains("exact child output")
                 );
-                assert!(guidance.contains("parent uses model/status receipts"));
+                assert!(guidance.contains("parent") && guidance.contains("model/status receipts"));
                 assert!(brief.get("x-astra-discovery-summary").is_none());
                 let reasoning = if selected["name"] == "agent" {
                     vec![&parameters["reasoning"]]
@@ -1293,7 +1293,16 @@ mod tests {
                     ]
                 };
                 for control in reasoning {
-                    assert_eq!(control["description"], "Omit outside user-requested scope.");
+                    let guidance = control["description"].as_str().unwrap();
+                    for term in [
+                        "User scope only",
+                        "mode=adaptive",
+                        "effort",
+                        "mode=enabled",
+                        "budget_tokens",
+                    ] {
+                        assert!(guidance.contains(term));
+                    }
                     assert!(control.get("x-astra-discovery-summary").is_none());
                 }
                 let policies = if selected["name"] == "agent" {
@@ -1325,7 +1334,7 @@ mod tests {
                     assert!(guidance.contains("inherit"));
                     assert!(guidance.contains("model_catalog"));
                     assert!(guidance.contains("fixed"));
-                    assert!(guidance.contains("Not task/output text"));
+                    assert!(guidance.contains("User model override"));
                     let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
                         ["source"];
                     assert_eq!(source["description"], "Exact provider/access_label.");

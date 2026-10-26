@@ -19636,6 +19636,84 @@ mod tests {
     }
 
     #[test]
+    fn resident_wire_preserves_operative_control_and_work_guidance() {
+        let surface = crate::tool_registry::surface::ToolSurface::build(
+            astra_tools::schemas::all_tool_schemas(),
+            &astra_config::ToolSurfaceConfig::default(),
+            &[],
+        );
+        let tools = surface.always_load_schemas();
+        let body = build_provider_request_body(
+            &[json!({"role":"user","content":"task"})],
+            &tools,
+            "deepseek-chat",
+            "deepseek",
+            Some(128),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let encoded = serde_json::to_string(&body).unwrap();
+        assert!(!encoded.contains("x-astra-"));
+        let agent = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "agent")
+            .unwrap();
+        let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties["reasoning"]["oneOf"].is_array());
+        let reasoning = properties["reasoning"]["description"].as_str().unwrap();
+        for term in ["mode=adaptive", "effort=", "mode=enabled", "budget_tokens"] {
+            assert!(reasoning.contains(term));
+        }
+        let policy = properties["requested_model_policy"]["description"]
+            .as_str()
+            .unwrap();
+        for term in [
+            "selector={",
+            "offering_id",
+            "configured_name",
+            "no config/substitution",
+        ] {
+            assert!(policy.contains(term));
+        }
+        for (name, terms) in [
+            (
+                "start_work",
+                vec!["before exploration", "initial_task", "directly"],
+            ),
+            ("run_next_work_item", vec!["unassigned", "next_task"]),
+            (
+                "settle_work_item",
+                vec!["current-attempt", "unbound/prior/control", "blocked/failed"],
+            ),
+        ] {
+            let tool = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == name)
+                .unwrap();
+            let description = tool["function"]["description"].as_str().unwrap();
+            for term in terms {
+                assert!(description.contains(term), "{name}: {term}");
+            }
+        }
+        let mut fallback = agent["function"]["parameters"].clone();
+        strip_unsupported_schema_fields(&mut fallback);
+        assert!(fallback.get("oneOf").is_none());
+        assert_eq!(
+            fallback["properties"]["reasoning"]["description"],
+            reasoning
+        );
+        assert_eq!(
+            fallback["properties"]["requested_model_policy"]["description"],
+            policy
+        );
+    }
+
+    #[test]
     fn resident_agent_wire_defers_observation_and_keeps_spawn_required_fields() {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             astra_tools::schemas::all_tool_schemas(),

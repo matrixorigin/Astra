@@ -566,6 +566,12 @@ pub enum Criterion {
         /// tool execution, including one whose execution result is an error.
         #[serde(default)]
         require_added_before_execution: bool,
+        /// User explicitly requires retirement before any execution.
+        #[serde(default)]
+        require_cancel_before_execution: bool,
+        /// Task execution must follow a server-issued Work assignment.
+        #[serde(default)]
+        require_board_before_execution: bool,
     },
 
     /// Proves a successful canonical graph patch was committed after Work was
@@ -4060,6 +4066,8 @@ fn evaluate_one_with_primary_cache(
             added_execution_after_initial_deliveries,
             require_added_at_start,
             require_added_before_execution,
+            require_cancel_before_execution,
+            require_board_before_execution,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_work_replacement_lifecycle");
@@ -4076,6 +4084,8 @@ fn evaluate_one_with_primary_cache(
                         *added_execution_after_initial_deliveries,
                     require_added_at_start: *require_added_at_start,
                     require_added_before_execution: *require_added_before_execution,
+                    require_cancel_before_execution: *require_cancel_before_execution,
+                    require_board_before_execution: *require_board_before_execution,
                 },
             );
             CriterionResult {

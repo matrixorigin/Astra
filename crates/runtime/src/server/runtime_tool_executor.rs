@@ -15454,6 +15454,22 @@ for line in sys.stdin:
         let progress = Arc::new(ToolLifecycleProgressCallback::default());
         exec.set_progress_callback(progress.clone());
         for (tool_name, arguments) in [
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "reasoning":{"mode":"medium"}}),
+            ),
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "reasoning":{"mode":"adaptive"}}),
+            ),
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "requested_model_policy":{"mode":"fixed","model":"wrong"}}),
+            ),
+            (
+                "agent",
+                json!({"action":"spawn", "description":"test", "prompt":"return a value", "requested_model_policy":{"mode":"fixed","selector":"wrong"}}),
+            ),
             ("notify", json!({"message":"   "})),
             (
                 "agent",
@@ -15466,6 +15482,16 @@ for line in sys.stdin:
             let result = exec.execute_with_metadata(tool_name, &arguments).await;
 
             assert_tool_invalid_args(&result);
+            if arguments.get("reasoning").is_some() {
+                assert!(result.output.contains("adaptive") && result.output.contains("effort"));
+            }
+            if arguments.get("requested_model_policy").is_some() {
+                assert!(
+                    result.output.contains("offering_id")
+                        && result.output.contains("configured_name")
+                );
+            }
+
             let metadata = result.metadata.as_ref().expect("schema preflight metadata");
             assert_eq!(metadata["disposition"], "rejected");
             assert_eq!(metadata["execution_started"], false);

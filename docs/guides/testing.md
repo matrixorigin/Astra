@@ -189,13 +189,18 @@ edges too before claiming the entire combined graph is acyclic.
 
 `journal_work_replacement_lifecycle` checks exact initial, cancelled, added, and
 delivered item counts using canonical Work and branch identities. It allows any
-unexecuted initial item to be cancelled, requires fresh addition identities, and
+initial item without a delivered outcome to be cancelled, requires fresh addition identities, and
 checks that the remaining initial items and additions each have a delivered
 settlement. Replays of the same execution do not count twice. Its optional
 `cancellation_after_deliveries` minimum requires causal evidence that the target
-remained unstarted until the preceding deliveries; a late snapshot alone is not
+remained active until the preceding deliveries; a late snapshot alone is not
 proof of deferred cancellation. Natural requests with unspecified cancellation
-targets and requests for an explicit deferred replacement use separate cases.
+targets and requests for an explicit deferred replacement use separate cases. Cancellation permits execution under an earlier active revision;
+accepted retirement receipts must fence later execution even before another
+complete board arrives. Use `require_cancel_before_execution` when the user
+requires the item never to start. Use `require_board_before_execution` to reject
+unbound pre-reads and require successful evidence under the delivered assignment.
+Parallel batch position alone does not prove cancellation/execution ordering.
 
 ## MOI consumer compatibility with a fresh Astra database
 
