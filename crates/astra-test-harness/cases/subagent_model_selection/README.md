@@ -206,7 +206,10 @@ successful child-owned question and root-owned answer with the exact request
 ID, and a matching typed durable child Received observation binding both parties
 and the answer message ID. Canonical reply obligations own the stable parent
 mailbox identity; an extra root Sent mirror is unnecessary. Present correlated
-observations must still agree. The same child must complete on the selected
+observations must still agree. Attempts explicitly reported as unexecuted do
+not create questions or answers, so a rejected attempt followed by a successful
+correction does not count as two answers. Unknown execution and genuinely
+duplicated answers still fail closed. The same child must complete on the selected
 model and have its
 complete raw result digest adopted before parent finalization. A queued answer
 alone is insufficient. Ordinary `send_message` text (including

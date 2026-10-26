@@ -1216,6 +1216,13 @@ impl SessionExecutionCapture {
             .as_deref()
             .ok_or("question actor unavailable")?;
         let tools = self.tools(root, trace)?;
+        // A rejected, explicitly unexecuted attempt cannot create a question
+        // or answer. Unknown and failed executions still participate in the
+        // uniqueness and receipt checks; success alone is not authority.
+        let may_have_executed = |call: &&ExecutionToolCall<'_>| {
+            agent_fanout_control_execution_fact(call.raw_result())
+                != Some(AgentFanoutControlExecutionFact::NotExecuted)
+        };
         let transcript = self
             .transcript
             .as_ref()
@@ -1225,24 +1232,20 @@ impl SessionExecutionCapture {
         // the question's canonical PendingReply and the child's delivery fact.
         let answered_requests: std::collections::HashSet<_> = tools
             .iter()
+            .filter(may_have_executed)
             .filter(|call| call.run_id.as_deref() == Some(root) && call.name == "agent")
             .filter_map(|call| call.arguments.as_ref())
             .filter(|args| args["action"] == "send_message" && args["message_type"] == "answer")
             .filter_map(|args| args["request_id"].as_str().filter(|id| !id.is_empty()))
             .collect();
         let mut selected = None;
-        for question in tools.iter().filter(|call| {
+        for question in tools.iter().filter(may_have_executed).filter(|call| {
             call.run_id.as_deref() == Some(child.run_id.as_str())
                 && call.name == "agent"
                 && call.arguments.as_ref().is_some_and(|args| {
                     args["action"] == "send_message" && args["message_type"] == "question"
                 })
         }) {
-            if agent_fanout_control_execution_fact(question.raw_result())
-                == Some(AgentFanoutControlExecutionFact::NotExecuted)
-            {
-                continue;
-            }
             let receipt = question
                 .result
                 .as_ref()
@@ -1284,7 +1287,7 @@ impl SessionExecutionCapture {
         {
             return Ok(false);
         }
-        let mut answers = tools.iter().filter(|call| {
+        let mut answers = tools.iter().filter(may_have_executed).filter(|call| {
             call.run_id.as_deref() == Some(root)
                 && call.name == "agent"
                 && call.arguments.as_ref().is_some_and(|args| {
@@ -2936,9 +2939,10 @@ pub(crate) mod tests {
                 "{recipient}"
             );
         }
-        for recipient in ["peer", "parent"] {
+        for (recipient, rejected_reply) in [("peer", false), ("parent", false), ("parent", true)] {
             let mut additional = original.clone();
             additional.run_tree.runs[1].total_tool_calls += 1;
+            additional.run_tree.runs[0].total_tool_calls += u32::from(rejected_reply);
             let page = additional.transcript.as_mut().unwrap();
             let mut request = page.items[0].clone();
             request.item_seq = 7;
@@ -2958,11 +2962,28 @@ pub(crate) mod tests {
             }
             result.content = receipt.to_string();
             page.items.splice(6..6, [request, result]);
+            if rejected_reply {
+                let mut request = page.items[2].clone();
+                let mut result = page.items[3].clone();
+                request.item_seq = 9;
+                result.item_seq = 10;
+                page.items.last_mut().unwrap().item_seq = 11;
+                request.source_event_id = Some("second-question-rejected-answer".into());
+                result.source_event_id = Some("second-question-rejected-result".into());
+                request.tool_calls[0].tool_use_id = "second-reply".into();
+                request.tool_calls[0].arguments = serde_json::json!({"action":"send_message","message_type":"answer","to":"member","request_id":"second-question"}).to_string();
+                result.tool_result.as_mut().unwrap().tool_use_id = "second-reply".into();
+                result.tool_result.as_mut().unwrap().status = Some("rejected".into());
+                result.content =
+                    serde_json::json!({"success":false,"executed":false,"status":"rejected"})
+                        .to_string();
+                page.items.splice(8..8, [request, result]);
+            }
             assert_eq!(
                 proof_failure(additional, vec![expected.clone()], None),
                 // A different request is not part of the verified reply chain.
                 None,
-                "additional {recipient}"
+                "additional {recipient}, rejected reply={rejected_reply}"
             );
         }
         let mut custom_root = original.clone();
@@ -3026,6 +3047,58 @@ pub(crate) mod tests {
                 None,
                 "rejected peer before={before}"
             );
+        }
+        for before in [true, false] {
+            for recipient in [Some("peer"), None] {
+                for executed in [
+                    Some(Value::Bool(false)),
+                    Some(Value::Null),
+                    Some(Value::Bool(true)),
+                    None,
+                ] {
+                    let mut retried = original.clone();
+                    retried.run_tree.runs[0].total_tool_calls += 1;
+                    let page = retried.transcript.as_mut().unwrap();
+                    let mut request = page.items[2].clone();
+                    let mut result = page.items[3].clone();
+                    if before {
+                        for item in &mut page.items[2..] {
+                            item.item_seq += 2;
+                        }
+                    }
+                    request.item_seq = if before { 3 } else { 7 };
+                    result.item_seq = request.item_seq + 1;
+                    request.source_event_id = Some("rejected-answer-request".into());
+                    result.source_event_id = Some("rejected-answer-result".into());
+                    request.tool_calls[0].tool_use_id = "rejected-answer-call".into();
+                    let mut args = serde_json::json!({"action":"send_message","message_type":"answer","request_id":"question-id"});
+                    if let Some(recipient) = recipient {
+                        args["to"] = recipient.into();
+                    } else {
+                        args["agent_id"] = "member".into();
+                    }
+                    request.tool_calls[0].arguments = args.to_string();
+                    result.tool_result.as_mut().unwrap().tool_use_id =
+                        "rejected-answer-call".into();
+                    result.tool_result.as_mut().unwrap().status = Some("rejected".into());
+                    let mut receipt = serde_json::json!({"success":false,"status":"rejected","error_kind":"tool_invalid_args"});
+                    if let Some(executed) = &executed {
+                        receipt["executed"] = executed.clone();
+                    }
+                    result.content = receipt.to_string();
+                    page.items
+                        .splice(if before { 2..2 } else { 6..6 }, [request, result]);
+                    assert_eq!(
+                        proof_failure(retried, vec![expected.clone()], None),
+                        if executed == Some(Value::Bool(false)) {
+                            None
+                        } else {
+                            Some(BehaviorContractViolation)
+                        },
+                        "answer attempt before={before}, recipient={recipient:?}, executed={executed:?}"
+                    );
+                }
+            }
         }
         let mut run_addressed = original.clone();
         run_addressed.transcript.as_mut().unwrap().items[2].tool_calls[0].arguments =

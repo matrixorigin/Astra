@@ -428,6 +428,8 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
 pub(crate) struct CanonicalTerminalSettlementCommit {
     pub(crate) terminal_status: Option<&'static str>,
     pub(crate) canonical_context_cursor: Option<SessionCursorV1>,
+    /// Completion projection plus controls newly committed by this attempt.
+    /// Idempotent readback has no new controls; reconnect reads durable events.
     pub(crate) terminal_events: Vec<Value>,
     pub(crate) terminal_assistant_source_event_id: Option<String>,
 }
@@ -5113,7 +5115,19 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(replay.terminal_status, commit.terminal_status);
-            assert_eq!(replay.terminal_events, commit.terminal_events);
+            assert_eq!(
+                replay.terminal_events,
+                commit
+                    .terminal_events
+                    .iter()
+                    .filter(|event| matches!(
+                        durable_event_type(event),
+                        Some("text_done" | "run_error" | "run_finished")
+                    ))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                "idempotent confirmation repeats completion without new control notifications"
+            );
             if case == TerminalCase::Failed {
                 for kind in [None, Some(astra_core::ErrorKind::Unknown)] {
                     assert!(
@@ -5134,21 +5148,44 @@ mod tests {
                 }
             }
 
-            assert_eq!(
-                store
-                    .load_run(&user, &run_id)
+            let replayed = store.load_run(&user, &run_id).await.unwrap().unwrap();
+            assert_eq!(replayed.last_event_idx, current.last_event_idx);
+            assert_eq!(replayed.events, current.events);
+            if case == TerminalCase::LateGuidance {
+                let returned = |events: &[Value]| {
+                    events
+                        .iter()
+                        .filter(|event| durable_event_type(event) == Some("user_intent_returned"))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                let fresh = returned(&commit.terminal_events);
+                assert_eq!(fresh.len(), 1);
+                assert_eq!(fresh[0]["data"]["intent_id"], "late");
+                assert_eq!(fresh[0]["data"]["status"], "returned");
+                assert_eq!(fresh[0]["data"]["content"], "late guidance");
+                let durable = returned(&replayed.events);
+                assert_eq!(durable.len(), 1);
+                assert_eq!(durable[0]["data"], fresh[0]["data"]);
+                let returned_index = durable[0]["index"].as_i64().unwrap();
+                assert!(returned_index < text["index"].as_i64().unwrap());
+                let before_return = store
+                    .load_run_event_delta(&user, &run_id, returned_index - 1)
                     .await
                     .unwrap()
+                    .unwrap();
+                assert_eq!(returned(&before_return.events), durable);
+                let after_return = store
+                    .load_run_event_delta(&user, &run_id, returned_index)
+                    .await
                     .unwrap()
-                    .last_event_idx,
-                current.last_event_idx
-            );
-            if case == TerminalCase::LateGuidance {
+                    .unwrap();
+                assert!(returned(&after_return.events).is_empty());
                 assert!(
-                    current
+                    after_return
                         .events
                         .iter()
-                        .any(|event| durable_event_type(event) == Some("user_intent_returned"))
+                        .any(|event| durable_event_type(event) == Some("run_finished"))
                 );
                 assert!(
                     !current
