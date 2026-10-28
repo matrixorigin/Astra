@@ -219,8 +219,8 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
         .await
         .unwrap();
     // An old signed proof still revokes the current row even though its own
-    // hash disappeared on rotation. Revoked rows are eligible after retention.
-    sqlx::query("UPDATE auth_refresh_tokens SET created_at = DATE_SUB(NOW(6), INTERVAL 8 DAY) WHERE user_id = ? AND is_revoked = 1")
+    // hash disappeared on rotation. Revoked rows are retained until after expiry.
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 8 DAY), created_at = DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 8 DAY) WHERE user_id = ? AND is_revoked = 1")
         .bind(&user.user_id)
         .execute(pool.get())
         .await

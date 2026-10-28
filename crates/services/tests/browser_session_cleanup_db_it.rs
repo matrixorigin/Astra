@@ -97,6 +97,30 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
             .unwrap();
     assert_eq!(direct_exists, 0);
 
+    // A running catch-up round must not advance its cutoff as more rows expire.
+    let later = seed(pool.get(), true).await;
+    let now: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE token_id = ?")
+        .bind(now - chrono::Duration::days(10))
+        .bind(&later)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let fixed = now - chrono::Duration::days(20);
+    let batch = astra_services::cleanup_refresh_session_batch(
+        pool.get(),
+        &RetentionPolicy::default(),
+        Some(fixed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(batch.cutoff, fixed);
+    assert_eq!(batch.deleted, 0);
+    assert_eq!(clean(pool.get()).await.unwrap(), 1);
+
     // Keep the expired row locked while a second pool starts cleanup. A
     // conflicting cleanup must not delete the committed renewed credential.
     let renewed = seed(pool.get(), true).await;
@@ -158,8 +182,46 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
             .push_bind("fixture");
     });
     insert.build().execute(pool.get()).await.unwrap();
+    // The index has many future rows; only expired rows older than retention
+    // are eligible even when a backend index range misbehaves.
+    let future_ids: Vec<_> = (0..1001)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect();
+    let future_expiry = (chrono::Utc::now() + chrono::Duration::days(365)).naive_utc();
+    let mut future = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,created_at) ",
+    );
+    future.push_values(&future_ids, |mut row, id| {
+        row.push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(id)
+            .push_bind(future_expiry)
+            .push_bind("2020-01-01");
+    });
+    future.build().execute(pool.get()).await.unwrap();
+    let recent = seed(pool.get(), true).await;
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 1 DAY), is_revoked = 1 WHERE token_id = ?")
+        .bind(&recent).execute(pool.get()).await.unwrap();
     assert_eq!(clean(pool.get()).await.unwrap(), 1000);
     assert_eq!(clean(pool.get()).await.unwrap(), 1);
     assert_eq!(clean(pool.get()).await.unwrap(), 0);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_refresh_tokens WHERE expires_at > UTC_TIMESTAMP(6)",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(remaining, 1002); // 1001 future sessions and the renewed session.
+    let recent_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id = ?")
+            .bind(&recent)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        recent_count, 1,
+        "expired or revoked rows still respect retention"
+    );
     other.get().close().await;
 }

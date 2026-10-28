@@ -195,7 +195,7 @@ impl DatabaseAuthService {
             ),
             None => (None, None, ""),
         };
-        let statement = format!("UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), token_prefix = NULL, browser_handle_hash = ?, browser_ciphertext = ?
+        let statement = format!("UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), browser_handle_hash = ?, browser_ciphertext = ?
              WHERE token_id = ? AND token_hash = ? AND user_id = ? AND session_id = ?
                AND is_revoked = 0 AND expires_at > NOW(6){guard}");
         // `guard` is selected exclusively from the fixed literals above.

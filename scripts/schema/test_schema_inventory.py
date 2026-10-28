@@ -545,7 +545,7 @@ fn char_literal() { let slash = '/'; }
             self.tables["auth_roles"]["retention_policy"],
         )
         self.assertIn(
-            "ordered bounded batches",
+            "bounded keyed batches",
             self.tables["auth_refresh_tokens"]["retention_policy"],
         )
         self.assertIn(

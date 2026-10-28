@@ -483,14 +483,24 @@ This limitation does not affect delayed ordinary refresh or handle-logout respon
 The encrypted payload has an immutable one-year absolute cap. Browser rotation
 caps the canonical refresh-row expiry to it, so bearer admission and handle
 resolution respect the same ceiling. No separate browser expiry or sweep exists.
-The existing refresh retention sweep deletes at most 1,000 eligible rows per
-six-hour sweep; browser ciphertext is removed with its canonical row. Logout and
-provider disconnect clear the ciphertext immediately. Other ciphertext remains
-until the session has expired or been revoked and its age since issuance or last
-rotation exceeds the retention threshold (default seven days), plus backlog delay.
-The existing retention query can scan the refresh table and can accumulate a
-backlog above its deletion rate; this change does not solve that pre-existing
-MatrixOne query limitation.
+Refresh retention treats the configured seven days as a minimum period after
+expiry. Revoked rows can remain until their original expiry plus that period;
+logout and provider disconnect clear browser ciphertext immediately. Other
+ciphertext remains until expiry, the retention period and any cleanup backlog.
+
+Refresh maintenance captures a conservative UTC cutoff, binds it as a concrete
+DATETIME to the expiry index, and rechecks each candidate and the cutoff in a
+primary-key batch delete. This avoids the MatrixOne 4.2.5 dynamic time range
+error and reduces index maintenance work. The delete checks the current database
+clock and the retention period again, so a concurrent renewal or backward clock
+change cannot cause premature deletion. Correct expiry selection still depends
+on MatrixOne's index returning complete results. Candidate anomalies and stalled
+batches are logged and retried; the maintenance worker uses bounded batches and
+periodic retries without persistent coordination. Each catch-up round keeps a
+fixed cutoff and a normal six-hour sweep performs one follow-up check even if
+its first batch was empty. Replica conflicts can delay progress, and clock
+synchronization remains a deployment requirement. An admin cleanup error may
+follow already committed batches or other table deletions; retrying is safe.
 JWT signing and `ASTRA_TOKEN_ENCRYPTION_KEY` must match across runtime replicas.
 Missing keys, key mismatch and corrupt ciphertext fail closed. Changing either key
 requires sign-in again; it is not transparent key rotation.
@@ -503,7 +513,7 @@ the browser's shared cookie jar; it does not construct authentication cookies.
 
 ### Fresh-schema deployment
 
-This change advances the strict core schema contract to `2026-10-28-v112`. It does
+This change advances the strict core schema contract to `2026-10-28-v113`. It does
 not migrate, alter, drop or recreate an existing database. Provision a **separate
 fresh database**, preserving the old database and its data. Existing data does not
 appear in the fresh database without a separately designed migration. Drain old

@@ -288,6 +288,11 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
 
     for (change, restore, expected) in [
         (
+            "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_expires_at",
+            "CREATE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at)",
+            "idx_auth_refresh_tokens_expires_at",
+        ),
+        (
             "ALTER TABLE auth_external_identities DROP INDEX idx_external_identity_user",
             "CREATE INDEX idx_external_identity_user ON auth_external_identities (astra_user_id, provider_id, external_subject, updated_at)",
             "idx_external_identity_user",
