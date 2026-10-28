@@ -98,7 +98,7 @@ export class WebRuntimeClient {
       throw new RuntimeClientError({
         operation: init.operation ?? `${init.method ?? "GET"} ${path}`,
         path,
-        status: response.status,
+        status: 502,
         detail: `Runtime returned invalid JSON for ${path}.`,
         cause: error,
       });

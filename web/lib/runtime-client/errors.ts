@@ -22,7 +22,9 @@ export class RuntimeClientError extends Error {
     this.name = 'RuntimeClientError';
     this.operation = context.operation;
     this.path = context.path;
-    this.status = context.status;
+    this.status = context.status === undefined ? undefined
+      : Number.isInteger(context.status) && context.status >= 400 && context.status <= 599
+        ? context.status : 502;
     this.detail = context.detail;
     this.code = context.code;
     this.cause = context.cause;

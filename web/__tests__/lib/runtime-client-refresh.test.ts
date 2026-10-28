@@ -24,6 +24,9 @@ import {
   POST as createProject,
 } from "@/app/api/projects/route";
 import { registerAction } from "@/lib/auth/actions";
+import { RuntimeClientError } from "@/lib/runtime-client/errors";
+import { POST as stopRun } from "@/app/api/chats/[chatId]/stop/route";
+import { GET as capabilities } from "@/app/api/runtime/capabilities/route";
 
 const root = "https://runtime.example/";
 const handle = `bs1.${Buffer.from(root).toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
@@ -407,3 +410,51 @@ it.each([
     expect(set).not.toHaveBeenCalled();
   },
 );
+
+it("rejects a non-JSON successful current-user response before user mutations", async () => {
+  const auth = runtimeFetch();
+  const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+    new URL(String(input)).pathname === "/auth/me"
+      ? new Response("<html>upstream error</html>", { status: 200 })
+      : auth(input, init),
+  );
+  vi.stubGlobal("fetch", fetch);
+  expect((await meRoute()).status).toBe(502);
+  const createRequest = new NextRequest("http://web.test/api/projects", {
+    method: "POST", body: JSON.stringify({ name: "must not be created" }),
+  });
+  const stopRequest = new Request("http://web.test/api/chats/example/stop", {
+    method: "POST", body: JSON.stringify({ sessionId: "s", runId: "r", assistantMessageId: null }),
+  });
+  expect((await createProject(createRequest)).status).toBe(502);
+  expect((await stopRun(stopRequest, { params: Promise.resolve({ chatId: "example" }) })).status).toBe(502);
+  expect(createRequest.bodyUsed).toBe(false);
+  expect(stopRequest.bodyUsed).toBe(false);
+  expect(fetch.mock.calls.every(([url]) => ["/auth/me", "/auth/refresh"].includes(new URL(String(url)).pathname))).toBe(true);
+  expect(set).not.toHaveBeenCalled();
+});
+
+it.each([[200, 502], [302, 502], [401, 401], [403, 403], [409, 409], [429, 429], [503, 503], [600, 502], [NaN, 502]])(
+  "normalizes RuntimeClientError status %s to %s", (status, expected) => {
+    expect(new RuntimeClientError({ operation: "test", path: "/", detail: "failure", status }).status).toBe(expected);
+  },
+);
+
+it.each([200, 201])("rejects malformed capability responses with upstream status %s", async (status) => {
+  const auth = runtimeFetch();
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+    new URL(String(input)).pathname === "/auth/refresh"
+      ? auth(input, init) : new Response("<html>error</html>", { status }),
+  ));
+  expect((await capabilities()).status).toBe(502);
+});
+
+it("preserves missing error status and successful empty responses", async () => {
+  expect(new RuntimeClientError({ operation: "test", path: "/", detail: "failure" }).status).toBeUndefined();
+  const auth = runtimeFetch();
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+    new URL(String(input)).pathname === "/auth/refresh" ? auth(input, init) : new Response(null, { status: 204 }),
+  ));
+  const client = await requireRuntimeClient({ auth: "required" });
+  expect(await client.get("/empty")).toBeUndefined();
+});
