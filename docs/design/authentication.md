@@ -493,6 +493,12 @@ or scanning their owners.
 JWT signing and `ASTRA_TOKEN_ENCRYPTION_KEY` must match across runtime replicas.
 Missing keys, key mismatch and corrupt ciphertext fail closed. Changing either key
 requires sign-in again; it is not transparent key rotation.
+Web page errors offer retry and an explicit sign-in link, including when a saved
+session cannot be decrypted. The standard Next error boundary displays no backend
+error details and never grants an anonymous identity or changes the selector.
+Authentication APIs retain their original error status. The live Work browser
+harness enrolls through `POST /api/runtime-config` using its own credential and
+the browser's shared cookie jar; it does not construct authentication cookies.
 
 ### Fresh-schema deployment
 
@@ -510,5 +516,9 @@ concurrency, rollback, provider replacement/disconnect and isolation;
 `browser_session_next_db_it` for two real Next servers and two independent runtime
 auth services sharing an isolated DB. Build the current Web source before running
 the latter (`npm --prefix packages/sdk run build && npm --prefix web run build`),
-use Node >=22, and explicitly set `ASTRA_TEST_DB_IT=1` and `ASTRA_TEST_DATABASE`.
+use the Node version pinned in `.nvmrc`, install the lockfile-matched Playwright
+Chromium headless shell (`cd web && npm exec -- playwright install --with-deps chromium --only-shell`),
+and explicitly set `ASTRA_TEST_DB_IT=1` and `ASTRA_TEST_DATABASE`. The test also
+corrupts disposable owners and drives the real browser recovery links, including
+fresh document retry and sign-in across the two Web replicas.
 No live provider or LLM credentials are needed.

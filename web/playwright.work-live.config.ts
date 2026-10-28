@@ -18,7 +18,7 @@ export default defineConfig({
   reporter: process.env.CI ? [['line']] : 'line',
   use: {
     baseURL: webUrl,
-    // The browser receives an access-token cookie.  Playwright traces can
+    // Public runtime-config enrollment sets the browser session selector. Traces can
     // retain request headers/cookies, so keep them disabled; screenshots and
     // videos remain useful without copying credentials into evidence.
     trace: 'off',

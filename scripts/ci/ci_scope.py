@@ -187,7 +187,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
             _enable(result, *RUST_SCOPES)
             continue
         if path == ".nvmrc":
-            _enable(result, "sdk", "web", "test_cli")
+            _enable(result, "sdk", "web", "test_cli", "online_integration")
             continue
         if path.startswith("vendor/"):
             # Vendored Rust code is a compiler input, not an unknown-area
@@ -195,11 +195,11 @@ def classify(paths: list[str]) -> dict[str, bool]:
             _enable(result, *RUST_SCOPES)
             continue
         if path.startswith("packages/sdk/"):
-            # The web workspace consumes the local SDK package.
-            _enable(result, "sdk", "web")
+            # Web consumes the SDK; real Next/runtime tests run in integration.
+            _enable(result, "sdk", "web", "online_integration")
             continue
         if path.startswith("web/"):
-            _enable(result, "web")
+            _enable(result, "web", "online_integration")
             continue
         if path.startswith("scripts/tui-reflow/"):
             _enable(result, "test_cli")

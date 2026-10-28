@@ -499,6 +499,26 @@ execution without increasing contention on a shared database. The required
 `Test: online (core)` check aggregates all selected online jobs; the integration
 job retains `Test: online (integration)`.
 
+The integration lane also runs the real Next/browser-session database test. It
+installs the Node version pinned in `.nvmrc`, builds the local SDK and Web from
+that job's checkout, and installs Playwright's Chromium headless shell. The real
+browser checks recovery from an unreadable session, retry and explicit sign-in.
+Web, SDK and Node-version changes select this lane as
+well as their ordinary static checks; the other online lanes do not install Node.
+Before running the integration lane, `make test-online` without a lane, or
+`make test-ignored-integration` on a clean local checkout, run:
+
+```bash
+nvm use
+npm --prefix packages/sdk ci --ignore-scripts
+npm --prefix packages/sdk run build
+npm --prefix web ci
+npm --prefix web run build
+(cd web && npm exec -- playwright install --with-deps chromium --only-shell)
+```
+
+Missing Web build artifacts fail the test; they do not silently skip coverage.
+
 `make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
 still runs all three core groups. To reproduce a CI shard, choose
 `ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or

@@ -11,12 +11,14 @@ use axum::{Router, body::Body, http::Request};
 use serde_json::json;
 use std::{
     path::PathBuf,
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
+use tokio::io::AsyncWriteExt;
 use tower::ServiceExt;
 
 #[path = "../../services/tests/common/browser_session.rs"]
@@ -33,7 +35,7 @@ impl HealthChecker for Healthy {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated MatrixOne, Node >=22, npm ci and a fresh Next production build"]
+#[ignore = "requires isolated MatrixOne, pinned Node, Chromium and a fresh Next production build"]
 async fn real_next_render_across_two_web_and_runtime_instances() {
     let db = MatrixOneSettings::from_env();
     isolated_database::require_isolated_database(&db.database);
@@ -259,6 +261,63 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         assert_eq!(response.status(), 200);
         assert!(!response.headers().contains_key("set-cookie"));
     }
+    // Exercise the actual client-rendered error boundary. HTTP-only assertions
+    // cannot see that fallback or prove retry replaces the failed RSC document.
+    for (path, mode) in [
+        ("/?retry=preserved", "retry"),
+        ("/now?retry=preserved", "retry"),
+        ("/now", "sign-in"),
+    ] {
+        let login = client
+            .post(format!("{}/api/runtime-auth/login", urls[0]))
+            .json(&json!({"apiUrl":runtime_url,"username":name,"password":"next-browser-test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), 200);
+        let broken_cookie = login
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("astra_session="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let proof = broken_cookie.strip_prefix("astra_session=").unwrap();
+        sqlx::query("UPDATE auth_browser_sessions SET encrypted_value = 'corrupt-test-owner' WHERE handle_hash = ?")
+            .bind(fixture::digest(proof)).execute(pool.get()).await.unwrap();
+        let mut browser = tokio::process::Command::new("node")
+            .arg(web.join("e2e/browser-session-recovery.mjs"))
+            .current_dir(&web)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = json!({
+            "urls":urls, "path":path, "mode":mode, "cookie":broken_cookie,
+            "api_url":runtime_url, "username":name, "password":"next-browser-test",
+            "user_id":user.user_id,
+        })
+        .to_string();
+        browser
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .await
+            .unwrap();
+        let output = browser.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "browser recovery {path} {mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let logout = client
         .post(format!("{}/api/runtime-auth/logout", urls[1]))
         .header("cookie", &cookie)
@@ -304,6 +363,8 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         child.wait().await.unwrap();
     }
     server.abort();
+    sqlx::query("DELETE FROM auth_browser_sessions WHERE token_id IN (SELECT token_id FROM auth_refresh_tokens WHERE user_id = ?)")
+        .bind(&user.user_id).execute(pool.get()).await.unwrap();
     for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ?"

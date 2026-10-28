@@ -126,7 +126,7 @@ class CiScopeTests(unittest.TestCase):
         self.assert_rename_selects_expected_scopes(
             "packages/sdk/src/moved.ts",
             "web/lib/moved.ts",
-            {"sdk", "web"},
+            {"sdk", "web", "online_integration"},
         )
 
     def test_runtime_to_cli_rename_keeps_runtime_validation(self) -> None:
@@ -269,12 +269,16 @@ class CiScopeTests(unittest.TestCase):
         self.assertTrue(scopes["sdk"])
         self.assertTrue(scopes["web"])
         self.assertFalse(scopes["rust"])
+        self.assertTrue(scopes["online_integration"])
+        self.assertFalse(scopes["online_core"])
 
-    def test_web_change_does_not_run_sdk_or_rust(self) -> None:
+    def test_web_change_selects_real_next_integration_without_unrelated_lanes(self) -> None:
         scopes = classify(["web/app/page.tsx"])
         self.assertTrue(scopes["web"])
         self.assertFalse(scopes["sdk"])
         self.assertFalse(scopes["rust"])
+        self.assertTrue(scopes["online_integration"])
+        self.assertFalse(scopes["online_core"])
 
     def test_cli_source_only_selects_cli_tests(self) -> None:
         scopes = classify(["crates/astra-cli/src/main.rs"])
@@ -292,6 +296,7 @@ class CiScopeTests(unittest.TestCase):
                 self.assertTrue(scopes["test_cli"])
                 self.assertEqual(sum(scopes.values()), 1)
         self.assertTrue(classify([".nvmrc"])["test_cli"])
+        self.assertTrue(classify([".nvmrc"])["online_integration"])
 
     def test_test_only_rust_change_selects_owning_shard(self) -> None:
         scopes = classify(["crates/core/tests/repo_layout_contract.rs"])

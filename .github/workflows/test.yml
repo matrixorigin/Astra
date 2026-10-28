@@ -589,6 +589,25 @@ jobs:
       - name: Wait for dependencies
         if: env.RUN_TESTS == 'true'
         run: make dev-deps-wait
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            packages/sdk/package-lock.json
+            web/package-lock.json
+      - name: Build Web for real Next integration
+        if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'
+        run: |
+          npm --prefix packages/sdk ci --ignore-scripts
+          npm --prefix packages/sdk run build
+          npm --prefix web ci
+          npm --prefix web run build
+      - name: Install Chromium for browser session recovery
+        if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'
+        working-directory: web
+        run: npm exec -- playwright install --with-deps chromium --only-shell
       - name: Run online tests
         if: env.RUN_TESTS == 'true'
         env:

@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { visibleMarkdownSnippet } from './visible-markdown';
+import { configureRuntimeSession } from './runtime-session';
 
 type LiveState = {
   schema_version: 1;
@@ -97,10 +98,8 @@ test.beforeEach(async ({ context }) => {
     );
   }
   const webUrl = process.env.ASTRA_WORK_LIVE_WEB_URL ?? 'http://127.0.0.1:3537';
+  await configureRuntimeSession(context.request, webUrl, apiUrl, accessToken);
   await context.addCookies([
-    { name: 'astra_access_token', value: accessToken, url: webUrl },
-    { name: 'astra_api_url', value: apiUrl, url: webUrl },
-    { name: 'astra_demo_mode', value: '0', url: webUrl },
     { name: 'astra_web_client_id', value: `live-harness-${process.pid}`, url: webUrl },
   ]);
 });
