@@ -3419,6 +3419,8 @@ pub async fn run_stream_context_trace_persistence() {
     .execute(pool)
     .await
     .expect("seed corrupt legacy checkpoint");
+    let audits_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
     let (continuation_status, continuation) = post_json(
         app,
         &format!("/sessions/{session_id}/resume?continuation_only=true"),
@@ -3427,12 +3429,40 @@ pub async fn run_stream_context_trace_persistence() {
     )
     .await;
     assert_eq!(continuation_status, StatusCode::OK, "{continuation}");
+    let audits_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(audits_after, audits_before);
     assert_eq!(continuation["session_id"], session_id);
     assert_eq!(
         continuation["resume_bundle"],
         serde_json::to_value(restored.resume_bundle.as_ref().unwrap()).unwrap()
     );
     assert!(continuation.get("total_tokens_in").is_none());
+    sqlx::query("UPDATE agent_sessions SET status = 'paused' WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (reactivate_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(reactivate_status, StatusCode::OK);
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(user_id)
+            .bind(&session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    let reactivation_audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(reactivation_audits, audits_after + 1);
     let (full_status, _) = post_json(
         app,
         &format!("/sessions/{session_id}/resume"),

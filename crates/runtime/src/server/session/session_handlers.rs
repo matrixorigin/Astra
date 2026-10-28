@@ -2182,19 +2182,26 @@ pub(crate) async fn resume_session_handler(
     // observation and control remain explicit operations on `/attachments`
     // and `/handoffs`; inferring a Server attachment here would assign the
     // wrong actor and placement to a CLI restore.
-    state
-        .session_service
-        .update_session(
-            session_id,
-            user_id,
-            SessionUpdateRequestData {
-                title: None,
-                metadata: None,
-                metadata_patch: None,
-                status: Some("active".to_string()),
-            },
-        )
-        .await?;
+    if query.continuation_only && session.status == "active" {
+        state
+            .session_service
+            .ensure_session_active(session_id, user_id)
+            .await?;
+    } else {
+        state
+            .session_service
+            .update_session(
+                session_id,
+                user_id,
+                SessionUpdateRequestData {
+                    title: None,
+                    metadata: None,
+                    metadata_patch: None,
+                    status: Some("active".to_string()),
+                },
+            )
+            .await?;
+    }
     restored.last_status = "active".to_string();
     if query.continuation_only {
         let resume_bundle = restored

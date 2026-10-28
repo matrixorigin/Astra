@@ -296,8 +296,11 @@ terminal receipt, never a local counter or a pre-admission prediction.
 The per-turn refresh uses `continuation_only=true` on the same resume endpoint.
 It returns only the owner-scoped canonical bundle and session identity; it does
 not hydrate diagnostic counts, workspace metadata or legacy checkpoints. It
-still performs the existing fenced session activation and fails if no canonical
-head is available. An explicit restore retains the full response.
+checks session status under the lifecycle fence and fails if no canonical head
+is available. An already active session is not rewritten or audited by this
+read; a non-active session uses the ordinary audited activation. Conversation
+commits continue to advance the activity used for session ordering. An explicit
+restore retains the full response and activation behavior.
 The local snapshot supplies one turn allocation for the local journal, tool
 mutation/rollback scopes, checkpoints and traces, plus the canonical commit
 base. Session state and the workspace's sidecar ordering counter are seeded from
