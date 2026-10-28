@@ -156,6 +156,7 @@ it.each([401, 503])(
       ),
     );
     expect((await meRoute()).status).toBe(status);
+    expect((await refreshRoute()).status).toBe(status);
     expect((await requireRuntimeAuth())?.status).toBe(status);
     expect((await requireRuntimeUser()).response?.status).toBe(status);
     expect(set).not.toHaveBeenCalled();

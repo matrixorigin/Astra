@@ -22,7 +22,7 @@ pub struct BrowserSessionCreated {
 
 struct Handle {
     hash: String,
-    runtime_hash: String,
+    root: String,
 }
 
 impl Handle {
@@ -66,7 +66,7 @@ impl Handle {
         }
         Ok(Self {
             hash: sha256_hex(value),
-            runtime_hash: sha256_hex(&root),
+            root,
         })
     }
 }
@@ -75,7 +75,6 @@ impl Handle {
 struct Credentials {
     version: u8,
     handle_hash: String,
-    runtime_hash: String,
     token_id: String,
     user_id: String,
     session_id: String,
@@ -197,7 +196,6 @@ impl DatabaseAuthService {
             let token_id: String = row.try_get("token_id").map_err(|_| unavailable())?;
             if credentials.version != 1
                 || credentials.handle_hash != handle.hash
-                || credentials.runtime_hash != handle.runtime_hash
                 || credentials.token_id != token_id
                 || credentials.session_id != session
                 || refresh.token_type.as_deref() != Some("refresh")
@@ -279,7 +277,6 @@ impl DatabaseAuthService {
         let credentials = Credentials {
             version: 1,
             handle_hash: handle.hash.clone(),
-            runtime_hash: handle.runtime_hash.clone(),
             token_id: rotation.token_id.clone(),
             user_id: rotation.user_id.clone(),
             session_id: rotation.session_id.clone(),
@@ -350,7 +347,7 @@ impl DatabaseAuthService {
             .transpose()?;
         if previous_handle
             .as_ref()
-            .is_some_and(|old| old.runtime_hash != handle.runtime_hash || old.hash == handle.hash)
+            .is_some_and(|old| old.root != handle.root || old.hash == handle.hash)
         {
             return Err(session_denied());
         }
@@ -524,7 +521,7 @@ mod tests {
                 URL_SAFE_NO_PAD.encode(root),
                 URL_SAFE_NO_PAD.encode([7; 32])
             );
-            assert!(Handle::parse(&value).is_ok());
+            assert_eq!(Handle::parse(&value).unwrap().root, root);
         }
         for root in [
             "https://astra.example",
@@ -543,5 +540,6 @@ mod tests {
         for value in ["", "bs1.x.y", "bs1.a.b.c", "bs1.!!!!.!"] {
             assert!(Handle::parse(value).is_err());
         }
+        assert!(Handle::parse(&"x".repeat(MAX_HANDLE_BYTES + 1)).is_err());
     }
 }

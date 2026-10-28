@@ -112,6 +112,62 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         "normal reads must not rotate/write"
     );
 
+    // The complete handle binds both runtime and proof, including if an owner
+    // row is misplaced. Restoring it must leave canonical authority unchanged.
+    let proof = browser.rsplit('.').next().unwrap();
+    let other_runtime = format!(
+        "bs1.{}.{proof}",
+        URL_SAFE_NO_PAD.encode("http://localhost:17002/")
+    );
+    assert_eq!(
+        first.refresh(refresh(&other_runtime)).await.unwrap_err().0,
+        StatusCode::UNAUTHORIZED
+    );
+    let moved =
+        sqlx::query("UPDATE auth_browser_sessions SET handle_hash = ? WHERE handle_hash = ?")
+            .bind(digest(&other_runtime))
+            .bind(digest(&browser))
+            .execute(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(moved.rows_affected(), 1);
+    assert_eq!(
+        first.refresh(refresh(&other_runtime)).await.unwrap_err().0,
+        StatusCode::UNAUTHORIZED
+    );
+    let restored =
+        sqlx::query("UPDATE auth_browser_sessions SET handle_hash = ? WHERE handle_hash = ?")
+            .bind(digest(&browser))
+            .bind(digest(&other_runtime))
+            .execute(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(restored.rows_affected(), 1);
+    let replacement = login(&first, &name).await;
+    assert!(matches!(
+        first
+            .create_browser_session(adoption(&other_runtime, &replacement, Some(&browser)))
+            .await,
+        Err((StatusCode::UNAUTHORIZED, _))
+    ));
+    let same_handle = handle();
+    assert!(matches!(
+        first
+            .create_browser_session(adoption(&same_handle, &replacement, Some(&same_handle)))
+            .await,
+        Err((StatusCode::UNAUTHORIZED, _))
+    ));
+    assert!(first.refresh(refresh(&browser)).await.is_ok());
+    let replacement = first
+        .refresh(refresh(&replacement.refresh_token))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM auth_refresh_tokens WHERE token_hash = ?")
+        .bind(digest(&replacement.refresh_token))
+        .execute(pool.get())
+        .await
+        .unwrap();
+
     // Trace the real ordinary owner resolution, including all SQLx calls.
     // Each independent request must remain two reads and no transaction/write.
     {

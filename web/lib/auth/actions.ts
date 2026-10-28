@@ -14,8 +14,6 @@ import {
   saveSelection,
   logoutSelection,
   replaceableSession,
-  selectedSession,
-  resolveBrowserSession,
 } from "@/lib/auth/browser-session";
 
 type ActionResult = {
@@ -101,21 +99,6 @@ export async function registerAction(
 export async function logoutAction(): Promise<void> {
   await logoutSelection();
   redirect("/");
-}
-
-export async function refreshTokenAction(): Promise<ActionResult> {
-  try {
-    const selection = await selectedSession();
-    if (selection?.mode !== "browser")
-      return { ok: false, error: "Sign in to refresh your session." };
-    await resolveBrowserSession(selection);
-    return { ok: true };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "Refresh failed.",
-    };
-  }
 }
 
 export async function getCurrentUser(): Promise<AuthUser | null> {
