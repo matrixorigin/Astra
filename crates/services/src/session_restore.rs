@@ -665,13 +665,11 @@ impl HybridRestoreService {
 
         let session_query_started_at = std::time::Instant::now();
         let row = sqlx::query(
-            "SELECT s.session_id, s.user_id, s.title, s.status, s.event_count, CAST(s.metadata AS CHAR) AS metadata_json, \
+            "SELECT s.title, s.status, CAST(s.metadata AS CHAR) AS metadata_json, \
              COALESCE(event_summary.turn_count, 0) AS turn_count, \
              COALESCE(event_summary.total_tokens_in, 0) AS total_tokens_in, \
              COALESCE(event_summary.total_tokens_out, 0) AS total_tokens_out, \
-             COALESCE(checkpoint_summary.checkpoint_count, 0) AS checkpoint_count, \
-             latest_model.llm_model_used AS latest_model, \
-             s.created_at, s.updated_at \
+             COALESCE(checkpoint_summary.checkpoint_count, 0) AS checkpoint_count \
               FROM agent_sessions s \
               LEFT JOIN ( \
                 SELECT user_id, session_id, \
@@ -692,22 +690,8 @@ impl HybridRestoreService {
                 GROUP BY user_id, session_id \
               ) checkpoint_summary \
                 ON checkpoint_summary.user_id = s.user_id AND checkpoint_summary.session_id = s.session_id \
-              LEFT JOIN ( \
-                SELECT user_id, session_id, llm_model_used \
-                FROM ( \
-                  SELECT user_id, session_id, llm_model_used, \
-                         ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
-                  FROM agent_events \
-                  WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL \
-                    AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-                ) ranked_models \
-                WHERE rn = 1 \
-              ) latest_model \
-                ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
               WHERE s.session_id = ? AND s.user_id = ?",
         )
-        .bind(user_id)
-        .bind(session_id)
         .bind(user_id)
         .bind(session_id)
         .bind(user_id)
@@ -1850,7 +1834,6 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "title" => Some("Resume work".to_string()),
-                "latest_model" => None,
                 _ => unreachable!("unexpected optional string column: {column}"),
             })
         }
@@ -1884,10 +1867,6 @@ mod tests {
         assert_eq!(
             mysql_optional_string(&row, "restore_cloud_session", "title").unwrap(),
             Some("Resume work".to_string())
-        );
-        assert_eq!(
-            mysql_optional_string(&row, "restore_cloud_session", "latest_model").unwrap(),
-            None
         );
         assert_eq!(
             mysql_i64(&row, "restore_cloud_session", "turn_count").unwrap(),
