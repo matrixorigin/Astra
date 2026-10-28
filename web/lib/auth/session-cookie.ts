@@ -38,33 +38,42 @@ function decode(value: string): string {
   return decoded.toString("utf8");
 }
 
-/** Untrusted JWT payload hint; the runtime verifies the signature and session. */
-export function jwtSessionHint(token: string): string | undefined {
+/** Untrusted JWT hints; the runtime verifies the signed identity. */
+export function jwtIdentityHint(token: string): { userId: string; sessionId: string } | undefined {
   try {
     const parts = token.split(".");
     if (parts.length !== 3 || parts.some((part) => !part)) return undefined;
     const payload = JSON.parse(decode(parts[1]));
-    const sid: unknown = payload?.sid;
-    return typeof sid === "string" && sid.length > 0 && Buffer.byteLength(sid, "utf8") <= 64
-      ? sid : undefined;
-  } catch {
-    return undefined;
-  }
+    const { sub, sid } = payload;
+    if (typeof sub !== "string" || !sub || Buffer.byteLength(sub, "utf8") > 128 ||
+        typeof sid !== "string" || !sid || Buffer.byteLength(sid, "utf8") > 64) return undefined;
+    return { userId: sub, sessionId: sid };
+  } catch { return undefined; }
+}
+export function jwtSessionHint(token: string): string | undefined {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3 || parts.some((part) => !part)) return undefined;
+    const sid: unknown = JSON.parse(decode(parts[1]))?.sid;
+    return typeof sid === "string" && sid.length > 0 && Buffer.byteLength(sid, "utf8") <= 64 ? sid : undefined;
+  } catch { return undefined; }
 }
 
 export function parseSelection(value: string): SessionSelection {
   if (value.length > MAX_COOKIE_BYTES)
     throw new Error("Session selection is too large.");
-  if (value.startsWith("bs2.")) {
+  if (value.startsWith("bs3.")) {
     const parts = value.split(".");
     const apiUrl = decode(parts[1] ?? "");
-    const sessionId = decode(parts[2] ?? "");
+    const userId = decode(parts[2] ?? "");
+    const sessionId = decode(parts[3] ?? "");
     if (
-      value.length > 1600 ||
-      parts.length !== 4 ||
-      !sessionId || Buffer.byteLength(sessionId, "utf8") > 64 || encode(sessionId) !== parts[2] ||
-      !/^[\w-]{43}$/.test(parts[3] ?? "") ||
-      Buffer.from(parts[3], "base64url").toString("base64url") !== parts[3] ||
+      value.length > 2048 ||
+      parts.length !== 5 ||
+      !userId || Buffer.byteLength(userId, "utf8") > 128 || encode(userId) !== parts[2] ||
+      !sessionId || Buffer.byteLength(sessionId, "utf8") > 64 || encode(sessionId) !== parts[3] ||
+      !/^[\w-]{43}$/.test(parts[4] ?? "") ||
+      Buffer.from(parts[4], "base64url").toString("base64url") !== parts[4] ||
       runtimeRoot(apiUrl) !== apiUrl
     ) {
       throw new Error("Invalid browser session.");

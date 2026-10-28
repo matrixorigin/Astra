@@ -9,6 +9,7 @@ import {
   SESSION_MAX_AGE,
   parseSelection,
   jwtSessionHint,
+  jwtIdentityHint,
   runtimeRoot,
   selectionCookie,
   sessionCookieOptions,
@@ -128,9 +129,10 @@ export async function adoptBrowserSession(
   tokens: { access_token: string; refresh_token: string },
 ): Promise<string> {
   const root = runtimeRoot(apiUrl);
-  const sessionId = jwtSessionHint(tokens.refresh_token);
-  if (!sessionId) throw new RuntimeClientError({ operation: "create browser session", path: "/auth/browser-sessions", status: 400, detail: "Invalid session credential." });
-  const handle = `bs2.${Buffer.from(root).toString("base64url")}.${Buffer.from(sessionId).toString("base64url")}.${randomBytes(32).toString("base64url")}`;
+  const identity = jwtIdentityHint(tokens.refresh_token);
+  if (!identity) throw new RuntimeClientError({ operation: "create browser session", path: "/auth/browser-sessions", status: 400, detail: "Invalid session credential." });
+  const { userId, sessionId } = identity;
+  const handle = `bs3.${Buffer.from(root).toString("base64url")}.${Buffer.from(userId).toString("base64url")}.${Buffer.from(sessionId).toString("base64url")}.${randomBytes(32).toString("base64url")}`;
   parseSelection(handle);
   try {
     const created = await sessionRequest(root, "/auth/browser-sessions", {

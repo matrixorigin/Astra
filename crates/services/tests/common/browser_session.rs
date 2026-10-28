@@ -22,7 +22,7 @@ pub async fn age_access(
     origin: Option<&str>,
 ) -> String {
     let encrypted: String = sqlx::query_scalar(
-        "SELECT encrypted_value FROM auth_browser_sessions WHERE handle_hash = ?",
+        "SELECT browser_ciphertext FROM auth_refresh_tokens WHERE browser_handle_hash = ?",
     )
     .bind(digest(value))
     .fetch_one(pool.get())
@@ -73,11 +73,13 @@ pub async fn age_access(
     )
     .unwrap()
     .into();
-    sqlx::query("UPDATE auth_browser_sessions SET encrypted_value = ? WHERE handle_hash = ?")
-        .bind(enc.encrypt(&payload.to_string()).unwrap())
-        .bind(digest(value))
-        .execute(pool.get())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE auth_refresh_tokens SET browser_ciphertext = ? WHERE browser_handle_hash = ?",
+    )
+    .bind(enc.encrypt(&payload.to_string()).unwrap())
+    .bind(digest(value))
+    .execute(pool.get())
+    .await
+    .unwrap();
     payload["refresh_token"].as_str().unwrap().to_owned()
 }

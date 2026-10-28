@@ -1713,7 +1713,7 @@ impl AuthService for DatabaseAuthService {
                 .map_err(|error| map_auth_sqlx(error, "refresh.begin", Some(&pool)))?;
             self.lock_refresh_account(&mut tx, &rotation.user_id)
                 .await?;
-            match self.commit_refresh(&mut tx, &rotation).await {
+            match self.commit_refresh(&mut tx, &rotation, None).await {
                 Ok(()) => {}
                 Err(refresh::CommitRefreshError::BindingChanged) => {
                     tx.rollback()
@@ -1792,7 +1792,7 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ? AND session_id = ? AND is_revoked = 0")
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE user_id = ? AND session_id = ? AND is_revoked = 0")
             .bind(&user_id)
             .bind(&session_id)
             .execute(&mut *tx)

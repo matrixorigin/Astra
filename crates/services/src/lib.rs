@@ -350,9 +350,8 @@ pub use state_projection::{
 };
 pub use state_sync::MatrixOneSyncService;
 pub use storage::{
-    AUTH_REFRESH_TOKEN_BATCH_LIMIT, CleanupResult, RetentionPolicy, cleanup_expired_data,
-    cleanup_refresh_session_batch, database_user_from_row, ensure_core_schema, log_session_audit,
-    resolve_active_skill_versions, session_record_from_row,
+    CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
+    ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
 };
 pub use sync_outbox::{
     SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,

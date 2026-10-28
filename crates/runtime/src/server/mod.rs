@@ -464,51 +464,43 @@ fn spawn_data_cleanup(
     tokio::spawn(async move {
         let policy = RetentionPolicy::default();
         let mut interval = tokio::time::interval(cleanup_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await; // Run the full sweep on the normal schedule.
-        let mut catching_up = true;
-        let startup_jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 30;
-        let mut retry_at = tokio::time::Instant::now() + Duration::from_secs(startup_jitter);
+        interval.tick().await; // skip immediate first tick
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    match astra_services::cleanup_expired_data(pool.get(), &policy).await {
-                        Ok(results) => {
-                            let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
-                            catching_up |= results.iter().any(|r| r.table == "auth_refresh_tokens" && r.rows_deleted == u64::from(astra_services::AUTH_REFRESH_TOKEN_BATCH_LIMIT));
-                            if total > 0 {
-                                let detail = results.iter().filter(|r| r.rows_deleted > 0).map(|r| format!("{}={}", r.table, r.rows_deleted)).collect::<Vec<_>>().join(", ");
-                                tracing::info!(target: "astra_runtime::cleanup", rows_purged = total, tables = %detail, "expired data cleanup");
-                            }
-                        }
-                        Err(error) => {
-                            // An earlier refresh batch may have committed before a later table failed.
-                            catching_up = true;
-                            tracing::warn!(target: "astra_runtime::cleanup", %error, "expired data cleanup failed");
-                        }
-                    }
-                    if catching_up { retry_at = tokio::time::Instant::now(); }
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        "data cleanup received cancellation; exiting"
+                    );
+                    break;
                 }
-                _ = tokio::time::sleep_until(retry_at), if catching_up => {
-                    for _ in 0..4 {
-                        if cancel.is_cancelled() { return; }
-                        match astra_services::cleanup_refresh_session_batch(pool.get(), &policy).await {
-                            Ok((count, owners)) => {
-                                if count > 0 { tracing::info!(target: "astra_runtime::cleanup", sessions = count, owners, "refresh session cleanup batch"); }
-                                if count < u64::from(astra_services::AUTH_REFRESH_TOKEN_BATCH_LIMIT) { catching_up = false; break; }
-                            }
-                            Err(error) => {
-                                tracing::warn!(target: "astra_runtime::cleanup", %error, "refresh session cleanup failed; retrying");
-                                break;
-                            }
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                    // Independent replicas are staggered without persistent coordination.
-                    let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 6;
-                    retry_at = tokio::time::Instant::now() + Duration::from_secs(30 + jitter);
+                _ = interval.tick() => {}
+            }
+            let results = match astra_services::cleanup_expired_data(pool.get(), &policy).await {
+                Ok(results) => results,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::cleanup",
+                        error = %error,
+                        "expired data cleanup failed"
+                    );
+                    continue;
                 }
+            };
+            let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
+            if total > 0 {
+                let detail = results
+                    .iter()
+                    .filter(|r| r.rows_deleted > 0)
+                    .map(|r| format!("{}={}", r.table, r.rows_deleted))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::info!(
+                    target: "astra_runtime::cleanup",
+                    rows_purged = total,
+                    tables = %detail,
+                    "expired data cleanup"
+                );
             }
         }
     })

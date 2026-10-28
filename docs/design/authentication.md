@@ -417,29 +417,27 @@ authority.
 
 Web uses one HttpOnly `astra_session` selector. A browser login imports a matching
 access/refresh pair through `POST /auth/browser-sessions`, consumes that refresh
-JWT, and stores a stable `bs2.<runtime-root>.<session-id>.<random-proof>` handle in the cookie.
-The runtime root, immutable session ID and 256-bit random proof are bound together.
-The runtime verifies the handle's session ID against the signed refresh token
+JWT, and stores a stable `bs3.<runtime-root>.<user-id>.<session-id>.<random-proof>` handle in the cookie.
+The runtime root, user and session hints, and 256-bit random proof are bound together.
+The runtime verifies the handle's user and session IDs against the signed refresh token
 before adoption, preventing a logged-out handle from being rebound to a different
 session. An ordinary
 request never sends this proof to a separately configured runtime URL.
 
-`auth_refresh_tokens` still owns session identity and revocation. The core-owned
-`auth_browser_sessions` table points to that row and holds the current encrypted
-credential pair. Its only columns are the handle-hash primary key, unique token
-ID, and encrypted payload. `/auth/refresh` accepts either a direct single-use JWT or the independent
-browser proof. A consumed direct JWT cannot recover a successor. A browser proof
-returns the same current access JWT while usable; refreshing atomically replaces
-the canonical hash and encrypted pair under the existing account lock. A loser
-reads the committed winner on a fresh snapshot. Provider verification happens
-before locking, and its identity/credential binding is checked again under lock.
+`auth_refresh_tokens` owns session identity, revocation and the encrypted browser
+credential pair in the same row. The handle hash is uniquely indexed; raw proofs
+are never stored. `/auth/refresh` accepts either a direct single-use JWT or the
+independent browser proof. A consumed direct JWT cannot recover a successor. A
+browser proof returns the current access JWT while usable; refreshing atomically
+replaces the canonical hash and encrypted pair under the existing account lock.
+A loser reads the committed winner. Provider verification happens before locking,
+and its identity/credential binding is checked again under lock.
 
-Each resolved Web client costs two indexed reads (owner, then canonical authority) and decrypt
-plus a BFF-to-runtime call on the ordinary path, with no write or provider call.
-The existing external-identity user index also covers provider, external subject
-and update time. Explicit index selection keeps both the Memoria existence check
-and canonical provider-owner lookup inside that index, including absent users;
-this avoids MatrixOne's empty-result base-table scan without new state or queries.
+The ordinary browser resolution performs two indexed reads: a handle-to-primary-key
+lookup and a canonical authority snapshot, then decrypts the result and makes a
+BFF-to-runtime call. It does not write or call the provider. The snapshot rechecks
+the handle and binds the untrusted user hint to each joined identity lookup. The
+split avoids a MatrixOne planner path that scans many refresh rows despite an index hint.
 React request caching deduplicates Server Component configuration reads. Chat,
 project and sidebar handlers and hydrated pages pass their admitted client through
 the request; there is no cross-user or process-local token authority. A late Stop
@@ -485,23 +483,14 @@ This limitation does not affect delayed ordinary refresh or handle-logout respon
 The encrypted payload has an immutable one-year absolute cap. Browser rotation
 caps the canonical refresh-row expiry to it, so bearer admission and handle
 resolution respect the same ceiling. No separate browser expiry or sweep exists.
-The existing refresh retention sweep selects at most 1,000 expired/revoked sessions
-and atomically deletes them and their browser credentials in a short transaction
-with fresh retention predicates. Full batches trigger bounded refresh-only catch-up, with a pause between groups of four batches. A changed candidate batch rolls back before
-removing any owner and retries at most three times. Database/serialization failures
-are surfaced and retried by the existing periodic maintenance loop. Handle logout
-deletes the owner immediately; direct JWT logout revokes the canonical session and
-leaves its encrypted owner for the sweep. Other ciphertext remains until the session is expired or
-revoked **and** its age since issuance/last rotation exceeds the existing retention
-threshold (default seven days), followed by the sweep/backlog delay. This is a
-minimum row age, not an extra seven days after expiry. Refresh TTL defaults to
-30 days in code; deployment configuration can override it.
-The existing canonical candidate selection can scan refresh rows; the new keyed
-delete adds no independent owner scan. Cleanup results retain exact per-table
-counts. Managed mutators maintain this relationship; direct SQL deletion of a
-canonical row is unsupported and can orphan an encrypted owner. Inactive/deleted
-accounts and disconnected providers deny via canonical state without updating
-or scanning their owners.
+The existing refresh retention sweep deletes at most 1,000 eligible rows per
+six-hour sweep; browser ciphertext is removed with its canonical row. Logout and
+provider disconnect clear the ciphertext immediately. Other ciphertext remains
+until the session has expired or been revoked and its age since issuance or last
+rotation exceeds the retention threshold (default seven days), plus backlog delay.
+The existing retention query can scan the refresh table and can accumulate a
+backlog above its deletion rate; this change does not solve that pre-existing
+MatrixOne query limitation.
 JWT signing and `ASTRA_TOKEN_ENCRYPTION_KEY` must match across runtime replicas.
 Missing keys, key mismatch and corrupt ciphertext fail closed. Changing either key
 requires sign-in again; it is not transparent key rotation.
@@ -514,7 +503,7 @@ the browser's shared cookie jar; it does not construct authentication cookies.
 
 ### Fresh-schema deployment
 
-This change advances the strict core schema contract to `2026-10-28-v111`. It does
+This change advances the strict core schema contract to `2026-10-28-v112`. It does
 not migrate, alter, drop or recreate an existing database. Provision a **separate
 fresh database**, preserving the old database and its data. Existing data does not
 appear in the fresh database without a separately designed migration. Drain old

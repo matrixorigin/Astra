@@ -12,6 +12,17 @@ impl From<AuthHttpError> for CommitRefreshError {
     }
 }
 
+pub(super) enum BrowserPublication<'a> {
+    Adopt {
+        handle_hash: &'a str,
+        ciphertext: &'a str,
+    },
+    Rotate {
+        handle_hash: &'a str,
+        ciphertext: &'a str,
+    },
+}
+
 pub(super) struct PreparedRefresh {
     pub token_id: String,
     pub user_id: String,
@@ -148,6 +159,7 @@ impl DatabaseAuthService {
         &self,
         tx: &mut sqlx::Transaction<'_, MySql>,
         prepared: &PreparedRefresh,
+        browser: Option<BrowserPublication<'_>>,
     ) -> Result<(), CommitRefreshError> {
         if prepared.old_expiry <= Utc::now().timestamp()
             || prepared.expires_at <= Utc::now().naive_utc()
@@ -164,13 +176,45 @@ impl DatabaseAuthService {
         {
             return Err(CommitRefreshError::BindingChanged);
         }
-        let updated = query(
-            "UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), token_prefix = NULL
+        let (handle_hash, ciphertext, guard) = match &browser {
+            Some(BrowserPublication::Adopt {
+                handle_hash,
+                ciphertext,
+            }) => (
+                Some(*handle_hash),
+                Some(*ciphertext),
+                " AND browser_handle_hash IS NULL AND browser_ciphertext IS NULL",
+            ),
+            Some(BrowserPublication::Rotate {
+                handle_hash,
+                ciphertext,
+            }) => (
+                Some(*handle_hash),
+                Some(*ciphertext),
+                " AND browser_handle_hash = ?",
+            ),
+            None => (None, None, ""),
+        };
+        let statement = format!("UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), token_prefix = NULL, browser_handle_hash = ?, browser_ciphertext = ?
              WHERE token_id = ? AND token_hash = ? AND user_id = ? AND session_id = ?
-               AND is_revoked = 0 AND expires_at > NOW(6)",
-        ).bind(sha256_hex(&prepared.tokens.refresh_token)).bind(prepared.expires_at)
-            .bind(&prepared.token_id).bind(&prepared.old_hash).bind(&prepared.user_id).bind(&prepared.session_id)
-            .execute(&mut **tx).await.map_err(|error| map_auth_sqlx(error, "refresh.database", None))?;
+               AND is_revoked = 0 AND expires_at > NOW(6){guard}");
+        // `guard` is selected exclusively from the fixed literals above.
+        let mut update = query(sqlx::AssertSqlSafe(statement.as_str()))
+            .bind(sha256_hex(&prepared.tokens.refresh_token))
+            .bind(prepared.expires_at)
+            .bind(handle_hash)
+            .bind(ciphertext)
+            .bind(&prepared.token_id)
+            .bind(&prepared.old_hash)
+            .bind(&prepared.user_id)
+            .bind(&prepared.session_id);
+        if matches!(browser, Some(BrowserPublication::Rotate { .. })) {
+            update = update.bind(handle_hash);
+        }
+        let updated = update
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| map_auth_sqlx(error, "refresh.database", None))?;
         if updated.rows_affected() != 1 {
             return Err(session_denied().into());
         }

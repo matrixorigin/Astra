@@ -10,7 +10,11 @@ const browser = await chromium.launch();
 try {
   const context = await browser.newContext();
   const separator = fixture.cookie.indexOf('=');
-  const original = fixture.cookie.slice(separator + 1);
+  const captured = fixture.cookie.slice(separator + 1);
+  const offline = fixture.mode.startsWith('offline-');
+  const original = offline
+    ? `bs3.${Buffer.from('http://127.0.0.1:1/').toString('base64url')}.${captured.split('.')[2]}.${captured.split('.')[3]}.${captured.split('.')[4]}`
+    : captured;
   await context.addCookies([{
     name: fixture.cookie.slice(0, separator), value: original, url: fixture.urls[0],
     httpOnly: true, secure: true, sameSite: 'Lax',
@@ -44,8 +48,18 @@ try {
     await page.getByRole('link', { name: 'Sign in', exact: true }).click();
     await expect(page).toHaveURL(fixture.urls[0] + loginPath);
     await page.getByRole('button', { name: 'Sign out previous browser session' }).click();
-    await expect(page.getByRole('status')).toContainText('Previous browser session signed out');
-    assert.equal((await context.request.get(fixture.urls[0] + '/api/runtime-auth/me')).status(), 401);
+    if (offline) {
+      await expect(page.getByText('Could not sign out the previous session. Please retry.', { exact: true })).toBeVisible();
+      if (fixture.mode === 'offline-explicit') {
+        await page.getByLabel(/runtime URL/i).fill(fixture.api_url);
+      } else {
+        await page.getByRole('button', { name: 'Select runtime' }).click();
+        await expect(page.getByRole('status')).toContainText('Runtime selected');
+      }
+    } else {
+      await expect(page.getByRole('status')).toContainText('Previous browser session signed out');
+      assert.equal((await context.request.get(fixture.urls[0] + '/api/runtime-auth/me')).status(), 401);
+    }
     await page.getByLabel('Username', { exact: true }).fill(fixture.username);
     await page.getByLabel('Password', { exact: true }).fill(fixture.password);
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();

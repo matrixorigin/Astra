@@ -820,7 +820,7 @@ impl DatabaseAuthService {
             .map_err(internal_error)?;
         sqlx::query("DELETE FROM auth_tokens WHERE type = 'memoria_connection' AND provider = 'memoria' AND scope_user_id = ?")
             .bind(user).execute(&mut *tx).await.map_err(internal_error)?;
-        sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
+        sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE user_id = ?")
             .bind(user)
             .execute(&mut *tx)
             .await

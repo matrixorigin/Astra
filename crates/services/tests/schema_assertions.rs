@@ -64,7 +64,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     for expected in [
         "work_proposal_sequences",
         "work_proposals",
-        "auth_browser_sessions",
+        "auth_refresh_tokens",
     ] {
         assert!(
             contracts.iter().any(|table| table.name == expected),
@@ -293,14 +293,14 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             "idx_external_identity_user",
         ),
         (
-            "ALTER TABLE auth_browser_sessions MODIFY handle_hash VARCHAR(63) NOT NULL",
-            "ALTER TABLE auth_browser_sessions MODIFY handle_hash VARCHAR(64) NOT NULL",
-            "handle_hash",
+            "ALTER TABLE auth_refresh_tokens MODIFY browser_handle_hash VARCHAR(63) NULL",
+            "ALTER TABLE auth_refresh_tokens MODIFY browser_handle_hash VARCHAR(64) NULL",
+            "browser_handle_hash",
         ),
         (
-            "ALTER TABLE auth_browser_sessions MODIFY encrypted_value TEXT NULL",
-            "ALTER TABLE auth_browser_sessions MODIFY encrypted_value TEXT NOT NULL",
-            "encrypted_value",
+            "ALTER TABLE auth_refresh_tokens MODIFY browser_ciphertext VARCHAR(100) NULL",
+            "ALTER TABLE auth_refresh_tokens MODIFY browser_ciphertext TEXT NULL",
+            "browser_ciphertext",
         ),
     ] {
         sqlx::query(change).execute(pool.get()).await.unwrap();
@@ -311,27 +311,29 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         assert!(error.contains(expected), "{error}");
         sqlx::query(restore).execute(pool.get()).await.unwrap();
     }
-    sqlx::query("ALTER TABLE auth_browser_sessions DROP INDEX uq_browser_session_token")
+    sqlx::query("ALTER TABLE auth_refresh_tokens DROP INDEX uq_auth_refresh_browser_handle")
         .execute(pool.get())
         .await
         .unwrap();
-    sqlx::query("CREATE INDEX uq_browser_session_token ON auth_browser_sessions (token_id)")
-        .execute(pool.get())
-        .await
-        .unwrap();
+    sqlx::query(
+        "CREATE INDEX uq_auth_refresh_browser_handle ON auth_refresh_tokens (browser_handle_hash)",
+    )
+    .execute(pool.get())
+    .await
+    .unwrap();
     let error = ensure_core_schema(&settings, &bootstrap_catalog)
         .await
         .expect_err("one owner per canonical session requires uniqueness")
         .to_string();
     assert!(
-        error.contains("uq_browser_session_token must be unique"),
+        error.contains("uq_auth_refresh_browser_handle must be unique"),
         "{error}"
     );
-    sqlx::query("ALTER TABLE auth_browser_sessions DROP INDEX uq_browser_session_token")
+    sqlx::query("ALTER TABLE auth_refresh_tokens DROP INDEX uq_auth_refresh_browser_handle")
         .execute(pool.get())
         .await
         .unwrap();
-    sqlx::query("CREATE UNIQUE INDEX uq_browser_session_token ON auth_browser_sessions (token_id)")
+    sqlx::query("CREATE UNIQUE INDEX uq_auth_refresh_browser_handle ON auth_refresh_tokens (browser_handle_hash)")
         .execute(pool.get())
         .await
         .unwrap();

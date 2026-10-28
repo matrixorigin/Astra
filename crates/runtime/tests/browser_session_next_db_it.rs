@@ -383,6 +383,8 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         ("/?retry=preserved", "retry"),
         ("/now?retry=preserved", "retry"),
         ("/now", "sign-in"),
+        ("/now", "offline-explicit"),
+        ("/now", "offline-default"),
     ] {
         let login = client
             .post(format!("{}/api/runtime-auth/login", urls[0]))
@@ -403,7 +405,7 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
             .unwrap()
             .to_owned();
         let proof = broken_cookie.strip_prefix("astra_session=").unwrap();
-        sqlx::query("UPDATE auth_browser_sessions SET encrypted_value = 'corrupt-test-owner' WHERE handle_hash = ?")
+        sqlx::query("UPDATE auth_refresh_tokens SET browser_ciphertext = 'corrupt-test-owner' WHERE browser_handle_hash = ?")
             .bind(fixture::digest(proof)).execute(pool.get()).await.unwrap();
         let mut browser = tokio::process::Command::new("node")
             .arg(web.join("e2e/browser-session-recovery.mjs"))
@@ -524,8 +526,6 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
     server.abort();
     other_server.abort();
     failure_server.abort();
-    sqlx::query("DELETE FROM auth_browser_sessions WHERE token_id IN (SELECT token_id FROM auth_refresh_tokens WHERE user_id = ?)")
-        .bind(&user.user_id).execute(pool.get()).await.unwrap();
     for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ?"

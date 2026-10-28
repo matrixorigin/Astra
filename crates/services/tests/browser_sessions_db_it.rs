@@ -23,8 +23,9 @@ fn handle(tokens: &astra_services::AuthTokenRecord) -> String {
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
     let sid = claims["sid"].as_str().unwrap();
     format!(
-        "bs2.{}.{}.{}",
+        "bs3.{}.{}.{}.{}",
         URL_SAFE_NO_PAD.encode("http://localhost:17001/"),
+        URL_SAFE_NO_PAD.encode(&tokens.user_id),
         URL_SAFE_NO_PAD.encode(sid),
         URL_SAFE_NO_PAD.encode(&secret.as_bytes()[..32])
     )
@@ -125,32 +126,34 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     // row is misplaced. Restoring it must leave canonical authority unchanged.
     let proof = browser.split('.').skip(2).collect::<Vec<_>>().join(".");
     let other_runtime = format!(
-        "bs2.{}.{proof}",
+        "bs3.{}.{proof}",
         URL_SAFE_NO_PAD.encode("http://localhost:17002/")
     );
     assert_eq!(
         first.refresh(refresh(&other_runtime)).await.unwrap_err().0,
         StatusCode::UNAUTHORIZED
     );
-    let moved =
-        sqlx::query("UPDATE auth_browser_sessions SET handle_hash = ? WHERE handle_hash = ?")
-            .bind(digest(&other_runtime))
-            .bind(digest(&browser))
-            .execute(pool.get())
-            .await
-            .unwrap();
+    let moved = sqlx::query(
+        "UPDATE auth_refresh_tokens SET browser_handle_hash = ? WHERE browser_handle_hash = ?",
+    )
+    .bind(digest(&other_runtime))
+    .bind(digest(&browser))
+    .execute(pool.get())
+    .await
+    .unwrap();
     assert_eq!(moved.rows_affected(), 1);
     assert_eq!(
         first.refresh(refresh(&other_runtime)).await.unwrap_err().0,
         StatusCode::UNAUTHORIZED
     );
-    let restored =
-        sqlx::query("UPDATE auth_browser_sessions SET handle_hash = ? WHERE handle_hash = ?")
-            .bind(digest(&browser))
-            .bind(digest(&other_runtime))
-            .execute(pool.get())
-            .await
-            .unwrap();
+    let restored = sqlx::query(
+        "UPDATE auth_refresh_tokens SET browser_handle_hash = ? WHERE browser_handle_hash = ?",
+    )
+    .bind(digest(&browser))
+    .bind(digest(&other_runtime))
+    .execute(pool.get())
+    .await
+    .unwrap();
     assert_eq!(restored.rows_affected(), 1);
     assert!(first.refresh(refresh(&browser)).await.is_ok());
 
@@ -265,12 +268,13 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .await
             .unwrap();
     assert_eq!(count, 1, "rotation replaces one canonical row");
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_browser_sessions WHERE handle_hash = ?")
-            .bind(digest(&browser))
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_refresh_tokens WHERE browser_handle_hash = ?",
+    )
+    .bind(digest(&browser))
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
     assert_eq!(count, 1);
 
     let mut bounded_settings = settings.clone();
@@ -355,8 +359,8 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         StatusCode::UNAUTHORIZED
     );
 
-    // A second handle for an already-owned canonical session reaches the
-    // unique token-id constraint after rotation; the transaction must roll back.
+    // A second handle cannot replace an already-owned canonical session.
+    // Its compare-and-swap must leave the existing credential intact.
     let blocker = login(&first, &name).await;
     let blocked = handle(&blocker);
     first
@@ -364,7 +368,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         .await
         .unwrap();
     let encrypted: String = sqlx::query_scalar(
-        "SELECT encrypted_value FROM auth_browser_sessions WHERE handle_hash = ?",
+        "SELECT browser_ciphertext FROM auth_refresh_tokens WHERE browser_handle_hash = ?",
     )
     .bind(digest(&blocked))
     .fetch_one(pool.get())
@@ -390,9 +394,9 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             first
                 .create_browser_session(adoption(&duplicate, &rollback_tokens))
                 .await,
-            Err((StatusCode::SERVICE_UNAVAILABLE, _))
+            Err((StatusCode::UNAUTHORIZED, _))
         ),
-        "the duplicate owner must reach the database constraint"
+        "an owned session cannot be adopted by another handle"
     );
     assert_eq!(
         first.refresh(refresh(&blocked)).await.unwrap().user_id,
@@ -443,7 +447,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         .create_browser_session(adoption(&keyed, &expiry_tokens))
         .await
         .unwrap();
-    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = '2020-01-01', created_at = '2020-01-01' WHERE token_id = (SELECT token_id FROM auth_browser_sessions WHERE handle_hash = ?)")
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = '2020-01-01', created_at = '2020-01-01' WHERE browser_handle_hash = ?")
         .bind(digest(&keyed))
         .execute(pool.get())
         .await
@@ -461,17 +465,18 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     assert!(
         cleanup
             .iter()
-            .find(|r| r.table == "auth_browser_sessions")
+            .find(|r| r.table == "auth_refresh_tokens")
             .unwrap()
             .rows_deleted
             >= 1
     );
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_browser_sessions WHERE handle_hash = ?")
-            .bind(digest(&keyed))
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_refresh_tokens WHERE browser_handle_hash = ?",
+    )
+    .bind(digest(&keyed))
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
     assert_eq!(
         remaining, 0,
         "cleanup must remove the expired session's owner"
@@ -661,7 +666,7 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
     );
     unavailable.store(true, Ordering::SeqCst);
     let before: String = sqlx::query_scalar(
-        "SELECT encrypted_value FROM auth_browser_sessions WHERE handle_hash = ?",
+        "SELECT browser_ciphertext FROM auth_refresh_tokens WHERE browser_handle_hash = ?",
     )
     .bind(digest(&browser))
     .fetch_one(pool.get())
@@ -672,7 +677,7 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
         StatusCode::SERVICE_UNAVAILABLE
     );
     let after: String = sqlx::query_scalar(
-        "SELECT encrypted_value FROM auth_browser_sessions WHERE handle_hash = ?",
+        "SELECT browser_ciphertext FROM auth_refresh_tokens WHERE browser_handle_hash = ?",
     )
     .bind(digest(&browser))
     .fetch_one(pool.get())
@@ -712,7 +717,7 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
         "reconnect must not resurrect the old session"
     );
     server.abort();
-    sqlx::query("DELETE FROM auth_browser_sessions WHERE handle_hash = ?")
+    sqlx::query("UPDATE auth_refresh_tokens SET browser_handle_hash = NULL, browser_ciphertext = NULL WHERE browser_handle_hash = ?")
         .bind(digest(&browser))
         .execute(pool.get())
         .await

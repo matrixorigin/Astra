@@ -31,10 +31,10 @@ import { POST as stopRun } from "@/app/api/chats/[chatId]/stop/route";
 import { GET as capabilities } from "@/app/api/runtime/capabilities/route";
 
 const root = "https://runtime.example/";
-const handle = `bs2.${Buffer.from(root).toString("base64url")}.${Buffer.from("session-id").toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
-const fixtureRefresh = `header.${Buffer.from(JSON.stringify({ sid: "session-id" })).toString("base64url")}.signature`;
+const handle = `bs3.${Buffer.from(root).toString("base64url")}.${Buffer.from("user-id").toString("base64url")}.${Buffer.from("session-id").toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+const fixtureRefresh = `header.${Buffer.from(JSON.stringify({ sub: "user-id", sid: "session-id" })).toString("base64url")}.signature`;
 const fixtureAccess = fixtureRefresh;
-const fixtureOldAccess = `header.${Buffer.from(JSON.stringify({ sid: "session-id", jti: "old" })).toString("base64url")}.signature`;
+const fixtureOldAccess = `header.${Buffer.from(JSON.stringify({ sub: "user-id", sid: "session-id", jti: "old" })).toString("base64url")}.signature`;
 let jar: Map<string, string>;
 let set: ReturnType<typeof vi.fn>;
 beforeEach(() => {

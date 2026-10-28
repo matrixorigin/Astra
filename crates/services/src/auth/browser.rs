@@ -2,8 +2,8 @@
 //! The refresh row remains the sole session/revocation authority.
 use super::{refresh::session_denied, *};
 
-pub(super) const HANDLE_PREFIX: &str = "bs2.";
-const MAX_HANDLE_BYTES: usize = 1600;
+pub(super) const HANDLE_PREFIX: &str = "bs3.";
+const MAX_HANDLE_BYTES: usize = 2048;
 const ABSOLUTE_TTL_SECONDS: i64 = 365 * 24 * 60 * 60;
 
 #[derive(Deserialize)]
@@ -22,6 +22,7 @@ pub struct BrowserSessionCreated {
 struct Handle {
     hash: String,
     session_id: String,
+    user_id: String,
 }
 
 impl Handle {
@@ -34,6 +35,7 @@ impl Handle {
             .ok_or_else(session_denied)?
             .split('.');
         let encoded_root = parts.next().ok_or_else(session_denied)?;
+        let encoded_user = parts.next().ok_or_else(session_denied)?;
         let encoded_session = parts.next().ok_or_else(session_denied)?;
         let secret = parts.next().ok_or_else(session_denied)?;
         if parts.next().is_some()
@@ -45,6 +47,13 @@ impl Handle {
         {
             return Err(session_denied());
         }
+        let user = URL_SAFE_NO_PAD
+            .decode(encoded_user)
+            .map_err(|_| session_denied())?;
+        if user.is_empty() || user.len() > 128 || URL_SAFE_NO_PAD.encode(&user) != encoded_user {
+            return Err(session_denied());
+        }
+        let user_id = String::from_utf8(user).map_err(|_| session_denied())?;
         let session = URL_SAFE_NO_PAD
             .decode(encoded_session)
             .map_err(|_| session_denied())?;
@@ -77,6 +86,7 @@ impl Handle {
         Ok(Self {
             hash: sha256_hex(value),
             session_id,
+            user_id,
         })
     }
 }
@@ -139,28 +149,31 @@ impl DatabaseAuthService {
         self.encryptor.as_ref().ok_or_else(unavailable)
     }
 
+    // MatrixOne may ignore a secondary-index hint on the joined query. First
+    // resolve the immutable primary key, then recheck the handle in the
+    // canonical snapshot. A concurrent revoke or rotation cannot grant access.
+    async fn browser_token_id(
+        &self,
+        pool: &sqlx::MySqlPool,
+        handle: &Handle,
+    ) -> Result<Option<String>, AuthHttpError> {
+        sqlx::query_scalar("SELECT token_id FROM auth_refresh_tokens FORCE INDEX (uq_auth_refresh_browser_handle) WHERE browser_handle_hash = ?")
+            .bind(&handle.hash).fetch_optional(pool).await.map_err(|_| unavailable())
+    }
+
     async fn browser_revocation(
         &self,
         pool: &sqlx::MySqlPool,
         handle: &Handle,
     ) -> Result<Option<Revocation>, AuthHttpError> {
-        let token: Option<String> =
-            sqlx::query_scalar("SELECT token_id FROM auth_browser_sessions WHERE handle_hash = ?")
-                .bind(&handle.hash)
-                .fetch_optional(pool)
-                .await
-                .map_err(|_| unavailable())?;
-        let Some(token_id) = token else {
+        let Some(token_id) = self.browser_token_id(pool, handle).await? else {
             return Ok(None);
         };
-        let identity: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT user_id, session_id FROM auth_refresh_tokens WHERE token_id = ?",
-        )
-        .bind(&token_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| unavailable())?;
-        Ok(identity.and_then(|(user_id, session_id)| {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT token_id, user_id, session_id FROM auth_refresh_tokens WHERE token_id = ? AND browser_handle_hash = ? AND user_id = ? AND session_id = ?",
+        ).bind(&token_id).bind(&handle.hash).bind(&handle.user_id).bind(&handle.session_id)
+            .fetch_optional(pool).await.map_err(|_| unavailable())?;
+        Ok(row.and_then(|(token_id, user_id, session_id)| {
             session_id.map(|session_id| Revocation {
                 token_id,
                 user_id,
@@ -178,102 +191,86 @@ impl DatabaseAuthService {
         handle: &Handle,
     ) -> Result<Option<Owner>, AuthHttpError> {
         let encryptor = self.browser_encryptor()?;
-        let mut stale_ciphertext = None;
-        for _ in 0..3 {
-            let row = query(
-                "SELECT encrypted_value, token_id FROM auth_browser_sessions WHERE handle_hash = ?",
-            )
-            .bind(&handle.hash)
-            .fetch_optional(pool)
-            .await
+        let Some(token_id) = self.browser_token_id(pool, handle).await? else {
+            return Ok(None);
+        };
+        let canonical = query(
+            "SELECT t.token_id, t.token_hash, t.expires_at, t.browser_ciphertext, m.memoria_bound
+             FROM auth_refresh_tokens t
+             JOIN auth_users u ON u.user_id = ? AND u.user_id = t.user_id
+             LEFT JOIN (SELECT 1 AS memoria_bound FROM auth_external_identities FORCE INDEX (idx_external_identity_user)
+                        WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' LIMIT 1) m ON TRUE
+             WHERE t.token_id = ? AND t.browser_handle_hash = ? AND t.user_id = ? AND t.session_id = ?
+               AND t.is_revoked = 0 AND t.expires_at > NOW(6) AND u.is_active = 1",
+        ).bind(&handle.user_id).bind(&handle.user_id).bind(&token_id).bind(&handle.hash)
+            .bind(&handle.user_id).bind(&handle.session_id)
+            .fetch_optional(pool).await.map_err(|_| unavailable())?;
+        let Some(canonical) = canonical else {
+            return Ok(None);
+        };
+        let ciphertext: String = canonical
+            .try_get("browser_ciphertext")
             .map_err(|_| unavailable())?;
-            let Some(row) = row else {
-                return Ok(None);
-            };
-            let ciphertext: String = row.try_get("encrypted_value").map_err(|_| unavailable())?;
-            if stale_ciphertext.as_ref() == Some(&ciphertext) {
-                return Err(session_denied());
-            }
-            if ciphertext.len() > 32768 {
-                return Err(unavailable());
-            }
-            let credentials: Credentials =
-                serde_json::from_str(&encryptor.decrypt(&ciphertext).map_err(|_| unavailable())?)
-                    .map_err(|_| unavailable())?;
-            let refresh = decode_jwt_claims(&credentials.refresh_token, &self.jwt)?;
-            let access = jwt::decode_stored_access_claims(&credentials.access_token, &self.jwt)?;
-            let (session, origin, _) = self.parse_token_session(&refresh)?;
-            let token_id: String = row.try_get("token_id").map_err(|_| unavailable())?;
-            if credentials.version != 1
-                || credentials.handle_hash != handle.hash
-                || credentials.token_id != token_id
-                || credentials.session_id != handle.session_id
-                || credentials.session_id != session
-                || refresh.token_type.as_deref() != Some("refresh")
-                || refresh.sub.as_deref() != Some(&credentials.user_id)
-                || refresh.exp <= Utc::now().timestamp()
-                || credentials.absolute_expiry <= Utc::now().timestamp()
-                || access.token_type.as_deref() != Some("access")
-                || access.sub != refresh.sub
-                || access.sid != refresh.sid
-                || access.origin != refresh.origin
-            {
-                return Err(session_denied());
-            }
-            // Each table has its own constant key predicate; keep token/account
-            // checks in the SAME statement so logout cannot yield a mixed view.
-            let canonical = query(
-                "SELECT t.token_hash, t.expires_at, m.memoria_bound
-                 FROM auth_refresh_tokens t
-                 JOIN auth_users u ON u.user_id = ? AND u.user_id = t.user_id
-                 LEFT JOIN (SELECT 1 AS memoria_bound FROM auth_external_identities FORCE INDEX (idx_external_identity_user)
-                            WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' LIMIT 1) m ON TRUE
-                 WHERE t.token_id = ? AND t.user_id = ? AND t.session_id = ?
-                   AND t.is_revoked = 0 AND t.expires_at > NOW(6) AND u.is_active = 1",
-            ).bind(&credentials.user_id).bind(&credentials.user_id).bind(&token_id)
-                .bind(&credentials.user_id).bind(&session)
-                .fetch_optional(pool).await.map_err(|_| unavailable())?;
-            let Some(canonical) = canonical else {
-                return Ok(None);
-            };
-            let token_hash: String = canonical.try_get("token_hash").map_err(|_| unavailable())?;
-            if sha256_hex(&credentials.refresh_token) != token_hash {
-                stale_ciphertext = Some(ciphertext);
-                continue;
-            }
-            let now = Utc::now();
-            let canonical_expiry: chrono::NaiveDateTime =
-                canonical.try_get("expires_at").map_err(|_| unavailable())?;
-            if canonical_expiry <= now.naive_utc()
-                || credentials.absolute_expiry <= now.timestamp()
-                || refresh.exp <= now.timestamp()
-            {
-                return Err(session_denied());
-            }
-            let issued = access.iat.ok_or_else(session_denied)?;
-            let memoria_bound: Option<i64> = canonical
-                .try_get("memoria_bound")
-                .map_err(|_| unavailable())?;
-            let access_expiry = if memoria_bound.is_some()
-                || origin == "memoria"
-                || origin.starts_with("verified:memoria:")
-            {
-                access
-                    .exp
-                    .min(issued.saturating_add(i64::from(memoria::ACCESS_TTL_SECONDS)))
-            } else {
-                access.exp
-            };
-            return Ok(Some(Owner {
-                ciphertext,
-                access_expiry: access_expiry
-                    .min(canonical_expiry.and_utc().timestamp())
-                    .min(credentials.absolute_expiry),
-                credentials,
-                access_issued: issued,
-            }));
+        if ciphertext.len() > 32768 {
+            return Err(unavailable());
         }
-        Err(unavailable())
+        let credentials: Credentials =
+            serde_json::from_str(&encryptor.decrypt(&ciphertext).map_err(|_| unavailable())?)
+                .map_err(|_| unavailable())?;
+        let refresh = decode_jwt_claims(&credentials.refresh_token, &self.jwt)?;
+        let access = jwt::decode_stored_access_claims(&credentials.access_token, &self.jwt)?;
+        let (session, origin, _) = self.parse_token_session(&refresh)?;
+        let token_id: String = canonical.try_get("token_id").map_err(|_| unavailable())?;
+        let token_hash: String = canonical.try_get("token_hash").map_err(|_| unavailable())?;
+        if credentials.version != 1
+            || credentials.handle_hash != handle.hash
+            || credentials.token_id != token_id
+            || credentials.user_id != handle.user_id
+            || credentials.session_id != handle.session_id
+            || credentials.session_id != session
+            || sha256_hex(&credentials.refresh_token) != token_hash
+            || refresh.token_type.as_deref() != Some("refresh")
+            || refresh.sub.as_deref() != Some(&credentials.user_id)
+            || refresh.exp <= Utc::now().timestamp()
+            || credentials.absolute_expiry <= Utc::now().timestamp()
+            || access.token_type.as_deref() != Some("access")
+            || access.sub != refresh.sub
+            || access.sid != refresh.sid
+            || access.origin != refresh.origin
+        {
+            return Err(session_denied());
+        }
+        let now = Utc::now();
+        let canonical_expiry: chrono::NaiveDateTime =
+            canonical.try_get("expires_at").map_err(|_| unavailable())?;
+        if canonical_expiry <= now.naive_utc()
+            || credentials.absolute_expiry <= now.timestamp()
+            || refresh.exp <= now.timestamp()
+        {
+            return Err(session_denied());
+        }
+        let issued = access.iat.ok_or_else(session_denied)?;
+        let memoria_bound: Option<i64> = canonical
+            .try_get("memoria_bound")
+            .map_err(|_| unavailable())?;
+        let access_expiry = if memoria_bound.is_some()
+            || origin == "memoria"
+            || origin.starts_with("verified:memoria:")
+        {
+            access
+                .exp
+                .min(issued.saturating_add(i64::from(memoria::ACCESS_TTL_SECONDS)))
+        } else {
+            access.exp
+        };
+        Ok(Some(Owner {
+            ciphertext,
+            access_expiry: access_expiry
+                .min(canonical_expiry.and_utc().timestamp())
+                .min(credentials.absolute_expiry),
+            credentials,
+            access_issued: issued,
+        }))
     }
 
     fn encrypted_successor(
@@ -349,7 +346,7 @@ impl DatabaseAuthService {
             return Err(session_denied().into());
         }
         let mut rotation = self.prepare_refresh(pool, &request.refresh_token).await?;
-        if rotation.session_id != handle.session_id {
+        if rotation.session_id != handle.session_id || rotation.user_id != handle.user_id {
             return Err(session_denied().into());
         }
         let access = jwt::decode_stored_access_claims(&request.access_token, &self.jwt)?;
@@ -369,15 +366,22 @@ impl DatabaseAuthService {
         let mut tx = pool.begin().await.map_err(|_| unavailable())?;
         self.lock_refresh_account(&mut tx, &rotation.user_id)
             .await?;
-        if let Err(error) = self.commit_refresh(&mut tx, &rotation).await {
+        if let Err(error) = self
+            .commit_refresh(
+                &mut tx,
+                &rotation,
+                Some(refresh::BrowserPublication::Adopt {
+                    handle_hash: &handle.hash,
+                    ciphertext: &ciphertext,
+                }),
+            )
+            .await
+        {
             if matches!(error, refresh::CommitRefreshError::BindingChanged) {
                 tx.rollback().await.map_err(|_| unavailable())?;
             }
             return Err(error);
         }
-        query("INSERT INTO auth_browser_sessions (handle_hash, token_id, encrypted_value) VALUES (?, ?, ?)")
-            .bind(&handle.hash).bind(&rotation.token_id).bind(ciphertext)
-            .execute(&mut *tx).await.map_err(|_| unavailable())?;
         tx.commit().await.map_err(|_| unavailable())?;
         Ok(BrowserSessionCreated {
             expires_in: ABSOLUTE_TTL_SECONDS as u32,
@@ -439,18 +443,21 @@ impl DatabaseAuthService {
         if owner.credentials.absolute_expiry <= Utc::now().timestamp() {
             return Err(session_denied().into());
         }
-        if let Err(error) = self.commit_refresh(&mut tx, &rotation).await {
+        if let Err(error) = self
+            .commit_refresh(
+                &mut tx,
+                &rotation,
+                Some(refresh::BrowserPublication::Rotate {
+                    handle_hash: &handle.hash,
+                    ciphertext: &ciphertext,
+                }),
+            )
+            .await
+        {
             if matches!(error, refresh::CommitRefreshError::BindingChanged) {
                 tx.rollback().await.map_err(|_| unavailable())?;
             }
             return Err(error);
-        }
-        // Exact canonical hash CAS fences all legitimate ciphertext changes;
-        // immutable handle/token identity suffices, with no TEXT collation CAS.
-        let updated = query("UPDATE auth_browser_sessions SET encrypted_value = ? WHERE handle_hash = ? AND token_id = ?")
-            .bind(ciphertext).bind(&handle.hash).bind(&rotation.token_id).execute(&mut *tx).await.map_err(|_| unavailable())?;
-        if updated.rows_affected() != 1 {
-            return Err(session_denied().into());
         }
         tx.commit().await.map_err(|_| unavailable())?;
         Ok(())
@@ -462,14 +469,9 @@ impl DatabaseAuthService {
         handle: &Handle,
         credentials: &Revocation,
     ) -> Result<(), AuthHttpError> {
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_id = ? AND user_id = ? AND session_id = ?")
-            .bind(&credentials.token_id).bind(&credentials.user_id).bind(&credentials.session_id).execute(&mut **tx).await.map_err(|_| unavailable())?;
-        query("DELETE FROM auth_browser_sessions WHERE handle_hash = ? AND token_id = ?")
-            .bind(&handle.hash)
-            .bind(&credentials.token_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|_| unavailable())?;
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE token_id = ? AND user_id = ? AND session_id = ? AND browser_handle_hash = ?")
+            .bind(&credentials.token_id).bind(&credentials.user_id).bind(&credentials.session_id).bind(&handle.hash)
+            .execute(&mut **tx).await.map_err(|_| unavailable())?;
         Ok(())
     }
 
@@ -497,8 +499,9 @@ mod tests {
     fn handles_require_canonical_runtime_and_256_bit_proof() {
         for root in ["https://astra.example/", "http://localhost:17001/"] {
             let value = format!(
-                "bs2.{}.{}.{}",
+                "bs3.{}.{}.{}.{}",
                 URL_SAFE_NO_PAD.encode(root),
+                URL_SAFE_NO_PAD.encode("user-id"),
                 URL_SAFE_NO_PAD.encode("session-id"),
                 URL_SAFE_NO_PAD.encode([7; 32])
             );
@@ -512,8 +515,9 @@ mod tests {
             "https://astra.example/?x=1",
         ] {
             let value = format!(
-                "bs2.{}.{}.{}",
+                "bs3.{}.{}.{}.{}",
                 URL_SAFE_NO_PAD.encode(root),
+                URL_SAFE_NO_PAD.encode("user-id"),
                 URL_SAFE_NO_PAD.encode("session-id"),
                 URL_SAFE_NO_PAD.encode([7; 32])
             );

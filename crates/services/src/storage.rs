@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-28-v111";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-28-v112";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3047,27 +3047,17 @@ async fn ensure_core_schema_while_leased(
             session_id VARCHAR(64) NULL,
             token_hash VARCHAR(255) NOT NULL,
             token_prefix VARCHAR(16) NULL,
+            browser_handle_hash VARCHAR(64) NULL,
+            browser_ciphertext TEXT NULL,
             expires_at DATETIME(6) NOT NULL,
             is_revoked SMALLINT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_auth_refresh_tokens_hash (token_hash),
+            UNIQUE KEY uq_auth_refresh_browser_handle (browser_handle_hash),
             INDEX idx_auth_refresh_tokens_session (session_id),
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
             INDEX idx_auth_refresh_tokens_expires_at (expires_at),
             INDEX idx_auth_refresh_tokens_prefix (token_prefix)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "auth_browser_sessions",
-        "CREATE TABLE IF NOT EXISTS auth_browser_sessions (
-            handle_hash VARCHAR(64) NOT NULL PRIMARY KEY,
-            token_id VARCHAR(64) NOT NULL,
-            encrypted_value TEXT NOT NULL,
-            UNIQUE KEY uq_browser_session_token (token_id)
         )",
     )
     .execute(&pool)
@@ -5371,29 +5361,26 @@ async fn verify_core_schema_shape(
                     .into(),
             ));
         }
-        if table == "auth_browser_sessions" {
-            let (kind, length) = match column.as_str() {
-                "handle_hash" | "token_id" => ("varchar", Some(64)),
-                "encrypted_value" => ("text", None),
-                _ => {
-                    return Err(sqlx::Error::Protocol(
-                        "unexpected auth_browser_sessions column".into(),
-                    ));
-                }
+        if table == "auth_refresh_tokens"
+            && matches!(
+                column.as_str(),
+                "browser_handle_hash" | "browser_ciphertext"
+            )
+        {
+            let kind = if column == "browser_handle_hash" {
+                "varchar"
+            } else {
+                "text"
             };
             if !row
                 .try_get::<String, _>("DATA_TYPE")?
                 .eq_ignore_ascii_case(kind)
-                || row.try_get::<String, _>("IS_NULLABLE")? != "NO"
-                || length.is_some_and(|expected| {
-                    row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")
-                        .ok()
-                        .flatten()
-                        != Some(expected)
-                })
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || (column == "browser_handle_hash"
+                    && row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
             {
                 return Err(sqlx::Error::Protocol(format!(
-                    "invalid auth_browser_sessions.{column} shape"
+                    "invalid auth_refresh_tokens.{column} shape"
                 )));
             }
         }
@@ -5415,10 +5402,9 @@ async fn verify_core_schema_shape(
                 "updated_at",
             ][..],
         ),
-        ("auth_refresh_tokens", &["session_id"][..]),
         (
-            "auth_browser_sessions",
-            &["handle_hash", "token_id", "encrypted_value"][..],
+            "auth_refresh_tokens",
+            &["session_id", "browser_handle_hash", "browser_ciphertext"][..],
         ),
         (
             "agent_sessions",
@@ -5524,12 +5510,12 @@ async fn verify_core_schema_shape(
     {
         let table: String = row.try_get("TABLE_NAME")?;
         let index: String = row.try_get("INDEX_NAME")?;
-        if table == "auth_browser_sessions"
-            && matches!(index.as_str(), "PRIMARY" | "uq_browser_session_token")
+        if table == "auth_refresh_tokens"
+            && index == "uq_auth_refresh_browser_handle"
             && row.try_get::<i64, _>("NON_UNIQUE")? != 0
         {
             return Err(sqlx::Error::Protocol(format!(
-                "auth_browser_sessions.{index} must be unique"
+                "auth_refresh_tokens.{index} must be unique"
             )));
         }
         if table == "session_transcript_items"
@@ -5568,12 +5554,12 @@ async fn verify_core_schema_shape(
         ],
     )?;
 
-    for (index, columns) in [
-        ("PRIMARY", &["handle_hash"][..]),
-        ("uq_browser_session_token", &["token_id"][..]),
-    ] {
-        ensure_index_shape(&indexes, "auth_browser_sessions", index, columns)?;
-    }
+    ensure_index_shape(
+        &indexes,
+        "auth_refresh_tokens",
+        "uq_auth_refresh_browser_handle",
+        &["browser_handle_hash"],
+    )?;
 
     fail_if_obsolete_shape(
         pool,
@@ -6964,81 +6950,6 @@ pub async fn cleanup_inactive_memoria_credentials(pool: &sqlx::MySqlPool) -> Res
         .map_err(|error| format!("cleanup inactive Memoria credentials: {error}"))
 }
 
-// Retention is owned by the canonical refresh row. A short transaction deletes
-// both rows. Multi-table DELETE corrupts index tuple decoding on MatrixOne 4.2.5.
-// The original candidate scan remains outside the transaction and locks no rows.
-async fn cleanup_refresh_sessions(
-    pool: &sqlx::MySqlPool,
-    days: u32,
-    limit: u32,
-) -> Result<(u64, u64), sqlx::Error> {
-    for _ in 0..3 {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT token_id FROM auth_refresh_tokens
-             WHERE (expires_at < NOW(6) OR is_revoked = 1)
-               AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
-             ORDER BY created_at ASC, token_id ASC LIMIT ?",
-        )
-        .bind(days)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-        if ids.is_empty() {
-            return Ok((0, 0));
-        }
-        let mut tx = pool.begin().await?;
-        let mut deletion =
-            QueryBuilder::<MySql>::new("DELETE FROM auth_refresh_tokens WHERE token_id IN (");
-        let mut values = deletion.separated(", ");
-        for id in &ids {
-            values.push_bind(id);
-        }
-        deletion.push(") AND (expires_at < NOW(6) OR is_revoked = 1) AND created_at < DATE_SUB(NOW(6), INTERVAL ")
-            .push_bind(days).push(" DAY)");
-        let sessions = deletion.build().execute(&mut *tx).await?.rows_affected();
-        if sessions != ids.len() as u64 {
-            // A renewal or another sweeper won. Roll back the whole batch before
-            // touching owners; use a fresh snapshot for the bounded next attempt.
-            tx.rollback().await?;
-            continue;
-        }
-        // All selected canonical rows are now locked/deleted. Creation/rotation
-        // cannot publish another owner without a successful canonical hash CAS.
-        let mut deletion =
-            QueryBuilder::<MySql>::new("DELETE FROM auth_browser_sessions WHERE token_id IN (");
-        let mut values = deletion.separated(", ");
-        for id in &ids {
-            values.push_bind(id);
-        }
-        deletion.push(")");
-        let owners = deletion.build().execute(&mut *tx).await?.rows_affected();
-        tx.commit().await?;
-        return Ok((sessions, owners));
-    }
-    // Database/serialization failures also propagate: the existing maintenance
-    // loop logs failures and retries on its next sweep, without partial commit.
-    Err(sqlx::Error::Protocol(
-        "refresh retention changed concurrently; retry cleanup".into(),
-    ))
-}
-
-/// Maximum refresh sessions retired by one cleanup transaction.
-pub const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
-
-/// Remove one bounded batch of expired or revoked refresh sessions and their browser owners.
-pub async fn cleanup_refresh_session_batch(
-    pool: &sqlx::Pool<MySql>,
-    policy: &RetentionPolicy,
-) -> Result<(u64, u64), String> {
-    cleanup_refresh_sessions(
-        pool,
-        policy.refresh_token_days,
-        AUTH_REFRESH_TOKEN_BATCH_LIMIT,
-    )
-    .await
-    .map_err(|error| format!("cleanup refresh sessions: {error}"))
-}
-
 /// Purge expired authentication and operational records with TTL/expiry semantics.
 ///
 /// Returns a list of per-table cleanup results showing how many rows were deleted.
@@ -7048,6 +6959,7 @@ pub async fn cleanup_expired_data(
     pool: &sqlx::Pool<MySql>,
     policy: &RetentionPolicy,
 ) -> Result<Vec<CleanupResult>, String> {
+    const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_PROOF_BATCH_LIMIT: u32 = 1000;
     const DEVICE_CHALLENGE_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
@@ -7055,23 +6967,24 @@ pub async fn cleanup_expired_data(
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     let mut results = Vec::new();
 
-    let (sessions, owners) = cleanup_refresh_sessions(
-        pool,
-        policy.refresh_token_days,
-        AUTH_REFRESH_TOKEN_BATCH_LIMIT,
+    // 1. Expired + revoked refresh tokens
+    let deleted = sqlx::query(
+        "DELETE FROM auth_refresh_tokens \
+         WHERE (expires_at < NOW(6) OR is_revoked = 1) \
+           AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         ORDER BY created_at ASC, token_id ASC \
+         LIMIT ?",
     )
+    .bind(policy.refresh_token_days)
+    .bind(AUTH_REFRESH_TOKEN_BATCH_LIMIT)
+    .execute(pool)
     .await
-    .map_err(|error| format!("cleanup refresh sessions: {error}"))?;
-    results.extend([
-        CleanupResult {
-            table: "auth_refresh_tokens",
-            rows_deleted: sessions,
-        },
-        CleanupResult {
-            table: "auth_browser_sessions",
-            rows_deleted: owners,
-        },
-    ]);
+    .map(|r| r.rows_affected())
+    .map_err(|e| format!("cleanup auth_refresh_tokens: {e}"))?;
+    results.push(CleanupResult {
+        table: "auth_refresh_tokens",
+        rows_deleted: deleted,
+    });
 
     let deleted = sqlx::query(
         "DELETE FROM auth_reauthentication_proofs

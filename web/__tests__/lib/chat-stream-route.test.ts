@@ -263,7 +263,7 @@ describe("chat stream route proxy cancellation", () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const { WebRuntimeClient } = await vi.importActual<typeof import("@/lib/runtime-client/server")>("@/lib/runtime-client/server");
     const root = "https://runtime.example/";
-    const handle = `bs2.${Buffer.from(root).toString("base64url")}.${Buffer.from("session-id").toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+    const handle = `bs3.${Buffer.from(root).toString("base64url")}.${Buffer.from("user-id").toString("base64url")}.${Buffer.from("session-id").toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
     const runtime = new WebRuntimeClient({ mode: "live", source: "cookie", apiUrl: root,
       accessToken: "old", refreshToken: handle, hasAccessToken: true, hasRefreshToken: true,
       demoMode: false, message: "" });
