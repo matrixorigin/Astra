@@ -452,6 +452,28 @@ async fn http_shutdown_signal() {
 
 /// Spawn a background task that periodically cleans up expired authentication
 /// and operational data.
+async fn cleanup_until_cancelled<F: std::future::Future>(
+    cancel: &tokio_util::sync::CancellationToken,
+    cleanup: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        _ = cancel.cancelled() => None,
+        result = cleanup => Some(result),
+    }
+}
+
+fn schedule_refresh_after_sweep(
+    catching_up: &mut bool,
+    cutoff: &mut Option<chrono::NaiveDateTime>,
+    retry_at: &mut tokio::time::Instant,
+) {
+    if !*catching_up {
+        *catching_up = true;
+        *cutoff = None;
+        *retry_at = tokio::time::Instant::now();
+    }
+}
+
 fn spawn_data_cleanup(
     pool: astra_core::SharedPool,
     cancel: tokio_util::sync::CancellationToken,
@@ -474,7 +496,10 @@ fn spawn_data_cleanup(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    match astra_services::cleanup_expired_data(pool.get(), &policy).await {
+                    let Some(result) = cleanup_until_cancelled(
+                        &cancel, astra_services::cleanup_expired_data(pool.get(), &policy),
+                    ).await else { break; };
+                    match result {
                         Ok(results) => {
                             let total: u64 = results.iter().map(|r| r.rows_deleted).sum();
                             if total > 0 {
@@ -484,16 +509,18 @@ fn spawn_data_cleanup(
                         }
                         Err(error) => tracing::warn!(target: "astra_runtime::cleanup", %error, "expired data cleanup failed"),
                     }
-                    // A refresh batch can commit even if a later table fails.
-                    catching_up = true;
-                    round_cutoff = None;
-                    retry_at = tokio::time::Instant::now();
+                    // Preserve an ongoing round's fixed cutoff. A refresh batch
+                    // may have committed even if a later table failed.
+                    schedule_refresh_after_sweep(&mut catching_up, &mut round_cutoff, &mut retry_at);
                 }
                 _ = tokio::time::sleep_until(retry_at), if catching_up => {
                     let mut deleted = 0;
                     for _ in 0..4 {
                         if cancel.is_cancelled() { return; }
-                        match astra_services::cleanup_refresh_session_batch(pool.get(), &policy, round_cutoff).await {
+                        let Some(result) = cleanup_until_cancelled(
+                            &cancel, astra_services::cleanup_refresh_session_batch(pool.get(), &policy, round_cutoff),
+                        ).await else { return; };
+                        match result {
                             Ok(batch) => {
                                 deleted += batch.deleted;
                                 match batch.status() {
@@ -722,6 +749,60 @@ mod tests {
         http::{Method, Request, StatusCode},
     };
     use tower::ServiceExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_sweep_preserves_an_active_refresh_round() {
+        let fixed = chrono::Utc::now().naive_utc() - chrono::Duration::days(7);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut active = true;
+        let mut cutoff = Some(fixed);
+        let mut retry_at = deadline;
+        super::schedule_refresh_after_sweep(&mut active, &mut cutoff, &mut retry_at);
+        assert!(active);
+        assert_eq!(cutoff, Some(fixed));
+        assert_eq!(retry_at, deadline);
+
+        active = false;
+        super::schedule_refresh_after_sweep(&mut active, &mut cutoff, &mut retry_at);
+        assert!(active);
+        assert_eq!(cutoff, None);
+        assert_eq!(retry_at, tokio::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn cleanup_cancellation_drops_an_inflight_operation() {
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let cancel = cancelled.clone();
+            let dropped = dropped.clone();
+            async move {
+                super::cleanup_until_cancelled(&cancel, async move {
+                    let _signal = DropSignal(dropped);
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await
+                })
+                .await
+            }
+        });
+        ready.await.unwrap();
+        cancelled.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[derive(Default)]
     struct RecordingEdgeDispatchService {

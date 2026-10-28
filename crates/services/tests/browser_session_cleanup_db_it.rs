@@ -18,6 +18,24 @@ async fn clean(pool: &sqlx::MySqlPool) -> Result<u64, String> {
         .rows_deleted)
 }
 
+async fn wait_for_delete(
+    pool: &sqlx::MySqlPool,
+    database: &str,
+    connection: u64,
+    task: &tokio::task::JoinHandle<Result<u64, String>>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            assert!(!task.is_finished(), "cleanup completed before its DELETE was observed");
+            let info: Option<String> = sqlx::query_scalar(
+                "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
+            ).bind(database).bind(connection).fetch_optional(pool).await.unwrap().flatten();
+            if info.is_some_and(|sql| sql.contains("DELETE FROM auth_refresh_tokens")) && !task.is_finished() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("cleanup DELETE did not start while the row was locked");
+}
+
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn cleanup_catalog_is_dropped_after_a_test_panics() {
@@ -133,23 +151,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
         .unwrap();
     let sweeper_pool = other.clone();
     let sweep = tokio::spawn(async move { clean(sweeper_pool.get()).await });
-    // Observe the real DELETE while the conflicting renewal is uncommitted.
-    // Sleeping alone does not prove that the sweeper has started.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            assert!(
-                !sweep.is_finished(),
-                "cleanup finished before the conflicting DELETE was observed"
-            );
-            let info: Option<String> = sqlx::query_scalar(
-                "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
-            ).bind(&settings.database).bind(worker_connection_id).fetch_optional(pool.get()).await.unwrap().flatten();
-            if info.is_some_and(|sql| sql.contains("DELETE FROM auth_refresh_tokens")) && !sweep.is_finished() { break; }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("cleanup DELETE did not start while the renewal held the row");
+    wait_for_delete(pool.get(), &settings.database, worker_connection_id, &sweep).await;
     rotation.commit().await.unwrap();
     if let Err(error) = sweep.await.unwrap() {
         assert!(
@@ -164,6 +166,48 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
             .await
             .unwrap();
     assert_eq!(value, "renewed");
+
+    // Cancellation may race a database commit. A later checkout and retry must
+    // be safe whether the cancelled delete committed or was rolled back.
+    let uncertain = seed(pool.get(), true).await;
+    let mut blocker = pool.get().begin().await.unwrap();
+    sqlx::query("SELECT token_hash FROM auth_refresh_tokens WHERE token_id = ? FOR UPDATE")
+        .bind(&uncertain)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let worker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(other.get())
+        .await
+        .unwrap();
+    let sweeper_pool = other.clone();
+    let cancelled = tokio::spawn(async move { clean(sweeper_pool.get()).await });
+    wait_for_delete(
+        pool.get(),
+        &settings.database,
+        worker_connection_id,
+        &cancelled,
+    )
+    .await;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    blocker.commit().await.unwrap();
+    let check: i64 = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sqlx::query_scalar("SELECT 1").fetch_one(other.get()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(check, 1);
+    assert!(clean(other.get()).await.unwrap() <= 1);
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id = ?")
+            .bind(&uncertain)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
 
     let ids: Vec<_> = (0..1001)
         .map(|_| uuid::Uuid::new_v4().to_string())
@@ -224,4 +268,24 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
         "expired or revoked rows still respect retention"
     );
     other.get().close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn refresh_cleanup_error_does_not_hide_other_tables_committed_work() {
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let pool = isolated.pool.clone();
+    isolated.run(async move {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO auth_reauthentication_proofs (proof_id,user_id,purpose,proof_hash,expires_at) VALUES (?, ?, 'test', ?, '2020-01-01')")
+            .bind(&id).bind(&id).bind("0123456789012345678901234567890123456789012345678901234567890123")
+            .execute(pool.get()).await.unwrap();
+        sqlx::query("ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_expires_at")
+            .execute(pool.get()).await.unwrap();
+        let error = cleanup_expired_data(pool.get(), &RetentionPolicy::default()).await.unwrap_err();
+        assert!(error.contains("select refresh cleanup candidates"), "{error}");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_reauthentication_proofs WHERE proof_id = ?")
+            .bind(&id).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(count, 0, "other table cleanup may commit before the reported refresh failure");
+    }).await;
 }
