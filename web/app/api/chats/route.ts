@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireRuntimeUser } from '@/lib/api/auth-guard';
 import { createChatWithMessage, deleteArchivedChats, listChats } from '@/lib/api/web-store';
 import type { CreateChatRequest } from '@/lib/api/types';
-import { RuntimeClientError, requireRuntimeClient } from '@/lib/runtime-client';
+import { RuntimeClientError } from '@/lib/runtime-client';
 import { verifyLiveWorkspaceSelection } from '@/lib/workspace-selection-server';
 import { normalizeWorkspaceSelection } from '@/lib/workspace-authority';
 
@@ -20,7 +20,7 @@ export async function GET(request: NextRequest) {
       cursor: params.get('cursor'),
       limit: Number(params.get('limit') ?? 50),
       archived: params.get('archived') === 'true',
-    }),
+    }, auth.client),
   );
 }
 
@@ -55,10 +55,7 @@ export async function POST(request: NextRequest) {
       normalizedWorkspaceSelection?.kind === 'edge_workspace'
         ? await verifyLiveWorkspaceSelection(
             normalizedWorkspaceSelection,
-            await requireRuntimeClient({
-              auth: 'required',
-              operation: 'verify initial chat environment selection',
-            }),
+            auth.client,
           )
         : normalizedWorkspaceSelection;
     const result = await createChatWithMessage(auth.user.user_id, {
@@ -93,7 +90,7 @@ export async function DELETE(request: NextRequest) {
   }
 
   try {
-    const deleted = await deleteArchivedChats(auth.user.user_id);
+    const deleted = await deleteArchivedChats(auth.user.user_id, auth.client);
     return NextResponse.json({ deleted });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'failed to clear archived chats';

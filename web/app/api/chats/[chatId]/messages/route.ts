@@ -9,7 +9,6 @@ import {
 import type { SendMessageRequest } from "@/lib/api/types";
 import { applyStreamEvent } from "@/lib/api/stream-event-handler";
 import { streamObservationInterrupted } from "@/lib/api/errors";
-import { requireRuntimeClient } from "@/lib/runtime-client/server";
 import { RuntimeClientError, readRuntimeErrorDetail, runtimeErrorDetail } from "@/lib/runtime-client/errors";
 import { chatRunStreamPath, parseSseDataEvents } from "@astra/sdk";
 
@@ -66,7 +65,7 @@ export async function POST(
   });
   let timeout = setTimeout(() => deadline.abort(new Error("Run admission timed out.")), 30_000);
   try {
-    const runtime = await requireRuntimeClient({ auth: "required", operation: "start web chat turn" });
+    const runtime = auth.client;
     assertCurrent();
     const sessionId = await ensureChatBackendSession(ownerUserId, chatId, { model, runtime });
     assertCurrent();

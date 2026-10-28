@@ -12,7 +12,7 @@ export async function GET(
     return auth.response;
   }
   const { projectId } = await context.params;
-  const detail = await getProjectHydrated(auth.user.user_id, projectId);
+  const detail = await getProjectHydrated(auth.user.user_id, projectId, auth.client);
   if (!detail) {
     return NextResponse.json({ error: 'project not found' }, { status: 404 });
   }

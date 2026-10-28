@@ -41,6 +41,11 @@ const mockUpdateChatWorkspaceSelection = vi.mocked(
   updateChatWorkspaceSelection,
 );
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
+function setAdmittedRuntime(value: unknown) {
+  mockRequireRuntimeClient.mockResolvedValue(value as never);
+  const previous = mockRequireRuntimeUser.getMockImplementation();
+  mockRequireRuntimeUser.mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
+}
 
 const connectedEdge = {
   edge_agent_id: "edge-1",
@@ -97,7 +102,7 @@ describe("chat route workspace selection patch", () => {
       async (_ownerUserId, _chatId, selection) =>
         chatDetail(selection ?? undefined) as never,
     );
-    mockRequireRuntimeClient.mockResolvedValue(runtimeWithEdges() as never);
+    setAdmittedRuntime(runtimeWithEdges() as never);
   });
 
   it("persists a valid edge workspace selection", async () => {
@@ -118,12 +123,13 @@ describe("chat route workspace selection patch", () => {
       "user-a",
       "chat-1",
       workspaceSelection,
+      expect.objectContaining({ get: expect.any(Function) }),
     );
   });
 
   it("rejects an edge workspace selection that is not visible for the current user", async () => {
     const { PATCH } = await import("@/app/api/chats/[chatId]/route");
-    mockRequireRuntimeClient.mockResolvedValue(runtimeWithEdges([]) as never);
+    setAdmittedRuntime(runtimeWithEdges([]) as never);
 
     const response = await PATCH(
       patchChat({
@@ -153,6 +159,7 @@ describe("chat route workspace selection patch", () => {
       "user-a",
       "chat-1",
       null,
+      expect.objectContaining({ get: expect.any(Function) }),
     );
   });
 

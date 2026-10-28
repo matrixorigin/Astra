@@ -6,7 +6,9 @@ import {
 } from "@/lib/runtime-client/errors";
 import {
   SESSION_COOKIE,
+  SESSION_MAX_AGE,
   parseSelection,
+  jwtSessionHint,
   runtimeRoot,
   selectionCookie,
   sessionCookieOptions,
@@ -97,7 +99,7 @@ export async function resolveBrowserSession(
   if (
     !tokens ||
     typeof tokens.access_token !== "string" ||
-    !tokens.access_token ||
+    jwtSessionHint(tokens.access_token) !== selection.sessionId ||
     tokens.refresh_token !== selection.handle
   ) {
     throw new RuntimeClientError({
@@ -126,27 +128,26 @@ export async function adoptBrowserSession(
   tokens: { access_token: string; refresh_token: string },
 ): Promise<string> {
   const root = runtimeRoot(apiUrl);
-  const handle = `bs1.${Buffer.from(root).toString("base64url")}.${randomBytes(32).toString("base64url")}`;
+  const sessionId = jwtSessionHint(tokens.refresh_token);
+  if (!sessionId) throw new RuntimeClientError({ operation: "create browser session", path: "/auth/browser-sessions", status: 400, detail: "Invalid session credential." });
+  const handle = `bs2.${Buffer.from(root).toString("base64url")}.${Buffer.from(sessionId).toString("base64url")}.${randomBytes(32).toString("base64url")}`;
   parseSelection(handle);
-  const previous = await replaceableSession();
-  if (previous?.mode === "browser" && previous.apiUrl !== root) {
-    await revokeSelection(previous);
-  }
   try {
-    await sessionRequest(root, "/auth/browser-sessions", {
+    const created = await sessionRequest(root, "/auth/browser-sessions", {
       handle,
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token,
-      previous_handle:
-        previous?.mode === "browser" && previous.apiUrl === root
-          ? previous.handle
-          : null,
     });
+    if (!created || typeof created !== "object" || !("expires_in" in created) ||
+      typeof created.expires_in !== "number" || !Number.isInteger(created.expires_in) ||
+      created.expires_in <= 0 || created.expires_in > SESSION_MAX_AGE) {
+      throw new RuntimeClientError({ operation: "create browser session", path: "/auth/browser-sessions", status: 502, detail: "Invalid session response from runtime." });
+    }
   } catch (error) {
     // A lost creation response does not imply rollback. Only our independently
     // generated handle can recover a committed owner; never replay a JWT.
     try {
-      await resolveBrowserSession({ mode: "browser", apiUrl: root, handle });
+      await resolveBrowserSession({ mode: "browser", apiUrl: root, sessionId, handle });
     } catch {
       throw error;
     }

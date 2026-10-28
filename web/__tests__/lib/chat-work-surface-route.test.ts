@@ -29,6 +29,11 @@ import { requireRuntimeClient } from "@/lib/runtime-client";
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
+function setAdmittedRuntime(value: unknown) {
+  mockRequireRuntimeClient.mockResolvedValue(value as never);
+  const previous = mockRequireRuntimeUser.getMockImplementation();
+  mockRequireRuntimeUser.mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
+}
 
 describe("chat work surface route", () => {
   beforeEach(() => {
@@ -132,7 +137,7 @@ describe("chat work surface route", () => {
     const taskGraph = { schema_version: 2, scope: "declared_work" };
     const getWorkSessionBinding = vi.fn().mockResolvedValue(workBinding);
     const getWorkTaskGraph = vi.fn().mockResolvedValue(taskGraph);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       get,
       sdk: { getWorkSessionBinding, getWorkTaskGraph },
     } as never);
@@ -266,7 +271,7 @@ describe("chat work surface route", () => {
       throw new Error(`unexpected runtime path: ${path}`);
     });
     const getWorkSessionBinding = vi.fn().mockResolvedValue(null);
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       get,
       sdk: { getWorkSessionBinding },
     } as never);

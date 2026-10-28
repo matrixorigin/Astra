@@ -37,7 +37,6 @@ import {
   RuntimeClientError,
   WebRuntimeClient,
   readRuntimeErrorDetail,
-  requireRuntimeClient,
 } from "@/lib/runtime-client";
 import type {
   SendMessageRequest,
@@ -587,14 +586,7 @@ export async function POST(
     body.options?.activeTools,
     body.options?.webSearch,
   );
-  let runtimePromise: Promise<WebRuntimeClient> | undefined;
-  const getStreamRuntime = () => {
-    runtimePromise ??= requireRuntimeClient({
-      auth: "required",
-      operation: "stream web chat turn",
-    });
-    return runtimePromise;
-  };
+  const getStreamRuntime = async () => auth.client;
   const hasRequestedWorkspace = Object.prototype.hasOwnProperty.call(
     body,
     "workspace",
@@ -664,6 +656,7 @@ export async function POST(
           ownerUserId,
           chatId,
           liveWorkspaceSelection,
+          auth.client,
         );
         if (!updated) {
           throw new Error("chat not found");
@@ -786,15 +779,7 @@ export async function GET(
     return NextResponse.json({ error: error.message, code: error.code }, { status: 409 });
   }
 
-  let runtime: WebRuntimeClient;
-  try {
-    runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: `stream existing web run ${runId}`,
-    });
-  } catch {
-    return NextResponse.json({ error: "AUTH_REQUIRED" }, { status: 401 });
-  }
+  const runtime = auth.client;
 
   const sessionId = chat.session?.backendSessionId ?? chatId;
   const knownArtifactIds = new Set<string>();

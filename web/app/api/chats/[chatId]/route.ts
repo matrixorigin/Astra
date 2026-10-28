@@ -11,7 +11,7 @@ import {
 } from '@/lib/api/web-store';
 import type { WorkspaceSelection } from '@/lib/api/types';
 import { normalizeWorkspaceSelection } from '@/lib/workspace-authority';
-import { RuntimeClientError, requireRuntimeClient } from '@/lib/runtime-client';
+import { RuntimeClientError } from '@/lib/runtime-client';
 import { verifyLiveWorkspaceSelection } from '@/lib/workspace-selection-server';
 
 export async function GET(_request: NextRequest, context: { params: Promise<{ chatId: string }> }) {
@@ -20,7 +20,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ch
     return auth.response;
   }
   const { chatId } = await context.params;
-  const detail = await getChatHydrated(auth.user.user_id, chatId);
+  const detail = await getChatHydrated(auth.user.user_id, chatId, auth.client);
   if (!detail) {
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
@@ -46,7 +46,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ c
 
   if (body.archived !== undefined) {
     try {
-      detail = await archiveChat(auth.user.user_id, chatId, body.archived);
+      detail = await archiveChat(auth.user.user_id, chatId, body.archived, auth.client);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'failed to update archive state';
       return NextResponse.json({ error: message }, { status: 502 });
@@ -59,7 +59,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ c
 
   if (body.model !== undefined) {
     try {
-      detail = await updateChatModel(auth.user.user_id, chatId, body.model);
+      detail = await updateChatModel(auth.user.user_id, chatId, body.model, auth.client);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'failed to update chat model';
       return NextResponse.json({ error: message }, { status: 502 });
@@ -82,15 +82,12 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ c
     }
     try {
       if (workspaceSelection?.kind === 'edge_workspace') {
-        const runtime = await requireRuntimeClient({
-          auth: 'required',
-          operation: 'verify chat environment selection',
-        });
+        const runtime = auth.client;
         workspaceSelection =
           (await verifyLiveWorkspaceSelection(workspaceSelection, runtime)) ??
           null;
       }
-      detail = await updateChatWorkspaceSelection(auth.user.user_id, chatId, workspaceSelection);
+      detail = await updateChatWorkspaceSelection(auth.user.user_id, chatId, workspaceSelection, auth.client);
     } catch (error) {
       if (error instanceof RuntimeClientError && error.status) {
         return NextResponse.json(
@@ -120,7 +117,7 @@ export async function DELETE(_request: NextRequest, context: { params: Promise<{
     return NextResponse.json({ error: 'chat not found' }, { status: 404 });
   }
   try {
-    const deleted = await deleteChat(auth.user.user_id, chatId);
+    const deleted = await deleteChat(auth.user.user_id, chatId, auth.client);
     if (!deleted) {
       return NextResponse.json({ error: 'chat not found' }, { status: 404 });
     }

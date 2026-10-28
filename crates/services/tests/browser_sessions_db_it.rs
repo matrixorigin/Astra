@@ -12,15 +12,20 @@ use std::sync::Arc;
 #[path = "common/browser_session.rs"]
 mod fixture;
 use fixture::{ENCRYPTION_KEY, JWT_KEY, digest, expire_access};
-fn handle() -> String {
+fn handle(tokens: &astra_services::AuthTokenRecord) -> String {
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
+    let payload = tokens.refresh_token.split('.').nth(1).unwrap();
+    let claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+    let sid = claims["sid"].as_str().unwrap();
     format!(
-        "bs1.{}.{}",
+        "bs2.{}.{}.{}",
         URL_SAFE_NO_PAD.encode("http://localhost:17001/"),
+        URL_SAFE_NO_PAD.encode(sid),
         URL_SAFE_NO_PAD.encode(&secret.as_bytes()[..32])
     )
 }
@@ -29,16 +34,11 @@ fn refresh(value: &str) -> AuthRefreshRequestData {
         refresh_token: value.into(),
     }
 }
-fn adoption(
-    value: &str,
-    tokens: &astra_services::AuthTokenRecord,
-    old: Option<&str>,
-) -> BrowserSessionRequest {
+fn adoption(value: &str, tokens: &astra_services::AuthTokenRecord) -> BrowserSessionRequest {
     BrowserSessionRequest {
         handle: value.into(),
         refresh_token: tokens.refresh_token.clone(),
         access_token: tokens.access_token.clone(),
-        previous_handle: old.map(str::to_owned),
     }
 }
 
@@ -69,7 +69,16 @@ async fn register(service: &DatabaseAuthService) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_replay_boundaries() {
-    let (pool, settings) = common::setup_pool_and_settings().await;
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let pool = isolated.pool.clone();
+    let settings = isolated.settings.clone();
+    isolated.run(browser_sessions_converge_across_pools_and_preserve_revocation_and_replay_boundaries_body(pool, settings)).await;
+}
+
+async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_replay_boundaries_body(
+    pool: astra_core::SharedPool,
+    settings: astra_core::MatrixOneSettings,
+) {
     let jwt = JwtSettings {
         secret_key: JWT_KEY.into(),
         algorithm: "HS256".into(),
@@ -85,15 +94,15 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     let second = Arc::new(make_service(SharedPool::new(&settings).await.unwrap()));
     let name = register(&first).await;
     let tokens = login(&first, &name).await;
-    let browser = handle();
+    let browser = handle(&tokens);
     first
-        .create_browser_session(adoption(&browser, &tokens, None))
+        .create_browser_session(adoption(&browser, &tokens))
         .await
         .unwrap();
     // Creation recovery uses the independent proof, even if acknowledgement was
     // lost and the input JWT has already been consumed.
     second
-        .create_browser_session(adoption(&browser, &tokens, None))
+        .create_browser_session(adoption(&browser, &tokens))
         .await
         .unwrap();
     assert_eq!(
@@ -114,9 +123,9 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
 
     // The complete handle binds both runtime and proof, including if an owner
     // row is misplaced. Restoring it must leave canonical authority unchanged.
-    let proof = browser.rsplit('.').next().unwrap();
+    let proof = browser.split('.').skip(2).collect::<Vec<_>>().join(".");
     let other_runtime = format!(
-        "bs1.{}.{proof}",
+        "bs2.{}.{proof}",
         URL_SAFE_NO_PAD.encode("http://localhost:17002/")
     );
     assert_eq!(
@@ -143,30 +152,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .await
             .unwrap();
     assert_eq!(restored.rows_affected(), 1);
-    let replacement = login(&first, &name).await;
-    assert!(matches!(
-        first
-            .create_browser_session(adoption(&other_runtime, &replacement, Some(&browser)))
-            .await,
-        Err((StatusCode::UNAUTHORIZED, _))
-    ));
-    let same_handle = handle();
-    assert!(matches!(
-        first
-            .create_browser_session(adoption(&same_handle, &replacement, Some(&same_handle)))
-            .await,
-        Err((StatusCode::UNAUTHORIZED, _))
-    ));
     assert!(first.refresh(refresh(&browser)).await.is_ok());
-    let replacement = first
-        .refresh(refresh(&replacement.refresh_token))
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM auth_refresh_tokens WHERE token_hash = ?")
-        .bind(digest(&replacement.refresh_token))
-        .execute(pool.get())
-        .await
-        .unwrap();
 
     // Trace the real ordinary owner resolution, including all SQLx calls.
     // Each independent request must remain two reads and no transaction/write.
@@ -306,25 +292,41 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         .refresh(refresh(&direct.refresh_token))
         .await
         .unwrap();
-    // Replacement across accounts revokes only the captured old session.
+    // Independent logins preserve the old session until explicit logout.
     let other_session = login(&first, &name).await;
-    let other_handle = handle();
+    let other_handle = handle(&other_session);
     first
-        .create_browser_session(adoption(&other_handle, &other_session, None))
+        .create_browser_session(adoption(&other_handle, &other_session))
         .await
         .unwrap();
     let name_b = register(&first).await;
     let tokens_b = login(&second, &name_b).await;
-    let new_handle = handle();
+    let new_handle = handle(&tokens_b);
     second
-        .create_browser_session(adoption(&new_handle, &tokens_b, Some(&browser)))
+        .create_browser_session(adoption(&new_handle, &tokens_b))
         .await
         .unwrap();
+    assert_eq!(
+        first.refresh(refresh(&browser)).await.unwrap().user_id,
+        tokens.user_id
+    );
+    first.logout(refresh(&browser)).await.unwrap(); // logout cannot revoke B
+    // A deleted owner must not let a different account reclaim its old handle.
+    let attacker = login(&second, &name_b).await;
+    assert!(matches!(
+        first
+            .create_browser_session(adoption(&browser, &attacker))
+            .await,
+        Err((StatusCode::UNAUTHORIZED, _))
+    ));
     assert_eq!(
         first.refresh(refresh(&browser)).await.unwrap_err().0,
         StatusCode::UNAUTHORIZED
     );
-    first.logout(refresh(&browser)).await.unwrap(); // delayed logout cannot revoke B
+    second
+        .refresh(refresh(&attacker.refresh_token))
+        .await
+        .expect("failed adoption must not consume B's refresh token");
     assert_eq!(
         first.refresh(refresh(&new_handle)).await.unwrap().user_id,
         tokens_b.user_id
@@ -353,22 +355,48 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         StatusCode::UNAUTHORIZED
     );
 
-    // Publishing a new owner with an existing revoked handle must roll back
-    // its canonical rotation; the unrelated input JWT stays usable.
-    let rollback_tokens = login(&first, &name).await;
-    let blocked = handle();
+    // A second handle for an already-owned canonical session reaches the
+    // unique token-id constraint after rotation; the transaction must roll back.
     let blocker = login(&first, &name).await;
+    let blocked = handle(&blocker);
     first
-        .create_browser_session(adoption(&blocked, &blocker, None))
+        .create_browser_session(adoption(&blocked, &blocker))
         .await
         .unwrap();
-    sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1, created_at = '2020-01-01' WHERE token_id = (SELECT token_id FROM auth_browser_sessions WHERE handle_hash = ?)")
-        .bind(digest(&blocked)).execute(pool.get()).await.unwrap();
+    let encrypted: String = sqlx::query_scalar(
+        "SELECT encrypted_value FROM auth_browser_sessions WHERE handle_hash = ?",
+    )
+    .bind(digest(&blocked))
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(
+        &FernetTokenEncryptor::new(ENCRYPTION_KEY)
+            .unwrap()
+            .decrypt(&encrypted)
+            .unwrap(),
+    )
+    .unwrap();
+    let rollback_tokens = astra_services::AuthTokenRecord {
+        user_id: blocker.user_id.clone(),
+        access_token: payload["access_token"].as_str().unwrap().to_owned(),
+        refresh_token: payload["refresh_token"].as_str().unwrap().to_owned(),
+        token_type: "bearer".into(),
+        expires_in: 300,
+    };
+    let duplicate = handle(&rollback_tokens);
     assert!(
-        first
-            .create_browser_session(adoption(&blocked, &rollback_tokens, None))
-            .await
-            .is_err()
+        matches!(
+            first
+                .create_browser_session(adoption(&duplicate, &rollback_tokens))
+                .await,
+            Err((StatusCode::SERVICE_UNAVAILABLE, _))
+        ),
+        "the duplicate owner must reach the database constraint"
+    );
+    assert_eq!(
+        first.refresh(refresh(&blocked)).await.unwrap().user_id,
+        blocker.user_id
     );
     first
         .refresh(refresh(&rollback_tokens.refresh_token))
@@ -376,9 +404,9 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         .unwrap();
 
     let key_tokens = login(&first, &name).await;
-    let keyed = handle();
+    let keyed = handle(&key_tokens);
     first
-        .create_browser_session(adoption(&keyed, &key_tokens, None))
+        .create_browser_session(adoption(&keyed, &key_tokens))
         .await
         .unwrap();
     let wrong_key = DatabaseAuthService::new(settings.clone(), jwt)
@@ -410,9 +438,9 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         "logout while inactive must remain revoked after reactivation"
     );
     let expiry_tokens = login(&first, &name).await;
-    let keyed = handle();
+    let keyed = handle(&expiry_tokens);
     first
-        .create_browser_session(adoption(&keyed, &expiry_tokens, None))
+        .create_browser_session(adoption(&keyed, &expiry_tokens))
         .await
         .unwrap();
     sqlx::query("UPDATE auth_refresh_tokens SET expires_at = '2020-01-01', created_at = '2020-01-01' WHERE token_id = (SELECT token_id FROM auth_browser_sessions WHERE handle_hash = ?)")
@@ -436,7 +464,17 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .find(|r| r.table == "auth_browser_sessions")
             .unwrap()
             .rows_deleted
-            >= 2
+            >= 1
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_browser_sessions WHERE handle_hash = ?")
+            .bind(digest(&keyed))
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "cleanup must remove the expired session's owner"
     );
     for user in [&tokens.user_id, &tokens_b.user_id] {
         sqlx::query("DELETE FROM auth_refresh_tokens WHERE user_id = ?")
@@ -466,6 +504,8 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
     let hold_all = Arc::new(AtomicBool::new(false));
     let contenders = Arc::new(tokio::sync::Barrier::new(9));
     let hold_next = Arc::new(AtomicBool::new(false));
+    let reject_held = Arc::new(AtomicBool::new(false));
+    let reject_next = Arc::new(AtomicBool::new(false));
     let unavailable = Arc::new(AtomicBool::new(false));
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -473,15 +513,17 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
     let app = Router::new().route("/auth/whoami", get({
         let hold_all = hold_all.clone(); let contenders = contenders.clone();
         let hold = hold_next.clone(); let entered = entered.clone(); let release = release.clone(); let unavailable = unavailable.clone();
+        let reject_held = reject_held.clone(); let reject_next = reject_next.clone();
         move |headers: HeaderMap| {
             let synchronize = hold_all.load(Ordering::SeqCst); let contenders = contenders.clone();
             let hold = hold.swap(false, Ordering::SeqCst); let entered = entered.clone(); let release = release.clone();
+            let rejected = reject_next.swap(false, Ordering::SeqCst); let reject_held = reject_held.clone();
             let subject = subject.clone(); let unavailable = unavailable.load(Ordering::SeqCst);
             async move {
                 let key = headers["authorization"].to_str().unwrap().trim_start_matches("Bearer ").to_owned();
                 if hold { entered.notify_one(); release.notified().await; }
                 if synchronize { contenders.wait().await; }
-                (if unavailable { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }, Json(serde_json::json!({
+                (if unavailable { StatusCode::SERVICE_UNAVAILABLE } else if rejected || (hold && reject_held.swap(false, Ordering::SeqCst)) { StatusCode::UNAUTHORIZED } else { StatusCode::OK }, Json(serde_json::json!({
                     "user_id":subject, "key_id":key, "is_active":true, "is_master":false,
                     "scope":{"type":"personal","id":subject}, "api_version":"1",
                     "capabilities":["api_key_scopes","memory_filters_v1"], "granted_scopes":["identity:read"]
@@ -509,8 +551,8 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
         .with_memoria_base_url(url),
     );
     let tokens = auth.login_memoria("first-key").await.unwrap().tokens;
-    let browser = handle();
-    auth.create_browser_session(adoption(&browser, &tokens, None))
+    let browser = handle(&tokens);
+    auth.create_browser_session(adoption(&browser, &tokens))
         .await
         .unwrap();
     // Model an internal session issued before its account was provider-bound.
@@ -574,16 +616,49 @@ async fn provider_verification_holds_no_account_lock_and_cannot_publish_a_stale_
     .unwrap()
     .unwrap();
     release.notify_one();
-    assert_eq!(
-        stale.await.unwrap().unwrap_err().0,
-        StatusCode::UNAUTHORIZED
-    );
+    stale
+        .await
+        .unwrap()
+        .expect("binding replacement is reverified");
     assert!(
         auth.refresh(refresh(&browser)).await.is_ok(),
         "fresh verification of the replacement binding recovers"
     );
 
+    // The direct single-use refresh path must reverify the new binding too,
+    // without accepting a replay of the consumed refresh token.
+    let direct = auth.login_memoria("replacement-key").await.unwrap().tokens;
+    reject_held.store(true, Ordering::SeqCst);
+    hold_next.store(true, Ordering::SeqCst);
+    let pending_direct = tokio::spawn({
+        let auth = auth.clone();
+        let token = direct.refresh_token.clone();
+        async move { auth.refresh(refresh(&token)).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    auth.login_memoria("third-key").await.unwrap();
+    release.notify_one();
+    pending_direct
+        .await
+        .unwrap()
+        .expect("direct refresh reverified");
+    assert_eq!(
+        auth.refresh(refresh(&direct.refresh_token))
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+
     expire_access(&pool, &browser).await;
+    reject_next.store(true, Ordering::SeqCst);
+    assert_eq!(
+        auth.refresh(refresh(&browser)).await.unwrap_err().0,
+        StatusCode::UNAUTHORIZED,
+        "an unchanged binding rejected by the provider must not be retried"
+    );
     unavailable.store(true, Ordering::SeqCst);
     let before: String = sqlx::query_scalar(
         "SELECT encrypted_value FROM auth_browser_sessions WHERE handle_hash = ?",
@@ -685,9 +760,9 @@ async fn fresh_login_and_logout_do_not_depend_on_expired_credentials_or_an_old_e
     for scenario in ["expired", "key_replaced", "account_deleted"] {
         let name = register(&original).await;
         let tokens = login(&original, &name).await;
-        let old = handle();
+        let old = handle(&tokens);
         original
-            .create_browser_session(adoption(&old, &tokens, None))
+            .create_browser_session(adoption(&old, &tokens))
             .await
             .unwrap();
         if scenario == "expired" {
@@ -714,15 +789,17 @@ async fn fresh_login_and_logout_do_not_depend_on_expired_credentials_or_an_old_e
         assert!(current.refresh(refresh(&old)).await.is_err());
         let next_name = register(&current).await;
         let next = login(&current, &next_name).await;
-        let new_handle = handle();
+        let new_handle = handle(&next);
         current
-            .create_browser_session(adoption(&new_handle, &next, Some(&old)))
+            .create_browser_session(adoption(&new_handle, &next))
             .await
             .unwrap();
         assert_eq!(
             current.refresh(refresh(&new_handle)).await.unwrap().user_id,
             next.user_id
         );
+        // Logout is independent of decryption and account activity.
+        current.logout(refresh(&old)).await.unwrap();
         assert_eq!(
             original.refresh(refresh(&old)).await.unwrap_err().0,
             StatusCode::UNAUTHORIZED

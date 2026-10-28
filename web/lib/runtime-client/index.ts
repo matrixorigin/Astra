@@ -6,7 +6,6 @@ export {
 export {
   WebRuntimeClient,
   getRuntimeClient,
-  getRuntimeClientFromCookies,
   requireRuntimeClient,
   type RuntimeAuthMode,
   type RuntimeRequestInit,

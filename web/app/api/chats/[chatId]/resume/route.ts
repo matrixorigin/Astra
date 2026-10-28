@@ -13,7 +13,7 @@ export async function POST(
   }
 
   const { chatId } = await context.params;
-  const chat = await getChatHydrated(auth.user.user_id, chatId);
+  const chat = await getChatHydrated(auth.user.user_id, chatId, auth.client);
   if (!chat) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
@@ -37,7 +37,7 @@ export async function POST(
   }
 
   try {
-    const result = await resumeActiveRun(auth.user.user_id, chatId);
+    const result = await resumeActiveRun(auth.user.user_id, chatId, auth.client);
     if (!result) {
       return NextResponse.json({ error: "chat not found" }, { status: 404 });
     }

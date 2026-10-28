@@ -95,7 +95,7 @@ export async function POST(request: NextRequest) {
     apiUrl = runtimeRoot(
       body.apiUrl?.trim() || process.env.ASTRA_API_URL || DEFAULT_API_URL,
     );
-    // Validate the complete replacement before revoking the captured owner.
+    // Validate the complete replacement before changing the browser selection.
     value = selectionCookie(
       body.demoMode
         ? { mode: "demo", apiUrl }
@@ -115,8 +115,6 @@ export async function POST(request: NextRequest) {
         access_token: accessToken,
         refresh_token: refreshToken,
       });
-    } else {
-      await revokeSelection(await replaceableSession());
     }
     const response = NextResponse.json({ ok: true });
     response.cookies.set(SESSION_COOKIE, value, sessionCookieOptions());

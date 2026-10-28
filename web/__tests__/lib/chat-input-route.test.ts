@@ -74,6 +74,7 @@ describe("chat deferred input route workspace authority", () => {
     vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
+      client: { admitted: true },
       response: null,
     } as never);
     mockQueueDeferredRunInput.mockResolvedValue({
@@ -213,6 +214,7 @@ describe("chat deferred input route workspace authority", () => {
       "user-a",
       "chat-1",
       expect.objectContaining({ content: "continue" }),
+      { admitted: true },
     );
   });
 });

@@ -8,6 +8,14 @@ function request(path: string) {
 }
 
 describe("web proxy auth boundary", () => {
+  it("preserves the requested path without RSC transport data or caller headers", () => {
+    const req = new NextRequest("http://web.test/now?source=review&_rsc=internal", {
+      headers: { "x-astra-request-path": "//attacker.example" },
+    });
+    req.cookies.set("astra_session", `cfg1.${Buffer.from(JSON.stringify({ mode: "live", apiUrl: "http://runtime/", auth: "static", accessToken: "test" })).toString("base64url")}`);
+    const response = proxy(req);
+    expect(response.headers.get("x-middleware-request-x-astra-request-path")).toBe("/now?source=review");
+  });
   it("keeps edge status protected without web auth cookies", async () => {
     const response = proxy(request("/api/edges/status"));
 

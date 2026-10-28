@@ -96,15 +96,57 @@ async fn pair_count(pool: &sqlx::MySqlPool, id: &str) -> (i64, i64) {
     (parents, owners)
 }
 
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn cleanup_catalog_is_dropped_after_a_test_panics() {
+    use futures_util::FutureExt;
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let name = isolated.settings.database.clone();
+    let result = std::panic::AssertUnwindSafe(isolated.run(async { panic!("fixture failure") }))
+        .catch_unwind()
+        .await;
+    assert!(result.is_err());
+    let mut admin_settings = common::require_db_it_env();
+    admin_settings.database =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    let admin = astra_core::SharedPool::new(&admin_settings).await.unwrap();
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?",
+    )
+    .bind(name)
+    .fetch_one(admin.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        exists, 0,
+        "the panicking test must not leave its catalog behind"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_sessions() {
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let pool = isolated.pool.clone();
+    let settings = isolated.settings.clone();
+    isolated
+        .run(
+            canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_sessions_body(
+                pool, settings,
+            ),
+        )
+        .await;
+}
+
+async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_sessions_body(
+    pool: astra_core::SharedPool,
+    settings: astra_core::MatrixOneSettings,
+) {
     let gate = Arc::new(SelectedBatch::default());
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(PauseSelection(gate.clone())),
     )
     .unwrap();
-    let (pool, settings) = common::setup_pool_and_settings().await;
     let other = astra_core::SharedPool::new(&settings).await.unwrap();
     clean(pool.get()).await.unwrap();
     let direct = seed(pool.get(), false).await;
@@ -196,4 +238,5 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     assert_eq!(clean(pool.get()).await.unwrap(), 2000);
     assert_eq!(clean(pool.get()).await.unwrap(), 2);
     assert_eq!(pair_count(pool.get(), &renewed).await, (1, 1));
+    other.get().close().await;
 }

@@ -8,16 +8,18 @@ import {
 import { getRuntimeConfig } from "@/lib/runtime-config";
 import { SESSION_COOKIE, selectionCookie } from "@/lib/auth/session-cookie";
 import { GET as sidebar } from "@/app/api/sidebar/route";
+import { GET as chats } from "@/app/api/chats/route";
 import { POST as workTurn } from "@/app/api/works/[workId]/branches/[branchId]/turns/route";
 import { POST as refreshRoute } from "@/app/api/runtime-auth/refresh/route";
 import { POST as logoutRoute } from "@/app/api/runtime-auth/logout/route";
+import { POST as loginRoute } from "@/app/api/runtime-auth/login/route";
 import { GET as meRoute } from "@/app/api/runtime-auth/me/route";
 import {
   GET as configRoute,
   POST as configure,
   DELETE as clearConfiguration,
 } from "@/app/api/runtime-config/route";
-import { requireRuntimeAuth, requireRuntimeUser } from "@/lib/api/auth-guard";
+import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { NextRequest } from "next/server";
 import {
   GET as projects,
@@ -29,7 +31,10 @@ import { POST as stopRun } from "@/app/api/chats/[chatId]/stop/route";
 import { GET as capabilities } from "@/app/api/runtime/capabilities/route";
 
 const root = "https://runtime.example/";
-const handle = `bs1.${Buffer.from(root).toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+const handle = `bs2.${Buffer.from(root).toString("base64url")}.${Buffer.from("session-id").toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+const fixtureRefresh = `header.${Buffer.from(JSON.stringify({ sid: "session-id" })).toString("base64url")}.signature`;
+const fixtureAccess = fixtureRefresh;
+const fixtureOldAccess = `header.${Buffer.from(JSON.stringify({ sid: "session-id", jti: "old" })).toString("base64url")}.signature`;
 let jar: Map<string, string>;
 let set: ReturnType<typeof vi.fn>;
 beforeEach(() => {
@@ -46,16 +51,79 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+function loginRequest() {
+  return new NextRequest("http://web.test/api/runtime-auth/login", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ apiUrl: root, username: "Alice", password: "test-password" }),
+  });
+}
+
+it.each(["not-a-jwt", `h.${Buffer.from('{}').toString('base64url')}.s`, `h.${Buffer.from(JSON.stringify({ sid: 'x'.repeat(65) })).toString('base64url')}.s`])(
+  "reports a malformed runtime refresh token as a gateway error",
+  async (token) => {
+    const fetch = vi.fn(async () => Response.json({ access_token: fixtureAccess, refresh_token: token }));
+    vi.stubGlobal("fetch", fetch);
+    const response = await loginRoute(loginRequest());
+    expect(response.status).toBe(502);
+    expect(response.headers.has("set-cookie")).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
+  },
+);
+
+it.each(["garbage", `h.${Buffer.from(JSON.stringify({ sid: "other-session" })).toString("base64url")}.s`])(
+  "rejects an invalid or mismatched access token from login",
+  async (token) => {
+    const fetch = vi.fn(async () => Response.json({ access_token: token, refresh_token: fixtureRefresh }));
+    vi.stubGlobal("fetch", fetch);
+    const response = await loginRoute(loginRequest());
+    expect(response.status).toBe(502);
+    expect(response.headers.has("set-cookie")).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
+  },
+);
+
+it.each([401, 503])("preserves a runtime login failure (%s)", async (status) => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: "failed" }, { status })));
+  expect((await loginRoute(loginRequest())).status).toBe(status);
+});
+
+it.each(["none", "invalid", "valid"])("accepts a malformed adoption response only after independent recovery (%s)", async (recover) => {
+  let selected = "";
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/auth/login") return Response.json({ access_token: fixtureAccess, refresh_token: fixtureRefresh });
+    if (path === "/auth/browser-sessions") {
+      selected = JSON.parse(String(init?.body)).handle;
+      return Response.json({ error: "not created" });
+    }
+    if (path === "/auth/refresh" && recover !== "none") return Response.json({ access_token: recover === "valid" ? fixtureAccess : "garbage", refresh_token: selected });
+    return Response.json({ error: "not found" }, { status: 401 });
+  }));
+  const response = await loginRoute(loginRequest());
+  expect(response.status).toBe(recover === "valid" ? 200 : 502);
+  expect(response.headers.has("set-cookie")).toBe(recover === "valid");
+});
+
+it.each(["garbage", `h.${Buffer.from(JSON.stringify({ sid: "other-session" })).toString("base64url")}.s`])(
+  "rejects a malformed or wrong-session access token returned during resolution",
+  async (token) => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ access_token: token, refresh_token: handle })));
+    expect((await refreshRoute()).status).toBe(502);
+    expect((await meRoute()).status).toBe(502);
+    expect(set).not.toHaveBeenCalled();
+  },
+);
+
 function runtimeFetch() {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(String(input)).pathname;
     if (path === "/auth/refresh") {
       expect(JSON.parse(String(init?.body)).refresh_token).toBe(handle);
-      return Response.json({ access_token: "current", refresh_token: handle });
+      return Response.json({ access_token: fixtureAccess, refresh_token: handle });
     }
     if (path === "/auth/logout")
       return Response.json({ message: "Logged out" });
-    return new Headers(init?.headers).get("authorization") === "Bearer current"
+    return new Headers(init?.headers).get("authorization") === `Bearer ${fixtureAccess}`
       ? Response.json({
           user_id: "alice",
           username: "Alice",
@@ -110,7 +178,6 @@ it("uses one owner for me, refresh, gates and config and exposes no credential",
   vi.stubGlobal("fetch", runtimeFetch());
   expect((await meRoute()).status).toBe(200);
   expect((await refreshRoute()).status).toBe(200);
-  expect(await requireRuntimeAuth()).toBeNull();
   expect((await requireRuntimeUser()).user?.user_id).toBe("alice");
   const response = await configRoute();
   const text = await response.text();
@@ -157,7 +224,6 @@ it.each([401, 503])(
     );
     expect((await meRoute()).status).toBe(status);
     expect((await refreshRoute()).status).toBe(status);
-    expect((await requireRuntimeAuth())?.status).toBe(status);
     expect((await requireRuntimeUser()).response?.status).toBe(status);
     expect(set).not.toHaveBeenCalled();
   },
@@ -174,7 +240,7 @@ it("reports failed logout and keeps the proof when revocation outcome is unknown
   expect(set).not.toHaveBeenCalled();
 });
 
-it("validates replacement before revoking and binds static credentials to their selected runtime", async () => {
+it("validates a selection and binds static credentials to their selected runtime", async () => {
   const fetch = runtimeFetch();
   vi.stubGlobal("fetch", fetch);
   const send = (body: unknown) =>
@@ -194,9 +260,7 @@ it("validates replacement before revoking and binds static credentials to their 
     accessToken: "static",
   });
   expect(response.status).toBe(200);
-  expect(new URL(String(fetch.mock.calls[0][0])).origin).toBe(
-    new URL(root).origin,
-  );
+  expect(fetch).not.toHaveBeenCalled();
   jar.set(SESSION_COOKIE, response.cookies.get(SESSION_COOKIE)!.value);
   const config = await getRuntimeConfig();
   expect(config.accessToken).toBe("static");
@@ -232,7 +296,7 @@ it.each(["cfg1.invalid", ""])(
     jar.set(SESSION_COOKIE, value);
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
-    expect((await requireRuntimeAuth())?.status).toBe(401);
+    expect((await requireRuntimeUser()).response?.status).toBe(401);
     expect(fetch).not.toHaveBeenCalled();
   },
 );
@@ -251,11 +315,15 @@ it("resolves sidebar with the browser owner; demo configuration grants no worksp
   const live = await sidebar();
   expect(live.status).toBe(200);
   expect((await live.json()).user.id).toBe("alice");
+  expect(fetch.mock.calls.filter(([url]) => new URL(String(url)).pathname === "/auth/refresh")).toHaveLength(1);
   expect(
     fetch.mock.calls.some(
       ([url]) => new URL(String(url)).pathname === "/sessions",
     ),
   ).toBe(true);
+  fetch.mockClear();
+  expect((await chats(new NextRequest("http://localhost/api/chats"))).status).toBe(200);
+  expect(fetch.mock.calls.filter(([url]) => new URL(String(url)).pathname === "/auth/refresh")).toHaveLength(1);
   expect(set).not.toHaveBeenCalled();
   fetch.mockClear();
   jar.set(SESSION_COOKIE, selectionCookie({ mode: "demo" }));
@@ -265,6 +333,27 @@ it("resolves sidebar with the browser owner; demo configuration grants no worksp
   expect((await logoutRoute()).status).toBe(200);
   expect((await getRuntimeConfig()).demoMode).toBe(false);
   expect(fetch).not.toHaveBeenCalled();
+});
+
+it("does not return sidebar data when the admitted session is revoked mid-request", async () => {
+  let resolutions = 0;
+  const calls: string[] = [];
+  vi.stubEnv("ASTRA_ACCESS_TOKEN", "different-account");
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    calls.push(path);
+    if (path === "/auth/refresh") {
+      resolutions++;
+      return resolutions === 1
+        ? Response.json({ access_token: fixtureAccess, refresh_token: handle })
+        : Response.json({ error: "revoked" }, { status: 401 });
+    }
+    if (path === "/auth/me") return Response.json({ user_id: "alice", username: "Alice", email: "alice@example.test", display_name: null });
+    expect(new Headers(init?.headers).get("authorization")).not.toBe("Bearer different-account");
+    return Response.json({ error: "revoked" }, { status: 401 });
+  }));
+  expect((await sidebar()).status).toBeGreaterThanOrEqual(400);
+  expect(calls).not.toContain("/runs");
 });
 
 it("retries Work stream admission after a late 401 without changing its request or cookie", async () => {
@@ -278,7 +367,7 @@ it("retries Work stream admission after a late 401 without changing its request 
         resolutions += 1;
         expect(JSON.parse(String(init?.body)).refresh_token).toBe(handle);
         return Response.json({
-          access_token: resolutions === 1 ? "old" : "current",
+          access_token: resolutions === 1 ? fixtureOldAccess : fixtureAccess,
           refresh_token: handle,
         });
       }
@@ -312,8 +401,8 @@ it("retries Work stream admission after a late 401 without changing its request 
   expect(response.status).toBe(200);
   expect(await response.text()).toContain("work_turn_started");
   expect(admissions).toEqual([
-    { body: JSON.stringify(input), bearer: "Bearer old" },
-    { body: JSON.stringify(input), bearer: "Bearer current" },
+    { body: JSON.stringify(input), bearer: `Bearer ${fixtureOldAccess}` },
+    { body: JSON.stringify(input), bearer: `Bearer ${fixtureAccess}` },
   ]);
   expect(resolutions).toBe(2);
   expect(response.headers.has("set-cookie")).toBe(false);
@@ -330,7 +419,6 @@ it.each([undefined, selectionCookie({ mode: "default" })])(
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     expect((await meRoute()).status).toBe(401);
-    expect((await requireRuntimeAuth())?.status).toBe(401);
     expect((await requireRuntimeUser()).response?.status).toBe(401);
     const config = await getRuntimeConfig();
     expect(config.hasAccessToken).toBe(false);
@@ -353,8 +441,8 @@ it("reports an already-created account when browser enrollment fails after regis
           username: "Alice",
           email: "alice@example.test",
           display_name: null,
-          access_token: "access",
-          refresh_token: "refresh",
+          access_token: fixtureAccess,
+          refresh_token: fixtureRefresh,
         });
       return Response.json({ detail: "unavailable" }, { status: 503 });
     }),

@@ -2,8 +2,8 @@
 //! The refresh row remains the sole session/revocation authority.
 use super::{refresh::session_denied, *};
 
-pub(super) const HANDLE_PREFIX: &str = "bs1.";
-const MAX_HANDLE_BYTES: usize = 1500;
+pub(super) const HANDLE_PREFIX: &str = "bs2.";
+const MAX_HANDLE_BYTES: usize = 1600;
 const ABSOLUTE_TTL_SECONDS: i64 = 365 * 24 * 60 * 60;
 
 #[derive(Deserialize)]
@@ -12,7 +12,6 @@ pub struct BrowserSessionRequest {
     pub handle: String,
     pub refresh_token: String,
     pub access_token: String,
-    pub previous_handle: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -22,7 +21,7 @@ pub struct BrowserSessionCreated {
 
 struct Handle {
     hash: String,
-    root: String,
+    session_id: String,
 }
 
 impl Handle {
@@ -35,6 +34,7 @@ impl Handle {
             .ok_or_else(session_denied)?
             .split('.');
         let encoded_root = parts.next().ok_or_else(session_denied)?;
+        let encoded_session = parts.next().ok_or_else(session_denied)?;
         let secret = parts.next().ok_or_else(session_denied)?;
         if parts.next().is_some()
             || URL_SAFE_NO_PAD
@@ -45,6 +45,16 @@ impl Handle {
         {
             return Err(session_denied());
         }
+        let session = URL_SAFE_NO_PAD
+            .decode(encoded_session)
+            .map_err(|_| session_denied())?;
+        if session.is_empty()
+            || session.len() > 64
+            || URL_SAFE_NO_PAD.encode(&session) != encoded_session
+        {
+            return Err(session_denied());
+        }
+        let session_id = String::from_utf8(session).map_err(|_| session_denied())?;
         let root = String::from_utf8(
             URL_SAFE_NO_PAD
                 .decode(encoded_root)
@@ -66,7 +76,7 @@ impl Handle {
         }
         Ok(Self {
             hash: sha256_hex(value),
-            root,
+            session_id,
         })
     }
 }
@@ -197,6 +207,7 @@ impl DatabaseAuthService {
             if credentials.version != 1
                 || credentials.handle_hash != handle.hash
                 || credentials.token_id != token_id
+                || credentials.session_id != handle.session_id
                 || credentials.session_id != session
                 || refresh.token_type.as_deref() != Some("refresh")
                 || refresh.sub.as_deref() != Some(&credentials.user_id)
@@ -312,13 +323,20 @@ impl DatabaseAuthService {
                     .max(0) as u32,
             });
         }
-        let result = self.create_browser_owner(&pool, &handle, &request).await;
-        if result.is_err() && self.browser_owner(&pool, &handle).await?.is_some() {
-            return Ok(BrowserSessionCreated {
-                expires_in: ABSOLUTE_TTL_SECONDS as u32,
-            });
+        for _ in 0..3 {
+            let result = self.create_browser_owner(&pool, &handle, &request).await;
+            if result.is_err() && self.browser_owner(&pool, &handle).await?.is_some() {
+                return Ok(BrowserSessionCreated {
+                    expires_in: ABSOLUTE_TTL_SECONDS as u32,
+                });
+            }
+            match result {
+                Ok(created) => return Ok(created),
+                Err(refresh::CommitRefreshError::BindingChanged) => continue,
+                Err(refresh::CommitRefreshError::Auth(error)) => return Err(error),
+            }
         }
-        result
+        Err(unavailable())
     }
 
     async fn create_browser_owner(
@@ -326,11 +344,14 @@ impl DatabaseAuthService {
         pool: &sqlx::MySqlPool,
         handle: &Handle,
         request: &BrowserSessionRequest,
-    ) -> Result<BrowserSessionCreated, AuthHttpError> {
+    ) -> Result<BrowserSessionCreated, refresh::CommitRefreshError> {
         if request.access_token.len() > 8192 {
-            return Err(session_denied());
+            return Err(session_denied().into());
         }
         let mut rotation = self.prepare_refresh(pool, &request.refresh_token).await?;
+        if rotation.session_id != handle.session_id {
+            return Err(session_denied().into());
+        }
         let access = jwt::decode_stored_access_claims(&request.access_token, &self.jwt)?;
         let refresh = decode_jwt_claims(&request.refresh_token, &self.jwt)?;
         if access.token_type.as_deref() != Some("access")
@@ -338,69 +359,21 @@ impl DatabaseAuthService {
             || access.sid != refresh.sid
             || access.origin != refresh.origin
         {
-            return Err(session_denied());
-        }
-        let previous_handle = request
-            .previous_handle
-            .as_deref()
-            .map(Handle::parse)
-            .transpose()?;
-        if previous_handle
-            .as_ref()
-            .is_some_and(|old| old.root != handle.root || old.hash == handle.hash)
-        {
-            return Err(session_denied());
-        }
-        let previous = if let Some(old) = &previous_handle {
-            self.browser_revocation(pool, old).await?
-        } else {
-            None
-        };
-        if previous
-            .as_ref()
-            .is_some_and(|old| old.token_id == rotation.token_id)
-        {
-            return Err(session_denied());
+            return Err(session_denied().into());
         }
         let ciphertext = self.encrypted_successor(
             handle,
             &mut rotation,
             Utc::now().timestamp() + ABSOLUTE_TTL_SECONDS,
         )?;
-        let _invalidation = previous.as_ref().map(|old| {
-            self.authentication_cache
-                .session_mutation(&old.user_id, &old.session_id)
-        });
         let mut tx = pool.begin().await.map_err(|_| unavailable())?;
-        let mut users = vec![rotation.user_id.as_str()];
-        if let Some(old) = &previous {
-            users.push(&old.user_id);
-        }
-        users.sort_unstable();
-        users.dedup();
-        for user in users {
-            let active = self.lock_session_account(&mut tx, user).await?;
-            if user == rotation.user_id && active != Some(true) {
-                return Err(session_denied());
+        self.lock_refresh_account(&mut tx, &rotation.user_id)
+            .await?;
+        if let Err(error) = self.commit_refresh(&mut tx, &rotation).await {
+            if matches!(error, refresh::CommitRefreshError::BindingChanged) {
+                tx.rollback().await.map_err(|_| unavailable())?;
             }
-        }
-        // Lock every canonical row before touching either dependent. Account
-        // replacement and retention must not invert canonical/owner ordering.
-        if let Some(old) = &previous {
-            let mut ids = [&rotation.token_id, &old.token_id];
-            ids.sort_unstable();
-            query("SELECT token_id FROM auth_refresh_tokens WHERE token_id IN (?, ?) FOR UPDATE")
-                .bind(ids[0])
-                .bind(ids[1])
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|_| unavailable())?;
-        }
-        self.commit_refresh(&mut tx, &rotation).await?;
-        if let (Some(old_handle), Some(old)) = (&previous_handle, &previous) {
-            // The immutable token ID identifies the old session even if another
-            // replica refreshed its ciphertext while login was in flight.
-            self.revoke_browser_owner(&mut tx, old_handle, old).await?;
+            return Err(error);
         }
         query("INSERT INTO auth_browser_sessions (handle_hash, token_id, encrypted_value) VALUES (?, ?, ?)")
             .bind(&handle.hash).bind(&rotation.token_id).bind(ciphertext)
@@ -433,10 +406,12 @@ impl DatabaseAuthService {
                 .browser_owner(&pool, &handle)
                 .await?
                 .ok_or_else(session_denied)?;
-            if let Err(error) = result
-                && current.ciphertext == owner.ciphertext
-            {
-                return Err(error);
+            if current.ciphertext == owner.ciphertext {
+                match result {
+                    Err(refresh::CommitRefreshError::BindingChanged) => {}
+                    Err(refresh::CommitRefreshError::Auth(error)) => return Err(error),
+                    Ok(()) => {}
+                }
             }
             owner = current;
         }
@@ -452,7 +427,7 @@ impl DatabaseAuthService {
         pool: &sqlx::MySqlPool,
         handle: &Handle,
         owner: &Owner,
-    ) -> Result<(), AuthHttpError> {
+    ) -> Result<(), refresh::CommitRefreshError> {
         let mut rotation = self
             .prepare_refresh(pool, &owner.credentials.refresh_token)
             .await?;
@@ -462,15 +437,20 @@ impl DatabaseAuthService {
         self.lock_refresh_account(&mut tx, &rotation.user_id)
             .await?;
         if owner.credentials.absolute_expiry <= Utc::now().timestamp() {
-            return Err(session_denied());
+            return Err(session_denied().into());
         }
-        self.commit_refresh(&mut tx, &rotation).await?;
+        if let Err(error) = self.commit_refresh(&mut tx, &rotation).await {
+            if matches!(error, refresh::CommitRefreshError::BindingChanged) {
+                tx.rollback().await.map_err(|_| unavailable())?;
+            }
+            return Err(error);
+        }
         // Exact canonical hash CAS fences all legitimate ciphertext changes;
         // immutable handle/token identity suffices, with no TEXT collation CAS.
         let updated = query("UPDATE auth_browser_sessions SET encrypted_value = ? WHERE handle_hash = ? AND token_id = ?")
             .bind(ciphertext).bind(&handle.hash).bind(&rotation.token_id).execute(&mut *tx).await.map_err(|_| unavailable())?;
         if updated.rows_affected() != 1 {
-            return Err(session_denied());
+            return Err(session_denied().into());
         }
         tx.commit().await.map_err(|_| unavailable())?;
         Ok(())
@@ -517,11 +497,12 @@ mod tests {
     fn handles_require_canonical_runtime_and_256_bit_proof() {
         for root in ["https://astra.example/", "http://localhost:17001/"] {
             let value = format!(
-                "bs1.{}.{}",
+                "bs2.{}.{}.{}",
                 URL_SAFE_NO_PAD.encode(root),
+                URL_SAFE_NO_PAD.encode("session-id"),
                 URL_SAFE_NO_PAD.encode([7; 32])
             );
-            assert_eq!(Handle::parse(&value).unwrap().root, root);
+            assert_eq!(Handle::parse(&value).unwrap().hash, sha256_hex(&value));
         }
         for root in [
             "https://astra.example",
@@ -531,13 +512,14 @@ mod tests {
             "https://astra.example/?x=1",
         ] {
             let value = format!(
-                "bs1.{}.{}",
+                "bs2.{}.{}.{}",
                 URL_SAFE_NO_PAD.encode(root),
+                URL_SAFE_NO_PAD.encode("session-id"),
                 URL_SAFE_NO_PAD.encode([7; 32])
             );
             assert!(Handle::parse(&value).is_err());
         }
-        for value in ["", "bs1.x.y", "bs1.a.b.c", "bs1.!!!!.!"] {
+        for value in ["", "bs1.x.y", "bs2.a.b.c.d", "bs2.!!!!.!.!"] {
             assert!(Handle::parse(value).is_err());
         }
         assert!(Handle::parse(&"x".repeat(MAX_HANDLE_BYTES + 1)).is_err());

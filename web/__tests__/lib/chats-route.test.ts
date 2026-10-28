@@ -31,6 +31,11 @@ import { requireRuntimeClient } from "@/lib/runtime-client";
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockCreateChatWithMessage = vi.mocked(createChatWithMessage);
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
+function setAdmittedRuntime(value: unknown) {
+  mockRequireRuntimeClient.mockResolvedValue(value as never);
+  const previous = mockRequireRuntimeUser.getMockImplementation();
+  mockRequireRuntimeUser.mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
+}
 
 function postChats(body: Record<string, unknown>) {
   return new Request("http://web.test/api/chats", {
@@ -56,7 +61,7 @@ describe("chats route create workspace selection", () => {
       chatId: "chat-1",
       messageId: "message-1",
     });
-    mockRequireRuntimeClient.mockResolvedValue(
+    setAdmittedRuntime(
       runtimeWithEdges([
         {
           edge_agent_id: "edge-1",

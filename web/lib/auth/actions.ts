@@ -1,12 +1,11 @@
 "use server";
 
 import { redirect } from "next/navigation";
-import { getRuntimeConfig, DEFAULT_API_URL } from "@/lib/runtime-config";
-import { WebRuntimeClient, RuntimeClientError } from "@/lib/runtime-client";
+import { DEFAULT_API_URL } from "@/lib/runtime-config";
+import { currentUserContext } from "@/lib/auth/current-user";
 import {
   runtimeLogin,
   runtimeRegister,
-  isAuthUser,
   type AuthUser,
 } from "@/lib/auth/runtime-auth-client";
 import {
@@ -102,23 +101,5 @@ export async function logoutAction(): Promise<void> {
 }
 
 export async function getCurrentUser(): Promise<AuthUser | null> {
-  try {
-    const config = await getRuntimeConfig();
-    if (config.mode !== "live" || !config.accessToken) return null;
-    const client = new WebRuntimeClient(config);
-    const user = await client.get<unknown>("/auth/me", { auth: "required" });
-    if (!isAuthUser(user)) {
-      throw new RuntimeClientError({
-        operation: "read current user",
-        path: "/auth/me",
-        status: 502,
-        detail: "Invalid account response from runtime.",
-      });
-    }
-    return user;
-  } catch (error) {
-    if (error instanceof RuntimeClientError && error.status === 401)
-      return null;
-    throw error;
-  }
+  return (await currentUserContext())?.user ?? null;
 }

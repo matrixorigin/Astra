@@ -85,12 +85,27 @@ fn headers(token: &str) -> HeaderMap {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_other_sessions() {
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let pool = isolated.pool.clone();
+    let settings = isolated.settings.clone();
+    isolated
+        .run(
+            logout_revokes_the_session_across_refresh_rotation_without_revoking_other_sessions_body(
+                pool, settings,
+            ),
+        )
+        .await;
+}
+
+async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_other_sessions_body(
+    pool: astra_core::SharedPool,
+    settings: astra_core::MatrixOneSettings,
+) {
     let gate = Arc::new(AccountLockGate::default());
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(PauseAccountLock(gate.clone())),
     )
     .expect("this test binary owns its tracing subscriber");
-    let (pool, settings) = common::setup_pool_and_settings().await;
     let service = DatabaseAuthService::new(
         settings,
         JwtSettings {
@@ -365,5 +380,4 @@ async fn logout_revokes_the_session_across_refresh_rotation_without_revoking_oth
         .await
         .unwrap();
     }
-    pool.get().close().await;
 }

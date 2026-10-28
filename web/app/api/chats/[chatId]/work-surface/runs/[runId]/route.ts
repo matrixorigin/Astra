@@ -3,7 +3,6 @@ import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat } from "@/lib/api/web-store";
 import {
   RuntimeClientError,
-  requireRuntimeClient,
   runtimeErrorDetail,
 } from "@/lib/runtime-client";
 import {
@@ -61,10 +60,7 @@ export async function GET(
   }
 
   try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "load agent run projection",
-    });
+    const runtime = auth.client;
     const projection = await runtime.get<RuntimeRunProjectionResponse>(
       `/chat/runs/${encodeURIComponent(
         runId,

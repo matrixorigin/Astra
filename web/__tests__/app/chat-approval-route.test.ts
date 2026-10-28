@@ -23,6 +23,11 @@ import { requireRuntimeClient } from "@/lib/runtime-client";
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
+function setAdmittedRuntime(value: unknown) {
+  mockRequireRuntimeClient.mockResolvedValue(value as never);
+  const previous = mockRequireRuntimeUser.getMockImplementation();
+  mockRequireRuntimeUser.mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
+}
 
 function approvalRequest(overrides: Record<string, unknown> = {}) {
   return new Request("http://localhost/api/chats/chat-1/approval", {
@@ -68,7 +73,7 @@ describe("chat approval route", () => {
 
   it("forwards an owned active-run decision to the durable runtime interaction", async () => {
     const post = vi.fn().mockResolvedValue(undefined);
-    mockRequireRuntimeClient.mockResolvedValue({ post } as never);
+    setAdmittedRuntime({ post } as never);
 
     const response = await POST(approvalRequest(), {
       params: Promise.resolve({ chatId: "chat-1" }),

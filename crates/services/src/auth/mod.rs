@@ -1705,18 +1705,33 @@ impl AuthService for DatabaseAuthService {
             .get_pool()
             .await
             .map_err(|error| map_auth_sqlx(error, "auth.get_pool", None))?;
-        let rotation = self.prepare_refresh(&pool, &request.refresh_token).await?;
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|error| map_auth_sqlx(error, "refresh.begin", Some(&pool)))?;
-        self.lock_refresh_account(&mut tx, &rotation.user_id)
-            .await?;
-        self.commit_refresh(&mut tx, &rotation).await?;
-        tx.commit()
-            .await
-            .map_err(|error| map_auth_sqlx(error, "refresh.commit", Some(&pool)))?;
-        Ok(rotation.tokens)
+        for _ in 0..3 {
+            let rotation = self.prepare_refresh(&pool, &request.refresh_token).await?;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|error| map_auth_sqlx(error, "refresh.begin", Some(&pool)))?;
+            self.lock_refresh_account(&mut tx, &rotation.user_id)
+                .await?;
+            match self.commit_refresh(&mut tx, &rotation).await {
+                Ok(()) => {}
+                Err(refresh::CommitRefreshError::BindingChanged) => {
+                    tx.rollback()
+                        .await
+                        .map_err(|error| map_auth_sqlx(error, "refresh.rollback", Some(&pool)))?;
+                    continue;
+                }
+                Err(refresh::CommitRefreshError::Auth(error)) => return Err(error),
+            }
+            tx.commit()
+                .await
+                .map_err(|error| map_auth_sqlx(error, "refresh.commit", Some(&pool)))?;
+            return Ok(rotation.tokens);
+        }
+        Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session binding changed; retry",
+        ))
     }
 
     async fn logout(

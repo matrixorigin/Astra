@@ -5,6 +5,7 @@ import {
   type UserInfo,
 } from "@astra/sdk";
 import { WebRuntimeClient } from "@/lib/runtime-client";
+import { jwtSessionHint } from "@/lib/auth/session-cookie";
 
 export type AuthTokens = AuthResult;
 export type AuthUser = Omit<UserInfo, "display_name"> & {
@@ -30,12 +31,9 @@ function hasAuthTokens(value: unknown): value is AuthTokens {
     return false;
   }
 
-  return (
-    typeof value.access_token === "string" &&
-    value.access_token.length > 0 &&
-    typeof value.refresh_token === "string" &&
-    value.refresh_token.length > 0
-  );
+  if (typeof value.access_token !== "string" || typeof value.refresh_token !== "string") return false;
+  const session = jwtSessionHint(value.refresh_token);
+  return session !== undefined && jwtSessionHint(value.access_token) === session;
 }
 
 export function isAuthUser(value: unknown): value is AuthUser {

@@ -211,9 +211,3 @@ export async function requireRuntimeClient(
   }
   return new WebRuntimeClient(config);
 }
-
-export async function getRuntimeClientFromCookies(
-  options: RuntimeClientOptions = {},
-): Promise<WebRuntimeClient> {
-  return requireRuntimeClient(options);
-}

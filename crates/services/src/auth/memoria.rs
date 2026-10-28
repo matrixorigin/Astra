@@ -462,7 +462,7 @@ impl MemoriaRefreshBinding {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         user: &str,
-    ) -> Result<(), AuthHttpError> {
+    ) -> Result<bool, AuthHttpError> {
         let current: Option<(String, String)> = sqlx::query_as(
             "SELECT encrypted_value, CAST(metadata AS CHAR) FROM auth_tokens
              WHERE token_id = ? AND scope_user_id = ? AND type = 'memoria_connection'
@@ -473,12 +473,9 @@ impl MemoriaRefreshBinding {
         .fetch_optional(&mut **tx)
         .await
         .map_err(internal_error)?;
-        if current.as_ref().is_none_or(|(ciphertext, metadata)| {
-            ciphertext != &self.ciphertext || metadata != &self.metadata
-        }) {
-            return Err(reconnect());
-        }
-        Ok(())
+        Ok(current.as_ref().is_some_and(|(ciphertext, metadata)| {
+            ciphertext == &self.ciphertext && metadata == &self.metadata
+        }))
     }
 }
 
@@ -664,24 +661,51 @@ impl DatabaseAuthService {
         owner: &str,
     ) -> Result<MemoriaRefreshBinding, AuthHttpError> {
         let resolver = self.credential_resolver().ok_or_else(unavailable)?;
-        let snapshot = resolver
-            .load_authority_snapshot(user)
-            .await
-            .map_err(|_| unavailable())?
-            .ok_or_else(reconnect)?;
-        let credential = resolver
-            .scoped_credential(&snapshot)
-            .map_err(|_| unavailable())?
-            .ok_or_else(reconnect)?;
-        let identity = resolver.provider.verify(&credential.key).await?;
-        if identity.memoria_user_id != owner || identity.key_id != credential.generation {
-            return Err(reconnect());
+        for _ in 0..3 {
+            let snapshot = resolver
+                .load_authority_snapshot(user)
+                .await
+                .map_err(|_| unavailable())?
+                .ok_or_else(reconnect)?;
+            let credential = resolver
+                .scoped_credential(&snapshot)
+                .map_err(|_| unavailable())?
+                .ok_or_else(reconnect)?;
+            let verified = resolver
+                .provider
+                .verify(&credential.key)
+                .await
+                .and_then(|identity| {
+                    if identity.memoria_user_id == owner && identity.key_id == credential.generation
+                    {
+                        Ok(())
+                    } else {
+                        Err(reconnect())
+                    }
+                });
+            if let Err(error) = verified {
+                if error.0 == StatusCode::UNAUTHORIZED {
+                    let current = resolver
+                        .load_authority_snapshot(user)
+                        .await
+                        .map_err(|_| unavailable())?;
+                    if current.is_some_and(|current| {
+                        current.current_token != snapshot.current_token
+                            || current.ciphertext != snapshot.ciphertext
+                            || current.metadata != snapshot.metadata
+                    }) {
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+            return Ok(MemoriaRefreshBinding {
+                token_id: resolver.token_id(user),
+                ciphertext: snapshot.ciphertext.ok_or_else(reconnect)?,
+                metadata: snapshot.metadata.ok_or_else(reconnect)?,
+            });
         }
-        Ok(MemoriaRefreshBinding {
-            token_id: resolver.token_id(user),
-            ciphertext: snapshot.ciphertext.ok_or_else(reconnect)?,
-            metadata: snapshot.metadata.ok_or_else(reconnect)?,
-        })
+        Err(unavailable())
     }
     pub(super) async fn memoria_login(&self, key: &str) -> Result<MemoriaLogin, AuthHttpError> {
         let resolver = self.credential_resolver().ok_or_else(unavailable)?;

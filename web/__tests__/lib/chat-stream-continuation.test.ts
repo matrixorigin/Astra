@@ -48,6 +48,8 @@ function runtime(response: ReturnType<typeof backend>) {
   vi.spyOn(value.sdk, "listSessionArtifacts").mockResolvedValue({ artifacts: [] } as never);
   vi.spyOn(value.sdk, "createRuntimeSession").mockResolvedValue({ session_id: "session" } as never);
   vi.spyOn(value, "fetchResponse").mockResolvedValue(response as never);
+  const previous = vi.mocked(requireRuntimeUser).getMockImplementation();
+  vi.mocked(requireRuntimeUser).mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
   vi.mocked(requireRuntimeClient).mockResolvedValue(value);
   vi.mocked(requireStoreRuntimeClient).mockResolvedValue(value);
   return value;

@@ -50,6 +50,7 @@ export async function POST(
     const result = await stopActiveRun(auth.user.user_id, chatId, binding, {
       skipSync: true,
       cancelTimeoutMs: STOP_CANCEL_ACK_TIMEOUT_MS,
+      client: auth.client,
     });
     if (!result) {
       return NextResponse.json({ error: "chat not found" }, { status: 404 });

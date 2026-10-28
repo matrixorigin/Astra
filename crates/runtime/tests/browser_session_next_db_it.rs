@@ -7,7 +7,12 @@ use astra_services::{
     AuthRegisterRequestData, AuthService, DatabaseAuthService, FernetTokenEncryptor,
 };
 use async_trait::async_trait;
-use axum::{Router, body::Body, http::Request};
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode},
+    routing::post,
+};
 use serde_json::json;
 use std::{
     path::PathBuf,
@@ -65,6 +70,8 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
                 .with_auth_service(auth),
         )
     });
+    let other_app = apps[1].clone();
+    let failure_app = apps[0].clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     // Round-robin ingress keeps one public runtime binding, just as a deployment
@@ -77,6 +84,29 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
     let runtime_url = format!("http://{}/", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         axum::serve(listener, ingress).await.unwrap();
+    });
+    let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_runtime_url = format!("http://{}/", other_listener.local_addr().unwrap());
+    let other_server = tokio::spawn(async move {
+        axum::serve(other_listener, other_app).await.unwrap();
+    });
+    // Keep real login/database behavior while failing only the subsequent
+    // browser-owner adoption at a different runtime address.
+    let failing_runtime = Router::new()
+        .route(
+            "/auth/browser-sessions",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .fallback(move |request: Request<Body>| {
+            let app = failure_app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        });
+    let failure_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failure_url = format!("http://{}/", failure_listener.local_addr().unwrap());
+    let failure_server = tokio::spawn(async move {
+        axum::serve(failure_listener, failing_runtime)
+            .await
+            .unwrap();
     });
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -205,6 +235,92 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         .unwrap()
         .to_owned();
     let handle = cookie.strip_prefix("astra_session=").unwrap();
+    // Even if the response containing a new selector never reaches the browser,
+    // the original selection remains usable on either Web replica.
+    for candidate in [&runtime_url, &other_runtime_url] {
+        let switched = client
+            .post(format!("{}/api/runtime-auth/login", urls[0]))
+            .header("cookie", &cookie)
+            .json(&json!({"apiUrl":candidate,"username":name,"password":"next-browser-test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(switched.status(), 200);
+        let switched_cookie = switched
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("astra_session="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        for url in &urls {
+            let old = client
+                .get(format!("{url}/api/runtime-auth/me"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                old.status(),
+                200,
+                "old selection survives an unreceived login response"
+            );
+            assert_eq!(
+                client
+                    .get(format!("{url}/api/runtime-auth/me"))
+                    .header("cookie", &switched_cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        assert_eq!(
+            client
+                .post(format!("{}/api/runtime-auth/logout", urls[1]))
+                .header("cookie", &switched_cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            client
+                .get(format!("{}/api/runtime-auth/me", urls[0]))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200,
+            "signing out the new session does not revoke the old one"
+        );
+    }
+    let failed = client
+        .post(format!("{}/api/runtime-auth/login", urls[0]))
+        .header("cookie", &cookie)
+        .json(&json!({"apiUrl":failure_url,"username":name,"password":"next-browser-test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 503);
+    assert_eq!(
+        client
+            .get(format!("{}/api/runtime-auth/me", urls[1]))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "a failed cross-runtime adoption must leave the original session usable"
+    );
     let old_jwt = fixture::expire_access(&pool, handle).await;
     let mut requests = tokio::task::JoinSet::new();
     let begin = tokio::time::Instant::now();
@@ -326,6 +442,42 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         .unwrap();
     assert_eq!(logout.status(), 200);
     assert!(!logout.headers().contains_key("set-cookie"));
+    let other_name = format!("next_other_{}", uuid::Uuid::new_v4().simple());
+    let other_user = auth
+        .register(AuthRegisterRequestData {
+            username: other_name.clone(),
+            email: format!("{other_name}@example.test"),
+            password: "next-browser-test".into(),
+            display_name: None,
+        })
+        .await
+        .unwrap();
+    let other_tokens = auth
+        .login(astra_services::AuthLoginRequestData {
+            username: other_name,
+            password: "next-browser-test".into(),
+        })
+        .await
+        .unwrap();
+    let takeover = client.post(format!("{runtime_url}auth/browser-sessions"))
+        .json(&json!({"handle":handle,"access_token":other_tokens.access_token,"refresh_token":other_tokens.refresh_token}))
+        .send().await.unwrap();
+    assert_eq!(
+        takeover.status(),
+        401,
+        "another account cannot claim a logged-out browser handle"
+    );
+    assert_eq!(
+        client
+            .post(format!("{runtime_url}auth/refresh"))
+            .json(&json!({"refresh_token":other_tokens.refresh_token}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "rejected adoption must not consume the other session's refresh token"
+    );
     let after = client
         .get(format!("{}/api/runtime-auth/me", urls[0]))
         .header("cookie", &cookie)
@@ -345,11 +497,18 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         .await
         .unwrap();
     assert!(protected.status().is_redirection());
-    assert!(
-        protected.headers()["location"]
-            .to_str()
+    let location = reqwest::Url::parse(&urls[0])
+        .unwrap()
+        .join(protected.headers()["location"].to_str().unwrap())
+        .unwrap();
+    assert_eq!(location.path(), "/login");
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "next")
             .unwrap()
-            .ends_with("/login")
+            .1,
+        "/projects"
     );
     let public = client
         .get(format!("{}/", urls[0]))
@@ -363,6 +522,8 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         child.wait().await.unwrap();
     }
     server.abort();
+    other_server.abort();
+    failure_server.abort();
     sqlx::query("DELETE FROM auth_browser_sessions WHERE token_id IN (SELECT token_id FROM auth_refresh_tokens WHERE user_id = ?)")
         .bind(&user.user_id).execute(pool.get()).await.unwrap();
     for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
@@ -370,6 +531,15 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
             "DELETE FROM {table} WHERE user_id = ?"
         )))
         .bind(&user.user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+    for table in ["auth_refresh_tokens", "auth_user_roles", "auth_users"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&other_user.user_id)
         .execute(pool.get())
         .await
         .unwrap();

@@ -417,8 +417,11 @@ authority.
 
 Web uses one HttpOnly `astra_session` selector. A browser login imports a matching
 access/refresh pair through `POST /auth/browser-sessions`, consumes that refresh
-JWT, and stores a stable `bs1.<runtime-root>.<random-proof>` handle in the cookie.
-The runtime root and the 256-bit random proof are bound together. An ordinary
+JWT, and stores a stable `bs2.<runtime-root>.<session-id>.<random-proof>` handle in the cookie.
+The runtime root, immutable session ID and 256-bit random proof are bound together.
+The runtime verifies the handle's session ID against the signed refresh token
+before adoption, preventing a logged-out handle from being rebound to a different
+session. An ordinary
 request never sends this proof to a separately configured runtime URL.
 
 `auth_refresh_tokens` still owns session identity and revocation. The core-owned
@@ -437,9 +440,10 @@ The existing external-identity user index also covers provider, external subject
 and update time. Explicit index selection keeps both the Memoria existence check
 and canonical provider-owner lookup inside that index, including absent users;
 this avoids MatrixOne's empty-result base-table scan without new state or queries.
-React request caching deduplicates Server Component configuration reads. Separate
-client constructions in route handlers can still perform separate reads; there is
-no cross-user or process-local token authority. The existing SDK owns later 401
+React request caching deduplicates Server Component configuration reads. Chat,
+project and sidebar handlers and hydrated pages pass their admitted client through
+the request; there is no cross-user or process-local token authority. A late Stop
+acknowledgement resolves authority again before reconciliation. The existing SDK owns later 401
 retries, cancellation, REST and streaming admission. An initial owner/provider/DB
 outage is reported as unavailable. A later SDK refresh failure retains the SDK's
 existing original-401 behavior; it never clears the proof or reports success.
@@ -450,12 +454,20 @@ transaction, but leaves the now-inert cookie: a delayed logout response must not
 erase a newer login. Revocation uses the exact handle hash and canonical session
 identity, without decrypting credentials, calling a provider or requiring an active
 account. Expiry, deleted old accounts and replaced encryption keys cannot trap the
-browser in a session it cannot sign out of or replace. Other replicas reject subsequent owner resolutions; access
-JWTs already admitted or cached elsewhere retain the existing maximum 30-second
-principal-cache revocation delay. Same-runtime account replacement revokes the
-captured old session in the adoption transaction, taking account locks in sorted
-order. A different-runtime replacement revokes on the old runtime first; it fails
-without switching if that outcome is unknown and is not a distributed transaction.
+browser in a session it cannot sign out of or replace. Other replicas reject
+subsequent owner resolutions. Ordinary principal checks can retain an already
+admitted access JWT for the existing maximum 30-second cache interval. The
+existing admin authorizer checks JWT and role independently of session revocation;
+an already issued admin access JWT can remain usable until its expiry. Signing
+in creates an independent session;
+runtime configuration changes only the browser selection. Neither operation
+implicitly revokes a previously selected session. If the response is lost, the
+browser can continue using its old selection. A copied old browser handle may be
+refreshed until its one-year absolute limit unless explicitly revoked. Sign out
+before switching when immediate revocation is required: signing out afterwards
+revokes only the currently selected session. An unreceived new session expires
+through the normal retention path. Static bearer tokens must be revoked at their
+issuer and can outlive the Web cookie.
 
 Runtime settings are full replacements, encoded as `cfg1` in the same selector:
 explicit static bearer, no authentication, demo, or deployment default. The deployment API URL may supply a default destination; `ASTRA_ACCESS_TOKEN`
@@ -478,8 +490,9 @@ The existing refresh retention sweep selects at most 1,000 expired/revoked sessi
 and atomically deletes them and their browser credentials in a short transaction
 with fresh retention predicates. A changed candidate batch rolls back before
 removing any owner and retries at most three times. Database/serialization failures
-are surfaced and retried by the existing periodic maintenance loop. Logout deletes
-the owner immediately. Other ciphertext remains until the session is expired or
+are surfaced and retried by the existing periodic maintenance loop. Handle logout
+deletes the owner immediately; direct JWT logout revokes the canonical session and
+leaves its encrypted owner for the sweep. Other ciphertext remains until the session is expired or
 revoked **and** its age since issuance/last rotation exceeds the existing retention
 threshold (default seven days), followed by the sweep/backlog delay. This is a
 minimum row age, not an extra seven days after expiry. Refresh TTL defaults to

@@ -36,7 +36,7 @@ export async function POST(
     );
   }
 
-  const chat = await getChatHydrated(auth.user.user_id, chatId);
+  const chat = await getChatHydrated(auth.user.user_id, chatId, auth.client);
   if (!chat) {
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
@@ -98,7 +98,7 @@ export async function POST(
     );
   }
   try {
-    const result = await queueDeferredRunInput(auth.user.user_id, chatId, body);
+    const result = await queueDeferredRunInput(auth.user.user_id, chatId, body, auth.client);
     if (!result) {
       return NextResponse.json({ error: "chat not found" }, { status: 404 });
     }

@@ -23,6 +23,7 @@
 
 #![allow(dead_code)]
 
+pub mod cleanup_catalog;
 pub mod collaborator_fixture;
 
 use astra_core::{MatrixOneSettings, SharedPool};

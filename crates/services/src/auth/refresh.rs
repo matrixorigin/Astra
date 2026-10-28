@@ -1,6 +1,17 @@
 //! One refresh preparation/commit path for direct JWT and browser-owned sessions.
 use super::*;
 
+pub(super) enum CommitRefreshError {
+    BindingChanged,
+    Auth(AuthHttpError),
+}
+
+impl From<AuthHttpError> for CommitRefreshError {
+    fn from(error: AuthHttpError) -> Self {
+        Self::Auth(error)
+    }
+}
+
 pub(super) struct PreparedRefresh {
     pub token_id: String,
     pub user_id: String,
@@ -137,19 +148,21 @@ impl DatabaseAuthService {
         &self,
         tx: &mut sqlx::Transaction<'_, MySql>,
         prepared: &PreparedRefresh,
-    ) -> Result<(), AuthHttpError> {
+    ) -> Result<(), CommitRefreshError> {
         if prepared.old_expiry <= Utc::now().timestamp()
             || prepared.expires_at <= Utc::now().naive_utc()
         {
-            return Err(session_denied());
+            return Err(session_denied().into());
         }
         // Re-read after acquiring the account lock, including a first-ever
         // provider link that raced preparation of an internal session.
         if self.memoria_owner(&mut **tx, &prepared.user_id).await? != prepared.memoria_owner {
-            return Err(session_denied());
+            return Err(CommitRefreshError::BindingChanged);
         }
-        if let Some(binding) = &prepared.memoria_binding {
-            binding.check(tx, &prepared.user_id).await?;
+        if let Some(binding) = &prepared.memoria_binding
+            && !binding.check(tx, &prepared.user_id).await?
+        {
+            return Err(CommitRefreshError::BindingChanged);
         }
         let updated = query(
             "UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), token_prefix = NULL
@@ -159,7 +172,7 @@ impl DatabaseAuthService {
             .bind(&prepared.token_id).bind(&prepared.old_hash).bind(&prepared.user_id).bind(&prepared.session_id)
             .execute(&mut **tx).await.map_err(|error| map_auth_sqlx(error, "refresh.database", None))?;
         if updated.rows_affected() != 1 {
-            return Err(session_denied());
+            return Err(session_denied().into());
         }
         Ok(())
     }

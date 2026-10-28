@@ -50,6 +50,13 @@ function isWebClientId(value: string | undefined): value is string {
   return value !== undefined && /^[A-Za-z0-9._:-]{1,128}$/u.test(value);
 }
 
+function requestedPath(request: NextRequest): string {
+  const query = new URLSearchParams(request.nextUrl.searchParams);
+  query.delete("_rsc");
+  const search = query.toString();
+  return `${request.nextUrl.pathname}${search ? `?${search}` : ""}`;
+}
+
 /**
  * Give every browser instance one stable, owner-scoped identity. The value is
  * forwarded on the internal request so the first Work page can use it before
@@ -63,6 +70,10 @@ function withWebClientIdentity(request: NextRequest): NextResponse {
     : crypto.randomUUID();
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set(WEB_CLIENT_ID_HEADER, clientId);
+  requestHeaders.set(
+    "x-astra-request-path",
+    requestedPath(request),
+  );
   const response = NextResponse.next({ request: { headers: requestHeaders } });
   if (clientId !== cookieValue) {
     response.cookies.set({
@@ -82,7 +93,7 @@ function loginRedirect(request: NextRequest): NextResponse {
   const url = request.nextUrl.clone();
   url.pathname = "/login";
   url.search = "";
-  const nextPath = `${request.nextUrl.pathname}${request.nextUrl.search}`;
+  const nextPath = requestedPath(request);
   url.searchParams.set("next", nextPath || "/");
   return NextResponse.redirect(url);
 }

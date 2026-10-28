@@ -2,13 +2,15 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useActionState, useEffect } from 'react';
+import { useActionState, useEffect, useState } from 'react';
 import { AuthShell } from '@/components/auth/auth-shell';
+import { PreviousSessionLogout } from '@/components/auth/previous-session-logout';
 import { registerAction } from '@/lib/auth/actions';
 
 export default function RegisterPage() {
   const router = useRouter();
   const [state, formAction, isPending] = useActionState(registerAction, { ok: false });
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     if (state.ok) {
@@ -125,11 +127,12 @@ export default function RegisterPage() {
 
           <button
             type="submit"
-            disabled={isPending}
+            disabled={isPending || signingOut}
             className="inline-flex h-11 w-full items-center justify-center rounded-control bg-text px-4 text-sm font-semibold text-white transition hover:bg-text/90 disabled:cursor-wait disabled:opacity-60"
           >
             {isPending ? 'Creating account…' : 'Create account'}
           </button>
+          <PreviousSessionLogout disabled={isPending} onPendingChange={setSigningOut} />
         </form>
     </AuthShell>
   );

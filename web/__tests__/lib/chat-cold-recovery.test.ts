@@ -9,6 +9,7 @@ import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { WebRuntimeClient, getRuntimeClient, requireRuntimeClient } from "@/lib/runtime-client/server";
 import { createProject, ensureChatBackendSession, updateChatModel, updateChatWorkspaceSelection, archiveChat, moveChat, deleteChat, getChat, getChatHydrated, getStore, listChats, queueDeferredRunInput, stopActiveRun, updateStreamingAssistantMessage } from "@/lib/api/web-store";
 import { GET as GETDetail } from "@/app/api/chats/[chatId]/route";
+import { DELETE as DELETEArchived } from "@/app/api/chats/route";
 import { POST as POSTMessage } from "@/app/api/chats/[chatId]/messages/route";
 import { GET, POST as POSTStream } from "@/app/api/chats/[chatId]/stream/route";
 import { AstraApiError, type RuntimeConversationResponse } from "@astra/sdk";
@@ -26,7 +27,6 @@ function conversation(runId = "run", status = "running", content = "original req
 }
 function setup() {
   globalThis.__astraWebStores = undefined;
-  vi.mocked(requireRuntimeUser).mockResolvedValue({ user: { user_id: "owner", display_name: null }, response: null } as never);
   const sdk = {
     getTokens: vi.fn(() => ({ accessToken: "synthetic-test", refreshToken: null })),
     listRuntimeSessions: vi.fn().mockResolvedValue({ sessions: [session] }),
@@ -48,6 +48,7 @@ function setup() {
     headers: { "x-astra-agent-interaction-api-major": "3" },
   }));
   const runtime = Object.assign(new WebRuntimeClient({ accessToken: "synthetic-test" } as never), { sdk, fetchResponse });
+  vi.mocked(requireRuntimeUser).mockResolvedValue({ user: { user_id: "owner", display_name: null }, client: runtime, response: null } as never);
   vi.mocked(getRuntimeClient).mockResolvedValue(runtime as never);
   vi.mocked(requireRuntimeClient).mockResolvedValue(runtime as never);
   return runtime;
@@ -797,4 +798,59 @@ it("rejects an old missing-Session result after A-B-A metadata commits", async (
   read.reject(new AstraApiError(404, "Old Session snapshot was missing", "/sessions/session/transcript"));
   expect((await reading)?.chat.model).toBe("A");
   expect(getChat("owner", "session")?.chat.model).toBe("A");
+});
+
+it("uses the admitted client throughout chat detail hydration", async () => {
+  const runtime = setup();
+  vi.mocked(getRuntimeClient).mockClear().mockRejectedValue(new Error("unexpected second authentication"));
+  vi.mocked(requireRuntimeClient).mockClear().mockRejectedValue(new Error("unexpected second authentication"));
+  const response = await GETDetail({} as never, { params: Promise.resolve({ chatId: "session" }) });
+  expect(response.status).toBe(200);
+  expect((await response.json()).messages[0].content).toBe("original request");
+  expect(runtime.sdk.getSessionConversation).toHaveBeenCalled();
+  expect(getRuntimeClient).not.toHaveBeenCalled();
+  expect(requireRuntimeClient).not.toHaveBeenCalled();
+});
+
+it("preserves an authentication outage when opening an existing stream", async () => {
+  setup();
+  vi.mocked(requireRuntimeUser).mockResolvedValue({ user: null, client: null,
+    response: new Response(JSON.stringify({ error: "service unavailable" }), { status: 503 }) } as never);
+  const response = await stream();
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: "service unavailable" });
+});
+
+it("uses the admitted client to cancel and reconcile a completed Stop", async () => {
+  const runtime = setup();
+  const first = await getChatHydrated("owner", "session");
+  runtime.sdk.cancelRun.mockResolvedValue({});
+  runtime.sdk.getRunStatus.mockResolvedValue({ runId: "run", sessionId: "session", status: "cancelled", eventsCount: 4 });
+  vi.mocked(getRuntimeClient).mockClear().mockRejectedValue(new Error("unexpected second authentication"));
+  vi.mocked(requireRuntimeClient).mockClear().mockRejectedValue(new Error("unexpected second authentication"));
+  const result = await stopActiveRun("owner", "session", {
+    sessionId: "session", runId: "run", assistantMessageId: first!.activeRun!.assistantMessageId!,
+  }, { skipSync: true, client: runtime });
+  expect(result?.cancelPending).toBe(false);
+  expect(runtime.sdk.cancelRun).toHaveBeenCalledWith("run");
+  expect(runtime.sdk.getRunStatus).toHaveBeenCalledWith("run");
+  expect(getRuntimeClient).not.toHaveBeenCalled();
+  expect(requireRuntimeClient).not.toHaveBeenCalled();
+});
+
+it("clears multiple archived chats without resolving the admitted session again", async () => {
+  const runtime = setup();
+  runtime.sdk.listRuntimeSessions.mockResolvedValue({ sessions: [
+    { ...session, session_id: "archived-a", status: "archived" },
+    { ...session, session_id: "archived-b", status: "archived" },
+  ] });
+  runtime.sdk.listRuns.mockResolvedValue({ runs: [] });
+  vi.mocked(getRuntimeClient).mockClear().mockRejectedValue(new Error("unexpected second authentication"));
+  vi.mocked(requireRuntimeClient).mockClear().mockRejectedValue(new Error("unexpected second authentication"));
+  const response = await DELETEArchived({ nextUrl: new URL("http://web.test/api/chats?archived=true") } as never);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ deleted: 2 });
+  expect(runtime.sdk.deleteSession.mock.calls.map(call => call[0]).sort()).toEqual(["archived-a", "archived-b"]);
+  expect(getRuntimeClient).not.toHaveBeenCalled();
+  expect(requireRuntimeClient).not.toHaveBeenCalled();
 });

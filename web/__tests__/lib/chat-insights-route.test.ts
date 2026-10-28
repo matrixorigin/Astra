@@ -21,6 +21,11 @@ import { requireRuntimeClient } from "@/lib/runtime-client";
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
 const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
+function setAdmittedRuntime(value: unknown) {
+  mockRequireRuntimeClient.mockResolvedValue(value as never);
+  const previous = mockRequireRuntimeUser.getMockImplementation();
+  mockRequireRuntimeUser.mockImplementation(async () => ({ ...(await previous!()), client: value }) as never);
+}
 
 describe("chat insights route", () => {
   beforeEach(() => {
@@ -48,7 +53,7 @@ describe("chat insights route", () => {
       },
       messages: [],
     });
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         getSessionAudit: vi.fn().mockRejectedValue(new Error("audit busy")),
         getSessionReflect: vi.fn().mockResolvedValue({
@@ -105,7 +110,7 @@ describe("chat insights route", () => {
       },
       messages: [],
     });
-    mockRequireRuntimeClient.mockResolvedValue({
+    setAdmittedRuntime({
       sdk: {
         getSessionAudit: vi.fn().mockResolvedValue(null),
         getSessionReflect: vi.fn().mockResolvedValue({

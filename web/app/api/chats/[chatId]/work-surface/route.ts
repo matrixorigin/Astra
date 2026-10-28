@@ -3,7 +3,6 @@ import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat } from "@/lib/api/web-store";
 import {
   RuntimeClientError,
-  requireRuntimeClient,
   runtimeErrorDetail,
 } from "@/lib/runtime-client";
 import {
@@ -146,10 +145,7 @@ export async function GET(
   }
 
   try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "load web work surface",
-    });
+    const runtime = auth.client;
     const warnings: string[] = [];
     const runTree = sessionId
       ? await runtime

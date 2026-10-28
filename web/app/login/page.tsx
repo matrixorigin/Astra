@@ -2,18 +2,20 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useActionState, useEffect } from "react";
+import { Suspense, useActionState, useEffect, useState } from "react";
 import { AuthShell } from "@/components/auth/auth-shell";
+import { PreviousSessionLogout } from "@/components/auth/previous-session-logout";
 import { loginAction } from "@/lib/auth/actions";
+import { safeNextPath } from "@/lib/auth/next-path";
 
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const next = searchParams.get("next") || "/overview";
+  const next = safeNextPath(searchParams.get("next"));
   const [state, formAction, isPending] = useActionState(loginAction, {
     ok: false,
   });
-
+  const [signingOut, setSigningOut] = useState(false);
   useEffect(() => {
     if (state.ok) {
       router.push(next);
@@ -81,11 +83,12 @@ function LoginForm() {
 
         <button
           type="submit"
-          disabled={isPending}
+          disabled={isPending || signingOut}
           className="inline-flex h-11 w-full items-center justify-center rounded-control bg-text px-4 text-sm font-semibold text-white transition hover:bg-text/90 disabled:cursor-wait disabled:opacity-60"
         >
           {isPending ? "Signing in…" : "Sign in"}
         </button>
+        <PreviousSessionLogout disabled={isPending} onPendingChange={setSigningOut} />
       </form>
   );
 }

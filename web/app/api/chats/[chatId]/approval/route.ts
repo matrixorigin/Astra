@@ -3,7 +3,6 @@ import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat } from "@/lib/api/web-store";
 import {
   RuntimeClientError,
-  requireRuntimeClient,
 } from "@/lib/runtime-client";
 
 type ApprovalBody = {
@@ -68,10 +67,7 @@ export async function POST(
   }
 
   try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "respond to run approval",
-    });
+    const runtime = auth.client;
     await runtime.post(
       "/approval/respond",
       {

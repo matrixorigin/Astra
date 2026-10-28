@@ -7,7 +7,7 @@ it("offers a fresh document request and sign-in without needing the failed route
   render(<PageError />);
 
   expect(screen.getByRole("heading", { name: "Unable to load this page" })).toBeVisible();
-  expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login");
+  expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login?next=%2F");
   expect(screen.getByText("Try again", { selector: "a" })).toHaveAttribute("href", "");
 });
 

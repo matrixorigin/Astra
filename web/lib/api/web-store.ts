@@ -346,9 +346,10 @@ function isLocallyStoppedRun(
 async function reconcileStoppedRun(
   runId: string,
   ownedChat: () => ChatRecord | undefined,
+  admittedClient?: WebRuntimeClient,
 ): Promise<void> {
   if (!ownedChat()) return;
-  const client = await getRuntimeClient({
+  const client = admittedClient ?? await getRuntimeClient({
     auth: "required", operation: `reconcile stopped run ${runId}`,
   }).catch(() => null);
   if (!client || !ownedChat()) return;
@@ -516,8 +517,9 @@ export async function listChats(
     limit?: number;
     archived?: boolean;
   },
+  client?: WebRuntimeClient,
 ): Promise<ChatListResponse> {
-  await syncBackendSessions(ownerUserId);
+  await syncBackendSessions(ownerUserId, client);
   const store = getStore(ownerUserId);
   const limit = params.limit ?? 50;
   const offset = Number(params.cursor ?? 0);
@@ -633,8 +635,9 @@ export function getProject(
 export async function getProjectHydrated(
   ownerUserId: string,
   projectId: string,
+  client?: WebRuntimeClient,
 ): Promise<ProjectDetail | null> {
-  await syncBackendSessions(ownerUserId);
+  await syncBackendSessions(ownerUserId, client);
   return getProject(ownerUserId, projectId);
 }
 
@@ -765,8 +768,9 @@ export function getChat(
 export async function getChatHydrated(
   ownerUserId: string,
   chatId: string,
+  client?: WebRuntimeClient,
 ): Promise<ChatDetail | null> {
-  const canonicalId = await syncBackendTranscript(ownerUserId, chatId);
+  const canonicalId = await syncBackendTranscript(ownerUserId, chatId, client);
   return getChat(ownerUserId, canonicalId ?? chatId);
 }
 
@@ -1010,11 +1014,12 @@ export async function queueDeferredRunInput(
     options?: ComposerOptions;
     pendingMessageId?: string;
   },
+  admittedClient?: WebRuntimeClient,
 ) {
   if ([...payload.content].length > MAX_DEFERRED_INPUT_CHARS) {
     throw new Error("Deferred input is too large.");
   }
-  await syncBackendSessions(ownerUserId);
+  await syncBackendSessions(ownerUserId, admittedClient);
 
   // Re-read chat after every async boundary to avoid TOCTOU races.
   function findChat(): ChatRecord | undefined {
@@ -1044,7 +1049,7 @@ export async function queueDeferredRunInput(
   if (previous) return previous;
 
   const activeRunId = chat.activeRun.runId;
-  const client = await requireRuntimeClient({
+  const client = admittedClient ?? await requireRuntimeClient({
     auth: "required",
     operation: `submit deferred run input for ${activeRunId}`,
   });
@@ -1193,9 +1198,9 @@ export async function stopActiveRun(
   ownerUserId: string,
   chatId: string,
   requested: StopRunRequest,
-  options?: { skipSync?: boolean; cancelTimeoutMs?: number },
+  options?: { skipSync?: boolean; cancelTimeoutMs?: number; client?: WebRuntimeClient },
 ) {
-  if (!options?.skipSync) await syncBackendSessions(ownerUserId);
+  if (!options?.skipSync) await syncBackendSessions(ownerUserId, options?.client);
   const findChat = () => getStore(ownerUserId).chats.find(item => item.id === chatId);
   if (!findChat()) return null;
   const binding: ChatRunBinding = { ...requested, chatId };
@@ -1204,7 +1209,7 @@ export async function stopActiveRun(
     return chat && sameRunBinding(storedRunBinding(chat), binding) ? chat : undefined;
   };
   if (!boundChat()) throw new StaleRunBindingError();
-  const client = await requireRuntimeClient({
+  const client = options?.client ?? await requireRuntimeClient({
     auth: "required", operation: `cancel active run ${binding.runId}`,
   });
   const chat = boundChat();
@@ -1249,13 +1254,13 @@ export async function stopActiveRun(
   const current = ownedChat();
   if (cancelPending && current) cancellingRun.waitingFor = "cancel_requested";
   completeMessage();
-  if (!cancelPending) await reconcileStoppedRun(binding.runId, ownedChat);
+  if (!cancelPending) await reconcileStoppedRun(binding.runId, ownedChat, client);
   const selected = findChat();
   return selected ? { activeRun: publicActiveRun(selected), cancelPending } : null;
 }
 
-export async function resumeActiveRun(ownerUserId: string, chatId: string) {
-  await syncBackendSessions(ownerUserId);
+export async function resumeActiveRun(ownerUserId: string, chatId: string, admittedClient?: WebRuntimeClient) {
+  await syncBackendSessions(ownerUserId, admittedClient);
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
@@ -1279,7 +1284,7 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     }
     return current;
   };
-  const client = await requireRuntimeClient({
+  const client = admittedClient ?? await requireRuntimeClient({
     auth: "required",
     operation: `resume active run ${runId}`,
   });
@@ -1415,6 +1420,7 @@ export async function updateChatModel(
   ownerUserId: string,
   chatId: string,
   model: string,
+  client?: WebRuntimeClient,
 ) {
   const normalized = model.trim();
   if (!normalized) {
@@ -1426,7 +1432,7 @@ export async function updateChatModel(
     return null;
   }
   const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
-  await updateBackendSessionModel(chat, normalized);
+  await updateBackendSessionModel(chat, normalized, client);
   if (!commitChatMetadata(ownerUserId, binding, { model: normalized })) return null;
   return getChat(ownerUserId, chatId);
 }
@@ -1435,6 +1441,7 @@ export async function updateChatWorkspaceSelection(
   ownerUserId: string,
   chatId: string,
   selection: WorkspaceSelection | null,
+  client?: WebRuntimeClient,
 ) {
   const normalized: WorkspaceSelection | null =
     selection === null
@@ -1452,7 +1459,7 @@ export async function updateChatWorkspaceSelection(
   }
   const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
   if (chat.backendSessionId) {
-    await updateBackendSessionWorkspaceSelection(chat, normalized);
+    await updateBackendSessionWorkspaceSelection(chat, normalized, client);
   }
   if (!commitChatMetadata(ownerUserId, binding, { workspaceSelection: normalized ?? undefined })) return null;
   return getChat(ownerUserId, chatId);
@@ -1482,13 +1489,14 @@ export async function archiveChat(
   ownerUserId: string,
   chatId: string,
   archived: boolean,
+  client?: WebRuntimeClient,
 ) {
   const chat = getStore(ownerUserId).chats.find((item) => item.id === chatId);
   if (!chat) {
     return null;
   }
   const binding = { id: chat.id, backendSessionId: chat.backendSessionId };
-  await updateBackendSessionArchive(chat, archived);
+  await updateBackendSessionArchive(chat, archived, client);
   if (!commitChatMetadata(ownerUserId, binding, { archivedAt: archived ? nowIso() : null })) return null;
   return getChat(ownerUserId, chatId);
 }
@@ -1496,13 +1504,14 @@ export async function archiveChat(
 export async function deleteChat(
   ownerUserId: string,
   chatId: string,
+  client?: WebRuntimeClient,
 ): Promise<boolean> {
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
     return false;
   }
-  await deleteBackendSession(chat);
+  await deleteBackendSession(chat, client);
   discardChatStreamProjection(chat);
   store.chats = store.chats.filter((item) => item.id !== chatId);
   if (chat.projectId) {
@@ -1513,12 +1522,13 @@ export async function deleteChat(
 
 export async function deleteArchivedChats(
   ownerUserId: string,
+  client?: WebRuntimeClient,
 ): Promise<number> {
-  await syncBackendSessions(ownerUserId);
+  await syncBackendSessions(ownerUserId, client);
   const store = getStore(ownerUserId);
   const archivedChats = store.chats.filter((chat) => chat.archivedAt);
   for (const chat of archivedChats) {
-    await deleteBackendSession(chat);
+    await deleteBackendSession(chat, client);
   }
   for (const chat of archivedChats) discardChatStreamProjection(chat);
   const archivedIds = new Set(archivedChats.map((chat) => chat.id));
@@ -1534,8 +1544,11 @@ export async function deleteArchivedChats(
   return archivedChats.length;
 }
 
-export async function getSidebar(ownerUserId: string): Promise<SidebarData> {
-  await syncBackendSessions(ownerUserId);
+export async function getSidebar(
+  ownerUserId: string,
+  client?: WebRuntimeClient,
+): Promise<SidebarData> {
+  await syncBackendSessions(ownerUserId, client);
   const store = getStore(ownerUserId);
   const recentChats: Array<{
     kind: "chat";
@@ -1870,11 +1883,14 @@ async function listAllBackendSessions(
   return sessions;
 }
 
-async function syncBackendSessions(ownerUserId: string): Promise<void> {
+async function syncBackendSessions(
+  ownerUserId: string,
+  admittedClient?: WebRuntimeClient,
+): Promise<void> {
   const beforeRead = new Map(getStore(ownerUserId).chats.map(chat => [chat.id, chat]));
   const beforeBySession = new Map([...beforeRead.values()].filter(chat => chat.backendSessionId)
     .map(chat => [chat.backendSessionId!, chat]));
-  const client = await getRuntimeClient({
+  const client = admittedClient ?? await getRuntimeClient({
     auth: "required",
     operation: `sync persisted sessions for user ${ownerUserId}`,
   });
@@ -2038,7 +2054,7 @@ function transcriptItemToMessage(
   };
 }
 
-async function syncBackendTranscript(ownerUserId: string, chatId: string): Promise<string | undefined> {
+async function syncBackendTranscript(ownerUserId: string, chatId: string, admittedClient?: WebRuntimeClient): Promise<string | undefined> {
   const currentChat = () => getStore(ownerUserId).chats.find(item =>
     item.id === chatId || item.backendSessionId === chatId);
   const original = currentChat();
@@ -2056,7 +2072,7 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string): Promi
       current?.activeRun?.assistantMessageId === assistantId && current?.streamProjection === projection &&
       current?.messages === messages && current?.pendingTurn === pendingTurn;
   };
-  const client = await getRuntimeClient({ auth: "required", operation: "read selected conversation" });
+  const client = admittedClient ?? await getRuntimeClient({ auth: "required", operation: "read selected conversation" });
   if (!client || !stillCurrent()) return currentChat()?.id;
 
   let backendSessionId = sessionId;
@@ -2202,9 +2218,9 @@ async function createBackendSession(params: {
   return { sessionId: parsed.session_id };
 }
 
-async function deleteBackendSession(chat: ChatRecord): Promise<void> {
+async function deleteBackendSession(chat: ChatRecord, admittedClient?: WebRuntimeClient): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
-  const client = await requireRuntimeClient({
+  const client = admittedClient ?? await requireRuntimeClient({
     auth: "required",
     operation: `delete persisted session ${sessionId}`,
   });
@@ -2221,9 +2237,10 @@ async function deleteBackendSession(chat: ChatRecord): Promise<void> {
 async function updateBackendSessionArchive(
   chat: ChatRecord,
   archived: boolean,
+  admittedClient?: WebRuntimeClient,
 ): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
-  const client = await requireRuntimeClient({
+  const client = admittedClient ?? await requireRuntimeClient({
     auth: "required",
     operation: `update persisted session ${sessionId} archive state`,
   });
@@ -2242,9 +2259,10 @@ async function updateBackendSessionArchive(
 async function updateBackendSessionModel(
   chat: ChatRecord,
   model: string,
+  admittedClient?: WebRuntimeClient,
 ): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
-  const client = await requireRuntimeClient({
+  const client = admittedClient ?? await requireRuntimeClient({
     auth: "required",
     operation: `update persisted session ${sessionId} model`,
   });
@@ -2263,9 +2281,10 @@ async function updateBackendSessionModel(
 async function updateBackendSessionWorkspaceSelection(
   chat: ChatRecord,
   selection: WorkspaceSelection | null,
+  admittedClient?: WebRuntimeClient,
 ): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
-  const client = await requireRuntimeClient({
+  const client = admittedClient ?? await requireRuntimeClient({
     auth: "required",
     operation: `update persisted session ${sessionId} workspace selection`,
   });

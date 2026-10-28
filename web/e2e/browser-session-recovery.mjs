@@ -21,7 +21,8 @@ try {
   const response = await page.goto(fixture.urls[0] + fixture.path);
   await expect(page.getByRole('heading', { name: 'Unable to load this page' })).toBeVisible();
   await expect(page.locator('nav[aria-label="Mobile primary navigation"]')).toHaveCount(0);
-  await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toHaveAttribute('href', '/login');
+  const loginPath = `/login?${new URLSearchParams({ next: fixture.path })}`;
+  await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toHaveAttribute('href', loginPath);
   assert(!(response.headers()['set-cookie'] ?? '').includes('astra_session='), 'render must not replace authentication');
   assert(await selected() === original, 'error rendering must retain the captured proof');
   assert.equal((await context.request.get(fixture.urls[0] + '/api/runtime-auth/me')).status(), 503);
@@ -41,14 +42,25 @@ try {
     await expect(page).toHaveURL(fixture.urls[0] + fixture.path);
   } else {
     await page.getByRole('link', { name: 'Sign in', exact: true }).click();
-    await expect(page).toHaveURL(fixture.urls[0] + '/login');
+    await expect(page).toHaveURL(fixture.urls[0] + loginPath);
+    await page.getByRole('button', { name: 'Sign out previous browser session' }).click();
+    await expect(page.getByRole('status')).toContainText('Previous browser session signed out');
+    assert.equal((await context.request.get(fixture.urls[0] + '/api/runtime-auth/me')).status(), 401);
     await page.getByLabel('Username', { exact: true }).fill(fixture.username);
     await page.getByLabel('Password', { exact: true }).fill(fixture.password);
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-    await expect(page).not.toHaveURL(/\/login/);
+    await expect(page).toHaveURL(fixture.urls[0] + fixture.path);
   }
   await expect(page.getByRole('heading', { name: 'Unable to load this page' })).toHaveCount(0);
   await expect(page.locator('nav[aria-label="Mobile primary navigation"]')).toHaveCount(1);
+  if (fixture.mode === 'sign-in') {
+    await page.goto(fixture.urls[0] + '/login?' + new URLSearchParams({ next: '/a/..//evil.example' }));
+    await page.getByLabel('Username', { exact: true }).fill(fixture.username);
+    await page.getByLabel('Password', { exact: true }).fill(fixture.password);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    // /overview is the safe fallback and currently redirects to the home page.
+    await expect(page).toHaveURL(fixture.urls[0] + '/');
+  }
   assert(await selected() !== original, 'only explicit login replaces the broken owner');
   for (const url of fixture.urls) {
     const me = await context.request.get(url + '/api/runtime-auth/me');

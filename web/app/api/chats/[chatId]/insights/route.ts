@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat } from "@/lib/api/web-store";
 import type { ChatInsightsResponse } from "@/lib/api/types";
-import { requireRuntimeClient, runtimeErrorDetail } from "@/lib/runtime-client";
+import { runtimeErrorDetail } from "@/lib/runtime-client";
 import type { ReflectReport } from "@astra/sdk";
 
 type EvidenceKey = "audit" | "reflection" | "decision trace";
@@ -73,10 +73,7 @@ export async function GET(
   }
 
   try {
-    const runtime = await requireRuntimeClient({
-      auth: "required",
-      operation: "load web agent insights",
-    });
+    const runtime = auth.client;
     const [auditResult, reflectionResult, decisionTraceResult] =
       await Promise.allSettled([
         runtime.sdk.getSessionAudit(sessionId),

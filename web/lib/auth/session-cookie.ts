@@ -4,7 +4,7 @@ export const SESSION_MAX_AGE = 365 * 24 * 60 * 60;
 const MAX_COOKIE_BYTES = 3800;
 
 export type SessionSelection =
-  | { mode: "browser"; apiUrl: string; handle: string }
+  | { mode: "browser"; apiUrl: string; sessionId: string; handle: string }
   | { mode: "live"; apiUrl: string; auth: "none" }
   | { mode: "live"; apiUrl: string; auth: "static"; accessToken: string }
   | { mode: "demo"; apiUrl?: string }
@@ -38,22 +38,38 @@ function decode(value: string): string {
   return decoded.toString("utf8");
 }
 
+/** Untrusted JWT payload hint; the runtime verifies the signature and session. */
+export function jwtSessionHint(token: string): string | undefined {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3 || parts.some((part) => !part)) return undefined;
+    const payload = JSON.parse(decode(parts[1]));
+    const sid: unknown = payload?.sid;
+    return typeof sid === "string" && sid.length > 0 && Buffer.byteLength(sid, "utf8") <= 64
+      ? sid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseSelection(value: string): SessionSelection {
   if (value.length > MAX_COOKIE_BYTES)
     throw new Error("Session selection is too large.");
-  if (value.startsWith("bs1.")) {
+  if (value.startsWith("bs2.")) {
     const parts = value.split(".");
     const apiUrl = decode(parts[1] ?? "");
+    const sessionId = decode(parts[2] ?? "");
     if (
-      value.length > 1500 ||
-      parts.length !== 3 ||
-      !/^[\w-]{43}$/.test(parts[2] ?? "") ||
-      Buffer.from(parts[2], "base64url").toString("base64url") !== parts[2] ||
+      value.length > 1600 ||
+      parts.length !== 4 ||
+      !sessionId || Buffer.byteLength(sessionId, "utf8") > 64 || encode(sessionId) !== parts[2] ||
+      !/^[\w-]{43}$/.test(parts[3] ?? "") ||
+      Buffer.from(parts[3], "base64url").toString("base64url") !== parts[3] ||
       runtimeRoot(apiUrl) !== apiUrl
     ) {
       throw new Error("Invalid browser session.");
     }
-    return { mode: "browser", apiUrl, handle: value };
+    return { mode: "browser", apiUrl, sessionId, handle: value };
   }
   if (!value.startsWith("cfg1.")) throw new Error("Invalid session selection.");
   const selection: unknown = JSON.parse(decode(value.slice(5)));
