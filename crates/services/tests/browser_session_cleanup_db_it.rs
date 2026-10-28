@@ -64,7 +64,10 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     pool: astra_core::SharedPool,
     settings: astra_core::MatrixOneSettings,
 ) {
-    let other = astra_core::SharedPool::new(&settings).await.unwrap();
+    let mut worker_settings = settings.clone();
+    worker_settings.db_pool_max_connections = 1;
+    worker_settings.db_pool_min_connections = 0;
+    let other = astra_core::SharedPool::new(&worker_settings).await.unwrap();
     clean(pool.get()).await.unwrap();
     let direct = seed(pool.get(), false).await;
     let second_direct = seed(pool.get(), false).await;
@@ -100,9 +103,29 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     let mut rotation = pool.get().begin().await.unwrap();
     sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 DAY), created_at = NOW(6), browser_ciphertext = 'renewed' WHERE token_id = ?")
         .bind(&renewed).execute(&mut *rotation).await.unwrap();
+    let worker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(other.get())
+        .await
+        .unwrap();
     let sweeper_pool = other.clone();
     let sweep = tokio::spawn(async move { clean(sweeper_pool.get()).await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Observe the real DELETE while the conflicting renewal is uncommitted.
+    // Sleeping alone does not prove that the sweeper has started.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            assert!(
+                !sweep.is_finished(),
+                "cleanup finished before the conflicting DELETE was observed"
+            );
+            let info: Option<String> = sqlx::query_scalar(
+                "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
+            ).bind(&settings.database).bind(worker_connection_id).fetch_optional(pool.get()).await.unwrap().flatten();
+            if info.is_some_and(|sql| sql.contains("DELETE FROM auth_refresh_tokens")) && !sweep.is_finished() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cleanup DELETE did not start while the renewal held the row");
     rotation.commit().await.unwrap();
     if let Err(error) = sweep.await.unwrap() {
         assert!(
