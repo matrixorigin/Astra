@@ -2,6 +2,7 @@
 
 import { redirect } from "next/navigation";
 import { DEFAULT_API_URL } from "@/lib/runtime-config";
+import { runtimeRoot } from "@/lib/auth/session-cookie";
 import { currentUserContext } from "@/lib/auth/current-user";
 import {
   runtimeLogin,
@@ -20,7 +21,9 @@ type ActionResult = {
   error?: string;
 };
 
-async function loginApiUrl(): Promise<string> {
+async function loginApiUrl(formData: FormData): Promise<string> {
+  const requested = formData.get("runtime_url");
+  if (typeof requested === "string" && requested.trim()) return runtimeRoot(requested.trim());
   const selected = await replaceableSession();
   return selected && "apiUrl" in selected && selected.apiUrl
     ? selected.apiUrl
@@ -38,7 +41,9 @@ export async function loginAction(
     return { ok: false, error: "Username and password are required." };
   }
 
-  const apiUrl = await loginApiUrl();
+  let apiUrl: string;
+  try { apiUrl = await loginApiUrl(formData); }
+  catch { return { ok: false, error: "Invalid runtime URL." }; }
   const result = await runtimeLogin(apiUrl, { username, password });
   if (!result.ok) {
     return { ok: false, error: result.error };
@@ -71,7 +76,9 @@ export async function registerAction(
     return { ok: false, error: "Username, email, and password are required." };
   }
 
-  const apiUrl = await loginApiUrl();
+  let apiUrl: string;
+  try { apiUrl = await loginApiUrl(formData); }
+  catch { return { ok: false, error: "Invalid runtime URL." }; }
 
   const result = await runtimeRegister(apiUrl, {
     username,

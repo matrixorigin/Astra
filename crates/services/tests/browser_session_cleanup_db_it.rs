@@ -236,7 +236,18 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     });
     owners.build().execute(pool.get()).await.unwrap();
     assert_eq!(clean(pool.get()).await.unwrap(), 2000);
-    assert_eq!(clean(pool.get()).await.unwrap(), 2);
+    assert_eq!(
+        astra_services::cleanup_refresh_session_batch(pool.get(), &RetentionPolicy::default())
+            .await
+            .unwrap(),
+        (1, 1)
+    );
+    assert_eq!(
+        astra_services::cleanup_refresh_session_batch(pool.get(), &RetentionPolicy::default())
+            .await
+            .unwrap(),
+        (0, 0)
+    );
     assert_eq!(pair_count(pool.get(), &renewed).await, (1, 1));
     other.get().close().await;
 }

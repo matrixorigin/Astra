@@ -28,3 +28,14 @@ it("prevents signing in while the previous selection is still being signed out",
   expect(screen.getByRole("status")).toHaveTextContent("Previous browser session signed out");
   expect(screen.getByRole("button", { name: /^Sign in$/ })).toBeEnabled();
 });
+
+it("lets the user select a new runtime without revoking the old one", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 200 })));
+  render(<LoginPage />);
+  fireEvent.change(screen.getByLabelText(/runtime URL/i), { target: { value: "https://new.example/" } });
+  fireEvent.click(screen.getByRole("button", { name: "Select runtime" }));
+  expect(await screen.findByRole("status")).toHaveTextContent("Runtime selected");
+  expect(fetch).toHaveBeenCalledWith("/api/runtime-config", expect.objectContaining({
+    method: "POST", body: JSON.stringify({ apiUrl: "https://new.example/" }),
+  }));
+});

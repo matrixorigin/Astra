@@ -6,7 +6,7 @@ import {
   requireRuntimeClient,
 } from "@/lib/runtime-client/server";
 import { getRuntimeConfig } from "@/lib/runtime-config";
-import { SESSION_COOKIE, selectionCookie } from "@/lib/auth/session-cookie";
+import { SESSION_COOKIE, selectionCookie, parseSelection } from "@/lib/auth/session-cookie";
 import { GET as sidebar } from "@/app/api/sidebar/route";
 import { GET as chats } from "@/app/api/chats/route";
 import { POST as workTurn } from "@/app/api/works/[workId]/branches/[branchId]/turns/route";
@@ -25,7 +25,7 @@ import {
   GET as projects,
   POST as createProject,
 } from "@/app/api/projects/route";
-import { registerAction } from "@/lib/auth/actions";
+import { loginAction, registerAction } from "@/lib/auth/actions";
 import { RuntimeClientError } from "@/lib/runtime-client/errors";
 import { POST as stopRun } from "@/app/api/chats/[chatId]/stop/route";
 import { GET as capabilities } from "@/app/api/runtime/capabilities/route";
@@ -546,4 +546,28 @@ it("preserves missing error status and successful empty responses", async () => 
   ));
   const client = await requireRuntimeClient({ auth: "required" });
   expect(await client.get("/empty")).toBeUndefined();
+});
+
+it("forgets the browser selection without contacting an unavailable runtime", async () => {
+  const fetch = vi.fn().mockRejectedValue(new Error("offline"));
+  vi.stubGlobal("fetch", fetch);
+  const response = await clearConfiguration();
+  expect(response.status).toBe(200);
+  expect(fetch).not.toHaveBeenCalled();
+  expect(parseSelection(response.cookies.get(SESSION_COOKIE)!.value)).toEqual({ mode: "default" });
+});
+
+
+it.each(["login", "register"])("submits credentials only to the explicitly entered runtime for %s", async (action) => {
+  const seen: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    seen.push(new URL(String(input)).origin);
+    return Response.json({ error: "denied" }, { status: 401 });
+  }));
+  const form = new FormData();
+  form.set("username", "Alice"); form.set("password", "fixture-password");
+  form.set("email", "alice@example.test"); form.set("runtime_url", "https://new.example/");
+  const result = await (action === "login" ? loginAction : registerAction)({ ok: false }, form);
+  expect(result.ok).toBe(false);
+  expect(seen).toEqual(["https://new.example"]);
 });

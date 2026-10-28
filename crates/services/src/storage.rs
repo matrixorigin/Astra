@@ -7022,6 +7022,23 @@ async fn cleanup_refresh_sessions(
     ))
 }
 
+/// Maximum refresh sessions retired by one cleanup transaction.
+pub const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
+
+/// Remove one bounded batch of expired or revoked refresh sessions and their browser owners.
+pub async fn cleanup_refresh_session_batch(
+    pool: &sqlx::Pool<MySql>,
+    policy: &RetentionPolicy,
+) -> Result<(u64, u64), String> {
+    cleanup_refresh_sessions(
+        pool,
+        policy.refresh_token_days,
+        AUTH_REFRESH_TOKEN_BATCH_LIMIT,
+    )
+    .await
+    .map_err(|error| format!("cleanup refresh sessions: {error}"))
+}
+
 /// Purge expired authentication and operational records with TTL/expiry semantics.
 ///
 /// Returns a list of per-table cleanup results showing how many rows were deleted.
@@ -7031,7 +7048,6 @@ pub async fn cleanup_expired_data(
     pool: &sqlx::Pool<MySql>,
     policy: &RetentionPolicy,
 ) -> Result<Vec<CleanupResult>, String> {
-    const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_PROOF_BATCH_LIMIT: u32 = 1000;
     const DEVICE_CHALLENGE_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;

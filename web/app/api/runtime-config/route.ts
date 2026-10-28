@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { DEFAULT_API_URL, getRuntimeConfig } from "@/lib/runtime-config";
 import {
   adoptBrowserSession,
-  replaceableSession,
-  revokeSelection,
 } from "@/lib/auth/browser-session";
 import {
   SESSION_COOKIE,
@@ -126,7 +124,6 @@ export async function POST(request: NextRequest) {
 
 export async function DELETE() {
   try {
-    await revokeSelection(await replaceableSession());
     const response = NextResponse.json({ ok: true });
     response.cookies.set(
       SESSION_COOKIE,

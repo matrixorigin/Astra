@@ -477,8 +477,7 @@ creates a browser owner; raw refresh JWTs are never stored in cookies. Demo conf
 The public landing remains available and live workspace pages require sign-in.
 Demo combined with credentials is rejected as ambiguous; logout exits demo. Missing/malformed/revoked
 browser credentials do not fall back to environment authentication. Static logout
-selects explicit no-auth mode; settings DELETE restores the deployment destination (without credentials) only
-after revoking the captured browser session. These settings changes, static logout
+selects explicit no-auth mode; settings DELETE restores the deployment destination (without credentials) without revoking the previously selected session. Explicit logout remains the way to request revocation. These settings changes, static logout
 and login/import explicitly write the selector. Two concurrent explicit changes
 can arrive in reverse response order: HTTP cookies do not support compare-and-set.
 This limitation does not affect delayed ordinary refresh or handle-logout responses.
@@ -488,7 +487,7 @@ caps the canonical refresh-row expiry to it, so bearer admission and handle
 resolution respect the same ceiling. No separate browser expiry or sweep exists.
 The existing refresh retention sweep selects at most 1,000 expired/revoked sessions
 and atomically deletes them and their browser credentials in a short transaction
-with fresh retention predicates. A changed candidate batch rolls back before
+with fresh retention predicates. Full batches trigger bounded refresh-only catch-up, with a pause between groups of four batches. A changed candidate batch rolls back before
 removing any owner and retries at most three times. Database/serialization failures
 are surfaced and retried by the existing periodic maintenance loop. Handle logout
 deletes the owner immediately; direct JWT logout revokes the canonical session and
