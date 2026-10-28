@@ -411,3 +411,104 @@ Only `execution_settled: true` confirms execution settlement; a terminal status
 alone does not release an uncertain local execution lease. Internal transport
 detach retains the existing server recovery semantics and is not user cancel
 authority.
+
+
+## Web browser credential delivery
+
+Web uses one HttpOnly `astra_session` selector. A browser login imports a matching
+access/refresh pair through `POST /auth/browser-sessions`, consumes that refresh
+JWT, and stores a stable `bs1.<runtime-root>.<random-proof>` handle in the cookie.
+The runtime root and the 256-bit random proof are bound together. An ordinary
+request never sends this proof to a separately configured runtime URL.
+
+`auth_refresh_tokens` still owns session identity and revocation. The core-owned
+`auth_browser_sessions` table points to that row and holds the current encrypted
+credential pair. Its only columns are the handle-hash primary key, unique token
+ID, and encrypted payload. `/auth/refresh` accepts either a direct single-use JWT or the independent
+browser proof. A consumed direct JWT cannot recover a successor. A browser proof
+returns the same current access JWT while usable; refreshing atomically replaces
+the canonical hash and encrypted pair under the existing account lock. A loser
+reads the committed winner on a fresh snapshot. Provider verification happens
+before locking, and its identity/credential binding is checked again under lock.
+
+Each resolved Web client costs two indexed reads (owner, then canonical authority) and decrypt
+plus a BFF-to-runtime call on the ordinary path, with no write or provider call.
+The existing external-identity user index also covers provider, external subject
+and update time. Explicit index selection keeps both the Memoria existence check
+and canonical provider-owner lookup inside that index, including absent users;
+this avoids MatrixOne's empty-result base-table scan without new state or queries.
+React request caching deduplicates Server Component configuration reads. Separate
+client constructions in route handlers can still perform separate reads; there is
+no cross-user or process-local token authority. The existing SDK owns later 401
+retries, cancellation, REST and streaming admission. An initial owner/provider/DB
+outage is reported as unavailable. A later SDK refresh failure retains the SDK's
+existing original-401 behavior; it never clears the proof or reports success.
+
+RSC rendering, sidebar, ordinary API calls and refresh never write authentication
+cookies. Handle logout revokes the captured session and deletes its owner in one
+transaction, but leaves the now-inert cookie: a delayed logout response must not
+erase a newer login. Revocation uses the exact handle hash and canonical session
+identity, without decrypting credentials, calling a provider or requiring an active
+account. Expiry, deleted old accounts and replaced encryption keys cannot trap the
+browser in a session it cannot sign out of or replace. Other replicas reject subsequent owner resolutions; access
+JWTs already admitted or cached elsewhere retain the existing maximum 30-second
+principal-cache revocation delay. Same-runtime account replacement revokes the
+captured old session in the adoption transaction, taking account locks in sorted
+order. A different-runtime replacement revokes on the old runtime first; it fails
+without switching if that outcome is unknown and is not a distributed transaction.
+
+Runtime settings are full replacements, encoded as `cfg1` in the same selector:
+explicit static bearer, no authentication, demo, or deployment default. The deployment API URL may supply a default destination; `ASTRA_ACCESS_TOKEN`
+is never a browser identity. Anonymous/default selections cannot inherit a server
+credential. Each browser must sign in or explicitly supply its own static token. Refresh-pair import
+creates a browser owner; raw refresh JWTs are never stored in cookies. Demo configuration disables live access; it does not authenticate a workspace.
+The public landing remains available and live workspace pages require sign-in.
+Demo combined with credentials is rejected as ambiguous; logout exits demo. Missing/malformed/revoked
+browser credentials do not fall back to environment authentication. Static logout
+selects explicit no-auth mode; settings DELETE restores the deployment destination (without credentials) only
+after revoking the captured browser session. These settings changes, static logout
+and login/import explicitly write the selector. Two concurrent explicit changes
+can arrive in reverse response order: HTTP cookies do not support compare-and-set.
+This limitation does not affect delayed ordinary refresh or handle-logout responses.
+
+The encrypted payload has an immutable one-year absolute cap. Browser rotation
+caps the canonical refresh-row expiry to it, so bearer admission and handle
+resolution respect the same ceiling. No separate browser expiry or sweep exists.
+The existing refresh retention sweep selects at most 1,000 expired/revoked sessions
+and atomically deletes them and their browser credentials in a short transaction
+with fresh retention predicates. A changed candidate batch rolls back before
+removing any owner and retries at most three times. Database/serialization failures
+are surfaced and retried by the existing periodic maintenance loop. Logout deletes
+the owner immediately. Other ciphertext remains until the session is expired or
+revoked **and** its age since issuance/last rotation exceeds the existing retention
+threshold (default seven days), followed by the sweep/backlog delay. This is a
+minimum row age, not an extra seven days after expiry. Refresh TTL defaults to
+30 days in code; deployment configuration can override it.
+The existing canonical candidate selection can scan refresh rows; the new keyed
+delete adds no independent owner scan. Cleanup results retain exact per-table
+counts. Managed mutators maintain this relationship; direct SQL deletion of a
+canonical row is unsupported and can orphan an encrypted owner. Inactive/deleted
+accounts and disconnected providers deny via canonical state without updating
+or scanning their owners.
+JWT signing and `ASTRA_TOKEN_ENCRYPTION_KEY` must match across runtime replicas.
+Missing keys, key mismatch and corrupt ciphertext fail closed. Changing either key
+requires sign-in again; it is not transparent key rotation.
+
+### Fresh-schema deployment
+
+This change advances the strict core schema contract to `2026-10-28-v111`. It does
+not migrate, alter, drop or recreate an existing database. Provision a **separate
+fresh database**, preserving the old database and its data. Existing data does not
+appear in the fresh database without a separately designed migration. Drain old
+Web/runtime replicas before cutting over both tiers and require new sign-in; legacy
+token cookies are not converted. Do not mix old cookie writers with new handle
+readers. Rollback also requires a drain and the original code/database; older
+runtimes cannot consume new browser handles.
+
+Validation: Web unit/public-route tests; `browser_sessions_db_it` for real DB
+concurrency, rollback, provider replacement/disconnect and isolation;
+`browser_session_next_db_it` for two real Next servers and two independent runtime
+auth services sharing an isolated DB. Build the current Web source before running
+the latter (`npm --prefix packages/sdk run build && npm --prefix web run build`),
+use Node >=22, and explicitly set `ASTRA_TEST_DB_IT=1` and `ASTRA_TEST_DATABASE`.
+No live provider or LLM credentials are needed.

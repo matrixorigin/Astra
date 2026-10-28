@@ -21,6 +21,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(auth_handlers::auth_memoria_handler)
                 .delete(auth_handlers::auth_memoria_disconnect_handler),
         )
+        .route(
+            "/auth/browser-sessions",
+            post(auth_handlers::auth_browser_session_handler),
+        )
         .route("/auth/refresh", post(auth_handlers::auth_refresh_handler))
         .route("/auth/logout", post(auth_handlers::auth_logout_handler))
         .route(

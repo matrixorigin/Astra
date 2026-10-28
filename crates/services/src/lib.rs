@@ -144,9 +144,10 @@ pub use astra_core::composite_snapshot::{
 pub use auth::{
     AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthProviderAuthorizedRequestContext,
     AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
-    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
-    DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
-    DatabaseAuthService, DatabaseSessionService, EdgeTokenBinding, ExternalAuthProviderConfig,
+    BrowserSessionCreated, BrowserSessionRequest, DatabaseAdminAuditReader,
+    DatabaseAdminAuthorizer, DatabaseAdminInitializer, DatabaseAdminTokenReader,
+    DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager, DatabaseAuthService,
+    DatabaseSessionService, EdgeTokenBinding, ExternalAuthProviderConfig,
     ExternalAuthorizeRequestData, ExternalAuthorizedRequest, ExternalCatalogResponse,
     ExternalProviderClient, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, FernetTokenEncryptor, HttpExternalProviderClient,

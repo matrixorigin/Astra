@@ -18,6 +18,23 @@ pub(super) fn decode_jwt_claims_with_detail(
     .map_err(|_| error_response(StatusCode::UNAUTHORIZED, invalid_detail))
 }
 
+/// Only for a signature-verified, encrypted browser credential snapshot. Callers
+/// must check expiry before returning access; request authentication never uses this.
+pub(super) fn decode_stored_access_claims(
+    token: &str,
+    settings: &JwtSettings,
+) -> Result<JwtClaims, (StatusCode, Json<ErrorResponse>)> {
+    let mut validation = Validation::new(parse_jwt_algorithm(&settings.algorithm)?);
+    validation.validate_exp = false;
+    decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(settings.secret_key.as_bytes()),
+        &validation,
+    )
+    .map(|data| data.claims)
+    .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "Invalid browser credentials"))
+}
+
 pub(super) fn decode_jwt_claims(
     token: &str,
     settings: &JwtSettings,

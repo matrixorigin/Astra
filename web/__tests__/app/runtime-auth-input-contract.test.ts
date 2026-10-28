@@ -1,5 +1,8 @@
 // @vitest-environment node
 
+vi.mock('next/headers', () => ({ cookies: vi.fn(async () => ({ get: () => undefined })) }));
+vi.mock('@/lib/auth/browser-session', () => ({ adoptBrowserSession: vi.fn(async () => 'opaque-handle'), replaceableSession: vi.fn(async () => undefined), revokeSelection: vi.fn() }));
+
 vi.mock('@/lib/auth/runtime-auth-client', () => ({
   runtimeLogin: vi.fn(),
 }));
@@ -9,11 +12,10 @@ import { POST as login } from '@/app/api/runtime-auth/login/route';
 import { POST as saveRuntimeConfig } from '@/app/api/runtime-config/route';
 import { runtimeLogin } from '@/lib/auth/runtime-auth-client';
 import {
-  ACCESS_TOKEN_COOKIE,
-  API_URL_COOKIE,
-  DEMO_MODE_COOKIE,
   DEFAULT_API_URL,
 } from '@/lib/runtime-config';
+
+import { SESSION_COOKIE, parseSelection } from '@/lib/auth/session-cookie';
 
 const mockRuntimeLogin = vi.mocked(runtimeLogin);
 
@@ -117,15 +119,12 @@ describe('public runtime input contracts', () => {
         '/api/runtime-config',
         JSON.stringify({
           apiUrl: ' http://runtime ',
-          accessToken: ' access ',
           demoMode: true,
         }),
       ),
     );
 
     expect(response.status).toBe(200);
-    expect(response.cookies.get(API_URL_COOKIE)?.value).toBe('http://runtime');
-    expect(response.cookies.get(ACCESS_TOKEN_COOKIE)?.value).toBe('access');
-    expect(response.cookies.get(DEMO_MODE_COOKIE)?.value).toBe('true');
+    expect(parseSelection(response.cookies.get(SESSION_COOKIE)!.value)).toEqual({ mode: 'demo', apiUrl: 'http://runtime/' });
   });
 });

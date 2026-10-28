@@ -5,10 +5,6 @@ import {
   methodCanHaveJson,
 } from "@astra/sdk";
 import {
-  ACCESS_TOKEN_COOKIE,
-  API_URL_COOKIE,
-  DEFAULT_API_URL,
-  REFRESH_TOKEN_COOKIE,
   getRuntimeConfig,
   getWebConfigurationMessage,
   type RuntimeConfig,
@@ -49,9 +45,6 @@ export class WebRuntimeClient {
       baseUrl: new URL("/", config.apiUrl).toString(),
       accessToken: config.accessToken,
       refreshToken: config.refreshToken,
-      onTokenRefresh: async (tokens) => {
-        await this.persistTokens(tokens.accessToken, tokens.refreshToken);
-      },
     });
   }
 
@@ -179,28 +172,7 @@ export class WebRuntimeClient {
     return headers;
   }
 
-  private async persistTokens(
-    accessToken: string,
-    refreshToken: string,
-  ): Promise<void> {
-    const { cookies } = await import("next/headers");
-    const cookieStore = await cookies();
-    // A newer refresh may have replaced this pair while cookie acquisition waited.
-    const current = this.sdk.getTokens();
-    if (current.accessToken !== accessToken || current.refreshToken !== refreshToken) {
-      return;
-    }
-    cookieStore.set(REFRESH_TOKEN_COOKIE, refreshToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-    });
-    cookieStore.set(ACCESS_TOKEN_COOKIE, accessToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-    });
-  }
+
 }
 
 export async function getRuntimeClient(
@@ -243,35 +215,5 @@ export async function requireRuntimeClient(
 export async function getRuntimeClientFromCookies(
   options: RuntimeClientOptions = {},
 ): Promise<WebRuntimeClient> {
-  const { cookies } = await import("next/headers");
-  const cookieStore = await cookies();
-  const apiUrl =
-    cookieStore.get(API_URL_COOKIE)?.value ??
-    process.env.ASTRA_API_URL ??
-    DEFAULT_API_URL;
-  const accessToken =
-    cookieStore.get(ACCESS_TOKEN_COOKIE)?.value ??
-    process.env.ASTRA_ACCESS_TOKEN;
-  const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
-  if (options.auth === "required" && !accessToken) {
-    throw new RuntimeClientError({
-      operation: options.operation ?? "initialize runtime client",
-      path: "/",
-      status: 401,
-      detail: "Runtime authentication is missing.",
-    });
-  }
-  return new WebRuntimeClient({
-    mode: "live",
-    source: cookieStore.get(API_URL_COOKIE)?.value ? "cookie" : "env",
-    apiUrl,
-    accessToken,
-    refreshToken,
-    demoMode: false,
-    hasAccessToken: Boolean(accessToken),
-    hasRefreshToken: Boolean(refreshToken),
-    message: accessToken
-      ? `Connected to ${apiUrl} with authentication.`
-      : `Connected to ${apiUrl} without authentication. Login for full access.`,
-  });
+  return requireRuntimeClient(options);
 }

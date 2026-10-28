@@ -61,7 +61,11 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .collect::<Vec<_>>();
     assert!(missing.is_empty(), "missing catalog tables: {missing:?}");
     assert!(contracts.iter().all(|table| table.ddl_sha256.len() == 64));
-    for expected in ["work_proposal_sequences", "work_proposals"] {
+    for expected in [
+        "work_proposal_sequences",
+        "work_proposals",
+        "auth_browser_sessions",
+    ] {
         assert!(
             contracts.iter().any(|table| table.name == expected),
             "canonical proposal owner is missing from schema authority: {expected}"
@@ -281,6 +285,59 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         current,
         astra_services::storage::CORE_SCHEMA_CONTRACT_VERSION
     );
+
+    for (change, restore, expected) in [
+        (
+            "ALTER TABLE auth_external_identities DROP INDEX idx_external_identity_user",
+            "CREATE INDEX idx_external_identity_user ON auth_external_identities (astra_user_id, provider_id, external_subject, updated_at)",
+            "idx_external_identity_user",
+        ),
+        (
+            "ALTER TABLE auth_browser_sessions MODIFY handle_hash VARCHAR(63) NOT NULL",
+            "ALTER TABLE auth_browser_sessions MODIFY handle_hash VARCHAR(64) NOT NULL",
+            "handle_hash",
+        ),
+        (
+            "ALTER TABLE auth_browser_sessions MODIFY encrypted_value TEXT NULL",
+            "ALTER TABLE auth_browser_sessions MODIFY encrypted_value TEXT NOT NULL",
+            "encrypted_value",
+        ),
+    ] {
+        sqlx::query(change).execute(pool.get()).await.unwrap();
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("browser owner drift must reject startup")
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+        sqlx::query(restore).execute(pool.get()).await.unwrap();
+    }
+    sqlx::query("ALTER TABLE auth_browser_sessions DROP INDEX uq_browser_session_token")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("CREATE INDEX uq_browser_session_token ON auth_browser_sessions (token_id)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("one owner per canonical session requires uniqueness")
+        .to_string();
+    assert!(
+        error.contains("uq_browser_session_token must be unique"),
+        "{error}"
+    );
+    sqlx::query("ALTER TABLE auth_browser_sessions DROP INDEX uq_browser_session_token")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_browser_session_token ON auth_browser_sessions (token_id)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .unwrap();
 
     // The named hash lookup must remain unique, even when the readiness
     // marker is already present. Bootstrap validates shape; it never repairs.

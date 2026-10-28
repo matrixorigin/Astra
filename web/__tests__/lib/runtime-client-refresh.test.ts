@@ -1,283 +1,409 @@
 // @vitest-environment node
 vi.mock("next/headers", () => ({ cookies: vi.fn() }));
-
 import { cookies } from "next/headers";
-import { WebRuntimeClient } from "@/lib/runtime-client/server";
-import { ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE, type RuntimeConfig } from "@/lib/runtime-config";
+import {
+  WebRuntimeClient,
+  requireRuntimeClient,
+} from "@/lib/runtime-client/server";
+import { getRuntimeConfig } from "@/lib/runtime-config";
+import { SESSION_COOKIE, selectionCookie } from "@/lib/auth/session-cookie";
+import { GET as sidebar } from "@/app/api/sidebar/route";
+import { POST as workTurn } from "@/app/api/works/[workId]/branches/[branchId]/turns/route";
+import { POST as refreshRoute } from "@/app/api/runtime-auth/refresh/route";
+import { POST as logoutRoute } from "@/app/api/runtime-auth/logout/route";
+import { GET as meRoute } from "@/app/api/runtime-auth/me/route";
+import {
+  GET as configRoute,
+  POST as configure,
+  DELETE as clearConfiguration,
+} from "@/app/api/runtime-config/route";
+import { requireRuntimeAuth, requireRuntimeUser } from "@/lib/api/auth-guard";
+import { NextRequest } from "next/server";
+import {
+  GET as projects,
+  POST as createProject,
+} from "@/app/api/projects/route";
+import { registerAction } from "@/lib/auth/actions";
 
-beforeEach(() => vi.mocked(cookies).mockReset());
-afterEach(() => vi.unstubAllGlobals());
+const root = "https://runtime.example/";
+const handle = `bs1.${Buffer.from(root).toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+let jar: Map<string, string>;
+let set: ReturnType<typeof vi.fn>;
+beforeEach(() => {
+  jar = new Map([[SESSION_COOKIE, handle]]);
+  set = vi.fn((key: string, value: string) => jar.set(key, value));
+  vi.mocked(cookies).mockResolvedValue({
+    get: (name: string) =>
+      jar.has(name) ? { value: jar.get(name) } : undefined,
+    set,
+  } as unknown as Awaited<ReturnType<typeof cookies>>);
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 
-function runtimeConfig(accessToken: string, refreshToken: string): RuntimeConfig {
-  return {
-    mode: "live", source: "cookie", apiUrl: "https://example.test",
-    accessToken, refreshToken, demoMode: false,
-    hasAccessToken: true, hasRefreshToken: true, message: "",
-  };
+function runtimeFetch() {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/auth/refresh") {
+      expect(JSON.parse(String(init?.body)).refresh_token).toBe(handle);
+      return Response.json({ access_token: "current", refresh_token: handle });
+    }
+    if (path === "/auth/logout")
+      return Response.json({ message: "Logged out" });
+    return new Headers(init?.headers).get("authorization") === "Bearer current"
+      ? Response.json({
+          user_id: "alice",
+          username: "Alice",
+          email: "alice@example.test",
+          display_name: null,
+        })
+      : new Response("expired", { status: 401 });
+  });
 }
 
-it("persists refreshed httpOnly cookies before the initiating SDK request completes", async () => {
-  let release!: () => void;
-  const available = new Promise<void>(resolve => { release = resolve; });
-  const set = vi.fn();
-  vi.mocked(cookies).mockImplementation(async () => {
-    await available;
-    // This consumer only uses the cookie store's setter.
-    return { set } as unknown as Awaited<ReturnType<typeof cookies>>;
+it("resolves many independent clients without touching read-only rendering cookies", async () => {
+  set.mockImplementation(() => {
+    throw new Error(
+      "Cookies can only be modified in a Server Action or Route Handler.",
+    );
   });
-  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith("/auth/refresh")) {
-      return Response.json({ access_token: "new-access", refresh_token: "new-refresh" });
-    }
-    return new Headers(init?.headers).get("Authorization") === "Bearer new-access"
-      ? Response.json({ user_id: "alice" }) : Response.json({}, { status: 401 });
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  const runtime = new WebRuntimeClient(runtimeConfig("old-access", "old-refresh"));
-  const settled = vi.fn();
-  const pending = runtime.sdk.getMe();
-  void pending.then(settled, settled);
-  await vi.waitFor(() => expect(cookies).toHaveBeenCalledTimes(1));
-  expect(settled).not.toHaveBeenCalled();
+  vi.stubGlobal("fetch", runtimeFetch());
+  const results = await Promise.all(
+    Array.from({ length: 8 }, async () => {
+      const client = await requireRuntimeClient({ auth: "required" });
+      return client.sdk.getMe();
+    }),
+  );
+  expect(results.every((user) => user.user_id === "alice")).toBe(true);
   expect(set).not.toHaveBeenCalled();
-  await expect(runtime.get("/auth/me", { auth: "required" })).resolves.toEqual({ user_id: "alice" });
-  expect(settled).not.toHaveBeenCalled();
-  release();
-  await expect(pending).resolves.toEqual({ user_id: "alice" });
-  const options = { httpOnly: true, sameSite: "lax", path: "/" };
-  expect(set.mock.calls).toEqual([
-    [REFRESH_TOKEN_COOKIE, "new-refresh", options],
-    [ACCESS_TOKEN_COOKIE, "new-access", options],
-  ]);
-  expect(fetchMock.mock.calls.map(([, init]) => new Headers(init?.headers).get("Authorization"))).toEqual([
-    "Bearer old-access", null, "Bearer new-access", "Bearer new-access",
-  ]);
+  const config = await getRuntimeConfig();
+  const expiredClient = new WebRuntimeClient({
+    ...config,
+    accessToken: "expired",
+  });
+  expect((await expiredClient.sdk.getMe()).user_id).toBe("alice");
+  expect(set).not.toHaveBeenCalled();
 });
 
-it("does not replay a delayed old-token request while cookie persistence fails", async () => {
-  let release401!: (response: Response) => void;
-  let releaseCookies!: () => void;
-  const late401 = new Promise<Response>(resolve => { release401 = resolve; });
-  const cookiesReady = new Promise<void>(resolve => { releaseCookies = resolve; });
-  vi.mocked(cookies).mockImplementation(async () => {
-    await cookiesReady;
-    return { set: () => { throw new Error("cookie write unavailable"); } } as unknown as Awaited<ReturnType<typeof cookies>>;
-  });
-  const expired = () => new Response("expired", { status: 401 });
-  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith('/auth/refresh')) return Response.json({ access_token: 'new', refresh_token: 'rotated' });
-    const auth = new Headers(init?.headers).get('Authorization');
-    if (url.endsWith('/late') && auth === 'Bearer old') return late401;
-    return auth === 'Bearer old' ? expired() : new Response('ok');
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const runtime = new WebRuntimeClient(runtimeConfig('old', 'old-refresh'));
-  const late = runtime.fetchResponse('/late', { auth: 'required' });
-  const first = runtime.fetchResponse('/first', { auth: 'required' });
-  await vi.waitFor(() => expect(cookies).toHaveBeenCalledTimes(1));
-  release401(expired());
-  expect((await late).status).toBe(401);
-  releaseCookies();
-  expect((await first).status).toBe(401);
-  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/late'))).toHaveLength(1);
-  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/first'))).toHaveLength(1);
+it("uses the handle runtime even when old settings and env select a different server", async () => {
+  jar.set("astra_api_url", "https://unrelated.example");
+  jar.set("astra_access_token", "legacy");
+  vi.stubEnv("ASTRA_API_URL", "https://unrelated.example");
+  vi.stubEnv("ASTRA_ACCESS_TOKEN", "another-account");
+  const fetch = runtimeFetch();
+  vi.stubGlobal("fetch", fetch);
+  const client = await requireRuntimeClient({ auth: "required" });
+  await client.sdk.getMe();
+  expect(
+    fetch.mock.calls.every(
+      ([url]) => new URL(String(url)).origin === new URL(root).origin,
+    ),
+  ).toBe(true);
 });
 
-it("can recover when writing the access cookie fails after the rotated refresh cookie", async () => {
-  const jar = new Map([[ACCESS_TOKEN_COOKIE, 'old'], [REFRESH_TOKEN_COOKIE, 'old-refresh']]);
-  let failAccess = true;
-  vi.mocked(cookies).mockResolvedValue({
-    set(name: string, value: string) {
-      if (name === ACCESS_TOKEN_COOKIE && failAccess) {
-        failAccess = false;
-        throw new Error('access cookie write failed');
+it("uses one owner for me, refresh, gates and config and exposes no credential", async () => {
+  vi.stubGlobal("fetch", runtimeFetch());
+  expect((await meRoute()).status).toBe(200);
+  expect((await refreshRoute()).status).toBe(200);
+  expect(await requireRuntimeAuth()).toBeNull();
+  expect((await requireRuntimeUser()).user?.user_id).toBe("alice");
+  const response = await configRoute();
+  const text = await response.text();
+  expect(text).toContain('"hasAccessToken":true');
+  expect(text).not.toContain(handle);
+  expect(text).not.toContain("current");
+  expect(response.headers.has("set-cookie")).toBe(false);
+  expect(set).not.toHaveBeenCalled();
+});
+
+it("does not erase a new login when an old handle logout response arrives late", async () => {
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const started = vi.fn();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      started();
+      await pending;
+      return Response.json({});
+    }),
+  );
+  const response = logoutRoute();
+  await vi.waitFor(() => expect(started).toHaveBeenCalledOnce());
+  const newHandle = handle.replace(/.$/, handle.endsWith("A") ? "Q" : "A");
+  jar.set(SESSION_COOKIE, newHandle);
+  finish();
+  expect((await response).status).toBe(200);
+  expect(set).not.toHaveBeenCalled();
+  expect(jar.get(SESSION_COOKIE)).toBe(newHandle);
+});
+
+it.each([401, 503])(
+  "keeps a failed owner bound and never falls back to env (%s)",
+  async (status) => {
+    vi.stubEnv("ASTRA_ACCESS_TOKEN", "other-account");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({ detail: "session unavailable" }, { status }),
+      ),
+    );
+    expect((await meRoute()).status).toBe(status);
+    expect((await requireRuntimeAuth())?.status).toBe(status);
+    expect((await requireRuntimeUser()).response?.status).toBe(status);
+    expect(set).not.toHaveBeenCalled();
+  },
+);
+
+it("reports failed logout and keeps the proof when revocation outcome is unknown", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => {
+      throw new Error("connection reset");
+    }),
+  );
+  expect((await logoutRoute()).status).toBe(503);
+  expect(set).not.toHaveBeenCalled();
+});
+
+it("validates replacement before revoking and binds static credentials to their selected runtime", async () => {
+  const fetch = runtimeFetch();
+  vi.stubGlobal("fetch", fetch);
+  const send = (body: unknown) =>
+    configure(
+      new NextRequest("http://web.test/api/runtime-config", {
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  expect(
+    (await send({ apiUrl: "file:///tmp", accessToken: "static" })).status,
+  ).toBe(400);
+  expect(fetch).not.toHaveBeenCalled();
+  const response = await send({
+    apiUrl: "https://other.example",
+    accessToken: "static",
+  });
+  expect(response.status).toBe(200);
+  expect(new URL(String(fetch.mock.calls[0][0])).origin).toBe(
+    new URL(root).origin,
+  );
+  jar.set(SESSION_COOKIE, response.cookies.get(SESSION_COOKIE)!.value);
+  const config = await getRuntimeConfig();
+  expect(config.accessToken).toBe("static");
+  expect(config.apiUrl).toBe("https://other.example/");
+  expect(config.refreshToken).toBeUndefined();
+});
+
+it("static logout suppresses env fallback, while reset restores only the deployment URL", async () => {
+  vi.stubEnv("ASTRA_ACCESS_TOKEN", "env-token");
+  vi.stubEnv("ASTRA_API_URL", "https://env.example");
+  jar.set(
+    SESSION_COOKIE,
+    selectionCookie({
+      mode: "live",
+      apiUrl: root,
+      auth: "static",
+      accessToken: "static",
+    }),
+  );
+  expect((await logoutRoute()).status).toBe(200);
+  expect((await getRuntimeConfig()).accessToken).toBeUndefined();
+  const reset = await clearConfiguration();
+  jar.set(SESSION_COOKIE, reset.cookies.get(SESSION_COOKIE)!.value);
+  const config = await getRuntimeConfig();
+  expect(config.accessToken).toBeUndefined();
+  expect(config.apiUrl).toBe("https://env.example/");
+});
+
+it.each(["cfg1.invalid", ""])(
+  "does not use a different account for invalid selector %s",
+  async (value) => {
+    vi.stubEnv("ASTRA_ACCESS_TOKEN", "env-token");
+    jar.set(SESSION_COOKIE, value);
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    expect((await requireRuntimeAuth())?.status).toBe(401);
+    expect(fetch).not.toHaveBeenCalled();
+  },
+);
+
+it("resolves sidebar with the browser owner; demo configuration grants no workspace identity", async () => {
+  const auth = runtimeFetch();
+  const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/sessions")
+      return Response.json({ sessions: [], next_cursor: null });
+    if (path === "/v1/runs" || path === "/runs")
+      return Response.json({ runs: [], next_cursor: null });
+    return auth(input, init);
+  });
+  vi.stubGlobal("fetch", fetch);
+  const live = await sidebar();
+  expect(live.status).toBe(200);
+  expect((await live.json()).user.id).toBe("alice");
+  expect(
+    fetch.mock.calls.some(
+      ([url]) => new URL(String(url)).pathname === "/sessions",
+    ),
+  ).toBe(true);
+  expect(set).not.toHaveBeenCalled();
+  fetch.mockClear();
+  jar.set(SESSION_COOKIE, selectionCookie({ mode: "demo" }));
+  const demo = await sidebar();
+  expect(demo.status).toBe(401);
+  expect((await requireRuntimeUser()).response?.status).toBe(401);
+  expect((await logoutRoute()).status).toBe(200);
+  expect((await getRuntimeConfig()).demoMode).toBe(false);
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it("retries Work stream admission after a late 401 without changing its request or cookie", async () => {
+  let resolutions = 0;
+  const admissions: Array<{ body: string; bearer: string | null }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/auth/refresh") {
+        resolutions += 1;
+        expect(JSON.parse(String(init?.body)).refresh_token).toBe(handle);
+        return Response.json({
+          access_token: resolutions === 1 ? "old" : "current",
+          refresh_token: handle,
+        });
       }
-      jar.set(name, value);
-    },
-  } as unknown as Awaited<ReturnType<typeof cookies>>);
-  let validRefresh = 'old-refresh';
-  let rotations = 0;
-  const seenRefresh: string[] = [];
-  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith('/auth/refresh')) {
-      const refresh = JSON.parse(String(init?.body)).refresh_token;
-      seenRefresh.push(refresh);
-      if (refresh !== validRefresh) return new Response('expired', { status: 401 });
-      rotations++;
-      validRefresh = `refresh-${rotations}`;
-      return Response.json({ access_token: `access-${rotations}`, refresh_token: validRefresh });
-    }
-    return new Headers(init?.headers).get('Authorization') === `Bearer access-${rotations}`
-      ? Response.json({ user_id: 'alice' }) : new Response('expired', { status: 401 });
-  }));
-  const first = new WebRuntimeClient(runtimeConfig('old', 'old-refresh'));
-  expect((await first.fetchResponse('/resource', { auth: 'required' })).status).toBe(401);
-  expect(jar.get(ACCESS_TOKEN_COOKIE)).toBe('old');
-  expect(jar.get(REFRESH_TOKEN_COOKIE)).toBe('refresh-1');
-  const retry = new WebRuntimeClient(runtimeConfig(jar.get(ACCESS_TOKEN_COOKIE)!, jar.get(REFRESH_TOKEN_COOKIE)!));
-  await expect(retry.get('/resource', { auth: 'required' })).resolves.toEqual({ user_id: 'alice' });
-  expect(seenRefresh).toEqual(['old-refresh', 'refresh-1']);
+      expect(path).toBe("/v1/works/work-1/branches/branch-1/turns");
+      admissions.push({
+        body: String(init?.body),
+        bearer: new Headers(init?.headers).get("authorization"),
+      });
+      return admissions.length === 1
+        ? new Response("expired", { status: 401 })
+        : new Response('data: {"type":"work_turn_started"}\n\n', {
+            headers: { "content-type": "text/event-stream" },
+          });
+    }),
+  );
+  const input = {
+    request_id: "turn-1",
+    attachment_id: "attachment-1",
+    message: "Continue",
+  };
+  const response = await workTurn(
+    new NextRequest(
+      "http://web.test/api/works/work-1/branches/branch-1/turns",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    ),
+    { params: Promise.resolve({ workId: "work-1", branchId: "branch-1" }) },
+  );
+  expect(response.status).toBe(200);
+  expect(await response.text()).toContain("work_turn_started");
+  expect(admissions).toEqual([
+    { body: JSON.stringify(input), bearer: "Bearer old" },
+    { body: JSON.stringify(input), bearer: "Bearer current" },
+  ]);
+  expect(resolutions).toBe(2);
+  expect(response.headers.has("set-cookie")).toBe(false);
+  expect(set).not.toHaveBeenCalled();
+});
+
+it.each([undefined, selectionCookie({ mode: "default" })])(
+  "never exposes a deployment bearer to an anonymous/default browser (%s)",
+  async (selector) => {
+    vi.stubEnv("ASTRA_ACCESS_TOKEN", "deployment-account-secret");
+    vi.stubEnv("ASTRA_API_URL", "https://env.example/");
+    if (selector === undefined) jar.delete(SESSION_COOKIE);
+    else jar.set(SESSION_COOKIE, selector);
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    expect((await meRoute()).status).toBe(401);
+    expect((await requireRuntimeAuth())?.status).toBe(401);
+    expect((await requireRuntimeUser()).response?.status).toBe(401);
+    const config = await getRuntimeConfig();
+    expect(config.hasAccessToken).toBe(false);
+    expect(config.accessToken).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  },
+);
+
+it("reports an already-created account when browser enrollment fails after registration", async () => {
+  jar.clear();
+  const calls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      calls.push(path);
+      if (path === "/auth/register")
+        return Response.json({
+          user_id: "alice",
+          username: "Alice",
+          email: "alice@example.test",
+          display_name: null,
+          access_token: "access",
+          refresh_token: "refresh",
+        });
+      return Response.json({ detail: "unavailable" }, { status: 503 });
+    }),
+  );
+  const form = new FormData();
+  form.set("username", "Alice");
+  form.set("email", "alice@example.test");
+  form.set("password", "test-password");
+  const result = await registerAction({ ok: false }, form);
+  expect(result.ok).toBe(false);
+  expect(result.error).toContain("Account created");
+  expect(result.error).toContain("Sign in to continue");
+  expect(calls).toEqual([
+    "/auth/register",
+    "/auth/browser-sessions",
+    "/auth/refresh",
+  ]);
+  expect(set).not.toHaveBeenCalled();
 });
 
 it.each([
-  { name: "SDK notification", sdkRefresh: true },
-  { name: "Web transport", sdkRefresh: false },
-])("does not rotate during an outstanding $name notification and recovers afterward", async ({ sdkRefresh }) => {
-  let release!: () => void;
-  const available = new Promise<void>(resolve => { release = resolve; });
-  const jar = new Map<string, string>();
-  const set = vi.fn((name: string, value: string) => { jar.set(name, value); });
-  vi.mocked(cookies).mockImplementation(async () => {
-    if (vi.mocked(cookies).mock.calls.length === 1) await available;
-    return { set } as unknown as Awaited<ReturnType<typeof cookies>>;
-  });
-
-  const issued = new Set(["access-0"]);
-  const expired = new Set(["access-0"]);
-  const refreshRequests: string[] = [];
-  let rotation = 0;
-  let validRefresh = "refresh-0";
-  const unauthorized = () => Response.json({ detail: "Unauthorized" }, { status: 401 });
-  vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith("/auth/refresh")) {
-      const token = JSON.parse(String(init?.body)).refresh_token;
-      refreshRequests.push(token);
-      if (token !== validRefresh) return unauthorized();
-      rotation++;
-      validRefresh = `refresh-${rotation}`;
-      const access = `access-${rotation}`;
-      issued.add(access);
-      return Response.json({ access_token: access, refresh_token: validRefresh });
-    }
-    const token = new Headers(init?.headers).get("Authorization")?.replace("Bearer ", "");
-    return token && issued.has(token) && !expired.has(token)
-      ? Response.json({ user_id: "alice" }) : unauthorized();
-  }));
-
-  const runtime = new WebRuntimeClient(runtimeConfig("access-0", "refresh-0"));
-  const first = Promise.allSettled([runtime.sdk.getMe()]);
-  await vi.waitFor(() => expect(cookies).toHaveBeenCalledTimes(1));
-  expired.add("access-1");
-  if (sdkRefresh) {
-    await expect(runtime.sdk.getMe()).rejects.toMatchObject({ status: 401 });
-  } else {
-    await expect(runtime.get("/auth/me", { auth: "required" })).rejects.toMatchObject({ status: 401 });
-  }
-  release();
-  expect(await first).toMatchObject([{ status: "rejected", reason: { status: 401 } }]);
-
-  expect(set.mock.calls.map(([name, value]) => [name, value])).toEqual([
-    [REFRESH_TOKEN_COOKIE, "refresh-1"],
-    [ACCESS_TOKEN_COOKIE, "access-1"],
-  ]);
-  const next = new WebRuntimeClient(runtimeConfig(jar.get(ACCESS_TOKEN_COOKIE)!, jar.get(REFRESH_TOKEN_COOKIE)!));
-  await expect(next.sdk.getMe()).resolves.toEqual({ user_id: "alice" });
-  expect(jar.get(REFRESH_TOKEN_COOKIE)).toBe(validRefresh);
-  expect(refreshRequests).toEqual(["refresh-0", "refresh-1"]);
-});
-
-it("shares one in-flight refresh between SDK and Web requests", async () => {
-  let release!: () => void;
-  const refresh = new Promise<void>(resolve => { release = resolve; });
-  const set = vi.fn();
-  vi.mocked(cookies).mockResolvedValue({ set } as unknown as Awaited<ReturnType<typeof cookies>>);
-  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith("/auth/refresh")) {
-      await refresh;
-      return Response.json({ access_token: "new", refresh_token: "rotated" });
-    }
-    return new Headers(init?.headers).get("Authorization") === "Bearer new"
-      ? Response.json({ user_id: "alice" }) : new Response("expired", { status: 401 });
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  const runtime = new WebRuntimeClient(runtimeConfig("old", "refresh"));
-  const pending = Promise.all([runtime.sdk.getMe(), runtime.get("/auth/me", { auth: "required" })]);
-  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
-  release();
-  expect(await pending).toEqual([{ user_id: "alice" }, { user_id: "alice" }]);
-  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/auth/refresh"))).toHaveLength(1);
-  expect(cookies).toHaveBeenCalledTimes(1);
-  expect(set).toHaveBeenCalledTimes(2);
-});
-
-it("keeps Web raw responses, body, cancellation and origin routing intact", async () => {
-  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response("data: event\n\n", { status: 403 }));
-  vi.stubGlobal("fetch", fetchMock);
-  const runtime = new WebRuntimeClient({ ...runtimeConfig("access", "refresh"), apiUrl: "https://example.test/ignored?query=ignored" });
-  const body = new FormData();
-  body.set("upload", "contents");
-  const signal = new AbortController().signal;
-  const response = await runtime.fetchResponse("/stream", { method: "POST", body, signal, headers: { Accept: "text/event-stream" } });
-  expect(response.bodyUsed).toBe(false);
-  expect(await response.text()).toBe("data: event\n\n");
-  const [url, init] = fetchMock.mock.calls[0];
-  expect(url).toBe("https://example.test/stream");
-  expect(init).toMatchObject({ method: "POST", body, signal, cache: "no-store" });
-  expect(new Headers(init?.headers).get("Accept")).toBe("text/event-stream");
-  expect(new Headers(init?.headers).has("Content-Type")).toBe(false);
-  await expect(runtime.get("/error", { operation: "read item" })).rejects.toMatchObject({ status: 403, operation: "read item" });
-  await expect(runtime.sdk.getMe()).rejects.toMatchObject({ status: 403 });
-  expect(fetchMock.mock.calls[2][0]).toBe("https://example.test/auth/me");
-});
-
-it("uses current SDK credentials for Web auth and keeps old requests fenced on identity replacement", async () => {
-  let release!: () => void;
-  const refresh = new Promise<void>(resolve => { release = resolve; });
-  const set = vi.fn();
-  vi.mocked(cookies).mockResolvedValue({ set } as unknown as Awaited<ReturnType<typeof cookies>>);
-  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith("/auth/refresh")) {
-      await refresh;
-      return Response.json({ access_token: "stale", refresh_token: "stale-refresh" });
-    }
-    if (url.endsWith("/auth/logout")) return new Response(null, { status: 204 });
-    return new Headers(init?.headers).get("Authorization") === "Bearer bob"
-      ? Response.json({ user_id: "bob" }) : new Response("expired", { status: 401 });
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  const runtime = new WebRuntimeClient(runtimeConfig("alice", "refresh"));
-  const old = Promise.allSettled([runtime.get("/auth/me", { auth: "required" })]);
-  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-  runtime.sdk.setTokens("bob", "bob-refresh");
-  release();
-  expect(await old).toMatchObject([{ status: "rejected", reason: { status: 401 } }]);
-  await expect(runtime.get("/auth/me", { auth: "required" })).resolves.toEqual({ user_id: "bob" });
-  expect(set).not.toHaveBeenCalled();
-  await runtime.sdk.logout();
-  const count = fetchMock.mock.calls.length;
-  await expect(runtime.get("/auth/me", { auth: "required" })).rejects.toMatchObject({ status: 401 });
-  expect(fetchMock).toHaveBeenCalledTimes(count);
-});
-
-it("does not authenticate or refresh anonymous Web calls and preserves explicit overrides", async () => {
-  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response("unauthorized", { status: 401 }));
-  vi.stubGlobal("fetch", fetchMock);
-  const runtime = new WebRuntimeClient(runtimeConfig("access", "refresh"));
-  await runtime.fetchResponse("/auth/login", { auth: "none", method: "POST", json: { username: "alice" } });
-  await runtime.fetchResponse("/auth/login", { auth: "none", headers: { Authorization: "Bearer explicit", "X-User-Id": "hint" } });
-  expect(fetchMock).toHaveBeenCalledTimes(2);
-  const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
-  expect(headers.has("Authorization")).toBe(false);
-  expect(headers.has("X-User-Id")).toBe(false);
-  expect(headers.get("Content-Type")).toBe("application/json");
-  expect(fetchMock.mock.calls[0][1]?.body).toBe('{"username":"alice"}');
-  expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("Authorization")).toBe("Bearer explicit");
-  expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("X-User-Id")).toBe("hint");
-});
-
-it("only retries a raw mutation when its caller opts in", async () => {
-  vi.mocked(cookies).mockResolvedValue({ set: vi.fn() } as unknown as Awaited<ReturnType<typeof cookies>>);
-  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.endsWith('/auth/refresh')) return Response.json({ access_token: 'new', refresh_token: 'rotated' });
-    return new Headers(init?.headers).get('Authorization') === 'Bearer new'
-      ? new Response('ok') : new Response('expired', { status: 401 });
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  const runtime = new WebRuntimeClient(runtimeConfig('old', 'refresh'));
-  expect((await runtime.fetchResponse('/write', { method: 'POST', json: { value: 1 } })).status).toBe(401);
-  expect(fetchMock).toHaveBeenCalledTimes(1);
-  await expect(runtime.post('/write', { value: 1 }, { retryUnauthorized: false })).rejects.toMatchObject({ status: 401 });
-  expect(fetchMock).toHaveBeenCalledTimes(2);
-  expect((await runtime.fetchResponse('/write', { method: 'POST', json: { value: 1 }, retryUnauthorized: true })).status).toBe(200);
-  expect(fetchMock).toHaveBeenCalledTimes(5);
-});
+  {},
+  { user_id: "", username: "A", email: "a@example.test", display_name: null },
+  { user_id: 1, username: "A", email: "a@example.test", display_name: null },
+])(
+  "rejects malformed current-user JSON before any user-scoped route: %j",
+  async (payload) => {
+    const auth = runtimeFetch();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        return new URL(String(input)).pathname === "/auth/me"
+          ? Response.json(payload)
+          : auth(input, init);
+      }),
+    );
+    expect((await meRoute()).status).toBe(502);
+    const guard = await requireRuntimeUser();
+    expect(guard.user).toBeNull();
+    expect(guard.response?.status).toBe(502);
+    expect(
+      (await projects(new NextRequest("http://web.test/api/projects"))).status,
+    ).toBe(502);
+    expect(
+      (
+        await createProject(
+          new NextRequest("http://web.test/api/projects", {
+            method: "POST",
+            body: JSON.stringify({ name: "must not be created" }),
+          }),
+        )
+      ).status,
+    ).toBe(502);
+    expect(set).not.toHaveBeenCalled();
+  },
+);

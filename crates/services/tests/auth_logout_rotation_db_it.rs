@@ -50,7 +50,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PauseAccountLock {
         event.record(&mut fields);
         if fields
             .0
-            .contains("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
+            .contains("FROM auth_users WHERE user_id = ? FOR UPDATE")
             && self.0.armed.swap(false, Ordering::SeqCst)
         {
             self.0.acquired.notify_one();

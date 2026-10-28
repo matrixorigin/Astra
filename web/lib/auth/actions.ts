@@ -1,50 +1,33 @@
 "use server";
 
-import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import {
-  API_URL_COOKIE,
-  ACCESS_TOKEN_COOKIE,
-  REFRESH_TOKEN_COOKIE,
-  DEFAULT_API_URL,
-} from "@/lib/runtime-config";
+import { getRuntimeConfig, DEFAULT_API_URL } from "@/lib/runtime-config";
+import { WebRuntimeClient, RuntimeClientError } from "@/lib/runtime-client";
 import {
   runtimeLogin,
-  runtimeLogout,
-  runtimeMe,
-  runtimeRefresh,
   runtimeRegister,
-  type AuthTokens,
+  isAuthUser,
   type AuthUser,
 } from "@/lib/auth/runtime-auth-client";
+import {
+  adoptBrowserSession,
+  saveSelection,
+  logoutSelection,
+  replaceableSession,
+  selectedSession,
+  resolveBrowserSession,
+} from "@/lib/auth/browser-session";
 
 type ActionResult = {
   ok: boolean;
   error?: string;
 };
 
-const TOKEN_MAX_AGE = 365 * 24 * 60 * 60; // 1 year for cookie persistence
-
-function getApiUrl(cookieStore: Awaited<ReturnType<typeof cookies>>): string {
-  return (
-    cookieStore.get(API_URL_COOKIE)?.value ??
-    process.env.ASTRA_API_URL ??
-    DEFAULT_API_URL
-  );
-}
-
-async function saveTokens(tokens: AuthTokens): Promise<void> {
-  const cookieStore = await cookies();
-  const opts = {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax" as const,
-    path: "/",
-    maxAge: TOKEN_MAX_AGE,
-  };
-
-  cookieStore.set(ACCESS_TOKEN_COOKIE, tokens.access_token, opts);
-  cookieStore.set(REFRESH_TOKEN_COOKIE, tokens.refresh_token, opts);
+async function loginApiUrl(): Promise<string> {
+  const selected = await replaceableSession();
+  return selected && "apiUrl" in selected && selected.apiUrl
+    ? selected.apiUrl
+    : (process.env.ASTRA_API_URL ?? DEFAULT_API_URL);
 }
 
 export async function loginAction(
@@ -58,14 +41,23 @@ export async function loginAction(
     return { ok: false, error: "Username and password are required." };
   }
 
-  const cookieStore = await cookies();
-  const apiUrl = getApiUrl(cookieStore);
+  const apiUrl = await loginApiUrl();
   const result = await runtimeLogin(apiUrl, { username, password });
   if (!result.ok) {
     return { ok: false, error: result.error };
   }
 
-  await saveTokens(result.data);
+  try {
+    await saveSelection(await adoptBrowserSession(apiUrl, result.data));
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Sign-in could not be completed.",
+    };
+  }
   return { ok: true };
 }
 
@@ -82,8 +74,7 @@ export async function registerAction(
     return { ok: false, error: "Username, email, and password are required." };
   }
 
-  const cookieStore = await cookies();
-  const apiUrl = getApiUrl(cookieStore);
+  const apiUrl = await loginApiUrl();
 
   const result = await runtimeRegister(apiUrl, {
     username,
@@ -95,65 +86,56 @@ export async function registerAction(
     return { ok: false, error: result.error };
   }
 
-  await saveTokens(result.data);
+  try {
+    await saveSelection(await adoptBrowserSession(apiUrl, result.data));
+  } catch {
+    return {
+      ok: false,
+      error:
+        "Account created, but sign-in could not be completed. Sign in to continue.",
+    };
+  }
   return { ok: true };
 }
 
 export async function logoutAction(): Promise<void> {
-  const cookieStore = await cookies();
-  const apiUrl = getApiUrl(cookieStore);
-  const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
-
-  if (apiUrl && refreshToken) {
-    await runtimeLogout(apiUrl, refreshToken);
-  }
-
-  cookieStore.delete(ACCESS_TOKEN_COOKIE);
-  cookieStore.delete(REFRESH_TOKEN_COOKIE);
+  await logoutSelection();
   redirect("/");
 }
 
 export async function refreshTokenAction(): Promise<ActionResult> {
-  const cookieStore = await cookies();
-  const apiUrl = getApiUrl(cookieStore);
-  const refreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
-
-  if (!refreshToken) {
-    return { ok: false, error: "No refresh token available." };
+  try {
+    const selection = await selectedSession();
+    if (selection?.mode !== "browser")
+      return { ok: false, error: "Sign in to refresh your session." };
+    await resolveBrowserSession(selection);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Refresh failed.",
+    };
   }
-
-  const result = await runtimeRefresh(apiUrl, refreshToken);
-  if (!result.ok) {
-    return { ok: false, error: result.error };
-  }
-
-  await saveTokens(result.data);
-  return { ok: true };
 }
 
 export async function getCurrentUser(): Promise<AuthUser | null> {
-  const cookieStore = await cookies();
-  const apiUrl = getApiUrl(cookieStore);
-  const accessToken = cookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
-
-  if (!accessToken) return null;
-
-  const result = await runtimeMe(apiUrl, accessToken);
-  if (result.ok) {
-    return result.data;
+  try {
+    const config = await getRuntimeConfig();
+    if (config.mode !== "live" || !config.accessToken) return null;
+    const client = new WebRuntimeClient(config);
+    const user = await client.get<unknown>("/auth/me", { auth: "required" });
+    if (!isAuthUser(user)) {
+      throw new RuntimeClientError({
+        operation: "read current user",
+        path: "/auth/me",
+        status: 502,
+        detail: "Invalid account response from runtime.",
+      });
+    }
+    return user;
+  } catch (error) {
+    if (error instanceof RuntimeClientError && error.status === 401)
+      return null;
+    throw error;
   }
-
-  if (result.status !== 401) {
-    return null;
-  }
-
-  const refreshResult = await refreshTokenAction();
-  if (!refreshResult.ok) return null;
-
-  const newCookieStore = await cookies();
-  const newToken = newCookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
-  if (!newToken) return null;
-
-  const retryResult = await runtimeMe(apiUrl, newToken);
-  return retryResult.ok ? retryResult.data : null;
 }

@@ -1,8 +1,5 @@
 import {
   PATH_AUTH_LOGIN,
-  PATH_AUTH_LOGOUT,
-  PATH_AUTH_ME,
-  PATH_AUTH_REFRESH,
   PATH_AUTH_REGISTER,
   type AuthResult,
   type UserInfo,
@@ -15,10 +12,6 @@ export type AuthUser = Omit<UserInfo, "display_name"> & {
 };
 
 export type AuthRegisterResponse = AuthTokens & AuthUser;
-
-export type AuthLogoutResponse = {
-  message?: string;
-};
 
 export type RuntimeAuthResult<T> =
   | { ok: true; data: T }
@@ -45,41 +38,19 @@ function hasAuthTokens(value: unknown): value is AuthTokens {
   );
 }
 
-function isAuthRegisterResponse(value: unknown): value is AuthRegisterResponse {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  const record = value;
-  const userId = record["user_id"];
-  const username = record["username"];
-  const email = record["email"];
-  const displayName = record["display_name"];
-
+export function isAuthUser(value: unknown): value is AuthUser {
   return (
-    hasAuthTokens(record) &&
-    typeof userId === "string" &&
-    typeof username === "string" &&
-    typeof email === "string" &&
-    (typeof displayName === "string" || displayName === null)
-  );
-}
-
-function isAuthUser(value: unknown): value is AuthUser {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  return (
+    isRecord(value) &&
     typeof value.user_id === "string" &&
+    value.user_id.trim().length > 0 &&
     typeof value.username === "string" &&
     typeof value.email === "string" &&
     (typeof value.display_name === "string" || value.display_name === null)
   );
 }
 
-function isLogoutResponse(value: unknown): value is AuthLogoutResponse {
-  return isRecord(value);
+function isAuthRegisterResponse(value: unknown): value is AuthRegisterResponse {
+  return isAuthUser(value) && hasAuthTokens(value);
 }
 
 function runtimeClientForAuth(
@@ -177,6 +148,7 @@ async function postRuntimeAuth<T>(
     const client = runtimeClientForAuth(apiUrl);
     const response = await client.fetchResponse(path, {
       method: "POST",
+      redirect: "error",
       auth: "none",
       json: body,
       operation: defaultError,
@@ -221,55 +193,4 @@ export function runtimeRegister(
     "Registration failed",
     isAuthRegisterResponse,
   );
-}
-
-export function runtimeRefresh(
-  apiUrl: string,
-  refreshToken: string,
-): Promise<RuntimeAuthResult<AuthTokens>> {
-  return postRuntimeAuth(
-    apiUrl,
-    PATH_AUTH_REFRESH,
-    { refresh_token: refreshToken },
-    "Token refresh failed",
-    hasAuthTokens,
-  );
-}
-
-export function runtimeLogout(
-  apiUrl: string,
-  refreshToken: string,
-): Promise<RuntimeAuthResult<AuthLogoutResponse>> {
-  return postRuntimeAuth(
-    apiUrl,
-    PATH_AUTH_LOGOUT,
-    { refresh_token: refreshToken },
-    "Logout failed",
-    isLogoutResponse,
-  );
-}
-
-export async function runtimeMe(
-  apiUrl: string,
-  accessToken: string,
-): Promise<RuntimeAuthResult<AuthUser>> {
-  try {
-    const client = runtimeClientForAuth(apiUrl, { accessToken });
-    const response = await client.fetchResponse(PATH_AUTH_ME, {
-      auth: "required",
-      operation: "Fetch current user",
-    });
-    return decodeRuntimeResponse(
-      response,
-      "Fetch current user failed",
-      isAuthUser,
-    );
-  } catch (error) {
-    return {
-      ok: false,
-      status: 502,
-      error:
-        error instanceof Error ? error.message : "Cannot reach Astra runtime.",
-    };
-  }
 }

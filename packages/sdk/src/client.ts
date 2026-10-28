@@ -846,6 +846,7 @@ export class AstraClient {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: revision.refreshToken }),
         cache: "no-store",
+        redirect: "error", // Never forward refresh credentials to a redirect target.
       });
       if (!res.ok) return false;
       const data = (await res.json()) as AuthResult;

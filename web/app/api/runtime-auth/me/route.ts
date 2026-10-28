@@ -1,27 +1,10 @@
 import { NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
-import { ACCESS_TOKEN_COOKIE, API_URL_COOKIE, DEFAULT_API_URL } from '@/lib/runtime-config';
-import { runtimeMe } from '@/lib/auth/runtime-auth-client';
+import { getCurrentUser } from '@/lib/auth/actions';
+import { authErrorResponse } from '@/lib/auth/http-error';
 
-/**
- * Proxy GET /auth/me through Next.js so httpOnly cookies are accessible.
- */
 export async function GET() {
-  const cookieStore = await cookies();
-  const token = cookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
-  const apiUrl = cookieStore.get(API_URL_COOKIE)?.value ?? DEFAULT_API_URL;
-
-  if (!token) {
-    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-  }
-
-  const result = await runtimeMe(apiUrl, token);
-  if (!result.ok) {
-    return NextResponse.json(
-      { error: result.error },
-      { status: result.status },
-    );
-  }
-
-  return NextResponse.json(result.data);
+  try {
+    const user = await getCurrentUser();
+    return user ? NextResponse.json(user) : NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  } catch (error) { return authErrorResponse(error); }
 }

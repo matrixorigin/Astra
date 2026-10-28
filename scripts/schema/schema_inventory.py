@@ -883,6 +883,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / auth",
         product_owner="auth and admin role management",
     ),
+    "auth_browser_sessions": TableMetadata(
+        semantic_owner="astra_services::auth",
+        state_class="encrypted credential delivery for a canonical refresh session",
+        primary_query="point lookup by handle_hash, then one canonical snapshot with explicit token/user keys",
+        retention_policy="logout deletes owner; canonical refresh cleanup atomically deletes up to 1000 sessions and their owners",
+        rebuildability="lost encrypted successors require sign-in; never recover via consumed refresh JWT",
+        merge_guidance="canonical refresh row owns revocation; browser owner stores only encrypted credential delivery",
+        migration_owner="astra_services::storage / auth",
+        product_owner="Web browser session continuity across replicas",
+    ),
     "auth_refresh_tokens": TableMetadata(
         semantic_owner="astra_services::auth",
         state_class="durable refresh-session credential fact",

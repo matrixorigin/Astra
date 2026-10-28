@@ -187,11 +187,22 @@ pub(super) async fn auth_memoria_handler(
     }))
 }
 
+pub(super) async fn auth_browser_session_handler(
+    State(state): State<AppState>,
+    Json(request): Json<BrowserSessionRequest>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let created = state.auth_service.create_browser_session(request).await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(created),
+    ))
+}
+
 pub(super) async fn auth_refresh_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     Json(request): Json<AuthRefreshRequest>,
-) -> Result<Json<AuthTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let tokens = state
         .auth_service
         .refresh(AuthRefreshRequestData {
@@ -203,7 +214,10 @@ pub(super) async fn auth_refresh_handler(
         request_id = %trace.request_id,
         "access token refreshed"
     );
-    Ok(Json(AuthTokenResponse::from(tokens)))
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(AuthTokenResponse::from(tokens)),
+    ))
 }
 
 pub(super) async fn auth_logout_handler(

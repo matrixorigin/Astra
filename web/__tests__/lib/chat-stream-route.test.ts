@@ -254,6 +254,46 @@ describe("chat stream route proxy cancellation", () => {
     });
   });
 
+  it("uses the canonical browser proof to retry late chat admission without replaying a different turn", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const { WebRuntimeClient } = await vi.importActual<typeof import("@/lib/runtime-client/server")>("@/lib/runtime-client/server");
+    const root = "https://runtime.example/";
+    const handle = `bs1.${Buffer.from(root).toString("base64url")}.${Buffer.alloc(32, 1).toString("base64url")}`;
+    const runtime = new WebRuntimeClient({ mode: "live", source: "cookie", apiUrl: root,
+      accessToken: "old", refreshToken: handle, hasAccessToken: true, hasRefreshToken: true,
+      demoMode: false, message: "" });
+    mockRequireRuntimeClient.mockResolvedValue(runtime);
+    const admissions: Array<{ body: string; bearer: string | null }> = [];
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/auth/refresh") {
+        expect(JSON.parse(String(init?.body)).refresh_token).toBe(handle);
+        return Response.json({ access_token: "current", refresh_token: handle });
+      }
+      if (path === "/chat/stream") {
+        admissions.push({ body: String(init?.body), bearer: new Headers(init?.headers).get("authorization") });
+        if (admissions.length === 1) return new Response("expired", { status: 401 });
+        return new Response('data: {"type":"content","content":"Hello"}\n\ndata: {"type":"done"}\n\n', {
+          headers: { "content-type": "text/event-stream", [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR },
+        });
+      }
+      return Response.json({ artifacts: [], edges: [] });
+    });
+    vi.stubGlobal("fetch", fetch);
+    try {
+      const response = await POST(new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST", body: JSON.stringify({ content: "hello", options: { model: "sonnet-4.6-adaptive", activeSkills: [] } }),
+      }) as never, { params: Promise.resolve({ chatId: "chat-1" }) });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(admissions).toHaveLength(2);
+      expect(admissions[0].bearer).toBe("Bearer old");
+      expect(admissions[1]).toEqual({ body: admissions[0].body, bearer: "Bearer current" });
+      expect(JSON.parse(admissions[1].body).session_id).toBe("chat-1");
+      expect(response.headers.has("set-cookie")).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it("cancels the backend SSE reader when the web client disconnects", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();

@@ -449,6 +449,39 @@ impl MemoriaCredentialResolver {
         })
     }
 }
+/// The binding verified outside a transaction. Compare under the account lock
+/// before issuing a successor, including disconnect/reconnect with the same key.
+pub(super) struct MemoriaRefreshBinding {
+    token_id: String,
+    ciphertext: String,
+    metadata: String,
+}
+
+impl MemoriaRefreshBinding {
+    pub(super) async fn check(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user: &str,
+    ) -> Result<(), AuthHttpError> {
+        let current: Option<(String, String)> = sqlx::query_as(
+            "SELECT encrypted_value, CAST(metadata AS CHAR) FROM auth_tokens
+             WHERE token_id = ? AND scope_user_id = ? AND type = 'memoria_connection'
+               AND provider = 'memoria' AND is_active = 1 FOR UPDATE",
+        )
+        .bind(&self.token_id)
+        .bind(user)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal_error)?;
+        if current.as_ref().is_none_or(|(ciphertext, metadata)| {
+            ciphertext != &self.ciphertext || metadata != &self.metadata
+        }) {
+            return Err(reconnect());
+        }
+        Ok(())
+    }
+}
+
 impl DatabaseAuthService {
     pub(super) async fn reauthentication_binding(
         &self,
@@ -584,7 +617,7 @@ impl DatabaseAuthService {
     }
     pub(super) async fn memoria_owner(
         &self,
-        pool: &sqlx::MySqlPool,
+        executor: impl sqlx::Executor<'_, Database = sqlx::MySql>,
         user: &str,
     ) -> Result<Option<String>, AuthHttpError> {
         let current_provider_id = self
@@ -594,7 +627,7 @@ impl DatabaseAuthService {
             .unwrap_or("");
         let identity: Option<(String, String)> = sqlx::query_as(
             "SELECT provider_id, external_subject
-             FROM auth_external_identities
+             FROM auth_external_identities FORCE INDEX (idx_external_identity_user)
              WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%'
              ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END,
                       updated_at DESC, provider_id ASC
@@ -602,7 +635,7 @@ impl DatabaseAuthService {
         )
         .bind(user)
         .bind(current_provider_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(internal_error)?;
         self.validate_memoria_identity(identity)
@@ -629,18 +662,26 @@ impl DatabaseAuthService {
         _pool: &sqlx::MySqlPool,
         user: &str,
         owner: &str,
-    ) -> Result<(), AuthHttpError> {
+    ) -> Result<MemoriaRefreshBinding, AuthHttpError> {
         let resolver = self.credential_resolver().ok_or_else(unavailable)?;
-        let credential = resolver
-            .resolve(user)
+        let snapshot = resolver
+            .load_authority_snapshot(user)
             .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(reconnect)?;
+        let credential = resolver
+            .scoped_credential(&snapshot)
             .map_err(|_| unavailable())?
             .ok_or_else(reconnect)?;
         let identity = resolver.provider.verify(&credential.key).await?;
         if identity.memoria_user_id != owner || identity.key_id != credential.generation {
             return Err(reconnect());
         }
-        Ok(())
+        Ok(MemoriaRefreshBinding {
+            token_id: resolver.token_id(user),
+            ciphertext: snapshot.ciphertext.ok_or_else(reconnect)?,
+            metadata: snapshot.metadata.ok_or_else(reconnect)?,
+        })
     }
     pub(super) async fn memoria_login(&self, key: &str) -> Result<MemoriaLogin, AuthHttpError> {
         let resolver = self.credential_resolver().ok_or_else(unavailable)?;

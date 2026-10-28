@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ACCESS_TOKEN_COOKIE, API_URL_COOKIE, DEFAULT_API_URL, DEMO_MODE_COOKIE, REFRESH_TOKEN_COOKIE } from '@/lib/runtime-config';
+import { DEFAULT_API_URL } from '@/lib/runtime-config';
 import { runtimeLogin } from '@/lib/auth/runtime-auth-client';
+import { adoptBrowserSession } from '@/lib/auth/browser-session';
+import { SESSION_COOKIE, sessionCookieOptions, runtimeRoot } from '@/lib/auth/session-cookie';
+import { authErrorResponse } from '@/lib/auth/http-error';
 
 type LoginBody = {
   apiUrl?: string;
@@ -46,7 +49,10 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const apiUrl = body.apiUrl?.trim() || DEFAULT_API_URL;
+  const apiUrl = body.apiUrl?.trim() || process.env.ASTRA_API_URL || DEFAULT_API_URL;
+  try { runtimeRoot(apiUrl); } catch {
+    return NextResponse.json({ error: 'Invalid runtime URL.' }, { status: 400 });
+  }
 
   if (!body.username || !body.password) {
     return NextResponse.json(
@@ -64,30 +70,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: result.error }, { status: result.status });
   }
 
-  const json = result.data;
-
-  const nextResponse = NextResponse.json({
-    ok: true,
-    expiresIn: json.expires_in ?? null,
-    tokenType: json.token_type ?? 'Bearer',
-  });
-
-  nextResponse.cookies.set(API_URL_COOKIE, apiUrl, {
-    httpOnly: true,
-    sameSite: 'lax',
-    path: '/',
-  });
-  nextResponse.cookies.set(ACCESS_TOKEN_COOKIE, json.access_token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    path: '/',
-  });
-  nextResponse.cookies.set(REFRESH_TOKEN_COOKIE, json.refresh_token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    path: '/',
-  });
-  nextResponse.cookies.delete(DEMO_MODE_COOKIE);
-
-  return nextResponse;
+  try {
+    const handle = await adoptBrowserSession(apiUrl, result.data);
+    const response = NextResponse.json({ ok: true, expiresIn: result.data.expires_in ?? null, tokenType: result.data.token_type ?? 'Bearer' });
+    response.cookies.set(SESSION_COOKIE, handle, sessionCookieOptions());
+    return response;
+  } catch (error) { return authErrorResponse(error); }
 }

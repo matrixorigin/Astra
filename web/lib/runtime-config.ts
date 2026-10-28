@@ -1,18 +1,20 @@
-import { cookies } from 'next/headers';
+import { cache } from "react";
+import {
+  selectedSession,
+  resolveBrowserSession,
+} from "@/lib/auth/browser-session";
+import { runtimeRoot } from "@/lib/auth/session-cookie";
+import { RuntimeClientError } from "@/lib/runtime-client/errors";
 
-export const API_URL_COOKIE = 'astra_api_url';
-export const ACCESS_TOKEN_COOKIE = 'astra_access_token';
-export const REFRESH_TOKEN_COOKIE = 'astra_refresh_token';
-export const DEMO_MODE_COOKIE = 'astra_demo_mode';
 /** Stable browser instance identity used to isolate Work read attachments. */
-export const WEB_CLIENT_ID_COOKIE = 'astra_web_client_id';
-export const WEB_CLIENT_ID_HEADER = 'x-astra-web-client-id';
+export const WEB_CLIENT_ID_COOKIE = "astra_web_client_id";
+export const WEB_CLIENT_ID_HEADER = "x-astra-web-client-id";
 
-export type WebDataMode = 'live' | 'demo' | 'unconfigured';
+export type WebDataMode = "live" | "demo" | "unconfigured";
 
 export type RuntimeConfig = {
   mode: WebDataMode;
-  source: 'cookie' | 'env' | 'none';
+  source: "cookie" | "env" | "none";
   apiUrl?: string;
   accessToken?: string;
   refreshToken?: string;
@@ -24,7 +26,7 @@ export type RuntimeConfig = {
 };
 
 export function getWebConfigurationMessage(): string {
-  return 'Use the Settings page to configure the runtime API URL and login token, or enable demo mode.';
+  return "Use the Settings page to configure the runtime API URL and login token, or enable demo mode.";
 }
 
 export function maskToken(token?: string): string | undefined {
@@ -33,76 +35,60 @@ export function maskToken(token?: string): string | undefined {
   }
 
   if (token.length <= 10) {
-    return '••••••';
+    return "••••••";
   }
 
   return `${token.slice(0, 4)}••••${token.slice(-4)}`;
 }
 
-export const DEFAULT_API_URL = 'http://localhost:17001';
+export const DEFAULT_API_URL = "http://localhost:17001";
 
-export async function getRuntimeConfig(): Promise<RuntimeConfig> {
-  const cookieStore = await cookies();
-  const cookieDemo = cookieStore.get(DEMO_MODE_COOKIE)?.value === 'true';
-  const cookieApiUrl = cookieStore.get(API_URL_COOKIE)?.value;
-  const cookieAccessToken = cookieStore.get(ACCESS_TOKEN_COOKIE)?.value;
-  const cookieRefreshToken = cookieStore.get(REFRESH_TOKEN_COOKIE)?.value;
-
-  if (cookieDemo) {
-    return {
-      mode: 'demo',
-      source: 'cookie',
-      demoMode: true,
-      apiUrl: cookieApiUrl,
-      accessToken: cookieAccessToken,
-      refreshToken: cookieRefreshToken,
-      hasAccessToken: Boolean(cookieAccessToken),
-      hasRefreshToken: Boolean(cookieRefreshToken),
-      maskedAccessToken: maskToken(cookieAccessToken),
-      message: 'Demo mode is enabled from saved frontend settings.',
-    };
-  }
-
-  // Resolve API URL: cookie > env > default
-  const apiUrl = cookieApiUrl ?? process.env.ASTRA_API_URL ?? DEFAULT_API_URL;
-  const accessToken = cookieAccessToken ?? process.env.ASTRA_ACCESS_TOKEN;
-  const refreshToken = cookieRefreshToken;
-
-  const envDemo = process.env.ASTRA_WEB_DEMO === 'true';
-  if (envDemo) {
-    return {
-      mode: 'demo',
-      source: 'env',
-      demoMode: true,
-      apiUrl,
-      accessToken,
-      refreshToken,
-      hasAccessToken: Boolean(accessToken),
-      hasRefreshToken: Boolean(refreshToken),
-      maskedAccessToken: maskToken(accessToken),
-      message: 'Demo mode is enabled from environment variables.',
-    };
-  }
-
-  // Live mode: API URL is always available (defaults to localhost:17001)
-  const source: 'cookie' | 'env' | 'none' = cookieApiUrl
-    ? 'cookie'
+// React deduplicates within a Server Component render only, never across users
+// or Web replicas. Route handlers may construct more than one resolved client.
+export const getRuntimeConfig = cache(async (): Promise<RuntimeConfig> => {
+  const selection = await selectedSession();
+  const configured = selection && selection.mode !== "default";
+  const source = configured
+    ? "cookie"
     : process.env.ASTRA_API_URL
-      ? 'env'
-      : 'none';
-
+      ? "env"
+      : "none";
+  const apiUrl =
+    configured && "apiUrl" in selection && selection.apiUrl
+      ? selection.apiUrl
+      : runtimeRoot(process.env.ASTRA_API_URL ?? DEFAULT_API_URL);
+  const demoMode = configured
+    ? selection.mode === "demo"
+    : process.env.ASTRA_WEB_DEMO === "true";
+  let accessToken: string | undefined;
+  let refreshToken: string | undefined;
+  if (selection?.mode === "browser") {
+    refreshToken = selection.handle;
+    try {
+      accessToken = await resolveBrowserSession(selection);
+    } catch (error) {
+      // A revoked handle stays bound to its account/runtime; no environment
+      // fallback. Keep it available for idempotent logout and a fresh login.
+      if (!(error instanceof RuntimeClientError && error.status === 401))
+        throw error;
+    }
+  } else if (selection?.mode === "live") {
+    if (selection.auth === "static") accessToken = selection.accessToken;
+  }
   return {
-    mode: 'live',
+    mode: demoMode ? "demo" : "live",
     source,
-    demoMode: false,
     apiUrl,
     accessToken,
     refreshToken,
+    demoMode,
     hasAccessToken: Boolean(accessToken),
-    hasRefreshToken: Boolean(refreshToken),
+    hasRefreshToken: Boolean(refreshToken && accessToken),
     maskedAccessToken: maskToken(accessToken),
-    message: accessToken
-      ? `Connected to ${apiUrl} with authentication.`
-      : `Connected to ${apiUrl} without authentication. Login for full access.`,
+    message: demoMode
+      ? "Demo mode is enabled."
+      : accessToken
+        ? `Connected to ${apiUrl} with authentication.`
+        : `Connected to ${apiUrl} without authentication. Login for full access.`,
   };
-}
+});

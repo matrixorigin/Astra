@@ -101,8 +101,8 @@ trust store to the Server. Restart the process after changing its trust settings
 - `ASTRA_JWT_SECRET`
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
-- `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
-- `ASTRA_TOKEN_ENCRYPTION_KEY` (high-entropy secret from which Astra derives Fernet encryption; changing it makes existing provider credentials undecryptable)
+- `ASTRA_JWT_REFRESH_TTL_DAYS` (code default `30`; `.env.example` selects `7`)
+- `ASTRA_TOKEN_ENCRYPTION_KEY` (shared high-entropy secret for stored provider and browser session credentials; changing it makes provider credentials undecryptable and requires browser sign-in again)
 - `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth

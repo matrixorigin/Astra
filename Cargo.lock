@@ -499,6 +499,7 @@ dependencies = [
  "hmac 0.12.1",
  "http-body-util",
  "indexmap",
+ "jsonwebtoken",
  "nix 0.31.3",
  "notify",
  "percent-encoding",
