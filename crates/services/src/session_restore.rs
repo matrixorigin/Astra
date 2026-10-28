@@ -681,13 +681,14 @@ impl HybridRestoreService {
                        CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                          THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) AS total_tokens_out \
                 FROM agent_events \
+                WHERE user_id = ? AND session_id = ? \
                 GROUP BY user_id, session_id \
               ) event_summary \
                 ON event_summary.user_id = s.user_id AND event_summary.session_id = s.session_id \
               LEFT JOIN ( \
                 SELECT user_id, session_id, COUNT(*) AS checkpoint_count \
                 FROM session_checkpoints \
-                WHERE state_json IS NULL \
+                WHERE user_id = ? AND session_id = ? AND state_json IS NULL \
                 GROUP BY user_id, session_id \
               ) checkpoint_summary \
                 ON checkpoint_summary.user_id = s.user_id AND checkpoint_summary.session_id = s.session_id \
@@ -697,7 +698,7 @@ impl HybridRestoreService {
                   SELECT user_id, session_id, llm_model_used, \
                          ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
                   FROM agent_events \
-                  WHERE parent_run_id IS NULL \
+                  WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL \
                     AND llm_model_used IS NOT NULL AND llm_model_used != '' \
                 ) ranked_models \
                 WHERE rn = 1 \
@@ -705,6 +706,12 @@ impl HybridRestoreService {
                 ON latest_model.user_id = s.user_id AND latest_model.session_id = s.session_id \
               WHERE s.session_id = ? AND s.user_id = ?",
         )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(session_id)
         .bind(session_id)
         .bind(user_id)
         .fetch_optional(pool)

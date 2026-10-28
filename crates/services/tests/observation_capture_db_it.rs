@@ -86,20 +86,17 @@ async fn event_api_replays_exact_request_and_rejects_changed_agent_or_lineage() 
         causal_chain_id: None,
         metadata: None,
     };
-    assert!(
-        !service
-            .create_event(owner.clone(), request.clone())
-            .await
-            .unwrap()
-            .idempotent_replay
-    );
-    assert!(
-        service
-            .create_event(owner.clone(), request.clone())
-            .await
-            .unwrap()
-            .idempotent_replay
-    );
+    let created = service
+        .create_event(owner.clone(), request.clone())
+        .await
+        .unwrap();
+    assert!(!created.idempotent_replay);
+    let replay = service
+        .create_event(owner.clone(), request.clone())
+        .await
+        .unwrap();
+    assert!(replay.idempotent_replay);
+    assert_eq!(created.record, replay.record);
     let mut changed_agent = request.clone();
     changed_agent.agent_id = Some("different-agent".into());
     assert_eq!(

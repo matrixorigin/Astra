@@ -5048,6 +5048,7 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
     let pool = shared.get().clone();
 
     let user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     let first_event_id = Uuid::new_v4().to_string();
     let fourth_event_id = Uuid::new_v4().to_string();
@@ -5126,6 +5127,42 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         .expect("insert sparse-turn restore event");
     }
 
+    // A different owner may independently use the same session ID. Its
+    // history and checkpoints must not affect this owner's restore summary.
+    seed_restore_session_fixture(&pool, &other_user_id, &session_id, serde_json::json!({})).await;
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, event_type, turn_seq, token_usage, \
+          token_input, token_output, llm_model_used, payload_hash, ingestion_write_id) \
+         VALUES (?, ?, ?, 'user_query', 99, CAST(? AS JSON), 1000, 1000, 'foreign-model', ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .bind(r#"{"input_tokens":1000,"output_tokens":1000}"#)
+    .bind("foreign-payload")
+    .bind(Uuid::new_v4().to_string())
+    .execute(&pool)
+    .await
+    .expect("insert foreign owner event");
+    seed_restore_checkpoint_fixture(
+        &pool,
+        &other_user_id,
+        &session_id,
+        &astra_services::session_checkpoint::Checkpoint {
+            number: 1,
+            turn: 99,
+            title: "foreign".into(),
+            summary: "foreign".into(),
+            tools_used: Vec::new(),
+            total_tokens: 0,
+            had_stalls: false,
+            error_count: 0,
+        },
+        None,
+    )
+    .await;
+
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
         .restore_session(&user_id, &session_id)
@@ -5136,6 +5173,9 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         restored.turn_count, 4,
         "restore_session must report turn_seq high watermark, not user_query row count"
     );
+    assert_eq!(restored.total_tokens_in, 2);
+    assert_eq!(restored.total_tokens_out, 2);
+    assert_eq!(restored.checkpoint_count, 0);
 
     let listed = restore
         .list_resumable_sessions(&user_id)
@@ -5150,7 +5190,7 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         "directory omits diagnostic turn counts; selected detail recovery retains its high watermark"
     );
 
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&user_id, &other_user_id]).await;
 }
 
 #[tokio::test]

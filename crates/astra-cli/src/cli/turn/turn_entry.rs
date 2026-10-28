@@ -784,11 +784,16 @@ pub(super) async fn acquire_interactive_turn_admission(
         let refresh = tokio::time::timeout(INTERACTIVE_SERVER_RESUME_TIMEOUT, async {
             let auth_owner =
                 session_runtime::capture_admitted_auth_owner(&request_api, profile, token).await;
-            let (restored, bearer) = crate::cli::session::session_restore_client::fetch_cloud_session_snapshot_with_bearer(
-                &request_api, &session_id, token, auth_owner.as_ref(),
-            ).await?;
-            let restored = restored.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
-            Ok::<_, String>((restored, bearer, auth_owner))
+            let (bundle, bearer) =
+                crate::cli::session::session_restore_client::fetch_cloud_continuation_with_bearer(
+                    &request_api,
+                    &session_id,
+                    token,
+                    auth_owner.as_ref(),
+                )
+                .await?;
+            let bundle = bundle.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
+            Ok::<_, String>((bundle, bearer, auth_owner))
         });
         let cancelled = async {
             match state.tui_cancel_token.as_ref() {
@@ -796,7 +801,7 @@ pub(super) async fn acquire_interactive_turn_admission(
                 None => std::future::pending::<()>().await,
             }
         };
-        let (restored, bearer, auth_owner) = tokio::select! {
+        let (bundle, bearer, auth_owner) = tokio::select! {
             biased;
             _ = cancelled => return Err("Server continuation refresh cancelled before execution".into()),
             result = refresh => result.map_err(|_| "Server continuation refresh timed out before execution".to_string())??,
@@ -808,9 +813,6 @@ pub(super) async fn acquire_interactive_turn_admission(
                 "Server resume account changed during restore; restore the session again".into(),
             );
         }
-        let bundle = restored.resume_bundle.filter(|bundle| {
-            bundle.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
-        }).ok_or_else(|| "Server continuation is no longer canonical; restore the session again before continuing".to_string())?;
         let continuation =
             crate::cli::session::session_continuation::continuation_from_resume_bundle(bundle)
                 .ok_or_else(|| "Server continuation failed causal validation".to_string())?;
