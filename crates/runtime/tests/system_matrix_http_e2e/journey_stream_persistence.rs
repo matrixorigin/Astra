@@ -3351,6 +3351,15 @@ pub async fn run_stream_context_trace_persistence() {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
+    let (missing_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+
     let fixture_model = format!("mock-{}", ctx.suffix);
     ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_context_trace_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="context trace persistence test")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Context trace reply.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 100, "completion_tokens": 50,
                     "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0} }}))])]).await;
@@ -3397,6 +3406,71 @@ pub async fn run_stream_context_trace_persistence() {
         message["role"] == "assistant"
             && message["content"].as_str() == Some("Context trace reply.")
     }));
+    // An unrelated legacy checkpoint must not be decoded during a canonical
+    // per-turn refresh. The full restore still detects the corruption.
+    sqlx::query(
+        "INSERT INTO session_checkpoints \
+         (checkpoint_id, user_id, session_id, number, turn, summary, state_json) \
+         VALUES (?, ?, ?, 2147483647, 0, 'heavy', 'not-json')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("seed corrupt legacy checkpoint");
+    let audits_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    let (continuation_status, continuation) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(continuation_status, StatusCode::OK, "{continuation}");
+    let audits_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(audits_after, audits_before);
+    assert_eq!(continuation["session_id"], session_id);
+    assert_eq!(
+        continuation["resume_bundle"],
+        serde_json::to_value(restored.resume_bundle.as_ref().unwrap()).unwrap()
+    );
+    assert!(continuation.get("total_tokens_in").is_none());
+    sqlx::query("UPDATE agent_sessions SET status = 'paused' WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (reactivate_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(reactivate_status, StatusCode::OK);
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(user_id)
+            .bind(&session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    let reactivation_audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(reactivation_audits, audits_after + 1);
+    let (full_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(full_status, StatusCode::INTERNAL_SERVER_ERROR);
     for table in [
         "session_state_items",
         "session_state_item_events",

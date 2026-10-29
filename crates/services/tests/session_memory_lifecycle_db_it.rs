@@ -46,6 +46,89 @@ async fn persisted_work(pool: &SharedPool, user: &str, session: &str) -> serde_j
     value
 }
 
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn continuation_activation_avoids_active_writes_and_respects_lifecycle() {
+    let (pool, settings, user, session) = setup().await;
+    let sessions = DatabaseSessionService::new(settings).with_pool(pool.clone());
+    let audit_count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'",
+        )
+        .bind(&user)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+    };
+    sqlx::query("UPDATE agent_sessions SET updated_at = '2000-01-01 00:00:00' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    let before = audit_count().await;
+    sessions
+        .ensure_session_active(session.clone(), user.clone())
+        .await
+        .unwrap();
+    let unchanged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ? AND updated_at = '2000-01-01 00:00:00' AND status = 'active'")
+        .bind(&user).bind(&session).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(unchanged, 1);
+    assert_eq!(audit_count().await, before);
+
+    assert!(
+        sessions
+            .ensure_session_active(session.clone(), "foreign-user".into())
+            .await
+            .is_err()
+    );
+    let foreign_fence: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = 'foreign-user' AND session_id = ?")
+        .bind(&session).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(foreign_fence, 0);
+
+    let mut tx = pool.get().begin().await.unwrap();
+    astra_services::storage::lock_agent_session_write_fence(&mut tx, &session, &user)
+        .await
+        .unwrap();
+    let contender = sessions.clone();
+    let contender_user = user.clone();
+    let contender_session = session.clone();
+    let mut refresh = tokio::spawn(async move {
+        contender
+            .ensure_session_active(contender_session, contender_user)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut refresh)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE agent_sessions SET status = 'paused' WHERE user_id = ? AND session_id = ?")
+        .bind(&user)
+        .bind(&session)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    refresh.await.unwrap().unwrap();
+    assert_eq!(
+        sessions
+            .get_session(session.clone(), user.clone())
+            .await
+            .unwrap()
+            .status,
+        "active"
+    );
+    assert_eq!(audit_count().await, before + 1);
+
+    sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(pool.get()).await.unwrap();
+    assert!(
+        sessions
+            .ensure_session_active(session.clone(), user.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(audit_count().await, before + 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn independent_pools_preserve_one_active_and_newest_pending_input() {

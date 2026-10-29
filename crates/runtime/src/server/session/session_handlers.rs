@@ -2080,12 +2080,28 @@ pub(crate) struct SessionExecutionGrantRequest {
     pub ttl_seconds: u64,
 }
 
+#[derive(Deserialize, Default)]
+pub(crate) struct ResumeSessionQuery {
+    #[serde(default)]
+    continuation_only: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ResumeSessionResponse {
+    Full(Box<astra_services::session_restore::RestoredSession>),
+    Continuation {
+        session_id: String,
+        resume_bundle: Box<astra_turn_types::ResumeBundleV1>,
+    },
+}
+
 pub(crate) async fn resume_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    Query(query): Query<ResumeSessionQuery>,
     headers: HeaderMap,
-) -> Result<Json<astra_services::session_restore::RestoredSession>, (StatusCode, Json<ErrorResponse>)>
-{
+) -> Result<Json<ResumeSessionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
     let session = state
@@ -2095,11 +2111,15 @@ pub(crate) async fn resume_session_handler(
     let Some(shared_pool) = state.shared_pool.as_ref() else {
         return Err(internal_error("shared MatrixOne pool is not configured"));
     };
-    let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
-    let legacy = svc
-        .restore_session(&user_id, &session.session_id)
-        .await
-        .map_err(internal_error)?;
+    let legacy = if query.continuation_only {
+        None
+    } else {
+        let svc =
+            astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
+        svc.restore_session(&user_id, &session.session_id)
+            .await
+            .map_err(internal_error)?
+    };
     let key = server_session_key(&user_id, &session.session_id);
     let canonical_snapshot = match state.session_context_coordinator.as_ref() {
         Some(coordinator) => Some(
@@ -2162,21 +2182,38 @@ pub(crate) async fn resume_session_handler(
     // observation and control remain explicit operations on `/attachments`
     // and `/handoffs`; inferring a Server attachment here would assign the
     // wrong actor and placement to a CLI restore.
-    state
-        .session_service
-        .update_session(
-            session_id,
-            user_id,
-            SessionUpdateRequestData {
-                title: None,
-                metadata: None,
-                metadata_patch: None,
-                status: Some("active".to_string()),
-            },
-        )
-        .await?;
+    if query.continuation_only && session.status == "active" {
+        state
+            .session_service
+            .ensure_session_active(session_id, user_id)
+            .await?;
+    } else {
+        state
+            .session_service
+            .update_session(
+                session_id,
+                user_id,
+                SessionUpdateRequestData {
+                    title: None,
+                    metadata: None,
+                    metadata_patch: None,
+                    status: Some("active".to_string()),
+                },
+            )
+            .await?;
+    }
     restored.last_status = "active".to_string();
-    Ok(Json(restored))
+    if query.continuation_only {
+        let resume_bundle = restored
+            .resume_bundle
+            .ok_or_else(|| internal_error("canonical continuation is unavailable"))?;
+        Ok(Json(ResumeSessionResponse::Continuation {
+            session_id: restored.session_id,
+            resume_bundle: Box::new(resume_bundle),
+        }))
+    } else {
+        Ok(Json(ResumeSessionResponse::Full(Box::new(restored))))
+    }
 }
 
 pub(crate) async fn attach_session_handler(
@@ -4297,6 +4334,7 @@ mod tests {
         let error = resume_session_handler(
             State(state),
             Path("session-resume-order".to_string()),
+            Query(ResumeSessionQuery::default()),
             auth_headers(),
         )
         .await

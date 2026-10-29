@@ -221,6 +221,27 @@ pub trait SessionService: Send + Sync {
         request: SessionUpdateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Ensure a continuation can use an active session. Implementations may
+    /// avoid rewriting an already active session while preserving its fence.
+    async fn ensure_session_active(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        self.update_session(
+            session_id,
+            user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("active".into()),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn delete_session(
         &self,
         session_id: String,
@@ -1142,6 +1163,74 @@ impl SessionService for DatabaseSessionService {
         });
         log_session_audit(&pool, &user_id, "session_update", &session_id, details).await;
         Ok(updated)
+    }
+
+    async fn ensure_session_active(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        // Do not lazily create a lifecycle fence for a foreign or missing
+        // session. Recheck under the fence below to handle concurrent delete.
+        let exists: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? \
+             AND delete_requested_at IS NULL",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        if exists.is_none() {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            ));
+        }
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
+        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ? \
+             AND delete_requested_at IS NULL FOR UPDATE",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        let status = status.ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        })?;
+        tx.commit().await.map_err(internal_error)?;
+        connection.release();
+        if status == "active" {
+            return Ok(());
+        }
+        self.update_session(
+            session_id,
+            user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("active".into()),
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn delete_session(

@@ -5,6 +5,34 @@ use astra_services::session_restore::{
 use crate::cli::cli_config::cli_utils;
 use crate::cli::session::session_runtime;
 
+#[derive(serde::Deserialize)]
+struct ContinuationResponse {
+    session_id: String,
+    resume_bundle: astra_turn_types::ResumeBundleV1,
+}
+
+async fn request_cloud_resume(
+    api: &astra_thin_client::ThinClient,
+    bearer: &str,
+    path: &str,
+    continuation_only: bool,
+) -> Result<RestoredSession, astra_thin_client::ThinClientError> {
+    if continuation_only {
+        let response: ContinuationResponse = api.post_bearer_path_empty_json(bearer, path).await?;
+        // Adapt to the existing owner/cursor/root validator; only the bundle
+        // leaves this private continuation path, never the unloaded summaries.
+        Ok(RestoredSession {
+            session_id: response.session_id,
+            turn_count: response.resume_bundle.cursor.completed_turn,
+            restored_from_cloud: true,
+            resume_bundle: Some(response.resume_bundle),
+            ..Default::default()
+        })
+    } else {
+        api.post_bearer_path_empty_json(bearer, path).await
+    }
+}
+
 fn validate_remote_session_id(session_id: &str) -> Result<(), String> {
     cli_utils::validate_cli_session_id(session_id)
 }
@@ -160,7 +188,7 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_client(
     if native_binding.is_some() && owner.is_none() {
         return Err("Server resume native account changed during authentication".into());
     }
-    fetch_cloud_session_snapshot_with_bearer(api, session_id, &token, owner.as_ref())
+    fetch_cloud_session_snapshot_with_bearer(api, session_id, &token, owner.as_ref(), false)
         .await
         .map(|(restored, _)| restored)
 }
@@ -168,11 +196,12 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_client(
 /// Read the official continuation through the captured credential binding.
 /// Return the successful bearer for subsequent catalog and model requests.
 /// An unowned explicit bearer never acquires ambient refresh authority.
-pub(crate) async fn fetch_cloud_session_snapshot_with_bearer(
+async fn fetch_cloud_session_snapshot_with_bearer(
     api: &astra_thin_client::ThinClient,
     session_id: &str,
     token: &str,
     owner: Option<&cli_utils::CliOwnerAuthSnapshot>,
+    continuation_only: bool,
 ) -> Result<(Option<RestoredSession>, String), String> {
     validate_remote_session_id(session_id)?;
     let api = api.clone().without_bearer_provider();
@@ -192,10 +221,11 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_bearer(
     if owner.is_some_and(|owner| !owner.is_current()) {
         return Err("Server resume account changed before request".into());
     }
-    let path = astra_thin_client::paths::session_resume(session_id);
-    let response = api
-        .post_bearer_path_empty_json::<RestoredSession>(&bearer, &path)
-        .await;
+    let mut path = astra_thin_client::paths::session_resume(session_id);
+    if continuation_only {
+        path.push_str("?continuation_only=true");
+    }
+    let response = request_cloud_resume(&api, &bearer, &path, continuation_only).await;
     // Only a typed rejection before execution permits one retry. Refresh the
     // captured binding, never an ambient profile or an environment bearer.
     let response = match (response, owner) {
@@ -213,8 +243,7 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_bearer(
             if !owner.is_current() {
                 return Err("Server resume account changed during authentication retry".into());
             }
-            api.post_bearer_path_empty_json::<RestoredSession>(&bearer, &path)
-                .await
+            request_cloud_resume(&api, &bearer, &path, continuation_only).await
         }
         (response, _) => response,
     };
@@ -231,6 +260,25 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_bearer(
         }
         Err(error) => Err(format!("Resume failed: {error}")),
     }
+}
+
+/// Refresh only the canonical continuation for an already restored attachment.
+pub(crate) async fn fetch_cloud_continuation_with_bearer(
+    api: &astra_thin_client::ThinClient,
+    session_id: &str,
+    token: &str,
+    owner: Option<&cli_utils::CliOwnerAuthSnapshot>,
+) -> Result<(Option<astra_turn_types::ResumeBundleV1>, String), String> {
+    let (session, bearer) =
+        fetch_cloud_session_snapshot_with_bearer(api, session_id, token, owner, true).await?;
+    let bundle = session.and_then(|session| session.resume_bundle);
+    if bundle
+        .as_ref()
+        .is_some_and(|bundle| bundle.source != astra_turn_types::ResumeSourceV1::CanonicalJournal)
+    {
+        return Err("Server continuation is no longer canonical; restore the session again before continuing".to_string());
+    }
+    Ok((bundle, bearer))
 }
 
 pub(crate) async fn fetch_cloud_session_snapshot(
@@ -272,6 +320,105 @@ mod tests {
     use astra_services::session_restore::{RestoredSession, ResumableSessionsResponse};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn canonical_bundle(owner: &str, session: &str) -> astra_turn_types::ResumeBundleV1 {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: owner.into(),
+            session_id: session.into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor,
+            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+            conversation_messages: messages,
+            materialized_conversation_root_hash: None,
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn continuation_refresh_uses_canonical_bundle_and_checks_owner() {
+        let _identity = cli_utils::install_cli_profile_identity_for_test(
+            "continuation-test",
+            Some("continuation-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let bundle = canonical_bundle("continuation-owner", "continuation-session");
+        Mock::given(method("POST"))
+            .and(path("/sessions/continuation-session/resume"))
+            .and(wiremock::matchers::query_param("continuation_only", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "continuation-session",
+                "resume_bundle": bundle,
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (restored, bearer) = super::fetch_cloud_continuation_with_bearer(
+            &api,
+            "continuation-session",
+            "token",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bearer, "token");
+        assert_eq!(restored.unwrap().cursor.owner_id, "continuation-owner");
+
+        let _other = cli_utils::install_cli_profile_identity_for_test(
+            "continuation-other",
+            Some("other-owner"),
+        )
+        .unwrap();
+        let error = super::fetch_cloud_continuation_with_bearer(
+            &api,
+            "continuation-session",
+            "token",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("mismatched owner"), "{error}");
+        server.verify().await;
+
+        drop(_other);
+        let fallback_server = MockServer::start().await;
+        let fallback_api =
+            astra_thin_client::ThinClient::new(&fallback_server.uri(), None).unwrap();
+        let mut fallback = canonical_bundle("continuation-owner", "continuation-session");
+        fallback.source = astra_turn_types::ResumeSourceV1::Checkpoint;
+        Mock::given(method("POST"))
+            .and(path("/sessions/continuation-session/resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "continuation-session", "resume_bundle": fallback,
+            })))
+            .mount(&fallback_server)
+            .await;
+        let error = super::fetch_cloud_continuation_with_bearer(
+            &fallback_api,
+            "continuation-session",
+            "token",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no longer canonical"), "{error}");
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -328,12 +475,12 @@ mod tests {
         use wiremock::matchers::header;
         let _credentials = crate::tests::isolate_credentials();
         let _environment = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
-        for (owned, initial_status, refresh_status, retry_status) in [
-            (true, 401, 200, 401),
-            (true, 401, 200, 403),
-            (true, 401, 503, 200),
-            (true, 403, 200, 200),
-            (false, 401, 200, 200),
+        for (owned, initial_status, refresh_status, retry_status, continuation_only) in [
+            (true, 401, 200, 401, true),
+            (true, 401, 200, 403, false),
+            (true, 401, 503, 200, false),
+            (true, 403, 200, 200, false),
+            (false, 401, 200, 200, false),
         ] {
             let mut credentials = CredentialsFile::default();
             credentials.profiles.insert(
@@ -390,7 +537,8 @@ mod tests {
                     &api,
                     "auth-retry",
                     token,
-                    owner.as_ref()
+                    owner.as_ref(),
+                    continuation_only,
                 )
                 .await
                 .is_err()
@@ -412,30 +560,7 @@ mod tests {
             Some("account-a"),
         )
         .unwrap();
-        let messages = vec![serde_json::json!({"role": "user", "content": "private"})];
-        let cursor = astra_turn_types::SessionCursorV1 {
-            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
-            owner_id: "account-b".into(),
-            session_id: "shared-session".into(),
-            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
-            completed_turn: 1,
-            journal_event_seq: 1,
-            conversation_seq: 1,
-            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
-            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
-            compaction_generation: 0,
-            config_version_id: None,
-        };
-        let bundle = astra_turn_types::ResumeBundleV1 {
-            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
-            cursor,
-            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
-            conversation_messages: messages,
-            materialized_conversation_root_hash: None,
-            degraded_reasons: Vec::new(),
-            repair_actions: Vec::new(),
-            projections: Default::default(),
-        };
+        let bundle = canonical_bundle("account-b", "shared-session");
 
         let error = validate_restored_session(
             "shared-session",

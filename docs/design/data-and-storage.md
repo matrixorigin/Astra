@@ -286,6 +286,9 @@ Retention is a product contract:
   explicit run-existence admission. Generic event appends retain the same
   locked metadata reader but omit the unused checkpoint body. These changes
   reduce SQL exchanges and returned bytes, not retained data or durability.
+- Synchronous event creation uses the database's insert receipt for generated
+  fields instead of reading the inserted row again. Session admission retains
+  the same durable deletion fence.
 - Run status snapshots omit checkpoint bodies and read their canonical binding
   and accounting facts in one bounded event query after the metadata lookup.
   A narrow type/index aggregate selects the earliest event of each binding type

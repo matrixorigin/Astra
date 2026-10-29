@@ -654,15 +654,6 @@ impl EventService for DatabaseEventService {
         }
         ensure_event_session_requirement(&mut tx, &session_id, &user_id, sync_outbox_ingestion)
             .await?;
-        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
-            .await
-            .map_err(|error| match error {
-                sqlx::Error::RowNotFound | sqlx::Error::Protocol(_) => error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Session {session_id} not found"),
-                ),
-                error => internal_error(error),
-            })?;
         if let Some(existing_id) = client_event_id.as_deref() {
             let select_sql = format!(
                 "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
@@ -743,11 +734,14 @@ impl EventService for DatabaseEventService {
         let meta_duration_ms = metadata_duration_ms(metadata.as_ref());
 
         let insert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO agent_events \
+            sqlx::AssertSqlSafe(format!(
+                "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
               meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()) \
+             RETURNING {EVENT_DETAIL_SELECT_COLS}"
+            )),
             [
                 primary_parent_event_id.is_some(),
                 tool_call_id.is_some(),
@@ -755,7 +749,7 @@ impl EventService for DatabaseEventService {
                 meta_duration_ms.is_some(),
             ],
         );
-        let insert_result = match query(insert_sql)
+        let row = match query(insert_sql)
             .bind(&event_id)
             .bind(&session_id)
             .bind(&user_id)
@@ -771,7 +765,7 @@ impl EventService for DatabaseEventService {
             .bind(meta_duration_ms)
             .bind(&payload_hash)
             .bind(Uuid::new_v4().to_string())
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
         {
             Ok(result) => result,
@@ -846,27 +840,7 @@ impl EventService for DatabaseEventService {
         .await
         .map_err(internal_error)?;
 
-        let event_count_delta =
-            crate::storage::rows_affected_to_i64(insert_result.rows_affected(), "create_event")
-                .map_err(internal_error)?;
-        bump_agent_session_event_count(
-            &mut *tx,
-            &session_id,
-            &user_id,
-            event_count_delta,
-            Some(&event_id),
-        )
-        .await
-        .map_err(internal_error)?;
-
-        let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
-            EVENT_DETAIL_SELECT_COLS
-        );
-        let row = query(sqlx::AssertSqlSafe(select_sql))
-            .bind(&event_id)
-            .bind(&user_id)
-            .fetch_one(&mut *tx)
+        bump_agent_session_event_count(&mut *tx, &session_id, &user_id, 1, Some(&event_id))
             .await
             .map_err(internal_error)?;
 
