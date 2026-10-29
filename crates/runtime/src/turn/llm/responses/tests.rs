@@ -49,6 +49,22 @@ async fn infer(
     tools: &[Value],
     attempts: &Attempts,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    infer_with_budget(
+        execution,
+        messages,
+        tools,
+        attempts,
+        Duration::from_secs(12),
+    )
+    .await
+}
+async fn infer_with_budget(
+    execution: &astra_services::AdmittedModelExecution,
+    messages: &[Value],
+    tools: &[Value],
+    attempts: &Attempts,
+    budget: Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let projected = consolidate_system_messages_for_provider(messages, "chatgpt", None);
     call_llm_and_collect_with_stream_callback(
         LlmCall {
@@ -65,7 +81,7 @@ async fn infer(
         None,
         Some(attempts),
         RuntimeToolChoice::Auto,
-        Some(Duration::from_secs(12)),
+        Some(budget),
     )
     .await
 }
@@ -81,7 +97,7 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         .await
         .unwrap();
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
-    let provider = fixture::ProviderFixture::start().await;
+    let mut provider = fixture::ProviderFixture::start().await;
     let key = Arc::new(FernetTokenEncryptor::new("responses-runtime-test-key").unwrap());
     let config = ChatgptConfig::for_test(&provider.base);
     let service = DatabaseModelService::new(settings.clone(), key.clone())
@@ -295,6 +311,30 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         "quota must not trigger a retry"
     );
     provider.state.quota.store(false, Ordering::SeqCst);
+    // A refused connection schedules retry backoff. The original invocation
+    // deadline must expire during that sleep, before another attempt begins.
+    provider.stop().await;
+    let before_attempts = attempts.next.load(Ordering::SeqCst);
+    let started = Instant::now();
+    {
+        let _backoff = super::super::set_test_retry_backoff_ms(1000);
+        let failure = infer_with_budget(
+            &admitted,
+            &messages,
+            &tools,
+            &attempts,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, astra_core::ErrorKind::ProviderDeadline);
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "retry sleep escaped the invocation budget"
+    );
+    assert_eq!(attempts.next.load(Ordering::SeqCst), before_attempts + 1);
+    provider.restart().await;
     provider.state.hold_responses.store(true, Ordering::SeqCst);
     let before = provider.state.responses_calls.load(Ordering::SeqCst);
     let disconnect_started = Instant::now();

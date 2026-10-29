@@ -14,7 +14,8 @@ use astra_services::chatgpt::{
     StartAuthorization,
 };
 use astra_services::{
-    DatabaseModelService, FernetTokenEncryptor, ModelService, models::UserModelCreateRequestData,
+    DatabaseModelService, FernetTokenEncryptor, ModelService,
+    models::{UserModelCreateRequestData, UserModelUpdateRequestData},
 };
 use serde_json::{Value, json};
 use std::{
@@ -51,6 +52,101 @@ async fn expire(pool: &sqlx::MySqlPool, key: &FernetTokenEncryptor, owner: &str,
     value["expires_at"] = json!(chrono::Utc::now().timestamp() - 1);
     sqlx::query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=? WHERE user_id=? AND connection_id=?")
         .bind(key.encrypt(&value.to_string()).unwrap()).bind(chrono::Utc::now().timestamp()-1).bind(owner).bind(id).execute(pool).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn valid_credentials_read_concurrently_over_database_round_trips() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (direct, mut settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    let provider = fixture::ProviderFixture::start().await;
+    let config = ChatgptConfig::for_test(&provider.base);
+    let key = Arc::new(FernetTokenEncryptor::new("subscription-parallel-read-test").unwrap());
+    let service = Arc::new(ChatgptConnections::new(
+        Some(direct),
+        key.clone(),
+        Ok(config.clone()),
+    ));
+    let owner = format!("parallel-{}", uuid::Uuid::new_v4());
+    let authorization = start(&service, &owner, None).await;
+    let code = provider.issue_code(&authorization, "parallel-account", true);
+    let linked = service
+        .operate(
+            &owner,
+            ConnectionOperation::Complete(
+                authorization["authorization_id"].as_str().unwrap().into(),
+                callback(&authorization, &code),
+            ),
+        )
+        .await
+        .unwrap();
+    let connection = linked["connection"]["connection_id"].as_str().unwrap();
+
+    // Delay SQL responses to expose actual overlapping queries. Assert
+    // concurrency, not a machine-dependent latency or throughput threshold.
+    let upstream = (settings.host.clone(), settings.port);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    settings.host = "127.0.0.1".into();
+    settings.port = listener.local_addr().unwrap().port();
+    settings.db_pool_min_connections = 8;
+    settings.db_pool_max_connections = 8;
+    let overlap = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+    let proxy = tokio::spawn({
+        let overlap = overlap.clone();
+        async move {
+            loop {
+                let (client, _) = listener.accept().await.unwrap();
+                let db = tokio::net::TcpStream::connect(upstream.clone())
+                    .await
+                    .unwrap();
+                client.set_nodelay(true).unwrap();
+                db.set_nodelay(true).unwrap();
+                let overlap = overlap.clone();
+                tokio::spawn(async move {
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut db_read, mut db_write) = db.into_split();
+                    let responses = async {
+                        let mut bytes = [0; 16384];
+                        while let Ok(n) = db_read.read(&mut bytes).await {
+                            if n == 0 {
+                                break;
+                            }
+                            let active = overlap.0.fetch_add(1, Ordering::SeqCst) + 1;
+                            overlap.1.fetch_max(active, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            let written = client_write.write_all(&bytes[..n]).await;
+                            overlap.0.fetch_sub(1, Ordering::SeqCst);
+                            if written.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy(&mut client_read, &mut db_write) => {},
+                        _ = responses => {},
+                    }
+                });
+            }
+        }
+    });
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let service = Arc::new(ChatgptConnections::new(Some(pool.clone()), key, Ok(config)));
+    let binding = service.binding(&owner, connection).await.unwrap();
+    overlap.1.store(0, Ordering::SeqCst);
+    let results = futures_util::future::join_all((0..64).map(|_| binding.acquire(None))).await;
+    assert!(results.iter().all(Result::is_ok));
+    assert!(
+        overlap.1.load(Ordering::SeqCst) >= 4,
+        "valid credentials serialized database reads"
+    );
+    assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 0);
+    drop(results);
+    pool.close().await;
+    proxy.abort();
 }
 
 #[tokio::test]
@@ -258,13 +354,81 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     provider.restart().await;
     drop(primary.acquire(None).await.unwrap());
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 2);
+
+    // Even the last waiter can disappear after dispatch. The connection owner
+    // must still persist the rotating token instead of stranding its lease.
+    let version = primary.acquire(None).await.unwrap().version();
+    expire(&pool, &key, &owner, &connection).await;
+    provider.state.refresh_delay_ms.store(200, Ordering::SeqCst);
+    let cancelled = tokio::spawn({
+        let primary = primary.clone();
+        async move { primary.acquire(None).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while provider.state.refresh_calls.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancelled.abort();
+    assert!(cancelled.await.err().unwrap().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let state:(String,i64,Option<String>)=sqlx::query_as("SELECT status,credential_version,refresh_owner FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+                .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
+            assert_eq!(state.0, "connected");
+            if state.1 == version + 1 && state.2.is_none() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    let refreshed = primary.acquire(Some(version)).await.unwrap();
+    assert_eq!(refreshed.version(), version + 1);
+    drop(refreshed);
+    assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 3);
+
+    // A simultaneous expiry shares one worker/result, and subsequent valid
+    // acquisitions neither rotate nor wait on that worker's coordination.
+    expire(&pool, &key, &owner, &connection).await;
+    for expected_refreshes in [4, 4] {
+        let leases = futures_util::future::join_all((0..64).map(|_| primary.acquire(None))).await;
+        let leases = leases.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(
+            leases
+                .iter()
+                .all(|lease| lease.bearer() == leases[0].bearer())
+        );
+        assert_eq!(
+            provider.state.refresh_calls.load(Ordering::SeqCst),
+            expected_refreshes
+        );
+    }
+    provider.state.refresh_delay_ms.store(0, Ordering::SeqCst);
     let live = first.acquire(None).await.unwrap();
+    expire(&pool, &key, &owner, &connection).await;
+    provider.state.refresh_delay_ms.store(200, Ordering::SeqCst);
+    let interrupted_refresh = tokio::spawn({
+        let first = first.clone();
+        async move { first.acquire(None).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while provider.state.refresh_calls.load(Ordering::SeqCst) < 5 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let disconnected = service
         .operate(&owner, ConnectionOperation::Disconnect(connection.clone()))
         .await
         .unwrap();
     assert_eq!(disconnected["status"], "disconnected");
     assert_eq!(disconnected["remote_revocation_confirmed"], true);
+    assert!(
+        interrupted_refresh.await.unwrap().is_err(),
+        "an owned refresh must not overwrite disconnect"
+    );
+    provider.state.refresh_delay_ms.store(0, Ordering::SeqCst);
     assert!(first.ensure_current().await.is_err());
     // This binding belongs to another service instance: database fencing is
     // authoritative even when local cancellation registries are different.
@@ -400,6 +564,133 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         .map(|request| request["model"].as_str().unwrap().to_owned())
         .collect();
     assert!(codes.contains("fixture-model") && codes.contains("fixture-second"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn disconnect_fences_inflight_model_creation_check_activation_and_default() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    let provider = fixture::ProviderFixture::start().await;
+    let config = ChatgptConfig::for_test(&provider.base);
+    let key = Arc::new(FernetTokenEncryptor::new("subscription-activation-race-test").unwrap());
+    let connections = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        key.clone(),
+        Ok(config.clone()),
+    ));
+    let models = Arc::new(
+        DatabaseModelService::new(settings, key)
+            .with_pool(shared.clone())
+            .with_chatgpt_config(config),
+    );
+    for operation in ["check", "activate", "default", "create"] {
+        let owner = format!("activation-{}", uuid::Uuid::new_v4());
+        let authorization = start(&connections, &owner, None).await;
+        let code = provider.issue_code(&authorization, "activation-account", true);
+        let linked = connections
+            .operate(
+                &owner,
+                ConnectionOperation::Complete(
+                    authorization["authorization_id"].as_str().unwrap().into(),
+                    callback(&authorization, &code),
+                ),
+            )
+            .await
+            .unwrap();
+        let connection = linked["connection"]["connection_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let model_request = UserModelCreateRequestData {
+            connection_id: Some(connection.clone()),
+            name: "initial".into(),
+            provider: "chatgpt".into(),
+            model: "fixture-model".into(),
+            base_url: None,
+            api_key: String::new(),
+            context_window: 128000,
+            is_default: true,
+        };
+        let model = models
+            .create_user_model(owner.clone(), model_request.clone())
+            .await
+            .unwrap();
+        let mut blocked = shared.get().begin().await.unwrap();
+        sqlx::query(
+            "SELECT model_id FROM user_llm_models WHERE user_id=? AND model_id=? FOR UPDATE",
+        )
+        .bind(&owner)
+        .bind(&model.model_id)
+        .fetch_one(&mut *blocked)
+        .await
+        .unwrap();
+        let disconnect = tokio::spawn({
+            let connections = connections.clone();
+            let owner = owner.clone();
+            let connection = connection.clone();
+            async move {
+                connections
+                    .operate(&owner, ConnectionOperation::Disconnect(connection))
+                    .await
+            }
+        });
+        // Disconnect first locks the connection, then waits for the model row.
+        // Probes can still see the old committed connection during that wait.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let before = provider.state.responses_calls.load(Ordering::SeqCst);
+        let activation = tokio::spawn({
+            let models = models.clone();
+            let owner = owner.clone();
+            let model_id = model.model_id.clone();
+            async move {
+                match operation {
+                    "check" => models.check_user_model(owner, model_id).await,
+                    "create" => {
+                        models
+                            .create_user_model(
+                                owner,
+                                UserModelCreateRequestData {
+                                    name: "new-model".into(),
+                                    ..model_request
+                                },
+                            )
+                            .await
+                    }
+                    _ => {
+                        models
+                            .update_user_model(
+                                owner,
+                                model_id,
+                                UserModelUpdateRequestData {
+                                    is_active: (operation == "activate").then_some(true),
+                                    is_default: (operation == "default").then_some(true),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                    }
+                }
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while provider.state.responses_calls.load(Ordering::SeqCst) == before {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        blocked.commit().await.unwrap();
+        disconnect.await.unwrap().unwrap();
+        assert!(
+            activation.await.unwrap().is_err(),
+            "stale {operation} succeeded after disconnect"
+        );
+        let state:(String,i64)=sqlx::query_as("SELECT c.status, COUNT(CASE WHEN m.is_active=1 THEN 1 END) FROM user_llm_connections c LEFT JOIN user_llm_models m ON c.user_id=m.user_id AND c.connection_id=m.connection_id WHERE c.user_id=? AND c.connection_id=? GROUP BY c.status")
+            .bind(&owner).bind(&connection).fetch_one(shared.get()).await.unwrap();
+        assert_eq!(state, ("disconnected".into(), 0), "{operation}");
+    }
 }
 
 #[tokio::test]

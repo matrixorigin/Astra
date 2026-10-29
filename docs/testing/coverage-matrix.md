@@ -59,13 +59,18 @@ MatrixOne database and a local fake OAuth/Responses provider for encryption,
 ownership, rotation races, model sharing, disconnect and reauthorization.
 Refresh regressions cover a refused TCP connection followed by recovery,
 cross-instance expiry with 11-second discovery/JWKS/token legs, and metadata
-cache reuse.
+cache reuse. Cancellation of the last refresh waiter must still commit the new
+credential; 64 concurrent waiters share one rotation. Row-lock races exercise
+model creation, checking, activation and default selection against disconnect.
+A delayed SQL response proxy verifies that valid-token queries overlap instead
+of serializing behind refresh coordination, without a throughput threshold.
 The ignored `responses_transport_replays_checkpoint_and_fences_disconnected_credentials`
 transport test covers physical-attempt settlement, manually constructed tool
 frames replayed through canonical heavy-checkpoint JSON, a delayed old-token
 401, context-window and in-stream quota classifications, and disconnect during
 headers. Sixteen concurrent requests verify that SQL fencing is shared per
-connection.
+connection. A refused-connection retry with a 100 ms invocation budget must
+expire during its one-second backoff before admitting a second attempt.
 The ignored `chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session`
 test in `runtime/tests/web_agent_e2e.rs` exercises authenticated connection and
 model routes, real model-catalog tool execution through `/chat/stream`, and

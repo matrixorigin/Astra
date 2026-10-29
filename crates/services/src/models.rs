@@ -3495,11 +3495,10 @@ impl DatabaseModelService {
         let model = validate_user_model_identifier("model", &request.model)?;
         validate_context_window_value(request.context_window, "context_window")
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
-        self.subscriptions
+        let binding = self
+            .subscriptions
             .probe(&user_id, connection_id, &model)
             .await?;
-        let binding = self.subscriptions.binding(&user_id, connection_id).await?;
-        binding.ensure_current().await?;
         let pool = self.get_pool().await.map_err(internal_error)?;
         let duplicate: i64 =
             query_scalar("SELECT COUNT(*) FROM user_llm_models WHERE user_id=? AND model_alias=?")
@@ -3516,6 +3515,7 @@ impl DatabaseModelService {
         }
         let model_id = Uuid::new_v4().to_string();
         let mut tx = pool.begin().await.map_err(internal_error)?;
+        binding.lock_current(&mut tx).await?;
         if request.is_default {
             query("UPDATE user_llm_models SET is_default=0,updated_at=NOW(6) WHERE user_id=?")
                 .bind(&user_id)
@@ -4351,6 +4351,7 @@ impl ModelService for DatabaseModelService {
                 .await
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
+        let mut subscription_binding = None;
         if provider == crate::chatgpt::PROVIDER {
             if request.api_key.is_some() {
                 return Err(error_response_coded(
@@ -4364,9 +4365,11 @@ impl ModelService for DatabaseModelService {
                     .try_get::<Option<String>, _>("connection_id")
                     .map_err(internal_error)?
                     .ok_or_else(|| internal_error("Subscription model has no connection"))?;
-                self.subscriptions
-                    .probe(&user_id, &connection, &model)
-                    .await?;
+                subscription_binding = Some(
+                    self.subscriptions
+                        .probe(&user_id, &connection, &model)
+                        .await?,
+                );
             }
         }
         let encrypted_key = if let Some(api_key) = request.api_key.as_deref() {
@@ -4385,6 +4388,9 @@ impl ModelService for DatabaseModelService {
         };
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
+        if let Some(binding) = subscription_binding {
+            binding.lock_current(&mut tx).await?;
+        }
         if request.is_default == Some(true) {
             query(
                 "UPDATE user_llm_models SET is_default = 0, updated_at = NOW(6) WHERE user_id = ?",
@@ -4475,10 +4481,16 @@ impl ModelService for DatabaseModelService {
             let model = existing
                 .try_get::<String, _>("model_name")
                 .map_err(internal_error)?;
-            self.subscriptions
+            let binding = self
+                .subscriptions
                 .probe(&user_id, &connection, &model)
                 .await?;
-            query("UPDATE user_llm_models SET is_active=1,updated_at=NOW(6) WHERE user_id=? AND model_id=?").bind(&user_id).bind(&model_id).execute(&self.get_pool().await.map_err(internal_error)?).await.map_err(internal_error)?;
+            let pool = self.get_pool().await.map_err(internal_error)?;
+            let mut tx = pool.begin().await.map_err(internal_error)?;
+            binding.lock_current(&mut tx).await?;
+            query("UPDATE user_llm_models SET is_active=1,updated_at=NOW(6) WHERE user_id=? AND model_id=?")
+                .bind(&user_id).bind(&model_id).execute(&mut *tx).await.map_err(internal_error)?;
+            tx.commit().await.map_err(internal_error)?;
             return self.get_user_model(user_id, model_id).await;
         }
         let pool = self.get_pool().await.map_err(internal_error)?;

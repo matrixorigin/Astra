@@ -1819,6 +1819,30 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
     }
 }
 
+/// All transports charge retry backoff to the original provider work budget.
+async fn wait_provider_retry(
+    delay_ms: u64,
+    cancel: LlmCancel<'_>,
+    started: Instant,
+    total_budget: std::time::Duration,
+) -> Result<(), astra_core::ClassifiedError> {
+    let remaining = total_budget.saturating_sub(started.elapsed());
+    let deadline = || {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider work deadline reached during provider retry backoff",
+        )
+    };
+    if remaining.is_zero() {
+        return Err(deadline());
+    }
+    tokio::select! {
+        biased;
+        result = sleep_ms_or_llm_cancel(delay_ms, cancel) => result,
+        _ = tokio::time::sleep(remaining) => Err(deadline()),
+    }
+}
+
 /// Per-chunk idle watchdog (pre-progress): no SSE JSON for this long → treat as stalled.
 /// Production delegates to the canonical timeout in `sse_stream_host`; tests may
 /// override it through unit-test locals or the `e2e-hooks` integration hook.
@@ -5352,35 +5376,7 @@ async fn call_prepared_llm_with_total_budget(
             let delay = retry_delay_override_ms
                 .take()
                 .unwrap_or_else(|| retry_backoff_ms(attempt));
-            let remaining = total_budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::ProviderDeadline,
-                    format!(
-                        "LLM provider work deadline reached ({:.0}s) before provider retry",
-                        total_budget.as_secs_f64()
-                    ),
-                ));
-            }
-            let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay));
-            tokio::pin!(sleep);
-            tokio::select! {
-                biased;
-                _ = wait_llm_cancel(cancel) => return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::Cancelled,
-                    "LLM call cancelled",
-                )),
-                _ = tokio::time::sleep(remaining), if remaining <= std::time::Duration::from_millis(delay) => {
-                    return Err(astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ProviderDeadline,
-                        format!(
-                            "LLM provider work deadline reached ({:.0}s) during provider retry backoff",
-                            total_budget.as_secs_f64()
-                        ),
-                    ));
-                }
-                _ = &mut sleep => {}
-            }
+            wait_provider_retry(delay, cancel, started, total_budget).await?;
         }
 
         // Scheduler delay after a retry backoff is outside the HTTP attempt.
@@ -8824,6 +8820,44 @@ mod tests {
     async fn sleep_ms_or_llm_cancel_sleeps_when_no_cancel_source() {
         let r = sleep_ms_or_llm_cancel(8, LlmCancel::None).await;
         assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_retry_wait_obeys_original_budget_and_cancellation() {
+        let started = Instant::now();
+        let error = wait_provider_retry(
+            1000,
+            LlmCancel::None,
+            started,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let error = wait_provider_retry(0, LlmCancel::None, started, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = wait_provider_retry(
+            1000,
+            LlmCancel::Token(&cancel),
+            Instant::now(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        wait_provider_retry(
+            1,
+            LlmCancel::None,
+            Instant::now(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

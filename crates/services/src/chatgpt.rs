@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{MySqlPool, Row, query};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -234,6 +234,8 @@ struct Identity {
 }
 
 type ConnectionKey = (String, String);
+type RefreshKey = (String, String, i64);
+type RefreshWaiter = tokio::sync::watch::Receiver<Option<ApiResult<(String, i64)>>>;
 struct ActiveConnection {
     monitor: Uuid,
     requests: Vec<(Uuid, i64, CancellationToken)>,
@@ -247,7 +249,7 @@ pub struct ChatgptConnections {
     encryptor: Arc<FernetTokenEncryptor>,
     config: Result<ChatgptConfig, String>,
     active: Mutex<HashMap<ConnectionKey, ActiveConnection>>,
-    refresh_gates: Mutex<HashMap<ConnectionKey, Weak<tokio::sync::Mutex<()>>>>,
+    refreshes: Mutex<HashMap<RefreshKey, RefreshWaiter>>,
     signing_keys: tokio::sync::Mutex<Option<SigningKeys>>,
     inference_client: OnceLock<reqwest::Client>,
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -392,6 +394,22 @@ impl ExecutionCredential {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = query("SELECT status, generation FROM user_llm_connections WHERE user_id = ? AND connection_id = ?")
             .bind(&self.owner).bind(&self.connection_id).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
+        self.validate_current(&row)
+    }
+
+    /// Serialize model activation with disconnect/reauthorization. Call only
+    /// after provider I/O, before touching model rows in the same transaction.
+    pub(crate) async fn lock_current(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    ) -> ApiResult<()> {
+        self.service.enabled()?;
+        let row = query("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+            .bind(&self.owner).bind(&self.connection_id).fetch_optional(&mut **tx).await.map_err(internal_error)?.ok_or_else(not_found)?;
+        self.validate_current(&row)
+    }
+
+    fn validate_current(&self, row: &sqlx::mysql::MySqlRow) -> ApiResult<()> {
         if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
             || row
                 .try_get::<i64, _>("generation")
@@ -431,7 +449,7 @@ impl ChatgptConnections {
             encryptor,
             config,
             active: Mutex::new(HashMap::new()),
-            refresh_gates: Mutex::new(HashMap::new()),
+            refreshes: Mutex::new(HashMap::new()),
             signing_keys: tokio::sync::Mutex::new(None),
             inference_client: OnceLock::new(),
             #[cfg(any(test, feature = "e2e-hooks"))]
@@ -674,16 +692,38 @@ impl ChatgptConnections {
         Ok(keys)
     }
 
-    fn refresh_gate(&self, owner: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.refresh_gates.lock().unwrap_or_else(|e| e.into_inner());
-        gates.retain(|_, value| value.strong_count() > 0);
-        let key = (owner.to_owned(), id.to_owned());
-        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
-            return gate;
+    fn refresh(
+        self: &Arc<Self>,
+        owner: &str,
+        id: &str,
+        generation: i64,
+        rejected_version: Option<i64>,
+    ) -> RefreshWaiter {
+        let mut refreshes = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (owner.to_owned(), id.to_owned(), generation);
+        if let Some(waiter) = refreshes.get(&key)
+            && waiter.has_changed().is_ok()
+        {
+            return waiter.clone();
         }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(key, Arc::downgrade(&gate));
-        gate
+        let (result, waiter) = tokio::sync::watch::channel(None);
+        refreshes.insert(key.clone(), waiter.clone());
+        let service = self.clone();
+        // Rotation belongs to the connection, not an inference's cancellation
+        // or deadline. Always finish its bounded exchange and persistence even
+        // if every waiter goes away; disconnect still fences its database CAS.
+        tokio::spawn(async move {
+            let outcome = service
+                .refresh_access_token(&key.0, &key.1, generation, rejected_version)
+                .await;
+            service
+                .refreshes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            result.send_replace(Some(outcome));
+        });
+        waiter
     }
 
     fn register_request(
@@ -998,6 +1038,87 @@ impl ChatgptConnections {
     }
 
     async fn access_token(
+        self: &Arc<Self>,
+        owner: &str,
+        id: &str,
+        generation: i64,
+        rejected_version: Option<i64>,
+    ) -> ApiResult<(String, i64)> {
+        loop {
+            let row = self.credential_row(owner, id, generation).await?;
+            if let Some(token) = self.usable_access_token(&row, rejected_version)? {
+                return Ok(token);
+            }
+            let mut refresh = self.refresh(owner, id, generation, rejected_version);
+            let (token, version) = loop {
+                if let Some(result) = refresh.borrow_and_update().clone() {
+                    break result?;
+                }
+                refresh.changed().await.map_err(|_| {
+                    fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "chatgpt_refresh_unavailable",
+                        "Subscription refresh did not settle",
+                    )
+                })?;
+            };
+            // A caller rejecting the next version may have joined an older
+            // flight that only reused it. That caller must refresh that version.
+            if rejected_version != Some(version) {
+                return Ok((token, version));
+            }
+        }
+    }
+
+    async fn credential_row(
+        &self,
+        owner: &str,
+        id: &str,
+        generation: i64,
+    ) -> ApiResult<sqlx::mysql::MySqlRow> {
+        self.enabled()?;
+        let row = query("SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+            .bind(owner)
+            .bind(id)
+            .fetch_optional(&self.pool()?)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(not_found)?;
+        if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
+            || row
+                .try_get::<i64, _>("generation")
+                .map_err(internal_error)?
+                != generation
+        {
+            return Err(reauth());
+        }
+        Ok(row)
+    }
+
+    fn usable_access_token(
+        &self,
+        row: &sqlx::mysql::MySqlRow,
+        rejected_version: Option<i64>,
+    ) -> ApiResult<Option<(String, i64)>> {
+        let version: i64 = row.try_get("credential_version").map_err(internal_error)?;
+        let expires: Option<i64> = row.try_get("token_expires_at").map_err(internal_error)?;
+        let refreshing: Option<String> = row.try_get("refresh_owner").map_err(internal_error)?;
+        if rejected_version != Some(version)
+            && refreshing.is_none()
+            && expires.is_some_and(|value| value > unix_now() + 60)
+        {
+            let encrypted: Option<String> = row
+                .try_get("credentials_encrypted")
+                .map_err(internal_error)?;
+            let credentials = self.decode_credentials(&encrypted.ok_or_else(reauth)?)?;
+            if credentials.expires_at > unix_now() + 60 {
+                return Ok(Some((credentials.access_token, version)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn refresh_access_token(
         &self,
         owner: &str,
         id: &str,
@@ -1005,43 +1126,20 @@ impl ChatgptConnections {
         rejected_version: Option<i64>,
     ) -> ApiResult<(String, i64)> {
         let config = self.enabled()?;
-        let gate = self.refresh_gate(owner, id);
-        let _guard = gate.lock().await;
         let pool = self.pool()?;
         let mut metadata_ready = false;
         let mut deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         let mut wait = Duration::from_millis(100);
         loop {
-            let row =
-                query("SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?")
-                    .bind(owner)
-                    .bind(id)
-                    .fetch_optional(&pool)
-                    .await
-                    .map_err(internal_error)?
-                    .ok_or_else(not_found)?;
-            if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
-                || row
-                    .try_get::<i64, _>("generation")
-                    .map_err(internal_error)?
-                    != generation
-            {
-                return Err(reauth());
+            let row = self.credential_row(owner, id, generation).await?;
+            if let Some(token) = self.usable_access_token(&row, rejected_version)? {
+                return Ok(token);
             }
             let version: i64 = row.try_get("credential_version").map_err(internal_error)?;
             let encrypted: Option<String> = row
                 .try_get("credentials_encrypted")
                 .map_err(internal_error)?;
             let encrypted = encrypted.ok_or_else(reauth)?;
-            let expires: Option<i64> = row.try_get("token_expires_at").map_err(internal_error)?;
-            if rejected_version != Some(version)
-                && expires.is_some_and(|value| value > unix_now() + 60)
-            {
-                let credentials = self.decode_credentials(&encrypted)?;
-                if credentials.expires_at > unix_now() + 60 {
-                    return Ok((credentials.access_token, version));
-                }
-            }
             let refresh_owner: Option<String> =
                 row.try_get("refresh_owner").map_err(internal_error)?;
             if let Some(refresh_owner) = refresh_owner {
@@ -1062,8 +1160,8 @@ impl ChatgptConnections {
                         "Subscription refresh is already in progress",
                     ));
                 }
-                // One local waiter per connection polls cross-replica state;
-                // other requests await the shared gate without SQL/decryption.
+                // Only the connection-owned worker polls cross-replica state;
+                // local waiters share its result without SQL or decryption.
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(1));
                 continue;
@@ -1177,7 +1275,12 @@ impl ChatgptConnections {
         binding.ensure_current().await?;
         Ok(json!({"connection_id":id,"items":items}))
     }
-    pub async fn probe(self: &Arc<Self>, owner: &str, id: &str, model: &str) -> ApiResult<()> {
+    pub async fn probe(
+        self: &Arc<Self>,
+        owner: &str,
+        id: &str,
+        model: &str,
+    ) -> ApiResult<ExecutionCredential> {
         let catalog = self.models(owner, id).await?;
         if !catalog["items"]
             .as_array()
@@ -1230,7 +1333,8 @@ impl ChatgptConnections {
                 "Subscription model check returned no text",
             ));
         }
-        binding.ensure_current().await
+        binding.ensure_current().await?;
+        Ok(binding)
     }
     async fn disconnect(&self, owner: &str, id: &str) -> ApiResult<Value> {
         let pool = self.pool()?;

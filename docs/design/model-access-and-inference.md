@@ -59,8 +59,10 @@ credentials are stored encrypted. Credentials never enter serializable routes, c
 checkpoints or public errors. The CLI relays only the browser callback and uses
 a loopback listener; Server never reads local CLI/Codex credentials.
 
-Refresh rotation uses a local gate per connection and a database compare-and-set
-lease plus the rejected credential version. Discovery/JWKS metadata is cached
+Valid-token reads run concurrently. Refresh rotation shares one connection-owned
+task per generation and a database compare-and-set lease plus the rejected
+credential version. Cancelling an inference or its last waiter does not cancel
+the bounded rotation or its credential commit. Discovery/JWKS metadata is cached
 and prepared before taking the lease; the full rotation operation has a
 25-second budget within its 30-second lease. A proven pre-dispatch connection
 failure releases the lease and preserves credentials. A lost/expired refresh
@@ -73,6 +75,13 @@ fresh fence before accepting completion. Watchers stop with their last request.
 Interrupted delivered requests settle as delivery-unknown through the existing
 attempt owner. A disabled selected default cannot silently choose deployment
 credentials. OAuth identity is never Astra identity or login-session authority.
+
+Model creation, activation and default selection lock and revalidate the probed
+connection generation within their database transaction, before changing model
+rows. Disconnect and reauthorization use the same connection-before-model lock
+order. A stale successful probe cannot re-enable models after disconnect.
+Retry backoff uses the shared provider deadline/cancellation owner and consumes
+the original inference budget.
 
 Responses requests always send full history with `store:false` and `stream:true`.
 Astra functions occupy the `astra` namespace. Completed provider output items,

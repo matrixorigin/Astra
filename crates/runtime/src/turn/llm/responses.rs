@@ -437,7 +437,8 @@ pub(super) async fn execute(
                     return Err(attach_llm_result_details(failure, &partial));
                 }
                 if rejected_version.is_none() {
-                    sleep_ms_or_llm_cancel(retry_backoff_ms(attempt + 1), cancel).await?;
+                    wait_provider_retry(retry_backoff_ms(attempt + 1), cancel, started, budget)
+                        .await?;
                 }
             }
         }
