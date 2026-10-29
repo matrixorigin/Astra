@@ -59,12 +59,17 @@ credentials are stored encrypted. Credentials never enter serializable routes, c
 checkpoints or public errors. The CLI relays only the browser callback and uses
 a loopback listener; Server never reads local CLI/Codex credentials.
 
-Refresh rotation uses a database compare-and-set lease plus credential version.
-A lost/expired refresh outcome requires reauthentication instead of reusing a
-potentially consumed refresh token. Connection generations fence reauthorization
+Refresh rotation uses a local gate per connection and a database compare-and-set
+lease plus the rejected credential version. Discovery/JWKS metadata is cached
+and prepared before taking the lease; the full rotation operation has a
+25-second budget within its 30-second lease. A proven pre-dispatch connection
+failure releases the lease and preserves credentials. A lost/expired refresh
+outcome requires reauthentication instead of reusing a potentially consumed
+refresh token. A delayed 401 for an older version reuses a committed winner. Connection generations fence reauthorization
 and disconnect against old execution bindings. Disconnect clears ciphertext,
-disables dependent models and cancels local requests; other replicas check the
-database generation during provider work and before accepting completion.
+disables dependent models and cancels local requests; each replica shares one
+database generation watcher per active connection, and each request performs a
+fresh fence before accepting completion. Watchers stop with their last request.
 Interrupted delivered requests settle as delivery-unknown through the existing
 attempt owner. A disabled selected default cannot silently choose deployment
 credentials. OAuth identity is never Astra identity or login-session authority.

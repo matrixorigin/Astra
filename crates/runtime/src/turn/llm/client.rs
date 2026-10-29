@@ -7855,19 +7855,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let kind = if status == 401 || status == 403 {
-            astra_core::ErrorKind::Auth
-        } else if is_rate_limit_status(status) {
-            astra_core::ErrorKind::RateLimit
-        } else if status >= 500 {
-            astra_core::ErrorKind::ServerError
-        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
-            astra_core::ErrorKind::ContextWindow
-        } else if status == 400 {
-            astra_core::ErrorKind::InvalidRequest
-        } else {
-            astra_core::ErrorKind::Unknown
-        };
+        let kind = provider_http_error_kind(status, &text);
         let message = if kind == astra_core::ErrorKind::Auth {
             "LLM provider authentication failed".to_owned()
         } else {
@@ -8271,6 +8259,24 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
             .and_then(Value::as_str)
             .map(String::from),
         effective_finish_reason: None,
+    }
+}
+
+/// Canonical HTTP recovery classification shared by inference protocols.
+fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
+    use astra_core::ErrorKind;
+    if status == 401 || status == 403 {
+        ErrorKind::Auth
+    } else if is_rate_limit_status(status) {
+        ErrorKind::RateLimit
+    } else if status >= 500 {
+        ErrorKind::ServerError
+    } else if status == 400 && astra_core::is_llm_context_window_error(body) {
+        ErrorKind::ContextWindow
+    } else if status == 400 {
+        ErrorKind::InvalidRequest
+    } else {
+        ErrorKind::Unknown
     }
 }
 

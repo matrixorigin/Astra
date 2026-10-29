@@ -7,6 +7,26 @@ use std::collections::BTreeMap;
 pub const CONTINUATION_KEY: &str = "_astra_responses";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
 
+/// Stable protocol errors and their HTTP equivalents, including SSE failures.
+/// Unknown upstream prose/codes never become public error details.
+pub fn provider_error(code: &str) -> Option<(&'static str, u16)> {
+    match code {
+        "subscription_sharing_user_not_eligible" => {
+            Some(("subscription_sharing_user_not_eligible", 403))
+        }
+        "subscription_sharing_usage_limit_exceeded" => {
+            Some(("subscription_sharing_usage_limit_exceeded", 429))
+        }
+        "subscription_sharing_usage_unavailable" => {
+            Some(("subscription_sharing_usage_unavailable", 503))
+        }
+        "context_length_exceeded" | "context_window_exceeded" | "input_too_long" => {
+            Some(("context_length_exceeded", 400))
+        }
+        _ => None,
+    }
+}
+
 fn replay_item(item: &Value) -> Result<Value, String> {
     let keys: &[&str] = match item["type"].as_str() {
         Some("message") => {
@@ -340,12 +360,9 @@ impl ResponseAccumulator {
                     .or_else(|| event.get("code"))
                     .and_then(Value::as_str)
                     .unwrap_or("response_incomplete");
-                let code = match code {
-                    "subscription_sharing_user_not_eligible"
-                    | "subscription_sharing_usage_limit_exceeded"
-                    | "subscription_sharing_usage_unavailable" => code,
-                    _ => "response_incomplete",
-                };
+                let code = provider_error(code)
+                    .map(|value| value.0)
+                    .unwrap_or("response_incomplete");
                 return Err(code.into());
             }
             _ => {}

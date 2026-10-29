@@ -73,6 +73,20 @@ async fn provider_identity_requires_signature_audience_and_nonce() {
             .await
             .is_err()
     );
+    assert_eq!(
+        fixture
+            .state
+            .discovery_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture
+            .state
+            .jwks_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 }
 #[tokio::test]
 async fn feature_flag_blocks_linking_before_database_or_provider_io() {

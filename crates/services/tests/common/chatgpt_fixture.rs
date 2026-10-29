@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -42,6 +42,17 @@ pub struct ProviderState {
     pub hold_responses: AtomicBool,
     pub truncate: AtomicBool,
     pub unterminated: AtomicBool,
+    pub discovery_calls: AtomicUsize,
+    pub jwks_calls: AtomicUsize,
+    pub metadata_delay_ms: AtomicU64,
+    pub refresh_delay_ms: AtomicU64,
+    pub reject_token: Mutex<Option<String>>,
+    pub stale_requests: AtomicUsize,
+    pub fresh_seen: AtomicBool,
+    pub script: Mutex<Vec<(String, Value)>>,
+    pub scripted: AtomicBool,
+    pub context_failure: AtomicBool,
+    pub stream_quota: AtomicBool,
 }
 pub struct ProviderFixture {
     pub base: String,
@@ -75,24 +86,36 @@ impl ProviderFixture {
             hold_responses: AtomicBool::new(false),
             truncate: AtomicBool::new(false),
             unterminated: AtomicBool::new(false),
+            discovery_calls: AtomicUsize::new(0),
+            jwks_calls: AtomicUsize::new(0),
+            metadata_delay_ms: AtomicU64::new(0),
+            refresh_delay_ms: AtomicU64::new(0),
+            reject_token: Mutex::new(None),
+            stale_requests: AtomicUsize::new(0),
+            fresh_seen: AtomicBool::new(false),
+            script: Mutex::new(Vec::new()),
+            scripted: AtomicBool::new(false),
+            context_failure: AtomicBool::new(false),
+            stream_quota: AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         *state.base.lock().unwrap() = base.clone();
-        let app = Router::new()
-            .route("/.well-known/openid-configuration", get(discovery))
-            .route("/jwks", get(jwks_handler))
-            .route("/token", post(tokens))
-            .route("/revoke", post(revoke))
-            .route("/v1/models", get(models))
-            .route("/v1/responses", post(responses))
-            .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let task = spawn_provider(listener, state.clone());
         Self { base, state, task }
+    }
+    pub async fn stop(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+    pub async fn restart(&mut self) {
+        assert!(self.task.is_finished());
+        let listener = tokio::net::TcpListener::bind(self.base.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        self.task = spawn_provider(listener, self.state.clone());
     }
     pub fn issue_code(&self, authorization: &Value, subject: &str, plan: bool) -> String {
         let url =
@@ -120,6 +143,22 @@ impl ProviderFixture {
         sign(&self.state, subject, client_id, nonce)
     }
 }
+fn spawn_provider(
+    listener: tokio::net::TcpListener,
+    state: Arc<ProviderState>,
+) -> tokio::task::JoinHandle<()> {
+    let app = Router::new()
+        .route("/.well-known/openid-configuration", get(discovery))
+        .route("/jwks", get(jwks_handler))
+        .route("/token", post(tokens))
+        .route("/revoke", post(revoke))
+        .route("/v1/models", get(models))
+        .route("/v1/responses", post(responses))
+        .with_state(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })
+}
 fn sign(state: &ProviderState, subject: &str, client_id: &str, nonce: &str) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("fixture-key".into());
@@ -127,12 +166,22 @@ fn sign(state: &ProviderState, subject: &str, client_id: &str, nonce: &str) -> S
         "nonce":nonce,"exp":chrono::Utc::now().timestamp()+3600,"email":format!("{subject}@example.test")}),&state.key).unwrap()
 }
 async fn discovery(State(state): State<Arc<ProviderState>>) -> Json<Value> {
+    state.discovery_calls.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(
+        state.metadata_delay_ms.load(Ordering::SeqCst),
+    ))
+    .await;
     let base = state.base.lock().unwrap().clone();
     Json(
         json!({"issuer":base,"jwks_uri":format!("{base}/jwks"),"revocation_endpoint":format!("{base}/revoke")}),
     )
 }
 async fn jwks_handler(State(state): State<Arc<ProviderState>>) -> Json<Value> {
+    state.jwks_calls.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(
+        state.metadata_delay_ms.load(Ordering::SeqCst),
+    ))
+    .await;
     Json(state.jwks.clone())
 }
 async fn tokens(
@@ -158,6 +207,10 @@ async fn tokens(
         })
     } else {
         state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.refresh_delay_ms.load(Ordering::SeqCst),
+        ))
+        .await;
         if state.fail_refresh.load(Ordering::SeqCst) {
             return (
                 StatusCode::BAD_REQUEST,
@@ -240,6 +293,41 @@ async fn responses(
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
     }
     let content = [("content-type".into(), "text/event-stream".into())];
+    let rejected = state.reject_token.lock().unwrap().clone();
+    if let Some(rejected) = rejected {
+        let auth = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if auth == Some(rejected.as_str()) {
+            let index = state.stale_requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                while if index == 0 {
+                    state.stale_requests.load(Ordering::SeqCst) < 2
+                } else {
+                    !state.fresh_seen.load(Ordering::SeqCst)
+                } {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            return (StatusCode::UNAUTHORIZED, content, String::new());
+        }
+        state.fresh_seen.store(true, Ordering::SeqCst);
+    }
+    if state.context_failure.load(Ordering::SeqCst) {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type".into(), "application/json".into())],
+            json!({"error":{"code":"context_length_exceeded","message":"private upstream prose"}})
+                .to_string(),
+        );
+    }
+    if state.stream_quota.load(Ordering::SeqCst) {
+        let event = json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}});
+        return (StatusCode::OK, content, format!("data: {event}\n\n"));
+    }
     if !permitted(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, content, String::new());
     }
@@ -280,7 +368,25 @@ async fn responses(
         .unwrap()
         .iter()
         .any(|item| item["type"] == "function_call_output");
-    let output = if body.get("tools").is_some() && body["tool_choice"] != "none" && !continued {
+    let action = if state.scripted.load(Ordering::SeqCst) && body["tool_choice"] != "none" {
+        let mut script = state.script.lock().unwrap();
+        if script.is_empty() {
+            None
+        } else {
+            Some(script.remove(0))
+        }
+    } else {
+        None
+    };
+    let output = if let Some((name, arguments)) = action {
+        let index = state.responses_calls.load(Ordering::SeqCst);
+        json!([{"type":"reasoning","id":format!("reasoning-{index}"),"encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
+            {"type":"function_call","id":format!("function-{index}"),"namespace":"astra","name":name,"call_id":format!("call-{index}"),"arguments":arguments.to_string(),"status":"completed"}])
+    } else if !state.scripted.load(Ordering::SeqCst)
+        && body.get("tools").is_some()
+        && body["tool_choice"] != "none"
+        && !continued
+    {
         let name = body["tools"][0]["tools"][0]["name"].as_str().unwrap();
         json!([{"type":"reasoning","id":"reasoning-1","encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
             {"type":"function_call","id":"function-1","namespace":"astra","name":name,"call_id":"call-1","arguments":"{}","status":"completed"}])

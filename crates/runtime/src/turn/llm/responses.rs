@@ -21,8 +21,13 @@ fn credential_error(
         .0
         .error_code
         .as_deref()
-        .unwrap_or("model_connection_reauthentication_required");
-    error(astra_core::ErrorKind::InvalidRequest, code)
+        .unwrap_or("model_connection_unavailable");
+    let kind = if value.0 == axum::http::StatusCode::CONFLICT {
+        astra_core::ErrorKind::Auth
+    } else {
+        provider_http_error_kind(value.0.as_u16(), code)
+    };
+    error(kind, code)
 }
 
 pub(super) fn prepare(
@@ -166,7 +171,7 @@ pub(super) async fn execute(
             "model_connection_required",
         )
     })?;
-    let mut force_refresh = false;
+    let mut rejected_version = None;
     let mut auth_retried = false;
     let client = binding.http_client().map_err(credential_error)?;
     for attempt in 0..=LLM_MAX_RETRIES {
@@ -179,14 +184,14 @@ pub(super) async fn execute(
         }
         let lease = tokio::select! {
             _=wait_llm_cancel(cancel)=>return Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
-            value=tokio::time::timeout(remaining,binding.acquire(force_refresh))=>value.map_err(|_| error(astra_core::ErrorKind::ProviderDeadline,"credential_deadline"))?.map_err(credential_error)?,
+            value=tokio::time::timeout(remaining,binding.acquire(rejected_version.take()))=>value.map_err(|_| error(astra_core::ErrorKind::ProviderDeadline,"credential_deadline"))?.map_err(credential_error)?,
         };
-        force_refresh = false;
         let index = begin_observed_provider_attempt(observer, request.identity()).await?;
         let mut partial = LlmCallResult {
             model_used: route.model_name.into(),
             ..Default::default()
         };
+        let mut accumulator = ResponseAccumulator::default();
         let mut rejected = false;
         let mut retry = false;
         let mut dispatched = false;
@@ -222,7 +227,7 @@ pub(super) async fn execute(
             if !status.is_success() {
                 rejected = true;
                 if status.as_u16() == 401 && !auth_retried {
-                    force_refresh = true;
+                    rejected_version = Some(lease.version());
                     auth_retried = true;
                     retry = true;
                 } else if status.is_server_error() {
@@ -246,28 +251,20 @@ pub(super) async fn execute(
                 }
                 let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 let code = astra_services::chatgpt::provider_error_code(status.as_u16(), &body);
-                return Err(error(
-                    if status.as_u16() == 429 {
-                        astra_core::ErrorKind::ResourceLimit
-                    } else {
-                        astra_core::ErrorKind::InvalidRequest
-                    },
-                    code,
-                )
-                .with_details_json(
-                    json!({"source":"chatgpt","code":code,"http_status":status.as_u16()})
-                        .to_string(),
-                ));
+                return Err(error(provider_http_error_kind(status.as_u16(), code), code)
+                    .with_details_json(
+                        json!({"source":"chatgpt","code":code,"http_status":status.as_u16()})
+                            .to_string(),
+                    ));
             }
             let mut stream = response.bytes_stream();
             let mut frames = SseBlankLineUtf8Buf::new();
-            let mut accumulator = ResponseAccumulator::default();
             let mut size = 0;
             let mut idle_deadline = tokio::time::Instant::now() + stream_idle_timeout();
             let mut admitted_items = HashSet::new();
             loop {
                 let next = tokio::select! {
-                    _=lease.cancel.cancelled()=>return Err(error(astra_core::ErrorKind::Cancelled,"model_connection_disconnected")),
+                    _=lease.cancel.cancelled()=>return Err(error(astra_core::ErrorKind::Cancelled,"model_connection_unavailable")),
                     _=wait_llm_cancel(cancel)=>return Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
                     _=tokio::time::sleep_until(idle_deadline)=>return Err(error(astra_core::ErrorKind::ProviderDeadline,"stream_progress_deadline")),
                     value=stream.next()=>value,
@@ -338,12 +335,11 @@ pub(super) async fn execute(
                             ) {
                                 rejected = true;
                             }
-                            error(astra_core::ErrorKind::StreamTransport, &code)
+                            let kind = astra_core::model_wire::responses::provider_error(&code)
+                                .map(|(_, status)| provider_http_error_kind(status, &code))
+                                .unwrap_or(astra_core::ErrorKind::StreamTransport);
+                            error(kind, &code)
                         })?;
-                        partial.full_text = accumulator.output.text.clone();
-                        partial.reasoning = accumulator.output.reasoning.clone();
-                        partial.response_id = accumulator.output.response_id.clone();
-                        partial.usage = accumulator.output.usage.clone();
                         if let Some((delta, reasoning)) = delta {
                             if !delta.trim().is_empty() {
                                 idle_deadline = tokio::time::Instant::now()
@@ -358,12 +354,7 @@ pub(super) async fn execute(
                             }
                         }
                         if accumulator.completed() {
-                            let output = accumulator.finish().map_err(|_| {
-                                error(
-                                    astra_core::ErrorKind::StreamTransport,
-                                    "response_completion_missing",
-                                )
-                            })?;
+                            let output = &accumulator.output;
                             if output.tool_calls.len() > MAX_STREAM_TOOL_CALLS
                                 || output.tool_calls.iter().any(|call| {
                                     !call["function"]["name"]
@@ -377,6 +368,13 @@ pub(super) async fn execute(
                                 ));
                             }
                             binding.ensure_current().await.map_err(credential_error)?;
+                            let output =
+                                std::mem::take(&mut accumulator).finish().map_err(|_| {
+                                    error(
+                                        astra_core::ErrorKind::StreamTransport,
+                                        "response_completion_missing",
+                                    )
+                                })?;
                             let mut result = result(
                                 output,
                                 binding.connection_id(),
@@ -399,24 +397,11 @@ pub(super) async fn execute(
         let outcome = {
             let timed = tokio::time::timeout(budget.saturating_sub(started.elapsed()), exchange);
             tokio::pin!(timed);
-            let mut fence = tokio::time::interval(Duration::from_secs(2));
-            fence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    _=wait_llm_cancel(cancel)=>break Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
-                    _=lease.cancel.cancelled()=>break Err(error(astra_core::ErrorKind::Cancelled,"model_connection_disconnected")),
-                    value=&mut timed=>break value.unwrap_or_else(|_|Err(error(astra_core::ErrorKind::ProviderDeadline,"provider_deadline"))),
-                    _=fence.tick()=> {
-                        let current=tokio::select! {
-                            biased;
-                            _=wait_llm_cancel(cancel)=>Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
-                            _=lease.cancel.cancelled()=>Err(error(astra_core::ErrorKind::Cancelled,"model_connection_disconnected")),
-                            value=tokio::time::timeout(budget.saturating_sub(started.elapsed()),binding.ensure_current())=>value.map_err(|_|error(astra_core::ErrorKind::ProviderDeadline,"credential_deadline")).and_then(|value|value.map_err(credential_error)),
-                        };
-                        if let Err(error)=current {break Err(error);}
-                    }
-                }
+            tokio::select! {
+                biased;
+                _=wait_llm_cancel(cancel)=>Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
+                _=lease.cancel.cancelled()=>Err(error(astra_core::ErrorKind::Cancelled,"model_connection_unavailable")),
+                value=&mut timed=>value.unwrap_or_else(|_|Err(error(astra_core::ErrorKind::ProviderDeadline,"provider_deadline"))),
             }
         };
         match outcome {
@@ -431,6 +416,12 @@ pub(super) async fn execute(
                 return Ok(result);
             }
             Err(failure) => {
+                // Move a partial snapshot once at settlement, rather than
+                // cloning accumulated history on every streamed delta.
+                partial.full_text = std::mem::take(&mut accumulator.output.text);
+                partial.reasoning = std::mem::take(&mut accumulator.output.reasoning);
+                partial.response_id = accumulator.output.response_id.take();
+                partial.usage = std::mem::take(&mut accumulator.output.usage);
                 if rejected || !dispatched {
                     finish_observed_provider_error_with_partial(
                         observer, index, &failure, &partial,
@@ -445,7 +436,7 @@ pub(super) async fn execute(
                 if !retry || attempt == LLM_MAX_RETRIES {
                     return Err(attach_llm_result_details(failure, &partial));
                 }
-                if !force_refresh {
+                if rejected_version.is_none() {
                     sleep_ms_or_llm_cancel(retry_backoff_ms(attempt + 1), cancel).await?;
                 }
             }

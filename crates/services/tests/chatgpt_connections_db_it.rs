@@ -60,7 +60,7 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     isolated_database::require_isolated_database(&settings.database);
     let (shared, settings) = common::setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let provider = fixture::ProviderFixture::start().await;
+    let mut provider = fixture::ProviderFixture::start().await;
     let config = ChatgptConfig::for_test(&provider.base);
     let key = Arc::new(FernetTokenEncryptor::new("chatgpt-database-journey-test-key").unwrap());
     let service = Arc::new(ChatgptConnections::new(
@@ -207,18 +207,58 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         .unwrap()
         .subscription
         .unwrap();
+    // Every leg fits its 15-second timeout, but the old token + discovery +
+    // JWKS chain exceeded the 30-second rotation lease. Metadata is prepared
+    // before claiming that lease and reused while verifying the response.
+    provider
+        .state
+        .metadata_delay_ms
+        .store(11000, Ordering::SeqCst);
+    provider
+        .state
+        .refresh_delay_ms
+        .store(11000, Ordering::SeqCst);
     expire(&pool, &key, &owner, &connection).await;
-    let (a, b) = tokio::join!(first.acquire(false), second.acquire(false));
+    let (a, b) = tokio::join!(first.acquire(None), second.acquire(None));
     let a = a.unwrap();
     let b = b.unwrap();
     assert_eq!(a.bearer(), b.bearer());
+    provider.state.metadata_delay_ms.store(0, Ordering::SeqCst);
+    provider.state.refresh_delay_ms.store(0, Ordering::SeqCst);
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 1);
     let refreshed: String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
         .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
     let refreshed: Value = serde_json::from_str(&key.decrypt(&refreshed).unwrap()).unwrap();
     assert!(refreshed.get("id_token").is_none());
     drop((a, b));
-    let live = first.acquire(false).await.unwrap();
+    let primary = service.binding(&owner, &connection).await.unwrap();
+    expire(&pool, &key, &owner, &connection).await;
+    let previous:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+        .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
+    provider.stop().await;
+    assert_eq!(
+        primary.acquire(None).await.err().unwrap().0,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let after:(String,String,Option<String>)=sqlx::query_as("SELECT status,credentials_encrypted,refresh_owner FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+        .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        after,
+        ("connected".into(), previous, None),
+        "an undispatched refresh must retain its credential and release its lease"
+    );
+    assert!(
+        models
+            .list_models(owner.clone(), false)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.offering_id == model_ids[0])
+    );
+    provider.restart().await;
+    drop(primary.acquire(None).await.unwrap());
+    assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 2);
+    let live = first.acquire(None).await.unwrap();
     let disconnected = service
         .operate(&owner, ConnectionOperation::Disconnect(connection.clone()))
         .await
@@ -305,12 +345,12 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         first.ensure_current().await.is_err(),
         "old generation must remain fenced"
     );
-    let bytes = renewed.acquire(false).await.unwrap();
+    let bytes = renewed.acquire(None).await.unwrap();
     assert!(!bytes.bearer().is_empty());
     drop(bytes);
     expire(&pool, &key, &owner, &connection).await;
     provider.state.fail_refresh.store(true, Ordering::SeqCst);
-    assert!(renewed.acquire(false).await.is_err());
+    assert!(renewed.acquire(None).await.is_err());
     assert_eq!(
         service
             .operate(&owner, ConnectionOperation::List)

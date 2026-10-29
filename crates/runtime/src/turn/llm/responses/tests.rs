@@ -211,6 +211,57 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
     assert_eq!(attempts.next.load(Ordering::SeqCst), 2);
     assert_eq!(attempts.finished.lock().unwrap().len(), 2);
 
+    // Both requests are sent with one token. Delay the second 401 until the
+    // first request has rotated and successfully used the replacement token.
+    let stale = admitted
+        .subscription
+        .as_ref()
+        .unwrap()
+        .acquire(None)
+        .await
+        .unwrap();
+    *provider.state.reject_token.lock().unwrap() = Some(stale.bearer().to_owned());
+    drop(stale);
+    let refreshes = provider.state.refresh_calls.load(Ordering::SeqCst);
+    let (left, right) = tokio::join!(
+        infer(&admitted, &messages, &[], &attempts),
+        infer(&admitted, &messages, &[], &attempts)
+    );
+    assert!(left.is_ok() && right.is_ok(), "{left:?} {right:?}");
+    assert_eq!(provider.state.stale_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        provider.state.refresh_calls.load(Ordering::SeqCst),
+        refreshes + 1,
+        "late old-token 401 must reuse the winning credential version"
+    );
+    *provider.state.reject_token.lock().unwrap() = None;
+
+    provider.state.context_failure.store(true, Ordering::SeqCst);
+    let failure = infer(&admitted, &messages, &[], &attempts)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind, astra_core::ErrorKind::ContextWindow);
+    assert!(!failure.to_string().contains("private upstream prose"));
+    assert_eq!(
+        provider.state.refresh_calls.load(Ordering::SeqCst),
+        refreshes + 1
+    );
+    provider
+        .state
+        .context_failure
+        .store(false, Ordering::SeqCst);
+    provider.state.stream_quota.store(true, Ordering::SeqCst);
+    let before = provider.state.responses_calls.load(Ordering::SeqCst);
+    let failure = infer(&admitted, &messages, &[], &attempts)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind, astra_core::ErrorKind::RateLimit);
+    assert_eq!(
+        provider.state.responses_calls.load(Ordering::SeqCst),
+        before + 1
+    );
+    provider.state.stream_quota.store(false, Ordering::SeqCst);
+
     provider.state.truncate.store(true, Ordering::SeqCst);
     let before = provider.state.responses_calls.load(Ordering::SeqCst);
     assert!(
@@ -247,29 +298,38 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
     provider.state.hold_responses.store(true, Ordering::SeqCst);
     let before = provider.state.responses_calls.load(Ordering::SeqCst);
     let disconnect_started = Instant::now();
-    let call = infer(&admitted, &messages, &tools, &attempts);
+    let calls = futures_util::future::join_all(
+        (0..16).map(|_| infer(&admitted, &messages, &tools, &attempts)),
+    );
     let disconnect = async {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while provider.state.responses_calls.load(Ordering::SeqCst) == before {
+            while provider.state.responses_calls.load(Ordering::SeqCst) < before + 16 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
+        let binding = admitted.subscription.as_ref().unwrap();
+        let reads = binding.fence_reads_for_test();
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            binding.fence_reads_for_test() - reads <= 2,
+            "active requests must share one connection watcher"
+        );
         replica
             .model_connection_operation(owner, ConnectionOperation::Disconnect(connection))
             .await
             .unwrap();
     };
-    let (failure, ()) = tokio::join!(call, disconnect);
+    let (failures, ()) = tokio::join!(calls, disconnect);
     assert!(
-        disconnect_started.elapsed() < Duration::from_secs(5),
+        disconnect_started.elapsed() < Duration::from_secs(8),
         "a different replica must fence the request before its ordinary deadline"
     );
-    assert!(failure.is_err());
+    assert!(failures.iter().all(Result::is_err));
     assert_eq!(
         attempts.finished.lock().unwrap().len(),
-        5,
+        attempts.next.load(Ordering::SeqCst) as usize,
         "every admitted request must settle"
     );
     assert_eq!(

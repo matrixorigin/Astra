@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{MySqlPool, Row, query};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,8 @@ const SCOPES: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
 const AUTH_LIFETIME: i64 = 900;
+const REFRESH_BUDGET: Duration = Duration::from_secs(25);
+const REFRESH_LEASE_SECONDS: i64 = 30;
 type ApiResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 
 fn fail(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -54,25 +56,28 @@ fn unix_now() -> i64 {
 
 /// Preserve only documented machine codes; upstream prose may contain secrets.
 pub fn provider_error_code(status: u16, body: &Value) -> &'static str {
-    match body.pointer("/error/code").and_then(Value::as_str) {
-        Some("subscription_sharing_user_not_eligible") => "subscription_sharing_user_not_eligible",
-        Some("subscription_sharing_usage_limit_exceeded") => {
-            "subscription_sharing_usage_limit_exceeded"
-        }
-        Some("subscription_sharing_usage_unavailable") => "subscription_sharing_usage_unavailable",
-        _ => match status {
-            400 | 401 => "model_connection_reauthentication_required",
-            403 => "subscription_provider_forbidden",
-            429 => "provider_rate_limited",
-            _ => "subscription_provider_rejected",
-        },
+    let raw = body
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .or_else(|| body["error"].as_str());
+    if let Some((code, _)) = raw.and_then(astra_core::model_wire::responses::provider_error) {
+        return code;
+    }
+    if matches!(raw, Some("invalid_grant" | "invalid_token")) {
+        return "model_connection_reauthentication_required";
+    }
+    match status {
+        401 => "model_connection_reauthentication_required",
+        403 => "subscription_provider_forbidden",
+        429 => "provider_rate_limited",
+        _ => "subscription_provider_rejected",
     }
 }
 fn provider_failure(status: StatusCode, bytes: &[u8]) -> (StatusCode, Json<ErrorResponse>) {
     let body = serde_json::from_slice(bytes).unwrap_or(Value::Null);
     let code = provider_error_code(status.as_u16(), &body);
     fail(
-        if matches!(status.as_u16(), 400 | 401) {
+        if code == "model_connection_reauthentication_required" {
             StatusCode::CONFLICT
         } else {
             status
@@ -228,13 +233,25 @@ struct Identity {
     email: Option<String>,
 }
 
-type ActiveConnectionRequests = HashMap<(String, String), Vec<(Uuid, i64, CancellationToken)>>;
+type ConnectionKey = (String, String);
+struct ActiveConnection {
+    monitor: Uuid,
+    requests: Vec<(Uuid, i64, CancellationToken)>,
+}
+struct SigningKeys {
+    fetched: std::time::Instant,
+    keys: JwkSet,
+}
 pub struct ChatgptConnections {
     pool: Option<SharedPool>,
     encryptor: Arc<FernetTokenEncryptor>,
     config: Result<ChatgptConfig, String>,
-    active: Mutex<ActiveConnectionRequests>,
+    active: Mutex<HashMap<ConnectionKey, ActiveConnection>>,
+    refresh_gates: Mutex<HashMap<ConnectionKey, Weak<tokio::sync::Mutex<()>>>>,
+    signing_keys: tokio::sync::Mutex<Option<SigningKeys>>,
     inference_client: OnceLock<reqwest::Client>,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    fence_reads: std::sync::atomic::AtomicUsize,
 }
 impl std::fmt::Debug for ChatgptConnections {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -267,12 +284,16 @@ impl std::fmt::Debug for ExecutionCredential {
 pub struct CredentialLease {
     owner: String,
     token: String,
+    version: i64,
     pub cancel: CancellationToken,
     service: Arc<ChatgptConnections>,
     connection_id: String,
     request_id: Uuid,
 }
 impl CredentialLease {
+    pub fn version(&self) -> i64 {
+        self.version
+    }
     pub fn bearer(&self) -> &str {
         &self.token
     }
@@ -284,15 +305,24 @@ impl Drop for CredentialLease {
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(requests) = active.get_mut(&(self.owner.clone(), self.connection_id.clone())) {
-            requests.retain(|(id, _, _)| *id != self.request_id);
-            if requests.is_empty() {
+        if let Some(connection) = active.get_mut(&(self.owner.clone(), self.connection_id.clone()))
+        {
+            connection
+                .requests
+                .retain(|(id, _, _)| *id != self.request_id);
+            if connection.requests.is_empty() {
                 active.remove(&(self.owner.clone(), self.connection_id.clone()));
             }
         }
     }
 }
 impl ExecutionCredential {
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn fence_reads_for_test(&self) -> usize {
+        self.service
+            .fence_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     /// Fixed-origin transport. Redirects cannot move private history off origin.
     /// The runtime's canonical request/stream deadlines bound each operation.
     pub fn http_client(&self) -> ApiResult<reqwest::Client> {
@@ -322,28 +352,29 @@ impl ExecutionCredential {
     pub fn api_base(&self) -> ApiResult<&str> {
         self.service.api_base()
     }
-    pub async fn acquire(&self, force_refresh: bool) -> ApiResult<CredentialLease> {
-        let token = self
+    pub async fn acquire(&self, rejected_version: Option<i64>) -> ApiResult<CredentialLease> {
+        let (token, version) = self
             .service
             .access_token(
                 &self.owner,
                 &self.connection_id,
                 self.generation,
-                force_refresh,
+                rejected_version,
             )
             .await?;
         let request_id = Uuid::new_v4();
         let cancel = CancellationToken::new();
-        self.service
-            .active
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry((self.owner.clone(), self.connection_id.clone()))
-            .or_default()
-            .push((request_id, self.generation, cancel.clone()));
+        self.service.register_request(
+            &self.owner,
+            &self.connection_id,
+            request_id,
+            self.generation,
+            cancel.clone(),
+        );
         let lease = CredentialLease {
             owner: self.owner.clone(),
             token,
+            version,
             cancel,
             service: self.service.clone(),
             connection_id: self.connection_id.clone(),
@@ -355,6 +386,10 @@ impl ExecutionCredential {
     pub async fn ensure_current(&self) -> ApiResult<()> {
         self.service.enabled()?;
         let pool = self.service.pool()?;
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        self.service
+            .fence_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = query("SELECT status, generation FROM user_llm_connections WHERE user_id = ? AND connection_id = ?")
             .bind(&self.owner).bind(&self.connection_id).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
         if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
@@ -396,7 +431,11 @@ impl ChatgptConnections {
             encryptor,
             config,
             active: Mutex::new(HashMap::new()),
+            refresh_gates: Mutex::new(HashMap::new()),
+            signing_keys: tokio::sync::Mutex::new(None),
             inference_client: OnceLock::new(),
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            fence_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn config(&self) -> ApiResult<&ChatgptConfig> {
@@ -606,6 +645,125 @@ impl ChatgptConnections {
         serde_json::from_slice(&bytes)
             .map_err(|_| internal_error("OpenAI returned an invalid JSON response"))
     }
+    async fn signing_keys(&self, kid: Option<&str>) -> ApiResult<JwkSet> {
+        let mut cached = self.signing_keys.lock().await;
+        if let Some(value) = cached.as_ref()
+            && value.fetched.elapsed() < Duration::from_secs(300)
+            && kid.is_none_or(|kid| value.keys.find(kid).is_some())
+        {
+            return Ok(value.keys.clone());
+        }
+        let config = self.config()?;
+        let client = self.client()?;
+        let discovery = self
+            .read_json(client.get(config.provider_url(&config.discovery)?))
+            .await?;
+        if discovery["issuer"].as_str() != Some(config.issuer.as_str()) {
+            return Err(reauth());
+        }
+        let url = discovery["jwks_uri"].as_str().ok_or_else(reauth)?;
+        let keys: JwkSet = serde_json::from_value(
+            self.read_json(client.get(config.provider_url(url)?))
+                .await?,
+        )
+        .map_err(|_| reauth())?;
+        *cached = Some(SigningKeys {
+            fetched: std::time::Instant::now(),
+            keys: keys.clone(),
+        });
+        Ok(keys)
+    }
+
+    fn refresh_gate(&self, owner: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.refresh_gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.retain(|_, value| value.strong_count() > 0);
+        let key = (owner.to_owned(), id.to_owned());
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
+    fn register_request(
+        self: &Arc<Self>,
+        owner: &str,
+        id: &str,
+        request: Uuid,
+        generation: i64,
+        cancel: CancellationToken,
+    ) {
+        let key = (owner.to_owned(), id.to_owned());
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let first = !active.contains_key(&key);
+        let connection = active
+            .entry(key.clone())
+            .or_insert_with(|| ActiveConnection {
+                monitor: Uuid::new_v4(),
+                requests: Vec::new(),
+            });
+        connection.requests.push((request, generation, cancel));
+        if first {
+            let monitor = connection.monitor;
+            let service = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let Some(service) = service.upgrade() else {
+                        return;
+                    };
+                    if !service
+                        .active
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .is_some_and(|value| value.monitor == monitor)
+                    {
+                        return;
+                    }
+                    #[cfg(any(test, feature = "e2e-hooks"))]
+                    service
+                        .fence_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let row=tokio::time::timeout(Duration::from_secs(2),async {
+                        query("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+                            .bind(&key.0).bind(&key.1).fetch_optional(&service.pool()?).await.map_err(internal_error)
+                    }).await;
+                    let observed = match row {
+                        Ok(Ok(Some(row))) => row
+                            .try_get::<String, _>("status")
+                            .ok()
+                            .zip(row.try_get::<i64, _>("generation").ok()),
+                        _ => None,
+                    };
+                    let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(connection) = active
+                        .get_mut(&key)
+                        .filter(|value| value.monitor == monitor)
+                    else {
+                        return;
+                    };
+                    for (_, generation, cancel) in &connection.requests {
+                        if observed.as_ref().is_none_or(|(status, current)| {
+                            *generation < *current
+                                || (status != "connected" && generation == current)
+                        }) {
+                            cancel.cancel();
+                        }
+                    }
+                    connection
+                        .requests
+                        .retain(|(_, _, cancel)| !cancel.is_cancelled());
+                    if connection.requests.is_empty() {
+                        active.remove(&key);
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
     async fn identity(
         &self,
         id_token: &str,
@@ -613,29 +771,13 @@ impl ChatgptConnections {
         nonce: Option<&str>,
     ) -> ApiResult<Identity> {
         let config = self.config()?;
-        let client = self.client()?;
-        let discovery = self
-            .read_json(client.get(config.provider_url(&config.discovery)?))
-            .await?;
-        if discovery.get("issuer").and_then(Value::as_str) != Some(config.issuer.as_str()) {
-            return Err(reauth());
-        }
-        let jwks_url = discovery
-            .get("jwks_uri")
-            .and_then(Value::as_str)
-            .ok_or_else(reauth)?;
-        let jwks: JwkSet = serde_json::from_value(
-            self.read_json(client.get(config.provider_url(jwks_url)?))
-                .await?,
-        )
-        .map_err(|_| reauth())?;
         let header = decode_header(id_token).map_err(|_| reauth())?;
         if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
             return Err(reauth());
         }
-        let key = jwks
-            .find(header.kid.as_deref().ok_or_else(reauth)?)
-            .ok_or_else(reauth)?;
+        let kid = header.kid.as_deref().ok_or_else(reauth)?;
+        let jwks = self.signing_keys(Some(kid)).await?;
+        let key = jwks.find(kid).ok_or_else(reauth)?;
         let key = jsonwebtoken::DecodingKey::from_jwk(key).map_err(|_| reauth())?;
         let mut validation = Validation::new(header.alg);
         validation.leeway = 0;
@@ -850,17 +992,25 @@ impl ChatgptConnections {
     pub fn api_base(&self) -> ApiResult<&str> {
         Ok(&self.enabled()?.api_base)
     }
+    fn decode_credentials(&self, encrypted: &str) -> ApiResult<Credentials> {
+        serde_json::from_str(&self.encryptor.decrypt(encrypted).map_err(internal_error)?)
+            .map_err(|_| internal_error("Stored subscription credentials are invalid"))
+    }
+
     async fn access_token(
         &self,
         owner: &str,
         id: &str,
         generation: i64,
-        force: bool,
-    ) -> ApiResult<String> {
+        rejected_version: Option<i64>,
+    ) -> ApiResult<(String, i64)> {
         let config = self.enabled()?;
+        let gate = self.refresh_gate(owner, id);
+        let _guard = gate.lock().await;
         let pool = self.pool()?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-        let mut forced_version = None;
+        let mut metadata_ready = false;
+        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        let mut wait = Duration::from_millis(100);
         loop {
             let row =
                 query("SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?")
@@ -878,34 +1028,32 @@ impl ChatgptConnections {
             {
                 return Err(reauth());
             }
+            let version: i64 = row.try_get("credential_version").map_err(internal_error)?;
             let encrypted: Option<String> = row
                 .try_get("credentials_encrypted")
                 .map_err(internal_error)?;
-            let credentials: Credentials = serde_json::from_str(
-                &self
-                    .encryptor
-                    .decrypt(&encrypted.ok_or_else(reauth)?)
-                    .map_err(internal_error)?,
-            )
-            .map_err(|_| internal_error("Stored subscription credentials are invalid"))?;
-            let version: i64 = row.try_get("credential_version").map_err(internal_error)?;
-            let must_force = force && *forced_version.get_or_insert(version) == version;
-            if !must_force && credentials.expires_at > unix_now() + 60 {
-                return Ok(credentials.access_token);
+            let encrypted = encrypted.ok_or_else(reauth)?;
+            let expires: Option<i64> = row.try_get("token_expires_at").map_err(internal_error)?;
+            if rejected_version != Some(version)
+                && expires.is_some_and(|value| value > unix_now() + 60)
+            {
+                let credentials = self.decode_credentials(&encrypted)?;
+                if credentials.expires_at > unix_now() + 60 {
+                    return Ok((credentials.access_token, version));
+                }
             }
             let refresh_owner: Option<String> =
                 row.try_get("refresh_owner").map_err(internal_error)?;
-            if refresh_owner.is_some() {
+            if let Some(refresh_owner) = refresh_owner {
                 let until: Option<i64> = row.try_get("refresh_until").map_err(internal_error)?;
                 if until.is_none_or(|until| until < unix_now()) {
-                    self.mark_reauth(
-                        owner,
-                        id,
-                        generation,
-                        refresh_owner.as_deref().unwrap_or(""),
-                    )
-                    .await?;
-                    return Err(reauth());
+                    if self
+                        .mark_reauth(owner, id, generation, &refresh_owner)
+                        .await?
+                    {
+                        return Err(reauth());
+                    }
+                    continue;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(fail(
@@ -914,45 +1062,66 @@ impl ChatgptConnections {
                         "Subscription refresh is already in progress",
                     ));
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // One local waiter per connection polls cross-replica state;
+                // other requests await the shared gate without SQL/decryption.
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(1));
                 continue;
             }
+            if !metadata_ready {
+                // Discovery is independent of token rotation. Warm its cache
+                // before claiming the refresh lease, then re-read the winner.
+                self.signing_keys(None).await?;
+                metadata_ready = true;
+                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                continue;
+            }
+            let credentials = self.decode_credentials(&encrypted)?;
+            let client_id: String = row.try_get("client_id").map_err(internal_error)?;
             let refresh_id = Uuid::new_v4().to_string();
-            let lease = query("UPDATE user_llm_connections SET refresh_owner=?,refresh_until=? WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner IS NULL AND status='connected'")
-                .bind(&refresh_id).bind(unix_now()+30).bind(owner).bind(id).bind(generation).bind(version)
-                .execute(&pool).await.map_err(internal_error)?;
+            let lease=query("UPDATE user_llm_connections SET refresh_owner=?,refresh_until=? WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner IS NULL AND status='connected'")
+                .bind(&refresh_id).bind(unix_now()+REFRESH_LEASE_SECONDS).bind(owner).bind(id).bind(generation).bind(version).execute(&pool).await.map_err(internal_error)?;
             if lease.rows_affected() != 1 {
                 continue;
             }
-            let result = async {
-                let refresh = credentials.refresh_token.as_deref().ok_or_else(reauth)?;
-                let client_id: String = row.try_get("client_id").map_err(internal_error)?;
-                let value = self.read_json(self.client()?.post(&config.token).form(&[
+            let mut known_not_sent = false;
+            let refresh_result=tokio::time::timeout(REFRESH_BUDGET,async {
+                let refresh=credentials.refresh_token.as_deref().ok_or_else(reauth)?;
+                let request=self.client().map_err(|error|{known_not_sent=true;error})?.post(&config.token).form(&[
                     ("grant_type","refresh_token"),("client_id",client_id.as_str()),("refresh_token",refresh),("resource",API_BASE),
-                ])).await?;
-                let token: TokenResponse = serde_json::from_value(value).map_err(|_| reauth())?;
-                if token.access_token.is_empty() || token.expires_in<=0 || token.expires_in>86400*30 { return Err(reauth()); }
-                if let Some(id_token) = &token.id_token {
-                    let identity = self.identity(id_token,&client_id,None).await?;
-                    if identity.sub != row.try_get::<String,_>("subject").map_err(internal_error)? { return Err(reauth()); }
+                ]);
+                let response=request.send().await.map_err(|error|{
+                    if error.is_connect() || error.is_builder() {known_not_sent=true;}
+                    fail(StatusCode::SERVICE_UNAVAILABLE,"chatgpt_connection_unavailable","OpenAI connection failed")
+                })?;
+                let token:TokenResponse=serde_json::from_slice(&provider_body(response).await?).map_err(|_|reauth())?;
+                if token.access_token.is_empty()||token.expires_in<=0||token.expires_in>86400*30 {return Err(reauth());}
+                if let Some(id_token)=&token.id_token {
+                    let identity=self.identity(id_token,&client_id,None).await?;
+                    if identity.sub!=row.try_get::<String,_>("subject").map_err(internal_error)? {return Err(reauth());}
                 }
-                let scopes = token.scope.map(|s| s.split_whitespace().map(str::to_owned).collect()).unwrap_or(credentials.scopes);
-                let replacement = Credentials { access_token:token.access_token,refresh_token:token.refresh_token.or(credentials.refresh_token),
-                    scopes,expires_at:unix_now()+token.expires_in };
-                if !replacement.scopes.iter().any(|s| s==PLAN_SCOPE) { return Err(reauth()); }
-                let encrypted = self.encryptor.encrypt(&serde_json::to_string(&replacement).map_err(internal_error)?).map_err(internal_error)?;
-                let changed = query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=?,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=? AND status='connected'")
-                    .bind(encrypted).bind(replacement.expires_at).bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id)
-                    .execute(&pool).await.map_err(internal_error)?;
-                if changed.rows_affected()!=1 { return Err(reauth()); }
-                Ok(replacement.access_token)
-            }.await;
-            if result.is_err() {
-                // An exchange may have rotated the upstream token even when its
-                // response was lost. Never release this lease and race a retry.
-                self.mark_reauth(owner, id, generation, &refresh_id).await?;
+                let scopes=token.scope.map(|value|value.split_whitespace().map(str::to_owned).collect()).unwrap_or(credentials.scopes);
+                if !scopes.iter().any(|value|value==PLAN_SCOPE) {return Err(reauth());}
+                let replacement=Credentials {access_token:token.access_token,refresh_token:token.refresh_token.or(credentials.refresh_token),scopes,expires_at:unix_now()+token.expires_in};
+                let encrypted=self.encryptor.encrypt(&serde_json::to_string(&replacement).map_err(internal_error)?).map_err(internal_error)?;
+                let changed=query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=?,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=? AND status='connected'")
+                    .bind(encrypted).bind(replacement.expires_at).bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(&pool).await.map_err(internal_error)?;
+                if changed.rows_affected()!=1 {return Err(reauth());}
+                Ok((replacement.access_token,version+1))
+            }).await.unwrap_or_else(|_|Err(fail(StatusCode::SERVICE_UNAVAILABLE,"chatgpt_refresh_deadline","Subscription refresh timed out")));
+            if refresh_result.is_err() {
+                if !known_not_sent {
+                    if !self.mark_reauth(owner, id, generation, &refresh_id).await? {
+                        continue;
+                    }
+                } else {
+                    // A connection failure before dispatch cannot rotate the
+                    // token. Release the lease without destroying credentials.
+                    query("UPDATE user_llm_connections SET refresh_owner=NULL,refresh_until=NULL WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=?")
+                        .bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(&pool).await.map_err(internal_error)?;
+                }
             }
-            return result;
+            return refresh_result;
         }
     }
     async fn mark_reauth(
@@ -961,7 +1130,7 @@ impl ChatgptConnections {
         id: &str,
         generation: i64,
         refresh_owner: &str,
-    ) -> ApiResult<()> {
+    ) -> ApiResult<bool> {
         let pool = self.pool()?;
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let changed=query("UPDATE user_llm_connections SET status='reauth_required',credentials_encrypted=NULL,token_expires_at=NULL,generation=generation+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=? AND generation=? AND refresh_owner=? AND status='connected'")
@@ -971,11 +1140,11 @@ impl ChatgptConnections {
                 .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         }
         tx.commit().await.map_err(internal_error)?;
-        Ok(())
+        Ok(changed.rows_affected() == 1)
     }
     pub async fn models(self: &Arc<Self>, owner: &str, id: &str) -> ApiResult<Value> {
         let binding = self.binding(owner, id).await?;
-        let lease = binding.acquire(false).await?;
+        let lease = binding.acquire(None).await?;
         let value = self
             .read_json(
                 self.client()?
@@ -1021,7 +1190,7 @@ impl ChatgptConnections {
             ));
         }
         let binding = self.binding(owner, id).await?;
-        let lease = binding.acquire(false).await?;
+        let lease = binding.acquire(None).await?;
         let body = astra_core::model_wire::responses::request(
             model,
             &[json!({"role":"user","content":"Reply briefly with OK."})],
@@ -1094,14 +1263,16 @@ impl ChatgptConnections {
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
             let key = (owner.to_owned(), id.to_owned());
-            if let Some(requests) = active.get_mut(&key) {
-                for (_, version, cancel) in requests.iter() {
+            if let Some(connection) = active.get_mut(&key) {
+                for (_, version, cancel) in &connection.requests {
                     if *version <= generation {
                         cancel.cancel();
                     }
                 }
-                requests.retain(|(_, version, _)| *version > generation);
-                if requests.is_empty() {
+                connection
+                    .requests
+                    .retain(|(_, version, _)| *version > generation);
+                if connection.requests.is_empty() {
                     active.remove(&key);
                 }
             }
