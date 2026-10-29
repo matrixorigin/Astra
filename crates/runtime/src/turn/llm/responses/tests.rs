@@ -196,75 +196,84 @@ async fn responses_transport_recovery_and_credential_fencing() {
     );
     *provider.state.reject_token.lock().unwrap() = None;
 
-    // Shared supervision must retry a transient admission failure and retain
-    // the typed subscription error if every physical attempt is rejected.
+    // Both recovery and retry exhaustion preserve their physical-attempt counts.
     {
         let _backoff = super::super::set_test_retry_backoff_ms(1);
+        for failures in [1, LLM_MAX_RETRIES as usize + 1] {
+            let before = provider.state.responses_calls.load(Ordering::SeqCst);
+            provider
+                .state
+                .transient_responses
+                .store(failures, Ordering::SeqCst);
+            let result = infer(&admitted, &messages, &[], &attempts).await;
+            assert_eq!(
+                provider.state.responses_calls.load(Ordering::SeqCst),
+                before + failures + usize::from(failures == 1)
+            );
+            if failures == 1 {
+                assert!(result.is_ok());
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.kind, astra_core::ErrorKind::ServerError);
+                assert!(
+                    failure
+                        .message
+                        .contains("subscription_sharing_usage_unavailable")
+                );
+                assert!(!failure.message.contains("private upstream prose"));
+            }
+        }
+    }
+
+    for (flag, kind, code, has_usage) in [
+        (
+            &provider.state.context_failure,
+            astra_core::ErrorKind::ContextWindow,
+            "context_length_exceeded",
+            false,
+        ),
+        (
+            &provider.state.quota,
+            astra_core::ErrorKind::RateLimit,
+            "subscription_sharing_usage_limit_exceeded",
+            false,
+        ),
+        (
+            &provider.state.stream_quota,
+            astra_core::ErrorKind::RateLimit,
+            "subscription_sharing_usage_limit_exceeded",
+            true,
+        ),
+    ] {
+        flag.store(true, Ordering::SeqCst);
         let before = provider.state.responses_calls.load(Ordering::SeqCst);
-        provider
-            .state
-            .transient_responses
-            .store(1, Ordering::SeqCst);
-        assert!(infer(&admitted, &messages, &[], &attempts).await.is_ok());
-        assert_eq!(
-            provider.state.responses_calls.load(Ordering::SeqCst),
-            before + 2
-        );
-        provider
-            .state
-            .transient_responses
-            .store(LLM_MAX_RETRIES as usize + 1, Ordering::SeqCst);
         let failure = infer(&admitted, &messages, &[], &attempts)
             .await
             .unwrap_err();
-        assert_eq!(failure.kind, astra_core::ErrorKind::ServerError);
-        assert!(
-            failure
-                .message
-                .contains("subscription_sharing_usage_unavailable")
-        );
+        assert_eq!(failure.kind, kind);
+        assert!(failure.message.contains(code));
         assert!(!failure.message.contains("private upstream prose"));
         assert_eq!(
             provider.state.responses_calls.load(Ordering::SeqCst),
-            before + 2 + LLM_MAX_RETRIES as usize + 1
+            before + 1,
+            "terminal provider errors must not retry"
         );
-    }
-
-    provider.state.context_failure.store(true, Ordering::SeqCst);
-    let failure = infer(&admitted, &messages, &[], &attempts)
-        .await
-        .unwrap_err();
-    assert_eq!(failure.kind, astra_core::ErrorKind::ContextWindow);
-    assert!(!failure.to_string().contains("private upstream prose"));
-    assert_eq!(
-        provider.state.refresh_calls.load(Ordering::SeqCst),
-        refreshes + 1
-    );
-    provider
-        .state
-        .context_failure
-        .store(false, Ordering::SeqCst);
-    provider.state.stream_quota.store(true, Ordering::SeqCst);
-    let before = provider.state.responses_calls.load(Ordering::SeqCst);
-    let failure = infer(&admitted, &messages, &[], &attempts)
-        .await
-        .unwrap_err();
-    assert_eq!(failure.kind, astra_core::ErrorKind::RateLimit);
-    {
-        let terminals = attempts.finished.lock().unwrap();
-        let terminal = terminals.last().unwrap();
-        assert_eq!(terminal.usage.input.total_input_tokens(), 17);
-        assert_eq!(terminal.usage.output_tokens, 23);
         assert_eq!(
-            terminal.provider_response_id.as_deref(),
-            Some("failed-response")
+            provider.state.refresh_calls.load(Ordering::SeqCst),
+            refreshes + 1
         );
+        if has_usage {
+            let terminals = attempts.finished.lock().unwrap();
+            let terminal = terminals.last().unwrap();
+            assert_eq!(terminal.usage.input.total_input_tokens(), 17);
+            assert_eq!(terminal.usage.output_tokens, 23);
+            assert_eq!(
+                terminal.provider_response_id.as_deref(),
+                Some("failed-response")
+            );
+        }
+        flag.store(false, Ordering::SeqCst);
     }
-    assert_eq!(
-        provider.state.responses_calls.load(Ordering::SeqCst),
-        before + 1
-    );
-    provider.state.stream_quota.store(false, Ordering::SeqCst);
 
     provider.state.truncate.store(true, Ordering::SeqCst);
     let before = provider.state.responses_calls.load(Ordering::SeqCst);
@@ -288,22 +297,6 @@ async fn responses_transport_recovery_and_credential_fencing() {
         Some(astra_services::InferenceTerminalStatus::DeliveryUnknown)
     );
     provider.state.truncate.store(false, Ordering::SeqCst);
-    provider.state.quota.store(true, Ordering::SeqCst);
-    let before = provider.state.responses_calls.load(Ordering::SeqCst);
-    let failure = infer(&admitted, &messages, &tools, &attempts)
-        .await
-        .unwrap_err();
-    assert!(
-        failure
-            .to_string()
-            .contains("subscription_sharing_usage_limit_exceeded")
-    );
-    assert_eq!(
-        provider.state.responses_calls.load(Ordering::SeqCst),
-        before + 1,
-        "quota must not trigger a retry"
-    );
-    provider.state.quota.store(false, Ordering::SeqCst);
     // A refused connection schedules retry backoff. The original invocation
     // deadline must expire during that sleep, before another attempt begins.
     provider.stop().await;

@@ -67,7 +67,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["chrono", "json"] }
+sqlx = { workspace = true, features = ["chrono", "json", "derive"] }
 sqlx-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

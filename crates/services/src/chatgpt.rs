@@ -11,7 +11,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{MySqlPool, Row, query};
+use sqlx::{MySqlPool, query};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -60,13 +60,8 @@ fn unavailable() -> (StatusCode, Json<ErrorResponse>) {
 fn unix_now() -> i64 {
     Utc::now().timestamp()
 }
-fn connected_generation(row: &sqlx::mysql::MySqlRow, generation: i64) -> ApiResult<()> {
-    if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
-        || row
-            .try_get::<i64, _>("generation")
-            .map_err(internal_error)?
-            != generation
-    {
+fn connected_generation(row: &ConnectionFence, generation: i64) -> ApiResult<()> {
+    if row.status != "connected" || row.generation != generation {
         return Err(reauth());
     }
     Ok(())
@@ -217,7 +212,7 @@ pub enum ConnectionOperation {
     Models(String),
     Disconnect(String),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ConnectionView {
     pub remote_revocation_confirmed: Option<bool>,
     pub connection_id: String,
@@ -249,6 +244,41 @@ struct Identity {
     sub: String,
     nonce: Option<String>,
     email: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AuthorizationRow {
+    state_digest: String,
+    status: String,
+    callback_digest: Option<String>,
+    completed_connection_id: Option<String>,
+    expires_at: i64,
+    client_id: String,
+    verifier_encrypted: Option<String>,
+    redirect_uri: String,
+    nonce_digest: String,
+    expected_subject: Option<String>,
+    connection_id: Option<String>,
+    label: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ConnectionFence {
+    status: String,
+    generation: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct CredentialRow {
+    #[sqlx(flatten)]
+    fence: ConnectionFence,
+    credential_version: i64,
+    credentials_encrypted: Option<String>,
+    token_expires_at: Option<i64>,
+    refresh_owner: Option<String>,
+    refresh_until: Option<i64>,
+    client_id: String,
+    subject: String,
 }
 
 type ConnectionKey = (String, String);
@@ -410,7 +440,7 @@ impl ExecutionCredential {
         self.service
             .fence_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let row = query("SELECT status, generation FROM user_llm_connections WHERE user_id = ? AND connection_id = ?")
+        let row = sqlx::query_as::<_, ConnectionFence>("SELECT status, generation FROM user_llm_connections WHERE user_id = ? AND connection_id = ?")
             .bind(&self.owner).bind(&self.connection_id).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
         connected_generation(&row, self.generation)
     }
@@ -422,7 +452,7 @@ impl ExecutionCredential {
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     ) -> ApiResult<()> {
         self.service.enabled()?;
-        let row = query("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+        let row = sqlx::query_as::<_, ConnectionFence>("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
             .bind(&self.owner).bind(&self.connection_id).fetch_optional(&mut **tx).await.map_err(internal_error)?.ok_or_else(not_found)?;
         connected_generation(&row, self.generation)
     }
@@ -517,39 +547,16 @@ impl ChatgptConnections {
         }
     }
     pub async fn list(&self, owner: &str) -> ApiResult<Vec<ConnectionView>> {
-        let rows = query("SELECT connection_id, provider, label, email, status, token_expires_at, revocation_confirmed FROM user_llm_connections WHERE user_id = ? ORDER BY created_at, connection_id")
-            .bind(owner).fetch_all(&self.pool()?).await.map_err(internal_error)?;
-        rows.iter()
-            .map(|row| {
-                Ok(ConnectionView {
-                    remote_revocation_confirmed: row
-                        .try_get::<Option<i16>, _>("revocation_confirmed")
-                        .map_err(internal_error)?
-                        .map(|value| value != 0),
-                    connection_id: row.try_get("connection_id").map_err(internal_error)?,
-                    provider: row.try_get("provider").map_err(internal_error)?,
-                    label: row.try_get("label").map_err(internal_error)?,
-                    email: row.try_get("email").map_err(internal_error)?,
-                    status: row.try_get("status").map_err(internal_error)?,
-                    expires_at: row.try_get("token_expires_at").map_err(internal_error)?,
-                })
-            })
-            .collect()
+        sqlx::query_as("SELECT connection_id,provider,label,email,status,token_expires_at AS expires_at,revocation_confirmed <> 0 AS remote_revocation_confirmed FROM user_llm_connections WHERE user_id=? ORDER BY created_at,connection_id")
+            .bind(owner).fetch_all(&self.pool()?).await.map_err(internal_error)
     }
     pub async fn catalog_labels(&self, owner: &str) -> ApiResult<HashMap<String, String>> {
         let Ok(config) = self.enabled() else {
             return Ok(HashMap::new());
         };
-        let rows=query("SELECT connection_id,label FROM user_llm_connections WHERE user_id=? AND host_id=? AND status='connected'")
+        let rows = sqlx::query_as::<_, (String, String)>("SELECT connection_id,label FROM user_llm_connections WHERE user_id=? AND host_id=? AND status='connected'")
             .bind(owner).bind(&config.host_id).fetch_all(&self.pool()?).await.map_err(internal_error)?;
-        rows.iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("connection_id").map_err(internal_error)?,
-                    row.try_get("label").map_err(internal_error)?,
-                ))
-            })
-            .collect()
+        Ok(rows.into_iter().collect())
     }
     async fn start(&self, owner: &str, mut request: StartAuthorization) -> ApiResult<Value> {
         let config = self.enabled()?;
@@ -575,10 +582,8 @@ impl ChatgptConnections {
         }
         let mut need_consent = false;
         let (client_id, subject) = if let Some(previous) = &request.retry_authorization_id {
-            let row=query("SELECT client_id,expected_subject,connection_id,label,status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?")
+            let (client,subject,connection,previous_label,status):(String,Option<String>,Option<String>,String,String)=sqlx::query_as("SELECT client_id,expected_subject,connection_id,label,status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?")
                 .bind(owner).bind(previous).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
-            let client: String = row.try_get("client_id").map_err(internal_error)?;
-            let status: String = row.try_get("status").map_err(internal_error)?;
             if client == "dynamic_agent_client" || status != "failed" {
                 return Err(fail(
                     StatusCode::CONFLICT,
@@ -586,23 +591,15 @@ impl ChatgptConnections {
                     "Inspect your connections or start a new registration",
                 ));
             }
-            request.connection_id = row.try_get("connection_id").map_err(internal_error)?;
-            label = row.try_get("label").map_err(internal_error)?;
-            (
-                client,
-                row.try_get::<Option<String>, _>("expected_subject")
-                    .map_err(internal_error)?,
-            )
+            request.connection_id = connection;
+            label = previous_label;
+            (client, subject)
         } else if let Some(id) = &request.connection_id {
-            let row=query("SELECT client_id,subject,label,status FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+            let (client,subject,previous_label,status):(String,String,String,String)=sqlx::query_as("SELECT client_id,subject,label,status FROM user_llm_connections WHERE user_id=? AND connection_id=?")
                 .bind(owner).bind(id).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
-            label = row.try_get("label").map_err(internal_error)?;
-            need_consent =
-                row.try_get::<String, _>("status").map_err(internal_error)? == "plan_disabled";
-            (
-                row.try_get("client_id").map_err(internal_error)?,
-                Some(row.try_get("subject").map_err(internal_error)?),
-            )
+            label = previous_label;
+            need_consent = status == "plan_disabled";
+            (client, Some(subject))
         } else {
             ("dynamic_agent_client".into(), None)
         };
@@ -768,14 +765,11 @@ impl ChatgptConnections {
                         .fence_reads
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let row=tokio::time::timeout(Duration::from_secs(2),async {
-                        query("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+                        sqlx::query_as::<_, ConnectionFence>("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=?")
                             .bind(&key.0).bind(&key.1).fetch_optional(&service.pool()?).await.map_err(internal_error)
                     }).await;
                     let observed = match row {
-                        Ok(Ok(Some(row))) => row
-                            .try_get::<String, _>("status")
-                            .ok()
-                            .zip(row.try_get::<i64, _>("generation").ok()),
+                        Ok(Ok(Some(row))) => Some((row.status, row.generation)),
                         _ => None,
                     };
                     let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -852,7 +846,7 @@ impl ChatgptConnections {
     ) -> ApiResult<Value> {
         let config = self.enabled()?;
         let pool = self.pool()?;
-        let row = query(
+        let row = sqlx::query_as::<_, AuthorizationRow>(
             "SELECT * FROM user_llm_authorizations WHERE user_id = ? AND authorization_id = ?",
         )
         .bind(owner)
@@ -861,10 +855,9 @@ impl ChatgptConnections {
         .await
         .map_err(internal_error)?
         .ok_or_else(not_found)?;
-        let expected: String = row.try_get("state_digest").map_err(internal_error)?;
         if !self
             .encryptor
-            .verify_keyed_digest("chatgpt-state", &request.state, &expected)
+            .verify_keyed_digest("chatgpt-state", &request.state, &row.state_digest)
         {
             return Err(fail(
                 StatusCode::BAD_REQUEST,
@@ -872,32 +865,22 @@ impl ChatgptConnections {
                 "OAuth state did not match this attempt",
             ));
         }
-        let status: String = row.try_get("status").map_err(internal_error)?;
         let callback_digest = self.encryptor.keyed_digest(
             "chatgpt-callback",
             &serde_json::to_string(&json!([request.code, request.client_id, request.error]))
                 .map_err(internal_error)?,
         );
-        if status == "completed" {
-            if row
-                .try_get::<Option<String>, _>("callback_digest")
-                .map_err(internal_error)?
-                .as_deref()
-                != Some(callback_digest.as_str())
-            {
+        if row.status == "completed" {
+            if row.callback_digest.as_deref() != Some(callback_digest.as_str()) {
                 return Err(reauth());
             }
-            let connection: String = row
-                .try_get("completed_connection_id")
-                .map_err(internal_error)?;
-            return Ok(json!({"connection":self.view(owner,&connection).await?}));
+            let connection = row
+                .completed_connection_id
+                .as_deref()
+                .ok_or_else(|| internal_error("Completed authorization has no connection"))?;
+            return Ok(json!({"connection":self.view(owner,connection).await?}));
         }
-        if status != "pending"
-            || row
-                .try_get::<i64, _>("expires_at")
-                .map_err(internal_error)?
-                < unix_now()
-        {
+        if row.status != "pending" || row.expires_at < unix_now() {
             return Err(fail(
                 StatusCode::CONFLICT,
                 "oauth_attempt_expired",
@@ -913,15 +896,14 @@ impl ChatgptConnections {
                 "ChatGPT authorization was declined",
             ));
         }
-        let saved_client: String = row.try_get("client_id").map_err(internal_error)?;
-        let client_id = request.client_id.as_deref().unwrap_or(&saved_client);
+        let client_id = request.client_id.as_deref().unwrap_or(&row.client_id);
         if client_id == "dynamic_agent_client"
             || client_id.is_empty()
             || client_id.len() > 255
             || !client_id
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-            || (saved_client != "dynamic_agent_client" && saved_client != client_id)
+            || (row.client_id != "dynamic_agent_client" && row.client_id != client_id)
         {
             return Err(reauth());
         }
@@ -930,12 +912,10 @@ impl ChatgptConnections {
             .as_deref()
             .filter(|c| !c.is_empty() && c.len() < 16384)
             .ok_or_else(reauth)?;
-        let verifier: String = row
-            .try_get::<Option<String>, _>("verifier_encrypted")
-            .map_err(internal_error)?
-            .ok_or_else(reauth)?;
-        let verifier = self.encryptor.decrypt(&verifier).map_err(internal_error)?;
-        let redirect: String = row.try_get("redirect_uri").map_err(internal_error)?;
+        let verifier = self
+            .encryptor
+            .decrypt(row.verifier_encrypted.as_deref().ok_or_else(reauth)?)
+            .map_err(internal_error)?;
         let changed = query("UPDATE user_llm_authorizations SET status='exchanging', client_id=? WHERE user_id=? AND authorization_id=? AND status='pending' AND expires_at>=?")
             .bind(client_id).bind(owner).bind(id).bind(unix_now()).execute(&pool).await.map_err(internal_error)?;
         if changed.rows_affected() != 1 {
@@ -948,31 +928,27 @@ impl ChatgptConnections {
         let result = async {
             let value = self.read_json(self.client()?.post(&config.token).form(&[
                 ("grant_type","authorization_code"),("client_id",client_id),("code",code),
-                ("code_verifier",verifier.as_str()),("redirect_uri",redirect.as_str()),("resource",API_BASE),
+                ("code_verifier",verifier.as_str()),("redirect_uri",row.redirect_uri.as_str()),("resource",API_BASE),
             ])).await?;
             let token: TokenResponse = serde_json::from_value(value).map_err(|_| reauth())?;
             let id_token = token.id_token.as_deref().ok_or_else(reauth)?;
-            let nonce: String = row.try_get("nonce_digest").map_err(internal_error)?;
-            let identity = self.identity(id_token,client_id,Some(&nonce)).await?;
-            let subject: Option<String> = row.try_get("expected_subject").map_err(internal_error)?;
-            if subject.as_deref().is_some_and(|expected| expected!=identity.sub) { return Err(reauth()); }
+            let identity = self.identity(id_token,client_id,Some(&row.nonce_digest)).await?;
+            if row.expected_subject.as_deref().is_some_and(|expected| expected!=identity.sub) { return Err(reauth()); }
             if token.expires_in<=0 || token.expires_in>86400*30 || token.access_token.is_empty() { return Err(reauth()); }
             let scopes: Vec<String> = token.scope.as_deref().unwrap_or("").split_whitespace().map(str::to_owned).collect();
             let state = if scopes.iter().any(|s| s==PLAN_SCOPE) { "connected" } else { "plan_disabled" };
             let credentials = Credentials { access_token:token.access_token,refresh_token:token.refresh_token,
                 scopes,expires_at:unix_now()+token.expires_in };
             let encrypted = self.encryptor.encrypt(&serde_json::to_string(&credentials).map_err(internal_error)?).map_err(internal_error)?;
-            let requested_id: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
-            let existing = query("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND client_id=? AND subject=?")
+            let existing = sqlx::query_scalar::<_,String>("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND client_id=? AND subject=?")
                 .bind(owner).bind(client_id).bind(&identity.sub).fetch_optional(&pool).await.map_err(internal_error)?;
-            let connection_id = requested_id.or_else(|| existing.and_then(|r| r.try_get("connection_id").ok())).unwrap_or_else(|| Uuid::new_v4().to_string());
-            let label: String = row.try_get("label").map_err(internal_error)?;
+            let connection_id = row.connection_id.clone().or(existing).unwrap_or_else(|| Uuid::new_v4().to_string());
             let mut tx = pool.begin().await.map_err(internal_error)?;
-            let pending: String = query("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=? FOR UPDATE")
-                .bind(owner).bind(id).fetch_one(&mut *tx).await.map_err(internal_error)?.try_get("status").map_err(internal_error)?;
+            let pending: String = sqlx::query_scalar("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=? FOR UPDATE")
+                .bind(owner).bind(id).fetch_one(&mut *tx).await.map_err(internal_error)?;
             if pending!="exchanging" { return Err(fail(StatusCode::CONFLICT,"oauth_attempt_cancelled","Authorization was cancelled before linking completed")); }
             query("INSERT INTO user_llm_connections (connection_id,user_id,provider,label,client_id,subject,email,host_id,status,credentials_encrypted,token_expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE credentials_encrypted=VALUES(credentials_encrypted),token_expires_at=VALUES(token_expires_at),status=VALUES(status),revocation_confirmed=NULL,email=VALUES(email),host_id=VALUES(host_id),generation=generation+1,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6)")
-                .bind(&connection_id).bind(owner).bind(PROVIDER).bind(label).bind(client_id).bind(identity.sub).bind(identity.email)
+                .bind(&connection_id).bind(owner).bind(PROVIDER).bind(&row.label).bind(client_id).bind(identity.sub).bind(identity.email)
                 .bind(&config.host_id).bind(state).bind(encrypted).bind(credentials.expires_at).execute(&mut *tx).await.map_err(internal_error)?;
             if state!="connected" {
                 query("UPDATE user_llm_models SET is_active=0,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
@@ -1001,10 +977,9 @@ impl ChatgptConnections {
         owner: &str,
         id: &str,
     ) -> ApiResult<ExecutionCredential> {
-        self.enabled()?;
-        let row = query("SELECT status,generation,host_id,label FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+        let config = self.enabled()?;
+        let (status,generation,host,label):(String,i64,String,String)=sqlx::query_as("SELECT status,generation,host_id,label FROM user_llm_connections WHERE user_id=? AND connection_id=?")
             .bind(owner).bind(id).fetch_optional(&self.pool()?).await.map_err(internal_error)?.ok_or_else(not_found)?;
-        let status: String = row.try_get("status").map_err(internal_error)?;
         if status == "plan_disabled" {
             return Err(fail(
                 StatusCode::FORBIDDEN,
@@ -1012,22 +987,15 @@ impl ChatgptConnections {
                 "Authorize ChatGPT plan usage for this connection",
             ));
         }
-        if status != "connected" {
-            return Err(reauth());
-        }
-        if row
-            .try_get::<String, _>("host_id")
-            .map_err(internal_error)?
-            != self.enabled()?.host_id
-        {
+        if status != "connected" || host != config.host_id {
             return Err(reauth());
         }
         Ok(ExecutionCredential {
             service: self.clone(),
             owner: owner.into(),
             connection_id: id.into(),
-            generation: row.try_get("generation").map_err(internal_error)?,
-            label: row.try_get("label").map_err(internal_error)?,
+            generation,
+            label,
         })
     }
     pub fn api_base(&self) -> ApiResult<&str> {
@@ -1076,37 +1044,36 @@ impl ChatgptConnections {
         owner: &str,
         id: &str,
         generation: i64,
-    ) -> ApiResult<sqlx::mysql::MySqlRow> {
+    ) -> ApiResult<CredentialRow> {
         self.enabled()?;
-        let row = query("SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?")
-            .bind(owner)
-            .bind(id)
-            .fetch_optional(&self.pool()?)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(not_found)?;
-        connected_generation(&row, generation)?;
+        let row = sqlx::query_as::<_, CredentialRow>(
+            "SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?",
+        )
+        .bind(owner)
+        .bind(id)
+        .fetch_optional(&self.pool()?)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(not_found)?;
+        connected_generation(&row.fence, generation)?;
         Ok(row)
     }
 
     fn usable_access_token(
         &self,
-        row: &sqlx::mysql::MySqlRow,
+        row: &CredentialRow,
         rejected_version: Option<i64>,
     ) -> ApiResult<Option<(String, i64)>> {
-        let version: i64 = row.try_get("credential_version").map_err(internal_error)?;
-        let expires: Option<i64> = row.try_get("token_expires_at").map_err(internal_error)?;
-        let refreshing: Option<String> = row.try_get("refresh_owner").map_err(internal_error)?;
-        if rejected_version != Some(version)
-            && refreshing.is_none()
-            && expires.is_some_and(|value| value > unix_now() + 60)
+        if rejected_version != Some(row.credential_version)
+            && row.refresh_owner.is_none()
+            && row
+                .token_expires_at
+                .is_some_and(|value| value > unix_now() + 60)
         {
-            let encrypted: Option<String> = row
-                .try_get("credentials_encrypted")
-                .map_err(internal_error)?;
-            let credentials = self.decode_credentials(&encrypted.ok_or_else(reauth)?)?;
+            let credentials =
+                self.decode_credentials(row.credentials_encrypted.as_deref().ok_or_else(reauth)?)?;
             if credentials.expires_at > unix_now() + 60 {
-                return Ok(Some((credentials.access_token, version)));
+                return Ok(Some((credentials.access_token, row.credential_version)));
             }
         }
         Ok(None)
@@ -1129,18 +1096,12 @@ impl ChatgptConnections {
             if let Some(token) = self.usable_access_token(&row, rejected_version)? {
                 return Ok(token);
             }
-            let version: i64 = row.try_get("credential_version").map_err(internal_error)?;
-            let encrypted: Option<String> = row
-                .try_get("credentials_encrypted")
-                .map_err(internal_error)?;
-            let encrypted = encrypted.ok_or_else(reauth)?;
-            let refresh_owner: Option<String> =
-                row.try_get("refresh_owner").map_err(internal_error)?;
-            if let Some(refresh_owner) = refresh_owner {
-                let until: Option<i64> = row.try_get("refresh_until").map_err(internal_error)?;
-                if until.is_none_or(|until| until < unix_now()) {
+            let version = row.credential_version;
+            let encrypted = row.credentials_encrypted.as_deref().ok_or_else(reauth)?;
+            if let Some(refresh_owner) = row.refresh_owner.as_deref() {
+                if row.refresh_until.is_none_or(|until| until < unix_now()) {
                     if self
-                        .mark_reauth(owner, id, generation, &refresh_owner)
+                        .mark_reauth(owner, id, generation, refresh_owner)
                         .await?
                     {
                         return Err(reauth());
@@ -1168,8 +1129,8 @@ impl ChatgptConnections {
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 continue;
             }
-            let credentials = self.decode_credentials(&encrypted)?;
-            let client_id: String = row.try_get("client_id").map_err(internal_error)?;
+            let credentials = self.decode_credentials(encrypted)?;
+            let client_id = &row.client_id;
             let refresh_id = Uuid::new_v4().to_string();
             let lease=query("UPDATE user_llm_connections SET refresh_owner=?,refresh_until=? WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner IS NULL AND status='connected'")
                 .bind(&refresh_id).bind(unix_now()+REFRESH_LEASE_SECONDS).bind(owner).bind(id).bind(generation).bind(version).execute(&pool).await.map_err(internal_error)?;
@@ -1192,8 +1153,8 @@ impl ChatgptConnections {
                 let token:TokenResponse=serde_json::from_slice(&provider_body(response).await?).map_err(|_|reauth())?;
                 if token.access_token.is_empty()||token.expires_in<=0||token.expires_in>86400*30 {return Err(reauth());}
                 if let Some(id_token)=&token.id_token {
-                    let identity=self.identity(id_token,&client_id,None).await?;
-                    if identity.sub!=row.try_get::<String,_>("subject").map_err(internal_error)? {return Err(reauth());}
+                    let identity=self.identity(id_token,client_id,None).await?;
+                    if identity.sub!=row.subject {return Err(reauth());}
                 }
                 let scopes=token.scope.map(|value|value.split_whitespace().map(str::to_owned).collect()).unwrap_or(credentials.scopes);
                 if !scopes.iter().any(|value|value==PLAN_SCOPE) {return Err(reauth());}
@@ -1348,24 +1309,14 @@ impl ChatgptConnections {
     async fn disconnect(&self, owner: &str, id: &str) -> ApiResult<Value> {
         let pool = self.pool()?;
         let mut tx = pool.begin().await.map_err(internal_error)?;
-        let row=query("SELECT status,client_id,credentials_encrypted,generation,revocation_confirmed FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+        let (status,client_id,encrypted,generation,confirmed):(String,String,Option<String>,i64,Option<i16>)=sqlx::query_as("SELECT status,client_id,credentials_encrypted,generation,revocation_confirmed FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
             .bind(owner).bind(id).fetch_optional(&mut *tx).await.map_err(internal_error)?.ok_or_else(not_found)?;
-        let encrypted: Option<String> = row
-            .try_get("credentials_encrypted")
-            .map_err(internal_error)?;
-        if row.try_get::<String, _>("status").map_err(internal_error)? == "disconnected"
-            && encrypted.is_none()
-        {
-            let confirmed = row
-                .try_get::<Option<i16>, _>("revocation_confirmed")
-                .map_err(internal_error)?
-                == Some(1);
+        if status == "disconnected" && encrypted.is_none() {
             tx.commit().await.map_err(internal_error)?;
             return Ok(
-                json!({"connection_id":id,"status":"disconnected","remote_revocation_confirmed":confirmed}),
+                json!({"connection_id":id,"status":"disconnected","remote_revocation_confirmed":confirmed==Some(1)}),
             );
         }
-        let generation: i64 = row.try_get("generation").map_err(internal_error)?;
         query("UPDATE user_llm_connections SET status='disconnected',credentials_encrypted=NULL,token_expires_at=NULL,generation=generation+1,refresh_owner=NULL,refresh_until=NULL,revocation_confirmed=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
             .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         query("UPDATE user_llm_authorizations SET status='cancelled',verifier_encrypted=NULL WHERE user_id=? AND connection_id=? AND status IN ('pending','exchanging')")
@@ -1391,13 +1342,7 @@ impl ChatgptConnections {
             }
         }
         let confirmed = if let Some(encrypted) = encrypted {
-            self.revoke(
-                &row.try_get::<String, _>("client_id")
-                    .map_err(internal_error)?,
-                &encrypted,
-            )
-            .await
-            .is_ok()
+            self.revoke(&client_id, &encrypted).await.is_ok()
         } else {
             false
         };
@@ -1464,9 +1409,9 @@ pub(crate) const AUTHORIZATIONS_TABLE_SQL: &str =
     )";
 
 pub async fn bootstrap(pool: &MySqlPool) -> Result<(), sqlx::Error> {
-    let row = query("SELECT IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_llm_models' AND COLUMN_NAME = 'api_key_encrypted'")
+    let nullable: String = sqlx::query_scalar("SELECT IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_llm_models' AND COLUMN_NAME = 'api_key_encrypted'")
         .fetch_one(pool).await?;
-    if row.try_get::<String, _>("IS_NULLABLE")? != "YES" {
+    if nullable != "YES" {
         query("ALTER TABLE user_llm_models MODIFY COLUMN api_key_encrypted TEXT NULL")
             .execute(pool)
             .await?;

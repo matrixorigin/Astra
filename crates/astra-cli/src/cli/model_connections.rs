@@ -269,73 +269,29 @@ pub async fn select_connection(
         .ok_or_else(|| "Invalid connection selection".into())
 }
 
-pub async fn add_model(
+pub async fn select_model(
     api: &ThinClient,
     token: &str,
-    args: crate::cli::cli_config::cli_args::ModelAddArgs,
-    interactive: bool,
-    profile: Option<&str>,
+    connection: &str,
 ) -> Result<String, String> {
-    if args.api_key_stdin || args.base_url.is_some() {
-        return Err(
-            "ChatGPT models use a linked subscription connection and fixed OpenAI endpoint".into(),
-        );
-    }
-    let wizard = interactive
-        && (args.name.is_none() || args.model.is_none() || args.connection_id.is_none());
-    let id = select_connection(api, token, args.connection_id, interactive, profile).await?;
-    let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+    let body = api
+        .get_bearer_path_query_text(token, &connection_path(connection, "models")?, &[])
         .await
-        .ok_or("Unable to refresh Astra session; run `astra login`")?;
-    let model = match args.model {
-        Some(model) => model,
-        None if interactive => {
-            let body = api
-                .get_bearer_path_query_text(&token, &connection_path(&id, "models")?, &[])
-                .await
-                .map_err(map_thin_err)?;
-            let catalog: Value =
-                serde_json::from_str(&body).map_err(|_| "Invalid subscription model catalog")?;
-            let labels: Vec<String> = catalog["items"]
-                .as_array()
-                .ok_or("Invalid subscription catalog")?
-                .iter()
-                .filter_map(|item| item["slug"].as_str().map(str::to_owned))
-                .collect();
-            if labels.is_empty() {
-                return Err("This ChatGPT account exposes no selectable models".into());
-            }
-            inquire::Select::new("Subscription model:", labels)
-                .prompt()
-                .map_err(|e| e.to_string())?
-        }
-        _ => return Err("--model is required in non-interactive mode".into()),
-    };
-    let name = match args.name {
-        Some(name) => name,
-        None if interactive => inquire::Text::new("Astra model alias:")
-            .with_default(&model)
-            .prompt()
-            .map_err(|e| e.to_string())?,
-        _ => return Err("A model alias is required in non-interactive mode".into()),
-    };
-    let context = if wizard {
-        inquire::CustomType::<i32>::new("Context window (tokens):")
-            .with_default(args.context_window)
-            .prompt()
-            .map_err(|e| e.to_string())?
-    } else {
-        args.context_window
-    };
-    let default = if wizard && !args.default {
-        inquire::Confirm::new("Use as your default model?")
-            .with_default(false)
-            .prompt()
-            .map_err(|e| e.to_string())?
-    } else {
-        args.default
-    };
-    api.post_bearer_path_json_text(&token,"/me/models",&json!({"name":name,"model":model,"provider":"chatgpt","connection_id":id,"context_window":context,"is_default":default})).await.map_err(map_thin_err)
+        .map_err(map_thin_err)?;
+    let catalog: Value =
+        serde_json::from_str(&body).map_err(|_| "Invalid subscription model catalog")?;
+    let choices = catalog["items"]
+        .as_array()
+        .ok_or("Invalid subscription catalog")?
+        .iter()
+        .filter_map(|item| item["slug"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return Err("This ChatGPT account exposes no selectable models".into());
+    }
+    inquire::Select::new("Subscription model:", choices)
+        .prompt()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

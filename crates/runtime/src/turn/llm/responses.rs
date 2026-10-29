@@ -115,7 +115,6 @@ pub(super) fn prepare(
         authorized_tool_names,
         url,
         judgment_provenance,
-        tool_choice,
         preparation_elapsed: started.elapsed(),
     })
 }
@@ -160,7 +159,7 @@ pub(super) async fn collect(
     started: Instant,
     budget: Option<Duration>,
     lease: &astra_services::chatgpt::CredentialLease,
-) -> Result<LlmCallResult, ProviderStreamFailure> {
+) -> Result<LlmCallResult, StreamCollectError> {
     let binding = route
         .subscription
         .expect("Responses preparation requires a connection");
@@ -315,7 +314,7 @@ pub(super) async fn collect(
     };
     outcome.map_err(|error| {
         let usage = accumulator.output.usage;
-        ProviderStreamFailure {
+        StreamCollectError::Provider {
             error,
             rejected,
             partial: LlmCallResult {

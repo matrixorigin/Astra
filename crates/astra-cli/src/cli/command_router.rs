@@ -3125,7 +3125,7 @@ async fn execute_cli_command_impl(
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let interactive =
                 !args.api_key_stdin && std::io::IsTerminal::is_terminal(&std::io::stdin());
-            let wizard = args.provider.is_none() || args.model.is_none() || args.name.is_none();
+            let mut wizard = args.provider.is_none() || args.model.is_none() || args.name.is_none();
             let required_text =
                 |value: Option<String>, label: &str, flag: &str| -> Result<String, String> {
                     let value = match value {
@@ -3163,21 +3163,35 @@ async fn execute_cli_command_impl(
                 }
                 None => return Err("--provider is required in non-interactive mode".into()),
             };
-            if provider == "chatgpt" {
-                let body = crate::cli::model_connections::add_model(
-                    api,
-                    &token,
-                    args,
-                    interactive,
-                    profile.as_deref(),
-                )
-                .await?;
-                print_json_or_raw(&body);
-                return Ok(ExitCode::Success);
+            let subscription = provider == "chatgpt";
+            if subscription && (args.api_key_stdin || args.base_url.is_some()) {
+                return Err(
+                    "ChatGPT models use a linked connection and fixed OpenAI endpoint".into(),
+                );
             }
-            if args.connection_id.is_some() {
+            if !subscription && args.connection_id.is_some() {
                 return Err("--connection is only valid for --provider chatgpt".into());
             }
+            wizard |= subscription && args.connection_id.is_none();
+            let connection = if subscription {
+                Some(
+                    crate::cli::model_connections::select_connection(
+                        api,
+                        &token,
+                        args.connection_id,
+                        interactive,
+                        profile.as_deref(),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let token = if subscription {
+                fresh_access_token_or_error(api, profile.as_deref()).await?
+            } else {
+                token
+            };
             let base_url = if provider == "openai-compatible" {
                 Some(required_text(
                     args.base_url,
@@ -3200,6 +3214,16 @@ async fn execute_cli_command_impl(
                 .map_err(map_thin_err)?;
             }
             let model = match args.model {
+                None if interactive && subscription => Some(
+                    crate::cli::model_connections::select_model(
+                        api,
+                        &token,
+                        connection
+                            .as_deref()
+                            .expect("subscription connection selected"),
+                    )
+                    .await?,
+                ),
                 None if interactive => Some(
                     personal_model_id_prompt()
                         .prompt()
@@ -3230,13 +3254,15 @@ async fn execute_cli_command_impl(
             }
             let is_default = if wizard && interactive && !args.default {
                 inquire::Confirm::new("Use this as your default model?")
-                    .with_default(true)
+                    .with_default(!subscription)
                     .prompt()
                     .map_err(|e| e.to_string())?
             } else {
                 args.default
             };
-            let api_key = if args.api_key_stdin {
+            let api_key = if subscription {
+                String::new()
+            } else if args.api_key_stdin {
                 read_model_api_key_from_stdin()?
             } else {
                 prompt_password_masked(
@@ -3244,7 +3270,7 @@ async fn execute_cli_command_impl(
                     None,
                 )?
             };
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "name": name,
                 "provider": provider,
                 "model": model,
@@ -3253,6 +3279,9 @@ async fn execute_cli_command_impl(
                 "context_window": context_window,
                 "is_default": is_default,
             });
+            if let Some(connection) = connection {
+                payload["connection_id"] = serde_json::json!(connection);
+            }
             let body = api
                 .post_bearer_path_json_text(&token, paths::ME_MODELS, &payload)
                 .await

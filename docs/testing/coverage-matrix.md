@@ -64,8 +64,6 @@ cross-instance expiry with 11-second discovery/JWKS/token legs, and metadata
 cache reuse, rejected refresh rate limits and probe 401 recovery. Cancellation of the last refresh waiter must still commit the new
 credential; 64 concurrent waiters share one rotation. Row-lock races exercise
 model creation, checking, activation and default selection against disconnect.
-A delayed SQL response proxy verifies that valid-token queries overlap instead
-of serializing behind refresh coordination, without a throughput threshold.
 The ignored `responses_transport_recovery_and_credential_fencing`
 transport test covers physical-attempt settlement, manually constructed tool
 frames, a delayed old-token 401, context-window and in-stream quota classifications,

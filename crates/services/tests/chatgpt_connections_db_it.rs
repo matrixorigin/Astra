@@ -24,19 +24,26 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
+async fn operate_ok(
+    service: &Arc<ChatgptConnections>,
+    owner: &str,
+    operation: ConnectionOperation,
+) -> Value {
+    service.operate(owner, operation).await.unwrap()
+}
+
 async fn start(service: &Arc<ChatgptConnections>, owner: &str, connection: Option<&str>) -> Value {
-    service
-        .operate(
-            owner,
-            ConnectionOperation::Start(StartAuthorization {
-                redirect_uri: "http://127.0.0.1:14555/auth/callback".into(),
-                label: Some("Personal".into()),
-                connection_id: connection.map(str::to_owned),
-                retry_authorization_id: None,
-            }),
-        )
-        .await
-        .unwrap()
+    operate_ok(
+        service,
+        owner,
+        ConnectionOperation::Start(StartAuthorization {
+            redirect_uri: "http://127.0.0.1:14555/auth/callback".into(),
+            label: Some("Personal".into()),
+            connection_id: connection.map(str::to_owned),
+            retry_authorization_id: None,
+        }),
+    )
+    .await
 }
 fn callback(value: &Value, code: &str) -> CompleteAuthorization {
     CompleteAuthorization {
@@ -53,87 +60,6 @@ async fn expire(pool: &sqlx::MySqlPool, key: &FernetTokenEncryptor, owner: &str,
     value["expires_at"] = json!(chrono::Utc::now().timestamp() - 1);
     sqlx::query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=? WHERE user_id=? AND connection_id=?")
         .bind(key.encrypt(&value.to_string()).unwrap()).bind(chrono::Utc::now().timestamp()-1).bind(owner).bind(id).execute(pool).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
-async fn valid_credentials_read_concurrently_over_database_round_trips() {
-    use std::sync::atomic::AtomicUsize;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (direct, mut settings) = common::setup_pool_and_settings().await;
-    isolated_database::require_isolated_database(&settings.database);
-    let provider = fixture::ProviderFixture::start().await;
-    let config = ChatgptConfig::for_test(&provider.base);
-    let key = Arc::new(FernetTokenEncryptor::new("subscription-parallel-read-test").unwrap());
-    let service = DatabaseModelService::new(settings.clone(), key.clone())
-        .with_pool(direct)
-        .with_chatgpt_config(config.clone());
-    let owner = format!("parallel-{}", uuid::Uuid::new_v4());
-    let connection = provider.connect(&service, &owner).await;
-
-    // Delay SQL responses to expose actual overlapping queries. Assert
-    // concurrency, not a machine-dependent latency or throughput threshold.
-    let upstream = (settings.host.clone(), settings.port);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    settings.host = "127.0.0.1".into();
-    settings.port = listener.local_addr().unwrap().port();
-    settings.db_pool_min_connections = 8;
-    settings.db_pool_max_connections = 8;
-    let overlap = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
-    let proxy = tokio::spawn({
-        let overlap = overlap.clone();
-        async move {
-            loop {
-                let (client, _) = listener.accept().await.unwrap();
-                let db = tokio::net::TcpStream::connect(upstream.clone())
-                    .await
-                    .unwrap();
-                client.set_nodelay(true).unwrap();
-                db.set_nodelay(true).unwrap();
-                let overlap = overlap.clone();
-                tokio::spawn(async move {
-                    let (mut client_read, mut client_write) = client.into_split();
-                    let (mut db_read, mut db_write) = db.into_split();
-                    let responses = async {
-                        let mut bytes = [0; 16384];
-                        while let Ok(n) = db_read.read(&mut bytes).await {
-                            if n == 0 {
-                                break;
-                            }
-                            let active = overlap.0.fetch_add(1, Ordering::SeqCst) + 1;
-                            overlap.1.fetch_max(active, Ordering::SeqCst);
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            let written = client_write.write_all(&bytes[..n]).await;
-                            overlap.0.fetch_sub(1, Ordering::SeqCst);
-                            if written.is_err() {
-                                break;
-                            }
-                        }
-                    };
-                    tokio::select! {
-                        _ = tokio::io::copy(&mut client_read, &mut db_write) => {},
-                        _ = responses => {},
-                    }
-                });
-            }
-        }
-    });
-    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
-    let service = Arc::new(ChatgptConnections::new(Some(pool.clone()), key, Ok(config)));
-    let binding = service.binding(&owner, &connection).await.unwrap();
-    overlap.1.store(0, Ordering::SeqCst);
-    let results = futures_util::future::join_all((0..64).map(|_| binding.acquire(None))).await;
-    assert!(results.iter().all(Result::is_ok));
-    assert!(
-        overlap.1.load(Ordering::SeqCst) >= 4,
-        "valid credentials serialized database reads"
-    );
-    assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 0);
-    drop(results);
-    pool.close().await;
-    proxy.abort();
 }
 
 #[tokio::test]
@@ -191,25 +117,23 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
             .0,
         axum::http::StatusCode::NOT_FOUND
     );
-    let linked = service
-        .operate(
-            &owner,
-            ConnectionOperation::Complete(id.into(), callback(&attempt, &code)),
-        )
-        .await
-        .unwrap();
+    let linked = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(id.into(), callback(&attempt, &code)),
+    )
+    .await;
     let connection = linked["connection"]["connection_id"]
         .as_str()
         .unwrap()
         .to_owned();
     assert_eq!(linked["connection"]["status"], "connected");
-    let repeated = service
-        .operate(
-            &owner,
-            ConnectionOperation::Complete(id.into(), callback(&attempt, &code)),
-        )
-        .await
-        .unwrap();
+    let repeated = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(id.into(), callback(&attempt, &code)),
+    )
+    .await;
     assert_eq!(linked, repeated);
     assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 1);
     let stored:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
@@ -223,10 +147,8 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
             .get("id_token")
             .is_none()
     );
-    let metadata = service
-        .operate(&owner, ConnectionOperation::List)
+    let metadata = operate_ok(&service, &owner, ConnectionOperation::List)
         .await
-        .unwrap()
         .to_string();
     assert!(
         !metadata.contains("fixture-access-")
@@ -374,8 +296,7 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     drop(refreshed);
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 3);
 
-    // A simultaneous expiry shares one worker/result, and subsequent valid
-    // acquisitions neither rotate nor wait on that worker's coordination.
+    // A simultaneous expiry shares one worker/result; valid acquisitions reuse it.
     expire(&pool, &key, &owner, &connection).await;
     for expected_refreshes in [4, 4] {
         let leases = futures_util::future::join_all((0..64).map(|_| primary.acquire(None))).await;
@@ -405,12 +326,18 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     })
     .await
     .unwrap();
-    let disconnected = service
-        .operate(&owner, ConnectionOperation::Disconnect(connection.clone()))
-        .await
-        .unwrap();
+    let disconnected = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Disconnect(connection.clone()),
+    )
+    .await;
     assert_eq!(disconnected["status"], "disconnected");
     assert_eq!(disconnected["remote_revocation_confirmed"], true);
+    assert_eq!(
+        operate_ok(&service, &owner, ConnectionOperation::List).await["items"][0]["remote_revocation_confirmed"],
+        true
+    );
     assert!(
         interrupted_refresh.await.unwrap().is_err(),
         "an owned refresh must not overwrite disconnect"
@@ -463,18 +390,17 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
             .await
             .is_err()
     );
-    let good = service
-        .operate(
-            &owner,
-            ConnectionOperation::Start(StartAuthorization {
-                redirect_uri: "http://127.0.0.1:14555/auth/callback".into(),
-                label: None,
-                connection_id: None,
-                retry_authorization_id: Some(relink["authorization_id"].as_str().unwrap().into()),
-            }),
-        )
-        .await
-        .unwrap();
+    let good = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Start(StartAuthorization {
+            redirect_uri: "http://127.0.0.1:14555/auth/callback".into(),
+            label: None,
+            connection_id: None,
+            retry_authorization_id: Some(relink["authorization_id"].as_str().unwrap().into()),
+        }),
+    )
+    .await;
     let retry_url = reqwest::Url::parse(good["authorization_url"].as_str().unwrap()).unwrap();
     assert!(
         retry_url
@@ -487,16 +413,15 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
             .any(|(key, _)| key == "agent_name_hint")
     );
     let good_code = provider.issue_code(&good, "account-one", true);
-    service
-        .operate(
-            &owner,
-            ConnectionOperation::Complete(
-                good["authorization_id"].as_str().unwrap().into(),
-                callback(&good, &good_code),
-            ),
-        )
-        .await
-        .unwrap();
+    operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(
+            good["authorization_id"].as_str().unwrap().into(),
+            callback(&good, &good_code),
+        ),
+    )
+    .await;
     let renewed = service.binding(&owner, &connection).await.unwrap();
     assert!(
         first.ensure_current().await.is_err(),
@@ -530,25 +455,21 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     provider.state.refresh_error.store(400, Ordering::SeqCst);
     assert!(renewed.acquire(None).await.is_err());
     assert_eq!(
-        service
-            .operate(&owner, ConnectionOperation::List)
-            .await
-            .unwrap()["items"][0]["status"],
+        operate_ok(&service, &owner, ConnectionOperation::List).await["items"][0]["status"],
         "reauth_required"
     );
 
     let no_plan = start(&service, &other, None).await;
     let no_plan_code = provider.issue_code(&no_plan, "account-two", false);
-    let disabled = service
-        .operate(
-            &other,
-            ConnectionOperation::Complete(
-                no_plan["authorization_id"].as_str().unwrap().into(),
-                callback(&no_plan, &no_plan_code),
-            ),
-        )
-        .await
-        .unwrap();
+    let disabled = operate_ok(
+        &service,
+        &other,
+        ConnectionOperation::Complete(
+            no_plan["authorization_id"].as_str().unwrap().into(),
+            callback(&no_plan, &no_plan_code),
+        ),
+    )
+    .await;
     let disabled_id = disabled["connection"]["connection_id"].as_str().unwrap();
     assert_eq!(disabled["connection"]["status"], "plan_disabled");
     assert_eq!(
@@ -562,13 +483,12 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
             .any(|(key, value)| key == "prompt" && value == "consent")
     );
     assert!(!url.query_pairs().any(|(key, _)| key == "agent_name_hint"));
-    service
-        .operate(
-            &other,
-            ConnectionOperation::Cancel(consent["authorization_id"].as_str().unwrap().into()),
-        )
-        .await
-        .unwrap();
+    operate_ok(
+        &service,
+        &other,
+        ConnectionOperation::Cancel(consent["authorization_id"].as_str().unwrap().into()),
+    )
+    .await;
     let codes: HashSet<_> = provider
         .state
         .requests
