@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::Digest;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use uuid::Uuid;
 
@@ -29,6 +29,8 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
     let key_id = Uuid::new_v4().to_string();
     let revoked = Arc::new(AtomicBool::new(false));
     let flag = revoked.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let request_calls = calls.clone();
     let whoami = json!({"user_id":owner, "key_id":key_id, "is_active":true, "is_master":false,
         "scope":{"type":"personal","id":owner},"api_version":"1",
         "capabilities":["api_key_scopes","memory_filters_v1"],"granted_scopes":["identity:read"]});
@@ -37,7 +39,9 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         get(move || {
             let flag = flag.clone();
             let body = whoami.clone();
+            let request_calls = request_calls.clone();
             async move {
+                request_calls.fetch_add(1, Ordering::SeqCst);
                 (
                     if flag.load(Ordering::SeqCst) {
                         StatusCode::UNAUTHORIZED
@@ -163,9 +167,17 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         .unwrap();
         if kind == "refresh" {
             use sha2::{Digest, Sha256};
-            sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,is_revoked) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 DAY), 0)")
-                .bind(Uuid::new_v4().to_string()).bind(&tokens.user_id).bind(claims["sid"].as_str().unwrap())
-                .bind(format!("{:x}", Sha256::digest(legacy.as_bytes()))).execute(pool).await.unwrap();
+            let updated = sqlx::query(
+                "UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ? AND user_id = ?",
+            )
+            .bind(format!("{:x}", Sha256::digest(legacy.as_bytes())))
+            .bind(claims["sid"].as_str().unwrap())
+            .bind(&tokens.user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            assert_eq!(updated.rows_affected(), 1);
+            let before = calls.load(Ordering::SeqCst);
             assert_eq!(
                 auth.refresh(AuthRefreshRequestData {
                     refresh_token: legacy
@@ -174,6 +186,10 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
                 .unwrap_err()
                 .0,
                 StatusCode::UNAUTHORIZED
+            );
+            assert!(
+                calls.load(Ordering::SeqCst) > before,
+                "legacy refresh must reach provider verification"
             );
         } else {
             headers.insert(

@@ -434,8 +434,12 @@ A loser reads the committed winner. Provider verification happens before locking
 and its identity/credential binding is checked again under lock.
 
 The ordinary browser resolution uses the random session ID as the canonical row
-primary key and verifies the full handle hash in one authority snapshot. It does
-not write or call the provider. React request caching deduplicates Server Component configuration reads. Chat,
+primary key and verifies the full handle hash in one authority snapshot. Direct
+refresh and principal checks use the same primary key. Refresh also compares the
+signed refresh token hash on that row; the hash is not a separate index. When the
+current access token is usable, ordinary browser resolution does not write or call
+the provider; rotation writes and revalidates the provider when applicable. React
+request caching deduplicates Server Component configuration reads. Chat,
 project and sidebar handlers and hydrated pages pass their admitted client through
 the request; there is no cross-user or process-local token authority. A late Stop
 acknowledgement resolves authority again before reconciliation. The existing SDK owns later 401
@@ -487,8 +491,9 @@ ciphertext remains until expiry, the retention period and any cleanup backlog.
 
 Refresh maintenance captures a conservative UTC cutoff, binds it as a concrete
 DATETIME to the expiry index, and rechecks each candidate and the cutoff in a
-primary-key batch delete. This avoids the MatrixOne 4.2.5 dynamic time range
-error and reduces index maintenance work. The delete checks the current database
+primary-key batch delete. The bound candidate cutoff avoids the observed MatrixOne 4.2.5 dynamic time range
+error during candidate selection. The DELETE retains a database-clock condition
+and rechecks the base row; its index completeness and physical I/O remain engine-dependent. The delete checks the current database
 clock and the retention period again, so a concurrent renewal or backward clock
 change cannot cause premature deletion. Correct expiry selection still depends
 on MatrixOne's index returning complete results. Candidate anomalies and stalled
@@ -510,7 +515,7 @@ the browser's shared cookie jar; it does not construct authentication cookies.
 
 ### Fresh-schema deployment
 
-This change advances the strict core schema contract to `2026-10-29-v114`. It does
+This change advances the strict core schema contract to `2026-10-29-v115`. It does
 not migrate, alter, drop or recreate an existing database. Provision a **separate
 fresh database**, preserving the old database and its data. Existing data does not
 appear in the fresh database without a separately designed migration. Drain old

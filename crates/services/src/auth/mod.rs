@@ -1300,8 +1300,9 @@ impl DatabaseAuthService {
         let row = query(
             "SELECT CAST(UNIX_TIMESTAMP(MAX(expires_at)) AS SIGNED) AS max_expires_at_unix \
              FROM auth_refresh_tokens \
-             WHERE user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()",
+             WHERE token_id = ? AND user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()",
         )
+        .bind(session_id)
         .bind(user_id)
         .bind(session_id)
         .fetch_one(pool)
@@ -1792,7 +1793,8 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE user_id = ? AND session_id = ? AND is_revoked = 0")
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE token_id = ? AND user_id = ? AND session_id = ? AND is_revoked = 0")
+            .bind(&session_id)
             .bind(&user_id)
             .bind(&session_id)
             .execute(&mut *tx)
@@ -2125,7 +2127,7 @@ impl AuthService for DatabaseAuthService {
                     CAST(UNIX_TIMESTAMP(s.session_expires_at) AS SIGNED) AS session_expires_at_unix,
                     m.provider_id AS memoria_provider_id, m.external_subject AS memoria_subject
              FROM (SELECT MAX(expires_at) AS session_expires_at
-                   FROM auth_refresh_tokens WHERE user_id = ? AND session_id = ?
+                   FROM auth_refresh_tokens WHERE token_id = ? AND user_id = ? AND session_id = ?
                      AND is_revoked = 0 AND expires_at > NOW()) s
              LEFT JOIN auth_users u ON u.user_id = ?
              LEFT JOIN (SELECT astra_user_id, provider_id, external_subject
@@ -2135,6 +2137,7 @@ impl AuthService for DatabaseAuthService {
                                  updated_at DESC, provider_id ASC LIMIT 1) m
                ON m.astra_user_id = u.user_id",
         )
+        .bind(&session_id)
         .bind(&user_id)
         .bind(&session_id)
         .bind(&user_id)

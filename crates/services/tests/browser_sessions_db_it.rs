@@ -105,6 +105,19 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         .await
         .unwrap();
     assert_eq!(moved.rows_affected(), 1);
+    let mut drifted_headers = axum::http::HeaderMap::new();
+    drifted_headers.insert(
+        "authorization",
+        format!("Bearer {}", drifted.access_token).parse().unwrap(),
+    );
+    assert_eq!(
+        second
+            .current_principal(&drifted_headers)
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         first
             .create_browser_session(adoption(&drifted_handle, &drifted))
@@ -114,7 +127,96 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .0,
         StatusCode::UNAUTHORIZED
     );
+    let signed_sid = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(drifted_handle.split('.').nth(3).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        first
+            .refresh(refresh(&drifted.refresh_token))
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let restored = sqlx::query("UPDATE auth_refresh_tokens SET token_id = ? WHERE token_hash = ?")
+        .bind(&signed_sid)
+        .bind(digest(&drifted.refresh_token))
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert_eq!(restored.rows_affected(), 1);
     assert!(first.refresh(refresh(&drifted.refresh_token)).await.is_ok());
+
+    // Copied hashes cannot make a signed JWT authorize another session or user.
+    let collision_name = register(&first).await;
+    let first_token = login(&first, &collision_name).await;
+    let second_token = login(&first, &collision_name).await;
+    let third_name = register(&first).await;
+    let third_token = login(&first, &third_name).await;
+    let mut others = Vec::new();
+    for other in [&second_token, &third_token] {
+        let hint = handle(other);
+        let sid = String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(hint.split('.').nth(3).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let changed =
+            sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ?")
+                .bind(digest(&first_token.refresh_token))
+                .bind(&sid)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
+        others.push((other, sid));
+    }
+    assert!(
+        first
+            .refresh(refresh(&first_token.refresh_token))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        first
+            .refresh(refresh(&first_token.refresh_token))
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    for (other, sid) in others {
+        let (stored_hash, revoked): (String, i16) = sqlx::query_as(
+            "SELECT token_hash, is_revoked FROM auth_refresh_tokens WHERE token_id = ?",
+        )
+        .bind(&sid)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(stored_hash, digest(&first_token.refresh_token));
+        assert_eq!(revoked, 0);
+        assert_eq!(
+            first
+                .refresh(refresh(&other.refresh_token))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let restored =
+            sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ?")
+                .bind(digest(&other.refresh_token))
+                .bind(&sid)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        assert_eq!(restored.rows_affected(), 1);
+        assert!(first.refresh(refresh(&other.refresh_token)).await.is_ok());
+    }
 
     let tokens = login(&first, &name).await;
     let browser = handle(&tokens);

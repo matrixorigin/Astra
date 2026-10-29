@@ -62,10 +62,11 @@ impl DatabaseAuthService {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT t.token_id, u.username FROM auth_refresh_tokens t
              JOIN auth_users u ON u.user_id = ? AND u.user_id = t.user_id
-             WHERE t.token_hash = ? AND t.user_id = ? AND t.session_id = ?
+             WHERE t.token_id = ? AND t.token_hash = ? AND t.user_id = ? AND t.session_id = ?
                AND t.is_revoked = 0 AND t.expires_at > NOW(6) AND u.is_active = 1",
         )
         .bind(user_id)
+        .bind(&session_id)
         .bind(&old_hash)
         .bind(user_id)
         .bind(&session_id)

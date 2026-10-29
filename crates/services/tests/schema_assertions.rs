@@ -288,6 +288,16 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
 
     for (change, restore, expected) in [
         (
+            "ALTER TABLE auth_refresh_tokens DROP PRIMARY KEY",
+            "ALTER TABLE auth_refresh_tokens ADD PRIMARY KEY (token_id)",
+            "PRIMARY",
+        ),
+        (
+            "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_user_expires",
+            "CREATE INDEX idx_auth_refresh_tokens_user_expires ON auth_refresh_tokens (user_id, expires_at)",
+            "idx_auth_refresh_tokens_user_expires",
+        ),
+        (
             "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_expires_at",
             "CREATE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at)",
             "idx_auth_refresh_tokens_expires_at",
@@ -316,24 +326,68 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         assert!(error.contains(expected), "{error}");
         sqlx::query(restore).execute(pool.get()).await.unwrap();
     }
-    sqlx::query(
-        "CREATE INDEX uq_auth_refresh_browser_handle ON auth_refresh_tokens (browser_handle_hash)",
-    )
-    .execute(pool.get())
-    .await
-    .unwrap();
-    let error = ensure_core_schema(&settings, &bootstrap_catalog)
-        .await
-        .expect_err("obsolete browser index must reject startup")
-        .to_string();
-    assert!(error.contains("uq_auth_refresh_browser_handle"), "{error}");
-    sqlx::query("ALTER TABLE auth_refresh_tokens DROP INDEX uq_auth_refresh_browser_handle")
-        .execute(pool.get())
-        .await
-        .unwrap();
-    ensure_core_schema(&settings, &bootstrap_catalog)
-        .await
-        .unwrap();
+    for (index, create, drop_index) in [
+        (
+            "uq_auth_refresh_browser_handle",
+            "CREATE INDEX uq_auth_refresh_browser_handle ON auth_refresh_tokens (browser_handle_hash)",
+            "ALTER TABLE auth_refresh_tokens DROP INDEX uq_auth_refresh_browser_handle",
+        ),
+        (
+            "uq_auth_refresh_tokens_hash",
+            "CREATE INDEX uq_auth_refresh_tokens_hash ON auth_refresh_tokens (token_hash)",
+            "ALTER TABLE auth_refresh_tokens DROP INDEX uq_auth_refresh_tokens_hash",
+        ),
+        (
+            "idx_auth_refresh_tokens_session",
+            "CREATE INDEX idx_auth_refresh_tokens_session ON auth_refresh_tokens (session_id)",
+            "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_session",
+        ),
+    ] {
+        sqlx::query(create).execute(pool.get()).await.unwrap();
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("obsolete refresh index must reject startup")
+            .to_string();
+        assert!(error.contains(index), "{error}");
+        sqlx::query(drop_index).execute(pool.get()).await.unwrap();
+        ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .unwrap();
+    }
+
+    for (index, drop_index, create_unique, restore) in [
+        (
+            "idx_auth_refresh_tokens_user_expires",
+            "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_user_expires",
+            "CREATE UNIQUE INDEX idx_auth_refresh_tokens_user_expires ON auth_refresh_tokens (user_id, expires_at, token_id)",
+            "CREATE INDEX idx_auth_refresh_tokens_user_expires ON auth_refresh_tokens (user_id, expires_at)",
+        ),
+        (
+            "idx_auth_refresh_tokens_expires_at",
+            "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_expires_at",
+            "CREATE UNIQUE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at, token_id)",
+            "CREATE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at)",
+        ),
+    ] {
+        sqlx::query(drop_index).execute(pool.get()).await.unwrap();
+        sqlx::query(create_unique)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("refresh indexes must not be unique")
+            .to_string();
+        assert!(
+            error.contains(index) && error.contains("non-unique"),
+            "{error}"
+        );
+        sqlx::query(drop_index).execute(pool.get()).await.unwrap();
+        sqlx::query(restore).execute(pool.get()).await.unwrap();
+        ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .unwrap();
+    }
 
     // The named hash lookup must remain unique, even when the readiness
     // marker is already present. Bootstrap validates shape; it never repairs.
@@ -361,7 +415,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .await
         .unwrap();
 
-    sqlx::query("UPDATE astra_schema_contracts SET contract_version = 'unsupported-old-schema' WHERE component = 'astra-core'")
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-10-29-v114' WHERE component = 'astra-core'")
         .execute(pool.get()).await.unwrap();
     let error = ensure_core_schema(&settings, &bootstrap_catalog)
         .await
@@ -374,7 +428,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .fetch_one(pool.get())
     .await
     .unwrap();
-    assert_eq!(unchanged, "unsupported-old-schema");
+    assert_eq!(unchanged, "2026-10-29-v114");
 
     sqlx::query(
         "UPDATE astra_schema_contracts SET contract_version = ? WHERE component = 'astra-core'",
