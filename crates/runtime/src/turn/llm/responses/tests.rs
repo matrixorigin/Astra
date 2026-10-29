@@ -1,7 +1,5 @@
 use super::*;
-use astra_services::chatgpt::{
-    ChatgptConfig, CompleteAuthorization, ConnectionOperation, StartAuthorization,
-};
+use astra_services::chatgpt::{ChatgptConfig, ConnectionOperation};
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelService, UserModelCreateRequestData,
 };
@@ -12,6 +10,7 @@ use std::sync::{
 
 #[allow(dead_code)]
 mod fixture {
+    use astra_services as services;
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../services/tests/common/chatgpt_fixture.rs"
@@ -21,7 +20,7 @@ mod fixture {
 #[derive(Default)]
 struct Attempts {
     next: AtomicU32,
-    finished: Mutex<Vec<astra_services::InferenceTerminalStatus>>,
+    finished: Mutex<Vec<astra_services::InferenceInvocationTerminal>>,
 }
 #[async_trait]
 impl ProviderAttemptObserver for Attempts {
@@ -39,7 +38,7 @@ impl ProviderAttemptObserver for Attempts {
         _: u32,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError> {
-        self.finished.lock().unwrap().push(terminal.status);
+        self.finished.lock().unwrap().push(terminal.clone());
         Ok(())
     }
 }
@@ -88,7 +87,7 @@ async fn infer_with_budget(
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database; no live provider"]
-async fn responses_transport_replays_checkpoint_and_fences_disconnected_credentials() {
+async fn responses_transport_recovery_and_credential_fencing() {
     let mut settings = astra_core::MatrixOneSettings::from_env();
     crate::isolated_database::require_isolated_database(&settings.database);
     settings.db_pool_max_connections = 8;
@@ -107,38 +106,7 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         .with_pool(pool)
         .with_chatgpt_config(config);
     let owner = format!("runtime-{}", uuid::Uuid::new_v4());
-    let authorization = service
-        .model_connection_operation(
-            owner.clone(),
-            ConnectionOperation::Start(StartAuthorization {
-                redirect_uri: "http://127.0.0.1:14555/auth/callback".into(),
-                label: Some("Runtime fixture".into()),
-                connection_id: None,
-                retry_authorization_id: None,
-            }),
-        )
-        .await
-        .unwrap();
-    let code = provider.issue_code(&authorization, "runtime-account", true);
-    let linked = service
-        .model_connection_operation(
-            owner.clone(),
-            ConnectionOperation::Complete(
-                authorization["authorization_id"].as_str().unwrap().into(),
-                CompleteAuthorization {
-                    state: authorization["state"].as_str().unwrap().into(),
-                    code: Some(code),
-                    client_id: Some("oaiapp_fixture".into()),
-                    error: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-    let connection = linked["connection"]["connection_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let connection = provider.connect(&service, &owner).await;
     let model = service
         .create_user_model(
             owner.clone(),
@@ -179,31 +147,7 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
     messages.push(json!({"role":"assistant","content":"","tool_calls":calls,astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}));
     messages
         .push(json!({"role":"tool","tool_call_id":"internal-call","content":"fixture contents"}));
-    let mut recorder =
-        astra_pipeline::step_recorder::StepRecorder::new(&owner, "subscription-session", "test");
-    recorder.begin_turn(1);
-    let checkpoint = astra_turn_core::turn_checkpoint::build_turn_continuity_checkpoint(
-        astra_turn_core::turn_checkpoint::TurnCheckpointInput {
-            step_recorder: &recorder,
-            messages: &messages,
-            max_turn_input_tokens: 128000,
-            last_measured_prompt_tokens: Some(20),
-            remaining_turns: 4,
-            restricted_tools: &HashSet::new(),
-            recent_tools: &[],
-            interruption: None,
-            approval_overrides: None,
-            consecutive_context_window_errors: 0,
-            deferred_tool_activations: &mut Vec::new(),
-            pipeline_session: None,
-            workspace_observation_quarantine: None,
-        },
-    )
-    .unwrap();
-    let saved = serde_json::to_vec(&checkpoint).unwrap();
-    let restored: astra_pipeline::step_protocol::HeavyCheckpoint =
-        serde_json::from_slice(&saved).unwrap();
-    let second = infer(&admitted, &restored.messages, &tools, &attempts)
+    let second = infer(&admitted, &messages, &tools, &attempts)
         .await
         .unwrap();
     assert_eq!(second.full_text, "Continued successfully");
@@ -236,7 +180,7 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         .acquire(None)
         .await
         .unwrap();
-    *provider.state.reject_token.lock().unwrap() = Some(stale.bearer().to_owned());
+    provider.reject_access_token(stale.bearer(), true);
     drop(stale);
     let refreshes = provider.state.refresh_calls.load(Ordering::SeqCst);
     let (left, right) = tokio::join!(
@@ -272,6 +216,16 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         .await
         .unwrap_err();
     assert_eq!(failure.kind, astra_core::ErrorKind::RateLimit);
+    {
+        let terminals = attempts.finished.lock().unwrap();
+        let terminal = terminals.last().unwrap();
+        assert_eq!(terminal.usage.input.total_input_tokens(), 17);
+        assert_eq!(terminal.usage.output_tokens, 23);
+        assert_eq!(
+            terminal.provider_response_id.as_deref(),
+            Some("failed-response")
+        );
+    }
     assert_eq!(
         provider.state.responses_calls.load(Ordering::SeqCst),
         before + 1
@@ -291,8 +245,13 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         "partial output must not be retried"
     );
     assert_eq!(
-        attempts.finished.lock().unwrap().last(),
-        Some(&astra_services::InferenceTerminalStatus::DeliveryUnknown)
+        attempts
+            .finished
+            .lock()
+            .unwrap()
+            .last()
+            .map(|terminal| terminal.status),
+        Some(astra_services::InferenceTerminalStatus::DeliveryUnknown)
     );
     provider.state.truncate.store(false, Ordering::SeqCst);
     provider.state.quota.store(true, Ordering::SeqCst);
@@ -373,8 +332,13 @@ async fn responses_transport_replays_checkpoint_and_fences_disconnected_credenti
         "every admitted request must settle"
     );
     assert_eq!(
-        attempts.finished.lock().unwrap().last(),
-        Some(&astra_services::InferenceTerminalStatus::DeliveryUnknown)
+        attempts
+            .finished
+            .lock()
+            .unwrap()
+            .last()
+            .map(|terminal| terminal.status),
+        Some(astra_services::InferenceTerminalStatus::DeliveryUnknown)
     );
 }
 

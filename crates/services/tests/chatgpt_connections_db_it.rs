@@ -4,6 +4,7 @@ mod common;
 mod isolated_database;
 #[allow(dead_code)]
 mod fixture {
+    use astra_services as services;
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/common/chatgpt_fixture.rs"
@@ -64,25 +65,11 @@ async fn valid_credentials_read_concurrently_over_database_round_trips() {
     let provider = fixture::ProviderFixture::start().await;
     let config = ChatgptConfig::for_test(&provider.base);
     let key = Arc::new(FernetTokenEncryptor::new("subscription-parallel-read-test").unwrap());
-    let service = Arc::new(ChatgptConnections::new(
-        Some(direct),
-        key.clone(),
-        Ok(config.clone()),
-    ));
+    let service = DatabaseModelService::new(settings.clone(), key.clone())
+        .with_pool(direct)
+        .with_chatgpt_config(config.clone());
     let owner = format!("parallel-{}", uuid::Uuid::new_v4());
-    let authorization = start(&service, &owner, None).await;
-    let code = provider.issue_code(&authorization, "parallel-account", true);
-    let linked = service
-        .operate(
-            &owner,
-            ConnectionOperation::Complete(
-                authorization["authorization_id"].as_str().unwrap().into(),
-                callback(&authorization, &code),
-            ),
-        )
-        .await
-        .unwrap();
-    let connection = linked["connection"]["connection_id"].as_str().unwrap();
+    let connection = provider.connect(&service, &owner).await;
 
     // Delay SQL responses to expose actual overlapping queries. Assert
     // concurrency, not a machine-dependent latency or throughput threshold.
@@ -135,7 +122,7 @@ async fn valid_credentials_read_concurrently_over_database_round_trips() {
     });
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     let service = Arc::new(ChatgptConnections::new(Some(pool.clone()), key, Ok(config)));
-    let binding = service.binding(&owner, connection).await.unwrap();
+    let binding = service.binding(&owner, &connection).await.unwrap();
     overlap.1.store(0, Ordering::SeqCst);
     let results = futures_util::future::join_all((0..64).map(|_| binding.acquire(None))).await;
     assert!(results.iter().all(Result::is_ok));
@@ -225,13 +212,12 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     assert!(!stored.contains("fixture-access-"));
     let plaintext = key.decrypt(&stored).unwrap();
     assert!(plaintext.contains("fixture-access-"));
-    let mut legacy: Value = serde_json::from_str(&plaintext).unwrap();
-    assert!(legacy.get("id_token").is_none());
-    // A connection saved by the earlier PR revision must still refresh. Its
-    // unused ID-token field is ignored and omitted on the next credential write.
-    legacy["id_token"] = json!("obsolete-id-token");
-    sqlx::query("UPDATE user_llm_connections SET credentials_encrypted=? WHERE user_id=? AND connection_id=?")
-        .bind(key.encrypt(&legacy.to_string()).unwrap()).bind(&owner).bind(&connection).execute(&pool).await.unwrap();
+    assert!(
+        serde_json::from_str::<Value>(&plaintext)
+            .unwrap()
+            .get("id_token")
+            .is_none()
+    );
     let metadata = service
         .operate(&owner, ConnectionOperation::List)
         .await
@@ -322,10 +308,6 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     provider.state.metadata_delay_ms.store(0, Ordering::SeqCst);
     provider.state.refresh_delay_ms.store(0, Ordering::SeqCst);
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 1);
-    let refreshed: String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
-        .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
-    let refreshed: Value = serde_json::from_str(&key.decrypt(&refreshed).unwrap()).unwrap();
-    assert!(refreshed.get("id_token").is_none());
     drop((a, b));
     let primary = service.binding(&owner, &connection).await.unwrap();
     expire(&pool, &key, &owner, &connection).await;
@@ -511,9 +493,30 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     );
     let bytes = renewed.acquire(None).await.unwrap();
     assert!(!bytes.bearer().is_empty());
+    provider.reject_access_token(bytes.bearer(), false);
     drop(bytes);
+    let refreshes = provider.state.refresh_calls.load(Ordering::SeqCst);
+    service
+        .probe(&owner, &connection, "fixture-model")
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.state.refresh_calls.load(Ordering::SeqCst),
+        refreshes + 1
+    );
+    *provider.state.reject_token.lock().unwrap() = None;
     expire(&pool, &key, &owner, &connection).await;
-    provider.state.fail_refresh.store(true, Ordering::SeqCst);
+    let before:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+        .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
+    provider.state.refresh_error.store(429, Ordering::SeqCst);
+    assert_eq!(
+        renewed.acquire(None).await.err().unwrap().0,
+        axum::http::StatusCode::TOO_MANY_REQUESTS
+    );
+    let after:(String,String,Option<String>)=sqlx::query_as("SELECT status,credentials_encrypted,refresh_owner FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+        .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
+    assert_eq!(after, ("connected".into(), before, None));
+    provider.state.refresh_error.store(400, Ordering::SeqCst);
     assert!(renewed.acquire(None).await.is_err());
     assert_eq!(
         service
@@ -586,22 +589,7 @@ async fn disconnect_fences_inflight_model_creation_check_activation_and_default(
     );
     for operation in ["check", "activate", "default", "create"] {
         let owner = format!("activation-{}", uuid::Uuid::new_v4());
-        let authorization = start(&connections, &owner, None).await;
-        let code = provider.issue_code(&authorization, "activation-account", true);
-        let linked = connections
-            .operate(
-                &owner,
-                ConnectionOperation::Complete(
-                    authorization["authorization_id"].as_str().unwrap().into(),
-                    callback(&authorization, &code),
-                ),
-            )
-            .await
-            .unwrap();
-        let connection = linked["connection"]["connection_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let connection = provider.connect(models.as_ref(), &owner).await;
         let model_request = UserModelCreateRequestData {
             connection_id: Some(connection.clone()),
             name: "initial".into(),

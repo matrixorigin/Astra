@@ -315,10 +315,26 @@ impl ResponseAccumulator {
             }
             return Ok(None);
         }
-        match kind {
-            "response.created" => {
-                self.output.response_id = event["response"]["id"].as_str().map(str::to_owned);
+        // Successful and failed terminal events both own response identity and
+        // measured usage. Preserve that evidence before validating completion.
+        let response = &event["response"];
+        if let Some(id) = response["id"].as_str() {
+            self.output.response_id = Some(id.to_owned());
+        }
+        if let Some(usage) = response["usage"].as_object() {
+            self.output.usage = usage.clone();
+            for (source, target) in [
+                ("input_tokens", "prompt_tokens"),
+                ("output_tokens", "completion_tokens"),
+                ("input_tokens_details", "prompt_tokens_details"),
+                ("output_tokens_details", "completion_tokens_details"),
+            ] {
+                if let Some(value) = usage.get(source) {
+                    self.output.usage.insert(target.into(), value.clone());
+                }
             }
+        }
+        match kind {
             "response.output_text.delta" => {
                 let delta = event["delta"]
                     .as_str()
@@ -400,23 +416,6 @@ impl ResponseAccumulator {
                 if !text.is_empty() {
                     self.output.text = text;
                 }
-                if let Some(usage) = response["usage"].as_object() {
-                    self.output.usage = usage.clone();
-                    for (source, target) in [
-                        ("input_tokens", "prompt_tokens"),
-                        ("output_tokens", "completion_tokens"),
-                        ("input_tokens_details", "prompt_tokens_details"),
-                        ("output_tokens_details", "completion_tokens_details"),
-                    ] {
-                        if let Some(value) = usage.get(source) {
-                            self.output.usage.insert(target.into(), value.clone());
-                        }
-                    }
-                }
-                self.output.response_id = response["id"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or(self.output.response_id.take());
                 self.completed = true;
             }
             "error" | "response.failed" | "response.incomplete" => {
@@ -510,7 +509,12 @@ mod tests {
         let mut assistant =
             json!({"role":"assistant","content":"","tool_calls":output.tool_calls.clone()});
         assistant[CONTINUATION_KEY] = output.continuation("connection", "model");
-        let messages = [
+        assert!(
+            assistant[CONTINUATION_KEY]["items"][1]
+                .get("arguments")
+                .is_none()
+        );
+        let mut messages = [
             assistant,
             json!({"role":"tool","tool_call_id":"call-1","content":"file contents"}),
         ];
@@ -522,16 +526,11 @@ mod tests {
         let switched = request("model", &messages, None, "different-connection", false).unwrap();
         assert!(!switched.to_string().contains("opaque-state"));
         assert_eq!(switched["input"][0]["type"], "function_call");
-    }
-    #[test]
-    fn continuation_reuses_canonical_arguments_without_storing_a_raw_copy() {
-        let output=decode_sse(&sse(&[completion(json!([{"type":"function_call","namespace":"astra","name":"read_file","call_id":"call-1","arguments":"raw-provider-arguments"}]))])).unwrap();
-        let saved = output.continuation("connection", "model");
-        assert!(!saved.to_string().contains("raw-provider-arguments"));
-        let message = json!({"role":"assistant","content":"","tool_calls":[{"id":"call-1","function":{"name":"read_file","arguments":"canonical-normalized-arguments"}}],CONTINUATION_KEY:saved});
-        let body = request("model", &[message], None, "connection", false).unwrap();
+        messages[0]["tool_calls"][0]["function"]["arguments"] =
+            json!("canonical-normalized-arguments");
+        let body = request("model", &messages, None, "connection", false).unwrap();
         assert_eq!(
-            body["input"][0]["arguments"],
+            body["input"][1]["arguments"],
             "canonical-normalized-arguments"
         );
     }
@@ -560,10 +559,26 @@ mod tests {
             ]))
             .is_err()
         );
-        let value = json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"do-not-forward-private-provider-text"}}});
-        let error = decode_sse(&sse(&[value])).unwrap_err();
-        assert_eq!(error, "subscription_sharing_usage_limit_exceeded");
-        assert!(!error.contains("private-provider-text"));
+        for kind in ["response.failed", "response.incomplete"] {
+            let error = (kind == "response.failed").then(|| json!({"code":"subscription_sharing_usage_limit_exceeded","message":"private-provider-text"}));
+            let value = json!({"type":kind,"response":{"id":"failed-response","usage":{"input_tokens":17,"output_tokens":23},"error":error}});
+            let mut accumulator = ResponseAccumulator::default();
+            assert_eq!(
+                accumulator.observe(&value).unwrap_err(),
+                if error.is_some() {
+                    "subscription_sharing_usage_limit_exceeded"
+                } else {
+                    "response_incomplete"
+                }
+            );
+            assert_eq!(
+                accumulator.output.response_id.as_deref(),
+                Some("failed-response")
+            );
+            assert_eq!(accumulator.output.usage["prompt_tokens"], 17);
+            assert_eq!(accumulator.output.usage["completion_tokens"], 23);
+            assert!(accumulator.finish().is_err());
+        }
     }
     #[test]
     fn replay_cannot_introduce_privileged_instructions_or_hosted_tools() {

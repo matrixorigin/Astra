@@ -1,6 +1,7 @@
 use super::*;
 #[allow(dead_code)]
 mod fixture {
+    use crate as services;
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/common/chatgpt_fixture.rs"

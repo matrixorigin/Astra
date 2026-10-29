@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -36,7 +36,7 @@ pub struct ProviderState {
     pub refresh_calls: AtomicUsize,
     pub token_calls: AtomicUsize,
     pub quota: AtomicBool,
-    pub fail_refresh: AtomicBool,
+    pub refresh_error: AtomicU16,
     pub requests: Mutex<Vec<Value>>,
     pub responses_calls: AtomicUsize,
     pub hold_responses: AtomicBool,
@@ -80,7 +80,7 @@ impl ProviderFixture {
             refresh_calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
             quota: AtomicBool::new(false),
-            fail_refresh: AtomicBool::new(false),
+            refresh_error: AtomicU16::new(0),
             requests: Mutex::new(Vec::new()),
             responses_calls: AtomicUsize::new(0),
             hold_responses: AtomicBool::new(false),
@@ -109,6 +109,18 @@ impl ProviderFixture {
     pub async fn stop(&mut self) {
         self.task.abort();
         let _ = (&mut self.task).await;
+    }
+    pub async fn connect(&self, service: &dyn services::ModelService, owner: &str) -> String {
+        use services::chatgpt::ConnectionOperation;
+        let auth=service.model_connection_operation(owner.into(), ConnectionOperation::Start(
+            serde_json::from_value(json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback"})).unwrap()
+        )).await.unwrap();
+        let linked=service.model_connection_operation(owner.into(),ConnectionOperation::Complete(
+            auth["authorization_id"].as_str().unwrap().into(),serde_json::from_value(json!({
+                "state":auth["state"],"code":self.issue_code(&auth,owner,true),"client_id":"oaiapp_fixture"
+            })).unwrap()
+        )).await.unwrap();
+        linked["connection"]["connection_id"].as_str().unwrap().into()
     }
     pub async fn restart(&mut self) {
         assert!(self.task.is_finished());
@@ -141,6 +153,11 @@ impl ProviderFixture {
     }
     pub fn id_token(&self, subject: &str, client_id: &str, nonce: &str) -> String {
         sign(&self.state, subject, client_id, nonce)
+    }
+    pub fn reject_access_token(&self, token: &str, delay_second: bool) {
+        *self.state.reject_token.lock().unwrap() = Some(token.into());
+        self.state.stale_requests.store(usize::from(!delay_second), Ordering::SeqCst);
+        self.state.fresh_seen.store(!delay_second, Ordering::SeqCst);
     }
 }
 fn spawn_provider(
@@ -211,10 +228,11 @@ async fn tokens(
             state.refresh_delay_ms.load(Ordering::SeqCst),
         ))
         .await;
-        if state.fail_refresh.load(Ordering::SeqCst) {
+        let status = state.refresh_error.load(Ordering::SeqCst);
+        if status != 0 {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error":"invalid_grant"})),
+                StatusCode::from_u16(status).unwrap(),
+                Json(json!({"error":if status==429 {"rate_limit_exceeded"} else {"invalid_grant"}})),
             );
         }
         let token = form.get("refresh_token").cloned().unwrap_or_default();
@@ -325,7 +343,7 @@ async fn responses(
         );
     }
     if state.stream_quota.load(Ordering::SeqCst) {
-        let event = json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}});
+        let event = json!({"type":"response.failed","response":{"id":"failed-response","error":{"code":"subscription_sharing_usage_limit_exceeded"},"usage":{"input_tokens":17,"output_tokens":23}}});
         return (StatusCode::OK, content, format!("data: {event}\n\n"));
     }
     if !permitted(&state, &headers) {

@@ -50,8 +50,26 @@ fn reauth() -> (StatusCode, Json<ErrorResponse>) {
         "Reconnect the selected ChatGPT account",
     )
 }
+fn unavailable() -> (StatusCode, Json<ErrorResponse>) {
+    fail(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "chatgpt_connection_unavailable",
+        "OpenAI connection failed",
+    )
+}
 fn unix_now() -> i64 {
     Utc::now().timestamp()
+}
+fn connected_generation(row: &sqlx::mysql::MySqlRow, generation: i64) -> ApiResult<()> {
+    if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
+        || row
+            .try_get::<i64, _>("generation")
+            .map_err(internal_error)?
+            != generation
+    {
+        return Err(reauth());
+    }
+    Ok(())
 }
 
 /// Preserve only documented machine codes; upstream prose may contain secrets.
@@ -394,7 +412,7 @@ impl ExecutionCredential {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = query("SELECT status, generation FROM user_llm_connections WHERE user_id = ? AND connection_id = ?")
             .bind(&self.owner).bind(&self.connection_id).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
-        self.validate_current(&row)
+        connected_generation(&row, self.generation)
     }
 
     /// Serialize model activation with disconnect/reauthorization. Call only
@@ -406,19 +424,7 @@ impl ExecutionCredential {
         self.service.enabled()?;
         let row = query("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
             .bind(&self.owner).bind(&self.connection_id).fetch_optional(&mut **tx).await.map_err(internal_error)?.ok_or_else(not_found)?;
-        self.validate_current(&row)
-    }
-
-    fn validate_current(&self, row: &sqlx::mysql::MySqlRow) -> ApiResult<()> {
-        if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
-            || row
-                .try_get::<i64, _>("generation")
-                .map_err(internal_error)?
-                != self.generation
-        {
-            return Err(reauth());
-        }
-        Ok(())
+        connected_generation(&row, self.generation)
     }
 }
 
@@ -652,13 +658,7 @@ impl ChatgptConnections {
         )
     }
     async fn read_json(&self, request: reqwest::RequestBuilder) -> ApiResult<Value> {
-        let response = request.send().await.map_err(|_| {
-            fail(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "chatgpt_connection_unavailable",
-                "OpenAI connection failed",
-            )
-        })?;
+        let response = request.send().await.map_err(|_| unavailable())?;
         let bytes = provider_body(response).await?;
         serde_json::from_slice(&bytes)
             .map_err(|_| internal_error("OpenAI returned an invalid JSON response"))
@@ -1084,14 +1084,7 @@ impl ChatgptConnections {
             .await
             .map_err(internal_error)?
             .ok_or_else(not_found)?;
-        if row.try_get::<String, _>("status").map_err(internal_error)? != "connected"
-            || row
-                .try_get::<i64, _>("generation")
-                .map_err(internal_error)?
-                != generation
-        {
-            return Err(reauth());
-        }
+        connected_generation(&row, generation)?;
         Ok(row)
     }
 
@@ -1182,16 +1175,19 @@ impl ChatgptConnections {
             if lease.rows_affected() != 1 {
                 continue;
             }
-            let mut known_not_sent = false;
+            let mut credentials_unchanged = false;
             let refresh_result=tokio::time::timeout(REFRESH_BUDGET,async {
                 let refresh=credentials.refresh_token.as_deref().ok_or_else(reauth)?;
-                let request=self.client().inspect_err(|_|{known_not_sent=true;})?.post(&config.token).form(&[
+                let request=self.client().inspect_err(|_|{credentials_unchanged=true;})?.post(&config.token).form(&[
                     ("grant_type","refresh_token"),("client_id",client_id.as_str()),("refresh_token",refresh),("resource",API_BASE),
                 ]);
                 let response=request.send().await.map_err(|error|{
-                    if error.is_connect() || error.is_builder() {known_not_sent=true;}
-                    fail(StatusCode::SERVICE_UNAVAILABLE,"chatgpt_connection_unavailable","OpenAI connection failed")
+                    if error.is_connect() || error.is_builder() {credentials_unchanged=true;}
+                    unavailable()
                 })?;
+                // A rate-limited grant was rejected, not rotated. Keep the
+                // current token set even if its error body is interrupted.
+                credentials_unchanged = response.status() == StatusCode::TOO_MANY_REQUESTS;
                 let token:TokenResponse=serde_json::from_slice(&provider_body(response).await?).map_err(|_|reauth())?;
                 if token.access_token.is_empty()||token.expires_in<=0||token.expires_in>86400*30 {return Err(reauth());}
                 if let Some(id_token)=&token.id_token {
@@ -1208,13 +1204,12 @@ impl ChatgptConnections {
                 Ok((replacement.access_token,version+1))
             }).await.unwrap_or_else(|_|Err(fail(StatusCode::SERVICE_UNAVAILABLE,"chatgpt_refresh_deadline","Subscription refresh timed out")));
             if refresh_result.is_err() {
-                if !known_not_sent {
+                if !credentials_unchanged {
                     if !self.mark_reauth(owner, id, generation, &refresh_id).await? {
                         continue;
                     }
                 } else {
-                    // A connection failure before dispatch cannot rotate the
-                    // token. Release the lease without destroying credentials.
+                    // Release only our lease; another generation may have won.
                     query("UPDATE user_llm_connections SET refresh_owner=NULL,refresh_until=NULL WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=?")
                         .bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(&pool).await.map_err(internal_error)?;
                 }
@@ -1240,40 +1235,62 @@ impl ChatgptConnections {
         tx.commit().await.map_err(internal_error)?;
         Ok(changed.rows_affected() == 1)
     }
+    async fn authenticated_body(
+        &self,
+        binding: &ExecutionCredential,
+        request: reqwest::RequestBuilder,
+    ) -> ApiResult<Vec<u8>> {
+        let mut rejected = None;
+        loop {
+            let lease = binding.acquire(rejected).await?;
+            let response = request
+                .try_clone()
+                .ok_or_else(|| internal_error("Subscription probe body cannot be replayed"))?
+                .bearer_auth(lease.bearer())
+                .send()
+                .await
+                .map_err(|_| unavailable())?;
+            let status = response.status();
+            let body = provider_body(response).await;
+            if status == StatusCode::UNAUTHORIZED && rejected.is_none() {
+                rejected = Some(lease.version());
+                continue;
+            }
+            let body = body?;
+            binding.ensure_current().await?;
+            return Ok(body);
+        }
+    }
     pub async fn models(self: &Arc<Self>, owner: &str, id: &str) -> ApiResult<Value> {
-        let binding = self.binding(owner, id).await?;
-        let lease = binding.acquire(None).await?;
-        let value = self
-            .read_json(
+        self.catalog(&self.binding(owner, id).await?).await
+    }
+    async fn catalog(&self, binding: &ExecutionCredential) -> ApiResult<Value> {
+        let bytes = self
+            .authenticated_body(
+                binding,
                 self.client()?
-                    .get(format!("{}/models", self.enabled()?.api_base))
-                    .bearer_auth(lease.bearer()),
+                    .get(format!("{}/models", binding.api_base()?)),
             )
             .await?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| internal_error("OpenAI returned an invalid JSON response"))?;
         let models = value
             .get("models")
             .and_then(Value::as_array)
             .ok_or_else(|| internal_error("OpenAI subscription catalog is invalid"))?;
         let mut items = Vec::new();
-        for model in models {
-            if model.get("visibility").and_then(Value::as_str) != Some("list") {
-                continue;
-            }
-            let slug = model
-                .get("slug")
-                .and_then(Value::as_str)
+        for model in models.iter().filter(|model| model["visibility"] == "list") {
+            let slug = model["slug"]
+                .as_str()
                 .filter(|s| !s.is_empty() && s.len() <= 255)
                 .ok_or_else(|| {
                     internal_error("OpenAI subscription catalog has an invalid model slug")
                 })?;
-            let display = model
-                .get("display_name")
-                .and_then(Value::as_str)
-                .unwrap_or(slug);
-            items.push(json!({"slug":slug,"display_name":display}));
+            items.push(
+                json!({"slug":slug,"display_name":model["display_name"].as_str().unwrap_or(slug)}),
+            );
         }
-        binding.ensure_current().await?;
-        Ok(json!({"connection_id":id,"items":items}))
+        Ok(json!({"connection_id":binding.connection_id(),"items":items}))
     }
     pub async fn probe(
         self: &Arc<Self>,
@@ -1281,7 +1298,8 @@ impl ChatgptConnections {
         id: &str,
         model: &str,
     ) -> ApiResult<ExecutionCredential> {
-        let catalog = self.models(owner, id).await?;
+        let binding = self.binding(owner, id).await?;
+        let catalog = self.catalog(&binding).await?;
         if !catalog["items"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["slug"] == model))
@@ -1292,8 +1310,6 @@ impl ChatgptConnections {
                 "Choose a model from this connection's current catalog",
             ));
         }
-        let binding = self.binding(owner, id).await?;
-        let lease = binding.acquire(None).await?;
         let body = astra_core::model_wire::responses::request(
             model,
             &[json!({"role":"user","content":"Reply briefly with OK."})],
@@ -1302,21 +1318,14 @@ impl ChatgptConnections {
             true,
         )
         .map_err(internal_error)?;
-        let response = self
-            .client()?
-            .post(format!("{}/responses", self.enabled()?.api_base))
-            .bearer_auth(lease.bearer())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| {
-                fail(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "chatgpt_connection_unavailable",
-                    "Subscription model check could not connect",
-                )
-            })?;
-        let bytes = provider_body(response).await?;
+        let bytes = self
+            .authenticated_body(
+                &binding,
+                self.client()?
+                    .post(format!("{}/responses", binding.api_base()?))
+                    .json(&body),
+            )
+            .await?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| internal_error("Invalid subscription response encoding"))?;
         let output = astra_core::model_wire::responses::decode_sse(text).map_err(|_| {
@@ -1333,7 +1342,6 @@ impl ChatgptConnections {
                 "Subscription model check returned no text",
             ));
         }
-        binding.ensure_current().await?;
         Ok(binding)
     }
     async fn disconnect(&self, owner: &str, id: &str) -> ApiResult<Value> {
@@ -1399,9 +1407,7 @@ impl ChatgptConnections {
         )
     }
     async fn revoke(&self, client_id: &str, encrypted: &str) -> ApiResult<()> {
-        let credentials: Credentials =
-            serde_json::from_str(&self.encryptor.decrypt(encrypted).map_err(internal_error)?)
-                .map_err(|_| internal_error("Stored subscription credentials are invalid"))?;
+        let credentials = self.decode_credentials(encrypted)?;
         let refresh = credentials.refresh_token.as_deref().ok_or_else(reauth)?;
         let config = self.config()?;
         let discovery = self

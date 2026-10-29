@@ -287,15 +287,15 @@ pub async fn add_model(
     let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
         .await
         .ok_or("Unable to refresh Astra session; run `astra login`")?;
-    let catalog = api
-        .get_bearer_path_query_text(&token, &connection_path(&id, "models")?, &[])
-        .await
-        .map_err(map_thin_err)?;
-    let catalog: Value =
-        serde_json::from_str(&catalog).map_err(|_| "Invalid subscription model catalog")?;
     let model = match args.model {
         Some(model) => model,
         None if interactive => {
+            let body = api
+                .get_bearer_path_query_text(&token, &connection_path(&id, "models")?, &[])
+                .await
+                .map_err(map_thin_err)?;
+            let catalog: Value =
+                serde_json::from_str(&body).map_err(|_| "Invalid subscription model catalog")?;
             let labels: Vec<String> = catalog["items"]
                 .as_array()
                 .ok_or("Invalid subscription catalog")?

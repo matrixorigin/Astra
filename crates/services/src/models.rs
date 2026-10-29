@@ -2393,24 +2393,12 @@ fn admitted_user_model_from_row(
             offering_id: offering_id.into(),
         });
     }
-    let api_key = match &encrypted {
-        Some(value) => encryptor
-            .decrypt(value)
-            .map_err(ModelOfferingResolutionError::Backend)?,
-        None if row
-            .try_get::<Option<String>, _>("connection_id")
-            .ok()
-            .flatten()
-            .is_some() =>
-        {
-            String::new()
-        }
-        None => {
-            return Err(ModelOfferingResolutionError::CredentialUnavailable {
-                offering_id: offering_id.into(),
-            });
-        }
-    };
+    let api_key = encrypted
+        .as_deref()
+        .map(|value| encryptor.decrypt(value))
+        .transpose()
+        .map_err(ModelOfferingResolutionError::Backend)?
+        .unwrap_or_default();
     let context_window: i32 = row.try_get("context_window").map_err(|error| {
         ModelOfferingResolutionError::Backend(format!(
             "invalid user_llm_models.context_window: {error}"
@@ -2421,9 +2409,6 @@ fn admitted_user_model_from_row(
             "invalid user_llm_models.context_window: must be positive".to_string(),
         )
     })?;
-    let provider: String = row
-        .try_get("provider")
-        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
     let base_url: String = row
         .try_get("base_url")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
@@ -2454,22 +2439,10 @@ fn admitted_user_model_from_row(
         access_kind: ModelAccessKind::CloudByok,
         execution_placement: ModelExecutionPlacement::Server,
         model_name: alias,
-        wire_model_name: Some(row.try_get("model_name").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.model_name: {error}"
-            ))
-        })?),
+        wire_model_name: Some(upstream),
         api_key,
-        base_url: row.try_get("base_url").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.base_url: {error}"
-            ))
-        })?,
-        provider: row.try_get("provider").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.provider: {error}"
-            ))
-        })?,
+        base_url,
+        provider,
         cache_capability: None,
         thinking_capability,
         fixed_temperature: None,

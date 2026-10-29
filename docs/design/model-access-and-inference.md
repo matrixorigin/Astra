@@ -64,8 +64,8 @@ task per generation and a database compare-and-set lease plus the rejected
 credential version. Cancelling an inference or its last waiter does not cancel
 the bounded rotation or its credential commit. Discovery/JWKS metadata is cached
 and prepared before taking the lease; the full rotation operation has a
-25-second budget within its 30-second lease. A proven pre-dispatch connection
-failure releases the lease and preserves credentials. A lost/expired refresh
+25-second budget within its 30-second lease. Pre-dispatch failures and rejected
+rate-limited refreshes release the lease and preserve credentials. A lost/expired refresh
 outcome requires reauthentication instead of reusing a potentially consumed
 refresh token. A delayed 401 for an older version reuses a committed winner. Connection generations fence reauthorization
 and disconnect against old execution bindings. Disconnect clears ciphertext,
@@ -82,6 +82,8 @@ rows. Disconnect and reauthorization use the same connection-before-model lock
 order. A stale successful probe cannot re-enable models after disconnect.
 Retry backoff uses the shared provider deadline/cancellation owner and consumes
 the original inference budget.
+Catalog reads and connectivity probes share version-aware 401 recovery. Failed
+and incomplete Responses retain provider identity and usage for settlement.
 
 Responses requests always send full history with `store:false` and `stream:true`.
 Astra functions occupy the `astra` namespace. Completed provider output items,

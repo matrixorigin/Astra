@@ -422,6 +422,10 @@ pub(super) async fn execute(
                 partial.reasoning = std::mem::take(&mut accumulator.output.reasoning);
                 partial.response_id = accumulator.output.response_id.take();
                 partial.usage = std::mem::take(&mut accumulator.output.usage);
+                partial.usage_presence = crate::turn::token_usage::extract_usage_presence(
+                    crate::turn::token_usage::UsageDialect::OpenAi,
+                    &partial.usage,
+                );
                 if rejected || !dispatched {
                     finish_observed_provider_error_with_partial(
                         observer, index, &failure, &partial,
