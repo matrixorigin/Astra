@@ -33,16 +33,11 @@ class CiScopeTests(unittest.TestCase):
         for event in ({}, {"pull_request": None}, []):
             self.assertEqual(select_macos_runner("pull_request", event), ["macos-15"])
 
-    def test_main_develop_pushes_prefer_mini_without_an_author_allowlist(self):
-        for branch in ("main", "develop"):
-            self.assertEqual(select_macos_runner("push", {"ref": f"refs/heads/{branch}"}),
-                             ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"])
-
     def test_other_pushes_and_manual_events_remain_hosted(self):
         for event_name in ("workflow_dispatch", "pull_request_target"):
             self.assertEqual(select_macos_runner(event_name,
                 {"ref": "refs/heads/main", "sender": {"id": 39627130}}), ["macos-15"])
-        for ref in ("refs/heads/feature", "refs/tags/v1.0", "main", None):
+        for ref in ("refs/heads/main", "refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
             self.assertEqual(select_macos_runner("push", {"ref": ref}), ["macos-15"])
 
     def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):

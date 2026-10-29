@@ -124,15 +124,10 @@ and keeps external-fork behavior part of the repository's delivery contract.
 
 The static author-ID allowlist in `scripts/ci/ci_scope.py` makes the eleven
 selected contributors (including Dependabot) eligible for a mini attempt.
-Pushes to upstream main/develop also prefer the same mini, without a PR-author
-allowlist. No develop branch is required; the route applies if one is created.
-PR and push jobs share the persistent account, HOME/Cargo/rustup state and local
-caches. Main includes merged contributions from authors outside the PR allowlist
-and dependency build/install scripts; the allowlist limits unmerged PR execution,
-not every origin of code that can eventually run on this host. Dependabot is
-already in the PR allowlist. Push permission does not make that environment clean; use separate
-accounts/runners or disposable macOS VMs if trusted-build isolation is required.
-Release builds retain their existing platforms and do not use this route.
+Main/develop pushes and releases remain hosted. The mini runs unmerged PR code
+in a persistent account, HOME, toolchain and local caches. Read-only tokens and
+disabled cache uploads do not isolate that local state. Keep main hosted until
+an independently validated execution boundary is available (see issue #1106).
 Other or unknown PR authors run on hosted macOS immediately; GitHub's existing fork approval remains in effect. Every Mac
 job re-executed on attempts greater than one runs hosted, even when its planner's
 old output is reused. GitHub may retain successful Mac jobs on a failed-only
@@ -142,7 +137,7 @@ rerun; those checks still refer to the original tested merge. Required-check nam
 The ordinary Test Suite owns all required checks. Linux jobs depend only on
 scope and start without waiting for the mini. `Resolve macOS execution` has
 Actions/Pull requests read access and waits for a worker bound to its exact run
-ID, attempt and tested SHA (a PR merge or an upstream push commit). Missing
+ID, attempt and tested SHA (the PR merge). Missing
 controller, API errors or missing routing output select real hosted tests,
 never a successful skip. GETs use authenticated ETag revalidation when the
 server supplies an ETag. A 304 reuses only the exact previously fetched body
@@ -156,10 +151,16 @@ Retry-After and primary reset headers; secondary limits without timing headers
 back off for at least 60 seconds and then exponentially. Permission-denied 403s
 and dispatch POSTs are not retried. Backoff is bounded by the remaining queue
 or execution budget, and initial source validation counts toward the queue
-budget. Thus a short API outage can recover without restarting healthy tests,
+budget. Each phase permits a final observation, with API requests starting no
+later than 60 seconds after its deadline; this does not permit retry backoff
+beyond the phase deadline. In-flight requests retain their socket timeout.
+Late observation of an assignment cannot extend the execution deadline beyond
+queue deadline plus 60 minutes. Cleanup has a separate 120-second request budget,
+without observation grace. Thus a short API outage can recover without restarting healthy tests,
 but an outage that outlasts the budget can still require hosted recovery.
 Source freshness is checked again before publishing a worker outcome after
-potentially delayed reads.
+potentially delayed reads. If that check is unavailable, a confirmed test failure
+stays failed; success still requires fresh validation.
 
 The first response with valid X-RateLimit-Limit/Remaining/Reset headers records
 only those numeric values in the job log and summary, using the actual workflow
@@ -173,15 +174,16 @@ PR admission verifies the merge's actual two parents, with the PR head as its
 second parent and its first parent equal to or an ancestor of the current
 target branch tip. The event's base SHA may be stale and is not the authority
 for this check. The PR head repository and current author ID are still verified.
-Upstream push admission requires main/develop, matching source/head/checkout
-SHAs and repository IDs, and the current branch tip. Workers execute the exact
+Workers execute the exact
 validated SHA, not a moving branch checkout.
 
-Both readers recheck current PR/head or push-tip status while queued/running.
-A changed head or closed PR, superseded push or ended source attempt produces
+Both readers recheck current PR/head status while queued/running.
+A changed head or closed PR, or ended source attempt produces
 `obsolete`, not `hosted`. The trusted scheduler requests cancellation of that
 source attempt and its owned worker; it rechecks the attempt before cancelling
-so a delayed controller cannot cancel a rerun. If cancellation/control access
+and skips a newer attempt already visible at that check. Cancellation is best
+effort: GitHub's run-ID-scoped API cannot atomically exclude a rerun that starts
+between the check and cancel request. If cancellation/control access
 is unavailable, native Mac result gates run on Ubuntu and fail on `obsolete`;
 they neither allocate hosted Macs nor report missing tests as successful.
 An unexpected repository mismatch remains an unavailable-source error, not an
@@ -189,7 +191,7 @@ assumed obsolete PR. Initial source validation and worker admission also apply
 these rules, covering PR updates before a worker starts.
 
 `macos-scheduler.yml` runs on the default branch on Test Suite's `workflow_run`
-start/completion events for both PRs and pushes. It uses the built-in token's Actions write permission
+start/completion events for PRs. It uses the built-in token's Actions write permission
 to dispatch/cancel `macos-mini.yml`; it never checks out PR code. No App,
 organization membership query, additional secret, custom required context or
 admission hook is needed. These workflows must exist on main before dispatch
@@ -215,8 +217,7 @@ reported as failure, without hosted retry. Failed runs with incomplete test
 metadata also stay failed rather than hiding a possible test failure. Checkout,
 low-disk/toolchain setup,
 agent cancellation/loss or the execution budget select hosted fallback. The
-worker gets a read-only token and cache-mode read for PRs and pushes; neither
-route saves default-branch Actions/sccache cache entries.
+worker gets a read-only token and cache-mode read; it does not save default-branch Actions/sccache cache entries.
 
 The runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`, be available
 to Astra (including public repository access), and support the pinned Actions,

@@ -33,13 +33,10 @@ MACOS_RUNNER_AUTHORS = {
     28526327: "plane-hjh",
 }
 MACOS_SELF_HOSTED_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
-MACOS_PUSH_BRANCHES = ("main", "develop")
 
 
 def select_macos_runner(event_name: str, event: dict) -> list[str]:
-    if event_name == "push" and isinstance(event, dict):
-        if event.get("ref") in {f"refs/heads/{branch}" for branch in MACOS_PUSH_BRANCHES}:
-            return MACOS_SELF_HOSTED_LABELS.copy()
+    # Main must not consume persistent host state left by unmerged PRs.
     if event_name == "pull_request" and isinstance(event, dict):
         pull_request = event.get("pull_request")
         author = pull_request.get("user") if isinstance(pull_request, dict) else None

@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   schedule:
-    if: github.event.workflow_run.run_attempt == 1 && contains(fromJSON('["pull_request","push"]'), github.event.workflow_run.event)
+    if: github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 100
     steps:

@@ -16,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 
 from cancel_stale_pr_runs import GitHubApi, MAX_PAGES
-from ci_scope import MACOS_PUSH_BRANCHES, MACOS_SELF_HOSTED_LABELS, select_macos_runner
+from ci_scope import MACOS_SELF_HOSTED_LABELS, select_macos_runner
 
 
 WORKFLOW = "macos-mini.yml"
@@ -29,6 +29,7 @@ QUEUE_SECONDS = 900
 EXECUTION_SECONDS = 3600
 POLL_SECONDS = 90
 RUNNING_POLL_SECONDS = 120
+OBSERVATION_SECONDS = 60
 TITLE = re.compile(r"Test Suite pr=(\d+) base=([0-9a-f]{40}) head=([0-9a-f]{40}) merge=([0-9a-f]{40})")
 
 
@@ -50,14 +51,19 @@ class Api(GitHubApi):
         self._conditional = {}
         self._cooldown = 0
         self._deadline = None
+        self._request_deadline = None
         self._quota_reported = False
 
-    def set_deadline(self, deadline):
+    def set_deadline(self, deadline, *, observe=False):
         self._deadline = deadline
+        self._request_deadline = deadline + (OBSERVATION_SECONDS if observe else 0)
 
     def _pause(self):
-        delay = max(0, self._cooldown - time.monotonic())
-        if self._deadline is not None and time.monotonic() + delay >= self._deadline:
+        now = time.monotonic()
+        delay = max(0, self._cooldown - now)
+        if self._request_deadline is not None and now >= self._request_deadline:
+            raise Unavailable("mini API request budget expired")
+        if delay and self._deadline is not None and now + delay >= self._deadline:
             raise Unavailable("API backoff exceeds the remaining mini budget")
         if delay:
             time.sleep(delay)
@@ -189,7 +195,6 @@ class Source:
     pr_number: int = 0
     head_sha: str = ""
     head_repo_id: int | None = None
-    branch: str = ""
 
     @property
     def title(self):
@@ -211,10 +216,6 @@ def check_current(api, repo, src, run=None):
         if pr["head"]["sha"] != src.head_sha:
             raise Superseded("PR was updated", src)
         return pr
-    if src.branch:
-        tip = api.get(f"repos/{repo}/git/ref/heads/{quote(src.branch, safe='')}")["object"]["sha"]
-        if tip != src.sha:
-            raise Superseded("push was superseded", src)
     return None
 
 
@@ -251,13 +252,6 @@ def source(api, repo, run_id, attempt):
         if actual_base != event_base:
             print("::notice::Validated actual merge parents despite an outdated event base SHA")
         labels = select_macos_runner("pull_request", {"pull_request": {"user": pr["user"]}})
-    elif (run.get("event") == "push" and int(pr_number) == 0
-          and run.get("head_branch") in MACOS_PUSH_BRANCHES and head == merge
-          and run["head_repository"]["id"] == run["repository"]["id"]):
-        branch = run["head_branch"]
-        src = Source(run_id, attempt, head, run.get("created_at"), branch=branch)
-        check_current(api, repo, src, run)
-        labels = select_macos_runner("push", {"ref": f"refs/heads/{branch}"})
     else:
         raise Unavailable("unsupported source event")
     if labels != MACOS_SELF_HOSTED_LABELS:
@@ -335,7 +329,7 @@ def wait_for_mini(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, que
     announced = None
     while True:
         deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
-        api.set_deadline(deadline)
+        api.set_deadline(deadline, observe=True)
         check_current(api, repo, src)
         candidates = workers(api, repo, src)
         if len(candidates) > 1:
@@ -350,10 +344,17 @@ def wait_for_mini(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, que
             outcome, assigned = worker_state(api, repo, candidates[0])
             if outcome:
                 # A throttled read may have waited while the PR changed.
-                check_current(api, repo, src)
+                try:
+                    check_current(api, repo, src)
+                except Superseded:
+                    raise
+                except Exception:
+                    if outcome != "failure":
+                        raise
+                    print("::warning::Source revalidation unavailable; retaining the test failure")
                 return outcome
             if assigned and assigned_at is None:
-                assigned_at = clock()
+                assigned_at = min(clock(), queued_at + QUEUE_SECONDS)
         if assigned_at is None and clock() - queued_at >= QUEUE_SECONDS:
             print("::notice::Mini queue/discovery budget expired; using hosted macOS")
             return "hosted"
@@ -381,51 +382,45 @@ def cancel_workers(api, repo, src):
 
 def schedule(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, queued_at=None):
     queued_at, assigned_at = clock() if queued_at is None else queued_at, None
-    try:
-        api.set_deadline(queued_at + QUEUE_SECONDS)
-        # No worker is dispatched unless the approved ordinary workflow has
-        # actually started its gate. A delayed scheduler cannot resurrect it.
-        while True:
-            state = gate_status(api, repo, src)
-            if state == "ended":
+    api.set_deadline(queued_at + QUEUE_SECONDS, observe=True)
+    # No worker is dispatched unless the approved ordinary workflow has
+    # actually started its gate. A delayed scheduler cannot resurrect it.
+    while True:
+        state = gate_status(api, repo, src)
+        if state == "ended":
+            return
+        if clock() - queued_at >= QUEUE_SECONDS:
+            return
+        if state == "active":
+            break
+        sleep(min(POLL_SECONDS, max(0, queued_at + QUEUE_SECONDS - clock())))
+    queued_at = clock()
+    api.set_deadline(queued_at + QUEUE_SECONDS)
+    if not workers(api, repo, src):
+        api.post(f"repos/{repo}/actions/workflows/{WORKFLOW}/dispatches", {
+            "ref": "main", "inputs": {"source_run_id": str(src.run_id),
+                "source_attempt": str(src.attempt), "source_sha": src.sha}})
+    while True:
+        deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
+        api.set_deadline(deadline, observe=True)
+        if not gate_active(api, repo, src):
+            return
+        candidates = workers(api, repo, src)
+        if len(candidates) > 1:
+            raise Unavailable("duplicate mini dispatch")
+        if candidates:
+            outcome, assigned = worker_state(api, repo, candidates[0])
+            if outcome:
                 return
-            if state == "active":
-                break
-            if clock() - queued_at >= QUEUE_SECONDS:
-                return
-            sleep(min(POLL_SECONDS, max(0, queued_at + QUEUE_SECONDS - clock())))
-        queued_at = clock()
-        api.set_deadline(queued_at + QUEUE_SECONDS)
-        if not workers(api, repo, src):
-            api.post(f"repos/{repo}/actions/workflows/{WORKFLOW}/dispatches", {
-                "ref": "main", "inputs": {"source_run_id": str(src.run_id),
-                    "source_attempt": str(src.attempt), "source_sha": src.sha}})
-        while True:
-            deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
-            api.set_deadline(deadline)
-            if not gate_active(api, repo, src):
-                return
-            candidates = workers(api, repo, src)
-            if len(candidates) > 1:
-                raise Unavailable("duplicate mini dispatch")
-            if candidates:
-                outcome, assigned = worker_state(api, repo, candidates[0])
-                if outcome:
-                    return
-                if assigned and assigned_at is None:
-                    assigned_at = clock()
-            if assigned_at is None and clock() - queued_at >= QUEUE_SECONDS:
-                return
-            if assigned_at is not None and clock() - assigned_at >= EXECUTION_SECONDS:
-                return
-            deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
-            sleep(min(RUNNING_POLL_SECONDS if assigned_at is not None else POLL_SECONDS,
-                      max(0, deadline - clock())))
-    finally:
-        # Also runs when the parent is cancelled/superseded or has already
-        # selected hosted fallback. Only this exact source/attempt is touched.
-        api.set_deadline(clock() + 120)
-        cancel_workers(api, repo, src)
+            if assigned and assigned_at is None:
+                assigned_at = min(clock(), queued_at + QUEUE_SECONDS)
+        if assigned_at is None and clock() - queued_at >= QUEUE_SECONDS:
+            return
+        if assigned_at is not None and clock() - assigned_at >= EXECUTION_SECONDS:
+            return
+        deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
+        sleep(min(RUNNING_POLL_SECONDS if assigned_at is not None else POLL_SECONDS,
+                  max(0, deadline - clock())))
 
 
 def main():
@@ -439,7 +434,7 @@ def main():
     api = Api(os.environ.get("GH_TOKEN", ""), os.environ.get("GITHUB_API_URL", "https://api.github.com"))
     queued_at = time.monotonic()
     api.set_deadline(queued_at + (QUEUE_SECONDS if args.mode in {"wait", "schedule"} else 120))
-    outcome = "hosted"
+    outcome, status, src = "hosted", 0, None
     try:
         if args.mode == "cleanup":
             run = api.get(f"repos/{repo}/actions/runs/{args.run_id}")
@@ -452,31 +447,18 @@ def main():
         src = source(api, repo, args.run_id, args.attempt)
         if args.mode == "schedule":
             schedule(api, repo, src, queued_at=queued_at)
-            return 0
-        if args.mode == "admit":
+        elif args.mode == "admit":
             if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
                 raise Unavailable("worker reruns must use ordinary hosted recovery")
             if src.sha != args.sha or not gate_active(api, repo, src):
                 raise Unavailable("dispatch expired before execution")
             return 0
-        outcome = wait_for_mini(api, repo, src, queued_at=queued_at)
+        else:
+            outcome = wait_for_mini(api, repo, src, queued_at=queued_at)
     except Superseded as error:
         print(f"::notice::Obsolete mini source ({error}); no hosted retry")
         outcome = "obsolete"
-        if args.mode == "schedule":
-            # Only the trusted controller has Actions write. Bind cancellation
-            # to the same attempt; a delayed old controller cannot cancel a rerun.
-            try:
-                api.set_deadline(time.monotonic() + 120)
-                try:
-                    run = api.get(f"repos/{repo}/actions/runs/{error.src.run_id}")
-                    if run.get("run_attempt") == error.src.attempt and run.get("status") != "completed":
-                        api.cancel_run(repo, error.src.run_id)
-                finally:
-                    cancel_workers(api, repo, error.src)
-            except Exception:
-                print("::warning::Obsolete-run cancellation incomplete; no hosted retry")
-                return 1
+        src = error.src
         if args.mode == "admit":
             return 1
     except Exception as error:
@@ -484,14 +466,34 @@ def main():
         reason = str(error) if isinstance(error, Unavailable) else type(error).__name__
         if isinstance(getattr(error, "code", None), int):
             reason += f" HTTP {error.code}"
-        print(f"::notice::Mini unavailable ({reason}); using hosted macOS")
-        if args.mode == "admit":
+        print(f"::notice::Mini unavailable ({reason})")
+        if args.mode in {"admit", "cleanup"}:
             return 1
+        if args.mode == "schedule":
+            status = 1
+    finally:
+        if args.mode == "schedule" and src is not None:
+            # One owner for cleanup, including obsolescence during admission.
+            # Keep the source outcome; parent and child failures are independent.
+            api.set_deadline(time.monotonic() + 120)
+            if outcome == "obsolete":
+                try:
+                    run = api.get(f"repos/{repo}/actions/runs/{src.run_id}")
+                    if run.get("run_attempt") == src.attempt and run.get("status") != "completed":
+                        api.cancel_run(repo, src.run_id)
+                except Exception:
+                    print("::warning::Obsolete parent cancellation incomplete")
+                    status = 1
+            try:
+                cancel_workers(api, repo, src)
+            except Exception:
+                print("::warning::Mini worker cleanup incomplete")
+                status = 1
     if args.mode == "wait":
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
             output.write(f"result={outcome}\n")
         print(f"macOS execution result: {outcome}")
-    return 0
+    return status
 
 
 if __name__ == "__main__":
