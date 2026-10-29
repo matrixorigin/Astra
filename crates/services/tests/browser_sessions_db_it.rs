@@ -98,9 +98,16 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     let drifted_name = register(&first).await;
     let drifted = login(&first, &drifted_name).await;
     let drifted_handle = handle(&drifted);
-    let moved = sqlx::query("UPDATE auth_refresh_tokens SET token_id = ? WHERE token_hash = ?")
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(digest(&drifted.refresh_token))
+    let signed_sid = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(drifted_handle.split('.').nth(3).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let moved_sid = uuid::Uuid::new_v4().to_string();
+    let moved = sqlx::query("UPDATE auth_refresh_tokens SET session_id = ? WHERE session_id = ?")
+        .bind(&moved_sid)
+        .bind(&signed_sid)
         .execute(pool.get())
         .await
         .unwrap();
@@ -127,12 +134,6 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .0,
         StatusCode::UNAUTHORIZED
     );
-    let signed_sid = String::from_utf8(
-        URL_SAFE_NO_PAD
-            .decode(drifted_handle.split('.').nth(3).unwrap())
-            .unwrap(),
-    )
-    .unwrap();
     assert_eq!(
         first
             .refresh(refresh(&drifted.refresh_token))
@@ -141,12 +142,13 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .0,
         StatusCode::UNAUTHORIZED
     );
-    let restored = sqlx::query("UPDATE auth_refresh_tokens SET token_id = ? WHERE token_hash = ?")
-        .bind(&signed_sid)
-        .bind(digest(&drifted.refresh_token))
-        .execute(pool.get())
-        .await
-        .unwrap();
+    let restored =
+        sqlx::query("UPDATE auth_refresh_tokens SET session_id = ? WHERE session_id = ?")
+            .bind(&signed_sid)
+            .bind(&moved_sid)
+            .execute(pool.get())
+            .await
+            .unwrap();
     assert_eq!(restored.rows_affected(), 1);
     assert!(first.refresh(refresh(&drifted.refresh_token)).await.is_ok());
 
@@ -166,7 +168,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         )
         .unwrap();
         let changed =
-            sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ?")
+            sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE session_id = ?")
                 .bind(digest(&first_token.refresh_token))
                 .bind(&sid)
                 .execute(pool.get())
@@ -191,7 +193,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     );
     for (other, sid) in others {
         let (stored_hash, revoked): (String, i16) = sqlx::query_as(
-            "SELECT token_hash, is_revoked FROM auth_refresh_tokens WHERE token_id = ?",
+            "SELECT token_hash, is_revoked FROM auth_refresh_tokens WHERE session_id = ?",
         )
         .bind(&sid)
         .fetch_one(pool.get())
@@ -208,7 +210,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             StatusCode::UNAUTHORIZED
         );
         let restored =
-            sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ?")
+            sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE session_id = ?")
                 .bind(digest(&other.refresh_token))
                 .bind(&sid)
                 .execute(pool.get())

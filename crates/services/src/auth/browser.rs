@@ -95,7 +95,6 @@ impl Handle {
 struct Credentials {
     version: u8,
     handle_hash: String,
-    token_id: String,
     user_id: String,
     session_id: String,
     access_token: String,
@@ -105,7 +104,6 @@ struct Credentials {
 
 // Revocation grants no access and needs only the canonical immutable identity.
 struct Revocation {
-    token_id: String,
     user_id: String,
     session_id: String,
 }
@@ -154,16 +152,13 @@ impl DatabaseAuthService {
         pool: &sqlx::MySqlPool,
         handle: &Handle,
     ) -> Result<Option<Revocation>, AuthHttpError> {
-        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT token_id, user_id, session_id FROM auth_refresh_tokens WHERE token_id = ? AND browser_handle_hash = ? AND user_id = ? AND session_id = ?",
-        ).bind(&handle.session_id).bind(&handle.hash).bind(&handle.user_id).bind(&handle.session_id)
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT user_id, session_id FROM auth_refresh_tokens WHERE session_id = ? AND browser_handle_hash = ? AND user_id = ?",
+        ).bind(&handle.session_id).bind(&handle.hash).bind(&handle.user_id)
             .fetch_optional(pool).await.map_err(|_| unavailable())?;
-        Ok(row.and_then(|(token_id, user_id, session_id)| {
-            session_id.map(|session_id| Revocation {
-                token_id,
-                user_id,
-                session_id,
-            })
+        Ok(row.map(|(user_id, session_id)| Revocation {
+            user_id,
+            session_id,
         }))
     }
 
@@ -175,15 +170,15 @@ impl DatabaseAuthService {
     ) -> Result<Option<Owner>, AuthHttpError> {
         let encryptor = self.browser_encryptor()?;
         let canonical = query(
-            "SELECT t.token_id, t.token_hash, t.expires_at, t.browser_ciphertext, m.memoria_bound
+            "SELECT t.session_id, t.token_hash, t.expires_at, t.browser_ciphertext, m.memoria_bound
              FROM auth_refresh_tokens t
              JOIN auth_users u ON u.user_id = ? AND u.user_id = t.user_id
              LEFT JOIN (SELECT 1 AS memoria_bound FROM auth_external_identities FORCE INDEX (idx_external_identity_user)
                         WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' LIMIT 1) m ON TRUE
-             WHERE t.token_id = ? AND t.browser_handle_hash = ? AND t.user_id = ? AND t.session_id = ?
+             WHERE t.session_id = ? AND t.browser_handle_hash = ? AND t.user_id = ?
                AND t.is_revoked = 0 AND t.expires_at > NOW(6) AND u.is_active = 1",
         ).bind(&handle.user_id).bind(&handle.user_id).bind(&handle.session_id).bind(&handle.hash)
-            .bind(&handle.user_id).bind(&handle.session_id)
+            .bind(&handle.user_id)
             .fetch_optional(pool).await.map_err(|_| unavailable())?;
         let Some(canonical) = canonical else {
             return Ok(None);
@@ -200,11 +195,11 @@ impl DatabaseAuthService {
         let refresh = decode_jwt_claims(&credentials.refresh_token, &self.jwt)?;
         let access = jwt::decode_stored_access_claims(&credentials.access_token, &self.jwt)?;
         let (session, origin, _) = self.parse_token_session(&refresh)?;
-        let token_id: String = canonical.try_get("token_id").map_err(|_| unavailable())?;
+        let session_id: String = canonical.try_get("session_id").map_err(|_| unavailable())?;
         let token_hash: String = canonical.try_get("token_hash").map_err(|_| unavailable())?;
-        if credentials.version != 1
+        if credentials.version != 2
             || credentials.handle_hash != handle.hash
-            || credentials.token_id != token_id
+            || credentials.session_id != session_id
             || credentials.user_id != handle.user_id
             || credentials.session_id != handle.session_id
             || credentials.session_id != session
@@ -263,9 +258,8 @@ impl DatabaseAuthService {
             return Err(session_denied());
         }
         let credentials = Credentials {
-            version: 1,
+            version: 2,
             handle_hash: handle.hash.clone(),
-            token_id: rotation.token_id.clone(),
             user_id: rotation.user_id.clone(),
             session_id: rotation.session_id.clone(),
             access_token: rotation.tokens.access_token.clone(),
@@ -326,10 +320,7 @@ impl DatabaseAuthService {
             return Err(session_denied().into());
         }
         let mut rotation = self.prepare_refresh(pool, &request.refresh_token).await?;
-        if rotation.token_id != handle.session_id
-            || rotation.session_id != handle.session_id
-            || rotation.user_id != handle.user_id
-        {
+        if rotation.session_id != handle.session_id || rotation.user_id != handle.user_id {
             return Err(session_denied().into());
         }
         let access = jwt::decode_stored_access_claims(&request.access_token, &self.jwt)?;
@@ -452,8 +443,8 @@ impl DatabaseAuthService {
         handle: &Handle,
         credentials: &Revocation,
     ) -> Result<(), AuthHttpError> {
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE token_id = ? AND user_id = ? AND session_id = ? AND browser_handle_hash = ?")
-            .bind(&credentials.token_id).bind(&credentials.user_id).bind(&credentials.session_id).bind(&handle.hash)
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND browser_handle_hash = ?")
+            .bind(&credentials.session_id).bind(&credentials.user_id).bind(&handle.hash)
             .execute(&mut **tx).await.map_err(|_| unavailable())?;
         Ok(())
     }

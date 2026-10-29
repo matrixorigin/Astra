@@ -288,8 +288,18 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
 
     for (change, restore, expected) in [
         (
+            "ALTER TABLE auth_refresh_tokens MODIFY session_id VARCHAR(63) NOT NULL",
+            "ALTER TABLE auth_refresh_tokens MODIFY session_id VARCHAR(64) NOT NULL",
+            "session_id",
+        ),
+        (
+            "ALTER TABLE auth_refresh_tokens ADD token_id VARCHAR(64) NULL",
+            "ALTER TABLE auth_refresh_tokens DROP COLUMN token_id",
+            "token_id",
+        ),
+        (
             "ALTER TABLE auth_refresh_tokens DROP PRIMARY KEY",
-            "ALTER TABLE auth_refresh_tokens ADD PRIMARY KEY (token_id)",
+            "ALTER TABLE auth_refresh_tokens ADD PRIMARY KEY (session_id)",
             "PRIMARY",
         ),
         (
@@ -359,13 +369,13 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         (
             "idx_auth_refresh_tokens_user_expires",
             "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_user_expires",
-            "CREATE UNIQUE INDEX idx_auth_refresh_tokens_user_expires ON auth_refresh_tokens (user_id, expires_at, token_id)",
+            "CREATE UNIQUE INDEX idx_auth_refresh_tokens_user_expires ON auth_refresh_tokens (user_id, expires_at, session_id)",
             "CREATE INDEX idx_auth_refresh_tokens_user_expires ON auth_refresh_tokens (user_id, expires_at)",
         ),
         (
             "idx_auth_refresh_tokens_expires_at",
             "ALTER TABLE auth_refresh_tokens DROP INDEX idx_auth_refresh_tokens_expires_at",
-            "CREATE UNIQUE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at, token_id)",
+            "CREATE UNIQUE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at, session_id)",
             "CREATE INDEX idx_auth_refresh_tokens_expires_at ON auth_refresh_tokens (expires_at)",
         ),
     ] {
@@ -415,7 +425,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .await
         .unwrap();
 
-    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-10-29-v114' WHERE component = 'astra-core'")
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-10-29-v115' WHERE component = 'astra-core'")
         .execute(pool.get()).await.unwrap();
     let error = ensure_core_schema(&settings, &bootstrap_catalog)
         .await
@@ -428,7 +438,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .fetch_one(pool.get())
     .await
     .unwrap();
-    assert_eq!(unchanged, "2026-10-29-v114");
+    assert_eq!(unchanged, "2026-10-29-v115");
 
     sqlx::query(
         "UPDATE astra_schema_contracts SET contract_version = ? WHERE component = 'astra-core'",

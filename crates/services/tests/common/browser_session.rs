@@ -58,9 +58,9 @@ pub async fn age_access(
             &jsonwebtoken::EncodingKey::from_secret(JWT_KEY.as_bytes()),
         )
         .unwrap();
-        sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ?")
+        sqlx::query("UPDATE auth_refresh_tokens SET token_hash = ? WHERE session_id = ?")
             .bind(digest(&token))
-            .bind(payload["token_id"].as_str().unwrap())
+            .bind(payload["session_id"].as_str().unwrap())
             .execute(pool.get())
             .await
             .unwrap();

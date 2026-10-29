@@ -3,8 +3,8 @@ mod common;
 use astra_services::{RetentionPolicy, cleanup_expired_data};
 async fn seed(pool: &sqlx::MySqlPool, browser: bool) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,created_at,browser_handle_hash,browser_ciphertext) VALUES (?, ?, ?, ?, '2020-01-01', '2020-01-01', ?, ?)")
-        .bind(&id).bind(&id).bind(&id).bind(&id)
+    sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at,created_at,browser_handle_hash,browser_ciphertext) VALUES (?, ?, ?, '2020-01-01', '2020-01-01', ?, ?)")
+        .bind(&id).bind(&id).bind(&id)
         .bind(browser.then_some(&id)).bind(browser.then_some("fixture"))
         .execute(pool).await.unwrap();
     id
@@ -91,8 +91,8 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     let second_direct = seed(pool.get(), false).await;
     let browser = seed(pool.get(), true).await;
     let duplicate_id = uuid::Uuid::new_v4().to_string();
-    let duplicate = sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,browser_handle_hash,browser_ciphertext) VALUES (?, ?, ?, ?, '2020-01-01', ?, 'fixture')")
-        .bind(&browser).bind(&duplicate_id).bind(&duplicate_id).bind(&duplicate_id).bind(&browser)
+    let duplicate = sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at,browser_handle_hash,browser_ciphertext) VALUES (?, ?, ?, '2020-01-01', ?, 'fixture')")
+        .bind(&browser).bind(&duplicate_id).bind(&duplicate_id).bind(&browser)
         .execute(pool.get()).await;
     assert!(
         duplicate.is_err(),
@@ -100,7 +100,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     );
     assert_eq!(clean(pool.get()).await.unwrap(), 3);
     let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id IN (?, ?)")
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id IN (?, ?)")
             .bind(&direct)
             .bind(&browser)
             .fetch_one(pool.get())
@@ -108,7 +108,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
             .unwrap();
     assert_eq!(count, 0);
     let direct_exists: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id = ?")
             .bind(&second_direct)
             .fetch_one(pool.get())
             .await
@@ -121,7 +121,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
         .fetch_one(pool.get())
         .await
         .unwrap();
-    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE token_id = ?")
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE session_id = ?")
         .bind(now - chrono::Duration::days(10))
         .bind(&later)
         .execute(pool.get())
@@ -143,7 +143,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     // conflicting cleanup must not delete the committed renewed credential.
     let renewed = seed(pool.get(), true).await;
     let mut rotation = pool.get().begin().await.unwrap();
-    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 DAY), created_at = NOW(6), browser_ciphertext = 'renewed' WHERE token_id = ?")
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 DAY), created_at = NOW(6), browser_ciphertext = 'renewed' WHERE session_id = ?")
         .bind(&renewed).execute(&mut *rotation).await.unwrap();
     let worker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
         .fetch_one(other.get())
@@ -159,19 +159,20 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
             "unexpected cleanup failure: {error}"
         );
     }
-    let value: String =
-        sqlx::query_scalar("SELECT browser_ciphertext FROM auth_refresh_tokens WHERE token_id = ?")
-            .bind(&renewed)
-            .fetch_one(pool.get())
-            .await
-            .unwrap();
+    let value: String = sqlx::query_scalar(
+        "SELECT browser_ciphertext FROM auth_refresh_tokens WHERE session_id = ?",
+    )
+    .bind(&renewed)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
     assert_eq!(value, "renewed");
 
     // Cancellation may race a database commit. A later checkout and retry must
     // be safe whether the cancelled delete committed or was rolled back.
     let uncertain = seed(pool.get(), true).await;
     let mut blocker = pool.get().begin().await.unwrap();
-    sqlx::query("SELECT token_hash FROM auth_refresh_tokens WHERE token_id = ? FOR UPDATE")
+    sqlx::query("SELECT token_hash FROM auth_refresh_tokens WHERE session_id = ? FOR UPDATE")
         .bind(&uncertain)
         .fetch_one(&mut *blocker)
         .await
@@ -202,7 +203,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     assert_eq!(check, 1);
     assert!(clean(other.get()).await.unwrap() <= 1);
     let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id = ?")
             .bind(&uncertain)
             .fetch_one(pool.get())
             .await
@@ -213,11 +214,10 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
         .map(|_| uuid::Uuid::new_v4().to_string())
         .collect();
     let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
-        "INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,created_at,browser_handle_hash,browser_ciphertext) ",
+        "INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at,created_at,browser_handle_hash,browser_ciphertext) ",
     );
     insert.push_values(&ids, |mut row, id| {
         row.push_bind(id)
-            .push_bind(id)
             .push_bind(id)
             .push_bind(id)
             .push_bind("2020-01-01")
@@ -233,11 +233,10 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
         .collect();
     let future_expiry = (chrono::Utc::now() + chrono::Duration::days(365)).naive_utc();
     let mut future = sqlx::QueryBuilder::<sqlx::MySql>::new(
-        "INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,created_at) ",
+        "INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at,created_at) ",
     );
     future.push_values(&future_ids, |mut row, id| {
         row.push_bind(id)
-            .push_bind(id)
             .push_bind(id)
             .push_bind(id)
             .push_bind(future_expiry)
@@ -245,7 +244,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     });
     future.build().execute(pool.get()).await.unwrap();
     let recent = seed(pool.get(), true).await;
-    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 1 DAY), is_revoked = 1 WHERE token_id = ?")
+    sqlx::query("UPDATE auth_refresh_tokens SET expires_at = DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 1 DAY), is_revoked = 1 WHERE session_id = ?")
         .bind(&recent).execute(pool.get()).await.unwrap();
     assert_eq!(clean(pool.get()).await.unwrap(), 1000);
     assert_eq!(clean(pool.get()).await.unwrap(), 1);
@@ -258,7 +257,7 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     .unwrap();
     assert_eq!(remaining, 1002); // 1001 future sessions and the renewed session.
     let recent_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id = ?")
             .bind(&recent)
             .fetch_one(pool.get())
             .await

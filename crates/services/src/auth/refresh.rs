@@ -24,7 +24,6 @@ pub(super) enum BrowserPublication<'a> {
 }
 
 pub(super) struct PreparedRefresh {
-    pub token_id: String,
     pub user_id: String,
     pub session_id: String,
     pub old_hash: String,
@@ -59,21 +58,20 @@ impl DatabaseAuthService {
         let user_id = claims.sub.as_deref().ok_or_else(session_denied)?;
         let (session_id, origin, _) = self.parse_token_session(&claims)?;
         let old_hash = sha256_hex(refresh_token);
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT t.token_id, u.username FROM auth_refresh_tokens t
+        let username: Option<String> = sqlx::query_scalar(
+            "SELECT u.username FROM auth_refresh_tokens t
              JOIN auth_users u ON u.user_id = ? AND u.user_id = t.user_id
-             WHERE t.token_id = ? AND t.token_hash = ? AND t.user_id = ? AND t.session_id = ?
+             WHERE t.session_id = ? AND t.token_hash = ? AND t.user_id = ?
                AND t.is_revoked = 0 AND t.expires_at > NOW(6) AND u.is_active = 1",
         )
         .bind(user_id)
         .bind(&session_id)
         .bind(&old_hash)
         .bind(user_id)
-        .bind(&session_id)
         .fetch_optional(pool)
         .await
         .map_err(|error| map_auth_sqlx(error, "refresh.fetch_token", Some(pool)))?;
-        let (token_id, username) = row.ok_or_else(session_denied)?;
+        let username = username.ok_or_else(session_denied)?;
         let memoria_owner = self.memoria_owner(pool, user_id).await?;
         let memoria_binding = if let Some(owner) = &memoria_owner {
             Some(
@@ -112,7 +110,6 @@ impl DatabaseAuthService {
             .saturating_sub(Utc::now().timestamp())
             .max(0) as u32;
         Ok(PreparedRefresh {
-            token_id,
             user_id: user_id.to_owned(),
             session_id,
             old_hash,
@@ -197,7 +194,7 @@ impl DatabaseAuthService {
             None => (None, None, ""),
         };
         let statement = format!("UPDATE auth_refresh_tokens SET token_hash = ?, expires_at = ?, created_at = NOW(6), browser_handle_hash = ?, browser_ciphertext = ?
-             WHERE token_id = ? AND token_hash = ? AND user_id = ? AND session_id = ?
+             WHERE session_id = ? AND token_hash = ? AND user_id = ?
                AND is_revoked = 0 AND expires_at > NOW(6){guard}");
         // `guard` is selected exclusively from the fixed literals above.
         let mut update = query(sqlx::AssertSqlSafe(statement.as_str()))
@@ -205,10 +202,9 @@ impl DatabaseAuthService {
             .bind(prepared.expires_at)
             .bind(handle_hash)
             .bind(ciphertext)
-            .bind(&prepared.token_id)
+            .bind(&prepared.session_id)
             .bind(&prepared.old_hash)
-            .bind(&prepared.user_id)
-            .bind(&prepared.session_id);
+            .bind(&prepared.user_id);
         if matches!(browser, Some(BrowserPublication::Rotate { .. })) {
             update = update.bind(handle_hash);
         }

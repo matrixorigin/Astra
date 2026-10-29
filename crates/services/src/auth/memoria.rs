@@ -796,8 +796,8 @@ impl DatabaseAuthService {
         let refresh_token = self
             .create_refresh_token(&user.user_id, &session, &origin)
             .map_err(internal_error)?;
-        sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,is_revoked) VALUES (?, ?, ?, ?, ?, 0)")
-            .bind(&session).bind(&user.user_id).bind(&session).bind(sha256_hex(&refresh_token))
+        sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at,is_revoked) VALUES (?, ?, ?, ?, 0)")
+            .bind(&session).bind(&user.user_id).bind(sha256_hex(&refresh_token))
             .bind(self.refresh_token_expires_at_string(chrono::Utc::now())).execute(&mut *tx).await.map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
         Ok(AuthTokenRecord {

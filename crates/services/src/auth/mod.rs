@@ -1300,11 +1300,10 @@ impl DatabaseAuthService {
         let row = query(
             "SELECT CAST(UNIX_TIMESTAMP(MAX(expires_at)) AS SIGNED) AS max_expires_at_unix \
              FROM auth_refresh_tokens \
-             WHERE token_id = ? AND user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()",
+             WHERE session_id = ? AND user_id = ? AND is_revoked = 0 AND expires_at > NOW()",
         )
         .bind(session_id)
         .bind(user_id)
-        .bind(session_id)
         .fetch_one(pool)
         .await?;
         row.try_get::<Option<i64>, _>("max_expires_at_unix")
@@ -1645,12 +1644,11 @@ impl AuthService for DatabaseAuthService {
             .await
             .map_err(|e| map_auth_sqlx(e, "login.update_last_login_at", Some(&pool)))?;
         query(
-            "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
+            "INSERT INTO auth_refresh_tokens (session_id, user_id, token_hash, expires_at, is_revoked) \
+             VALUES (?, ?, ?, ?, 0)",
         )
         .bind(&session_id)
         .bind(&user.user_id)
-        .bind(&session_id)
         .bind(&refresh_token_hash)
         .bind(expires_at)
         .execute(&mut *tx)
@@ -1793,10 +1791,9 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE token_id = ? AND user_id = ? AND session_id = ? AND is_revoked = 0")
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND is_revoked = 0")
             .bind(&session_id)
             .bind(&user_id)
-            .bind(&session_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| map_auth_sqlx(e, "logout.revoke_session", Some(&pool)))?;
@@ -2127,7 +2124,7 @@ impl AuthService for DatabaseAuthService {
                     CAST(UNIX_TIMESTAMP(s.session_expires_at) AS SIGNED) AS session_expires_at_unix,
                     m.provider_id AS memoria_provider_id, m.external_subject AS memoria_subject
              FROM (SELECT MAX(expires_at) AS session_expires_at
-                   FROM auth_refresh_tokens WHERE token_id = ? AND user_id = ? AND session_id = ?
+                   FROM auth_refresh_tokens WHERE session_id = ? AND user_id = ?
                      AND is_revoked = 0 AND expires_at > NOW()) s
              LEFT JOIN auth_users u ON u.user_id = ?
              LEFT JOIN (SELECT astra_user_id, provider_id, external_subject
@@ -2139,7 +2136,6 @@ impl AuthService for DatabaseAuthService {
         )
         .bind(&session_id)
         .bind(&user_id)
-        .bind(&session_id)
         .bind(&user_id)
         .bind(&user_id)
         .bind(

@@ -168,7 +168,7 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         if kind == "refresh" {
             use sha2::{Digest, Sha256};
             let updated = sqlx::query(
-                "UPDATE auth_refresh_tokens SET token_hash = ? WHERE token_id = ? AND user_id = ?",
+                "UPDATE auth_refresh_tokens SET token_hash = ? WHERE session_id = ? AND user_id = ?",
             )
             .bind(format!("{:x}", Sha256::digest(legacy.as_bytes())))
             .bind(claims["sid"].as_str().unwrap())

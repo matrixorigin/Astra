@@ -434,7 +434,7 @@ A loser reads the committed winner. Provider verification happens before locking
 and its identity/credential binding is checked again under lock.
 
 The ordinary browser resolution uses the random session ID as the canonical row
-primary key and verifies the full handle hash in one authority snapshot. Direct
+primary key, stored only as `session_id`, and verifies the full handle hash in one authority snapshot. Direct
 refresh and principal checks use the same primary key. Refresh also compares the
 signed refresh token hash on that row; the hash is not a separate index. When the
 current access token is usable, ordinary browser resolution does not write or call
@@ -515,7 +515,7 @@ the browser's shared cookie jar; it does not construct authentication cookies.
 
 ### Fresh-schema deployment
 
-This change advances the strict core schema contract to `2026-10-29-v115`. It does
+This change advances the strict core schema contract to `2026-10-29-v116`. It does
 not migrate, alter, drop or recreate an existing database. Provision a **separate
 fresh database**, preserving the old database and its data. Existing data does not
 appear in the fresh database without a separately designed migration. Drain old

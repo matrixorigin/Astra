@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-29-v115";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-29-v116";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3042,9 +3042,8 @@ async fn ensure_core_schema_while_leased(
         pool,
         "auth_refresh_tokens",
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
-            token_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NULL,
             token_hash VARCHAR(255) NOT NULL,
             browser_handle_hash VARCHAR(64) NULL,
             browser_ciphertext TEXT NULL,
@@ -5357,6 +5356,18 @@ async fn verify_core_schema_shape(
             ));
         }
         if table == "auth_refresh_tokens"
+            && column == "session_id"
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "NO"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+        {
+            return Err(sqlx::Error::Protocol(
+                "invalid auth_refresh_tokens.session_id shape".into(),
+            ));
+        }
+        if table == "auth_refresh_tokens"
             && matches!(
                 column.as_str(),
                 "browser_handle_hash" | "browser_ciphertext"
@@ -5564,7 +5575,7 @@ async fn verify_core_schema_shape(
         ],
     )?;
 
-    ensure_index_shape(&indexes, "auth_refresh_tokens", "PRIMARY", &["token_id"])?;
+    ensure_index_shape(&indexes, "auth_refresh_tokens", "PRIMARY", &["session_id"])?;
     ensure_index_shape(
         &indexes,
         "auth_refresh_tokens",
@@ -5578,6 +5589,12 @@ async fn verify_core_schema_shape(
         "idx_auth_refresh_tokens_expires_at",
         &["expires_at"],
     )?;
+
+    if columns.contains(&("auth_refresh_tokens".to_owned(), "token_id".to_owned())) {
+        return Err(sqlx::Error::Protocol(
+            "obsolete auth_refresh_tokens.token_id column; recreate the database".into(),
+        ));
+    }
 
     fail_if_obsolete_shape(
         pool,
@@ -7027,7 +7044,7 @@ pub async fn cleanup_refresh_session_batch(
     // MatrixOne 4.2.5 can return future rows when NOW()/DATE_SUB() is used
     // directly as an index range bound. Bind a concrete DATETIME instead.
     let candidates: Vec<(String, chrono::NaiveDateTime)> = sqlx::query_as(
-        "SELECT token_id, expires_at FROM auth_refresh_tokens FORCE INDEX (idx_auth_refresh_tokens_expires_at) WHERE expires_at < ? LIMIT ?",
+        "SELECT session_id, expires_at FROM auth_refresh_tokens FORCE INDEX (idx_auth_refresh_tokens_expires_at) WHERE expires_at < ? LIMIT ?",
     )
     .bind(cutoff)
     .bind(AUTH_REFRESH_TOKEN_BATCH_LIMIT)
@@ -7067,7 +7084,7 @@ async fn delete_expired_refresh_candidates(
     retention_days: u32,
 ) -> Result<u64, sqlx::Error> {
     let mut deletion =
-        QueryBuilder::<MySql>::new("DELETE FROM auth_refresh_tokens WHERE token_id IN (");
+        QueryBuilder::<MySql>::new("DELETE FROM auth_refresh_tokens WHERE session_id IN (");
     let mut values = deletion.separated(", ");
     for id in ids {
         values.push_bind(id);
@@ -7266,11 +7283,11 @@ mod tests {
             now + chrono::Duration::days(1),
             now - chrono::Duration::days(8),
         ]) {
-            sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at) VALUES (?, ?, ?, ?, ?)")
-                .bind(id).bind(id).bind(id).bind(id).bind(expiry).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at) VALUES (?, ?, ?, ?)")
+                .bind(id).bind(id).bind(id).bind(expiry).execute(&pool).await.unwrap();
         }
         // Model a candidate renewed after selection but before the keyed DELETE.
-        sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE token_id = ?")
+        sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE session_id = ?")
             .bind(now + chrono::Duration::days(1))
             .bind(&ids[3])
             .execute(&pool)
@@ -7283,7 +7300,7 @@ mod tests {
         assert_eq!(deleted, 1);
         for (index, id) in ids.iter().enumerate() {
             let exists: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE token_id = ?")
+                sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id = ?")
                     .bind(id)
                     .fetch_one(&pool)
                     .await
@@ -7291,7 +7308,7 @@ mod tests {
             assert_eq!(exists, i64::from(index != 0));
         }
         for id in &ids {
-            sqlx::query("DELETE FROM auth_refresh_tokens WHERE token_id = ?")
+            sqlx::query("DELETE FROM auth_refresh_tokens WHERE session_id = ?")
                 .bind(id)
                 .execute(&pool)
                 .await
