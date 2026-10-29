@@ -571,3 +571,99 @@ it.each(["login", "register"])("submits credentials only to the explicitly enter
   expect(result.ok).toBe(false);
   expect(seen).toEqual(["https://new.example"]);
 });
+
+// Pair-only imports cannot recover a server-generated handle after a lost response.
+// Require caller-held proof before consuming the token pair.
+it.each(["refresh-token", "  refresh-token  "])("rejects refresh-pair import without independent proof and preserves the selected account (%s)", async (refreshToken) => {
+  const fetch = vi.fn();
+  vi.stubGlobal("fetch", fetch);
+  const selected = jar.get(SESSION_COOKIE);
+  const response = await configure(new NextRequest("http://web.test/api/runtime-config", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiUrl: root, accessToken: fixtureAccess, refreshToken }),
+  }));
+  expect(response.status).toBe(400);
+  expect((await response.json()).error).toContain("browserProof");
+  expect(response.headers.has("set-cookie")).toBe(false);
+  expect(jar.get(SESSION_COOKIE)).toBe(selected);
+  expect(set).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it("recovers an unconfirmed login by signing in again with a fresh session", async () => {
+  const original = jar.get(SESSION_COOKIE);
+  let attempt = 0;
+  let proof = "";
+  const token = () => `h.${Buffer.from(JSON.stringify({ sub: "user-id", sid: `fresh-${attempt}` })).toString("base64url")}.s`;
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/auth/login") {
+      attempt++;
+      return Response.json({ access_token: token(), refresh_token: token() });
+    }
+    if (path === "/auth/browser-sessions") {
+      const body = JSON.parse(String(init?.body));
+      expect(body.refresh_token).toBe(token());
+      proof = body.handle;
+      if (attempt === 1) throw new Error("adoption committed; response lost");
+      return Response.json({ expires_in: 86400 });
+    }
+    expect(path).toBe("/auth/refresh");
+    expect(JSON.parse(String(init?.body)).refresh_token).toBe(proof);
+    throw new Error("recovery is offline too");
+  }));
+  const failed = await loginRoute(loginRequest());
+  expect(failed.status).toBe(503);
+  expect(failed.headers.has("set-cookie")).toBe(false);
+  expect(jar.get(SESSION_COOKIE)).toBe(original);
+  const retried = await loginRoute(loginRequest());
+  expect(retried.status).toBe(200);
+  expect(retried.cookies.get(SESSION_COOKIE)?.value).toBe(proof);
+  expect(attempt).toBe(2);
+  expect(set).not.toHaveBeenCalled();
+});
+
+it("recovers a committed pair import across requests using the caller's independent proof", async () => {
+  const original = jar.get(SESSION_COOKIE);
+  let committed = "";
+  let offline = true;
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    if (new URL(String(input)).pathname === "/auth/browser-sessions") {
+      if (!committed) { committed = body.handle; throw new Error("commit response lost"); }
+      return body.handle === committed ? Response.json({ expires_in: 86400 }) : Response.json({}, { status: 401 });
+    }
+    if (offline) throw new Error("recovery offline");
+    return body.refresh_token === committed ? Response.json({ access_token: fixtureAccess, refresh_token: committed }) : Response.json({}, { status: 401 });
+  }));
+  const send = (proof: string) => configure(new NextRequest("http://web.test/api/runtime-config", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiUrl: root, accessToken: fixtureAccess, refreshToken: fixtureRefresh, browserProof: proof }),
+  }));
+  const proof = Buffer.alloc(32, 7).toString("base64url");
+  const failed = await send(proof);
+  expect(failed.status).toBe(503);
+  expect(failed.headers.has("set-cookie")).toBe(false);
+  expect(jar.get(SESSION_COOKIE)).toBe(original);
+  offline = false;
+  expect((await send(Buffer.alloc(32, 8).toString("base64url"))).status).toBe(401);
+  const recovered = await send(proof);
+  expect(recovered.status).toBe(200);
+  expect(recovered.cookies.get(SESSION_COOKIE)?.value).toBe(committed);
+});
+
+it.each([
+  { browserProof: "invalid" },
+  { refreshToken: fixtureRefresh, browserProof: "invalid" },
+  { refreshToken: fixtureRefresh, browserProof: Buffer.alloc(32).toString("base64url"), demoMode: true },
+  { browserProof: Buffer.alloc(32).toString("base64url") },
+])("rejects incomplete or malformed independent import proof before side effects", async (fields) => {
+  const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
+  const response = await configure(new NextRequest("http://web.test/api/runtime-config", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiUrl: root, accessToken: fixtureAccess, ...fields }),
+  }));
+  expect(response.status).toBe(400);
+  expect(response.headers.has("set-cookie")).toBe(false);
+  expect(fetch).not.toHaveBeenCalled();
+});

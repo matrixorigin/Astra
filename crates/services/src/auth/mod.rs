@@ -1791,7 +1791,7 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND is_revoked = 0")
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, expires_at = LEAST(expires_at, UTC_TIMESTAMP(6)), browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND is_revoked = 0")
             .bind(&session_id)
             .bind(&user_id)
             .execute(&mut *tx)

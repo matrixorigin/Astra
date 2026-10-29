@@ -188,6 +188,67 @@ async fn real_next_render_across_two_web_and_runtime_instances() {
         );
         urls.push(url);
     }
+    // A caller retains its independent proof across Web replicas and unknown
+    // publication outcomes; the consumed pair alone cannot select the owner.
+    let import_proof = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9; 32])
+    };
+    let import = json!({"apiUrl":runtime_url,"accessToken":deployment_tokens.access_token,
+        "refreshToken":deployment_tokens.refresh_token,"browserProof":import_proof});
+    let enrolled = client
+        .post(format!("{}/api/runtime-config", urls[0]))
+        .json(&import)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enrolled.status(), 200);
+    let imported_cookie = enrolled
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with("astra_session="))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let recovered = client
+        .post(format!("{}/api/runtime-config", urls[1]))
+        .json(&import)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), 200);
+    assert!(
+        recovered
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with(&format!("{imported_cookie};")))
+    );
+    let me = client
+        .get(format!("{}/api/runtime-auth/me", urls[1]))
+        .header("cookie", &imported_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status(), 200);
+    let mut wrong = import.clone();
+    wrong["browserProof"] = serde_json::Value::String({
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([8; 32])
+    });
+    let denied = client
+        .post(format!("{}/api/runtime-config", urls[1]))
+        .json(&wrong)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    assert!(!denied.headers().contains_key("set-cookie"));
     let default_cookie = format!("astra_session=cfg1.{}", {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"mode":"default"}"#)

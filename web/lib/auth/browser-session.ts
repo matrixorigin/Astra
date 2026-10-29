@@ -127,12 +127,13 @@ export async function revokeSelection(
 export async function adoptBrowserSession(
   apiUrl: string,
   tokens: { access_token: string; refresh_token: string },
+  proof = randomBytes(32).toString("base64url"),
 ): Promise<string> {
   const root = runtimeRoot(apiUrl);
   const identity = jwtIdentityHint(tokens.refresh_token);
   if (!identity) throw new RuntimeClientError({ operation: "create browser session", path: "/auth/browser-sessions", status: 400, detail: "Invalid session credential." });
   const { userId, sessionId } = identity;
-  const handle = `bs3.${Buffer.from(root).toString("base64url")}.${Buffer.from(userId).toString("base64url")}.${Buffer.from(sessionId).toString("base64url")}.${randomBytes(32).toString("base64url")}`;
+  const handle = `bs3.${Buffer.from(root).toString("base64url")}.${Buffer.from(userId).toString("base64url")}.${Buffer.from(sessionId).toString("base64url")}.${proof}`;
   parseSelection(handle);
   try {
     const created = await sessionRequest(root, "/auth/browser-sessions", {

@@ -471,8 +471,15 @@ issuer and can outlive the Web cookie.
 Runtime settings are full replacements, encoded as `cfg1` in the same selector:
 explicit static bearer, no authentication, demo, or deployment default. The deployment API URL may supply a default destination; `ASTRA_ACCESS_TOKEN`
 is never a browser identity. Anonymous/default selections cannot inherit a server
-credential. Each browser must sign in or explicitly supply its own static token. Refresh-pair import
-creates a browser owner; raw refresh JWTs are never stored in cookies. Demo configuration disables live access; it does not authenticate a workspace.
+credential. Each browser must sign in or explicitly supply its own static token. Refresh-pair import through `POST /api/runtime-config` requires `browserProof`: a
+caller-generated independent 32-byte CSPRNG secret encoded as unpadded base64url
+(for example, `crypto.randomBytes(32).toString("base64url")` in Node.js). Generate
+it before importing, retain the same proof, token pair and runtime URL across uncertain retries
+against any Web replica, and discard caller storage after confirming cookie delivery.
+Treat the proof as a bearer secret; never derive it from tokens or log it. Missing
+or malformed proof is rejected before consuming credentials. This also supports
+passwordless external accounts; interactive password login obtains a fresh pair
+on each retry. Raw refresh JWTs are never stored in cookies. Demo configuration disables live access; it does not authenticate a workspace.
 The public landing remains available and live workspace pages require sign-in.
 Demo combined with credentials is rejected as ambiguous; logout exits demo. Missing/malformed/revoked
 browser credentials do not fall back to environment authentication. Static logout
@@ -485,8 +492,10 @@ The encrypted payload has an immutable one-year absolute cap. Browser rotation
 caps the canonical refresh-row expiry to it, so bearer admission and handle
 resolution respect the same ceiling. No separate browser expiry or sweep exists.
 Refresh retention treats the configured seven days as a minimum period after
-expiry. Revoked rows can remain until their original expiry plus that period;
-logout and provider disconnect clear browser ciphertext immediately. Other
+expiry. Logout and provider disconnect shorten expiry to the earlier of its current value
+and database time, and clear browser ciphertext in the same update. Repeated
+revocation cannot postpone cleanup. Revoked rows remain for the retention period
+plus any cleanup backlog. Other
 ciphertext remains until expiry, the retention period and any cleanup backlog.
 
 Refresh maintenance captures a conservative UTC cutoff, binds it as a concrete

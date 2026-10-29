@@ -443,7 +443,7 @@ impl DatabaseAuthService {
         handle: &Handle,
         credentials: &Revocation,
     ) -> Result<(), AuthHttpError> {
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1, browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND browser_handle_hash = ?")
+        query("UPDATE auth_refresh_tokens SET is_revoked = 1, expires_at = LEAST(expires_at, UTC_TIMESTAMP(6)), browser_handle_hash = NULL, browser_ciphertext = NULL WHERE session_id = ? AND user_id = ? AND browser_handle_hash = ?")
             .bind(&credentials.session_id).bind(&credentials.user_id).bind(&handle.hash)
             .execute(&mut **tx).await.map_err(|_| unavailable())?;
         Ok(())

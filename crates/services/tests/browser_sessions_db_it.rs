@@ -988,3 +988,108 @@ async fn fresh_login_and_logout_do_not_depend_on_expired_credentials_or_an_old_e
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn revocation_shortens_retention_without_extending_expired_sessions() {
+    let isolated = common::cleanup_catalog::CleanupCatalog::create().await;
+    let settings = isolated.settings.clone();
+    let pool = isolated.pool.clone();
+    isolated
+        .run(async move {
+            let auth = DatabaseAuthService::new(
+                settings,
+                JwtSettings {
+                    secret_key: JWT_KEY.into(),
+                    algorithm: "HS256".into(),
+                    access_token_expire_minutes: 5,
+                    refresh_token_expire_days: 30,
+                },
+            )
+            .with_pool(pool.clone())
+            .with_encryptor(FernetTokenEncryptor::new(ENCRYPTION_KEY).unwrap());
+            let name = register(&auth).await;
+            let other_name = register(&auth).await;
+            let direct = login(&auth, &name).await;
+            let browser = login(&auth, &name).await;
+            let other = login(&auth, &other_name).await;
+            let proof = handle(&browser);
+            auth.create_browser_session(adoption(&proof, &browser))
+                .await
+                .unwrap();
+            auth.logout(refresh(&direct.refresh_token)).await.unwrap();
+            auth.logout(refresh(&proof)).await.unwrap();
+            let rows: Vec<(String, chrono::NaiveDateTime)> = sqlx::query_as(
+                "SELECT session_id, expires_at FROM auth_refresh_tokens WHERE user_id = ?",
+            )
+            .bind(&direct.user_id)
+            .fetch_all(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 2);
+            let now: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+            assert!(rows.iter().all(|(_, expiry)| *expiry <= now));
+            let active = login(&auth, &name).await;
+            let active_proof = handle(&active);
+            auth.create_browser_session(adoption(&active_proof, &active)).await.unwrap();
+            auth.disconnect_memoria(&direct.user_id).await.unwrap();
+            let retired: (chrono::NaiveDateTime, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT expires_at, browser_handle_hash, browser_ciphertext FROM auth_refresh_tokens WHERE user_id = ? AND session_id NOT IN (?, ?)"
+            ).bind(&direct.user_id).bind(&rows[0].0).bind(&rows[1].0).fetch_one(pool.get()).await.unwrap();
+            let revoked_at: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)").fetch_one(pool.get()).await.unwrap();
+            assert!(retired.0 <= revoked_at);
+            assert!(retired.1.is_none() && retired.2.is_none());
+            assert_eq!(auth.refresh(refresh(&active_proof)).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+            for (id, expiry) in &rows {
+                let repeated: chrono::NaiveDateTime = sqlx::query_scalar(
+                    "SELECT expires_at FROM auth_refresh_tokens WHERE session_id = ?",
+                )
+                .bind(id)
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+                assert_eq!(
+                    *expiry, repeated,
+                    "repeated revocation must not postpone cleanup"
+                );
+            }
+            let recent = astra_services::cleanup_refresh_session_batch(
+                pool.get(),
+                &astra_services::RetentionPolicy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                recent.deleted, 0,
+                "newly revoked rows retain the configured grace period"
+            );
+            sqlx::query(
+                "UPDATE auth_refresh_tokens SET expires_at = '2020-01-01' WHERE user_id = ?",
+            )
+            .bind(&direct.user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+            auth.disconnect_memoria(&direct.user_id).await.unwrap();
+            let old = astra_services::cleanup_refresh_session_batch(
+                pool.get(),
+                &astra_services::RetentionPolicy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(old.deleted, 3, "disconnect must preserve an earlier expiry");
+            auth.logout(refresh(&direct.refresh_token)).await.unwrap();
+            auth.logout(refresh(&proof)).await.unwrap();
+            assert!(
+                auth.refresh(refresh(&other.refresh_token)).await.is_ok(),
+                "another account remains usable"
+            );
+            assert!(auth.refresh(refresh(&proof)).await.is_err());
+        })
+        .await;
+}

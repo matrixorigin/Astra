@@ -1,20 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { DEFAULT_API_URL, getRuntimeConfig } from "@/lib/runtime-config";
 import {
-  adoptBrowserSession,
-} from "@/lib/auth/browser-session";
-import {
   SESSION_COOKIE,
   selectionCookie,
   sessionCookieOptions,
   runtimeRoot,
 } from "@/lib/auth/session-cookie";
+import { adoptBrowserSession } from "@/lib/auth/browser-session";
 import { authErrorResponse } from "@/lib/auth/http-error";
 
 type RuntimeConfigBody = {
   apiUrl?: string;
   accessToken?: string;
   refreshToken?: string;
+  browserProof?: string;
   demoMode?: boolean;
 };
 
@@ -28,6 +27,7 @@ function hasOnlyExpectedFieldTypes(body: Record<string, unknown>): boolean {
     (body.accessToken === undefined || typeof body.accessToken === "string") &&
     (body.refreshToken === undefined ||
       typeof body.refreshToken === "string") &&
+    (body.browserProof === undefined || typeof body.browserProof === "string") &&
     (body.demoMode === undefined || typeof body.demoMode === "boolean")
   );
 }
@@ -75,17 +75,19 @@ export async function POST(request: NextRequest) {
   const body = rawBody as RuntimeConfigBody;
   const accessToken = body.accessToken?.trim();
   const refreshToken = body.refreshToken?.trim();
-  if (
-    (refreshToken && !accessToken) ||
-    (body.demoMode && (accessToken || refreshToken))
-  ) {
-    return NextResponse.json(
-      {
-        error:
-          "Provide a matching token pair, or select demo mode without credentials.",
-      },
-      { status: 400 },
-    );
+  const proof = body.browserProof;
+  if (refreshToken || proof !== undefined) {
+    if (!refreshToken || !accessToken || body.demoMode || !proof ||
+        !/^[A-Za-z0-9_-]{43}$/.test(proof) ||
+        Buffer.from(proof, "base64url").toString("base64url") !== proof) {
+      return NextResponse.json(
+        { error: "Token-pair import requires an independent random 32-byte browserProof. Retain it across retries, or sign in." },
+        { status: 400 },
+      );
+    }
+  }
+  if (body.demoMode && accessToken) {
+    return NextResponse.json({ error: "Select demo mode without credentials." }, { status: 400 });
   }
   let apiUrl: string;
   let value: string;
@@ -109,10 +111,7 @@ export async function POST(request: NextRequest) {
   }
   try {
     if (refreshToken && accessToken) {
-      value = await adoptBrowserSession(apiUrl, {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-      });
+      value = await adoptBrowserSession(apiUrl, { access_token: accessToken, refresh_token: refreshToken }, proof);
     }
     const response = NextResponse.json({ ok: true });
     response.cookies.set(SESSION_COOKIE, value, sessionCookieOptions());
