@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-28-v113";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-29-v114";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3052,7 +3052,6 @@ async fn ensure_core_schema_while_leased(
             is_revoked SMALLINT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_auth_refresh_tokens_hash (token_hash),
-            UNIQUE KEY uq_auth_refresh_browser_handle (browser_handle_hash),
             INDEX idx_auth_refresh_tokens_session (session_id),
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
             INDEX idx_auth_refresh_tokens_expires_at (expires_at)
@@ -5508,14 +5507,6 @@ async fn verify_core_schema_shape(
     {
         let table: String = row.try_get("TABLE_NAME")?;
         let index: String = row.try_get("INDEX_NAME")?;
-        if table == "auth_refresh_tokens"
-            && index == "uq_auth_refresh_browser_handle"
-            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
-        {
-            return Err(sqlx::Error::Protocol(format!(
-                "auth_refresh_tokens.{index} must be unique"
-            )));
-        }
         if table == "session_transcript_items"
             && index == "uq_transcript_owner_session_source_event"
             && row.try_get::<i64, _>("NON_UNIQUE")? != 0
@@ -5538,6 +5529,15 @@ async fn verify_core_schema_shape(
             .push(row.try_get("COLUMN_NAME")?);
     }
 
+    if indexes.contains_key(&(
+        "auth_refresh_tokens".to_owned(),
+        "uq_auth_refresh_browser_handle".to_owned(),
+    )) {
+        return Err(sqlx::Error::Protocol(
+            "obsolete auth_refresh_tokens.uq_auth_refresh_browser_handle index; recreate the database".into(),
+        ));
+    }
+
     // Cover canonical provider ownership and browser existence checks, including
     // issuer ordering, so an absent identity never requires a base-table scan.
     ensure_index_shape(
@@ -5552,12 +5552,6 @@ async fn verify_core_schema_shape(
         ],
     )?;
 
-    ensure_index_shape(
-        &indexes,
-        "auth_refresh_tokens",
-        "uq_auth_refresh_browser_handle",
-        &["browser_handle_hash"],
-    )?;
     ensure_index_shape(
         &indexes,
         "auth_refresh_tokens",

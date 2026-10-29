@@ -92,11 +92,11 @@ async fn canonical_cleanup_atomically_retires_delivery_without_deleting_renewed_
     let browser = seed(pool.get(), true).await;
     let duplicate_id = uuid::Uuid::new_v4().to_string();
     let duplicate = sqlx::query("INSERT INTO auth_refresh_tokens (token_id,user_id,session_id,token_hash,expires_at,browser_handle_hash,browser_ciphertext) VALUES (?, ?, ?, ?, '2020-01-01', ?, 'fixture')")
-        .bind(&duplicate_id).bind(&duplicate_id).bind(&duplicate_id).bind(&duplicate_id).bind(&browser)
+        .bind(&browser).bind(&duplicate_id).bind(&duplicate_id).bind(&duplicate_id).bind(&browser)
         .execute(pool.get()).await;
     assert!(
         duplicate.is_err(),
-        "non-NULL browser handles must remain unique"
+        "canonical session primary keys must remain unique"
     );
     assert_eq!(clean(pool.get()).await.unwrap(), 3);
     let count: i64 =

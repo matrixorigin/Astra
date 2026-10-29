@@ -1647,7 +1647,7 @@ impl AuthService for DatabaseAuthService {
             "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
              VALUES (?, ?, ?, ?, ?, 0)",
         )
-        .bind(Uuid::new_v4().to_string())
+        .bind(&session_id)
         .bind(&user.user_id)
         .bind(&session_id)
         .bind(&refresh_token_hash)

@@ -425,7 +425,7 @@ session. An ordinary
 request never sends this proof to a separately configured runtime URL.
 
 `auth_refresh_tokens` owns session identity, revocation and the encrypted browser
-credential pair in the same row. The handle hash is uniquely indexed; raw proofs
+credential pair in the same row. The handle hash is checked against the session primary key; raw proofs
 are never stored. `/auth/refresh` accepts either a direct single-use JWT or the
 independent browser proof. A consumed direct JWT cannot recover a successor. A
 browser proof returns the current access JWT while usable; refreshing atomically
@@ -433,12 +433,9 @@ replaces the canonical hash and encrypted pair under the existing account lock.
 A loser reads the committed winner. Provider verification happens before locking,
 and its identity/credential binding is checked again under lock.
 
-The ordinary browser resolution performs two indexed reads: a handle-to-primary-key
-lookup and a canonical authority snapshot, then decrypts the result and makes a
-BFF-to-runtime call. It does not write or call the provider. The snapshot rechecks
-the handle and binds the untrusted user hint to each joined identity lookup. The
-split avoids a MatrixOne planner path that scans many refresh rows despite an index hint.
-React request caching deduplicates Server Component configuration reads. Chat,
+The ordinary browser resolution uses the random session ID as the canonical row
+primary key and verifies the full handle hash in one authority snapshot. It does
+not write or call the provider. React request caching deduplicates Server Component configuration reads. Chat,
 project and sidebar handlers and hydrated pages pass their admitted client through
 the request; there is no cross-user or process-local token authority. A late Stop
 acknowledgement resolves authority again before reconciliation. The existing SDK owns later 401
@@ -513,7 +510,7 @@ the browser's shared cookie jar; it does not construct authentication cookies.
 
 ### Fresh-schema deployment
 
-This change advances the strict core schema contract to `2026-10-28-v113`. It does
+This change advances the strict core schema contract to `2026-10-29-v114`. It does
 not migrate, alter, drop or recreate an existing database. Provision a **separate
 fresh database**, preserving the old database and its data. Existing data does not
 appear in the fresh database without a separately designed migration. Drain old

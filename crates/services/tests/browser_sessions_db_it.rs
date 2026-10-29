@@ -94,6 +94,28 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     let first = Arc::new(make_service(pool.clone()));
     let second = Arc::new(make_service(SharedPool::new(&settings).await.unwrap()));
     let name = register(&first).await;
+    // A drifted canonical primary key must not consume a usable login token.
+    let drifted_name = register(&first).await;
+    let drifted = login(&first, &drifted_name).await;
+    let drifted_handle = handle(&drifted);
+    let moved = sqlx::query("UPDATE auth_refresh_tokens SET token_id = ? WHERE token_hash = ?")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(digest(&drifted.refresh_token))
+        .execute(pool.get())
+        .await
+        .unwrap();
+    assert_eq!(moved.rows_affected(), 1);
+    assert_eq!(
+        first
+            .create_browser_session(adoption(&drifted_handle, &drifted))
+            .await
+            .err()
+            .unwrap()
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(first.refresh(refresh(&drifted.refresh_token)).await.is_ok());
+
     let tokens = login(&first, &name).await;
     let browser = handle(&tokens);
     first
@@ -158,7 +180,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
     assert!(first.refresh(refresh(&browser)).await.is_ok());
 
     // Trace the real ordinary owner resolution, including all SQLx calls.
-    // Each independent request must remain two reads and no transaction/write.
+    // Each independent request must remain one read and no transaction/write.
     {
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
@@ -218,7 +240,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             .iter()
             .filter(|sql| sql.starts_with("SET sql_mode="))
             .count();
-        assert_eq!(reads, 80, "{queries:?}");
+        assert_eq!(reads, 40, "{queries:?}");
         assert!(
             queries
                 .iter()
@@ -226,7 +248,7 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
             "{queries:?}"
         );
         eprintln!(
-            "ordinary browser resolution: 40 requests, 80 business SELECTs, zero session writes/transactions, {initializations} pool initialization SETs; p50={}us p95={}us",
+            "ordinary browser resolution: 40 requests, 40 business SELECTs, zero session writes/transactions, {initializations} pool initialization SETs; p50={}us p95={}us",
             times[20], times[38]
         );
     }
@@ -310,11 +332,43 @@ async fn browser_sessions_converge_across_pools_and_preserve_revocation_and_repl
         .create_browser_session(adoption(&new_handle, &tokens_b))
         .await
         .unwrap();
+    // Duplicate stored hashes must not redirect lookup or logout to another session.
+    let changed = sqlx::query(
+        "UPDATE auth_refresh_tokens SET browser_handle_hash = ? WHERE browser_handle_hash = ?",
+    )
+    .bind(digest(&browser))
+    .bind(digest(&new_handle))
+    .execute(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
     assert_eq!(
         first.refresh(refresh(&browser)).await.unwrap().user_id,
         tokens.user_id
     );
-    first.logout(refresh(&browser)).await.unwrap(); // logout cannot revoke B
+    let a_parts: Vec<_> = browser.split('.').collect();
+    let b_parts: Vec<_> = new_handle.split('.').collect();
+    let forged = format!(
+        "bs3.{}.{}.{}.{}",
+        b_parts[1], b_parts[2], b_parts[3], a_parts[4]
+    );
+    assert_eq!(
+        first.refresh(refresh(&forged)).await.unwrap_err().0,
+        StatusCode::UNAUTHORIZED
+    );
+    first.logout(refresh(&browser)).await.unwrap();
+    let restored = sqlx::query("UPDATE auth_refresh_tokens SET browser_handle_hash = ? WHERE browser_handle_hash = ? AND user_id = ? AND is_revoked = 0")
+        .bind(digest(&new_handle)).bind(digest(&browser)).bind(&tokens_b.user_id)
+        .execute(pool.get()).await.unwrap();
+    assert_eq!(
+        restored.rows_affected(),
+        1,
+        "logout must not revoke the other session"
+    );
+    assert_eq!(
+        second.refresh(refresh(&new_handle)).await.unwrap().user_id,
+        tokens_b.user_id
+    );
     // A deleted owner must not let a different account reclaim its old handle.
     let attacker = login(&second, &name_b).await;
     assert!(matches!(

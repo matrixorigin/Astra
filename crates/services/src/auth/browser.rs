@@ -149,29 +149,14 @@ impl DatabaseAuthService {
         self.encryptor.as_ref().ok_or_else(unavailable)
     }
 
-    // MatrixOne may ignore a secondary-index hint on the joined query. First
-    // resolve the immutable primary key, then recheck the handle in the
-    // canonical snapshot. A concurrent revoke or rotation cannot grant access.
-    async fn browser_token_id(
-        &self,
-        pool: &sqlx::MySqlPool,
-        handle: &Handle,
-    ) -> Result<Option<String>, AuthHttpError> {
-        sqlx::query_scalar("SELECT token_id FROM auth_refresh_tokens FORCE INDEX (uq_auth_refresh_browser_handle) WHERE browser_handle_hash = ?")
-            .bind(&handle.hash).fetch_optional(pool).await.map_err(|_| unavailable())
-    }
-
     async fn browser_revocation(
         &self,
         pool: &sqlx::MySqlPool,
         handle: &Handle,
     ) -> Result<Option<Revocation>, AuthHttpError> {
-        let Some(token_id) = self.browser_token_id(pool, handle).await? else {
-            return Ok(None);
-        };
         let row: Option<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT token_id, user_id, session_id FROM auth_refresh_tokens WHERE token_id = ? AND browser_handle_hash = ? AND user_id = ? AND session_id = ?",
-        ).bind(&token_id).bind(&handle.hash).bind(&handle.user_id).bind(&handle.session_id)
+        ).bind(&handle.session_id).bind(&handle.hash).bind(&handle.user_id).bind(&handle.session_id)
             .fetch_optional(pool).await.map_err(|_| unavailable())?;
         Ok(row.and_then(|(token_id, user_id, session_id)| {
             session_id.map(|session_id| Revocation {
@@ -182,18 +167,13 @@ impl DatabaseAuthService {
         }))
     }
 
-    /// Point-read the encrypted owner, then validate all canonical authority in
-    /// one snapshot with explicit keys. MatrixOne does not reliably propagate a
-    /// browser-key filter across an unconstrained multi-table join.
+    /// Resolve by canonical session primary key and verify the complete handle.
     async fn browser_owner(
         &self,
         pool: &sqlx::MySqlPool,
         handle: &Handle,
     ) -> Result<Option<Owner>, AuthHttpError> {
         let encryptor = self.browser_encryptor()?;
-        let Some(token_id) = self.browser_token_id(pool, handle).await? else {
-            return Ok(None);
-        };
         let canonical = query(
             "SELECT t.token_id, t.token_hash, t.expires_at, t.browser_ciphertext, m.memoria_bound
              FROM auth_refresh_tokens t
@@ -202,7 +182,7 @@ impl DatabaseAuthService {
                         WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' LIMIT 1) m ON TRUE
              WHERE t.token_id = ? AND t.browser_handle_hash = ? AND t.user_id = ? AND t.session_id = ?
                AND t.is_revoked = 0 AND t.expires_at > NOW(6) AND u.is_active = 1",
-        ).bind(&handle.user_id).bind(&handle.user_id).bind(&token_id).bind(&handle.hash)
+        ).bind(&handle.user_id).bind(&handle.user_id).bind(&handle.session_id).bind(&handle.hash)
             .bind(&handle.user_id).bind(&handle.session_id)
             .fetch_optional(pool).await.map_err(|_| unavailable())?;
         let Some(canonical) = canonical else {
@@ -346,7 +326,10 @@ impl DatabaseAuthService {
             return Err(session_denied().into());
         }
         let mut rotation = self.prepare_refresh(pool, &request.refresh_token).await?;
-        if rotation.session_id != handle.session_id || rotation.user_id != handle.user_id {
+        if rotation.token_id != handle.session_id
+            || rotation.session_id != handle.session_id
+            || rotation.user_id != handle.user_id
+        {
             return Err(session_denied().into());
         }
         let access = jwt::decode_stored_access_claims(&request.access_token, &self.jwt)?;
