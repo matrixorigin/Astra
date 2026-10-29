@@ -1087,7 +1087,7 @@ impl ChatgptConnections {
             let mut known_not_sent = false;
             let refresh_result=tokio::time::timeout(REFRESH_BUDGET,async {
                 let refresh=credentials.refresh_token.as_deref().ok_or_else(reauth)?;
-                let request=self.client().map_err(|error|{known_not_sent=true;error})?.post(&config.token).form(&[
+                let request=self.client().inspect_err(|_|{known_not_sent=true;})?.post(&config.token).form(&[
                     ("grant_type","refresh_token"),("client_id",client_id.as_str()),("refresh_token",refresh),("resource",API_BASE),
                 ]);
                 let response=request.send().await.map_err(|error|{

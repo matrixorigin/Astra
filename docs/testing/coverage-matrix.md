@@ -57,19 +57,31 @@ Offline coverage lives in `astra-core::model_wire::responses` (wire codec),
 `services/tests/chatgpt_connections_db_it.rs` uses an explicitly isolated
 MatrixOne database and a local fake OAuth/Responses provider for encryption,
 ownership, rotation races, model sharing, disconnect and reauthorization.
+Refresh regressions cover a refused TCP connection followed by recovery,
+cross-instance expiry with 11-second discovery/JWKS/token legs, and metadata
+cache reuse.
 The ignored `responses_transport_replays_checkpoint_and_fences_disconnected_credentials`
 transport test covers physical-attempt settlement, manually constructed tool
-frames replayed through canonical heavy-checkpoint JSON, quota without retry
-and disconnect during headers. It does not execute a tool, persist/reload a
-Server session or restart a Server. Those product journeys remain unverified
-for this provider; the explicit operator lane below covers them.
-Neither database lane contacts OpenAI or spends subscription quota.
+frames replayed through canonical heavy-checkpoint JSON, a delayed old-token
+401, context-window and in-stream quota classifications, and disconnect during
+headers. Sixteen concurrent requests verify that SQL fencing is shared per
+connection.
+The ignored `chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session`
+test in `runtime/tests/web_agent_e2e.rs` exercises authenticated connection and
+model routes, real model-catalog tool execution through `/chat/stream`, and
+canonical database history. It continues the same session with fresh Server
+services and a new run engine, using an empty local journal directory, and
+asserts provider tool results, encrypted reasoning and assistant phase survive.
+This tests durable restoration within one test process; an operating-system
+restart and live OpenAI consent/inference remain operator acceptance steps.
+These database lanes do not contact OpenAI or spend subscription quota.
 
 Run these DB lanes with the testing guide's isolated database variables:
 
 ```bash
 cargo test -p astra-services --features e2e-hooks --test chatgpt_connections_db_it -- --ignored --test-threads=1
 cargo test -p astra-runtime --lib responses_transport_replays_checkpoint_and_fences_disconnected_credentials -- --ignored --test-threads=1
+cargo test -p astra-runtime --features e2e-hooks --test web_agent_e2e chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session -- --ignored --test-threads=1
 ```
 
 Live acceptance remains an explicit operator step on an isolated self-hosted

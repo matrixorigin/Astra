@@ -677,7 +677,10 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
             state.final_text_model_item_id.as_deref(),
         )
     {
-        if let Some(continuation) = state.pending_provider_continuation.as_ref() {
+        if state.final_text_model_item_id.is_some()
+            && state.final_text_model_item_id == state.current_model_item_id
+            && let Some(continuation) = state.pending_provider_continuation.as_ref()
+        {
             message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
         }
         state.push_prompt_history_message(message);
@@ -1052,6 +1055,27 @@ mod tests {
             vec![state.messages[1].clone()]
         );
         assert!(state.take_run_transcript_capture().is_empty());
+    }
+
+    #[test]
+    fn terminal_provider_continuation_belongs_only_to_its_model_item() {
+        for final_id in [None, Some("earlier-answer"), Some("current-answer")] {
+            let mut state = make_state();
+            state.messages = vec![serde_json::json!({"role":"user","content":"explain"})];
+            state.final_text = "An answer.".into();
+            state.current_model_item_id = Some("current-answer".into());
+            state.final_text_model_item_id = final_id.map(str::to_owned);
+            state.pending_provider_continuation = Some(serde_json::json!({"items":[]}));
+
+            materialize_terminal_text_message(&mut state);
+
+            assert_eq!(
+                state.messages[1]
+                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                    .is_some(),
+                final_id == Some("current-answer")
+            );
+        }
     }
 
     #[test]

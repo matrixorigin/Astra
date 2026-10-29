@@ -320,6 +320,20 @@ pub fn sanitize_canonical_continuation_messages_with_state(
     Ok(out)
 }
 
+fn canonical_provider_continuation(message: &Value) -> Option<Value> {
+    let mut saved = astra_core::model_wire::responses::validated_continuation(message)?;
+    // Provider-encrypted state and IDs are opaque protocol fields. Free text
+    // follows the existing credential-redaction boundary before persistence.
+    for item in saved["items"].as_array_mut()? {
+        for field in ["content", "summary"] {
+            if let Some(text) = item.get_mut(field) {
+                astra_text_utils::credential_redaction::redact_credentials_in_json(text);
+            }
+        }
+    }
+    Some(saved)
+}
+
 fn canonical_text_message(
     message: &Value,
     role: &str,
@@ -331,6 +345,9 @@ fn canonical_text_message(
         "role": role,
         "content": content,
     });
+    if let Some(saved) = canonical_provider_continuation(message) {
+        projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
+    }
     if message
         .get(crate::cloud::history_summary::HISTORY_SUMMARY_FIELD)
         .and_then(Value::as_u64)
@@ -394,7 +411,11 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
     }
 
     if matched_calls.is_empty() {
-        if let Some(projected) = canonical_text_message(assistant, "assistant", false) {
+        if let Some(mut projected) = canonical_text_message(assistant, "assistant", false) {
+            projected
+                .as_object_mut()
+                .expect("canonical text message is an object")
+                .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
             out.push(projected);
         }
         return;
@@ -409,6 +430,17 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
     }
     if let Some(reasoning) = assistant.get("reasoning_content") {
         projected.insert("reasoning_content".to_string(), reasoning.clone());
+    }
+    // A pruned/incomplete call group cannot replay the complete provider turn.
+    if projected["tool_calls"]
+        .as_array()
+        .is_some_and(|matched| matched.len() == calls.len())
+        && let Some(saved) = canonical_provider_continuation(assistant)
+    {
+        projected.insert(
+            astra_core::model_wire::responses::CONTINUATION_KEY.into(),
+            saved,
+        );
     }
     out.push(Value::Object(projected));
     out.extend(matched_results);
@@ -687,6 +719,61 @@ mod tests {
         runtime_owned_message,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn canonical_history_preserves_scoped_provider_state_and_phase() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let encrypted = "sk-fixtureciphertextciphertextciphertext";
+        let output = ResponseOutput {
+            items: vec![
+                json!({"type":"reasoning","summary":[],"encrypted_content":encrypted}),
+                json!({"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done"}]}),
+            ],
+            ..Default::default()
+        };
+        let mut assistant = json!({"role":"assistant","content":"Done"});
+        assistant[CONTINUATION_KEY] = output.continuation(&connection, "model");
+        let messages = vec![json!({"role":"user","content":"explain"}), assistant];
+        let canonical =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(messages.clone())
+                .unwrap();
+        let replay = request("model", &canonical, None, &connection, false).unwrap();
+        assert_eq!(replay["input"][1]["encrypted_content"], encrypted);
+        assert_eq!(replay["input"][2]["phase"], "final_answer");
+        let switched = request("model", &canonical, None, "other-connection", false).unwrap();
+        assert!(!switched.to_string().contains(encrypted));
+        assert!(
+            sanitize_prompt_facing_messages(messages)[1]
+                .get(CONTINUATION_KEY)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_history_drops_provider_state_from_incomplete_tool_groups() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput};
+        let output = ResponseOutput {
+            items: vec![json!({"type":"function_call","call_id":"c1","name":"read_file"})],
+            ..Default::default()
+        };
+        for matched in [0, 1, 2] {
+            let mut assistant = json!({"role":"assistant","content":"Checking","tool_calls":[
+                {"id":"c1","function":{"name":"read_file","arguments":"{}"}},
+                {"id":"c2","function":{"name":"read_file","arguments":"{}"}}
+            ]});
+            assistant[CONTINUATION_KEY] =
+                output.continuation(&uuid::Uuid::new_v4().to_string(), "model");
+            let mut messages = vec![json!({"role":"user","content":"inspect"}), assistant];
+            for id in ["c1", "c2"].into_iter().take(matched) {
+                messages.push(json!({"role":"tool","tool_call_id":id,"content":"file"}));
+            }
+            let canonical =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(messages)
+                    .unwrap();
+            assert_eq!(canonical[1].get(CONTINUATION_KEY).is_some(), matched == 2);
+        }
+    }
 
     #[test]
     fn compresses_completed_tool_pair_and_drops_reasoning_only_messages() {

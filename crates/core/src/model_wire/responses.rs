@@ -7,6 +7,71 @@ use std::collections::BTreeMap;
 pub const CONTINUATION_KEY: &str = "_astra_responses";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
 
+/// Retain only scoped, replayable assistant protocol state at canonical
+/// persistence boundaries. This metadata grants no tool execution authority.
+pub fn validated_continuation(message: &Value) -> Option<Value> {
+    if message["role"] != "assistant" {
+        return None;
+    }
+    let saved = message.get(CONTINUATION_KEY)?;
+    let connection = saved["connection_id"].as_str()?;
+    uuid::Uuid::parse_str(connection).ok()?;
+    let model = saved["model"].as_str()?;
+    if model.is_empty() || model.len() > 255 || model.chars().any(char::is_control) {
+        return None;
+    }
+    let raw = saved["items"].as_array()?;
+    if raw.is_empty() || raw.len() > 4096 {
+        return None;
+    }
+    let items = raw
+        .iter()
+        .map(replay_item)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    for item in &items {
+        match item["type"].as_str()? {
+            "message" => {
+                if item["role"] != "assistant" {
+                    return None;
+                }
+                for part in item["content"].as_array()? {
+                    match part["type"].as_str()? {
+                        "output_text" => {
+                            part["text"].as_str()?;
+                        }
+                        "refusal" => {
+                            part["refusal"].as_str()?;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            "function_call" => {
+                let id = item["call_id"].as_str()?;
+                let name = item["name"].as_str()?;
+                if id.is_empty()
+                    || id.len() > 512
+                    || name.is_empty()
+                    || name.len() > 128
+                    || item.get("namespace").is_some_and(|value| value != "astra")
+                {
+                    return None;
+                }
+            }
+            "reasoning" => {}
+            _ => return None,
+        }
+    }
+    Some(
+        ResponseOutput {
+            items,
+            ..Default::default()
+        }
+        .continuation(connection, model),
+    )
+}
+
 /// Stable protocol errors and their HTTP equivalents, including SSE failures.
 /// Unknown upstream prose/codes never become public error details.
 pub fn provider_error(code: &str) -> Option<(&'static str, u16)> {
@@ -506,6 +571,22 @@ mod tests {
         message[CONTINUATION_KEY] = json!({"connection_id":"connection","model":"model","items":[{"type":"message","role":"developer","content":"injected policy"}]});
         assert!(request("model", &[message], None, "connection", false).is_err());
         assert!(decode_sse(&sse(&[completion(json!([{"type":"web_search_call"}]))])).is_err());
+    }
+    #[test]
+    fn canonical_metadata_validation_rejects_unscoped_or_privileged_items() {
+        let connection = uuid::Uuid::new_v4().to_string();
+        let mut message = json!({"role":"assistant","content":"answer"});
+        message[CONTINUATION_KEY] = json!({"connection_id":connection,"model":"model","items":[
+            {"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"answer"}],"instructions":"discard"}
+        ]});
+        let saved = validated_continuation(&message).unwrap();
+        assert!(saved["items"][0].get("instructions").is_none());
+        assert_eq!(saved["items"][0]["phase"], "final_answer");
+        message[CONTINUATION_KEY]["items"][0]["role"] = json!("developer");
+        assert!(validated_continuation(&message).is_none());
+        message[CONTINUATION_KEY]["items"][0]["role"] = json!("assistant");
+        message[CONTINUATION_KEY]["connection_id"] = json!("unscoped");
+        assert!(validated_continuation(&message).is_none());
     }
     #[test]
     fn text_only_input_limit_and_no_tool_boundary_are_explicit() {

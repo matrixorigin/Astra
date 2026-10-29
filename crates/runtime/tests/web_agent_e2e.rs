@@ -6108,20 +6108,22 @@ mod subscription_provider {
     ));
 }
 
+#[path = "../../services/tests/common/isolated_database.rs"]
+mod subscription_isolated_database;
+
 /// Product path: explicit provider consent, personal model creation, real
-/// workspace read, durable session history, and a fresh Server composition.
+/// model-catalog execution, durable history, and fresh Server services.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
-async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session() {
+async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
     use astra_services::chatgpt::ChatgptConfig;
     use astra_services::{DatabaseAgentService, DatabaseModelService, DatabaseSessionService};
     init_env();
     let settings = test_support::require_db_it_env();
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DATABASE").as_deref(),
-        Ok(settings.database.as_str())
-    );
-    assert!(settings.database != "astra_runtime" && settings.database != "mysql");
+    subscription_isolated_database::require_isolated_database(&settings.database);
+    let journals = tempfile::tempdir().unwrap();
+    let _journal_scope =
+        astra_services::session_journal::ProcessJournalDirGuard::new(journals.path());
     astra_services::ensure_core_schema(&settings, "mysql")
         .await
         .unwrap();
@@ -6129,7 +6131,6 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
     let provider = subscription_provider::ProviderFixture::start().await;
     let config = ChatgptConfig::for_test(&provider.base);
     let key = test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!");
-    let directory = Arc::new(tempfile::tempdir().unwrap());
     let make_app = || {
         let models = Arc::new(
             DatabaseModelService::new(settings.clone(), key.clone())
@@ -6137,6 +6138,7 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
                 .with_chatgpt_config(config.clone()),
         );
         let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+            .with_shared_pool(pool.clone())
             .with_auth_service(Arc::new(StubAuth))
             .with_agent_service(Arc::new(
                 DatabaseAgentService::new(settings.clone()).with_pool(pool.clone()),
@@ -6156,13 +6158,9 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
             astra_runtime::RunEngine::new(store),
         )
         .with_pool(pool.clone())
+        .with_auth_service(Arc::new(StubAuth))
         .with_model_service(models)
         .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
-        let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
-            lifecycle,
-            directory.clone(),
-            "subscription-public-workspace",
-        );
         (base, lifecycle)
     };
     async fn post(app: &Router, path: &str, value: Value) -> Value {
@@ -6213,7 +6211,12 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
     )
     .await;
     let model=post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await;
-    let agent=post(&app,"/agents",json!({"agent_name":format!("subscription-{}",uuid::Uuid::new_v4()),"system_prompt":"Read the requested file and report its contents.","config":{}})).await;
+    let agent = post(
+        &app,
+        "/agents",
+        json!({"name":format!("subscription-{}",uuid::Uuid::new_v4())}),
+    )
+    .await;
     let session = post(
         &app,
         "/sessions",
@@ -6223,30 +6226,28 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
     let session_id = session["session_id"].as_str().unwrap();
     drop(app);
     let (base, lifecycle) = make_app();
-    let workspace = astra_runtime::server::provider_test_support::provision_workspace_fixture(
-        &lifecycle, session_id,
-    )
-    .unwrap();
-    std::fs::write(
-        std::path::Path::new(&workspace.root_or_volume_ref).join("review.txt"),
-        "subscription-real-file-marker",
-    )
-    .unwrap();
     *provider.state.script.lock().unwrap() = vec![
-        ("tool_search".into(), json!({"query":"select:read_file"})),
+        (
+            "tool_search".into(),
+            json!({"query":"select:model_catalog"}),
+        ),
         (
             "invoke_tool".into(),
-            json!({"name":"read_file","arguments":{"path":"review.txt"}}),
+            json!({"name":"model_catalog","arguments":{"limit":16}}),
         ),
     ];
     provider
         .state
         .scripted
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
+    let lifecycle = Arc::new(lifecycle);
+    let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
     let payload = |message: &str| json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
-    let first =
-        chat_stream_collect(&app, payload("subscription-public-first: Read review.txt.")).await;
+    let first = chat_stream_collect(
+        &app,
+        payload("subscription-public-first: List the models I can use."),
+    )
+    .await;
     assert!(
         first.iter().all(|event| event["type"] != "error"),
         "{first:?}"
@@ -6258,21 +6259,54 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
     let requests = provider.state.requests.lock().unwrap().clone();
     assert!(
         requests.iter().any(
-            |request| request["input"]
+            |request| request["input"].as_array().unwrap().iter().any(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains(model["model_id"].as_str().unwrap()))
+            })
+        ),
+        "authorized model catalog never reached the provider: {:?}",
+        requests
+            .iter()
+            .map(|request| request["input"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item["type"] == "function_call_output"
-                    && item["output"]
-                        .as_str()
-                        .is_some_and(|output| output.contains("subscription-real-file-marker")))
-        ),
-        "real workspace contents never reached the provider"
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["output"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(1200)
+                    .collect::<String>())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lifecycle.background_task_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let persisted:i64=sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id=? AND session_id=? AND content_json LIKE '%_astra_responses%'")
+        .bind(USER_ID).bind(session_id).fetch_one(pool.get()).await.unwrap();
+    assert!(
+        persisted > 0,
+        "provider continuation was not written to canonical database history"
     );
     drop(app);
+    drop(lifecycle);
+    // A new local journal root also rules out recovering the first turn from
+    // its local journal. The fresh services must read the durable store.
+    let fresh_journals = tempfile::tempdir().unwrap();
+    let _fresh_journal_scope =
+        astra_services::session_journal::ProcessJournalDirGuard::new(fresh_journals.path());
     // Build new services and a new run engine against the same durable store.
     let (base, lifecycle) = make_app();
-    let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
+    let lifecycle = Arc::new(lifecycle);
+    let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
     let before = provider.state.requests.lock().unwrap().len();
     let second = chat_stream_collect(
         &app,
@@ -6283,6 +6317,13 @@ async fn chatgpt_subscription_agent_reads_file_and_continues_persisted_session()
         second.iter().all(|event| event["type"] != "error"),
         "{second:?}"
     );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lifecycle.background_task_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     let requests = provider.state.requests.lock().unwrap();
     let continued = &requests[before..];
     assert!(
