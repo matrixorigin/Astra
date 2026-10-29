@@ -84,6 +84,9 @@ Retry backoff uses the shared provider deadline/cancellation owner and consumes
 the original inference budget.
 Catalog reads and connectivity probes share version-aware 401 recovery. Failed
 and incomplete Responses retain provider identity and usage for settlement.
+Streaming protocols share the physical-attempt runner for sending, retries,
+deadlines, error-body reads and settlement. The Responses adapter owns wire
+decoding and its connection fences, including cancellation during a stream.
 
 Responses requests always send full history with `store:false` and `stream:true`.
 Astra functions occupy the `astra` namespace. Completed provider output items,

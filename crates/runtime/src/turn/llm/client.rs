@@ -5270,6 +5270,192 @@ pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
     .await
 }
 
+struct ProviderStreamFailure {
+    error: astra_core::ClassifiedError,
+    partial: LlmCallResult,
+    rejected: bool,
+}
+
+async fn settle_provider_stream(
+    outcome: Result<LlmCallResult, ProviderStreamFailure>,
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt: Option<u32>,
+    provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
+    output_limit: Option<usize>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    match outcome {
+        Ok(mut result) => {
+            result.judgment_provenance = provenance;
+            reconcile_missing_output_cap_finish_reason(&mut result, output_limit);
+            note_observed_provider_usage_presence(observer, attempt, result.usage_presence);
+            finish_observed_provider_attempt(
+                observer,
+                attempt,
+                &provider_attempt_terminal_from_result(&result),
+            )
+            .await
+            .map_err(|error| attach_llm_result_details(error, &result))?;
+            Ok(result)
+        }
+        Err(failure) => {
+            let error = attach_llm_result_details(failure.error, &failure.partial);
+            if failure.rejected {
+                finish_observed_provider_error_with_partial(
+                    observer,
+                    attempt,
+                    &error,
+                    &failure.partial,
+                )
+                .await?;
+            } else {
+                finish_observed_provider_delivery_unknown_with_partial(
+                    observer,
+                    attempt,
+                    &error,
+                    &failure.partial,
+                )
+                .await?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn classify_stream_failure(
+    failure: StreamCollectError,
+    started: Instant,
+    budget: Option<Duration>,
+) -> ProviderStreamFailure {
+    use astra_core::{ClassifiedError, ErrorKind};
+    let (error, partial) = match failure {
+        StreamCollectError::Cancelled { partial } => (
+            ClassifiedError::new(
+                ErrorKind::Cancelled,
+                "LLM stream cancelled after provider delivery",
+            ),
+            partial,
+        ),
+        StreamCollectError::ProviderWorkDeadline {
+            elapsed_ms,
+            partial,
+        } => (
+            provider_deadline_from_transport(
+                "consuming the provider stream",
+                "stream exceeded the invocation-wide provider work budget",
+                Duration::from_millis(elapsed_ms),
+                None,
+            ),
+            partial,
+        ),
+        StreamCollectError::Transport { error, partial } => {
+            let error = if budget.is_some_and(|budget| started.elapsed() >= budget) {
+                provider_deadline_from_transport(
+                    "consuming the provider stream",
+                    &error,
+                    started.elapsed(),
+                    None,
+                )
+            } else {
+                ClassifiedError::new(
+                    ErrorKind::StreamTransport,
+                    format!("LLM stream transport error: {error}"),
+                )
+            };
+            (error, partial)
+        }
+        StreamCollectError::IdleTimeout {
+            elapsed_ms,
+            partial,
+        } => (
+            ClassifiedError::new(
+                ErrorKind::StreamIdle,
+                format!("stream idle timeout after {elapsed_ms}ms"),
+            ),
+            partial,
+        ),
+        StreamCollectError::SemanticProgressTimeout {
+            elapsed_ms,
+            made_semantic_progress,
+            partial,
+        } => {
+            let details = json!({
+                "deadline": {
+                    "scope":"provider_attempt", "phase":"semantic_progress", "limit_ms":elapsed_ms,
+                    "elapsed_ms":started.elapsed().as_millis() as u64,
+                    "semantic_activity_observed":!partial.reasoning.trim().is_empty() || made_semantic_progress,
+                    "actionable_delivery_observed":made_semantic_progress, "retry_safety":"convergence_only"
+                },
+                // An explicit empty partial authorizes the existing bounded recovery.
+                "partial_full_text":partial.full_text,"partial_reasoning":partial.reasoning,
+                "reasoning_signature":partial.reasoning_signature,"tool_calls":partial.tool_calls,
+                "usage":partial.usage,"finish_reason":partial.finish_reason,
+                "effective_finish_reason":partial.effective_finish_reason,"model_used":partial.model_used
+            });
+            (
+                ClassifiedError::new(
+                    ErrorKind::ProviderDeadline,
+                    format!("provider stream produced no semantic progress for {elapsed_ms}ms"),
+                )
+                .with_details_json(details.to_string()),
+                partial,
+            )
+        }
+    };
+    ProviderStreamFailure {
+        error,
+        partial,
+        rejected: false,
+    }
+}
+
+async fn wait_connection_cancel(lease: Option<&astra_services::chatgpt::CredentialLease>) {
+    match lease {
+        Some(lease) => lease.cancel.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn read_provider_error_body(
+    mut response: reqwest::Response,
+    limit: Option<usize>,
+    started: Instant,
+    budget: Duration,
+) -> Result<String, astra_core::ClassifiedError> {
+    let classify = |error: reqwest::Error| {
+        if started.elapsed() >= budget {
+            provider_deadline_from_transport(
+                "reading the provider error response body",
+                &error.to_string(),
+                started.elapsed(),
+                None,
+            )
+        } else {
+            astra_core::ClassifiedError::new(
+                if error.is_timeout() {
+                    astra_core::ErrorKind::StreamIdle
+                } else {
+                    astra_core::ErrorKind::StreamTransport
+                },
+                format!("LLM error response body could not be read: {error}"),
+            )
+        }
+    };
+    let Some(limit) = limit else {
+        return response.text().await.map_err(classify);
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(classify)? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ResourceLimit,
+                "provider error response exceeded its size limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn call_prepared_llm_with_total_budget(
     prepared: PreparedStreamingCall<'_>,
     cancel: LlmCancel<'_>,
@@ -5298,6 +5484,12 @@ async fn call_prepared_llm_with_total_budget(
         completions_url_override,
         ..
     } = route;
+    if (provider == astra_services::chatgpt::PROVIDER) != route.subscription.is_some() {
+        return Err(responses::error(
+            astra_core::ErrorKind::ContractViolation,
+            "subscription_route_mismatch",
+        ));
+    }
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let model_key = model_name;
@@ -5322,25 +5514,19 @@ async fn call_prepared_llm_with_total_budget(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
-    if provider == astra_services::chatgpt::PROVIDER {
-        return responses::execute(
-            route,
-            prepared_request,
-            &url,
-            authorized_tool_names,
-            judgment_provenance,
-            cancel,
-            stream_callback,
-            attempt_observer,
-            started,
-            total_budget,
-        )
-        .await;
-    }
-    let client = global_llm_client();
+    let subscription = route.subscription;
+    let subscription_client = subscription
+        .map(|binding| binding.http_client())
+        .transpose()
+        .map_err(responses::credential_error)?;
+    let client = subscription_client
+        .as_ref()
+        .unwrap_or_else(|| global_llm_client());
+    let mut rejected_version = None;
+    let mut auth_retried = false;
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
-    let mut last_model_gateway_error = None;
+    let mut last_structured_error = None;
     let max_retries = LLM_MAX_RETRIES;
     let mut retry_delay_override_ms = None;
     // Read idle timeouts once before the retry loop to avoid env-var races between
@@ -5412,11 +5598,29 @@ async fn call_prepared_llm_with_total_budget(
             None
         };
         let client = compatible_client.as_deref().unwrap_or(client);
+        let lease = if let Some(binding) = subscription {
+            let remaining = total_budget.saturating_sub(started.elapsed());
+            Some(tokio::select! {
+                biased;
+                _ = wait_llm_cancel(cancel) => return Err(responses::error(astra_core::ErrorKind::Cancelled, "cancelled")),
+                value = tokio::time::timeout(remaining, binding.acquire(rejected_version.take())) => value
+                    .map_err(|_| responses::error(astra_core::ErrorKind::ProviderDeadline, "credential_deadline"))?
+                    .map_err(responses::credential_error)?,
+            })
+        } else {
+            None
+        };
         let observed_attempt =
             begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
         let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, header_overrides);
-        req = apply_llm_header_overrides(req, header_overrides);
+        req = if let Some(lease) = &lease {
+            req.bearer_auth(lease.bearer())
+        } else {
+            apply_llm_header_overrides(
+                apply_provider_auth(req, provider, api_key, header_overrides),
+                header_overrides,
+            )
+        };
         // Bound response startup separately from a successful streaming body.
         let remaining_total_budget = total_budget.saturating_sub(started.elapsed());
         if remaining_total_budget.is_zero() {
@@ -5475,6 +5679,11 @@ async fn call_prepared_llm_with_total_budget(
                     &error,
                 )
                 .await?;
+                return Err(error);
+            }
+            _ = wait_connection_cancel(lease.as_ref()) => {
+                let error = responses::error(astra_core::ErrorKind::Cancelled, "model_connection_unavailable");
+                finish_observed_provider_delivery_unknown(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
             result = tokio::time::timeout(request_deadline, send_request) => result,
@@ -5556,7 +5765,7 @@ async fn call_prepared_llm_with_total_budget(
                 // This transport failure is the newest provider attempt outcome.
                 // Do not let structured metadata from an earlier gateway response
                 // replace the final connection failure after retries are exhausted.
-                last_model_gateway_error = None;
+                last_structured_error = None;
                 last_err = error.message.clone();
                 last_kind = error.kind;
                 if retry_safe {
@@ -5569,6 +5778,27 @@ async fn call_prepared_llm_with_total_budget(
         let status = response.status().as_u16();
         if response.status().is_success() {
             // Success — record to cooldown tracker
+            if let Some(lease) = &lease {
+                let outcome = responses::collect(
+                    response,
+                    route,
+                    &authorized_tool_names,
+                    cancel,
+                    stream_callback.as_deref_mut(),
+                    started,
+                    stream_budget,
+                    lease,
+                )
+                .await;
+                return settle_provider_stream(
+                    outcome,
+                    attempt_observer,
+                    observed_attempt,
+                    judgment_provenance,
+                    wire_output_limit,
+                )
+                .await;
+            }
             cooldown.with(model_key, |c| c.record_success());
             if provider_uses_bedrock_converse(provider) {
                 match crate::turn::bedrock::transport::collect_bedrock_stream_for_wire(
@@ -5583,105 +5813,21 @@ async fn call_prepared_llm_with_total_budget(
                 )
                 .await
                 {
-                    Ok(mut result) => {
-                        result.judgment_provenance = judgment_provenance;
-                        reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
-                        note_observed_provider_usage_presence(
-                            attempt_observer,
-                            observed_attempt,
-                            result.usage_presence,
-                        );
-                        if let Err(error) = finish_observed_provider_attempt(
-                            attempt_observer,
-                            observed_attempt,
-                            &provider_attempt_terminal_from_result(&result),
-                        )
-                        .await
-                        {
-                            return Err(attach_llm_result_details(error, &result));
-                        }
-                        return Ok(result);
-                    }
-                    Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled {
-                        partial,
-                    }) => {
-                        let error = attach_partial_details(
-                            astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "Bedrock stream cancelled after provider delivery",
-                            ),
-                            &partial,
-                        );
-                        finish_observed_provider_delivery_unknown_with_partial(
-                            attempt_observer,
-                            observed_attempt,
-                            &error,
-                            &partial,
-                        )
-                        .await?;
-                        return Err(error);
-                    }
-                    Err(
-                        crate::turn::bedrock::transport::BedrockStreamError::ProviderWorkDeadline {
-                            elapsed_ms,
-                            partial,
-                        },
-                    ) => {
-                        let error = provider_deadline_from_transport(
-                            "consuming a continuously progressing Bedrock provider stream",
-                            "stream exceeded the invocation-wide provider work budget",
-                            std::time::Duration::from_millis(elapsed_ms),
-                            Some(&partial),
-                        );
-                        finish_observed_provider_delivery_unknown_with_partial(
-                            attempt_observer,
-                            observed_attempt,
-                            &error,
-                            &partial,
-                        )
-                        .await?;
-                        return Err(error);
-                    }
-                    Err(crate::turn::bedrock::transport::BedrockStreamError::SemanticProgressTimeout {
-                        elapsed_ms,
-                        made_semantic_progress,
-                        partial,
-                    }) => {
-                        let details = serde_json::json!({
-                            "deadline": {
-                                "scope": "provider_attempt",
-                                "phase": "semantic_progress",
-                                "limit_ms": elapsed_ms,
-                                "elapsed_ms": started.elapsed().as_millis() as u64,
-                                "semantic_activity_observed": !partial.reasoning.trim().is_empty() || made_semantic_progress,
-                                "actionable_delivery_observed": made_semantic_progress,
-                                "retry_safety": "convergence_only"
-                            },
-                            "partial_full_text": partial.full_text,
-                            "partial_reasoning": partial.reasoning,
-                            "reasoning_signature": partial.reasoning_signature,
-                            "tool_calls": partial.tool_calls,
-                            "usage": partial.usage,
-                            "finish_reason": partial.finish_reason,
-                            "effective_finish_reason": partial.effective_finish_reason,
-                            "model_used": partial.model_used,
-                        });
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ProviderDeadline,
-                            format!(
-                                "provider stream produced no semantic progress for {elapsed_ms}ms"
-                            ),
-                        )
-                        .with_details_json(details.to_string());
-                        finish_observed_provider_delivery_unknown_with_partial(
-                            attempt_observer,
-                            observed_attempt,
-                            &error,
-                            &partial,
-                        )
-                        .await?;
-                        return Err(error);
-                    }
+                    Ok(result) => return settle_provider_stream(
+                        Ok(result), attempt_observer, observed_attempt, judgment_provenance, wire_output_limit,
+                    ).await,
+                    Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled { partial }) =>
+                        return settle_provider_stream(Err(classify_stream_failure(
+                            StreamCollectError::Cancelled { partial }, started, stream_budget,
+                        )), attempt_observer, observed_attempt, judgment_provenance, wire_output_limit).await,
+                    Err(crate::turn::bedrock::transport::BedrockStreamError::ProviderWorkDeadline { elapsed_ms, partial }) =>
+                        return settle_provider_stream(Err(classify_stream_failure(
+                            StreamCollectError::ProviderWorkDeadline { elapsed_ms, partial }, started, stream_budget,
+                        )), attempt_observer, observed_attempt, judgment_provenance, wire_output_limit).await,
+                    Err(crate::turn::bedrock::transport::BedrockStreamError::SemanticProgressTimeout { elapsed_ms, made_semantic_progress, partial }) =>
+                        return settle_provider_stream(Err(classify_stream_failure(
+                            StreamCollectError::SemanticProgressTimeout { elapsed_ms, made_semantic_progress, partial }, started, stream_budget,
+                        )), attempt_observer, observed_attempt, judgment_provenance, wire_output_limit).await,
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Exception {
                         kind,
                         message,
@@ -5764,40 +5910,11 @@ async fn call_prepared_llm_with_total_budget(
                             }
                         }
                     }
-                    Err(crate::turn::bedrock::transport::BedrockStreamError::Transport {
-                        error: transport_error,
-                        partial,
-                    }) => {
-                        let kind = if stream_budget.is_some_and(|budget| started.elapsed() >= budget) {
-                            astra_core::ErrorKind::ProviderDeadline
-                        } else {
-                            astra_core::ErrorKind::StreamTransport
-                        };
-                        let error = if kind == astra_core::ErrorKind::ProviderDeadline {
-                            provider_deadline_from_transport(
-                                "consuming the Bedrock provider stream",
-                                &transport_error,
-                                started.elapsed(),
-                                Some(&partial),
-                            )
-                        } else {
-                            attach_partial_details(
-                                astra_core::ClassifiedError::new(
-                                    kind,
-                                    format!("bedrock transport: {transport_error}"),
-                                ),
-                                &partial,
-                            )
-                        };
-                        finish_observed_provider_delivery_unknown_with_partial(
-                            attempt_observer,
-                            observed_attempt,
-                            &error,
-                            &partial,
-                        )
-                        .await?;
-                        return Err(error);
-                    }
+                    Err(crate::turn::bedrock::transport::BedrockStreamError::Transport { error, partial }) =>
+                        return settle_provider_stream(Err(classify_stream_failure(
+                            StreamCollectError::Transport { error, partial }, started, stream_budget,
+                        )), attempt_observer, observed_attempt, judgment_provenance, wire_output_limit).await,
+
                 }
             }
             let byte_stream = response.bytes_stream();
@@ -5828,153 +5945,15 @@ async fn call_prepared_llm_with_total_budget(
                 )
                 .await
             };
-            match stream_result {
-                Ok(mut result) => {
-                    result.judgment_provenance = judgment_provenance;
-                    reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
-                    note_observed_provider_usage_presence(
-                        attempt_observer,
-                        observed_attempt,
-                        result.usage_presence,
-                    );
-                    if let Err(error) = finish_observed_provider_attempt(
-                        attempt_observer,
-                        observed_attempt,
-                        &provider_attempt_terminal_from_result(&result),
-                    )
-                    .await
-                    {
-                        return Err(attach_llm_result_details(error, &result));
-                    }
-                    return Ok(result);
-                }
-                Err(StreamCollectError::Cancelled { partial }) => {
-                    let error = attach_partial_details(
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::Cancelled,
-                            "LLM stream cancelled after provider delivery",
-                        ),
-                        &partial,
-                    );
-                    finish_observed_provider_delivery_unknown_with_partial(
-                        attempt_observer,
-                        observed_attempt,
-                        &error,
-                        &partial,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(StreamCollectError::ProviderWorkDeadline {
-                    elapsed_ms,
-                    partial,
-                }) => {
-                    let error = provider_deadline_from_transport(
-                        "consuming the provider stream",
-                        "stream exceeded the invocation-wide provider work budget",
-                        std::time::Duration::from_millis(elapsed_ms),
-                        Some(&partial),
-                    );
-                    finish_observed_provider_delivery_unknown_with_partial(
-                        attempt_observer,
-                        observed_attempt,
-                        &error,
-                        &partial,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(StreamCollectError::Transport { error, partial }) => {
-                    let kind = if stream_budget.is_some_and(|budget| started.elapsed() >= budget) {
-                        astra_core::ErrorKind::ProviderDeadline
-                    } else {
-                        astra_core::ErrorKind::StreamTransport
-                    };
-                    let observed_error = if kind == astra_core::ErrorKind::ProviderDeadline {
-                        provider_deadline_from_transport(
-                            "consuming the provider stream",
-                            &error,
-                            started.elapsed(),
-                            Some(&partial),
-                        )
-                    } else {
-                        attach_partial_details(
-                            astra_core::ClassifiedError::new(
-                                kind,
-                                format!("LLM stream transport error: {error}"),
-                            ),
-                            &partial,
-                        )
-                    };
-                    finish_observed_provider_delivery_unknown_with_partial(
-                        attempt_observer,
-                        observed_attempt,
-                        &observed_error,
-                        &partial,
-                    )
-                    .await?;
-                    return Err(observed_error);
-                }
-                Err(StreamCollectError::IdleTimeout {
-                    elapsed_ms,
-                    partial,
-                    ..
-                }) => {
-                    let observed_error = attach_partial_details(
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::StreamIdle,
-                            format!("stream idle timeout after {elapsed_ms}ms"),
-                        ),
-                        &partial,
-                    );
-                    finish_observed_provider_delivery_unknown_with_partial(
-                        attempt_observer,
-                        observed_attempt,
-                        &observed_error,
-                        &partial,
-                    )
-                    .await?;
-                    return Err(observed_error);
-                }
-                Err(StreamCollectError::SemanticProgressTimeout {
-                    elapsed_ms,
-                    made_semantic_progress,
-                    partial,
-                }) => {
-                    let details = serde_json::json!({
-                        "deadline": {
-                            "scope": "provider_attempt",
-                            "phase": "semantic_progress",
-                            "limit_ms": elapsed_ms,
-                            "elapsed_ms": started.elapsed().as_millis() as u64,
-                            "semantic_activity_observed": !partial.reasoning.trim().is_empty() || made_semantic_progress,
-                            "actionable_delivery_observed": made_semantic_progress,
-                            "retry_safety": "convergence_only"
-                        },
-                        "partial_full_text": partial.full_text,
-                        "partial_reasoning": partial.reasoning,
-                        "reasoning_signature": partial.reasoning_signature,
-                        "tool_calls": partial.tool_calls,
-                        "usage": partial.usage,
-                        "finish_reason": partial.finish_reason,
-                        "effective_finish_reason": partial.effective_finish_reason,
-                        "model_used": partial.model_used,
-                    });
-                    let observed_error = astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ProviderDeadline,
-                        format!("provider stream produced no semantic progress for {elapsed_ms}ms"),
-                    )
-                    .with_details_json(details.to_string());
-                    finish_observed_provider_delivery_unknown_with_partial(
-                        attempt_observer,
-                        observed_attempt,
-                        &observed_error,
-                        &partial,
-                    )
-                    .await?;
-                    return Err(observed_error);
-                }
-            }
+            return settle_provider_stream(
+                stream_result
+                    .map_err(|failure| classify_stream_failure(failure, started, stream_budget)),
+                attempt_observer,
+                observed_attempt,
+                judgment_provenance,
+                wire_output_limit,
+            )
+            .await;
         }
 
         // Parse retry-after header
@@ -5997,7 +5976,12 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let body = response.text();
+        let body = read_provider_error_body(
+            response,
+            subscription.map(|_| 1024 * 1024),
+            started,
+            total_budget,
+        );
         tokio::pin!(body);
         let body_result = tokio::select! {
             biased;
@@ -6006,6 +5990,11 @@ async fn call_prepared_llm_with_total_budget(
                     astra_core::ErrorKind::Cancelled,
                     "LLM call cancelled while reading provider error response",
                 );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+            _ = wait_connection_cancel(lease.as_ref()) => {
+                let error = responses::error(astra_core::ErrorKind::Cancelled, "model_connection_unavailable");
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
@@ -6022,30 +6011,31 @@ async fn call_prepared_llm_with_total_budget(
         let text = match body_result {
             Ok(text) => text,
             Err(error) => {
-                let kind = if started.elapsed() >= total_budget {
-                    astra_core::ErrorKind::ProviderDeadline
-                } else if error.is_timeout() {
-                    astra_core::ErrorKind::StreamIdle
-                } else {
-                    astra_core::ErrorKind::StreamTransport
-                };
-                let error = if kind == astra_core::ErrorKind::ProviderDeadline {
-                    provider_deadline_from_transport(
-                        "reading the provider error response body",
-                        &error.to_string(),
-                        started.elapsed(),
-                        None,
-                    )
-                } else {
-                    astra_core::ClassifiedError::new(
-                        kind,
-                        format!("LLM error response body could not be read: {error}"),
-                    )
-                };
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
         };
+
+        if let Some(lease) = &lease {
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = astra_services::chatgpt::provider_error_code(status, &body);
+            let error = responses::error(provider_http_error_kind(status, code), code)
+                .with_details_json(
+                    json!({"source":"chatgpt","code":code,"http_status":status}).to_string(),
+                );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            if status == 401 && !auth_retried {
+                rejected_version = Some(lease.version());
+                auth_retried = true;
+                retry_delay_override_ms = Some(0);
+            } else if status < 500 {
+                return Err(error);
+            }
+            last_err = error.message.clone();
+            last_kind = error.kind;
+            last_structured_error = Some(error);
+            continue;
+        }
 
         if let Some(model_gateway_error) = moi_model_gateway_error(
             status,
@@ -6058,12 +6048,12 @@ async fn call_prepared_llm_with_total_budget(
             if model_gateway_error.retryable && status >= 500 {
                 last_err = error.message.clone();
                 last_kind = error.kind;
-                last_model_gateway_error = Some(error);
+                last_structured_error = Some(error);
                 continue;
             }
             return Err(error);
         }
-        last_model_gateway_error = None;
+        last_structured_error = None;
         // A negotiated gateway route must retain its versioned error boundary;
         // do not reinterpret a missing/mismatched contract as a provider error.
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
@@ -6194,7 +6184,7 @@ async fn call_prepared_llm_with_total_budget(
         return Err(error);
     }
 
-    if let Some(error) = last_model_gateway_error {
+    if let Some(error) = last_structured_error {
         return Err(error);
     }
     Err(astra_core::ClassifiedError::new(
@@ -8820,6 +8810,27 @@ mod tests {
     async fn sleep_ms_or_llm_cancel_sleeps_when_no_cancel_source() {
         let r = sleep_ms_or_llm_cancel(8, LlmCancel::None).await;
         assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn semantic_timeout_preserves_an_explicit_empty_partial() {
+        let failure = classify_stream_failure(
+            StreamCollectError::SemanticProgressTimeout {
+                elapsed_ms: 10,
+                made_semantic_progress: false,
+                partial: LlmCallResult::default(),
+            },
+            Instant::now(),
+            Some(Duration::from_secs(1)),
+        );
+        let error = settle_provider_stream(Err(failure), None, None, None, None)
+            .await
+            .unwrap_err();
+        let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["partial_full_text"], "");
+        assert_eq!(details["partial_reasoning"], "");
+        assert_eq!(details["tool_calls"], json!([]));
+        assert_eq!(details["deadline"]["phase"], "semantic_progress");
     }
 
     #[tokio::test]

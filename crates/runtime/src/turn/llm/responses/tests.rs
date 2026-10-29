@@ -196,6 +196,40 @@ async fn responses_transport_recovery_and_credential_fencing() {
     );
     *provider.state.reject_token.lock().unwrap() = None;
 
+    // Shared supervision must retry a transient admission failure and retain
+    // the typed subscription error if every physical attempt is rejected.
+    {
+        let _backoff = super::super::set_test_retry_backoff_ms(1);
+        let before = provider.state.responses_calls.load(Ordering::SeqCst);
+        provider
+            .state
+            .transient_responses
+            .store(1, Ordering::SeqCst);
+        assert!(infer(&admitted, &messages, &[], &attempts).await.is_ok());
+        assert_eq!(
+            provider.state.responses_calls.load(Ordering::SeqCst),
+            before + 2
+        );
+        provider
+            .state
+            .transient_responses
+            .store(LLM_MAX_RETRIES as usize + 1, Ordering::SeqCst);
+        let failure = infer(&admitted, &messages, &[], &attempts)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, astra_core::ErrorKind::ServerError);
+        assert!(
+            failure
+                .message
+                .contains("subscription_sharing_usage_unavailable")
+        );
+        assert!(!failure.message.contains("private upstream prose"));
+        assert_eq!(
+            provider.state.responses_calls.load(Ordering::SeqCst),
+            before + 2 + LLM_MAX_RETRIES as usize + 1
+        );
+    }
+
     provider.state.context_failure.store(true, Ordering::SeqCst);
     let failure = infer(&admitted, &messages, &[], &attempts)
         .await

@@ -648,10 +648,11 @@ impl ChatgptConnections {
                 "Finish or cancel a pending authorization",
             ));
         }
-        query("INSERT INTO user_llm_authorizations (authorization_id,user_id,connection_id,label,redirect_uri,state_digest,nonce_digest,verifier_encrypted,client_id,expected_subject,status,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?)")
-            .bind(&id).bind(owner).bind(request.connection_id).bind(label).bind(request.redirect_uri)
+        // Stable parameter types preserve nullable fences across cached executions.
+        query("INSERT INTO user_llm_authorizations (authorization_id,user_id,connection_id,label,redirect_uri,state_digest,nonce_digest,verifier_encrypted,client_id,expected_subject,status,expires_at) VALUES (?,?,CASE WHEN CAST(? AS SIGNED) <> 0 THEN CAST(? AS CHAR(255)) ELSE CAST(NULL AS CHAR(255)) END,?,?,?,?,?,?,CASE WHEN CAST(? AS SIGNED) <> 0 THEN CAST(? AS CHAR(255)) ELSE CAST(NULL AS CHAR(255)) END,'pending',?)")
+            .bind(&id).bind(owner).bind(if request.connection_id.is_some() {"1"} else {"0"}).bind(request.connection_id.as_deref().unwrap_or("")).bind(label).bind(request.redirect_uri)
             .bind(self.encryptor.keyed_digest("chatgpt-state",&state)).bind(self.encryptor.keyed_digest("chatgpt-nonce",&nonce))
-            .bind(self.encryptor.encrypt(&verifier).map_err(internal_error)?).bind(client_id).bind(subject).bind(expires)
+            .bind(self.encryptor.encrypt(&verifier).map_err(internal_error)?).bind(client_id).bind(if subject.is_some() {"1"} else {"0"}).bind(subject.as_deref().unwrap_or("")).bind(expires)
             .execute(&pool).await.map_err(internal_error)?;
         Ok(
             json!({"authorization_id":id,"authorization_url":url.as_str(),"state":state,"expires_at":expires}),

@@ -57,6 +57,8 @@ Offline coverage lives in `astra-core::model_wire::responses` (wire codec),
 `services/tests/chatgpt_connections_db_it.rs` uses an explicitly isolated
 MatrixOne database and a local fake OAuth/Responses provider for encryption,
 ownership, rotation races, model sharing, disconnect and reauthorization.
+The identity journey reuses one SQL connection from initial registration through
+reauthorization and verifies its persisted connection/subject fences.
 Refresh regressions cover a refused TCP connection followed by recovery,
 cross-instance expiry with 11-second discovery/JWKS/token legs, and metadata
 cache reuse, rejected refresh rate limits and probe 401 recovery. Cancellation of the last refresh waiter must still commit the new
@@ -71,6 +73,8 @@ failed-response usage preservation, and disconnect during
 headers. Sixteen concurrent requests verify that SQL fencing is shared per
 connection. A refused-connection retry with a 100 ms invocation budget must
 expire during its one-second backoff before admitting a second attempt.
+Transient HTTP admission failures exercise the shared retry runner and preserve
+the structured subscription error after physical retries are exhausted.
 The ignored `chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session`
 test in `runtime/tests/web_agent_e2e.rs` exercises authenticated connection and
 model routes, real model-catalog tool execution through `/chat/stream`, and

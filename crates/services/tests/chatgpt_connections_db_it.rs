@@ -141,7 +141,12 @@ async fn valid_credentials_read_concurrently_over_database_round_trips() {
 async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
-    let (shared, settings) = common::setup_pool_and_settings().await;
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    // Reuse one connection across registration (NULL fields) and reauthorization
+    // (populated fields) so cached nullable parameter metadata cannot hide a bug.
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = astra_core::SharedPool::new(&settings).await.unwrap();
     let pool = shared.get().clone();
     let mut provider = fixture::ProviderFixture::start().await;
     let config = ChatgptConfig::for_test(&provider.base);
@@ -439,6 +444,12 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
 
     // A reauthorization belongs to the existing verified identity, not email.
     let relink = start(&service, &owner, Some(&connection)).await;
+    let fence:(Option<String>,Option<String>)=sqlx::query_as("SELECT connection_id,expected_subject FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?")
+        .bind(&owner).bind(relink["authorization_id"].as_str().unwrap()).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        fence,
+        (Some(connection.clone()), Some("account-one".into()))
+    );
     let wrong_code = provider.issue_code(&relink, "another-account", true);
     assert!(
         service

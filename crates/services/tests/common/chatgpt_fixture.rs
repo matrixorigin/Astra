@@ -53,6 +53,7 @@ pub struct ProviderState {
     pub scripted: AtomicBool,
     pub context_failure: AtomicBool,
     pub stream_quota: AtomicBool,
+    pub transient_responses: AtomicUsize,
 }
 pub struct ProviderFixture {
     pub base: String,
@@ -97,6 +98,7 @@ impl ProviderFixture {
             scripted: AtomicBool::new(false),
             context_failure: AtomicBool::new(false),
             stream_quota: AtomicBool::new(false),
+            transient_responses: AtomicUsize::new(0),
         });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -333,6 +335,9 @@ async fn responses(
             return (StatusCode::UNAUTHORIZED, content, String::new());
         }
         state.fresh_seen.store(true, Ordering::SeqCst);
+    }
+    if state.transient_responses.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
+        return (StatusCode::SERVICE_UNAVAILABLE, content, json!({"error":{"code":"subscription_sharing_usage_unavailable","message":"private upstream prose"}}).to_string());
     }
     if state.context_failure.load(Ordering::SeqCst) {
         return (

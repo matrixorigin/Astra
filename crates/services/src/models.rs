@@ -2306,8 +2306,6 @@ async fn revalidate_admitted_model_executions_with_access(
                                 offering_id: offering_id.clone(),
                             })?,
                     );
-                    execution.thinking_protocol = None;
-                    execution.thinking_capability = None;
                     if let Some(binding) = &execution.subscription
                         && let Some(source) = execution.source_identity.as_mut()
                     {
@@ -2415,18 +2413,25 @@ fn admitted_user_model_from_row(
     let upstream: String = row
         .try_get("model_name")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-    let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
-    let snapshot: Option<String> = row
-        .try_get("thinking_probe_json")
-        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-    let identity = probe_identity(
-        &provider,
-        &base_url,
-        &upstream,
-        encrypted.as_deref().unwrap_or(""),
-        "",
-    );
-    let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
+    let (thinking_protocol, thinking_capability) = if connection.is_some() {
+        (None, None)
+    } else {
+        let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
+        let snapshot: Option<String> = row
+            .try_get("thinking_probe_json")
+            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+        let identity = probe_identity(
+            &provider,
+            &base_url,
+            &upstream,
+            encrypted.as_deref().unwrap_or(""),
+            "",
+        );
+        (
+            Some(protocol),
+            cached_capability(snapshot.as_deref(), &identity, protocol),
+        )
+    };
     Ok(AdmittedModelExecution {
         subscription: None,
         admitted_at: std::time::Instant::now(),
@@ -2447,7 +2452,7 @@ fn admitted_user_model_from_row(
         thinking_capability,
         fixed_temperature: None,
         supported_reasoning_efforts: None,
-        thinking_protocol: Some(protocol),
+        thinking_protocol,
         request_body_overrides: None,
         context_window: Some(context_window),
         max_completion_tokens: None,
@@ -3690,25 +3695,28 @@ impl DatabaseModelService {
         let model: String = row.try_get("model_name").map_err(internal_error)?;
         let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
-        let identity = probe_identity(
-            &provider,
-            &base,
-            &model,
-            encrypted.as_deref().unwrap_or(""),
-            "",
-        );
-        let protocol = canonical_thinking_protocol(&provider, &base, &model);
         let thinking_probe = raw
             .as_deref()
-            .and_then(|s| serde_json::from_str::<ThinkingProbeSnapshot>(s).ok())
-            .and_then(|s| s.result(&identity, protocol));
+            .and_then(|value| serde_json::from_str::<ThinkingProbeSnapshot>(value).ok())
+            .and_then(|snapshot| {
+                snapshot.result(
+                    &probe_identity(
+                        &provider,
+                        &base,
+                        &model,
+                        encrypted.as_deref().unwrap_or(""),
+                        "",
+                    ),
+                    canonical_thinking_protocol(&provider, &base, &model),
+                )
+            });
         Ok(UserModelRecord {
             thinking_probe,
             model_id: row.try_get("model_id").map_err(internal_error)?,
             name: row.try_get("model_alias").map_err(internal_error)?,
-            provider: row.try_get("provider").map_err(internal_error)?,
-            model: row.try_get("model_name").map_err(internal_error)?,
-            base_url: row.try_get("base_url").map_err(internal_error)?,
+            provider,
+            model,
+            base_url: base,
             context_window,
             is_default: is_default != 0,
             is_active: is_active != 0,
@@ -3801,7 +3809,6 @@ impl DatabaseModelService {
                 {
                     continue;
                 }
-                let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
                 let record = Self::user_model_record_from_row(&row)?;
                 let protocol =
                     canonical_thinking_protocol(&record.provider, &record.base_url, &record.model);
@@ -3817,7 +3824,7 @@ impl DatabaseModelService {
                     } else {
                         Some(protocol)
                     },
-                    offering_id: row.try_get("model_id").map_err(internal_error)?,
+                    offering_id: record.model_id,
                     access_id: connection_id
                         .as_ref()
                         .map(|id| format!("chatgpt:{id}"))
@@ -3829,11 +3836,11 @@ impl DatabaseModelService {
                         "Cloud BYOK".into()
                     },
                     execution_placement: ModelExecutionPlacement::Server,
-                    name: row.try_get("model_alias").map_err(internal_error)?,
-                    provider: row.try_get("provider").map_err(internal_error)?,
+                    name: record.name,
+                    provider: record.provider,
                     description: Some("Personal BYOK model".to_string()),
-                    is_active: is_active != 0,
-                    context_window: row.try_get("context_window").map_err(internal_error)?,
+                    is_active: record.is_active,
+                    context_window: record.context_window,
                     max_completion_tokens: None,
                     architecture: None,
                     thinking_capability,
