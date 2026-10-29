@@ -3080,6 +3080,34 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Model(ModelCmd::Connect(args))) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let value =
+                crate::cli::model_connections::connect(api, &token, args, profile.as_deref())
+                    .await?;
+            print_json_or_raw(&value.to_string());
+            Ok(ExitCode::Success)
+        }
+        Some(Command::Model(ModelCmd::Connections)) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let body = api
+                .get_bearer_path_query_text(&token, crate::cli::model_connections::CONNECTIONS, &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+        Some(Command::Model(ModelCmd::Disconnect { connection_id })) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let path =
+                crate::cli::model_connections::connection_path(&connection_id, "disconnect")?;
+            let body = api
+                .post_bearer_path_empty_text(&token, &path)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
         Some(Command::Model(ModelCmd::List)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = session_runtime::load_server_model_catalog_json(
@@ -3112,19 +3140,44 @@ async fn execute_cli_command_impl(
                     }
                     Ok(value.trim().to_string())
                 };
-            let provider = match args.provider {
+            let provider = match args.provider.clone() {
                 Some(provider) => provider,
                 None if interactive => {
                     let label = inquire::Select::new(
                         "Model provider:",
-                        vec!["OpenAI", "Anthropic", "DeepSeek", "OpenAI-compatible"],
+                        vec![
+                            "OpenAI",
+                            "Anthropic",
+                            "DeepSeek",
+                            "OpenAI-compatible",
+                            "ChatGPT subscription",
+                        ],
                     )
                     .prompt()
                     .map_err(|e| e.to_string())?;
-                    label.to_ascii_lowercase()
+                    if label == "ChatGPT subscription" {
+                        "chatgpt".into()
+                    } else {
+                        label.to_ascii_lowercase()
+                    }
                 }
                 None => return Err("--provider is required in non-interactive mode".into()),
             };
+            if provider == "chatgpt" {
+                let body = crate::cli::model_connections::add_model(
+                    api,
+                    &token,
+                    args,
+                    interactive,
+                    profile.as_deref(),
+                )
+                .await?;
+                print_json_or_raw(&body);
+                return Ok(ExitCode::Success);
+            }
+            if args.connection_id.is_some() {
+                return Err("--connection is only valid for --provider chatgpt".into());
+            }
             let base_url = if provider == "openai-compatible" {
                 Some(required_text(
                     args.base_url,

@@ -47,6 +47,36 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | `SharedPool` on `AppState` / auth+session service constructors | Compile-time API + real pool in services tests / Matrix E2E | `shared_pool_contract`, `shared_pool_migration_contract` |
 | Thinking models: `reasoning_content` on every assistant+`tool_calls` after mid-session switch / DB recovery | `runtime/src/turn/edge_ledger.rs` `#[cfg(test)]` (`mid_session_switch_*`, `append_recovered_events` + `strip_stale_reasoning` pipeline) | — (avoid extra integration binary) |
 
+## ChatGPT subscription connections
+
+Offline coverage lives in `astra-core::model_wire::responses` (wire codec),
+`astra-services::chatgpt::tests` (OIDC, redirect, digest and feature gates),
+`astra-cli::cli::model_connections::tests` (callback/browser binding), and
+`runtime/tests/user_models_http.rs` (authenticated routes and frozen catalog).
+`services/tests/chatgpt_connections_db_it.rs` uses an explicitly isolated
+MatrixOne database and a local fake OAuth/Responses provider for encryption,
+ownership, rotation races, model sharing, disconnect and reauthorization.
+The ignored `responses_runtime_tool_checkpoint_resume_quota_and_disconnect`
+runtime unit test covers physical-attempt settlement, a tool call through the
+canonical heavy checkpoint, quota without retry and disconnect during headers.
+Neither database lane contacts OpenAI or spends subscription quota.
+
+Run these DB lanes with the testing guide's isolated database variables:
+
+```bash
+cargo test -p astra-services --features e2e-hooks --test chatgpt_connections_db_it -- --ignored --test-threads=1
+cargo test -p astra-runtime --lib responses_runtime_tool_checkpoint_resume_quota_and_disconnect -- --ignored --test-threads=1
+```
+
+Live acceptance remains an explicit operator step on an isolated self-hosted
+installation: enable the feature/host ID, run the documented CLI linking flow,
+authorize plan use, configure two visible models sharing one connection, run a
+text/tool turn, close the CLI and resume the former session, then disconnect
+and verify dependent models fail closed. Reconnect and check a model to recover.
+This requires real browser consent and consumes plan usage; do not make it a
+required fork CI lane or reuse a deployment credential cache. Record the exact
+OpenAI model catalog and source SHA without logging tokens or callback URLs.
+
 ## Large integration binaries (audit — not removed in this pass)
 
 | Binary | Role | E2E overlap | Recommendation |

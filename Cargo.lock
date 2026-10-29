@@ -260,6 +260,7 @@ version = "0.2.13"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "dirs",
  "dotenvy",
@@ -519,6 +520,7 @@ dependencies = [
  "proptest",
  "regex",
  "reqwest 0.12.28",
+ "rsa 0.9.10",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -629,6 +631,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "rsa 0.9.10",
  "rustls",
  "serde",
  "serde_json",

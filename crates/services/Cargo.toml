@@ -35,6 +35,10 @@ required-features = ["external-contract-tests"]
 name = "user_model_probe_db_it"
 required-features = ["external-contract-tests"]
 
+[[test]]
+name = "chatgpt_connections_db_it"
+required-features = ["e2e-hooks"]
+
 [dependencies]
 astra-config.workspace = true
 astra-core.workspace = true
@@ -79,6 +83,7 @@ libc.workspace = true
 openssl = { version = "0.10.79", optional = true }
 
 [dev-dependencies]
+rsa = "0.9"
 rcgen = "0.13.2"
 dotenvy.workspace = true
 astra-core = { workspace = true, features = ["dev-defaults"] }

@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
 fs2.workspace = true
 async-trait.workspace = true
 axum.workspace = true

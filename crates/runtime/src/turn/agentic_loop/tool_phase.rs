@@ -2049,6 +2049,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             edge_tool_round: edge_round_for_headless,
             reasoning_content: turn_result.accum.reasoning_content.as_str(),
             reasoning_signature: turn_result.accum.reasoning_signature.as_str(),
+            provider_continuation: state.pending_provider_continuation.as_ref(),
             messages: &mut state.messages,
             tool_results: &mut state.tool_results,
             valid_tool_names: &valid_tool_names,

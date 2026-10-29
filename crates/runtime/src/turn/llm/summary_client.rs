@@ -458,6 +458,7 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            subscription: None,
             admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: "summary-offering".to_string(),
@@ -485,6 +486,7 @@ mod tests {
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            subscription: execution.subscription.clone(),
             model_name: execution.model_name.clone(),
             wire_model_name: None,
             api_key: execution.api_key.clone(),
@@ -632,6 +634,7 @@ mod tests {
         thinking_capability: Option<astra_services::models::ThinkingCapability>,
     ) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            subscription: None,
             model_name: "test-model".to_string(),
             wire_model_name: None,
             api_key: String::new(),

@@ -68,6 +68,33 @@ available through a ready bound Edge provider. Capability availability does
 not enable either tool for a user turn; Web and SDK clients must explicitly
 select optional tools separately.
 
+### ChatGPT subscription connections
+
+`ASTRA_CHATGPT_SUBSCRIPTION_ENABLED=1` enables explicit per-user ChatGPT
+subscription connections. The default is disabled. Enabling also requires
+`ASTRA_CHATGPT_HOST_ID=urn:uuid:<UUID>`: generate a UUID once per self-hosted
+installation, retain it across restarts, and share it only with replicas of
+that same installation on the same host. A different host ID requires explicit
+reauthorization. Stable `ASTRA_TOKEN_ENCRYPTION_KEY` and MatrixOne are required;
+back up this key through the deployment's secret-management process.
+
+This initial integration targets personal self-hosted installations. Hosted
+commercial offerings, multi-host installations and device-side inference are
+outside this version. It uses OpenAI's public Sign in with ChatGPT dynamic
+registration and direct Responses API, with fixed trusted origins. No provider
+client secret or Codex authentication file is configured.
+
+Upgrade every Server replica to this source before enabling, then follow
+[CLI linking](cli-commands.md#chatgpt-subscription-models). Startup adds two
+owner-scoped tables and a nullable connection reference to personal models;
+existing API-key model rows remain valid. Do not run older and newer binaries
+with subscription models in the same database. Disable the flag on every
+replica and restart to stop subscription execution. Disconnect and remove
+subscription model rows before rolling back to an older binary, which expects
+an API key on every personal model. Retain session history and the encryption
+key. Disabling the flag alone is a behavior rollback for the new binary, not
+an older-binary schema compatibility guarantee.
+
 ### CLI native collaborator capacity
 
 Ordinary CLI and TUI turns use the selected Astra model and the existing local

@@ -94,6 +94,7 @@ pub(crate) struct DirectMemoryInferenceClient {
 impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            subscription: None,
             fixed_temperature: self.fixed_temperature,
             supported_reasoning_efforts: None,
             thinking_protocol: self.thinking_protocol,

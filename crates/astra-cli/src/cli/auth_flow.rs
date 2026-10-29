@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod browser_code;
-mod browser_launcher;
+pub(crate) mod browser_launcher;
 #[cfg(test)]
 mod login_discovery_tests;
 pub(crate) mod uc;

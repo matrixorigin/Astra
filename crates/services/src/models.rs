@@ -842,6 +842,31 @@ pub fn server_model_access_declarations(
     declared
 }
 
+/// Connection identities are opaque catalog IDs; the frozen access-kind and
+/// response schemas remain unchanged for existing clients.
+pub fn server_model_access_declarations_for_models(
+    allows_deployment: bool,
+    models: &[ModelListItem],
+) -> Vec<DeclaredModelAccess> {
+    let mut result = server_model_access_declarations(
+        allows_deployment,
+        models.iter().map(|item| item.access_kind),
+    );
+    let mut seen: BTreeSet<String> = result.iter().map(|item| item.id.clone()).collect();
+    for model in models {
+        if seen.insert(model.access_id.clone()) {
+            result.push(DeclaredModelAccess {
+                id: model.access_id.clone(),
+                kind: model.access_kind,
+                label: model.access_label.clone(),
+                execution_placement: model.execution_placement,
+                availability: ModelAccessAvailability::Ready,
+            });
+        }
+    }
+    result
+}
+
 impl ModelAccessKind {
     /// Stable display/source qualifier used by the authorized model catalog.
     #[must_use]
@@ -1015,6 +1040,7 @@ impl RuntimeModelReasoningControl {
 /// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    pub subscription: Option<crate::chatgpt::ExecutionCredential>,
     /// Completion time of the trusted admission that produced this material.
     /// Cloning or installing it in another execution must not renew the grant.
     pub admitted_at: Instant,
@@ -1056,6 +1082,14 @@ impl AdmittedModelExecution {
     #[must_use]
     pub fn has_same_execution_identity(&self, other: &Self) -> bool {
         self.offering_id == other.offering_id
+            && self
+                .subscription
+                .as_ref()
+                .map(|binding| binding.connection_id())
+                == other
+                    .subscription
+                    .as_ref()
+                    .map(|binding| binding.connection_id())
             && self.source_identity == other.source_identity
             && self.access_kind == other.access_kind
             && self.execution_placement == other.execution_placement
@@ -1072,6 +1106,7 @@ impl AdmittedModelExecution {
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
+            subscription: None,
             admitted_at: Instant::now(),
             price_snapshot: offering.model.price_snapshot,
             offering_id: offering.offering_id,
@@ -1110,6 +1145,7 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            subscription: None,
             admitted_at: Instant::now(),
             price_snapshot: None,
             offering_id,
@@ -1172,6 +1208,9 @@ pub enum ModelOfferingResolutionError {
         offering_id: String,
         model_name: String,
     },
+    CredentialUnavailable {
+        offering_id: String,
+    },
     Backend(String),
 }
 
@@ -1200,6 +1239,10 @@ fn model_offering_resolution_error_response(
         ModelOfferingResolutionError::Backend(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "model_catalog_unavailable")
         }
+        ModelOfferingResolutionError::CredentialUnavailable { .. } => (
+            StatusCode::CONFLICT,
+            "model_connection_reauthentication_required",
+        ),
     };
     error_response_coded(status, error.to_string(), code)
 }
@@ -1222,6 +1265,10 @@ impl std::fmt::Display for ModelOfferingResolutionError {
                 "Offering '{offering_id}' for model '{model_name}' is disabled"
             ),
             Self::Backend(error) => write!(f, "Offering resolution failed: {error}"),
+            Self::CredentialUnavailable { offering_id } => write!(
+                f,
+                "Reconnect or inspect the credential connection for Offering '{offering_id}'"
+            ),
         }
     }
 }
@@ -2129,6 +2176,7 @@ pub async fn revalidate_admitted_model_executions(
         offering_ids,
         provided_pool,
         None,
+        None,
     )
     .await
 }
@@ -2144,6 +2192,7 @@ async fn revalidate_admitted_model_executions_with_access(
     offering_ids: &[String],
     provided_pool: Option<&sqlx::MySqlPool>,
     deployment_access: Option<bool>,
+    subscriptions: Option<&Arc<crate::chatgpt::ChatgptConnections>>,
 ) -> Result<Vec<AdmittedModelExecution>, ModelOfferingResolutionError> {
     validate_model_admission_batch(offering_ids)?;
     if offering_ids.is_empty() {
@@ -2173,7 +2222,7 @@ async fn revalidate_admitted_model_executions_with_access(
         .map_err(ModelOfferingResolutionError::Backend)?,
     };
     let mut query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url,
+        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url, connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
                 NULL AS tags_json, CAST(NULL AS INT) AS max_completion_tokens, 1 AS personal
@@ -2187,7 +2236,7 @@ async fn revalidate_admitted_model_executions_with_access(
         }
     }
     query.push(") UNION ALL
-         SELECT model_id, model_name AS model_alias, model_name, provider, api_key_encrypted, base_url,
+         SELECT model_id, model_name AS model_alias, model_name, provider, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 CAST(updated_at AS CHAR) AS configuration_updated_at,
                 CAST(quirks AS CHAR) AS quirks_json, CAST(pricing AS CHAR) AS pricing_json,
@@ -2238,7 +2287,35 @@ async fn revalidate_admitted_model_executions_with_access(
             continue;
         }
         let execution = if let Some(row) = personal.get(offering_id) {
-            admitted_user_model_from_row(row, offering_id, encryptor)?
+            {
+                let mut execution = admitted_user_model_from_row(row, offering_id, encryptor)?;
+                if let Some(connection_id) = row
+                    .try_get::<Option<String>, _>("connection_id")
+                    .map_err(|e| ModelOfferingResolutionError::Backend(e.to_string()))?
+                {
+                    let service = subscriptions.ok_or_else(|| {
+                        ModelOfferingResolutionError::CredentialUnavailable {
+                            offering_id: offering_id.clone(),
+                        }
+                    })?;
+                    execution.subscription = Some(
+                        service
+                            .binding(user_id, &connection_id)
+                            .await
+                            .map_err(|_| ModelOfferingResolutionError::CredentialUnavailable {
+                                offering_id: offering_id.clone(),
+                            })?,
+                    );
+                    execution.thinking_protocol = None;
+                    execution.thinking_capability = None;
+                    if let Some(binding) = &execution.subscription
+                        && let Some(source) = execution.source_identity.as_mut()
+                    {
+                        source.access_label = format!("ChatGPT subscription · {}", binding.label());
+                    }
+                }
+                execution
+            }
         } else {
             let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
             let row = deployment.get(offering_id).ok_or_else(|| {
@@ -2298,14 +2375,42 @@ fn admitted_user_model_from_row(
             model_name: alias,
         });
     }
-    let encrypted: String = row.try_get("api_key_encrypted").map_err(|error| {
+    let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(|error| {
         ModelOfferingResolutionError::Backend(format!(
             "invalid user_llm_models.api_key_encrypted: {error}"
         ))
     })?;
-    let api_key = encryptor
-        .decrypt(&encrypted)
-        .map_err(ModelOfferingResolutionError::Backend)?;
+    let connection: Option<String> = row
+        .try_get("connection_id")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let provider: String = row
+        .try_get("provider")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    if encrypted.is_some() == connection.is_some()
+        || (provider == crate::chatgpt::PROVIDER) != connection.is_some()
+    {
+        return Err(ModelOfferingResolutionError::CredentialUnavailable {
+            offering_id: offering_id.into(),
+        });
+    }
+    let api_key = match &encrypted {
+        Some(value) => encryptor
+            .decrypt(value)
+            .map_err(ModelOfferingResolutionError::Backend)?,
+        None if row
+            .try_get::<Option<String>, _>("connection_id")
+            .ok()
+            .flatten()
+            .is_some() =>
+        {
+            String::new()
+        }
+        None => {
+            return Err(ModelOfferingResolutionError::CredentialUnavailable {
+                offering_id: offering_id.into(),
+            });
+        }
+    };
     let context_window: i32 = row.try_get("context_window").map_err(|error| {
         ModelOfferingResolutionError::Backend(format!(
             "invalid user_llm_models.context_window: {error}"
@@ -2329,9 +2434,16 @@ fn admitted_user_model_from_row(
     let snapshot: Option<String> = row
         .try_get("thinking_probe_json")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-    let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
+    let identity = probe_identity(
+        &provider,
+        &base_url,
+        &upstream,
+        encrypted.as_deref().unwrap_or(""),
+        "",
+    );
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
     Ok(AdmittedModelExecution {
+        subscription: None,
         admitted_at: std::time::Instant::now(),
         price_snapshot: None,
         offering_id: offering_id.to_string(),
@@ -2911,6 +3023,7 @@ pub struct UserModelRecord {
 
 #[derive(Clone, PartialEq)]
 pub struct UserModelCreateRequestData {
+    pub connection_id: Option<String>,
     pub name: String,
     pub provider: String,
     pub model: String,
@@ -2978,6 +3091,17 @@ async fn read_user_model_catalog<T: ModelService + ?Sized>(
 
 #[async_trait]
 pub trait ModelService: Send + Sync {
+    async fn model_connection_operation(
+        &self,
+        _user_id: String,
+        _operation: crate::chatgpt::ConnectionOperation,
+    ) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chatgpt_subscription_unavailable",
+            "Model connections are not configured",
+        ))
+    }
     async fn user_model_catalog(
         &self,
         user_id: String,
@@ -2998,10 +3122,8 @@ pub trait ModelService: Send + Sync {
             catalog.items,
             astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         );
-        let declared = server_model_access_declarations(
-            catalog.allows_deployment,
-            offerings.iter().map(|item| item.access_kind),
-        );
+        let declared =
+            server_model_access_declarations_for_models(catalog.allows_deployment, &offerings);
         let user_default = catalog
             .default_offering_id
             .map(|offering_id| ModelDefaultCandidate {
@@ -3299,6 +3421,7 @@ pub struct DatabaseModelService {
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
     catalog_revision_cache: Arc<Mutex<HashMap<bool, CachedCatalogRevision>>>,
     uc_provider: Option<crate::auth::uc::UcNativeProvider>,
+    subscriptions: Arc<crate::chatgpt::ChatgptConnections>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3316,6 +3439,8 @@ struct CatalogRevisionFingerprint {
 
 #[derive(Debug)]
 struct ChatDefaultCandidateRow {
+    is_active: bool,
+    connection_id: Option<String>,
     offering_id: String,
     model_name: String,
     provider: String,
@@ -3334,12 +3459,88 @@ where
 }
 
 impl DatabaseModelService {
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn with_chatgpt_config(mut self, config: crate::chatgpt::ChatgptConfig) -> Self {
+        self.subscriptions = Arc::new(crate::chatgpt::ChatgptConnections::new(
+            self.pool.clone(),
+            self.encryptor.clone(),
+            Ok(config),
+        ));
+        self
+    }
+
+    async fn create_subscription_model(
+        &self,
+        user_id: String,
+        request: UserModelCreateRequestData,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        if request.provider != crate::chatgpt::PROVIDER
+            || !request.api_key.is_empty()
+            || request.base_url.is_some()
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "Subscription models require a ChatGPT connection and no API key or custom endpoint",
+                "model_credentials_invalid",
+            ));
+        }
+        let connection_id = request.connection_id.as_deref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "Select a ChatGPT connection",
+                "model_connection_required",
+            )
+        })?;
+        let name = validate_user_model_identifier("name", &request.name)?;
+        let model = validate_user_model_identifier("model", &request.model)?;
+        validate_context_window_value(request.context_window, "context_window")
+            .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
+        self.subscriptions
+            .probe(&user_id, connection_id, &model)
+            .await?;
+        let binding = self.subscriptions.binding(&user_id, connection_id).await?;
+        binding.ensure_current().await?;
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let duplicate: i64 =
+            query_scalar("SELECT COUNT(*) FROM user_llm_models WHERE user_id=? AND model_alias=?")
+                .bind(&user_id)
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .map_err(internal_error)?;
+        if duplicate != 0 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Model alias already exists",
+            ));
+        }
+        let model_id = Uuid::new_v4().to_string();
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        if request.is_default {
+            query("UPDATE user_llm_models SET is_default=0,updated_at=NOW(6) WHERE user_id=?")
+                .bind(&user_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        }
+        query("INSERT INTO user_llm_models (model_id,user_id,model_alias,model_name,provider,api_key_encrypted,connection_id,base_url,context_window,is_default,is_active) VALUES (?,?,?,?,?,NULL,?,?,?,?,1)")
+            .bind(&model_id).bind(&user_id).bind(name).bind(model).bind(crate::chatgpt::PROVIDER).bind(connection_id)
+            .bind(self.subscriptions.api_base()?).bind(request.context_window).bind(if request.is_default {1_i16} else {0_i16})
+            .execute(&mut *tx).await.map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+        self.get_user_model(user_id, model_id).await
+    }
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: std::sync::Arc<FernetTokenEncryptor>,
     ) -> Self {
         Self {
             matrixone,
+            subscriptions: Arc::new(crate::chatgpt::ChatgptConnections::new(
+                None,
+                encryptor.clone(),
+                crate::chatgpt::ChatgptConfig::from_env(),
+            )),
             encryptor,
             pool: None,
             catalog_revision_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -3422,6 +3623,11 @@ impl DatabaseModelService {
         })
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        self.subscriptions = Arc::new(crate::chatgpt::ChatgptConnections::new(
+            Some(pool.clone()),
+            self.encryptor.clone(),
+            crate::chatgpt::ChatgptConfig::from_env(),
+        ));
         self.pool = Some(pool);
         self
     }
@@ -3509,9 +3715,15 @@ impl DatabaseModelService {
         let provider: String = row.try_get("provider").map_err(internal_error)?;
         let base: String = row.try_get("base_url").map_err(internal_error)?;
         let model: String = row.try_get("model_name").map_err(internal_error)?;
-        let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
+        let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
-        let identity = probe_identity(&provider, &base, &model, &encrypted, "");
+        let identity = probe_identity(
+            &provider,
+            &base,
+            &model,
+            encrypted.as_deref().unwrap_or(""),
+            "",
+        );
         let protocol = canonical_thinking_protocol(&provider, &base, &model);
         let thinking_probe = raw
             .as_deref()
@@ -3596,7 +3808,26 @@ impl DatabaseModelService {
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
+            let labels = if user_rows.iter().any(|row| {
+                row.try_get::<Option<String>, _>("connection_id")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }) {
+                self.subscriptions.catalog_labels(&user_id).await?
+            } else {
+                HashMap::new()
+            };
             for row in user_rows {
+                let connection_id = row
+                    .try_get::<Option<String>, _>("connection_id")
+                    .map_err(internal_error)?;
+                if connection_id
+                    .as_ref()
+                    .is_some_and(|id| !labels.contains_key(id))
+                {
+                    continue;
+                }
                 let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
                 let record = Self::user_model_record_from_row(&row)?;
                 let protocol =
@@ -3608,11 +3839,22 @@ impl DatabaseModelService {
                     })
                     .map(|result| result.capability);
                 models.push(ModelListItem {
-                    thinking_protocol: Some(protocol),
+                    thinking_protocol: if connection_id.is_some() {
+                        None
+                    } else {
+                        Some(protocol)
+                    },
                     offering_id: row.try_get("model_id").map_err(internal_error)?,
-                    access_id: "cloud-byok".to_string(),
+                    access_id: connection_id
+                        .as_ref()
+                        .map(|id| format!("chatgpt:{id}"))
+                        .unwrap_or_else(|| "cloud-byok".into()),
                     access_kind: ModelAccessKind::CloudByok,
-                    access_label: "Cloud BYOK".to_string(),
+                    access_label: if let Some(id) = &connection_id {
+                        format!("ChatGPT subscription · {}", labels[id])
+                    } else {
+                        "Cloud BYOK".into()
+                    },
                     execution_placement: ModelExecutionPlacement::Server,
                     name: row.try_get("model_alias").map_err(internal_error)?,
                     provider: row.try_get("provider").map_err(internal_error)?,
@@ -3637,7 +3879,7 @@ impl DatabaseModelService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         query_scalar(
             "SELECT model_id FROM user_llm_models \
-             WHERE user_id = ? AND is_default = 1 AND is_active = 1 \
+             WHERE user_id = ? AND is_default = 1 AND (is_active = 1 OR connection_id IS NOT NULL) \
              ORDER BY updated_at DESC, model_id ASC LIMIT 1",
         )
         .bind(user_id)
@@ -3651,12 +3893,14 @@ impl DatabaseModelService {
         user_id: &str,
         offering_ids: &[String],
     ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
-        revalidate_admitted_model_executions(
+        revalidate_admitted_model_executions_with_access(
             &self.matrixone,
             self.encryptor.as_ref(),
             user_id,
             offering_ids,
             self.pool.as_ref().map(SharedPool::get),
+            None,
+            Some(&self.subscriptions),
         )
         .await
         .map_err(model_offering_resolution_error_response)
@@ -3675,6 +3919,7 @@ impl DatabaseModelService {
             offering_ids,
             self.pool.as_ref().map(SharedPool::get),
             Some(deployment_allowed),
+            Some(&self.subscriptions),
         )
         .await
         .map_err(model_offering_resolution_error_response)
@@ -3702,12 +3947,19 @@ const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
 const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
 const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, base_url, \
-    api_key_encrypted, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
+    api_key_encrypted, connection_id, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
     context_window, is_default, is_active, \
     CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
 
 #[async_trait]
 impl ModelService for DatabaseModelService {
+    async fn model_connection_operation(
+        &self,
+        user_id: String,
+        operation: crate::chatgpt::ConnectionOperation,
+    ) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+        self.subscriptions.operate(&user_id, operation).await
+    }
     async fn allows_deployment_models(
         &self,
         user_id: String,
@@ -3776,26 +4028,26 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         let candidate_sql = if deployment_allowed {
-            "SELECT offering_id, model_name, provider, is_default, is_user_model, updated_at_text
+            "SELECT offering_id, model_name, provider, is_default, is_user_model, updated_at_text, is_active, connection_id
              FROM (
                  SELECT model_id AS offering_id, model_alias AS model_name, provider,
-                        is_default, 1 AS is_user_model,
+                        is_default, is_active, connection_id, 1 AS is_user_model,
                         CAST(updated_at AS CHAR) AS updated_at_text
                  FROM user_llm_models
-                 WHERE user_id = ? AND is_active = 1
+                 WHERE user_id = ? AND (is_active = 1 OR (is_default = 1 AND connection_id IS NOT NULL))
                  UNION ALL
                  SELECT model_id AS offering_id, model_name, provider,
-                        0 AS is_default, 0 AS is_user_model,
+                        0 AS is_default, is_active, CAST(NULL AS CHAR(64)) AS connection_id, 0 AS is_user_model,
                         CAST(updated_at AS CHAR) AS updated_at_text
                  FROM infra_llm_models
                  WHERE is_active = 1
              ) AS candidate_offerings"
         } else {
             "SELECT model_id AS offering_id, model_alias AS model_name, provider,
-                    is_default, 1 AS is_user_model,
+                    is_default, is_active, connection_id, 1 AS is_user_model,
                     CAST(updated_at AS CHAR) AS updated_at_text
              FROM user_llm_models
-             WHERE user_id = ? AND is_active = 1"
+             WHERE user_id = ? AND (is_active = 1 OR (is_default = 1 AND connection_id IS NOT NULL))"
         };
         let rows = query(candidate_sql)
             .bind(&user_id)
@@ -3806,6 +4058,8 @@ impl ModelService for DatabaseModelService {
             .into_iter()
             .map(|row| {
                 Ok::<_, (StatusCode, Json<ErrorResponse>)>(ChatDefaultCandidateRow {
+                    is_active: row.try_get::<i16, _>("is_active").map_err(internal_error)? != 0,
+                    connection_id: row.try_get("connection_id").map_err(internal_error)?,
                     offering_id: row.try_get("offering_id").map_err(internal_error)?,
                     model_name: row.try_get("model_name").map_err(internal_error)?,
                     provider: row.try_get("provider").map_err(internal_error)?,
@@ -3832,7 +4086,25 @@ impl ModelService for DatabaseModelService {
         let chat = astra_core::model_wire::purpose::ModelRequestPurpose::Chat;
         let mut effective_ids = BTreeSet::new();
         let mut effective = Vec::with_capacity(candidates.len());
+        let subscription_labels = if candidates
+            .iter()
+            .any(|candidate| candidate.connection_id.is_some())
+        {
+            self.subscriptions.catalog_labels(&user_id).await?
+        } else {
+            HashMap::new()
+        };
         for candidate in &candidates {
+            if !candidate.is_active {
+                continue;
+            }
+            if candidate
+                .connection_id
+                .as_ref()
+                .is_some_and(|id| !subscription_labels.contains_key(id))
+            {
+                continue;
+            }
             if !chat.supported_by(&candidate.provider) {
                 continue;
             }
@@ -3866,6 +4138,16 @@ impl ModelService for DatabaseModelService {
                     .then_with(|| right.offering_id.cmp(&left.offering_id))
             })
         {
+            if let Some(connection_id) = &default.connection_id {
+                if !default.is_active {
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        "Reconnect or inspect the selected subscription model",
+                        "model_connection_reauthentication_required",
+                    ));
+                }
+                self.subscriptions.binding(&user_id, connection_id).await?;
+            }
             if !chat.supported_by(&default.provider) {
                 return Ok(None);
             }
@@ -3908,8 +4190,12 @@ impl ModelService for DatabaseModelService {
     async fn create_user_model(
         &self,
         user_id: String,
-        request: UserModelCreateRequestData,
+        mut request: UserModelCreateRequestData,
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        request.provider = request.provider.trim().to_ascii_lowercase();
+        if request.connection_id.is_some() || request.provider == crate::chatgpt::PROVIDER {
+            return self.create_subscription_model(user_id, request).await;
+        }
         let name = validate_user_model_identifier("name", &request.name)?;
         let model = validate_user_model_identifier("model", &request.model)?;
         let provider = request.provider.trim().to_ascii_lowercase();
@@ -4065,6 +4351,24 @@ impl ModelService for DatabaseModelService {
                 .await
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
+        if provider == crate::chatgpt::PROVIDER {
+            if request.api_key.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "Reconnect the subscription connection to rotate credentials",
+                    "model_credentials_invalid",
+                ));
+            }
+            if request.is_active == Some(true) || request.is_default == Some(true) {
+                let connection = existing
+                    .try_get::<Option<String>, _>("connection_id")
+                    .map_err(internal_error)?
+                    .ok_or_else(|| internal_error("Subscription model has no connection"))?;
+                self.subscriptions
+                    .probe(&user_id, &connection, &model)
+                    .await?;
+            }
+        }
         let encrypted_key = if let Some(api_key) = request.api_key.as_deref() {
             validate_user_model_api_key(api_key)?;
             if let Some(reason) =
@@ -4155,6 +4459,28 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         model_id: String,
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let existing = self
+            .user_model_row(&user_id, &model_id)
+            .await?
+            .ok_or_else(user_model_not_found)?;
+        if existing
+            .try_get::<String, _>("provider")
+            .map_err(internal_error)?
+            == crate::chatgpt::PROVIDER
+        {
+            let connection = existing
+                .try_get::<Option<String>, _>("connection_id")
+                .map_err(internal_error)?
+                .ok_or_else(|| internal_error("Subscription model has no connection"))?;
+            let model = existing
+                .try_get::<String, _>("model_name")
+                .map_err(internal_error)?;
+            self.subscriptions
+                .probe(&user_id, &connection, &model)
+                .await?;
+            query("UPDATE user_llm_models SET is_active=1,updated_at=NOW(6) WHERE user_id=? AND model_id=?").bind(&user_id).bind(&model_id).execute(&self.get_pool().await.map_err(internal_error)?).await.map_err(internal_error)?;
+            return self.get_user_model(user_id, model_id).await;
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         let row = query(
             "SELECT model_name, provider, api_key_encrypted, base_url, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
@@ -4340,6 +4666,13 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         request: ModelCreateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        if request.provider == crate::chatgpt::PROVIDER {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "ChatGPT subscriptions must be linked to a personal model connection",
+                "model_connection_required",
+            ));
+        }
         if let Some(pricing) = request.pricing.as_ref() {
             pricing
                 .validate()
@@ -5762,10 +6095,12 @@ fn default_user_model_context_window() -> i32 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserModelCreateRequest {
+    pub connection_id: Option<String>,
     pub name: String,
     pub provider: String,
     pub model: String,
     pub base_url: Option<String>,
+    #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_user_model_context_window")]
     pub context_window: i32,
@@ -9490,6 +9825,7 @@ mod tests {
     #[test]
     fn user_model_requests_redact_credentials_in_debug_output() {
         let create = UserModelCreateRequestData {
+            connection_id: None,
             name: "deepseek".into(),
             provider: "deepseek".into(),
             model: "deepseek-chat".into(),

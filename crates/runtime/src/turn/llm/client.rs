@@ -30,6 +30,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
+#[path = "responses.rs"]
+mod responses;
 
 #[cfg(test)]
 use crate::prompts;
@@ -196,6 +198,7 @@ use super::super::model_cooldown::rate_limit_cooldown;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LlmProviderProtocol {
+    OpenAiResponses,
     OpenAiCompatible,
     AnthropicMessages,
     BedrockConverse,
@@ -206,6 +209,7 @@ impl LlmProviderProtocol {
     #[must_use]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::OpenAiResponses => "openai_responses",
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicMessages => "anthropic_messages",
             Self::BedrockConverse => "bedrock_converse",
@@ -224,6 +228,7 @@ impl LlmProviderProtocol {
 
 pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
     match provider {
+        "chatgpt" => LlmProviderProtocol::OpenAiResponses,
         "anthropic" => LlmProviderProtocol::AnthropicMessages,
         "bedrock" => LlmProviderProtocol::BedrockConverse,
         "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
@@ -269,6 +274,23 @@ impl ProviderWireFingerprints {
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let (messages, system, conversation, tools) = match protocol {
+            LlmProviderProtocol::OpenAiResponses => {
+                let items = provider_wire_items(body.get("input"));
+                (
+                    items.clone(),
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|item| item["role"] == "developer")
+                        .collect(),
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|item| item["role"] != "developer")
+                        .collect(),
+                    provider_wire_items(body.get("tools")),
+                )
+            }
             LlmProviderProtocol::TypeSafeSystemOne => (
                 provider_wire_items(body.get("state")),
                 provider_wire_items(body.get("questions")),
@@ -366,6 +388,10 @@ fn provider_cache_key_system_items(
     use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
 
     let mut system = match protocol {
+        LlmProviderProtocol::OpenAiResponses => provider_wire_items(body.get("input"))
+            .into_iter()
+            .filter(|item| item["role"] == "developer")
+            .collect(),
         LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("questions")),
         LlmProviderProtocol::OpenAiCompatible => {
             let messages = body
@@ -420,6 +446,7 @@ fn provider_cache_key_tool_items(
     use astra_turn_core::cache_placement::CacheProtocol;
 
     let mut tools = match protocol {
+        LlmProviderProtocol::OpenAiResponses => provider_wire_items(body.get("tools")),
         LlmProviderProtocol::OpenAiCompatible
         | LlmProviderProtocol::AnthropicMessages
         | LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("tools")),
@@ -452,6 +479,7 @@ fn provider_cache_key_tool_items(
 
 fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
     let pointer = match protocol {
+        LlmProviderProtocol::OpenAiResponses => "/name",
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             "/function/name"
         }
@@ -516,6 +544,22 @@ impl ProviderWireComposition {
     ) -> Result<Self, astra_core::ClassifiedError> {
         let mut composition = Self::default();
         match protocol {
+            LlmProviderProtocol::OpenAiResponses => {
+                for item in provider_wire_items(body.get("input")) {
+                    if item["role"] == "developer" {
+                        composition.system_bytes += serialized_value_bytes(item)?;
+                        composition.system_items += 1;
+                    } else {
+                        composition.conversation_bytes += serialized_value_bytes(item)?;
+                        composition.conversation_items += 1;
+                    }
+                }
+                accumulate_wire_items(
+                    body.get("tools"),
+                    &mut composition.tool_schema_bytes,
+                    &mut composition.tool_schema_items,
+                )?;
+            }
             LlmProviderProtocol::TypeSafeSystemOne => {
                 accumulate_wire_items(
                     body.get("questions"),
@@ -850,6 +894,8 @@ fn is_tpm_exhaustion(error_text: &str) -> bool {
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LlmCallResult {
+    /// Replayable provider output, scoped to its connection and model.
+    pub provider_continuation: Option<Value>,
     /// Set by the executing adapter, never decoded from generated text.
     pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     /// Provider response identity when available on non-stream responses.
@@ -1042,6 +1088,7 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
     pub fixed_temperature: Option<f64>,
     pub supported_reasoning_efforts: Option<&'a [String]>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
@@ -1063,6 +1110,7 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            subscription: execution.subscription.as_ref(),
             fixed_temperature: execution.fixed_temperature,
             supported_reasoning_efforts: execution.supported_reasoning_efforts.as_deref(),
             thinking_protocol: execution.thinking_protocol,
@@ -1087,6 +1135,7 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     pub model_name: String,
     pub wire_model_name: Option<String>,
     pub api_key: String,
@@ -1109,6 +1158,7 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            subscription: self.subscription.as_ref(),
             fixed_temperature: self.fixed_temperature,
             supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
             thinking_protocol: self.thinking_protocol,
@@ -2275,6 +2325,7 @@ pub(crate) fn llm_request_url_for_provider(
 ) -> String {
     let base = base_url.trim_end_matches('/');
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => format!("{base}/responses"),
         LlmProviderProtocol::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")
@@ -3459,7 +3510,10 @@ fn build_provider_request_body_with_cache_capability(
     };
     let marker_stripped_messages;
     let messages = if messages.iter().any(|message| {
-        crate::turn::wire_assembly::is_required_runtime_preamble(message)
+        message
+            .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+            .is_some()
+            || crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
             || astra_turn_types::has_append_only_runtime_authority_policy(message)
@@ -3541,6 +3595,10 @@ fn build_provider_request_body_with_cache_capability(
         std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            astra_core::model_wire::responses::request(model_name, messages, Some(tools), "", false)
+                .unwrap_or_else(|_| json!({"_astra_invalid_responses_request":true}))
+        }
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing(&reasoning_repaired);
             let (system, bedrock_messages) =
@@ -3699,7 +3757,9 @@ fn apply_no_tool_choice(
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
+        LlmProviderProtocol::OpenAiResponses
+        | LlmProviderProtocol::OpenAiCompatible
+        | LlmProviderProtocol::TypeSafeSystemOne => {
             // Keep the explicit terminal instruction even when the repair
             // request physically removed every schema. OpenAI-compatible
             // models can otherwise infer the tool protocol from conversation
@@ -3743,6 +3803,10 @@ fn apply_required_tool_choice(
     }
 
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            body["tool_choice"] =
+                json!({"type":"function","namespace":"astra","name":required_tool_name});
+        }
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({
                 "type": "function",
@@ -4012,7 +4076,7 @@ pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
 
 #[cfg(test)]
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
-    consolidate_system_messages_inner(messages, false, true)
+    consolidate_system_messages_inner(messages, false, true, false)
 }
 
 pub(crate) fn consolidate_system_messages_for_provider(
@@ -4033,12 +4097,14 @@ pub(crate) fn consolidate_system_messages_for_provider(
             &projected,
             false,
             allow_suffix_dependent_history_repair,
+            false,
         );
     }
     consolidate_system_messages_inner(
         messages,
         preserve_runtime_system_tail,
         allow_suffix_dependent_history_repair,
+        matches!(protocol, LlmProviderProtocol::OpenAiResponses),
     )
 }
 
@@ -4065,12 +4131,18 @@ fn provider_history_ids(messages: &[Value]) -> HashMap<String, String> {
 
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     let provider_ids = provider_history_ids(messages);
-    strip_internal_runtime_markers_with_ids(messages, &provider_ids);
+    strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
+}
+
+fn strip_internal_runtime_markers_preserving_responses(messages: &mut [Value]) {
+    let provider_ids = provider_history_ids(messages);
+    strip_internal_runtime_markers_with_ids(messages, &provider_ids, true);
 }
 
 fn strip_internal_runtime_markers_with_ids(
     messages: &mut [Value],
     provider_ids: &HashMap<String, String>,
+    preserve_responses: bool,
 ) {
     use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
     for message in messages {
@@ -4129,6 +4201,7 @@ fn strip_internal_runtime_markers_with_ids(
             // message contract and only add round-specific bytes to the
             // prompt cache suffix.
             for key in [
+                astra_core::model_wire::responses::CONTINUATION_KEY,
                 "_round_index",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
@@ -4141,6 +4214,10 @@ fn strip_internal_runtime_markers_with_ids(
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
                 RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
             ] {
+                if preserve_responses && key == astra_core::model_wire::responses::CONTINUATION_KEY
+                {
+                    continue;
+                }
                 object.remove(key);
             }
         }
@@ -4151,6 +4228,7 @@ fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
     allow_suffix_dependent_history_repair: bool,
+    preserve_responses: bool,
 ) -> Vec<Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
@@ -4226,7 +4304,8 @@ fn consolidate_system_messages_inner(
     }
     out.extend(rest);
     if !allow_suffix_dependent_history_repair {
-        strip_internal_runtime_markers(&mut out);
+        let provider_ids = provider_history_ids(&out);
+        strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
         return out;
     }
 
@@ -4293,7 +4372,8 @@ fn consolidate_system_messages_inner(
         }
     }
 
-    strip_internal_runtime_markers(&mut out);
+    let provider_ids = provider_history_ids(&out);
+    strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
     out
 }
 
@@ -4933,7 +5013,9 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
 pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
     matches!(
         llm_provider_protocol(provider),
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+        LlmProviderProtocol::OpenAiResponses
+            | LlmProviderProtocol::OpenAiCompatible
+            | LlmProviderProtocol::AnthropicMessages
     )
 }
 
@@ -5005,6 +5087,9 @@ pub(crate) fn prepare_streaming_call(
     tool_choice: RuntimeToolChoice,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
     let preparation_started = Instant::now();
+    if call.route.provider == astra_services::chatgpt::PROVIDER {
+        return responses::prepare(call, tool_choice, preparation_started);
+    }
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
@@ -5214,6 +5299,21 @@ async fn call_prepared_llm_with_total_budget(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
+    if provider == astra_services::chatgpt::PROVIDER {
+        return responses::execute(
+            route,
+            prepared_request,
+            &url,
+            authorized_tool_names,
+            judgment_provenance,
+            cancel,
+            stream_callback,
+            attempt_observer,
+            started,
+            total_budget,
+        )
+        .await;
+    }
     let client = global_llm_client();
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
@@ -6261,6 +6361,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: response_id.clone(),
             full_text:
@@ -6773,6 +6874,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     }
 
     Ok(LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id,
         full_text,
@@ -6911,6 +7013,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: response_id.clone(),
             full_text: full_text.clone(),
@@ -7376,6 +7479,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     let (usage_tokens, reported_presence) =
         usage_tokens.qualified_snapshot(retained_usage_presence);
     Ok(LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id,
         full_text,
@@ -7458,6 +7562,17 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    if call.route.provider == astra_services::chatgpt::PROVIDER {
+        let prepared = prepare_streaming_call(call, tool_choice)?;
+        return call_prepared_llm_and_collect_with_stream_callback(
+            prepared,
+            LlmCancel::None,
+            None,
+            attempt_observer,
+            Some(timeout),
+        )
+        .await;
+    }
     call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_timeout = timeout;
@@ -7485,6 +7600,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         temperature
     };
     let LlmExecutionRoute {
+        subscription: _,
         fixed_temperature: _,
         supported_reasoning_efforts: _,
         thinking_protocol,
@@ -7977,6 +8093,7 @@ fn parse_bedrock_nonstream_response(v: &Value, model_name: &str) -> LlmCallResul
     }
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -8062,6 +8179,7 @@ fn parse_openai_compatible_nonstream_response(v: &Value, model_name: &str) -> Ll
     }
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -8138,6 +8256,7 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
         .unwrap_or_default();
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -8162,6 +8281,7 @@ pub(crate) fn parse_nonstream_response_for_provider(
     model_name: &str,
 ) -> LlmCallResult {
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => responses::parse_nonstream(v, model_name),
         LlmProviderProtocol::BedrockConverse => parse_bedrock_nonstream_response(v, model_name),
         LlmProviderProtocol::AnthropicMessages => parse_anthropic_nonstream_response(v, model_name),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
@@ -8353,6 +8473,7 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    subscription: None,
                     model_name: "local-alias".into(),
                     wire_model_name: Some("upstream-fixture".into()),
                     api_key: "fixture".into(),
@@ -8433,6 +8554,7 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    subscription: None,
                     model_name: "fixture".into(),
                     wire_model_name: None,
                     api_key: "fixture".into(),
@@ -8530,6 +8652,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
                 thinking_protocol: Some(
@@ -8610,6 +8733,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -8785,6 +8909,7 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            subscription: None,
             fixed_temperature: None,
             supported_reasoning_efforts: None,
             thinking_protocol: None,
@@ -9033,6 +9158,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9079,6 +9205,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9146,6 +9273,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9438,6 +9566,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9499,6 +9628,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9577,6 +9707,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9646,6 +9777,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9712,6 +9844,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9785,6 +9918,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9850,6 +9984,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9894,6 +10029,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9944,6 +10080,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -10011,6 +10148,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -10103,6 +10241,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -10176,6 +10315,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -12715,6 +12855,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -12776,6 +12917,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -13126,6 +13268,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
                 thinking_protocol: None,
@@ -13723,6 +13866,7 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -15475,6 +15619,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15539,6 +15684,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15591,6 +15737,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -15636,6 +15783,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15678,6 +15826,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15725,6 +15874,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -15800,6 +15950,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15832,6 +15983,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15885,6 +16037,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15952,6 +16105,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16001,6 +16155,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16054,6 +16209,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16101,6 +16257,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16148,6 +16305,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16269,6 +16427,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16314,6 +16473,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16458,6 +16618,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,

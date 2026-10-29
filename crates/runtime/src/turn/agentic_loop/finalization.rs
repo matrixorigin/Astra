@@ -670,13 +670,16 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 }
 
 fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
-    if let Some(message) =
+    if let Some(mut message) =
         astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
             &state.messages,
             &state.final_text,
             state.final_text_model_item_id.as_deref(),
         )
     {
+        if let Some(continuation) = state.pending_provider_continuation.as_ref() {
+            message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
+        }
         state.push_prompt_history_message(message);
     }
 }

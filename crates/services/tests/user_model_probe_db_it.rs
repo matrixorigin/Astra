@@ -164,6 +164,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .with_pool(pool.clone());
     let owner = uuid::Uuid::new_v4().to_string();
     let make_request = |name: &str, model: &str, key: &str| UserModelCreateRequestData {
+        connection_id: None,
         name: name.into(),
         provider: "deepseek".into(),
         model: model.into(),
