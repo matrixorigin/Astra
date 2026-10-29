@@ -50,22 +50,26 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 ## ChatGPT subscription connections
 
 Offline coverage lives in `astra-core::model_wire::responses` (wire codec),
-`astra-services::chatgpt::tests` (OIDC, redirect, digest and feature gates),
+`astra-services::chatgpt::tests` (OIDC, redirect and feature gates),
+`astra-services::auth::encryption::tests` (keyed-digest verification),
 `astra-cli::cli::model_connections::tests` (callback/browser binding), and
 `runtime/tests/user_models_http.rs` (authenticated routes and frozen catalog).
 `services/tests/chatgpt_connections_db_it.rs` uses an explicitly isolated
 MatrixOne database and a local fake OAuth/Responses provider for encryption,
 ownership, rotation races, model sharing, disconnect and reauthorization.
-The ignored `responses_runtime_tool_checkpoint_resume_quota_and_disconnect`
-runtime unit test covers physical-attempt settlement, a tool call through the
-canonical heavy checkpoint, quota without retry and disconnect during headers.
+The ignored `responses_transport_replays_checkpoint_and_fences_disconnected_credentials`
+transport test covers physical-attempt settlement, manually constructed tool
+frames replayed through canonical heavy-checkpoint JSON, quota without retry
+and disconnect during headers. It does not execute a tool, persist/reload a
+Server session or restart a Server. Those product journeys remain unverified
+for this provider; the explicit operator lane below covers them.
 Neither database lane contacts OpenAI or spends subscription quota.
 
 Run these DB lanes with the testing guide's isolated database variables:
 
 ```bash
 cargo test -p astra-services --features e2e-hooks --test chatgpt_connections_db_it -- --ignored --test-threads=1
-cargo test -p astra-runtime --lib responses_runtime_tool_checkpoint_resume_quota_and_disconnect -- --ignored --test-threads=1
+cargo test -p astra-runtime --lib responses_transport_replays_checkpoint_and_fences_disconnected_credentials -- --ignored --test-threads=1
 ```
 
 Live acceptance remains an explicit operator step on an isolated self-hosted

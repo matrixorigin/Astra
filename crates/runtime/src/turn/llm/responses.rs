@@ -16,10 +16,11 @@ fn credential_error(
         axum::Json<astra_core::ErrorResponse>,
     ),
 ) -> astra_core::ClassifiedError {
-    let json = serde_json::to_value(value.1.0).unwrap_or_default();
-    let code = json
-        .get("error_code")
-        .and_then(Value::as_str)
+    let code = value
+        .1
+        .0
+        .error_code
+        .as_deref()
         .unwrap_or("model_connection_reauthentication_required");
     error(astra_core::ErrorKind::InvalidRequest, code)
 }
@@ -454,18 +455,4 @@ pub(super) async fn execute(
         astra_core::ErrorKind::ProviderDeadline,
         "provider_deadline",
     ))
-}
-
-pub(super) fn parse_nonstream(value: &Value, model: &str) -> LlmCallResult {
-    let mut accumulator = ResponseAccumulator::default();
-    if accumulator
-        .observe(&json!({"type":"response.completed","response":value}))
-        .is_err()
-    {
-        return LlmCallResult::default();
-    }
-    accumulator
-        .finish()
-        .map(|out| result(out, "", model, model))
-        .unwrap_or_default()
 }

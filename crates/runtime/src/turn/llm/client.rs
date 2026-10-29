@@ -3596,8 +3596,7 @@ fn build_provider_request_body_with_cache_capability(
     };
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::OpenAiResponses => {
-            astra_core::model_wire::responses::request(model_name, messages, Some(tools), "", false)
-                .unwrap_or_else(|_| json!({"_astra_invalid_responses_request":true}))
+            unreachable!("Responses requests use the connection-bound streaming adapter")
         }
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing(&reasoning_repaired);
@@ -8281,7 +8280,9 @@ pub(crate) fn parse_nonstream_response_for_provider(
     model_name: &str,
 ) -> LlmCallResult {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiResponses => responses::parse_nonstream(v, model_name),
+        LlmProviderProtocol::OpenAiResponses => {
+            unreachable!("Responses calls collect the streaming adapter's result")
+        }
         LlmProviderProtocol::BedrockConverse => parse_bedrock_nonstream_response(v, model_name),
         LlmProviderProtocol::AnthropicMessages => parse_anthropic_nonstream_response(v, model_name),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {

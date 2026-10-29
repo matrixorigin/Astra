@@ -54,7 +54,8 @@ issued client registration and provider subject. Multiple personal model rows
 reference it. A row has exactly one source: API-key ciphertext or connection ID;
 admission rejects malformed combinations. `user_llm_authorizations` owns
 short-lived, owner-bound OAuth attempts, encrypted PKCE verifiers and keyed
-state/nonce digests. Credentials never enter serializable routes, catalogs,
+state/nonce digests. ID tokens are verified and discarded; only renewable
+credentials are stored encrypted. Credentials never enter serializable routes, catalogs,
 checkpoints or public errors. The CLI relays only the browser callback and uses
 a loopback listener; Server never reads local CLI/Codex credentials.
 

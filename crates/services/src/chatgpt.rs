@@ -82,6 +82,25 @@ fn provider_failure(status: StatusCode, bytes: &[u8]) -> (StatusCode, Json<Error
     )
 }
 
+async fn provider_body(mut response: reqwest::Response) -> ApiResult<Vec<u8>> {
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| internal_error("OpenAI response was interrupted"))?
+    {
+        if bytes.len() + chunk.len() > 1024 * 1024 {
+            return Err(internal_error("OpenAI response exceeded its size limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(provider_failure(status, &bytes));
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatgptConfig {
     pub enabled: bool,
@@ -189,7 +208,6 @@ pub struct ConnectionView {
 struct Credentials {
     access_token: String,
     refresh_token: Option<String>,
-    id_token: String,
     scopes: Vec<String>,
     expires_at: i64,
 }
@@ -577,28 +595,14 @@ impl ChatgptConnections {
         )
     }
     async fn read_json(&self, request: reqwest::RequestBuilder) -> ApiResult<Value> {
-        let mut response = request.send().await.map_err(|_| {
+        let response = request.send().await.map_err(|_| {
             fail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "chatgpt_connection_unavailable",
                 "OpenAI connection failed",
             )
         })?;
-        let status = response.status();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| internal_error("OpenAI response was interrupted"))?
-        {
-            if bytes.len() + chunk.len() > 1024 * 1024 {
-                return Err(internal_error("OpenAI response exceeded its size limit"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        if !status.is_success() {
-            return Err(provider_failure(status, &bytes));
-        }
+        let bytes = provider_body(response).await?;
         serde_json::from_slice(&bytes)
             .map_err(|_| internal_error("OpenAI returned an invalid JSON response"))
     }
@@ -773,7 +777,7 @@ impl ChatgptConnections {
             let scopes: Vec<String> = token.scope.as_deref().unwrap_or("").split_whitespace().map(str::to_owned).collect();
             let state = if scopes.iter().any(|s| s==PLAN_SCOPE) { "connected" } else { "plan_disabled" };
             let credentials = Credentials { access_token:token.access_token,refresh_token:token.refresh_token,
-                id_token:id_token.to_owned(),scopes,expires_at:unix_now()+token.expires_in };
+                scopes,expires_at:unix_now()+token.expires_in };
             let encrypted = self.encryptor.encrypt(&serde_json::to_string(&credentials).map_err(internal_error)?).map_err(internal_error)?;
             let requested_id: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
             let existing = query("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND client_id=? AND subject=?")
@@ -934,7 +938,7 @@ impl ChatgptConnections {
                 }
                 let scopes = token.scope.map(|s| s.split_whitespace().map(str::to_owned).collect()).unwrap_or(credentials.scopes);
                 let replacement = Credentials { access_token:token.access_token,refresh_token:token.refresh_token.or(credentials.refresh_token),
-                    id_token:token.id_token.unwrap_or(credentials.id_token),scopes,expires_at:unix_now()+token.expires_in };
+                    scopes,expires_at:unix_now()+token.expires_in };
                 if !replacement.scopes.iter().any(|s| s==PLAN_SCOPE) { return Err(reauth()); }
                 let encrypted = self.encryptor.encrypt(&serde_json::to_string(&replacement).map_err(internal_error)?).map_err(internal_error)?;
                 let changed = query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=?,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=? AND status='connected'")
@@ -1026,7 +1030,7 @@ impl ChatgptConnections {
             true,
         )
         .map_err(internal_error)?;
-        let mut response = self
+        let response = self
             .client()?
             .post(format!("{}/responses", self.enabled()?.api_base))
             .bearer_auth(lease.bearer())
@@ -1040,23 +1044,7 @@ impl ChatgptConnections {
                     "Subscription model check could not connect",
                 )
             })?;
-        let status = response.status();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| internal_error("Subscription model check was interrupted"))?
-        {
-            if bytes.len() + chunk.len() > 1024 * 1024 {
-                return Err(internal_error(
-                    "Subscription model check exceeded its size limit",
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        if !status.is_success() {
-            return Err(provider_failure(status, &bytes));
-        }
+        let bytes = provider_body(response).await?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| internal_error("Invalid subscription response encoding"))?;
         let output = astra_core::model_wire::responses::decode_sse(text).map_err(|_| {

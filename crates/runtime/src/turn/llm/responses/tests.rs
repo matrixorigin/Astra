@@ -72,7 +72,7 @@ async fn infer(
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database; no live provider"]
-async fn responses_runtime_tool_checkpoint_resume_quota_and_disconnect() {
+async fn responses_transport_replays_checkpoint_and_fences_disconnected_credentials() {
     let mut settings = astra_core::MatrixOneSettings::from_env();
     crate::isolated_database::require_isolated_database(&settings.database);
     settings.db_pool_max_connections = 8;
@@ -185,12 +185,12 @@ async fn responses_runtime_tool_checkpoint_resume_quota_and_disconnect() {
     )
     .unwrap();
     let saved = serde_json::to_vec(&checkpoint).unwrap();
-    let resumed: astra_pipeline::step_protocol::HeavyCheckpoint =
+    let restored: astra_pipeline::step_protocol::HeavyCheckpoint =
         serde_json::from_slice(&saved).unwrap();
-    let second = infer(&admitted, &resumed.messages, &tools, &attempts)
+    let second = infer(&admitted, &restored.messages, &tools, &attempts)
         .await
         .unwrap();
-    assert_eq!(second.full_text, "Resumed successfully");
+    assert_eq!(second.full_text, "Continued successfully");
     let requests = provider.state.requests.lock().unwrap().clone();
     let replay = requests.last().unwrap()["input"].as_array().unwrap();
     assert!(

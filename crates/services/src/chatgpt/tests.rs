@@ -25,15 +25,6 @@ fn callback_policy_accepts_only_the_bound_loopback_path() {
         assert!(validate_redirect(value).is_err(), "{value}");
     }
 }
-#[test]
-fn state_digests_are_domain_separated_and_constant_time_verified() {
-    let key = encryptor();
-    let digest = key.keyed_digest("chatgpt-state", "random-state");
-    assert!(key.verify_keyed_digest("chatgpt-state", "random-state", &digest));
-    assert!(!key.verify_keyed_digest("chatgpt-nonce", "random-state", &digest));
-    assert!(!key.verify_keyed_digest("chatgpt-state", "wrong-state", &digest));
-    assert!(!key.verify_keyed_digest("chatgpt-state", "random-state", "not-a-digest"));
-}
 #[tokio::test]
 async fn provider_identity_requires_signature_audience_and_nonce() {
     let fixture = fixture::ProviderFixture::start().await;
@@ -103,7 +94,7 @@ async fn feature_flag_blocks_linking_before_database_or_provider_io() {
     assert_eq!(failure.0, StatusCode::SERVICE_UNAVAILABLE);
 }
 #[test]
-fn callback_debug_and_public_metadata_do_not_disclose_credentials() {
+fn callback_debug_redacts_values_and_provider_urls_reject_untrusted_origins() {
     let request = CompleteAuthorization {
         state: "sensitive-state".into(),
         code: Some("sensitive-code".into()),

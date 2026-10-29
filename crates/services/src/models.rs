@@ -4482,16 +4482,7 @@ impl ModelService for DatabaseModelService {
             return self.get_user_model(user_id, model_id).await;
         }
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let row = query(
-            "SELECT model_name, provider, api_key_encrypted, base_url, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
-             FROM user_llm_models WHERE user_id = ? AND model_id = ?",
-        )
-        .bind(&user_id)
-        .bind(&model_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(user_model_not_found)?;
+        let row = existing;
         let model: String = row.try_get("model_name").map_err(internal_error)?;
         let provider: String = row.try_get("provider").map_err(internal_error)?;
         let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;

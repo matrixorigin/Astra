@@ -285,7 +285,7 @@ async fn responses(
         json!([{"type":"reasoning","id":"reasoning-1","encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
             {"type":"function_call","id":"function-1","namespace":"astra","name":name,"call_id":"call-1","arguments":"{}","status":"completed"}])
     } else {
-        json!([{"type":"message","id":"message-1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":if continued {"Resumed successfully"} else {"OK"},"annotations":[]}]}])
+        json!([{"type":"message","id":"message-1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":if continued {"Continued successfully"} else {"OK"},"annotations":[]}]}])
     };
     let event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":output,
         "usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":2}}}});

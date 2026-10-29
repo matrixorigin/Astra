@@ -293,6 +293,16 @@ mod tests {
     }
 
     #[test]
+    fn keyed_digest_verification_requires_matching_domain_value_and_digest() {
+        let key = make_encryptor("digest-verification-key");
+        let digest = key.keyed_digest("domain-one", "value");
+        assert!(key.verify_keyed_digest("domain-one", "value", &digest));
+        assert!(!key.verify_keyed_digest("domain-two", "value", &digest));
+        assert!(!key.verify_keyed_digest("domain-one", "different", &digest));
+        assert!(!key.verify_keyed_digest("domain-one", "value", "not-a-digest"));
+    }
+
+    #[test]
     fn decrypt_invalid_ciphertext_fails() {
         let enc = make_encryptor("any-key");
         let result = enc.decrypt("not-a-valid-fernet-token");

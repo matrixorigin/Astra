@@ -127,7 +127,15 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     let stored:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
         .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
     assert!(!stored.contains("fixture-access-"));
-    assert!(key.decrypt(&stored).unwrap().contains("fixture-access-"));
+    let plaintext = key.decrypt(&stored).unwrap();
+    assert!(plaintext.contains("fixture-access-"));
+    let mut legacy: Value = serde_json::from_str(&plaintext).unwrap();
+    assert!(legacy.get("id_token").is_none());
+    // A connection saved by the earlier PR revision must still refresh. Its
+    // unused ID-token field is ignored and omitted on the next credential write.
+    legacy["id_token"] = json!("obsolete-id-token");
+    sqlx::query("UPDATE user_llm_connections SET credentials_encrypted=? WHERE user_id=? AND connection_id=?")
+        .bind(key.encrypt(&legacy.to_string()).unwrap()).bind(&owner).bind(&connection).execute(&pool).await.unwrap();
     let metadata = service
         .operate(&owner, ConnectionOperation::List)
         .await
@@ -205,6 +213,10 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     let b = b.unwrap();
     assert_eq!(a.bearer(), b.bearer());
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 1);
+    let refreshed: String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+        .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
+    let refreshed: Value = serde_json::from_str(&key.decrypt(&refreshed).unwrap()).unwrap();
+    assert!(refreshed.get("id_token").is_none());
     drop((a, b));
     let live = first.acquire(false).await.unwrap();
     let disconnected = service
