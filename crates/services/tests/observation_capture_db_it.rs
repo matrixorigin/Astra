@@ -1,8 +1,7 @@
 //! Real MatrixOne contracts for bounded identity-collision diagnostics.
 
 use astra_services::observation_capture::{
-    ObservationCollisionReceipt, ObservationPayloadDomain, canonical_observation_payload_hash,
-    record_observation_collisions,
+    ObservationCollisionReceipt, canonical_agent_event_payload_hash, record_observation_collisions,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -158,7 +157,6 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
             &mut tx,
             &[ObservationCollisionReceipt {
                 user_id: &owner,
-                domain: ObservationPayloadDomain::AgentEvent,
                 identity_id: identities[index],
                 session_id: hashes[index],
                 stored_payload_hash: hashes[index],
@@ -184,7 +182,6 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
     let receipts = (0..260)
         .map(|index| ObservationCollisionReceipt {
             user_id: &owner,
-            domain: ObservationPayloadDomain::AgentEvent,
             identity_id: identities[index % 4],
             session_id: "changed-session",
             stored_payload_hash: "changed-stored",
@@ -233,12 +230,12 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
         }
         assert_eq!(last.get::<i64, _>("retention_seconds"), 7 * 24 * 60 * 60);
     }
-    // A fresh domain exercises first-insert metadata within the batch itself,
+    // A fresh owner exercises first-insert metadata within the batch itself,
     // using the sequential writes above as the database-collation oracle.
+    let fresh_owner = format!("{owner}-fresh");
     let manifests = (0..260)
         .map(|index| ObservationCollisionReceipt {
-            user_id: &owner,
-            domain: ObservationPayloadDomain::ContextManifest,
+            user_id: &fresh_owner,
             identity_id: identities[index % 4],
             session_id: hashes[index % 4],
             stored_payload_hash: hashes[index % 4],
@@ -249,9 +246,8 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
     record_observation_collisions(&mut tx, &manifests)
         .await
         .unwrap();
-    let manifest_select = select.replace("'agent_event'", "'context_manifest'");
-    let manifest_rows = sqlx::query(sqlx::AssertSqlSafe(manifest_select))
-        .bind(&owner)
+    let manifest_rows = sqlx::query(select)
+        .bind(&fresh_owner)
         .fetch_all(&mut *tx)
         .await
         .unwrap();
@@ -286,7 +282,6 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
         let invalid = (0..3)
             .map(|index| ObservationCollisionReceipt {
                 user_id: &owner,
-                domain: ObservationPayloadDomain::AgentEvent,
                 identity_id: "invalid-repeated-key",
                 session_id: "session",
                 stored_payload_hash: if index == invalid_index {
@@ -307,7 +302,6 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
     let mut invalid_batch = receipts;
     invalid_batch.push(ObservationCollisionReceipt {
         user_id: &owner,
-        domain: ObservationPayloadDomain::AgentEvent,
         identity_id: "invalid-final-chunk",
         session_id: "session",
         stored_payload_hash: &oversized_hash,
@@ -321,13 +315,17 @@ async fn collision_batches_preserve_database_identity_order_expiry_and_rollback(
     );
     tx.rollback().await.unwrap();
     let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM observation_identity_collisions WHERE user_id = ?",
+        "SELECT COUNT(*) FROM observation_identity_collisions WHERE user_id IN (?, ?)",
     )
     .bind(&owner)
+    .bind(&fresh_owner)
     .fetch_one(pool.get())
     .await
     .unwrap();
-    assert_eq!(remaining, 0, "rollback must remove every chunk and domain");
+    assert_eq!(
+        remaining, 0,
+        "rollback must remove every chunk in both owner scopes"
+    );
 }
 
 #[tokio::test]
@@ -336,10 +334,7 @@ async fn collision_receipts_bound_distinct_hashes_and_isolate_owners() {
     let pool = common::setup_pool().await;
     let owner = format!("collision-{}", Uuid::new_v4());
     let other_owner = format!("collision-other-{}", Uuid::new_v4());
-    let stored_hash = canonical_observation_payload_hash(
-        ObservationPayloadDomain::AgentEvent,
-        &serde_json::json!({"original": true}),
-    );
+    let stored_hash = canonical_agent_event_payload_hash(&serde_json::json!({"original": true}));
     // Keep a small explicit single-receipt concurrency contract before the
     // 1024-attempt workload. The opt-in scale path keeps one transaction per attempt.
     let scale = std::env::var("ASTRA_TEST_STORAGE_SCALE").as_deref() == Ok("1");
@@ -355,7 +350,6 @@ async fn collision_receipts_bound_distinct_hashes_and_isolate_owners() {
                     &mut tx,
                     &[ObservationCollisionReceipt {
                         user_id: &owner,
-                        domain: ObservationPayloadDomain::AgentEvent,
                         identity_id: "single-id",
                         session_id: "session",
                         stored_payload_hash: &stored_hash,
@@ -388,8 +382,7 @@ async fn collision_receipts_bound_distinct_hashes_and_isolate_owners() {
         tasks.spawn(async move {
             let hashes = (0..256)
                 .map(|sequence| {
-                    canonical_observation_payload_hash(
-                        ObservationPayloadDomain::AgentEvent,
+                    canonical_agent_event_payload_hash(
                         &serde_json::json!({"worker": worker, "sequence": sequence}),
                     )
                 })
@@ -399,7 +392,6 @@ async fn collision_receipts_bound_distinct_hashes_and_isolate_owners() {
                     .iter()
                     .map(|hash| ObservationCollisionReceipt {
                         user_id: &owner,
-                        domain: ObservationPayloadDomain::AgentEvent,
                         identity_id: "shared-id",
                         session_id: "session",
                         stored_payload_hash: &stored_hash,
@@ -428,7 +420,6 @@ async fn collision_receipts_bound_distinct_hashes_and_isolate_owners() {
         &mut tx,
         &[ObservationCollisionReceipt {
             user_id: &other_owner,
-            domain: ObservationPayloadDomain::AgentEvent,
             identity_id: "shared-id",
             session_id: "session",
             stored_payload_hash: &stored_hash,

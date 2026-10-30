@@ -7,19 +7,14 @@ Context and prompt owns context assembly, prompt-cache stability, dynamic state 
 
 This document defines the target behavior that implementation should converge toward.
 
-Context manifests project observed LLM calls. The retained 8k template supplies
-coarse projection budgets; context assembly owns actual request budgeting.
-The `post_compaction` reason describes a call after compaction state was recorded;
-multiple subsequent calls can carry it. Trace-gated, best-effort manifests are
-not one-per-compaction certificates, and their count does not prove preservation.
-Preservation belongs at acceptance of a canonical rewrite. Request-time manifest
-diagnostics retain only message/tool-result token totals across provider inference;
-they do not retain another transcript copy. These estimates are skipped unless
-context-assembly persistence has an owner and database, and the host must still
-confirm the authoritative session/run identity after inference. Retrieval-stage
-metadata describes runtime facts, but does not itself execute retrieval. Synthetic
-confidence, expiry, seven-child rendering, and 10GB retrieval assertions are not
-evidence that those policies or execution paths are implemented.
+The separate persisted per-call Context manifest product and its coarse 8k
+budget projection are retired. Canonical Context commits, heads, pins and
+receipts retain conversation custody. Live assembly traces, Explain Context,
+actual model input budgets, compaction, provider receipts and usage remain
+independent owners; they are not per-compaction preservation certificates.
+Preservation is verified when accepting a canonical rewrite. The removed
+per-attempt artifact-evidence list and zone estimates are not reconstructed from
+provider usage. Diagnostic manifests no longer add artifact retention pins.
 
 The database-inspired foundation for this design is described in
 [ContextPipe: Database-Inspired Context Assembly for Long-Horizon

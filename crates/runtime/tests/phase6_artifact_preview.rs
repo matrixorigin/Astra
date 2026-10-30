@@ -69,7 +69,7 @@ struct ArtifactSeed<'a> {
     policy: &'a str,
     status: &'a str,
     retention_days: i64,
-    manifest_refs: i64,
+    state_refs: i64,
 }
 
 async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) {
@@ -78,7 +78,7 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
     sqlx::query(
         "INSERT INTO session_artifacts
          (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
-          retention_policy, retention_until, status, referenced_by_manifest_count,
+          retention_policy, retention_until, status, referenced_by_state_items_count,
          created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
     )
@@ -91,7 +91,7 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
     .bind(seed.policy)
     .bind(retention_until)
     .bind(seed.status)
-    .bind(seed.manifest_refs)
+    .bind(seed.state_refs)
     .execute(pool.get())
     .await
     .unwrap();
@@ -772,7 +772,7 @@ async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
             policy: "default",
             status: "active",
             retention_days: 1,
-            manifest_refs: 0,
+            state_refs: 0,
         },
     )
     .await;
@@ -862,8 +862,8 @@ async fn l2_50_gc_preserves_referenced_artifact_deadline_without_fake_cold_stora
             kind: "pg_dump",
             policy: "default",
             status: "active",
-            retention_days: 1,
-            manifest_refs: 1,
+            retention_days: -1,
+            state_refs: 1,
         },
     )
     .await;
@@ -891,44 +891,48 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
-    let artifact_id = format!("artifact-{}", Uuid::new_v4());
-    insert_artifact(
-        &pool,
-        ArtifactSeed {
+    let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env()).with_pool(pool.clone());
+    for kind in [
+        SessionArtifactReferenceKind::InvocationLedger,
+        SessionArtifactReferenceKind::Manifest,
+        SessionArtifactReferenceKind::StateItem,
+        SessionArtifactReferenceKind::Citation,
+        SessionArtifactReferenceKind::RecoveryPoint,
+        SessionArtifactReferenceKind::SessionTranscript,
+    ] {
+        let artifact_id = format!("artifact-{}", Uuid::new_v4());
+        insert_artifact(&pool, ArtifactSeed {
             user_id: &user_id,
             session_id: &session_id,
             artifact_id: &artifact_id,
             kind: "arbitrary_provider_result",
             policy: "default",
             status: "active",
-            retention_days: 1,
-            manifest_refs: 0,
-        },
-    )
-    .await;
-    sqlx::query(
-        "INSERT INTO session_artifact_references
-         (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
-         VALUES (?, ?, ?, 'invocation_ledger', ?, NOW(6))",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&artifact_id)
-    .bind(format!("invocation:{}", Uuid::new_v4()))
-    .execute(pool.get())
-    .await
-    .unwrap();
-
-    let deadline_before =
-        artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
-    let _outcome = run_artifact_retention_gc_once(pool.clone(), 100)
-        .await
-        .unwrap();
-    let (status, cold_ref) = artifact_status(&pool, &user_id, &session_id, &artifact_id).await;
-    let deadline_after = artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
-    assert_eq!(deadline_after, deadline_before);
-    assert_eq!(status, "active");
-    assert_eq!(cold_ref, None);
+            retention_days: -1,
+            state_refs: 0,
+        }).await;
+        let reference = SessionArtifactReference {
+            kind,
+            reference_id: if kind == SessionArtifactReferenceKind::SessionTranscript {
+                session_id.clone()
+            } else {
+                format!("retention-{}", Uuid::new_v4())
+            },
+        };
+        store.retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference).await.unwrap();
+        // Retaining extends the deadline. Move it into the past to exercise
+        // expiry eligibility while the durable reference still exists.
+        sqlx::query("UPDATE session_artifacts SET retention_until = TIMESTAMPADD(DAY, -1, NOW(6)) WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
+            .bind(&user_id).bind(&session_id).bind(&artifact_id).execute(pool.get()).await.unwrap();
+        let deadline = artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await;
+        run_artifact_retention_gc_once(pool.clone(), 100).await.unwrap();
+        assert_eq!(artifact_status(&pool, &user_id, &session_id, &artifact_id).await, ("active".into(), None), "{kind:?}");
+        assert_eq!(artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await, deadline);
+        store.release_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference).await.unwrap();
+        run_artifact_retention_gc_once(pool.clone(), 100).await.unwrap();
+        assert_eq!(artifact_status(&pool, &user_id, &session_id, &artifact_id).await, ("expired".into(), None), "{kind:?}");
+        assert_eq!(artifact_retention_until(&pool, &user_id, &session_id, &artifact_id).await, deadline);
+    }
 }
 
 }
@@ -950,7 +954,7 @@ async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
             policy: "project_long_term",
             status: "active",
             retention_days: -1,
-            manifest_refs: 0,
+            state_refs: 0,
         },
     )
     .await;
@@ -980,7 +984,7 @@ async fn l2_54b_expiry_removes_retained_payload_bytes_instead_of_only_relabeling
             policy: "default",
             status: "active",
             retention_days: -1,
-            manifest_refs: 0,
+            state_refs: 0,
         },
     )
     .await;
@@ -1045,7 +1049,7 @@ async fn l3_18_s12_14_day_review_retention() {
     let mut insert = QueryBuilder::<MySql>::new(
         "INSERT INTO session_artifacts
          (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
-          retention_policy, retention_until, status, referenced_by_manifest_count,
+          retention_policy, retention_until, status, referenced_by_state_items_count,
           created_at, updated_at) ",
     );
     insert.push_values(0..250, |mut row, i| {

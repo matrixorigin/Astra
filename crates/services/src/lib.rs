@@ -10,9 +10,7 @@ mod cancellation_safe_db;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
 pub use cancellation_safe_db::{CancellationSafePoolConnection, TransactionConnection};
 pub mod context;
-pub mod context_manifest;
 pub mod coordination;
-pub mod data_versioning;
 pub mod db_row;
 pub mod decisions;
 pub mod edge_context;
@@ -34,7 +32,6 @@ pub mod multi_agent;
 pub mod observation_capture;
 pub mod pagination;
 pub mod personal_skills;
-pub mod prompt_delta;
 pub mod reflect;
 pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
@@ -158,19 +155,9 @@ pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
     SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
 };
-pub use context_manifest::{
-    BENCHMARK_TOOL_PREVIEW_BUDGET, BUDGET_V1_8K_PROMPT_CAP, BUDGET_V1_8K_TOTAL_CAP, BudgetV1_8k,
-    CONTEXT_MANIFEST_REASONS, ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
-    DatabaseContextManifestStore, RECENT_TAIL_BENCHMARK_FLOOR, RetrievalStage,
-    TURN_INTENT_BENCHMARK_COMPARISON, TurnIntentBudgetAllocation, artifact_id_from_raw_ref,
-    budget_for_turn_intent, expired_artifact_placeholder,
-};
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AggregationStrategy,
     CoordinationPattern, DelegationRequest, DelegationResult, aggregate_results,
-};
-pub use data_versioning::{
-    DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
 };
 pub use decisions::{
     DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
@@ -262,13 +249,6 @@ pub use personal_skills::{
     DatabasePersonalSkillStore, PersonalSkillError, RecordUserSkillEvaluation,
     SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillEvaluationRecord,
     UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, skill_md_content_hash,
-};
-pub use prompt_delta::{
-    PromptDeltaCounts, PromptRequestObservability, PromptRequestPersistInput,
-    PromptRequestPersistResult, PromptRequestPlan, PromptRequestPlanInput,
-    count_prompt_requests_for_run, count_prompt_requests_for_session,
-    load_latest_prompt_observability_for_run, load_latest_prompt_observability_for_session,
-    persist_prompt_request, plan_prompt_request,
 };
 pub use reflect::{
     DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,

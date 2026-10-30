@@ -1390,17 +1390,6 @@ export type RunProjectionResponse = {
     node_seq: number;
     created_at: string;
   } | null;
-  observability: {
-    observability_available: boolean;
-    prompt_request_count: number;
-    latest_prompt_request?: {
-      request_id: string;
-      request_hash: string;
-      message_count: number;
-      tool_count: number;
-      delta_counts: unknown;
-    } | null;
-  };
   recent_events: Array<StreamEvent | Record<string, unknown>>;
 };
 
@@ -2908,182 +2897,6 @@ export type WorkBranchComparisonReportV2 = {
   coverage_gaps: WorkBranchComparisonCoverageGapV2[];
 };
 
-export type WorkPatchArtifactV1 = {
-  schema_version: 1;
-  work_id: string;
-  branch_id: string;
-  patch_artifact_id: string;
-  source_branch_revision: number;
-  source_graph_revision: number;
-  base_subject_revision: WorkContentHash;
-  result_subject_revision: WorkContentHash;
-  payload_hash: WorkContentHash;
-  payload_bytes: number;
-  format: "unified_diff_v1";
-  provider_invocation_ref: string;
-  source_ref: string;
-  created_at: string;
-};
-
-export type WorkPatchArtifactExportInputV1 = {
-  requestId: string;
-  expectedBranchRevision: number;
-  expectedGraphRevision: number;
-};
-
-export type WorkPatchArtifactContent = {
-  data: string;
-  hash: WorkContentHash;
-  bytes: number;
-};
-
-export type WorkPatchArtifactCursorV1 = {
-  created_at: string;
-  patch_artifact_id: string;
-};
-
-export type WorkPatchArtifactPageV1 = {
-  schema_version: 1;
-  work_id: string;
-  branch_id: string;
-  artifacts: WorkPatchArtifactV1[];
-  next_cursor: WorkPatchArtifactCursorV1 | null;
-};
-
-export type WorkPatchArtifactListParamsV1 = {
-  before?: WorkPatchArtifactCursorV1;
-  limit?: number;
-};
-
-export type WorkPatchMaterializationInputV1 = {
-  requestId: string;
-  patchArtifactId: string;
-  expectedTargetBranchRevision: number;
-  expectedTargetGraphRevision: number;
-};
-
-export type WorkPatchMaterializationCursorV1 = {
-  created_at: string;
-  operation_id: string;
-};
-
-export type WorkPatchMaterializationListParamsV1 = {
-  sourceBranchId: string;
-  before?: WorkPatchMaterializationCursorV1;
-  limit?: number;
-};
-
-export type WorkPatchMaterializationOperationV2 = {
-  schema_version: 2;
-  operation_id: string;
-  work_id: string;
-  request_id: string;
-  patch_artifact_id: string;
-  source_branch_id: string;
-  target_branch_id: string;
-  target_branch_revision: number;
-  target_graph_revision: number;
-  base_subject_revision: WorkContentHash;
-  result_subject_revision: WorkContentHash;
-  payload_hash: WorkContentHash;
-  provider_ref: string;
-  policy_decision_ref: string;
-  state: "pending" | "aborted" | "succeeded" | "conflict" | "failed";
-  phase: "awaiting_dispatch" | "applying" | "reconciling" | "verifying" | "complete";
-  apply_invocation_ref: string | null;
-  observed_subject_revision: WorkContentHash | null;
-  apply_outcome:
-    | "applied"
-    | "not_applied"
-    | "result_mismatch"
-    | "target_changed"
-    | null;
-  failure_code:
-    | "provider_unavailable"
-    | "authorization_denied"
-    | "workspace_unavailable"
-    | "patch_rejected"
-    | "invocation_cancelled"
-    | "provider_internal"
-    | null;
-  verification_evidence_hash: WorkContentHash | null;
-  verification_outcome: "passed" | "target_changed" | null;
-  created_at: string;
-  completed_at: string | null;
-};
-
-export type WorkPatchMaterializationPageV2 = {
-  schema_version: 2;
-  work_id: string;
-  target_branch_id: string;
-  source_branch_id: string;
-  operations: WorkPatchMaterializationOperationV2[];
-  next_cursor: WorkPatchMaterializationCursorV1 | null;
-};
-
-export type WorkPatchCommitInputV1 = {
-  requestId: string;
-  patchArtifactId: string;
-  expectedTargetBranchRevision: number;
-  expectedTargetGraphRevision: number;
-  message: string;
-};
-
-export type WorkPatchCommitCursorV1 = {
-  created_at: string;
-  operation_id: string;
-};
-
-export type WorkPatchCommitListParamsV1 = {
-  before?: WorkPatchCommitCursorV1;
-  limit?: number;
-};
-
-export type WorkPatchCommitOperationV1 = {
-  schema_version: 1;
-  operation_id: string;
-  work_id: string;
-  request_id: string;
-  patch_artifact_id: string;
-  source_branch_id: string;
-  target_branch_id: string;
-  target_branch_revision: number;
-  target_graph_revision: number;
-  base_subject_revision: WorkContentHash;
-  result_subject_revision: WorkContentHash;
-  payload_hash: WorkContentHash;
-  message: string;
-  provider_ref: string;
-  policy_decision_ref: string;
-  state: "pending" | "aborted" | "succeeded" | "conflict" | "failed";
-  phase: "awaiting_dispatch" | "committing" | "reconciling" | "complete";
-  commit_invocation_ref: string | null;
-  commit_sha: string | null;
-  observed_subject_revision: WorkContentHash | null;
-  index_reconciled: boolean | null;
-  failure_code:
-    | "authorization_denied"
-    | "workspace_unavailable"
-    | "provider_unavailable"
-    | "invalid_metadata"
-    | "base_changed"
-    | "result_changed"
-    | "patch_rejected"
-    | "commit_rejected"
-    | "ref_conflict"
-    | null;
-  created_at: string;
-  completed_at: string | null;
-};
-
-export type WorkPatchCommitPageV1 = {
-  schema_version: 1;
-  work_id: string;
-  target_branch_id: string;
-  operations: WorkPatchCommitOperationV1[];
-  next_cursor: WorkPatchCommitCursorV1 | null;
-};
-
 export type WorkDeliverySelectionSubjectV1 = {
   graphRevision: number;
   subjectRef: string;
@@ -3149,7 +2962,6 @@ export type WorkEventKind =
   | "branch_archived"
   | "branch_restored"
   | "subject_changed"
-  | "patch_artifact_exported"
   | "plan_proposed"
   | "criteria_proposed"
   | "proposal_rejected"

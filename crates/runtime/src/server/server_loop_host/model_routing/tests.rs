@@ -329,7 +329,7 @@ async fn fixture() -> (
         .await
         .unwrap();
     state.current_run_owner_generation = Some(authority.owner_generation);
-    state.context_manifest_user_id = Some("router-user".into());
+    state.owner_user_id = Some("router-user".into());
     state.canonical_turn_chain_id = Some("router-turn".into());
     state.message = "explain this result".into();
     state.user_intent = state.message.clone();

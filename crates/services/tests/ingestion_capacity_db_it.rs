@@ -519,9 +519,7 @@ fn rss_kib() -> Option<u64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opt-in sustained MatrixOne load; ASTRA_TEST_DB_IT=1"]
 async fn sustained_ingestion_capacity() {
-    use astra_services::observation_capture::{
-        ObservationPayloadDomain, canonical_observation_payload_hash,
-    };
+    use astra_services::observation_capture::canonical_agent_event_payload_hash;
     use futures_util::TryStreamExt;
 
     assert!(
@@ -749,10 +747,7 @@ async fn sustained_ingestion_capacity() {
         assert_eq!(row.get::<String, _>("session_id"), expected.session_id);
         assert_eq!(
             row.get::<String, _>("payload_hash"),
-            canonical_observation_payload_hash(
-                ObservationPayloadDomain::AgentEvent,
-                &serde_json::to_value(&expected).unwrap()
-            )
+            canonical_agent_event_payload_hash(&serde_json::to_value(&expected).unwrap())
         );
         assert!(
             matches!(statuses[index as usize], 1 | 2 | 3 | 5 | 7),

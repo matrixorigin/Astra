@@ -59,10 +59,6 @@ pub enum HistoryWorkSite {
     CslFileRead,
     CslFileAppendSerialization,
     CslFileRewriteSerialization,
-    PromptDeltaHash,
-    PromptDeltaRead,
-    PromptDeltaRows,
-    PromptDeltaUnchangedPrefix,
     RunAdmission,
     FinalizationCheckpointClone,
     FinalizationRecoveryComparison,
@@ -135,7 +131,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 115;
+    const COUNT: usize = 111;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -181,10 +177,6 @@ impl HistoryWorkSite {
         Self::CslFileRead,
         Self::CslFileAppendSerialization,
         Self::CslFileRewriteSerialization,
-        Self::PromptDeltaHash,
-        Self::PromptDeltaRead,
-        Self::PromptDeltaRows,
-        Self::PromptDeltaUnchangedPrefix,
         Self::RunAdmission,
         Self::FinalizationCheckpointClone,
         Self::FinalizationRecoveryComparison,
@@ -308,10 +300,6 @@ impl HistoryWorkSite {
             Self::CslFileRead => "csl_file_read",
             Self::CslFileAppendSerialization => "csl_file_append_serialization",
             Self::CslFileRewriteSerialization => "csl_file_rewrite_serialization",
-            Self::PromptDeltaHash => "prompt_delta_hash",
-            Self::PromptDeltaRead => "prompt_delta_read",
-            Self::PromptDeltaRows => "prompt_delta_rows",
-            Self::PromptDeltaUnchangedPrefix => "prompt_delta_unchanged_prefix",
             Self::RunAdmission => "run_admission",
             Self::FinalizationCheckpointClone => "finalization_checkpoint_clone",
             Self::FinalizationRecoveryComparison => "finalization_recovery_comparison",
@@ -438,11 +426,7 @@ impl HistoryWorkSite {
             Self::CslFileRead
             | Self::CslFileAppendSerialization
             | Self::CslFileRewriteSerialization => "turn_core.csl_file_store",
-            Self::PromptDeltaHash | Self::PromptDeltaRead | Self::PromptDeltaRows => {
-                "services.prompt_delta"
-            }
             Self::RunAdmission => "runtime.run_admission",
-            Self::PromptDeltaUnchangedPrefix => "services.prompt_delta",
             Self::FinalizationCheckpointClone | Self::FinalizationRecoveryComparison => {
                 "runtime.agentic_loop.finalization"
             }

@@ -1129,17 +1129,7 @@ impl DatabaseWorkBranchDeletionService {
         // Commit admission and completion lock commit operations before the
         // canonical Work/branch rows. Preserve that order here so branch
         // cleanup cannot deadlock with an in-flight provider receipt.
-        sqlx::query(
-            "DELETE FROM work_patch_commit_operations
-             WHERE owner_id = ? AND work_id = ?
-               AND ? IN (source_branch_id, target_branch_id)",
-        )
-        .bind(owner_id.as_str())
-        .bind(work_id.as_str())
-        .bind(branch_id.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| database_error("delete branch patch commit operations", source))?;
+
         let work = sqlx::query(
             "SELECT delivery_branch_id FROM works
              WHERE owner_id = ? AND work_id = ? FOR UPDATE",
@@ -1179,17 +1169,6 @@ impl DatabaseWorkBranchDeletionService {
             ));
         }
         for (operation, statement) in [
-            (
-                "delete branch patch materialization operations",
-                "DELETE FROM work_patch_materialization_operations
-                 WHERE owner_id = ? AND work_id = ?
-                   AND ? IN (source_branch_id, target_branch_id)",
-            ),
-            (
-                "delete branch patch artifacts",
-                "DELETE FROM work_patch_artifacts
-                 WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
-            ),
             (
                 "delete branch gap acceptances",
                 "DELETE FROM work_current_gap_acceptances

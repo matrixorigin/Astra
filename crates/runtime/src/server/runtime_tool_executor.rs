@@ -748,7 +748,7 @@ pub struct RuntimeToolExecutor {
     /// Reflect service for persisted server/cloud observation evidence.
     reflect_service: Arc<dyn astra_services::ReflectService>,
     /// Optional shared pool for context-manifest side events.
-    pub(super) context_manifest_pool: Option<SharedPool>,
+    pub(super) service_pool: Option<SharedPool>,
     /// Owner- and session-validated canonical Work branch for typed Work tools.
     pub(super) work_binding: std::sync::OnceLock<WorkRuntimeBinding>,
     /// Exact immutable attempt installed by the delegated lifecycle owner.
@@ -1023,7 +1023,7 @@ impl RuntimeToolExecutor {
             cancel_token: None,
             admitted_execution_deadline: None,
             session_artifact_store: None,
-            context_manifest_pool: None,
+            service_pool: None,
             work_binding: std::sync::OnceLock::new(),
             delegated_work_item: None,
             active_primary_work_attempt: Arc::new(std::sync::RwLock::new(None)),
@@ -1145,7 +1145,7 @@ impl RuntimeToolExecutor {
             );
         }
         let store = crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore::new(
-            self.context_manifest_pool.clone(),
+            self.service_pool.clone(),
             limits,
         )
         .map_err(|error| error.to_string())?;
@@ -1179,7 +1179,7 @@ impl RuntimeToolExecutor {
     pub fn enable_durable_invocations(&mut self) {
         self.invocation_ledger = Some(
             crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(
-                self.context_manifest_pool.clone(),
+                self.service_pool.clone(),
             ),
         );
     }
@@ -1220,7 +1220,7 @@ impl RuntimeToolExecutor {
         }
         self.semantic_read_observation_store = Some(
             crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore::new(
-                self.context_manifest_pool.clone(),
+                self.service_pool.clone(),
                 limits,
             )
             .map_err(|error| error.to_string())?,
@@ -2101,7 +2101,7 @@ impl RuntimeToolExecutor {
     /// session's Work binding is intentionally separate: it is a typed
     /// operation precondition, not tool-surface readiness.
     pub(crate) fn work_service_available(&self) -> bool {
-        self.context_manifest_pool.is_some()
+        self.service_pool.is_some()
     }
 
     /// Whether this run is currently bound to canonical Work.
@@ -2168,7 +2168,7 @@ impl RuntimeToolExecutor {
         else {
             deny!("missing_terminal_cut");
         };
-        let Some(pool) = self.context_manifest_pool.as_ref() else {
+        let Some(pool) = self.service_pool.as_ref() else {
             return Err("durable Run store is unavailable for final Work synthesis".to_string());
         };
         // This is the same bounded indexed range seek used by durable action
@@ -2368,7 +2368,7 @@ impl RuntimeToolExecutor {
         if active.executor_run_id != run_id {
             return Err("active Work attempt belongs to a different durable run".to_string());
         }
-        let Some(pool) = self.context_manifest_pool.clone() else {
+        let Some(pool) = self.service_pool.clone() else {
             return Err("canonical Work storage is unavailable".to_string());
         };
         astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
@@ -2795,9 +2795,7 @@ impl RuntimeToolExecutor {
             // stable provider prompt-cache prefixes.  The backing store is
             // the actual service dependency; individual handlers already
             // enforce their typed bound/unbound preconditions.
-            Capability::WorkPlanning | Capability::WorkLifecycle => {
-                self.context_manifest_pool.is_some()
-            }
+            Capability::WorkPlanning | Capability::WorkLifecycle => self.service_pool.is_some(),
             Capability::AgentSpawner
             | Capability::MemoryService
             | Capability::Database
@@ -3059,8 +3057,8 @@ impl RuntimeToolExecutor {
         self
     }
 
-    pub fn set_context_manifest_pool(&mut self, pool: SharedPool) {
-        self.context_manifest_pool = Some(pool);
+    pub fn set_service_pool(&mut self, pool: SharedPool) {
+        self.service_pool = Some(pool);
     }
 
     pub(super) fn set_work_binding(&mut self, binding: WorkRuntimeBinding) {
@@ -3098,7 +3096,7 @@ impl RuntimeToolExecutor {
         if let Some(binding) = self.work_binding.get() {
             return Ok(Some(binding));
         }
-        let Some(pool) = self.context_manifest_pool.clone() else {
+        let Some(pool) = self.service_pool.clone() else {
             return Ok(None);
         };
         let resolve = async {
@@ -6429,7 +6427,6 @@ pub(crate) mod tests {
                 retention_policy: Some("default".to_string()),
                 retention_until: None,
                 status: Some("active".to_string()),
-                referenced_by_manifest_count: 0,
                 referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
                 referenced_by_durable_count: 0,
@@ -9969,7 +9966,7 @@ pub(crate) mod tests {
             let executor = Arc::new(executor);
             let mut state = make_state();
             state.runtime_tool_executor = Some(executor.clone());
-            state.context_manifest_user_id = Some("test-user".into());
+            state.owner_user_id = Some("test-user".into());
             state.current_session_id = Some("test-session".into());
             state.current_run_id = Some("producer".into());
             state.skills.resolver = Some(resolver.clone());

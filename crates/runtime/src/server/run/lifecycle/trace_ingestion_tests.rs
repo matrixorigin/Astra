@@ -44,7 +44,7 @@ fn state_for(owner: &str, session: &str, run: &str, events: &[JournalEvent]) -> 
     }
     state.turn_event_buffer = Some(buffer);
     state.current_run_owner_generation = Some(7);
-    state.context_manifest_user_id = Some(owner.into());
+    state.owner_user_id = Some(owner.into());
     state
 }
 

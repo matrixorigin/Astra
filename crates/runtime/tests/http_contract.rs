@@ -228,6 +228,47 @@ async fn retired_database_mutation_routes_cannot_execute_through_http() {
         ("POST", "/branches/merge"),
         ("POST", "/branches/cost-estimate"),
         ("POST", "/data-versioning/sandbox/fixture/restore"),
+        ("POST", "/data-versioning/checkpoints"),
+        ("GET", "/data-versioning/checkpoints"),
+        ("GET", "/data-versioning/checkpoints/fixture/events"),
+        ("GET", "/data-versioning/lineage/fixture/chain"),
+        ("GET", "/data-versioning/lineage/fixture/upstream"),
+        ("GET", "/v1/works/work/branches/branch/patch-artifacts"),
+        ("POST", "/v1/works/work/branches/branch/patch-artifacts"),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-artifacts/artifact",
+        ),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-artifacts/artifact/content",
+        ),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-materializations",
+        ),
+        (
+            "POST",
+            "/v1/works/work/branches/branch/patch-materializations",
+        ),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-materializations/operation",
+        ),
+        (
+            "DELETE",
+            "/v1/works/work/branches/branch/patch-materializations/operation",
+        ),
+        ("GET", "/v1/works/work/branches/branch/patch-commits"),
+        ("POST", "/v1/works/work/branches/branch/patch-commits"),
+        (
+            "GET",
+            "/v1/works/work/branches/branch/patch-commits/operation",
+        ),
+        (
+            "DELETE",
+            "/v1/works/work/branches/branch/patch-commits/operation",
+        ),
     ] {
         for authenticated in [false, true] {
             let headers = if authenticated {

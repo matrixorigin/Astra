@@ -32,17 +32,17 @@ use astra_services::session_workspace::{
 };
 use astra_services::{
     AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
-    DatabaseAdminAuditReader, DatabaseContextManifestStore, DatabaseContextService,
-    DatabaseDecisionService, DatabaseEventService, DatabaseIntrospectionService,
-    DatabaseMarketplaceService, DatabasePersonalSkillStore, DatabaseReflectService,
-    DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator, DatabaseSessionService,
-    DatabaseSkillService, DatabaseStateProjectionStore, DecisionCreateRequestData,
-    DecisionListFilter, DecisionService, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, ReflectService,
-    ReserveTurnOutcome, RetrievalStage, SessionArtifactJsonStore, SessionArtifactReference,
-    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
-    SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
-    SkillService, SnapshotCreateRequestData, SnapshotListFilter, SubmitUserSkillVersion,
+    DatabaseAdminAuditReader, DatabaseContextService, DatabaseDecisionService,
+    DatabaseEventService, DatabaseIntrospectionService, DatabaseMarketplaceService,
+    DatabasePersonalSkillStore, DatabaseReflectService, DatabaseSessionArtifactStore,
+    DatabaseSessionContextCoordinator, DatabaseSessionService, DatabaseSkillService,
+    DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
+    EventCreateRequestData, EventListFilter, EventService, IntrospectionService,
+    MAX_API_LIST_LIMIT, MarketplaceService, ReflectService, ReserveTurnOutcome,
+    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
+    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
+    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillService,
+    SnapshotCreateRequestData, SnapshotListFilter, SubmitUserSkillVersion,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -87,10 +87,7 @@ fn context_trace_request_fixture(
 }
 
 fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
-    astra_services::observation_capture::canonical_observation_payload_hash(
-        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
-        &payload,
-    )
+    astra_services::observation_capture::canonical_agent_event_payload_hash(&payload)
 }
 
 fn model_request_fixture_accepted_event(
@@ -2011,8 +2008,6 @@ async fn cleanup_restore_fixture_for_owner(
             "session_artifact_references",
             "session_artifacts",
             "agent_events",
-            "prompt_deltas",
-            "prompt_request_records",
             "agent_sessions",
             "agent_session_lifecycle_fences",
         ] {
@@ -2980,390 +2975,6 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
     cleanup_restore_fixture_for_owner(&pool, &owner_user_id, &[session_id, other_owner_session_id])
         .await;
     cleanup_restore_fixture_for_owner(&pool, &other_user_id, &[foreign_session_id]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn prompt_observability_is_owner_bound_for_session_and_run() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let run_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owners(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &[&owner_user_id, &other_user_id],
-    )
-    .await;
-
-    for (user_id, request_id, created_at, marker) in [
-        (
-            &owner_user_id,
-            Uuid::new_v4().to_string(),
-            "2026-10-02 10:00:00.000000",
-            "owner",
-        ),
-        (
-            &other_user_id,
-            Uuid::new_v4().to_string(),
-            "2026-10-02 11:00:00.000000",
-            "other",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO prompt_request_records \
-             (request_id, session_id, user_id, run_id, turn, round, attempt, source, model, provider, \
-              max_output_tokens, message_count, tool_count, previous_request_id, request_hash, summary_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, 0, 0, 'turn', 'gpt-5.4', 'test', NULL, ?, ?, NULL, ?, ?, ?)",
-        )
-        .bind(request_id)
-        .bind(&session_id)
-        .bind(user_id)
-        .bind(&run_id)
-        .bind(1_i64)
-        .bind(if marker == "owner" { 3_i64 } else { 30_i64 })
-        .bind(if marker == "owner" { 2_i64 } else { 20_i64 })
-        .bind(format!("hash-{marker}"))
-        .bind(
-            serde_json::json!({
-                "marker": marker,
-                "delta_counts": {
-                    "reuse": 1,
-                    "append": if marker == "owner" { 2 } else { 20 },
-                    "replace": 0,
-                    "drop": 0
-                }
-            })
-            .to_string(),
-        )
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .expect("insert prompt request record");
-    }
-
-    assert_eq!(
-        astra_services::count_prompt_requests_for_session(&shared, &owner_user_id, &session_id)
-            .await
-            .expect("owner session prompt count"),
-        1,
-        "owner session prompt count must not include another user's row"
-    );
-    assert_eq!(
-        astra_services::count_prompt_requests_for_run(&shared, &owner_user_id, &run_id)
-            .await
-            .expect("owner run prompt count"),
-        1,
-        "owner run prompt count must not include another user's row"
-    );
-    let latest_session = astra_services::load_latest_prompt_observability_for_session(
-        &shared,
-        &owner_user_id,
-        &session_id,
-    )
-    .await
-    .expect("owner latest session prompt")
-    .expect("owner latest session prompt exists");
-    assert_eq!(latest_session.request_hash, "hash-owner");
-    assert_eq!(latest_session.message_count, 3);
-    assert_eq!(latest_session.delta_counts.append, 2);
-
-    let latest_run =
-        astra_services::load_latest_prompt_observability_for_run(&shared, &owner_user_id, &run_id)
-            .await
-            .expect("owner latest run prompt")
-            .expect("owner latest run prompt exists");
-    assert_eq!(latest_run.request_hash, "hash-owner");
-    assert_eq!(latest_run.tool_count, 2);
-
-    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&owner_user_id, &other_user_id])
-        .await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn prompt_delta_previous_chunks_are_owner_session_bound() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owners(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &[&owner_user_id, &other_user_id],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
-         VALUES (?, ?, 'prompt-delta-owner-bound', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("seed owner session");
-
-    let first_messages = (0..260)
-        .map(|index| {
-            serde_json::json!({
-                "role": if index % 2 == 0 { "user" } else { "assistant" },
-                "content": format!("stable-{index}"),
-            })
-        })
-        .collect::<Vec<_>>();
-    let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: Some("first-root-run"),
-        turn: 1,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &first_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("first prompt plan");
-    let first = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: Some("first-root-run".into()),
-            turn: 1,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "test".into(),
-        },
-        &first_plan,
-    )
-    .await
-    .expect("persist first prompt");
-    assert_eq!(first.delta_counts.append, 260);
-    assert!(
-        first.delta_counts.token_weights.append > 0,
-        "new prompt chunks must carry token-weighted delta evidence"
-    );
-    assert_eq!(
-        first.delta_counts.token_weights.tokenizer_revision,
-        astra_turn_types::token_estimate::CANONICAL_JSON_TOKENIZER_REVISION
-    );
-    assert!(first.delta_counts.token_weights.complete);
-
-    sqlx::query(
-        "INSERT INTO prompt_deltas
-         (user_id, session_id, request_id, delta_seq, logical_key, chunk_kind, position,
-          op, chunk_id, chunk_hash, previous_chunk_hash)
-         VALUES (?, ?, ?, 99, 'message:99:user', 'message', 99,
-                 'append', 'foreign-chunk', REPEAT('a', 64), NULL)",
-    )
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .bind(&first.request_id)
-    .execute(&pool)
-    .await
-    .expect("seed foreign delta with same request id");
-
-    let second_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: Some("second-root-run"),
-        turn: 2,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &first_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("second prompt plan");
-    let second = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: Some("second-root-run".into()),
-            turn: 2,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "test".into(),
-        },
-        &second_plan,
-    )
-    .await
-    .expect("persist second prompt");
-
-    assert_eq!(
-        second.previous_request_id.as_deref(),
-        Some(first.request_id.as_str())
-    );
-    assert_eq!(second.delta_counts.reuse, 260);
-    assert_eq!(
-        second.delta_counts.token_weights.reuse, first.delta_counts.token_weights.append,
-        "the same retained chunk must preserve its tokenizer-independent weight"
-    );
-    assert_eq!(
-        second.delta_counts.drop, 0,
-        "foreign prompt_deltas rows with the same request_id must not affect owner diffing"
-    );
-    assert!(second.delta_counts.token_weights.complete);
-    let second_delta_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&second.request_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count compressed reuse rows");
-    let second_reuse_count: Option<i32> = sqlx::query_scalar(
-        "SELECT reuse_count FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ? AND op = 'reuse_prefix'",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&second.request_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load compressed reuse count");
-    assert_eq!(second_delta_rows, 1);
-    assert_eq!(second_reuse_count, Some(260));
-
-    let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: None,
-        turn: 3,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &first_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("third prompt plan");
-    let third = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: None,
-            turn: 3,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "other-provider".into(),
-        },
-        &third_plan,
-    )
-    .await
-    .expect("persist provider-change prompt");
-    assert_eq!(third.delta_counts.reuse, 260);
-    assert!(
-        !third.delta_counts.token_weights.complete,
-        "provider changes must not claim cache evidence from another namespace"
-    );
-
-    let mut previous_request_id = third.request_id;
-    for turn in 4..=100 {
-        let plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-            user_id: &owner_user_id,
-            session_id: &session_id,
-            run_id: None,
-            turn,
-            round: 0,
-            attempt: 0,
-            source: "turn",
-            messages: &first_messages,
-            tools: &[],
-            max_output_tokens: None,
-        })
-        .expect("long-session prompt plan");
-        let persisted = astra_services::persist_prompt_request(
-            &shared,
-            &astra_services::PromptRequestPersistInput {
-                session_id: session_id.clone(),
-                user_id: owner_user_id.clone(),
-                run_id: None,
-                turn,
-                round: 0,
-                attempt: 0,
-                source: "turn".into(),
-                model: "test-model".into(),
-                provider: "other-provider".into(),
-            },
-            &plan,
-        )
-        .await
-        .expect("persist long-session prompt");
-        assert_eq!(
-            persisted.previous_request_id.as_deref(),
-            Some(previous_request_id.as_str())
-        );
-        assert_eq!(persisted.delta_counts.reuse, 260);
-        previous_request_id = persisted.request_id;
-    }
-
-    let mut changed_messages = first_messages.clone();
-    changed_messages.last_mut().expect("tail")["content"] = serde_json::json!("changed-tail");
-    let tail_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-        user_id: &owner_user_id,
-        session_id: &session_id,
-        run_id: None,
-        turn: 101,
-        round: 0,
-        attempt: 0,
-        source: "turn",
-        messages: &changed_messages,
-        tools: &[],
-        max_output_tokens: None,
-    })
-    .expect("tail-change prompt plan");
-    let tail = astra_services::persist_prompt_request(
-        &shared,
-        &astra_services::PromptRequestPersistInput {
-            session_id: session_id.clone(),
-            user_id: owner_user_id.clone(),
-            run_id: None,
-            turn: 101,
-            round: 0,
-            attempt: 0,
-            source: "turn".into(),
-            model: "test-model".into(),
-            provider: "other-provider".into(),
-        },
-        &tail_plan,
-    )
-    .await
-    .expect("persist tail-change prompt");
-    assert_eq!(tail.delta_counts.reuse, 259);
-    assert_eq!(tail.delta_counts.replace, 1);
-    let tail_delta_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&tail.request_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count tail-change delta rows");
-    assert_eq!(tail_delta_rows, 2);
-
-    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&owner_user_id, &other_user_id])
-        .await;
 }
 
 #[tokio::test]
@@ -7974,16 +7585,15 @@ async fn ordinary_create_event_requires_existing_session_header_live_matrixone()
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_count_delta_service_context_state_paths_live_matrixone() {
+async fn event_count_delta_service_and_state_paths_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
     let user_id = Uuid::new_v4().to_string();
     let service_session = Uuid::new_v4().to_string();
-    let context_session = Uuid::new_v4().to_string();
     let state_session = Uuid::new_v4().to_string();
 
-    for session_id in [&service_session, &context_session, &state_session] {
+    for session_id in [&service_session, &state_session] {
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
              VALUES (?, ?, 'write-path-it', 'active', 0)",
@@ -8049,56 +7659,6 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         "DatabaseEventService::create_event should add one event_count delta per persisted row"
     );
 
-    let context_manifest_store = DatabaseContextManifestStore::new(shared.clone());
-    let normalized_reason = context_manifest_store
-        .normalize_reason(
-            &user_id,
-            "unknown-it-reason",
-            &context_session,
-            Some("run-context-it"),
-            "turn-1",
-            "services_db_integration",
-        )
-        .await
-        .expect("normalize unknown reason");
-    assert_eq!(normalized_reason, "other");
-    let next_stage = context_manifest_store
-        .record_retrieval_degrade_event(
-            &user_id,
-            &context_session,
-            Some("run-context-it"),
-            RetrievalStage::Structured,
-            "timeout",
-            25,
-        )
-        .await
-        .expect("record retrieval degrade event");
-    assert_eq!(next_stage, Some(RetrievalStage::Fts));
-    let context_count =
-        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&context_session)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load context manifest session count")
-            .try_get::<i64, _>("event_count")
-            .expect("decode context manifest event_count");
-    assert_eq!(
-        context_count, 2,
-        "context manifest diagnostics should add one event_count delta per persisted event"
-    );
-    let context_event_ids =
-        sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?")
-            .bind(&context_session)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await
-            .expect("load context manifest event ids")
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("event_id").expect("event_id"))
-            .collect::<Vec<_>>();
-    assert_eq!(context_event_ids.len(), 2);
-
     let state_projection_store = DatabaseStateProjectionStore::new(shared.clone());
     let active_skill_name = format!("active-skill-{}", Uuid::new_v4());
     let personal_skill_store = DatabasePersonalSkillStore::new(shared.clone());
@@ -8150,7 +7710,6 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
     assert_eq!(state_event_ids.len(), 1);
 
     let mut event_ids = vec![created_one.record.event_id, created_two.record.event_id];
-    event_ids.extend(context_event_ids);
     event_ids.extend(state_event_ids);
     let _ = sqlx::query(
         "DELETE FROM session_state_items WHERE session_id = ? AND user_id = ? AND item_key = ?",
@@ -8171,7 +7730,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &user_id,
-        &[service_session, context_session, state_session],
+        &[service_session, state_session],
         &event_ids,
         &[],
     )

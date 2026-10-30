@@ -398,7 +398,6 @@ pub struct ModelRequestLineage {
     pub device_trust_epoch: Option<u64>,
     pub permission_epoch: Option<u64>,
     pub conversation_root_hash: Option<String>,
-    pub prompt_assembly_manifest_hash: Option<String>,
     pub projection_schema: Option<String>,
     pub compaction_generation: Option<u64>,
     pub resume_source: Option<String>,
@@ -450,10 +449,6 @@ pub struct ModelRequestCache {
     pub invalidation_reasons: Vec<String>,
     pub eligible_tokens: Option<u64>,
     pub cache_read_share: Option<f64>,
-    pub delta_reuse_tokens: Option<u64>,
-    pub delta_append_tokens: Option<u64>,
-    pub delta_replace_tokens: Option<u64>,
-    pub delta_drop_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

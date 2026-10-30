@@ -9,28 +9,6 @@ use sha2::{Digest, Sha256};
 
 const HASH_ALGORITHM_VERSION: &str = "sha256:v1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObservationPayloadDomain {
-    AgentEvent,
-    ContextManifest,
-}
-
-impl ObservationPayloadDomain {
-    pub fn identity_kind(self) -> &'static str {
-        match self {
-            Self::AgentEvent => "agent_event",
-            Self::ContextManifest => "context_manifest",
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentEvent => "astra.agent-event",
-            Self::ContextManifest => "astra.context-manifest",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableCaptureOutcome {
     Inserted,
@@ -84,7 +62,6 @@ pub fn classify_capture(
 /// A receipt contains identifiers and digests only, never observation content.
 pub struct ObservationCollisionReceipt<'a> {
     pub user_id: &'a str,
-    pub domain: ObservationPayloadDomain,
     pub identity_id: &'a str,
     pub session_id: &'a str,
     pub stored_payload_hash: &'a str,
@@ -136,7 +113,7 @@ pub async fn record_observation_collisions(
                     .push(" UNION ALL SELECT ")
                     .push_bind(receipt.user_id)
                     .push(", ")
-                    .push_bind(receipt.domain.identity_kind())
+                    .push_bind("agent_event")
                     .push(", ")
                     .push_bind(receipt.identity_id)
                     .push(", ")
@@ -155,7 +132,7 @@ pub async fn record_observation_collisions(
         query.push_values(&groups, |mut row, &(first, last, count)| {
             let receipt = &chunk[first as usize];
             row.push_bind(receipt.user_id)
-                .push_bind(receipt.domain.identity_kind())
+                .push_bind("agent_event")
                 .push_bind(receipt.identity_id)
                 .push_bind(receipt.session_id)
                 .push_bind(receipt.stored_payload_hash)
@@ -182,14 +159,11 @@ pub async fn record_observation_collisions(
 /// Arrays retain their order. Nulls and scalar values retain their JSON
 /// meaning. Length framing keeps the domain, algorithm version, and payload
 /// unambiguous if this preimage format grows in a later version.
-pub fn canonical_observation_payload_hash(
-    domain: ObservationPayloadDomain,
-    payload: &Value,
-) -> String {
+pub fn canonical_agent_event_payload_hash(payload: &Value) -> String {
     let canonical_payload = astra_core::canonical_json_string(payload);
     let mut hasher = Sha256::new();
     hash_frame(&mut hasher, HASH_ALGORITHM_VERSION.as_bytes());
-    hash_frame(&mut hasher, domain.as_str().as_bytes());
+    hash_frame(&mut hasher, b"astra.agent-event");
     hash_frame(&mut hasher, canonical_payload.as_bytes());
     format!("{HASH_ALGORITHM_VERSION}:{:x}", hasher.finalize())
 }
@@ -249,8 +223,8 @@ mod tests {
         let right = json!({"items": [null, true], "outer": {"a": 1, "b": 2}});
 
         assert_eq!(
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &left),
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &right)
+            canonical_agent_event_payload_hash(&left),
+            canonical_agent_event_payload_hash(&right)
         );
     }
 
@@ -260,27 +234,14 @@ mod tests {
         let reordered = json!({"items": [1, null, 2]});
 
         assert_ne!(
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &ordered),
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &reordered)
-        );
-    }
-
-    #[test]
-    fn domains_separate_identical_json() {
-        let payload = json!({"id": "same", "value": 7});
-
-        assert_ne!(
-            canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &payload),
-            canonical_observation_payload_hash(ObservationPayloadDomain::ContextManifest, &payload)
+            canonical_agent_event_payload_hash(&ordered),
+            canonical_agent_event_payload_hash(&reordered)
         );
     }
 
     #[test]
     fn hash_has_stable_versioned_shape() {
-        let hash = canonical_observation_payload_hash(
-            ObservationPayloadDomain::AgentEvent,
-            &json!({"value": "test"}),
-        );
+        let hash = canonical_agent_event_payload_hash(&json!({"value": "test"}));
 
         assert!(hash.starts_with("sha256:v1:"));
         assert_eq!(hash.len(), "sha256:v1:".len() + 64);

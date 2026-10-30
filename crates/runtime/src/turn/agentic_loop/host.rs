@@ -109,27 +109,6 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
-/// Return identities carried by a host response only when both values are
-/// non-empty.  Remote-admission clients use this as their sole durable
-/// identity source; their local `AgenticLoopState.current_run_id` is only a
-/// correlation label until this response arrives.
-pub(crate) fn context_manifest_identity_from_result(
-    result: Option<&HostTurnResult>,
-) -> Option<(String, String)> {
-    let result = result?;
-    let session_id = result
-        .accum
-        .session_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
-    let run_id = result
-        .accum
-        .run_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())?;
-    Some((session_id.to_string(), run_id.to_string()))
-}
-
 /// Structured skill pre-route decision supplied by a host-side semantic judge.
 ///
 /// Runtime code must not infer this from natural-language keyword, alias, or
@@ -813,17 +792,6 @@ pub trait AgenticLoopHost: Send {
     /// buffers instead of persisting a synthetic interrupted turn.
     fn is_pre_admission_rejection(&self) -> bool {
         false
-    }
-
-    /// Resolve the identity that may own a context manifest for this host's
-    /// attempt. Remote clients must wait for the response pair above; a
-    /// server host may override this with its already-admitted state identity.
-    fn context_manifest_identity(
-        &self,
-        _state: &AgenticLoopState,
-        result: Option<&HostTurnResult>,
-    ) -> Option<(String, String)> {
-        context_manifest_identity_from_result(result)
     }
 
     /// Whether the host measures the provider boundary more precisely than
@@ -3706,9 +3674,8 @@ pub struct AgenticLoopState {
     /// run owner before execution and remains stable for the lifetime of the
     /// loop; provider, access source, and model selection are separate facts.
     pub inference_purpose: astra_turn_types::InferencePurpose,
-    pub context_manifest_pool: Option<astra_core::SharedPool>,
-    pub context_manifest_user_id: Option<String>,
-    pub context_manifest_model_name: Option<String>,
+    pub owner_user_id: Option<String>,
+    pub policy_model_name: Option<String>,
     /// Current nested agent/sub-run depth. Root loops start at 0.
     pub recursion_depth: u8,
 
@@ -4083,9 +4050,8 @@ impl AgenticLoopState {
             permission_mode_observation: Default::default(),
             durable_control_watcher: None,
             inference_purpose,
-            context_manifest_pool: None,
-            context_manifest_user_id: None,
-            context_manifest_model_name: None,
+            owner_user_id: None,
+            policy_model_name: None,
             recursion_depth: 0,
             final_text: String::new(),
             current_model_item_id: None,
@@ -4979,7 +4945,7 @@ impl AgenticLoopState {
     /// Answers "which model is running this session/turn?" and must not
     /// fall back to symbolic values such as `default`.
     pub fn current_model_identity(&self) -> Option<&str> {
-        self.context_manifest_model_name.as_deref().or_else(|| {
+        self.policy_model_name.as_deref().or_else(|| {
             self.recent_rounds
                 .last()
                 .map(|r| r.model.as_str())
@@ -9171,7 +9137,7 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["bash"]);
         let mut state = make_state();
-        state.context_manifest_user_id = Some("replay-owner".into());
+        state.owner_user_id = Some("replay-owner".into());
         state.current_session_id = Some("replay-session".into());
         state.current_run_id = Some("replay-run".into());
         state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(

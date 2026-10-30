@@ -16,9 +16,6 @@ import type {
   WorkCriterionV1,
   WorkObservationFactCodeV1,
   WorkTranscriptPageV1,
-  WorkPatchArtifactPageV1,
-  WorkPatchMaterializationPageV2,
-  WorkPatchCommitPageV1,
   WorkExecutionViewV1,
   WorkRecoveryPointPageV1,
   WorkBranchInteractionPageV1,
@@ -62,7 +59,6 @@ import { useToast } from "@/components/ui/toast";
 import { WorkTurnComposer } from "@/components/app/work-turn-composer";
 import { WorkActivityCard } from "@/components/app/work-activity-card";
 import { WorkTranscriptCard } from "@/components/app/work-transcript-card";
-import { WorkPatchReviewCard } from "@/components/app/work-patch-review-card";
 import { WorkTaskGraph } from "@/components/app/work-task-graph";
 import { WorkExecutionCard } from "@/components/app/work-execution-card";
 import type { WorkOverviewSnapshot } from "@/lib/work-overview";
@@ -155,9 +151,6 @@ export function WorkOverviewPage({
   branchCatalog,
   selectedBranch,
   archivedBranches,
-  patchArtifacts,
-  patchMaterializations,
-  patchCommits,
   recoveryPoints,
   initialInteractions,
 }: {
@@ -170,9 +163,6 @@ export function WorkOverviewPage({
   branchCatalog: WorkBranchCatalogV1;
   selectedBranch: WorkBranchCatalogEntryV1;
   archivedBranches?: WorkArchivedBranchPageV1 | null;
-  patchArtifacts?: WorkPatchArtifactPageV1 | null;
-  patchMaterializations?: WorkPatchMaterializationPageV2 | null;
-  patchCommits?: WorkPatchCommitPageV1 | null;
   recoveryPoints?: WorkRecoveryPointPageV1 | null;
   initialInteractions?: WorkBranchInteractionPageV1 | null;
 }) {
@@ -1349,37 +1339,6 @@ export function WorkOverviewPage({
               initialInteractions={currentBranchInteractions}
               onActivityChange={setTurnActive}
             />
-
-            {patchArtifacts !== undefined ? (
-              <WorkPatchReviewCard
-                key={branchId}
-                workId={overview.work_id}
-                branchId={branchId}
-                initial={patchArtifacts}
-                initialMaterializations={patchMaterializations ?? null}
-                initialCommits={patchCommits ?? null}
-                exportBasis={{
-                  branchRevision: selectedBranch.branch_revision,
-                  graphRevision: selectedBranch.current_graph_revision,
-                }}
-                materializeTarget={
-                  isDeliveryBranch
-                    ? undefined
-                    : {
-                        branchId: deliveryBranch.branch_id,
-                        label: "Main result",
-                        branchRevision: deliveryBranch.branch_revision,
-                        graphRevision: deliveryBranch.current_graph_revision,
-                      }
-                }
-                commitTarget={{
-                  branchId: deliveryBranch.branch_id,
-                  label: "Main result",
-                  branchRevision: deliveryBranch.branch_revision,
-                  graphRevision: deliveryBranch.current_graph_revision,
-                }}
-              />
-            ) : null}
 
             {pending.length > 0 ? (
               <Card id="work-done-when" className="overflow-hidden p-0">

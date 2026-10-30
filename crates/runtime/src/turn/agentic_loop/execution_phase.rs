@@ -10,8 +10,8 @@ use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CompletionAction,
     DIRECT_CHILD_RESULT_SCHEMA, HostTurnResult, RejectedToolCall, RunControlProvider,
     ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome, UserIntentState,
-    WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
-    context_manifest_identity_from_result, finalize_turn_trace, try_write_heavy_checkpoint,
+    WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase, finalize_turn_trace,
+    try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -20,8 +20,8 @@ use super::lifecycle::{
 };
 use super::verification_frontier::VerificationRecoveryError;
 use crate::turn::run_control::{ProviderBoundaryAuthorization, UserIntentAdmissionAuthority};
-use astra_config::user_profile::{Scenario, WorkspaceMutationIntent};
-use astra_services::{ContextManifestWrite, DatabaseContextManifestStore, SessionArtifactStore};
+use astra_config::user_profile::WorkspaceMutationIntent;
+use astra_services::SessionArtifactStore;
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
     AgenticTurnStreamSnapshot, agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
@@ -1099,7 +1099,7 @@ pub(crate) async fn authorize_provider_boundary(
 ) -> Result<ProviderBoundaryGate, astra_core::ClassifiedError> {
     let (Some(run_control), Some(user_id), Some(run_id)) = (
         state.run_control.as_ref(),
-        state.context_manifest_user_id.as_deref(),
+        state.owner_user_id.as_deref(),
         state.current_run_id.as_deref(),
     ) else {
         // Before a run identity exists there is no durable execution row to
@@ -3942,7 +3942,7 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
     let poll_started = tokio::time::Instant::now();
     let (run_control, user_id, run_id) = match (
         state.run_control.as_ref(),
-        state.context_manifest_user_id.as_ref(),
+        state.owner_user_id.as_ref(),
         state.current_run_id.as_ref(),
     ) {
         (Some(run_control), Some(user_id), Some(run_id)) => {
@@ -4674,182 +4674,6 @@ fn refresh_context_pressure_advisory(state: &mut AgenticLoopState) {
     );
 }
 
-fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
-    if state.compact_tier_applied != astra_turn_core::compaction_types::CompactionTier::Normal
-        || state.compaction_effectiveness.attempt_count > 0
-    {
-        "post_compaction"
-    } else {
-        "normal_turn"
-    }
-}
-
-fn infer_turn_intent_for_llm_call(state: &AgenticLoopState) -> String {
-    if let Some(intent) = state.turn_intent.as_ref()
-        && let Some(scenario) = intent
-            .requested_scenario
-            .filter(|scenario| intent.allows_scenario(*scenario))
-    {
-        return scenario_context_manifest_label(scenario).to_string();
-    }
-    if state.task_profile.mutates_workspace {
-        "implementation".to_string()
-    } else if state.task_profile.exploratory_task {
-        "exploration".to_string()
-    } else {
-        "normal".to_string()
-    }
-}
-
-fn scenario_context_manifest_label(scenario: Scenario) -> &'static str {
-    match scenario {
-        Scenario::CodeReview => "code_review",
-        Scenario::Debugging => "debugging",
-        Scenario::Exploration => "exploration",
-        Scenario::Planning => "planning",
-        Scenario::Implementation => "implementation",
-        Scenario::Refactoring => "refactoring",
-        Scenario::Testing => "testing",
-        Scenario::Documentation => "documentation",
-        Scenario::DevOps => "dev_ops",
-        Scenario::Learning => "learning",
-        Scenario::QuickAnswer => "quick_answer",
-        Scenario::BenchmarkComparison => astra_services::TURN_INTENT_BENCHMARK_COMPARISON,
-    }
-}
-
-async fn persist_context_manifest_for_llm_call(
-    state: &AgenticLoopState,
-    turn_index: usize,
-    llm_attempt_index: u32,
-    message_tokens: crate::turn::llm::context::ContextManifestMessageTokens,
-    turn_result: Option<&HostTurnResult>,
-    identity: Option<(String, String)>,
-) {
-    if !context_manifest_db_persistence_enabled() {
-        return;
-    }
-    if turn_result.is_none() && state.last_llm_context_manifest_trace.is_none() {
-        return;
-    }
-    // Provider transport errors may have no accumulator; retain the identity
-    // of the already-admitted execution.
-    let Some((session_id, run_id)) = identity else {
-        return;
-    };
-    let (Some(pool), Some(user_id)) = (
-        state.context_manifest_pool.clone(),
-        state.context_manifest_user_id.as_deref(),
-    ) else {
-        return;
-    };
-    let turn_intent = infer_turn_intent_for_llm_call(state);
-    let schema_tokens = state.pinned_tool_schema_tokens.min(u64::from(u32::MAX)) as u32;
-    let result_prompt_tokens = turn_result
-        .map(|result| {
-            NormalizedPromptCacheUsage::new(
-                result.accum.prompt_tokens,
-                result.accum.cache_read_tokens,
-                result.accum.cache_creation_tokens,
-            )
-            .total_input_tokens()
-        })
-        .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
-    let manifest_id = format!("manifest-{}", Uuid::new_v4());
-    let turn_id = format!("{run_id}:llm:{llm_attempt_index}");
-    let reason = manifest_reason_for_llm_call(state);
-    let model_name = state.current_model_identity().unwrap_or("").to_string();
-    let context_window_tokens = context_window_tokens_for_context_manifest(state);
-    let projection = crate::turn::llm::context::build_context_manifest_projection(
-        crate::turn::llm::context::ContextManifestProjectionInput {
-            owner_id: user_id,
-            session_id: session_id.as_str(),
-            run_id: run_id.as_str(),
-            turn_index,
-            llm_attempt_index,
-            message_tokens,
-            tool_results: &state.tool_results,
-            schema_tokens,
-            result_prompt_tokens,
-            observed_fresh_input_tokens: turn_result.map(|result| result.accum.prompt_tokens),
-            observed_cache_read_tokens: turn_result.map(|result| result.accum.cache_read_tokens),
-            observed_cache_creation_tokens: turn_result
-                .map(|result| result.accum.cache_creation_tokens),
-            observed_output_tokens: turn_result.map(|result| result.accum.completion_tokens),
-            assembly_trace: state.last_llm_context_manifest_trace.clone(),
-            turn_intent: &turn_intent,
-            reason,
-            context_window_tokens,
-        },
-    );
-
-    let manifest = ContextManifestWrite {
-        manifest_id: manifest_id.clone(),
-        user_id: user_id.to_string(),
-        session_id: session_id.to_string(),
-        run_id: Some(run_id.to_string()),
-        turn_id,
-        model_provider: "runtime".to_string(),
-        model_name,
-        context_window_tokens,
-        max_output_tokens: projection.max_output_tokens,
-        total_estimated_tokens: projection.total_estimated_tokens,
-        policy_version: "context_manifest_v1".to_string(),
-        tokenizer_id: Some("estimated_v1".to_string()),
-        budget_template_id: Some("budget_v1_8k".to_string()),
-        turn_intent: Some(turn_intent.clone()),
-        reason: reason.to_string(),
-        manifest_json: projection.manifest_json,
-    };
-    let store = DatabaseContextManifestStore::new(pool);
-    let capture = store.save_manifest(manifest, projection.items).await;
-    if matches!(
-        capture,
-        Ok(astra_services::observation_capture::DurableCaptureOutcome::Collision { .. })
-    ) {
-        tracing::warn!(
-            target: "astra_runtime::context_manifest",
-            run_id,
-            session_id,
-            manifest_id,
-            "context manifest identity collision; original observation retained"
-        );
-    }
-    if let Err(error) = capture {
-        tracing::warn!(
-            target: "astra_runtime::context_manifest",
-            run_id,
-            session_id,
-            manifest_id,
-            error = %error,
-            "failed to persist per-llm-call context manifest"
-        );
-    }
-}
-
-fn context_manifest_db_persistence_enabled_for_trace(
-    trace: &astra_config::runtime_config::SessionTraceConfig,
-) -> bool {
-    trace.category_enabled(astra_config::runtime_config::TraceCategory::ContextAssembly)
-}
-
-fn context_manifest_db_persistence_enabled() -> bool {
-    context_manifest_db_persistence_enabled_for_trace(
-        &astra_config::runtime_config::RuntimeConfig::cached().trace,
-    )
-}
-
-fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
-    state
-        .last_llm_context_manifest_trace
-        .as_ref()
-        .and_then(|trace| trace.get("model_context_window_tokens"))
-        .and_then(|value| value.as_u64())
-        .and_then(|tokens| u32::try_from(tokens).ok())
-        .filter(|tokens| *tokens > 0)
-        .unwrap_or(crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32)
-}
-
 pub(crate) fn record_context_compactions<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -4929,8 +4753,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     let show_policy_feedback_status = host.turn_interaction_mode().shows_policy_feedback_status();
     // Resolve from this execution's selected policy without round-local I/O.
     let tool_cfg = &state.admitted_tool_policy;
-    let resolved_tool_policy =
-        tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
+    let resolved_tool_policy = tool_cfg.resolve_for_model(state.policy_model_name.as_deref());
     let parallel_batching_force_threshold =
         resolved_tool_policy.parallel_batching_force_streak as usize;
     let cache_waste_threshold = tool_cfg.effective_cache_waste_midloop_threshold() as usize;
@@ -5106,15 +4929,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     );
 
     let request_message_count = state.messages.len();
-    // Remote hosts learn the authoritative session/run pair from the response.
-    // Capture only zone totals when this attempt can persist diagnostics; the
-    // host still authorizes the identity after the provider returns.
-    let manifest_message_tokens = (context_manifest_db_persistence_enabled()
-        && state.context_manifest_pool.is_some()
-        && state.context_manifest_user_id.is_some())
-    .then(|| {
-        crate::turn::llm::context::ContextManifestMessageTokens::from_messages(&state.messages)
-    });
     let llm_attempt_index = state.llm_rounds_completed;
     state.last_llm_context_manifest_trace = None;
     // Protect the exact request prefix we are about to send even if the LLM
@@ -5236,18 +5050,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         && let Some(trace) = result.accum.context_manifest_trace.clone()
     {
         state.last_llm_context_manifest_trace = Some(trace);
-    }
-    if let Some(message_tokens) = manifest_message_tokens {
-        let manifest_identity = host.context_manifest_identity(state, turn_result.as_ref().ok());
-        persist_context_manifest_for_llm_call(
-            state,
-            turn_index,
-            llm_attempt_index,
-            message_tokens,
-            turn_result.as_ref().ok(),
-            manifest_identity,
-        )
-        .await;
     }
     let mut turn_result = match turn_result {
         Ok(turn_result) => {
@@ -5876,7 +5678,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             // `JournalWriter::append` auto-prepends
                             // `SessionStart` under the same file lock;
                             // see `prepend_session_start_if_needed`.
-                            let writer = match state.context_manifest_user_id.as_deref() {
+                            let writer = match state.owner_user_id.as_deref() {
                                 Some(user_id) => {
                                     astra_services::session_journal::JournalWriter::for_user(
                                         user_id, sid,
@@ -8623,7 +8425,7 @@ mod tests {
             state.runtime_tool_executor = Some(Arc::new(executor));
             state.current_run_id = Some("test-run".into());
             state.current_session_id = Some("test-session".into());
-            state.context_manifest_user_id = Some("user".into());
+            state.owner_user_id = Some("user".into());
             state.canonical_turn_chain_id = Some("test-chain".into());
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let wait_started = Arc::new(tokio::sync::Notify::new());
@@ -8752,7 +8554,7 @@ mod tests {
         state.runtime_tool_executor = Some(Arc::new(executor));
         state.current_run_id = Some("test-run".into());
         state.current_session_id = Some("test-session".into());
-        state.context_manifest_user_id = Some("user".into());
+        state.owner_user_id = Some("user".into());
         state.canonical_turn_chain_id = Some("test-chain".into());
         let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut host = MockHost::new(vec![
@@ -9461,7 +9263,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("parent-run".into());
         state.current_session_id = Some("parent-session".into());
-        state.context_manifest_user_id = Some("parent-user".into());
+        state.owner_user_id = Some("parent-user".into());
         state.run_control = Some(provider.clone());
         state.user_intents.wake = Some(wake_rx);
         let task = tokio::spawn(async move {
@@ -9544,7 +9346,7 @@ mod tests {
             let mut state = make_state();
             state.current_run_id = Some("agent-run".into());
             state.current_session_id = Some("session".into());
-            state.context_manifest_user_id = Some("user".into());
+            state.owner_user_id = Some("user".into());
             state.run_control = Some(provider.clone());
             state.current_run_owner_generation = Some(3);
             state.step_recorder.begin_turn(0);
@@ -18400,20 +18202,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_reason_uses_structured_compaction_state_not_message_text() {
-        let mut state = make_state();
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": "Please explain compaction without changing the context."
-        }));
-        assert_eq!(manifest_reason_for_llm_call(&state), "normal_turn");
-
-        state.compact_tier_applied =
-            astra_turn_core::compaction_types::CompactionTier::CompactHistory;
-        assert_eq!(manifest_reason_for_llm_call(&state), "post_compaction");
-    }
-
-    #[test]
     fn alert_dispatch_session_id_requires_real_session_identity() {
         assert_eq!(alert_dispatch_session_id(None), None);
         assert_eq!(alert_dispatch_session_id(Some("")), None);
@@ -18421,35 +18209,6 @@ mod tests {
         assert_eq!(
             alert_dispatch_session_id(Some("  session-123  ")).as_deref(),
             Some("session-123")
-        );
-    }
-
-    #[test]
-    fn context_manifest_turn_intent_ignores_prompt_facing_benchmark_marker() {
-        let mut state = make_state();
-        state.message = "please compare these results [TASK_ID:bnh]".into();
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": state.message}));
-
-        assert_eq!(
-            infer_turn_intent_for_llm_call(&state),
-            "normal",
-            "prompt-facing marker text must not become control-plane turn intent"
-        );
-    }
-
-    #[test]
-    fn context_manifest_turn_intent_uses_structured_benchmark_scenario() {
-        let mut state = make_state();
-        state.turn_intent = Some(
-            astra_config::user_profile::TurnIntent::default()
-                .with_requested_scenario(Scenario::BenchmarkComparison),
-        );
-
-        assert_eq!(
-            infer_turn_intent_for_llm_call(&state),
-            astra_services::TURN_INTENT_BENCHMARK_COMPARISON
         );
     }
 
@@ -18765,7 +18524,7 @@ mod tests {
     fn observe_turn_end_without_tools_records_outer_session_turn() {
         let mut state = make_state();
         state.session_turn = 6;
-        state.context_manifest_model_name = Some("test-model".to_string());
+        state.policy_model_name = Some("test-model".to_string());
         state.max_turns = 20;
         state.remaining_turns = 4;
         state.total_prompt = 10_000;
@@ -18783,67 +18542,6 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
-    }
-
-    #[test]
-    fn context_manifest_requires_server_owned_session_and_run_identity() {
-        let rejected = HostTurnResult {
-            accum: ChatTurnSseAccum::default(),
-            ttft_ms: None,
-
-            error_kind: Some(astra_core::ErrorKind::InvalidRequest),
-        };
-        assert_eq!(
-            context_manifest_identity_from_result(Some(&rejected)),
-            None,
-            "an admission rejection must not use the edge correlation id for a manifest"
-        );
-
-        let mut admitted = rejected;
-        admitted.accum.session_id = Some("session-server".to_string());
-        admitted.accum.run_id = Some("run-server".to_string());
-        assert_eq!(
-            context_manifest_identity_from_result(Some(&admitted)),
-            Some(("session-server".to_string(), "run-server".to_string()))
-        );
-    }
-
-    #[test]
-    fn context_manifest_db_persistence_follows_context_assembly_trace_category() {
-        use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
-
-        let production = SessionTraceConfig::default();
-        assert!(
-            !context_manifest_db_persistence_enabled_for_trace(&production),
-            "production/default trace profile must not write context manifest diagnostics"
-        );
-
-        let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
-        assert!(
-            context_manifest_db_persistence_enabled_for_trace(&dev),
-            "dev trace profile enables all diagnostic persistence categories"
-        );
-
-        let custom = SessionTraceConfig {
-            profile: TraceProfile::Custom,
-            enabled_categories: vec![TraceCategory::ContextAssembly],
-            ..SessionTraceConfig::default()
-        }
-        .normalize();
-        assert!(context_manifest_db_persistence_enabled_for_trace(&custom));
-    }
-
-    #[test]
-    fn context_manifest_uses_pipeline_context_window_trace() {
-        let mut state = make_state();
-        state.last_llm_context_manifest_trace = Some(serde_json::json!({
-            "model_context_window_tokens": 1_000_000
-        }));
-
-        assert_eq!(
-            context_window_tokens_for_context_manifest(&state),
-            1_000_000
-        );
     }
 
     #[test]
@@ -18894,16 +18592,6 @@ mod tests {
             }))),
             None,
             "malformed measurements stay unknown instead of being coerced"
-        );
-    }
-
-    #[test]
-    fn context_manifest_context_window_defaults_to_generic_200k_without_trace() {
-        let state = make_state();
-
-        assert_eq!(
-            context_window_tokens_for_context_manifest(&state),
-            crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32
         );
     }
 
@@ -19166,7 +18854,7 @@ mod tests {
             let mut state = make_state();
             state.current_run_id = Some("run-guidance-race".into());
             state.current_run_owner_generation = Some(17);
-            state.context_manifest_user_id = Some("user-guidance-race".into());
+            state.owner_user_id = Some("user-guidance-race".into());
             let pending = UserIntentPoll {
                 next_cursor: 1,
                 snapshot_page_fact_count: 1,
@@ -19893,7 +19581,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-final-fence".into());
         state.current_session_id = Some("session-final-fence".into());
-        state.context_manifest_user_id = Some("user-final-fence".into());
+        state.owner_user_id = Some("user-final-fence".into());
         state.current_run_owner_generation = Some(9);
         install_committed_work_synthesis_wire_surface(&mut state);
         let provider = Arc::new(
@@ -22245,7 +21933,7 @@ mod tests {
 
     /// End-to-end wiring: the runtime guard MUST consume the *resolved*
     /// per-model threshold rather than the global default. This pins the
-    /// chain `state.context_manifest_model_name → resolve_for_model →
+    /// chain `state.policy_model_name → resolve_for_model →
     /// EffectiveToolPolicy::parallel_batching_force_streak →
     /// should_emit_parallel_batching_advisory(_, threshold)`. A regression that
     /// re-routes the guard back to `effective_parallel_batching_force_streak`
@@ -22256,7 +21944,7 @@ mod tests {
             let mut state = make_state();
             state.message = "explore the codebase".into();
             state.user_intent = state.message.clone();
-            state.context_manifest_model_name = Some("claude-haiku-4-5".into());
+            state.policy_model_name = Some("claude-haiku-4-5".into());
             state.admitted_tool_policy.model_profiles =
                 vec![astra_config::runtime_config::ModelPolicyProfile {
                     model_match: "haiku".into(),
@@ -22732,7 +22420,7 @@ mod tests {
                 astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
             );
         state.current_run_id = Some("run-queued".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 2,
             snapshot_has_more: false,
@@ -22793,7 +22481,7 @@ mod tests {
     async fn action_boundary_drains_settled_page_before_observing_next_page_guidance() {
         let mut state = make_state();
         state.current_run_id = Some("run-paged-boundary".into());
-        state.context_manifest_user_id = Some("user-paged-boundary".into());
+        state.owner_user_id = Some("user-paged-boundary".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll {
                 next_cursor: 256,
@@ -22837,7 +22525,7 @@ mod tests {
     async fn action_boundary_fails_closed_when_control_snapshot_exceeds_page_cap() {
         let mut state = make_state();
         state.current_run_id = Some("run-over-page-cap".into());
-        state.context_manifest_user_id = Some("user-over-page-cap".into());
+        state.owner_user_id = Some("user-over-page-cap".into());
         let polls = (1..=MAX_USER_INTENT_BOUNDARY_PAGES)
             .map(|page| UserIntentPoll {
                 next_cursor: page,
@@ -22872,7 +22560,7 @@ mod tests {
     async fn middle_page_apply_failure_keeps_cursor_for_exact_retry() {
         let mut state = make_state();
         state.current_run_id = Some("run-middle-page-retry".into());
-        state.context_manifest_user_id = Some("user-middle-page-retry".into());
+        state.owner_user_id = Some("user-middle-page-retry".into());
         let pending_page = || UserIntentPoll {
             next_cursor: 257,
             snapshot_has_more: false,
@@ -22927,7 +22615,7 @@ mod tests {
     async fn settlement_boundary_forces_poll_before_empty_poll_cooldown_expires() {
         let mut state = make_state();
         state.current_run_id = Some("run-settling".into());
-        state.context_manifest_user_id = Some("user-settling".into());
+        state.owner_user_id = Some("user-settling".into());
         state
             .user_intents
             .note_user_intent_poll_finished(tokio::time::Instant::now(), Duration::from_secs(60));
@@ -22993,7 +22681,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-real-fence-drain".into());
         state.current_run_owner_generation = Some(0);
-        state.context_manifest_user_id = Some("user-real".into());
+        state.owner_user_id = Some("user-real".into());
         state.current_session_id = Some("session-real".into());
         state.run_control = Some(engine.clone());
         let mut host = MockHost::new(vec![]);
@@ -23052,7 +22740,7 @@ mod tests {
         let mut stale = make_state();
         stale.current_run_id = Some("run-provider-authority".into());
         stale.current_run_owner_generation = Some(1);
-        stale.context_manifest_user_id = Some("user-provider".into());
+        stale.owner_user_id = Some("user-provider".into());
         stale.current_session_id = Some("session-provider".into());
         stale.run_control = Some(engine.clone());
         let mut stale_progress = attach_llm_progress_receiver(&mut stale);
@@ -23087,7 +22775,7 @@ mod tests {
         let mut terminal = make_state();
         terminal.current_run_id = Some("run-provider-authority".into());
         terminal.current_run_owner_generation = Some(0);
-        terminal.context_manifest_user_id = Some("user-provider".into());
+        terminal.owner_user_id = Some("user-provider".into());
         terminal.current_session_id = Some("session-provider".into());
         terminal.run_control = Some(engine.clone());
         let mut terminal_progress = attach_llm_progress_receiver(&mut terminal);
@@ -23112,7 +22800,7 @@ mod tests {
         let mut missing = make_state();
         missing.current_run_id = Some("run-provider-authority".into());
         missing.current_run_owner_generation = None;
-        missing.context_manifest_user_id = Some("user-provider".into());
+        missing.owner_user_id = Some("user-provider".into());
         missing.run_control = Some(engine);
         let mut missing_progress = attach_llm_progress_receiver(&mut missing);
         let mut missing_host = MockHost::new(vec![text_result("must not run", 1, 1, None)]);
@@ -23144,7 +22832,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-paused-boundary".into());
         state.current_run_owner_generation = Some(7);
-        state.context_manifest_user_id = Some("user-paused-boundary".into());
+        state.owner_user_id = Some("user-paused-boundary".into());
         state.current_session_id = Some("session-paused-boundary".into());
         state.run_control = Some(provider.clone());
         state.cancellation.pause_flag = Some(pause_flag.clone());
@@ -23163,7 +22851,7 @@ mod tests {
             let mut state = make_state();
             state.current_run_id = Some("run-paused-deadline".into());
             state.current_run_owner_generation = Some(7);
-            state.context_manifest_user_id = Some("user-paused-deadline".into());
+            state.owner_user_id = Some("user-paused-deadline".into());
             state.current_session_id = Some("session-paused-deadline".into());
             state.run_control = Some(Arc::new(BoundaryDecisionRunControl {
                 decision: Ok(ProviderBoundaryAuthorization::Paused),
@@ -23219,7 +22907,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-paused-boundary".into());
         state.current_run_owner_generation = Some(7);
-        state.context_manifest_user_id = Some("user-paused-boundary".into());
+        state.owner_user_id = Some("user-paused-boundary".into());
         state.current_session_id = Some("session-paused-boundary".into());
         state.run_control = Some(provider.clone());
         state.cancellation.pause_flag = None;
@@ -23269,7 +22957,7 @@ mod tests {
             let mut state = make_state();
             state.current_run_id = Some("run-boundary-decision".into());
             state.current_run_owner_generation = Some(7);
-            state.context_manifest_user_id = Some("user-boundary-decision".into());
+            state.owner_user_id = Some("user-boundary-decision".into());
             state.current_session_id = Some("session-boundary-decision".into());
             state.run_control = Some(provider.clone());
             let mut progress = attach_llm_progress_receiver(&mut state);
@@ -23418,7 +23106,7 @@ mod tests {
     async fn settlement_boundary_fails_closed_when_durable_poll_is_unavailable() {
         let mut state = make_state();
         state.current_run_id = Some("run-settling".into());
-        state.context_manifest_user_id = Some("user-settling".into());
+        state.owner_user_id = Some("user-settling".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 0,
             snapshot_has_more: false,
@@ -23448,7 +23136,7 @@ mod tests {
     async fn action_boundary_forces_guidance_poll_before_stale_tool_execution() {
         let mut state = make_state();
         state.current_run_id = Some("run-action-fence".into());
-        state.context_manifest_user_id = Some("user-action-fence".into());
+        state.owner_user_id = Some("user-action-fence".into());
         state
             .user_intents
             .note_user_intent_poll_finished(tokio::time::Instant::now(), Duration::from_secs(60));
@@ -23484,7 +23172,7 @@ mod tests {
     async fn action_boundary_fails_closed_when_guidance_apply_ack_fails() {
         let mut state = make_state();
         state.current_run_id = Some("run-action-ack".into());
-        state.context_manifest_user_id = Some("user-action-ack".into());
+        state.owner_user_id = Some("user-action-ack".into());
         let provider = Arc::new(StubRunControlProvider::with_release_failures(
             vec![UserIntentPoll {
                 next_cursor: 4,
@@ -23516,7 +23204,7 @@ mod tests {
     async fn forced_action_boundary_retries_pending_apply_ack_during_backoff() {
         let mut state = make_state();
         state.current_run_id = Some("run-pending-action-ack".into());
-        state.context_manifest_user_id = Some("user-pending-action-ack".into());
+        state.owner_user_id = Some("user-pending-action-ack".into());
         let provider = Arc::new(StubRunControlProvider::with_release_failures(
             vec![
                 UserIntentPoll {
@@ -23558,7 +23246,7 @@ mod tests {
     async fn action_boundary_discards_stale_actions_when_terminal_wins_apply_race() {
         let mut state = make_state();
         state.current_run_id = Some("run-action-terminal".into());
-        state.context_manifest_user_id = Some("user-action-terminal".into());
+        state.owner_user_id = Some("user-action-terminal".into());
         let provider = Arc::new(StubRunControlProvider::with_terminal_release(vec![
             UserIntentPoll {
                 next_cursor: 2,
@@ -23635,7 +23323,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-mid-provider-guidance".into());
         state.current_run_owner_generation = Some(7);
-        state.context_manifest_user_id = Some("user-mid-provider-guidance".into());
+        state.owner_user_id = Some("user-mid-provider-guidance".into());
         let guidance = "answer the revised question without reading files";
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll::default(),
@@ -23757,7 +23445,7 @@ mod tests {
             let mut state = make_state();
             state.current_run_id = Some(format!("run-{case:?}"));
             state.current_run_owner_generation = Some(17);
-            state.context_manifest_user_id = Some("user-settlement-guard".into());
+            state.owner_user_id = Some("user-settlement-guard".into());
             let polls = if matches!(case, ContinuationCase::GuidanceArrived) {
                 vec![
                     UserIntentPoll::default(),
@@ -23832,7 +23520,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-terminal-after-fence".into());
         state.current_run_owner_generation = Some(29);
-        state.context_manifest_user_id = Some("user-terminal-after-fence".into());
+        state.owner_user_id = Some("user-terminal-after-fence".into());
         mark_must_mutate(&mut state);
         state.hooks.completion_settlement.workspace_mutation_retries = 1;
         let provider = Arc::new(StubRunControlProvider::new(vec![
@@ -23865,7 +23553,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("run-continuing".into());
         state.current_run_owner_generation = Some(7);
-        state.context_manifest_user_id = Some("user-continuing".into());
+        state.owner_user_id = Some("user-continuing".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll::default(),
             // The post-provider action fence observes no guidance. The next
@@ -23917,7 +23605,7 @@ mod tests {
     async fn active_run_guidance_keeps_runtime_work_truth_out_of_user_speech() {
         let mut state = make_state();
         state.current_run_id = Some("run-status".into());
-        state.context_manifest_user_id = Some("user-status".into());
+        state.owner_user_id = Some("user-status".into());
         state
             .hooks
             .completion_settlement
@@ -24174,7 +23862,7 @@ mod tests {
             let mut state = make_state();
             state.current_run_id = Some("run".into());
             state.current_session_id = Some("session".into());
-            state.context_manifest_user_id = Some("user".into());
+            state.owner_user_id = Some("user".into());
             state.current_run_owner_generation = Some(0);
             state.run_control = Some(engine.clone());
             let mut host = MockHost::new(vec![]);
@@ -24285,7 +23973,7 @@ mod tests {
             2,
         );
         state.current_run_id = Some("run-queued-many".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 3,
             snapshot_has_more: false,
@@ -24394,7 +24082,7 @@ mod tests {
     async fn user_intent_does_not_reinject_after_cursor_advance() {
         let mut state = make_state();
         state.current_run_id = Some("run-repoll".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll {
                 next_cursor: 2,
@@ -24465,7 +24153,7 @@ mod tests {
     async fn user_intent_empty_poll_is_throttled() {
         let mut state = make_state();
         state.current_run_id = Some("run-empty-throttle".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll {
                 next_cursor: 0,
@@ -24531,7 +24219,7 @@ mod tests {
     async fn quiet_rounds_do_not_poll_but_notified_guidance_applies_before_the_next_provider() {
         let mut state = make_state();
         state.current_run_id = Some("run-watched-guidance".into());
-        state.context_manifest_user_id = Some("owner".into());
+        state.owner_user_id = Some("owner".into());
         state.current_session_id = Some("session".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll::default(),
@@ -24590,7 +24278,7 @@ mod tests {
     async fn guidance_notification_during_a_snapshot_remains_ready() {
         let mut state = make_state();
         state.current_run_id = Some("run-read-race".into());
-        state.context_manifest_user_id = Some("owner".into());
+        state.owner_user_id = Some("owner".into());
         state.current_session_id = Some("session".into());
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -24622,7 +24310,7 @@ mod tests {
     async fn provider_boundary_bypasses_empty_poll_throttle_after_tool_work() {
         let mut state = make_state();
         state.current_run_id = Some("run-provider-boundary".into());
-        state.context_manifest_user_id = Some("user-provider-boundary".into());
+        state.owner_user_id = Some("user-provider-boundary".into());
         state.current_session_id = Some("session-provider-boundary".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
             UserIntentPoll {
@@ -24673,7 +24361,7 @@ mod tests {
         for expires in [false, true] {
             let mut state = make_state();
             state.current_run_id = Some("run-paused-guidance".into());
-            state.context_manifest_user_id = Some("user-paused".into());
+            state.owner_user_id = Some("user-paused".into());
             let pause_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             state.cancellation.pause_flag = Some(pause_flag.clone());
             let mut provider = StubRunControlProvider::new(vec![UserIntentPoll {
@@ -24743,7 +24431,7 @@ mod tests {
         state.messages = vec![serde_json::json!({"role":"user", "content":"test query"})];
         crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
         state.current_run_id = Some("run-release-retry".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let pending_poll = || UserIntentPoll {
             next_cursor: 2,
             snapshot_has_more: false,
@@ -24850,7 +24538,7 @@ mod tests {
     async fn terminal_run_does_not_publish_user_intent_applied() {
         let mut state = make_state();
         state.current_run_id = Some("run-terminal-race".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::with_terminal_release(vec![
             UserIntentPoll {
                 next_cursor: 2,
@@ -24892,7 +24580,7 @@ mod tests {
     async fn committed_apply_outbox_rehydrates_model_context_without_second_ack() {
         let mut state = make_state();
         state.current_run_id = Some("run-recovered-apply".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 3,
             snapshot_has_more: false,
@@ -24928,7 +24616,7 @@ mod tests {
     async fn malformed_user_intent_isolated_without_blocking_later_valid_input() {
         let mut state = make_state();
         state.current_run_id = Some("run-invalid".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 7,
             snapshot_has_more: false,
@@ -24974,7 +24662,7 @@ mod tests {
     async fn user_intent_poll_error_degrades_without_advancing_cursor() {
         let mut state = make_state();
         state.current_run_id = Some("run-missing".into());
-        state.context_manifest_user_id = Some("user-deferred".into());
+        state.owner_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 4,
             snapshot_has_more: false,
@@ -25193,7 +24881,7 @@ mod tests {
         state.current_session_id = Some("session-1".to_string());
         state.current_run_id = Some("run-1".to_string());
         state.session_turn = 6;
-        state.context_manifest_model_name = Some("test-model".to_string());
+        state.policy_model_name = Some("test-model".to_string());
         state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(
             state.current_session_id.as_deref(),
             state.session_turn,

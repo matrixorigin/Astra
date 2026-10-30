@@ -165,7 +165,6 @@ pub struct AppState {
     pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
     pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
-    pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
@@ -269,7 +268,6 @@ impl AppState {
             decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
             model_catalog_cache: Default::default(),
-            data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             skill_service: Arc::new(UnconfiguredSkillService),
@@ -498,14 +496,6 @@ impl AppState {
 
     pub fn with_model_service(mut self, model_service: Arc<dyn ModelService>) -> Self {
         self.model_service = model_service;
-        self
-    }
-
-    pub fn with_data_versioning_service(
-        mut self,
-        data_versioning_service: Arc<dyn DataVersioningService>,
-    ) -> Self {
-        self.data_versioning_service = data_versioning_service;
         self
     }
 

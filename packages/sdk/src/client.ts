@@ -82,19 +82,6 @@ import type {
   WorkBranchCatalogV1,
   WorkBranchComparisonReportV2,
   WorkContentHash,
-  WorkPatchArtifactV1,
-  WorkPatchArtifactContent,
-  WorkPatchArtifactListParamsV1,
-  WorkPatchArtifactPageV1,
-  WorkPatchArtifactExportInputV1,
-  WorkPatchMaterializationInputV1,
-  WorkPatchMaterializationListParamsV1,
-  WorkPatchMaterializationOperationV2,
-  WorkPatchMaterializationPageV2,
-  WorkPatchCommitInputV1,
-  WorkPatchCommitListParamsV1,
-  WorkPatchCommitOperationV1,
-  WorkPatchCommitPageV1,
   WorkDeliverySelectionInputV1,
   WorkDeliverySelectionReceiptV1,
   WorkTranscriptPageV1,
@@ -207,9 +194,6 @@ import {
   workBranchActionsPath,
   workBranchTranscriptPath,
   workBranchAttachmentPath,
-  workBranchPatchArtifactPath,
-  workBranchPatchArtifactContentPath,
-  workBranchPatchArtifactsPath,
   workBranchAttachmentsPath,
   workBranchControlOperationPath,
   workBranchControlOperationsPath,
@@ -236,10 +220,6 @@ import {
   workBranchCriteriaProposalPath,
   workBranchCriteriaProposalDecisionPath,
   workReadCursorPath,
-  workPatchMaterializationPath,
-  workPatchMaterializationsPath,
-  workPatchCommitPath,
-  workPatchCommitsPath,
 } from "./paths";
 import { SSEClient, parseSseDataEvents } from "./sse-client";
 import {
@@ -258,12 +238,6 @@ import {
   decodeWorkBranchRetentionReceiptV1,
   decodeWorkBranchCatalogV1,
   decodeWorkBranchComparisonReportV2,
-  decodeWorkPatchArtifactV1,
-  decodeWorkPatchArtifactPageV1,
-  decodeWorkPatchMaterializationOperationV2,
-  decodeWorkPatchMaterializationPageV2,
-  decodeWorkPatchCommitOperationV1,
-  decodeWorkPatchCommitPageV1,
   decodeWorkDeliverySelectionReceiptV1,
   decodeWorkConversationHeadV1,
   decodeWorkTranscriptPageV1,
@@ -965,31 +939,6 @@ export class AstraClient {
         path,
       );
     }
-  }
-
-  private async fetchWorkPatchContent(path: string): Promise<WorkPatchArtifactContent> {
-    const res = await this.request(path, {
-      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
-    });
-    const contentType = res.headers.get("content-type")?.toLowerCase();
-    const lengthText = res.headers.get("content-length");
-    const etag = res.headers.get("etag");
-    const length = lengthText == null ? Number.NaN : Number(lengthText);
-    const hash = etag?.match(/^"(sha256:[0-9a-f]{64})"$/u)?.[1];
-    if (
-      contentType?.split(";", 1)[0]?.trim() !== "text/x-diff" ||
-      !Number.isSafeInteger(length) ||
-      length < 1 ||
-      length > 16 * 1024 * 1024 ||
-      hash == null
-    ) {
-      throw new TypeError("Work patch content response metadata is invalid");
-    }
-    const data = await res.text();
-    if (new TextEncoder().encode(data).byteLength !== length) {
-      throw new TypeError("Work patch content length disagrees with its response metadata");
-    }
-    return { data, hash: hash as WorkContentHash, bytes: length };
   }
 
   async post<T>(path: string, body?: unknown, init?: RequestInit): Promise<T> {
@@ -1742,277 +1691,6 @@ export class AstraClient {
       throw new TypeError("Work branch comparison identity disagrees with the request");
     }
     return report;
-  }
-
-  /** Read immutable patch provenance without exposing the backing session. */
-  async getWorkPatchArtifact(
-    workId: string,
-    branchId: string,
-    patchArtifactId: string,
-  ): Promise<WorkPatchArtifactV1> {
-    const raw = await this.fetch<unknown>(
-      workBranchPatchArtifactPath(workId, branchId, patchArtifactId),
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const artifact = decodeWorkPatchArtifactV1(raw);
-    if (
-      artifact.work_id !== workId ||
-      artifact.branch_id !== branchId ||
-      artifact.patch_artifact_id !== patchArtifactId
-    ) {
-      throw new TypeError("Work patch artifact identity disagrees with the request");
-    }
-    return artifact;
-  }
-
-  /** List bounded patch metadata; diff bodies remain lazy detail resources. */
-  async listWorkPatchArtifacts(
-    workId: string,
-    branchId: string,
-    params: WorkPatchArtifactListParamsV1 = {},
-  ): Promise<WorkPatchArtifactPageV1> {
-    if (
-      params.limit !== undefined &&
-      (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > 50)
-    ) {
-      throw new TypeError("limit must be an integer between 1 and 50");
-    }
-    const raw = await this.fetch<unknown>(
-      `${workBranchPatchArtifactsPath(workId, branchId)}${buildQueryString({
-        before_created_at: params.before?.created_at,
-        before_patch_artifact_id: params.before?.patch_artifact_id,
-        limit: params.limit,
-      })}`,
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const page = decodeWorkPatchArtifactPageV1(raw);
-    if (page.work_id !== workId || page.branch_id !== branchId) {
-      throw new TypeError("Work patch artifact page identity disagrees with the request");
-    }
-    return page;
-  }
-
-  /** Read integrity-checked, bounded unified diff text for review. */
-  async getWorkPatchArtifactContent(
-    workId: string,
-    branchId: string,
-    patchArtifactId: string,
-  ): Promise<WorkPatchArtifactContent> {
-    return this.fetchWorkPatchContent(
-      workBranchPatchArtifactContentPath(workId, branchId, patchArtifactId),
-    );
-  }
-
-  /** Export the exact current Server-owned Git worktree delta as an immutable patch. */
-  async exportWorkPatchArtifact(
-    workId: string,
-    branchId: string,
-    input: WorkPatchArtifactExportInputV1,
-  ): Promise<WorkPatchArtifactV1> {
-    const raw = await this.post<unknown>(
-      workBranchPatchArtifactsPath(workId, branchId),
-      {
-        request_id: input.requestId,
-        expected_branch_revision: input.expectedBranchRevision,
-        expected_graph_revision: input.expectedGraphRevision,
-      },
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const artifact = decodeWorkPatchArtifactV1(raw);
-    if (
-      artifact.work_id !== workId ||
-      artifact.branch_id !== branchId ||
-      artifact.source_ref !== input.requestId
-    ) {
-      throw new TypeError("Work patch export identity disagrees with the request");
-    }
-    return artifact;
-  }
-
-  /** Admit an exact-base patch application; execution remains provider/policy gated. */
-  async materializeWorkPatch(
-    workId: string,
-    targetBranchId: string,
-    input: WorkPatchMaterializationInputV1,
-  ): Promise<WorkPatchMaterializationOperationV2> {
-    const raw = await this.post<unknown>(
-      workPatchMaterializationsPath(workId, targetBranchId),
-      {
-        request_id: input.requestId,
-        patch_artifact_id: input.patchArtifactId,
-        expected_target_branch_revision: input.expectedTargetBranchRevision,
-        expected_target_graph_revision: input.expectedTargetGraphRevision,
-      },
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const operation = decodeWorkPatchMaterializationOperationV2(raw);
-    if (
-      operation.work_id !== workId ||
-      operation.target_branch_id !== targetBranchId ||
-      operation.patch_artifact_id !== input.patchArtifactId ||
-      operation.request_id !== input.requestId
-    ) {
-      throw new TypeError("Work patch materialization identity disagrees with the request");
-    }
-    return operation;
-  }
-
-  /** Restore bounded durable application progress for one branch pair. */
-  async listWorkPatchMaterializations(
-    workId: string,
-    targetBranchId: string,
-    params: WorkPatchMaterializationListParamsV1,
-  ): Promise<WorkPatchMaterializationPageV2> {
-    if (
-      params.limit !== undefined &&
-      (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > 50)
-    ) {
-      throw new TypeError("limit must be an integer between 1 and 50");
-    }
-    const raw = await this.fetch<unknown>(
-      `${workPatchMaterializationsPath(workId, targetBranchId)}${buildQueryString({
-        source_branch_id: params.sourceBranchId,
-        before_created_at: params.before?.created_at,
-        before_operation_id: params.before?.operation_id,
-        limit: params.limit,
-      })}`,
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const page = decodeWorkPatchMaterializationPageV2(raw);
-    if (
-      page.work_id !== workId ||
-      page.target_branch_id !== targetBranchId ||
-      page.source_branch_id !== params.sourceBranchId
-    ) {
-      throw new TypeError("Work patch materialization page identity disagrees with the request");
-    }
-    return page;
-  }
-
-  /** Read durable patch application progress without exposing executor leases. */
-  async getWorkPatchMaterialization(
-    workId: string,
-    targetBranchId: string,
-    operationId: string,
-  ): Promise<WorkPatchMaterializationOperationV2> {
-    const raw = await this.fetch<unknown>(
-      workPatchMaterializationPath(workId, targetBranchId, operationId),
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const operation = decodeWorkPatchMaterializationOperationV2(raw);
-    if (
-      operation.work_id !== workId ||
-      operation.target_branch_id !== targetBranchId ||
-      operation.operation_id !== operationId
-    ) {
-      throw new TypeError("Work patch materialization identity disagrees with the request");
-    }
-    return operation;
-  }
-
-  /** Abort only before dispatch; uncertain or observed effects must reconcile. */
-  async abortWorkPatchMaterialization(
-    workId: string,
-    targetBranchId: string,
-    operationId: string,
-  ): Promise<void> {
-    await this.fetch<void>(
-      workPatchMaterializationPath(workId, targetBranchId, operationId),
-      {
-        method: "DELETE",
-        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
-      },
-    );
-  }
-
-  /** Commit one immutable reviewed patch; Git identity and provider stay Server-owned. */
-  async commitWorkPatch(
-    workId: string,
-    targetBranchId: string,
-    input: WorkPatchCommitInputV1,
-  ): Promise<WorkPatchCommitOperationV1> {
-    assertWorkRequestId(input.requestId);
-    assertWorkCommitMessage(input.message);
-    const raw = await this.post<unknown>(
-      workPatchCommitsPath(workId, targetBranchId),
-      {
-        request_id: input.requestId,
-        patch_artifact_id: input.patchArtifactId,
-        expected_target_branch_revision: input.expectedTargetBranchRevision,
-        expected_target_graph_revision: input.expectedTargetGraphRevision,
-        message: input.message,
-      },
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const operation = decodeWorkPatchCommitOperationV1(raw);
-    if (
-      operation.work_id !== workId ||
-      operation.target_branch_id !== targetBranchId ||
-      operation.patch_artifact_id !== input.patchArtifactId ||
-      operation.request_id !== input.requestId
-    ) {
-      throw new TypeError("Work patch commit identity disagrees with the request");
-    }
-    return operation;
-  }
-
-  /** Restore bounded durable commit progress after refresh or reconnect. */
-  async listWorkPatchCommits(
-    workId: string,
-    targetBranchId: string,
-    params: WorkPatchCommitListParamsV1 = {},
-  ): Promise<WorkPatchCommitPageV1> {
-    if (
-      params.limit !== undefined &&
-      (!Number.isSafeInteger(params.limit) || params.limit < 1 || params.limit > 50)
-    ) {
-      throw new TypeError("limit must be an integer between 1 and 50");
-    }
-    const raw = await this.fetch<unknown>(
-      `${workPatchCommitsPath(workId, targetBranchId)}${buildQueryString({
-        before_created_at: params.before?.created_at,
-        before_operation_id: params.before?.operation_id,
-        limit: params.limit,
-      })}`,
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const page = decodeWorkPatchCommitPageV1(raw);
-    if (page.work_id !== workId || page.target_branch_id !== targetBranchId) {
-      throw new TypeError("Work patch commit page identity disagrees with the request");
-    }
-    return page;
-  }
-
-  async getWorkPatchCommit(
-    workId: string,
-    targetBranchId: string,
-    operationId: string,
-  ): Promise<WorkPatchCommitOperationV1> {
-    const raw = await this.fetch<unknown>(
-      workPatchCommitPath(workId, targetBranchId, operationId),
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
-    );
-    const operation = decodeWorkPatchCommitOperationV1(raw);
-    if (
-      operation.work_id !== workId ||
-      operation.target_branch_id !== targetBranchId ||
-      operation.operation_id !== operationId
-    ) {
-      throw new TypeError("Work patch commit identity disagrees with the request");
-    }
-    return operation;
-  }
-
-  /** Abort only before Git dispatch; possible side effects always reconcile. */
-  async abortWorkPatchCommit(
-    workId: string,
-    targetBranchId: string,
-    operationId: string,
-  ): Promise<void> {
-    await this.fetch<void>(workPatchCommitPath(workId, targetBranchId, operationId), {
-      method: "DELETE",
-      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
-    });
   }
 
   /** Select one exact compared branch as the Work result with a pinned evidence basis. */

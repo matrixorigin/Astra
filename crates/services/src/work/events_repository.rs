@@ -164,7 +164,6 @@ async fn prune_expired_event_fact(
         | WorkEventKind::BranchArchived
         | WorkEventKind::BranchRestored
         | WorkEventKind::SubjectChanged
-        | WorkEventKind::PatchArtifactExported
         | WorkEventKind::PlanProposed
         | WorkEventKind::CriteriaProposed
         | WorkEventKind::ProposalRejected

@@ -129,39 +129,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::work_handlers::get_work_branch_deletion_handler),
         )
         .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts",
-            get(crate::server::work_handlers::get_work_branch_patch_artifacts_handler)
-                .post(crate::server::work_handlers::post_work_branch_patch_artifact_handler),
-        )
-        .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts/{patch_artifact_id}",
-            get(crate::server::work_handlers::get_work_branch_patch_artifact_handler),
-        )
-        .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts/{patch_artifact_id}/content",
-            get(crate::server::work_handlers::get_work_branch_patch_artifact_content_handler),
-        )
-        .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-materializations",
-            get(crate::server::work_handlers::get_work_patch_materializations_handler)
-                .post(crate::server::work_handlers::post_work_patch_materialization_handler),
-        )
-        .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-materializations/{operation_id}",
-            get(crate::server::work_handlers::get_work_patch_materialization_handler)
-                .delete(crate::server::work_handlers::delete_work_patch_materialization_handler),
-        )
-        .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-commits",
-            get(crate::server::work_handlers::get_work_patch_commits_handler)
-                .post(crate::server::work_handlers::post_work_patch_commit_handler),
-        )
-        .route(
-            "/v1/works/{work_id}/branches/{branch_id}/patch-commits/{operation_id}",
-            get(crate::server::work_handlers::get_work_patch_commit_handler)
-                .delete(crate::server::work_handlers::delete_work_patch_commit_handler),
-        )
-        .route(
             "/v1/works/{work_id}/branches/{branch_id}/transcript",
             get(crate::server::work_handlers::get_work_branch_transcript_handler),
         )

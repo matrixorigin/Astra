@@ -1364,7 +1364,7 @@ mod tests {
             .await
             .expect("independent pool");
         closed_pool.close().await;
-        executor.set_context_manifest_pool(closed_pool);
+        executor.set_service_pool(closed_pool);
         let rejected = propose(&executor, &json!({"context_id":"context", "reason":"invalid empty mutation", "additions":[], "revisions":[], "dependencies":[], "dependency_removals":[]}), invocation("invalid-arguments"), None).await;
         assert!(rejected.is_error);
         assert_eq!(
@@ -1375,7 +1375,7 @@ mod tests {
             executor.work_binding.get().is_none(),
             "invalid arguments must not install authority"
         );
-        executor.set_context_manifest_pool(pool.clone());
+        executor.set_service_pool(pool.clone());
         assert!(executor.work_binding.get().is_none());
         // A new executor represents the next turn or another Server. Two
         // concurrent explicit reads must recover the same persisted identity.
@@ -1839,7 +1839,7 @@ mod tests {
             None,
             None,
         );
-        second_executor.set_context_manifest_pool(pool.clone());
+        second_executor.set_service_pool(pool.clone());
         assert!(second_executor.work_binding.get().is_none());
         let first_session_args = json!({});
         let second_session_args = json!({});

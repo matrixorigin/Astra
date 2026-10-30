@@ -48,6 +48,54 @@ initial immutable revision. Revision 1 remains retained for the Work lifetime,
 including after removal from an accepted set, so the existing owner/Work-scoped
 primary key prevents identity reuse without a separate identity table.
 
+## Persistence simplification boundary
+
+The production schema inventory contains 121 table declarations after retiring
+ten of the 131 declarations in this review. Individual bootstrap boundaries may
+initialize a subset; messaging, resource governance and provider admission also
+own declarations. Distinct durable facts do not automatically justify separate tables;
+this is a disposition for this delivery, not proof every retained table is
+permanently necessary. The source inventory remains the complete table catalog.
+
+| Journey | Retained table count | Boundary and disposition |
+| --- | ---: | --- |
+| Identity, device trust and policy | 14 | Preserve authorization, replay protection and credential/lease authority. |
+| Session, Run and conversation | 7 | Preserve lifecycle, deletion fencing, canonical transcript and recovery. |
+| Canonical Context, fork and handoff | 14 | Preserve heads, immutable nodes, pins, receipts and execution switching. |
+| Event audit and other diagnostics | 6 | Preserve event DAG, explicit context/decision captures, harness and collision diagnostics. Other diagnostic products remain candidates for separate evaluation. |
+| Inference and model routing | 11 | Preserve physical provider identity, admission, settlement, usage and route policy; metrics remain a derived projection. |
+| Tools and artifacts | 8 | Preserve uncertain-effect recovery, durable reference edges, upload leases, reservations and sealed bytes. |
+| Workspace, agents, Edge and messaging | 9 | Preserve selected provider ownership, dispatch and message coordination. |
+| MCP and skills | 11 | Preserve installed capabilities, credentials and version/evaluation journeys. MCP discovery remains a projection. |
+| Plan, session state and semantic reads | 6 | Preserve actual authoring gates, owner state and read observations; Work is not an automatic replacement for these callers. |
+| Quotas, bootstrap and maintenance | 7 | Preserve admission limits, schema ownership and bounded maintenance progress. |
+| Work roots, revisions, decisions and operations | 25 | Preserve branches, evidence, ordering, recovery and cross-Session operations; do not replace sequence high-water marks with retained-row MAX. |
+| Work runtime-event delivery | 2 | Preserve the bounded outbox, coverage floor and projection cursor. |
+| Work saved-progress capture | 1 | Preserve real capture, package/download and artifact/Context retention. |
+
+The removed product chains are prompt hash-diff diagnostics (two tables),
+legacy database-versioning HTTP checkpoints (one), Work-specific patch
+export/application/commit (three), and persisted Context manifest diagnostics
+(two), plus the two duplicate Work representations described above. No new
+projection, operation store, background worker or process cache replaces them.
+
+Run projection drops two diagnostic SQL reads; Session state drops those two
+plus one or two latest-manifest reads. Trace-enabled writes no longer maintain
+those diagnostic histories. Production defaults already disabled these writes,
+so this does not imply a write reduction on every default production exchange.
+Actual provider usage/cache facts and explicit full captures remain independent.
+
+The diagnostic-only artifact manifest counter is removed with its sole writer.
+Artifacts protected only by that counter now become eligible at their original
+retention deadline. All generic durable reference kinds, state/citation counts,
+byte-content references and upload protocols retain their existing transactions.
+
+This is a fresh empty database and same-version deployment contract. There is
+no new schema marker, migration, compatibility API or old-data cleanup. Strict
+request-context JSON decoding is not promised for historical payloads. Existing
+engine snapshots and in-flight old Git operations are not reconciled by the new
+build; stop old workers before handing their workspaces to a new deployment.
+
 ## MatrixOne role
 
 MatrixOne is the platform state store and analytic substrate. It should support:

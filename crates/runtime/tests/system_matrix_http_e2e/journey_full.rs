@@ -440,36 +440,6 @@ pub async fn run_product_matrix_full_journey(
         "manual event missing in list: {ev_sess}"
     );
 
-    let (st_dv_chain, dv_chain) = get_json(
-        app,
-        &format!("/data-versioning/lineage/{manual_event_id}/chain"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_dv_chain,
-        StatusCode::OK,
-        "data-versioning lineage chain: {dv_chain}"
-    );
-    assert!(
-        dv_chain.as_array().is_some_and(|a| !a.is_empty()),
-        "expected non-empty lineage for manual event: {dv_chain}"
-    );
-
-    let (st_dv_up, dv_up) = get_json(
-        app,
-        &format!("/data-versioning/lineage/{manual_event_id}/upstream"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_dv_up,
-        StatusCode::OK,
-        "data-versioning upstream lineage: {dv_up}"
-    );
-
     let (st_ctx, ctx_j) = post_json(
         app,
         "/context",
@@ -756,18 +726,6 @@ pub async fn run_product_matrix_full_journey(
 
     let (st_runs, runs) = get_json(app, "/runs", Some(auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
-
-    let (st_cpl, cpl_j) =
-        get_json(app, "/data-versioning/checkpoints", Some(auth_header), &[]).await;
-    assert_eq!(
-        st_cpl,
-        StatusCode::OK,
-        "list checkpoints (read-only): {cpl_j}"
-    );
-    assert!(
-        cpl_j.is_array(),
-        "checkpoints list should be a JSON array: {cpl_j}"
-    );
 
     let (retired_status, _) = get_json(app, "/sandbox", Some(auth_header), &[]).await;
     assert_eq!(retired_status, StatusCode::NOT_FOUND);

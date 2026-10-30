@@ -6,9 +6,8 @@ use sqlx::{MySql, QueryBuilder, Row, query};
 use astra_core::canonical_names::{metadata_duration_ms, metadata_tool_name};
 use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_services::observation_capture::{
-    DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    all_agent_event_rows_were_inserted, canonical_observation_payload_hash, classify_capture,
-    record_observation_collisions,
+    DurableCaptureOutcome, ObservationCollisionReceipt, all_agent_event_rows_were_inserted,
+    canonical_agent_event_payload_hash, classify_capture, record_observation_collisions,
 };
 use astra_turn_core::contracts::TurnAuxiliaryEventRecord;
 use astra_turn_core::trace_event::TraceEvent;
@@ -196,7 +195,6 @@ pub(crate) async fn classify_agent_event_capture_attempts(
                 attempted_payload_hash,
             } => Some(ObservationCollisionReceipt {
                 user_id: attempt.user_id,
-                domain: ObservationPayloadDomain::AgentEvent,
                 identity_id: attempt.event_id,
                 session_id: attempt.session_id,
                 stored_payload_hash,
@@ -265,7 +263,7 @@ fn persisted_token_usage_json(
 }
 
 fn hash_agent_event_payload(payload: serde_json::Value) -> String {
-    canonical_observation_payload_hash(ObservationPayloadDomain::AgentEvent, &payload)
+    canonical_agent_event_payload_hash(&payload)
 }
 
 /// Runtime trace identities carry the complete producer envelope. Journal
@@ -468,9 +466,7 @@ mod tests {
         unique_trace_event_indices,
     };
     use astra_core::matrixone_statement_with_null_shape;
-    use astra_services::observation_capture::{
-        ObservationPayloadDomain, canonical_observation_payload_hash,
-    };
+    use astra_services::observation_capture::canonical_agent_event_payload_hash;
     use astra_turn_core::trace_event::TraceEvent;
 
     #[tokio::test]
@@ -737,10 +733,7 @@ mod tests {
 
         assert_eq!(
             trace_event_payload_hash(&event).unwrap(),
-            canonical_observation_payload_hash(
-                ObservationPayloadDomain::AgentEvent,
-                &serde_json::to_value(&event).unwrap(),
-            )
+            canonical_agent_event_payload_hash(&serde_json::to_value(&event).unwrap(),)
         );
     }
 

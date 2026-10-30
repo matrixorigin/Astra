@@ -626,7 +626,7 @@ impl ServerSkillSubRunExecutor {
         self.apply_execution_binding_snapshot(&mut executor);
         executor.set_invocation_ledger(invocation_ledger);
         if let Some(pool) = &self.shared_pool {
-            executor.set_context_manifest_pool(pool.clone());
+            executor.set_service_pool(pool.clone());
         }
         Ok(executor)
     }
@@ -1120,8 +1120,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             current_session_id: Some(self.session_id.clone()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: Some(parent_owner_generation),
-            context_manifest_user_id: Some(self.user_id.clone()),
-            context_manifest_model_name: effective_model.clone(),
+            owner_user_id: Some(self.user_id.clone()),
+            policy_model_name: effective_model.clone(),
             recursion_depth: child_recursion_depth,
             max_turns: initial_turns,
             remaining_turns: initial_turns,

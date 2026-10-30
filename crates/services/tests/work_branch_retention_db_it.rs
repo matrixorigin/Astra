@@ -556,39 +556,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
         reconciled.phase,
         astra_services::work::WorkBranchDeletionPhase::BranchCleanup
     );
-    let patch_commit_operation_id = common::id("patch-commit");
-    sqlx::query(
-        "INSERT INTO work_patch_commit_operations
-         (owner_id, work_id, operation_id, request_id, request_digest,
-          patch_artifact_id, source_branch_id, target_branch_id,
-          target_branch_revision, target_graph_revision,
-          target_subject_record_revision, subject_ref, base_subject_revision,
-          result_subject_revision, payload_hash, commit_message,
-          commit_author_name, commit_author_email, provider_ref,
-          policy_decision_ref, operation_state, operation_phase, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 'aborted', 'complete', NOW(6))",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .bind(&patch_commit_operation_id)
-    .bind(common::id("patch-commit-request"))
-    .bind("0".repeat(64))
-    .bind(common::id("patch-artifact"))
-    .bind(&branch_id)
-    .bind(&branch_id)
-    .bind("workspace/branch-delete")
-    .bind(format!("sha256:{}", "a".repeat(64)))
-    .bind(format!("sha256:{}", "b".repeat(64)))
-    .bind(format!("sha256:{}", "c".repeat(64)))
-    .bind("Commit reviewed changes")
-    .bind("Astra Test")
-    .bind("astra@example.test")
-    .bind("server-git-worktree-commit-v1")
-    .bind(common::id("patch-commit-policy"))
-    .execute(pool.get())
-    .await
-    .expect("insert branch-owned patch commit history");
     let settled_attempt_id = common::id("settled-attempt");
     sqlx::query(
         "INSERT INTO work_item_attempts
@@ -660,9 +627,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                 (SELECT COUNT(*) FROM work_proposal_sequences p
                  WHERE p.owner_id = w.owner_id AND p.work_id = w.work_id
                    AND p.branch_id = ?) AS proposal_sequence_rows,
-                (SELECT COUNT(*) FROM work_patch_commit_operations c
-                 WHERE c.owner_id = w.owner_id AND c.work_id = w.work_id
-                   AND ? IN (c.source_branch_id, c.target_branch_id)) AS patch_commit_rows,
                 (SELECT COUNT(*) FROM work_item_attempts s
                  WHERE s.owner_id = w.owner_id AND s.work_id = w.work_id
                    AND s.branch_id = ?) AS settlement_rows,
@@ -671,7 +635,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                    AND c.branch_id = ?) AS terminal_cut_rows
          FROM works w WHERE w.owner_id = ? AND w.work_id = ?",
     )
-    .bind(&branch_id)
     .bind(&branch_id)
     .bind(&branch_id)
     .bind(&branch_id)
@@ -694,7 +657,6 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             .unwrap(),
         0
     );
-    assert_eq!(terminal.try_get::<i64, _>("patch_commit_rows").unwrap(), 0);
     assert_eq!(terminal.try_get::<i64, _>("settlement_rows").unwrap(), 0);
     assert_eq!(terminal.try_get::<i64, _>("terminal_cut_rows").unwrap(), 0);
     assert_eq!(

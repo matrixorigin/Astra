@@ -132,8 +132,8 @@
           "evidence": [
             {"kind": "source", "path": "crates/services/src/work/catalog_repository.rs", "claim": "bounded Now catalog and attention projection exist"},
             {"kind": "source", "path": "crates/services/src/work/control_operation.rs", "claim": "branch control is a durable operation"},
-            {"kind": "source", "path": "crates/services/src/work/patch_materialization.rs", "claim": "exact-base patch materialization is durable"},
-            {"kind": "source", "path": "crates/services/src/work/patch_commit.rs", "claim": "reviewed patch commit is durable"}
+            {"kind": "source", "path": "crates/services/src/work/branch_deletion_operation.rs", "claim": "branch deletion fences Session writers and reconciles lineage"},
+            {"kind": "source", "path": "crates/services/src/work/recovery_point.rs", "claim": "saved-progress capture retains canonical Context and artifact references"}
           ],
           "gaps": ["single remote/embedded domain suite is absent", "GitHub PR delivery lacks an end-to-end capability and permission journey gate", "archive/delete/fence/GC destructive matrix is not one release proof"]
         },

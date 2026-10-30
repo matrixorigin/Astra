@@ -5096,12 +5096,13 @@ mod tests {
         );
         let base = spawn_test_server(app).await;
         let (ledger, persistence) = test_ledger(&base);
-        let caller = tokio::spawn(async move {
+        // Client/TLS initialization is fixture setup, outside the provider-start window.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let mut caller = tokio::spawn(async move {
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
             ledger
                 .execute_nonstream(
                     &client,
@@ -5113,7 +5114,15 @@ mod tests {
         });
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            provider_started.notified(),
+            async {
+                tokio::select! {
+                    _ = provider_started.notified() => {},
+                    result = &mut caller => {
+                        let error = result.expect("caller task completed").into_result().expect_err("caller must not finish before provider delivery");
+                        panic!("caller ended before provider delivery: {error}");
+                    }
+                }
+            },
         )
         .await
         .expect("provider delivery must start before the caller is dropped");

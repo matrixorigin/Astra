@@ -501,10 +501,6 @@ describe("AstraClient — Runs", () => {
       total_prompt_tokens: 1,
       total_completion_tokens: 2,
       total_tool_calls: 3,
-      observability: {
-        observability_available: true,
-        prompt_request_count: 0,
-      },
       recent_events: [
         { type: "tool_call_start", call_id: "call-1", tool: "bash" },
       ],

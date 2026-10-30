@@ -611,9 +611,8 @@ impl EventService for DatabaseEventService {
         } else {
             serde_json::Value::String(content.clone())
         };
-        let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
-            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
-            &serde_json::json!({
+        let payload_hash =
+            crate::observation_capture::canonical_agent_event_payload_hash(&serde_json::json!({
                 "session_id": session_id,
                 "user_id": user_id,
                 "event_type": event_type,
@@ -624,8 +623,7 @@ impl EventService for DatabaseEventService {
                 "parent_event_ids": parent_event_ids,
                 "causal_chain_id": causal_chain_id,
                 "metadata": metadata.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
-            }),
-        );
+            }));
         let sync_outbox_ingestion = ingestion_source == EventIngestionSource::SyncOutbox;
         let verified_sync_payload_hash = verified_sync_outbox_payload_hash_for_source(
             ingestion_source,
@@ -691,7 +689,6 @@ impl EventService for DatabaseEventService {
                     &mut tx,
                     &[crate::observation_capture::ObservationCollisionReceipt {
                         user_id: &user_id,
-                        domain: crate::observation_capture::ObservationPayloadDomain::AgentEvent,
                         identity_id: existing_id,
                         session_id: &session_id,
                         stored_payload_hash: &stored_hash,
@@ -807,8 +804,6 @@ impl EventService for DatabaseEventService {
                         &mut tx,
                         &[crate::observation_capture::ObservationCollisionReceipt {
                             user_id: &user_id,
-                            domain:
-                                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
                             identity_id: &event_id,
                             session_id: &session_id,
                             stored_payload_hash: &stored_hash,

@@ -735,7 +735,7 @@ pub async fn bind_server_workspace(
         .await
         .expect("admit fixture run");
     state.current_run_owner_generation = Some(authority.owner_generation);
-    state.context_manifest_user_id = Some("provider-fixture-user".into());
+    state.owner_user_id = Some("provider-fixture-user".into());
     state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared_root(
         crate::orchestration::PermissionMode::Auto,
     ));

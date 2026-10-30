@@ -154,15 +154,6 @@ const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
     },
 ];
 
-const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[SessionDeleteStatement {
-    label: "context_manifest_items",
-    sql: "DELETE FROM context_manifest_items
-             WHERE (user_id, manifest_id) IN (
-                 SELECT user_id, manifest_id FROM context_manifests
-                 WHERE session_id = ? AND user_id = ?
-             )",
-}];
-
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "agent_session_memory_work",
@@ -243,10 +234,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
     },
     SessionDeleteStatement {
-        label: "context_manifests",
-        sql: "DELETE FROM context_manifests WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "observation_identity_collisions",
         sql: "DELETE FROM observation_identity_collisions WHERE session_id = ? AND user_id = ?",
     },
@@ -261,18 +248,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "tool_invocation_archive_chunks",
         sql: "DELETE FROM tool_invocation_archive_chunks WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "work_patch_commit_operations",
-        sql: "DELETE FROM work_patch_commit_operations WHERE EXISTS (SELECT 1 FROM work_branches WHERE session_id = ? AND owner_id = ? AND work_branches.owner_id = work_patch_commit_operations.owner_id AND work_branches.work_id = work_patch_commit_operations.work_id AND work_branches.branch_id IN (work_patch_commit_operations.source_branch_id, work_patch_commit_operations.target_branch_id))",
-    },
-    SessionDeleteStatement {
-        label: "work_patch_materialization_operations",
-        sql: "DELETE FROM work_patch_materialization_operations WHERE EXISTS (SELECT 1 FROM work_branches WHERE session_id = ? AND owner_id = ? AND work_branches.owner_id = work_patch_materialization_operations.owner_id AND work_branches.work_id = work_patch_materialization_operations.work_id AND work_branches.branch_id IN (work_patch_materialization_operations.source_branch_id, work_patch_materialization_operations.target_branch_id))",
-    },
-    SessionDeleteStatement {
-        label: "work_patch_artifacts",
-        sql: "DELETE FROM work_patch_artifacts WHERE session_id = ? AND owner_id = ?",
     },
     SessionDeleteStatement {
         label: "session_device_lease_events",
@@ -372,20 +347,6 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: "DELETE FROM inference_routes
              WHERE session_id = ? AND user_id = ?
              ORDER BY created_at ASC, route_id ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "prompt_deltas",
-        sql: "DELETE FROM prompt_deltas
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY request_id ASC, delta_seq ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "prompt_request_records",
-        sql: "DELETE FROM prompt_request_records
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY created_at ASC, request_id ASC
              LIMIT ?",
     },
     SessionBatchDeleteStatement {
@@ -823,18 +784,6 @@ pub(crate) async fn hard_delete_session_rows(
 
     for statement in SESSION_DELETE_SESSION_ORIGIN_TABLES {
         let rows_deleted = delete_session_rows_session_user_twice(
-            tx,
-            statement.label,
-            statement.sql,
-            session_id,
-            user_id,
-        )
-        .await?;
-        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
-    }
-
-    for statement in SESSION_DELETE_DERIVED_PARENT_TABLES {
-        let rows_deleted = delete_session_rows_session_user(
             tx,
             statement.label,
             statement.sql,
@@ -1469,8 +1418,6 @@ mod tests {
                 "inference_provider_attempts",
                 "inference_routes",
                 "model_request_context_events",
-                "prompt_deltas",
-                "prompt_request_records",
             ])
         );
         for statement in statements {
@@ -1499,34 +1446,6 @@ mod tests {
             assert!(SESSION_DELETE_BATCH_LIMIT > 0);
             assert!(SESSION_DELETE_BATCH_LIMIT <= 10_000);
         };
-    }
-
-    #[test]
-    fn prompt_session_hard_delete_keeps_child_before_parent_in_batched_path() {
-        let labels = SESSION_DELETE_DIRECT_BATCH_TABLES
-            .iter()
-            .map(|statement| statement.label)
-            .collect::<Vec<_>>();
-        let child = labels
-            .iter()
-            .position(|label| *label == "prompt_deltas")
-            .expect("prompt_deltas must use batched session hard delete");
-        let parent = labels
-            .iter()
-            .position(|label| *label == "prompt_request_records")
-            .expect("prompt_request_records must use batched session hard delete");
-
-        assert!(
-            child < parent,
-            "prompt_deltas must be pruned before prompt_request_records to preserve parent-bound cleanup"
-        );
-        assert!(
-            !SESSION_DELETE_DIRECT_TABLES
-                .iter()
-                .any(|statement| statement.label == "prompt_deltas"
-                    || statement.label == "prompt_request_records"),
-            "prompt high-growth tables must not regress to unbounded direct DELETE statements"
-        );
     }
 
     #[test]
@@ -1696,7 +1615,6 @@ mod tests {
         for group in [
             SESSION_DELETE_DERIVED_FROM_AGENT_RUNS,
             SESSION_DELETE_SESSION_ORIGIN_TABLES,
-            SESSION_DELETE_DERIVED_PARENT_TABLES,
             SESSION_DELETE_DIRECT_TABLES,
             SESSION_DELETE_TERMINAL_TABLES,
             SESSION_DELETE_ARTIFACT_TABLES,
@@ -1747,21 +1665,5 @@ mod tests {
             .join(" ");
         assert!(lock_agent_runs_sql.contains("session_id = ? AND user_id = ?"));
         assert!(lock_agent_runs_sql.ends_with("ORDER BY run_id ASC FOR UPDATE"));
-    }
-
-    #[test]
-    fn context_manifest_item_delete_matches_parent_and_child_owner() {
-        let statement = SESSION_DELETE_DERIVED_PARENT_TABLES
-            .iter()
-            .find(|statement| statement.label == "context_manifest_items")
-            .expect("context manifest item delete statement");
-        let normalized = statement
-            .sql
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(normalized.contains("WHERE (user_id, manifest_id) IN"));
-        assert!(normalized.contains("SELECT user_id, manifest_id FROM context_manifests"));
-        assert!(normalized.contains("session_id = ? AND user_id = ?"));
     }
 }

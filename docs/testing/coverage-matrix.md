@@ -35,7 +35,7 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | Sandbox CRUD + DB | `journey_full` | `sandbox_contract` |
 | Triggers + fire + delete + DB | `journey_full` | `triggers_contract` |
 | Marketplace probe | `journey_full` | `marketplace_contract` |
-| Data versioning lineage | `journey_full` | `data_versioning_contract` |
+| Retired data-versioning HTTP operations | `http_contract` | `retired_database_mutation_routes_cannot_execute_through_http` |
 | `GET /models` (authenticated paginated catalog) | `journey_full` + `e2e_matrix_models` | cursor continuation, global total, revision stability |
 | Models admin CRUD + `infra_llm_models` | `journey_extended::run_models_admin_crud_with_db` (`provider: mock`, `grant_astra_admin_role`) | `model_crud_contract` |
 | `GET /admin/tokens` (403 → grant `astra_admin` → 200 array) | `e2e_matrix_saas_admin_tokens_rbac_smoke` | — |

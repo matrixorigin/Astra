@@ -696,7 +696,7 @@ mod tests {
             .await
             .expect("independent pool");
         closed_pool.close().await;
-        executor.set_context_manifest_pool(closed_pool);
+        executor.set_service_pool(closed_pool);
         let rejected = propose(
             &executor,
             &json!({"context_id":"context", "members":[]}),
@@ -713,7 +713,7 @@ mod tests {
             executor.work_binding.get().is_none(),
             "invalid arguments must not install authority"
         );
-        executor.set_context_manifest_pool(pool.clone());
+        executor.set_service_pool(pool.clone());
         assert!(executor.work_binding.get().is_none());
         let inspected = inspect(&executor, &json!({}), None).await;
         assert!(executor.supports_server_tool_name("inspect_work_criteria"));

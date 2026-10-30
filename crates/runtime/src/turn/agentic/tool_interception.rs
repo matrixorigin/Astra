@@ -851,7 +851,7 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let skill_work_attribution = state
         .runtime_tool_executor
         .as_deref()
-        .zip(state.context_manifest_user_id.as_deref())
+        .zip(state.owner_user_id.as_deref())
         .zip(state.current_session_id.as_deref())
         .zip(state.current_run_id.as_deref())
         .map(|(((executor, user_id), session_id), run_id)| {

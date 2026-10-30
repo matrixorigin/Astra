@@ -489,29 +489,9 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         primary_query="artifact lookup/list by user_id, session_id, artifact_id, artifact_kind, source, owner_run_id, root_run_id, access_scope, status, and retention_until",
         retention_policy="retain while artifact previews, manifest refs, state items, citations, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows",
         rebuildability="not rebuildable after content_json, metadata, cold_storage_ref, derived_from_artifact_id, and reference counters are lost",
-        merge_guidance="keep separate from context manifests and state items; artifacts own content and retention state while callers enforce owner/run visibility",
+        merge_guidance="artifacts own content and retention state; canonical references and state/citation counts protect reachability while callers enforce owner/run visibility",
         migration_owner="astra_services::storage / session_artifact_store",
         product_owner="work surface artifacts, previews, retention, delegation visibility",
-    ),
-    "prompt_request_records": TableMetadata(
-        semantic_owner="astra_services::prompt_delta",
-        state_class="durable prompt observability parent fact",
-        primary_query="latest prompt request by user_id/session_id or user_id/run_id ordered by created_at/turn/round/attempt; parent lookup by user_id/request_id",
-        retention_policy="retain with prompt_deltas while prompt diff observability for the session/run is needed; age-based cleanup uses created_at_unix_ms retention key to avoid MatrixOne DATETIME cast scans, selects parent rows only after session is inactive and run is terminal, then prunes child deltas before parent rows in bounded chunks; session hard delete prunes parent rows after child deltas in ordered bounded batches",
-        rebuildability="partially rebuildable only if the rendered prompt inputs and chunk hashes still exist",
-        merge_guidance="keep as the parent fact for prompt_deltas; do not delete child deltas independently",
-        migration_owner="astra_services::storage / prompt_delta",
-        product_owner="prompt observability, prompt diffing, context assembly diagnostics",
-    ),
-    "prompt_deltas": TableMetadata(
-        semantic_owner="astra_services::prompt_delta",
-        state_class="derived prompt delta projection",
-        primary_query="request chunk diff lookup by user_id/session_id/request_id ordered by position/delta_seq",
-        retention_policy="delete with parent prompt_request_records during age-based cleanup or session deletion; independent TTL breaks previous-request diff lineage; retention cleanup and session hard delete prune child rows before prompt_request_records in bounded batches",
-        rebuildability="rebuildable only while consecutive prompt request payloads and chunk hashes remain available",
-        merge_guidance="keep separate from prompt_request_records because chunk cardinality grows per prompt and must be pruned with its parent",
-        migration_owner="astra_services::storage / prompt_delta",
-        product_owner="prompt diffing and LLM request diagnostics",
     ),
     "tool_invocation_ledger": TableMetadata(
         semantic_owner="astra_services::tool_invocation_ledger",
@@ -693,33 +673,13 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / multi_agent::edge_dispatch",
         product_owner="edge tool dispatch and cross-pod result recovery",
     ),
-    "context_manifests": TableMetadata(
-        semantic_owner="astra_services::context_manifest::ContextManifestStore",
-        state_class="durable context manifest parent fact",
-        primary_query="manifest lookup and history by user_id, session_id, run_id, created_at, and manifest_id",
-        retention_policy="retain while context assembly diagnostics, manifest replay, and child context_manifest_items are needed; session deletion removes owner/session manifests after child items",
-        rebuildability="rebuildable only by replaying the exact context assembly inputs, ranking decisions, token budgets, and raw refs",
-        merge_guidance="keep separate from context_manifest_items; parent manifest summary and item fanout have different row cardinality and query paths",
-        migration_owner="astra_services::storage / context_manifest",
-        product_owner="LLM context assembly traceability",
-    ),
-    "context_manifest_items": TableMetadata(
-        semantic_owner="astra_services::context_manifest::ContextManifestStore",
-        state_class="durable manifest item fact",
-        primary_query="owner-scoped manifest-local item lookup/order by user_id, manifest_id, and item_order; zone filtering by user_id, manifest_id, zone, included",
-        retention_policy="delete with parent context_manifests during session deletion or manifest retention cleanup",
-        rebuildability="rebuildable only by recomputing the exact manifest assembly inputs",
-        merge_guidance="keep separate from context_manifests; item-level ordering, source refs, token budgets, and raw refs are independently queried",
-        migration_owner="astra_services::storage / context_manifest",
-        product_owner="LLM context assembly traceability",
-    ),
     "observation_identity_collisions": TableMetadata(
         semantic_owner="astra_services::observation_capture",
         state_class="bounded diagnostic aggregate",
         primary_query="one collision aggregate by user_id, identity_kind, identity_id; owner/session diagnostics by last_seen_at; bounded expiry by expires_at",
         retention_policy="fixed seven days from first collision; bounded runtime maintenance removes expired receipts and session deletion removes owner/session receipts",
         rebuildability="not reconstructable from retained successful observations; stores only hashes and identity metadata, never rejected payloads",
-        merge_guidance="keep separate from agent_events and context_manifests; rejected identity claims must not overwrite canonical observations or grow one row per attempted hash",
+        merge_guidance="keep separate from agent_events; rejected identity claims must not overwrite canonical observations or grow one row per attempted hash",
         migration_owner="astra_services::storage / observation_capture",
         product_owner="observation integrity diagnostics and runtime maintenance",
     ),
@@ -762,16 +722,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
         migration_owner="astra_services::storage / state_projection",
         product_owner="session state projection and active skill audit",
-    ),
-    "data_versioning_checkpoints": TableMetadata(
-        semantic_owner="astra_services::data_versioning::DatabaseDataVersioningService",
-        state_class="durable named data checkpoint fact",
-        primary_query="checkpoint lookup by checkpoint_id and user-scoped checkpoint_name",
-        retention_policy="retain while data versioning rollback/list APIs need named checkpoints; delete only through data versioning lifecycle, not generic schema cleanup",
-        rebuildability="not rebuildable after checkpoint identity/name and created_at audit timestamp are lost",
-        merge_guidance="do not delete as dead DDL; DatabaseDataVersioningService reads and writes this table",
-        migration_owner="astra_services::storage / data_versioning",
-        product_owner="data versioning checkpoints and rollback/list workflows",
     ),
     "sweeper_leases": TableMetadata(
         semantic_owner="runtime::server::sweeper_lease",
@@ -939,7 +889,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         primary_query="context snapshot lookup by user_id, session_id, created_at and event_id",
         retention_policy="retain with session diagnostics while prompt/context debugging, token accounting, and decision audits need captured context; session hard delete removes owner/session rows",
         rebuildability="not rebuildable after context_data, llm_request_id, llm_response_id, token stats, relevance scores, and task_type are dropped",
-        merge_guidance="keep separate from agent_events and context_manifests; ctx_snapshots store captured context payloads and token diagnostics, not timeline events or manifest item ordering",
+        merge_guidance="ctx_snapshots own explicitly captured context payloads and token diagnostics; they do not replace canonical conversation history or event audit",
         migration_owner="astra_services::storage / context diagnostics",
         product_owner="context assembly diagnostics, prompt debugging, evaluation traceability",
     ),
@@ -1122,36 +1072,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep branch subjects separate from work_branches and immutable item/graph revisions; this row owns Work's selected immutable subject while workspace/materialization owns referenced content",
         migration_owner="astra_services::work",
         product_owner="Work branch subject targeting and invalidation",
-    ),
-    "work_patch_artifacts": TableMetadata(
-        semantic_owner="astra_services::work::patches",
-        state_class="immutable Work patch artifact evidence",
-        primary_query="patch artifact by owner/work/patch_artifact_id, session, payload artifact, hash, and branch",
-        retention_policy="retain patch payload identity and hashes while materialization, commit, checks, or acceptance reference them; delete with Work evidence cleanup",
-        rebuildability="not rebuildable after patch hash, payload artifact identity, or source/target basis are lost",
-        merge_guidance="keep patch artifacts separate from patch materialization/commit operations; artifacts preserve evidence while operations own recovery and idempotency",
-        migration_owner="astra_services::work",
-        product_owner="Work patch evidence, integrity, and review",
-    ),
-    "work_patch_materialization_operations": TableMetadata(
-        semantic_owner="astra_services::work::patches",
-        state_class="durable patch materialization recovery and idempotency authority",
-        primary_query="materialization operation by owner/work/operation_id, request_id, target/source branch, phase, recovery_after, executor lease, and outcome",
-        retention_policy="retain pending and terminal operations through retries, recovery_after scheduling, conflict diagnosis, and audit; prune after patch evidence and branch cleanup",
-        rebuildability="not rebuildable during recovery because request identity, phase, expected/observed revisions, and executor fencing are authoritative",
-        merge_guidance="keep patch materialization operations separate from patch artifacts and commit operations; patch operations are the idempotency/recovery authority for each distinct lifecycle",
-        migration_owner="astra_services::work",
-        product_owner="Work patch application recovery and idempotent materialization",
-    ),
-    "work_patch_commit_operations": TableMetadata(
-        semantic_owner="astra_services::work::patches",
-        state_class="durable patch commit recovery and idempotency authority",
-        primary_query="commit operation by owner/work/operation_id, request_id, active target branch, phase, recovery_after, executor lease, and outcome",
-        retention_policy="retain pending and terminal commit operations through retry, recovery, target fencing, and audit; prune after commit evidence and branch lifecycle cleanup",
-        rebuildability="not rebuildable during recovery because request identity, target uniqueness, expected revisions, phase, and executor lease are authoritative",
-        merge_guidance="keep patch commit operations separate from materialization operations and patch artifacts; commit has its own idempotency/recovery and active-target boundary",
-        migration_owner="astra_services::work",
-        product_owner="Work patch commit recovery and target coordination",
     ),
     "work_proposal_sequences": TableMetadata(
         semantic_owner="astra_services::work::proposals",
@@ -1672,34 +1592,6 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         rationale=(
             "the obsolete source table has no current schema or runtime owner; restoring it "
             "forces runtime auth and model eligibility to maintain a second identity lookup"
-        ),
-    ),
-    ConsolidationReview(
-        candidate="data_versioning_checkpoints",
-        decision="keep",
-        current_read_paths=[
-            "crates/services/src/data_versioning.rs::get_checkpoint",
-            "crates/services/src/data_versioning.rs::list_checkpoints",
-        ],
-        current_write_paths=[
-            "crates/services/src/data_versioning.rs::create_checkpoint",
-        ],
-        user_api_impact=(
-            "data versioning rollback/list workflows depend on named checkpoint identity and created_at audit"
-        ),
-        migration_backfill=(
-            "no deletion; if the feature is retired, first remove service/API callers and DB integration tests"
-        ),
-        rollback=(
-            "checkpoint rows are not reconstructable after deletion unless an external version store "
-            "preserved equivalent identity/name/timestamp data"
-        ),
-        test_evidence=[
-            "crates/services/tests/data_versioning_db_it.rs",
-            "scripts/schema/test_schema_inventory.py::test_p1_5_consolidation_reviews_are_evidence_backed",
-        ],
-        rationale=(
-            "small table size is not evidence of redundancy; it is the durable root for rollback/list identity"
         ),
     ),
 

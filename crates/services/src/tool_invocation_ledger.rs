@@ -643,8 +643,7 @@ impl DatabaseToolInvocationLedger {
                 "expired_dispatches_unknown": expired_dispatches_unknown,
                 "active_dispatches_remaining": active_dispatches_remaining,
             });
-            let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
-                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+            let payload_hash = crate::observation_capture::canonical_agent_event_payload_hash(
                 &serde_json::json!({
                     "event_id": event_id, "session_id": session_id, "user_id": user_id,
                     "run_id": run_id, "event_type": "tool_invocation_run_reconciled",
@@ -705,8 +704,7 @@ impl DatabaseToolInvocationLedger {
                     "active_dispatches_remaining": active_dispatches_remaining,
                     "resolution": "wait_for_completion_or_lease_expiry",
                 });
-                let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
-                    crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                let payload_hash = crate::observation_capture::canonical_agent_event_payload_hash(
                     &serde_json::json!({
                         "event_id": event_id, "session_id": session_id, "user_id": user_id,
                         "run_id": run_id, "event_type": "tool_invocation_compaction_deferred",

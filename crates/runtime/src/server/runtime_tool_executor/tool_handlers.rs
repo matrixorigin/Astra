@@ -318,7 +318,7 @@ impl MemoryToolHandler {
             }
         };
         if action == astra_tools::memory_tool_contract::MemoryAction::SessionAudit {
-            let inventory = if let Some(shared_pool) = context.context_manifest_pool.as_ref() {
+            let inventory = if let Some(shared_pool) = context.service_pool.as_ref() {
                 match astra_services::session_memory_inventory::load_database_session_memory_inventory(
                     shared_pool.get(),
                     &context.user_id,
@@ -695,7 +695,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                 );
             };
             return match crate::server::explain_analyze_artifact::resolve_selector(
-                context.context_manifest_pool.as_ref(),
+                context.service_pool.as_ref(),
                 context.session_artifact_store.as_deref(),
                 engine,
                 &context.user_id,
@@ -822,7 +822,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                         Err(JudgmentUsageCoverage::SourceExcluded)
                     } else {
                         load_introspect_judgment_usage_capture(
-                            context.context_manifest_pool.as_ref(),
+                            context.service_pool.as_ref(),
                             &context.user_id,
                             &context.session_id,
                             include_semantic_execution,
@@ -831,7 +831,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     }
                 },
                 astra_services::semantic_judgment_observation::load_semantic_judgment_view(
-                    context.context_manifest_pool.as_ref(),
+                    context.service_pool.as_ref(),
                     &context.user_id,
                     &context.session_id,
                     request.source_policy,

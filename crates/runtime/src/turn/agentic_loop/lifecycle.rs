@@ -476,7 +476,7 @@ async fn wait_for_pause_control(state: &mut AgenticLoopState) -> bool {
         {
             if let Some(run_control) = state.run_control.as_ref() {
                 if let (Some(user_id), Some(run_id)) = (
-                    state.context_manifest_user_id.as_deref(),
+                    state.owner_user_id.as_deref(),
                     state.current_run_id.as_deref(),
                 ) {
                     match run_control.control_status(user_id, run_id).await {
@@ -1365,7 +1365,7 @@ pub(crate) async fn resolve_cancellation_origin(
     let provisional_origin = state.cancellation.resolved_origin;
     let (Some(run_control), Some(user_id), Some(run_id)) = (
         state.run_control.as_ref(),
-        state.context_manifest_user_id.as_deref(),
+        state.owner_user_id.as_deref(),
         state.current_run_id.as_deref(),
     ) else {
         // Without a durable origin provider, a lost lease or other local
@@ -3733,7 +3733,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         {
             if let Some(ref rc) = state.run_control {
                 if let (Some(user_id), Some(run_id)) = (
-                    state.context_manifest_user_id.as_deref(),
+                    state.owner_user_id.as_deref(),
                     state.current_run_id.as_deref(),
                 ) {
                     match rc.control_status(user_id, run_id).await {
@@ -4071,7 +4071,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if let (Some(buffer), Some(sender), Some(owner), Some(session), Some(generation)) = (
         state.turn_event_buffer.as_mut(),
         state.telemetry.trace_ingestion.clone(),
-        state.context_manifest_user_id.as_deref(),
+        state.owner_user_id.as_deref(),
         state.current_session_id.as_deref(),
         state.current_run_owner_generation,
     ) {
@@ -4298,7 +4298,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
         let strategy = state.compact_strategy;
         let session_dir = state.current_session_id.as_deref().and_then(|sid| {
-            match state.context_manifest_user_id.as_deref() {
+            match state.owner_user_id.as_deref() {
                 Some(user_id) => astra_services::OwnerScope::user(user_id).and_then(|owner| {
                     astra_services::local_session_artifact_store()
                         .session_dir_for_owner(&owner, sid)
@@ -4583,7 +4583,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.current_session_id = Some(uuid::Uuid::new_v4().to_string());
-        state.context_manifest_user_id = Some("budget-checkpoint-test".into());
+        state.owner_user_id = Some("budget-checkpoint-test".into());
         state.current_run_id = Some("same-budget-run".into());
         state.current_run_owner_generation = Some(3);
         state.max_turns = 50;
@@ -8596,7 +8596,7 @@ mod tests {
     async fn between_turn_control_status_poll_is_shared_for_cancel_and_pause_checks() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
-        state.context_manifest_user_id = Some("user-control".to_string());
+        state.owner_user_id = Some("user-control".to_string());
         state.current_run_id = Some("run-control-clean".to_string());
         let provider = Arc::new(CountingStatusRunControl::new(None));
         state.run_control = Some(provider.clone());
@@ -8617,7 +8617,7 @@ mod tests {
     async fn between_turn_cross_pod_cancel_uses_single_control_poll() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
-        state.context_manifest_user_id = Some("user-control".to_string());
+        state.owner_user_id = Some("user-control".to_string());
         state.current_run_id = Some("run-control-cancel".to_string());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         state.cancellation.flag = Some(cancel_flag.clone());
@@ -8648,7 +8648,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_user_marker_wins_over_execution_lease_loss() {
         let mut state = make_state();
-        state.context_manifest_user_id = Some("user-control".to_string());
+        state.owner_user_id = Some("user-control".to_string());
         state.current_run_id = Some("run-user-cancelled".to_string());
         state.cancellation.execution_lease_lost = Some(Arc::new(AtomicBool::new(true)));
         state.run_control = Some(Arc::new(
@@ -8666,7 +8666,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stalled_cancellation_origin_provider_is_bounded_and_unverified() {
         let mut state = make_state();
-        state.context_manifest_user_id = Some("user-control".to_string());
+        state.owner_user_id = Some("user-control".to_string());
         state.current_run_id = Some("run-stalled-origin".to_string());
         state.run_control = Some(Arc::new(
             CountingStatusRunControl::new(Some(RunControlStatus::Cancelled))
@@ -8687,7 +8687,7 @@ mod tests {
     async fn durable_user_marker_upgrades_provisional_origin_and_never_downgrades() {
         for provisional in [CancellationOrigin::Runtime, CancellationOrigin::Unverified] {
             let mut state = make_state();
-            state.context_manifest_user_id = Some("user-control".to_string());
+            state.owner_user_id = Some("user-control".to_string());
             state.current_run_id = Some("run-origin-settlement".to_string());
             let provider = Arc::new(
                 CountingStatusRunControl::new(Some(RunControlStatus::Cancelled))
@@ -8719,7 +8719,7 @@ mod tests {
         }
 
         let mut state = make_state();
-        state.context_manifest_user_id = Some("user-control".to_string());
+        state.owner_user_id = Some("user-control".to_string());
         state.current_run_id = Some("run-user-origin-monotonic".to_string());
         let provider = Arc::new(
             CountingStatusRunControl::new(Some(RunControlStatus::Cancelled))
@@ -8744,7 +8744,7 @@ mod tests {
     async fn paused_loop_uses_slow_durable_poll_but_keeps_local_cancel_fast() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
-        state.context_manifest_user_id = Some("user-control".to_string());
+        state.owner_user_id = Some("user-control".to_string());
         state.current_run_id = Some("run-control-paused".to_string());
         let pause_flag = Arc::new(AtomicBool::new(true));
         let cancel_flag = Arc::new(AtomicBool::new(false));

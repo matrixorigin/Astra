@@ -10,28 +10,19 @@ vi.mock("@/lib/work-overview", () => ({
 }));
 
 import {
-  abortWorkPatchMaterializationAction,
   abortWorkBranchControlAction,
   abortWorkBranchCreationAction,
   acquireWorkBranchControlAction,
   changeWorkBranchRetentionAction,
   compareWorkBranchesAction,
-  commitWorkPatchAction,
   createWorkBranchAction,
   deleteWorkBranchAction,
   forceTakeoverWorkBranchAction,
-  exportWorkPatchArtifactAction,
   loadArchivedWorkBranchesAction,
   loadCriteriaProposalAction,
-  loadWorkPatchArtifactsAction,
-  loadWorkPatchContentAction,
-  materializeWorkPatchAction,
   observeWorkBranchControlAction,
   observeWorkBranchCreationAction,
   observeWorkBranchDeletionAction,
-  observeWorkPatchMaterializationAction,
-  observeWorkPatchCommitAction,
-  abortWorkPatchCommitAction,
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
 } from "@/app/(workspace)/works/[workId]/actions";
@@ -79,198 +70,6 @@ const detail = {
 };
 
 beforeEach(() => vi.clearAllMocks());
-
-test("loads patch metadata and content through exact typed identities", async () => {
-  const cursor = {
-    created_at: "2026-08-02T12:00:00.000001Z",
-    patch_artifact_id: "patch-1",
-  };
-  const page = { schema_version: 1, artifacts: [], next_cursor: null };
-  const content = {
-    data: "diff --git a/a b/a\n",
-    hash: `sha256:${"a".repeat(64)}`,
-    bytes: 21,
-  };
-  const listWorkPatchArtifacts = vi.fn().mockResolvedValue(page);
-  const getWorkPatchArtifactContent = vi.fn().mockResolvedValue(content);
-  requireClient.mockResolvedValue({
-    sdk: { listWorkPatchArtifacts, getWorkPatchArtifactContent },
-  } as never);
-
-  await expect(
-    loadWorkPatchArtifactsAction({
-      workId: "work-1",
-      branchId: "branch-1",
-      before: cursor,
-    }),
-  ).resolves.toEqual({ ok: true, page });
-  expect(listWorkPatchArtifacts).toHaveBeenCalledWith("work-1", "branch-1", {
-    before: cursor,
-    limit: 10,
-  });
-  await expect(
-    loadWorkPatchContentAction({
-      workId: "work-1",
-      branchId: "branch-1",
-      patchArtifactId: "patch-1",
-    }),
-  ).resolves.toEqual({ ok: true, content });
-  expect(getWorkPatchArtifactContent).toHaveBeenCalledWith(
-    "work-1",
-    "branch-1",
-    "patch-1",
-  );
-});
-
-test("exports a patch from public branch revisions while Server owns subject authority", async () => {
-  const artifact = { schema_version: 1, patch_artifact_id: "patch-1" };
-  const exportWorkPatchArtifact = vi.fn().mockResolvedValue(artifact);
-  requireClient.mockResolvedValue({ sdk: { exportWorkPatchArtifact } } as never);
-  await expect(
-    exportWorkPatchArtifactAction({
-      workId: "work-1",
-      branchId: "branch-1",
-      requestId: "export-1",
-      expectedBranchRevision: 4,
-      expectedGraphRevision: 3,
-    }),
-  ).resolves.toEqual({ ok: true, artifact });
-  expect(exportWorkPatchArtifact).toHaveBeenCalledWith("work-1", "branch-1", {
-    requestId: "export-1",
-    expectedBranchRevision: 4,
-    expectedGraphRevision: 3,
-  });
-});
-
-test("applies and observes a patch using public target facts only", async () => {
-  const operation = {
-    schema_version: 2,
-    operation_id: "materialization-1",
-    target_branch_id: "branch-main",
-  };
-  const materializeWorkPatch = vi.fn().mockResolvedValue(operation);
-  const getWorkPatchMaterialization = vi.fn().mockResolvedValue(operation);
-  const abortWorkPatchMaterialization = vi.fn().mockResolvedValue(undefined);
-  requireClient.mockResolvedValue({
-    sdk: {
-      materializeWorkPatch,
-      getWorkPatchMaterialization,
-      abortWorkPatchMaterialization,
-    },
-  } as never);
-  const admission = {
-    workId: "work-1",
-    targetBranchId: "branch-main",
-    patchArtifactId: "patch-1",
-    requestId: "materialize-1",
-    expectedTargetBranchRevision: 7,
-    expectedTargetGraphRevision: 6,
-  };
-  await expect(materializeWorkPatchAction(admission)).resolves.toEqual({
-    ok: true,
-    operation,
-  });
-  expect(materializeWorkPatch).toHaveBeenCalledWith("work-1", "branch-main", {
-    requestId: "materialize-1",
-    patchArtifactId: "patch-1",
-    expectedTargetBranchRevision: 7,
-    expectedTargetGraphRevision: 6,
-  });
-  const identity = {
-    workId: "work-1",
-    targetBranchId: "branch-main",
-    operationId: "materialization-1",
-  };
-  await expect(observeWorkPatchMaterializationAction(identity)).resolves.toEqual({
-    ok: true,
-    operation,
-  });
-  await expect(abortWorkPatchMaterializationAction(identity)).resolves.toEqual({ ok: true });
-  expect(getWorkPatchMaterialization).toHaveBeenCalledWith(
-    "work-1",
-    "branch-main",
-    "materialization-1",
-  );
-  expect(abortWorkPatchMaterialization).toHaveBeenCalledWith(
-    "work-1",
-    "branch-main",
-    "materialization-1",
-  );
-
-  await expect(
-    materializeWorkPatchAction({
-      ...admission,
-      expectedTargetSubjectRef: "internal/ref",
-    } as never),
-  ).resolves.toMatchObject({ ok: false, status: 400, retryable: false });
-});
-
-test("commits and observes an exact reviewed patch without accepting identity authority", async () => {
-  const operation = {
-    schema_version: 1,
-    operation_id: "commit-1",
-    target_branch_id: "branch-main",
-  };
-  const commitWorkPatch = vi.fn().mockResolvedValue(operation);
-  const getWorkPatchCommit = vi.fn().mockResolvedValue(operation);
-  const abortWorkPatchCommit = vi.fn().mockResolvedValue(undefined);
-  requireClient.mockResolvedValue({
-    sdk: { commitWorkPatch, getWorkPatchCommit, abortWorkPatchCommit },
-  } as never);
-  const admission = {
-    workId: "work-1",
-    targetBranchId: "branch-main",
-    patchArtifactId: "patch-1",
-    requestId: "commit-1",
-    expectedTargetBranchRevision: 8,
-    expectedTargetGraphRevision: 6,
-    message: "Commit reviewed changes",
-  };
-  await expect(commitWorkPatchAction(admission)).resolves.toEqual({
-    ok: true,
-    operation,
-  });
-  expect(commitWorkPatch).toHaveBeenCalledWith("work-1", "branch-main", {
-    requestId: "commit-1",
-    patchArtifactId: "patch-1",
-    expectedTargetBranchRevision: 8,
-    expectedTargetGraphRevision: 6,
-    message: "Commit reviewed changes",
-  });
-  const identity = {
-    workId: "work-1",
-    targetBranchId: "branch-main",
-    operationId: "commit-1",
-  };
-  await expect(observeWorkPatchCommitAction(identity)).resolves.toEqual({
-    ok: true,
-    operation,
-  });
-  await expect(abortWorkPatchCommitAction(identity)).resolves.toEqual({ ok: true });
-  expect(getWorkPatchCommit).toHaveBeenCalledWith("work-1", "branch-main", "commit-1");
-  expect(abortWorkPatchCommit).toHaveBeenCalledWith("work-1", "branch-main", "commit-1");
-  await expect(
-    commitWorkPatchAction({ ...admission, author_email: "forged@example.test" } as never),
-  ).resolves.toMatchObject({ ok: false, status: 400, retryable: false });
-  await expect(
-    commitWorkPatchAction({ ...admission, message: "reviewed\u0085commit" }),
-  ).resolves.toMatchObject({ ok: false, status: 400, retryable: false });
-  expect(commitWorkPatch).toHaveBeenCalledTimes(1);
-});
-
-test("rejects malformed patch cursors before loading runtime state", async () => {
-  await expect(
-    loadWorkPatchArtifactsAction({
-      workId: "work-1",
-      branchId: "branch-1",
-      before: {
-        created_at: "not-a-time",
-        patch_artifact_id: "patch-1",
-      },
-    }),
-  ).resolves.toMatchObject({ ok: false, status: 400, retryable: false });
-  expect(requireClient).not.toHaveBeenCalled();
-});
 
 test("returns typed API failure metadata without exposing backend prose", async () => {
   const getWorkCriteriaProposal = vi.fn().mockRejectedValue(

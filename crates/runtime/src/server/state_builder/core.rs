@@ -128,10 +128,6 @@ pub(super) fn build_core_state(
             .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
-    .with_data_versioning_service(Arc::new(
-        DatabaseDataVersioningService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
     .with_marketplace_service(Arc::new(
         DatabaseMarketplaceService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))

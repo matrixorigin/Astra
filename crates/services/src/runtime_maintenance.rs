@@ -44,10 +44,6 @@ pub struct RuntimeMaintenanceSweepResult {
     pub model_request_context_more: bool,
     /// Expired aggregate observation-identity collision diagnostics.
     pub observation_collision_receipts_expired: u64,
-    /// Expired prompt-assembly request diagnostics removed after retention.
-    pub prompt_request_records_expired: u64,
-    /// Child prompt delta diagnostics removed before their parent requests.
-    pub prompt_deltas_expired: u64,
     /// Expired fork-retention pins released after their grace period.
     pub expired_fork_pins_released: u64,
     /// Fork records whose child session no longer exists.
@@ -119,19 +115,6 @@ pub async fn maintain_runtime_storage(
         "expire_observation_collision_receipts",
         expire_observation_collision_receipts(pool, policy.batch_limit).await,
     );
-    match crate::prompt_delta::expire_prompt_diagnostics(pool, policy.batch_limit).await {
-        Ok(expiry) => {
-            result.prompt_request_records_expired = expiry.prompt_request_records;
-            result.prompt_deltas_expired = expiry.prompt_deltas;
-        }
-        Err(error) => {
-            record_runtime_storage_maintenance(
-                &mut result.cleanup_errors,
-                "expire_prompt_diagnostics",
-                Err(error),
-            );
-        }
-    }
     result.work_branch_control_operations_expired = record_runtime_storage_maintenance(
         &mut result.cleanup_errors,
         "expire_work_branch_control_operations",
@@ -179,8 +162,6 @@ impl RuntimeMaintenanceSweepResult {
         self.explicit_delete_intents_reconciled
             .saturating_add(self.model_request_context_events_expired)
             .saturating_add(self.observation_collision_receipts_expired)
-            .saturating_add(self.prompt_request_records_expired)
-            .saturating_add(self.prompt_deltas_expired)
             .saturating_add(self.expired_fork_pins_released)
             .saturating_add(self.orphaned_forks_collected)
             .saturating_add(self.orphaned_manifests_collected)

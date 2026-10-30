@@ -3618,7 +3618,7 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let mut executor = server_executor_for_test_workspace(workspace.path(), "test-session");
-        executor.set_context_manifest_pool(pool.clone());
+        executor.set_service_pool(pool.clone());
         let shared_ids = {
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
             pipeline.run_slot_with_control(0).await;

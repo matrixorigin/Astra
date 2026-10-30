@@ -534,15 +534,6 @@ pub fn apply_edit(
             mark_trace_custom(&mut config);
             return Ok(config);
         }
-        "trace.context_assembly" => {
-            toggle_category(
-                &mut config.trace.enabled_categories,
-                TraceCategory::ContextAssembly,
-                as_bool(&new_value, id)?,
-            );
-            mark_trace_custom(&mut config);
-            return Ok(config);
-        }
         "trace.decision_explain" => {
             toggle_category(
                 &mut config.trace.enabled_categories,
@@ -610,15 +601,6 @@ pub fn apply_edit(
             toggle_category(
                 &mut config.trace.enabled_categories,
                 TraceCategory::HarnessSnapshots,
-                as_bool(&new_value, id)?,
-            );
-            mark_trace_custom(&mut config);
-            return Ok(config);
-        }
-        "trace.prompt_assembly" => {
-            toggle_category(
-                &mut config.trace.enabled_categories,
-                TraceCategory::PromptAssembly,
                 as_bool(&new_value, id)?,
             );
             mark_trace_custom(&mut config);

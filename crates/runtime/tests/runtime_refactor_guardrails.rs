@@ -337,16 +337,7 @@ async fn retired_metadata_routes_are_not_registered() {
         );
     }
     assert_ne!(
-        request_status(
-            app,
-            request(
-                "GET",
-                "/data-versioning/checkpoints",
-                headers,
-                Body::empty()
-            )
-        )
-        .await,
+        request_status(app, request("GET", "/events", headers, Body::empty())).await,
         StatusCode::NOT_FOUND
     );
 }

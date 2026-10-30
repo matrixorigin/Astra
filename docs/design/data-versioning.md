@@ -7,6 +7,16 @@ Data versioning defines how Astra makes agent decisions reproducible across chan
 
 The legacy sandbox restore endpoint is also retired: authenticated session access does not authorize restoring the configured service database. Database administration must use an explicit administrative boundary.
 
+The legacy data-versioning HTTP service and named checkpoint table are retired.
+A user-scoped record did not scope the engine snapshot: creation snapshotted the
+configured database, and the event view only filtered by the recorded timestamp.
+Run checkpoints, canonical Context, provider attempt receipts and event lineage
+remain the existing owners of execution evidence. Canonical event APIs remain;
+they do not reproduce the retired per-event ancestry traversal interface.
+Existing engine snapshots are not enumerated, restored or removed by startup.
+Execution-local SQL snapshot journals and rollback retain their independent
+CLI/Runner authorization and ownership boundaries.
+
 ## Principle
 
 Reproducibility requires versioned inputs and durable facts, not only a transcript.

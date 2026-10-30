@@ -16,7 +16,6 @@ use astra_services::runs::{
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
-    ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
     DatabaseRunStateStore, DatabaseSessionArtifactStore, SessionArtifactJsonRecord,
     SessionArtifactJsonStore,
 };
@@ -1922,43 +1921,6 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
         .await
         .expect("S14 transcript seed insert must succeed");
     }
-    DatabaseContextManifestStore::new(pool.clone())
-        .save_manifest(
-            ContextManifestWrite {
-                manifest_id: id("manifest"),
-                user_id: user_id.clone(),
-                session_id: session_id.clone(),
-                run_id: Some(run_id.clone()),
-                turn_id: format!("{run_id}:turn-1"),
-                model_provider: "openai".to_string(),
-                model_name: "gpt-5.4".to_string(),
-                context_window_tokens: 8000,
-                max_output_tokens: 512,
-                total_estimated_tokens: 321,
-                policy_version: "context_manifest_v1".to_string(),
-                tokenizer_id: Some("estimated_v1".to_string()),
-                budget_template_id: Some("budget_v1_8k".to_string()),
-                turn_intent: Some("resume".to_string()),
-                reason: "initial_turn".to_string(),
-                manifest_json: json!({"source": "e2e_joint_s14"}),
-            },
-            vec![ContextManifestItemWrite {
-                session_id: session_id.clone(),
-                item_order: 0,
-                zone: "session_anchor".to_string(),
-                source_table: "session_state_items".to_string(),
-                source_id: "anchor-1".to_string(),
-                source_hash: None,
-                included: true,
-                token_estimate: 321,
-                budget_tokens: 400,
-                reason: "initial_turn".to_string(),
-                render_mode: "summary".to_string(),
-                raw_ref: None,
-            }],
-        )
-        .await
-        .expect("S14 context manifest insert must succeed");
 
     let app = build_joint_app(pool.clone(), user_id.clone(), store);
     let (addr, handle) = spawn_tcp_router(app).await;
@@ -2019,20 +1981,6 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
                 .and_then(Value::as_str),
             Some("deadbeef"),
             "S14 bounded session state must expose workspace git head for resume/debug; state={state}"
-        );
-        assert_eq!(
-            state
-                .pointer("/latest_context_manifest/reason")
-                .and_then(Value::as_str),
-            Some("initial_turn"),
-            "S14 bounded session state must include latest context manifest summary; state={state}"
-        );
-        assert_eq!(
-            state
-                .pointer("/latest_context_manifest/total_estimated_tokens")
-                .and_then(Value::as_u64),
-            Some(321),
-            "S14 bounded session state must surface manifest token estimate; state={state}"
         );
         assert_eq!(
             state

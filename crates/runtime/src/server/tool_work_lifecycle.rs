@@ -102,7 +102,7 @@ async fn defer_pending_work_establishment(
             "inspect_work_plan",
         );
     }
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let repository = astra_services::work::DatabaseWorkRepository::new(pool);
@@ -1017,7 +1017,7 @@ pub(super) async fn execute_start_work(
             "start_work requires the exact current turn-chain identity".to_string(),
         );
     };
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let owner_id = match WorkOwnerId::parse(executor.user_id.clone()) {
@@ -1675,7 +1675,7 @@ async fn load_next_active_task(
             "start_work",
         ));
     };
-    if let Some(pool) = executor.context_manifest_pool.clone() {
+    if let Some(pool) = executor.service_pool.clone() {
         if let Err(error) = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
             .reconcile_primary_attempt_carriers(
                 binding.owner_id.as_str(),
@@ -1741,7 +1741,7 @@ async fn restore_primary_attempt_from_selection(
             return Ok(None);
         }
         let pool = executor
-            .context_manifest_pool
+            .service_pool
             .clone()
             .ok_or_else(|| "canonical Work storage is unavailable".to_string())?;
         let taken_over = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
@@ -1873,7 +1873,7 @@ pub(super) async fn execute_run_next_work_item(
         Err(error) => return error,
     };
     if matches!(selected, WorkTaskExecutionNext::Complete) {
-        let Some(pool) = executor.context_manifest_pool.clone() else {
+        let Some(pool) = executor.service_pool.clone() else {
             return ToolResult::error("canonical Work storage is unavailable".to_string());
         };
         if let Err(error) = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool)
@@ -1958,7 +1958,7 @@ pub(super) async fn execute_run_next_work_item(
         Ok(attempt) => attempt,
         Err(error) => return ToolResult::error(format!("invalid Work attempt identity: {error}")),
     };
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let service = astra_services::work::DatabaseWorkAttemptSettlementService::new(pool);
@@ -2039,7 +2039,7 @@ pub(super) async fn execute_settle_work_item(
                 return ToolResult::error(format!("Invalid settle_work_item input: {error}"));
             }
         };
-    let Some(pool) = executor.context_manifest_pool.clone() else {
+    let Some(pool) = executor.service_pool.clone() else {
         return ToolResult::error("canonical Work storage is unavailable".to_string());
     };
     let active = executor.active_primary_work_attempt();
@@ -2522,7 +2522,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
-        executor.set_context_manifest_pool(pool);
+        executor.set_service_pool(pool);
         executor
     }
 
@@ -3131,7 +3131,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
-        executor.set_context_manifest_pool(pool.clone());
+        executor.set_service_pool(pool.clone());
         executor
             .bind_work_establishment_operation("physical-1", &request.operation_id)
             .expect("trusted recovery provenance");
@@ -3329,7 +3329,7 @@ mod tests {
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             true, false,
         ));
-        deferred_executor.set_context_manifest_pool(pool.clone());
+        deferred_executor.set_service_pool(pool.clone());
         deferred_executor
             .bind_work_establishment_defer("physical-defer", &deferred_request.operation_id)
             .expect("typed defer provenance");

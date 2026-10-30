@@ -7,6 +7,9 @@
 //! command-name allowlist.  It is deliberately best-effort: an unavailable or
 //! over-large fingerprint yields `None`, never a positive mutation claim.
 
+mod git;
+pub use git::{GitWorkspaceObservationError, observe_git_worktree_revision};
+
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};

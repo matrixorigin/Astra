@@ -1233,3 +1233,101 @@ async fn skill_turns_preserve_results_without_a_selection_projection() {
         b.ctx.close().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; this process owns SQL capture"]
+async fn concurrent_run_projections_preserve_one_hundred_session_identities() {
+    require_system_e2e_env();
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .expect("this integration binary owns its SQL subscriber");
+    let b = bootstrap().await;
+    let prefix = format!("poll-{}-", uuid::Uuid::new_v4());
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..100_u32 {
+        let session_id = format!("{prefix}s{index}");
+        let run_id = format!("{prefix}r{index}");
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, status) VALUES (?, ?, 'active')",
+        )
+        .bind(&session_id)
+        .bind(&b.ctx.user_id)
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
+              status, execution_mode, owner_pod_id, owner_lease_expires_at,
+              run_generation, last_event_idx, total_prompt_tokens, total_completion_tokens,
+              total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', 'poll-fixture',
+                     TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1, ?, 0, 0, NOW(6), NOW(6))",
+        )
+        .bind(&run_id)
+        .bind(&b.ctx.user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind(index + 1)
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
+    }
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    for index in 0..100_u32 {
+        let app = b.ctx.app.clone();
+        let auth = b.auth_header.clone();
+        let session_id = format!("{prefix}s{index}");
+        let run_id = format!("{prefix}r{index}");
+        tasks.spawn(async move {
+            let (status, body) = get_json(
+                &app,
+                &format!("/chat/runs/{run_id}/projection?recent_limit=1"),
+                Some(&auth),
+                &[],
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(body["run_id"], run_id);
+            assert_eq!(body["session_id"], session_id);
+            assert_eq!(body["status"], "running");
+            assert_eq!(body["total_prompt_tokens"], index + 1);
+            assert!(body["recent_events"].as_array().unwrap().is_empty());
+            assert!(body.get("observability").is_none());
+        });
+    }
+    let mut completed = 0;
+    while let Some(result) = tasks.join_next().await {
+        result.expect("independent public projection read");
+        completed += 1;
+    }
+    assert_eq!(completed, 100);
+    let samples = capture.0.lock().unwrap().take().unwrap();
+    assert!(
+        !samples.is_empty(),
+        "the query observer must cover real database reads"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|sample| !sample.sql.contains("prompt_request_records")
+                && !sample.sql.contains("prompt_deltas"))
+    );
+    let (rows, tokens): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), CAST(SUM(total_prompt_tokens) AS SIGNED) FROM agent_runs WHERE user_id = ? AND run_id LIKE ?",
+    ).bind(&b.ctx.user_id).bind(format!("{prefix}%")).fetch_one(&b.ctx.pool).await.unwrap();
+    assert_eq!((rows, tokens), (100, 5050));
+    for sql in [
+        "DELETE FROM agent_runs WHERE user_id = ? AND run_id LIKE ?",
+        "DELETE FROM agent_sessions WHERE user_id = ? AND session_id LIKE ?",
+    ] {
+        sqlx::query(sql)
+            .bind(&b.ctx.user_id)
+            .bind(format!("{prefix}%"))
+            .execute(&b.ctx.pool)
+            .await
+            .unwrap();
+    }
+    b.ctx.close().await;
+}

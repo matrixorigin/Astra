@@ -109,7 +109,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Chat (server-owned SSE) | P0 | `POST /chat/stream` | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_chat_stream_session_info`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order callback journeys |
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
 | Platform | P1 | `GET /platform/snapshot` | — | `product_matrix_*` |
-| Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
+| Data versioning | Retired | routes return 404 | no checkpoint table | `http_contract::retired_database_mutation_routes_cannot_execute_through_http` |
 | Admin | P1 | `GET /admin/tokens` | — | `e2e_matrix_saas_admin_tokens_rbac_smoke` |
 | WebSocket | — | `/chat/ws` | — | — |
 | Delegation | P1 | `GET .../delegations`, `POST .../delegate` (validation-only path) | **In-memory** tracker | `e2e_matrix_delegate_http_boundaries` |
@@ -137,7 +137,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 
-Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **data-versioning** (`/data-versioning`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
 ## Explicit coverage gaps
 

@@ -59,8 +59,13 @@ switch between settled Runs. A TUI-created Work is discoverable in Web, remote
 Run/activity freshness is explicit, branch-controller takeover is separate from
 Edge movement, and an Edge switch requires a clean, pre-materialized target
 workspace. The provider-switch path does not migrate an active Run or
-automatically copy workspace changes. Automatic patch materialization and
-Server Run-owner recovery require separate contracts and release gates.
+automatically copy workspace changes. The optional Work patch export, review,
+exact-base application and reviewed-commit product is retired, including its
+operation receipts and recovery workers. Ordinary authorized Git/Runner tools
+remain available without promising equivalent automatic transfer or reviewed
+commit guarantees. Work branch subjects still use the existing lease-protected
+read-only worktree observation after execution. Server Run-owner recovery
+requires its separate contract and release gate.
 
 ### 1. Start or promote once
 

@@ -108,7 +108,7 @@ pub(crate) fn refresh_work_evidence_context(state: &mut AgenticLoopState) {
     state.clear_volatile(VolatileKind::WorkEvidenceContext);
     let (Some(executor), Some(user), Some(session), Some(run)) = (
         state.runtime_tool_executor.as_deref(),
-        state.context_manifest_user_id.as_deref(),
+        state.owner_user_id.as_deref(),
         state.current_session_id.as_deref(),
         state.current_run_id.as_deref(),
     ) else {

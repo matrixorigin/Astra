@@ -44,10 +44,6 @@ mod graph;
 mod graph_repository;
 mod observation;
 mod observation_repository;
-mod patch_artifact;
-mod patch_artifact_repository;
-mod patch_commit;
-mod patch_materialization;
 mod plan_context;
 mod plan_context_repository;
 mod proposal;
@@ -167,35 +163,6 @@ pub use observation::{
     WorkGoalOverview, WorkGraphSummary, WorkObservationCauseCode, WorkObservationCursor,
     WorkObservationFactCode, WorkObservationFinding, WorkObservationQuery, WorkObservationReport,
     WorkObservationSatisfactionEvidenceRef, WorkOverview, WorkRetentionState,
-};
-pub use patch_artifact::{
-    NewWorkPatchArtifact, WORK_PATCH_ARTIFACT_MAX_BYTES, WORK_PATCH_ARTIFACT_MAX_LINES,
-    WORK_PATCH_ARTIFACT_PAGE_MAX_ITEMS, WORK_PATCH_ARTIFACT_SCHEMA_VERSION, WorkPatchArtifact,
-    WorkPatchArtifactBasisResource, WorkPatchArtifactContent, WorkPatchArtifactCursor,
-    WorkPatchArtifactId, WorkPatchArtifactPage, WorkPatchArtifactPageLimit, WorkPatchArtifactQuery,
-    WorkPatchFormat, WorkProviderInvocationRef, work_patch_line_count,
-};
-pub use patch_commit::{
-    DatabaseWorkPatchCommitService, SERVER_GIT_WORKTREE_COMMIT_PROVIDER_REF,
-    WORK_PATCH_COMMIT_PAGE_MAX_ITEMS, WORK_PATCH_COMMIT_SCHEMA_VERSION, WorkPatchCommitCommitted,
-    WorkPatchCommitConflict, WorkPatchCommitCursor, WorkPatchCommitError, WorkPatchCommitFailure,
-    WorkPatchCommitFailureCode, WorkPatchCommitId, WorkPatchCommitOperation, WorkPatchCommitPage,
-    WorkPatchCommitPageLimit, WorkPatchCommitPhase, WorkPatchCommitProviderRef,
-    WorkPatchCommitQuery, WorkPatchCommitRecoveryItem, WorkPatchCommitRequest,
-    WorkPatchCommitState,
-};
-pub use patch_materialization::{
-    DatabaseWorkPatchMaterializationService, SERVER_GIT_WORKTREE_MATERIALIZATION_PROVIDER_REF,
-    WORK_PATCH_MATERIALIZATION_PAGE_MAX_ITEMS, WORK_PATCH_MATERIALIZATION_SCHEMA_VERSION,
-    WorkMaterializationProviderRef, WorkPatchMaterializationApplied,
-    WorkPatchMaterializationApplyOutcome, WorkPatchMaterializationConflict,
-    WorkPatchMaterializationCursor, WorkPatchMaterializationError,
-    WorkPatchMaterializationFailureCode, WorkPatchMaterializationId,
-    WorkPatchMaterializationNotApplied, WorkPatchMaterializationOperation,
-    WorkPatchMaterializationPage, WorkPatchMaterializationPageLimit, WorkPatchMaterializationPhase,
-    WorkPatchMaterializationQuery, WorkPatchMaterializationRecoveryItem,
-    WorkPatchMaterializationRequest, WorkPatchMaterializationState,
-    WorkPatchMaterializationVerificationOutcome,
 };
 pub use plan_context::{
     WORK_TASK_GRAPH_DEPENDENCY_PAGE_MAX_ITEMS, WORK_TASK_GRAPH_ITEM_PAGE_MAX_ITEMS,
@@ -639,210 +606,6 @@ pub(crate) const WORK_BRANCH_SUBJECTS_CREATE_SQL: &str =
     CONSTRAINT chk_work_branch_subject_graph_revision CHECK (graph_revision > 0)
 )";
 
-/// Immutable Work-level binding for a provider-produced patch payload.
-/// Patch bytes remain in the bounded session artifact store; this table holds
-/// only exact source/target identity, digest, invocation, and reachability.
-pub(crate) const WORK_PATCH_ARTIFACTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_patch_artifacts (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    branch_id VARCHAR(64) NOT NULL,
-    patch_artifact_id VARCHAR(64) NOT NULL,
-    session_id VARCHAR(64) NOT NULL,
-    payload_artifact_id VARCHAR(64) NOT NULL,
-    source_branch_revision BIGINT NOT NULL,
-    source_graph_revision BIGINT NOT NULL,
-    source_subject_record_revision BIGINT NOT NULL,
-    subject_ref VARCHAR(256) NOT NULL,
-    base_subject_revision CHAR(71) NOT NULL,
-    result_subject_revision CHAR(71) NOT NULL,
-    payload_hash CHAR(71) NOT NULL,
-    payload_bytes BIGINT NOT NULL,
-    patch_format VARCHAR(32) NOT NULL,
-    provider_invocation_ref VARCHAR(128) NOT NULL,
-    source_ref VARCHAR(256) NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, patch_artifact_id),
-    UNIQUE KEY uq_work_patch_payload
-      (owner_id, session_id, payload_artifact_id),
-    INDEX idx_work_patch_branch_created
-      (owner_id, work_id, branch_id, created_at, patch_artifact_id),
-    CONSTRAINT chk_work_patch_branch_revision CHECK (source_branch_revision > 0),
-    CONSTRAINT chk_work_patch_graph_revision CHECK (source_graph_revision > 0),
-    CONSTRAINT chk_work_patch_subject_revision CHECK (source_subject_record_revision > 0),
-    CONSTRAINT chk_work_patch_payload_bytes CHECK (
-      payload_bytes >= 0 AND payload_bytes <= 16777216
-    ),
-    CONSTRAINT chk_work_patch_format CHECK (patch_format = 'unified_diff_v1'),
-    CONSTRAINT chk_work_patch_changes_subject CHECK (
-      base_subject_revision <> result_subject_revision
-    )
-)";
-
-pub(crate) const WORK_PATCH_MATERIALIZATION_OPERATIONS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_patch_materialization_operations (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    operation_id VARCHAR(64) NOT NULL,
-    request_id VARCHAR(256) NOT NULL,
-    request_digest CHAR(64) NOT NULL,
-    patch_artifact_id VARCHAR(64) NOT NULL,
-    source_branch_id VARCHAR(64) NOT NULL,
-    target_branch_id VARCHAR(64) NOT NULL,
-    target_branch_revision BIGINT NOT NULL,
-    target_graph_revision BIGINT NOT NULL,
-    target_subject_record_revision BIGINT NOT NULL,
-    subject_ref VARCHAR(256) NOT NULL,
-    base_subject_revision CHAR(71) NOT NULL,
-    result_subject_revision CHAR(71) NOT NULL,
-    payload_hash CHAR(71) NOT NULL,
-    provider_ref VARCHAR(128) NOT NULL,
-    policy_decision_ref VARCHAR(256) NOT NULL,
-    operation_state VARCHAR(32) NOT NULL,
-    operation_phase VARCHAR(32) NOT NULL,
-    executor_token VARCHAR(128) NULL,
-    executor_lease_expires_at DATETIME(6) NULL,
-    recovery_after DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    apply_invocation_ref VARCHAR(128) NULL,
-    observed_subject_revision CHAR(71) NULL,
-    apply_outcome VARCHAR(32) NULL,
-    failure_code VARCHAR(32) NULL,
-    verification_evidence_hash CHAR(71) NULL,
-    verification_outcome VARCHAR(32) NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    completed_at DATETIME(6) NULL,
-    PRIMARY KEY (owner_id, work_id, operation_id),
-    UNIQUE KEY uq_work_patch_materialization_request (owner_id, work_id, request_id),
-    INDEX idx_work_patch_materialization_pending
-      (operation_state, operation_phase, executor_lease_expires_at, created_at, operation_id),
-    INDEX idx_work_patch_materialization_recovery
-      (operation_state, recovery_after, operation_id),
-    INDEX idx_work_patch_materialization_target
-      (owner_id, work_id, target_branch_id, operation_state, created_at, operation_id),
-    INDEX idx_work_patch_materialization_source_history
-      (owner_id, work_id, target_branch_id, source_branch_id, created_at, operation_id),
-    CONSTRAINT chk_work_patch_materialization_branch_revision CHECK
-      (target_branch_revision > 0),
-    CONSTRAINT chk_work_patch_materialization_graph_revision CHECK
-      (target_graph_revision > 0),
-    CONSTRAINT chk_work_patch_materialization_subject_revision CHECK
-      (target_subject_record_revision > 0),
-    CONSTRAINT chk_work_patch_materialization_state CHECK
-      (operation_state IN ('pending', 'aborted', 'succeeded', 'conflict', 'failed')),
-    CONSTRAINT chk_work_patch_materialization_phase CHECK
-      (operation_phase IN ('awaiting_dispatch', 'applying', 'reconciling', 'verifying', 'complete')),
-    CONSTRAINT chk_work_patch_materialization_terminal CHECK (
-      (operation_state = 'pending' AND operation_phase <> 'complete' AND completed_at IS NULL)
-      OR
-      (operation_state <> 'pending' AND operation_phase = 'complete' AND completed_at IS NOT NULL)
-    ),
-    CONSTRAINT chk_work_patch_materialization_executor CHECK (
-      (executor_token IS NULL AND executor_lease_expires_at IS NULL)
-      OR
-      (operation_state = 'pending' AND operation_phase IN ('applying', 'reconciling')
-       AND executor_token IS NOT NULL AND executor_lease_expires_at IS NOT NULL)
-    ),
-    CONSTRAINT chk_work_patch_materialization_apply_report CHECK (
-      (apply_invocation_ref IS NULL AND observed_subject_revision IS NULL
-       AND apply_outcome IS NULL AND failure_code IS NULL)
-      OR
-      (apply_invocation_ref IS NOT NULL AND observed_subject_revision IS NOT NULL
-       AND apply_outcome IN ('applied', 'result_mismatch', 'target_changed')
-       AND failure_code IS NULL)
-      OR
-      (apply_invocation_ref IS NOT NULL AND observed_subject_revision IS NULL
-       AND apply_outcome IS NULL AND failure_code IS NULL
-       AND operation_state = 'pending' AND operation_phase IN ('applying', 'reconciling'))
-      OR
-      (apply_invocation_ref IS NOT NULL AND observed_subject_revision IS NULL
-       AND apply_outcome = 'not_applied'
-       AND failure_code IN ('provider_unavailable', 'authorization_denied',
-                            'workspace_unavailable', 'invalid_workspace', 'patch_rejected',
-                            'invocation_cancelled', 'provider_internal')
-       AND operation_state = 'failed' AND operation_phase = 'complete')
-    ),
-    CONSTRAINT chk_work_patch_materialization_verification CHECK (
-      (verification_outcome IS NULL AND verification_evidence_hash IS NULL)
-      OR (verification_outcome = 'passed' AND verification_evidence_hash IS NOT NULL)
-      OR (verification_outcome = 'target_changed' AND verification_evidence_hash IS NULL)
-    )
-    )";
-
-pub(crate) const WORK_PATCH_COMMIT_OPERATIONS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS work_patch_commit_operations (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    operation_id VARCHAR(64) NOT NULL,
-    request_id VARCHAR(256) NOT NULL,
-    request_digest CHAR(64) NOT NULL,
-    patch_artifact_id VARCHAR(64) NOT NULL,
-    source_branch_id VARCHAR(64) NOT NULL,
-    target_branch_id VARCHAR(64) NOT NULL,
-    active_target_branch_id VARCHAR(64) NULL,
-    target_branch_revision BIGINT NOT NULL,
-    target_graph_revision BIGINT NOT NULL,
-    target_subject_record_revision BIGINT NOT NULL,
-    subject_ref VARCHAR(256) NOT NULL,
-    base_subject_revision CHAR(71) NOT NULL,
-    result_subject_revision CHAR(71) NOT NULL,
-    payload_hash CHAR(71) NOT NULL,
-    commit_message TEXT NOT NULL,
-    commit_author_name VARCHAR(256) NOT NULL,
-    commit_author_email VARCHAR(320) NOT NULL,
-    provider_ref VARCHAR(128) NOT NULL,
-    policy_decision_ref VARCHAR(256) NOT NULL,
-    operation_state VARCHAR(32) NOT NULL,
-    operation_phase VARCHAR(32) NOT NULL,
-    executor_token VARCHAR(128) NULL,
-    executor_lease_expires_at DATETIME(6) NULL,
-    recovery_after DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    commit_invocation_ref VARCHAR(128) NULL,
-    commit_sha VARCHAR(64) NULL,
-    observed_subject_revision CHAR(71) NULL,
-    index_reconciled TINYINT NULL,
-    failure_code VARCHAR(64) NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    completed_at DATETIME(6) NULL,
-    PRIMARY KEY (owner_id, work_id, operation_id),
-    UNIQUE KEY uq_work_patch_commit_request (owner_id, work_id, request_id),
-    UNIQUE KEY uq_work_patch_commit_active_target
-      (owner_id, work_id, active_target_branch_id),
-    INDEX idx_work_patch_commit_target
-      (owner_id, work_id, target_branch_id, operation_state, created_at, operation_id),
-    INDEX idx_work_patch_commit_pending
-      (operation_state, operation_phase, executor_lease_expires_at, operation_id),
-    INDEX idx_work_patch_commit_recovery
-      (operation_state, recovery_after, operation_id),
-    CONSTRAINT chk_work_patch_commit_state CHECK
-      (operation_state IN ('pending', 'aborted', 'succeeded', 'conflict', 'failed')),
-    CONSTRAINT chk_work_patch_commit_phase CHECK
-      (operation_phase IN ('awaiting_dispatch', 'committing', 'reconciling', 'complete')),
-    CONSTRAINT chk_work_patch_commit_terminal CHECK (
-      (operation_state = 'pending' AND operation_phase <> 'complete' AND completed_at IS NULL)
-      OR
-      (operation_state <> 'pending' AND operation_phase = 'complete' AND completed_at IS NOT NULL)
-    ),
-    CONSTRAINT chk_work_patch_commit_active_target CHECK (
-      (operation_state = 'pending' AND active_target_branch_id = target_branch_id)
-      OR (operation_state <> 'pending' AND active_target_branch_id IS NULL)
-    ),
-    CONSTRAINT chk_work_patch_commit_executor CHECK (
-      (executor_token IS NULL AND executor_lease_expires_at IS NULL)
-      OR
-      (operation_state = 'pending' AND operation_phase IN ('committing', 'reconciling')
-       AND executor_token IS NOT NULL AND executor_lease_expires_at IS NOT NULL)
-    ),
-    CONSTRAINT chk_work_patch_commit_result CHECK (
-      (commit_sha IS NULL AND observed_subject_revision IS NULL AND index_reconciled IS NULL
-       AND failure_code IS NULL)
-      OR
-      (commit_sha IS NOT NULL AND observed_subject_revision IS NOT NULL
-       AND index_reconciled IN (0, 1) AND failure_code IS NULL)
-      OR
-      (commit_sha IS NULL AND index_reconciled IS NULL AND failure_code IS NOT NULL)
-    )
-)";
-
 pub(crate) const WORK_PROPOSAL_SEQUENCES_CREATE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS work_proposal_sequences (
     owner_id VARCHAR(128) NOT NULL,
@@ -1247,7 +1010,7 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
     CONSTRAINT chk_work_event_kind CHECK (event_kind IN (
         'work_created', 'criteria_accepted', 'branch_basis_adopted',
         'graph_replaced', 'delivery_branch_selected', 'branch_archived', 'branch_restored',
-        'subject_changed', 'patch_artifact_exported',
+        'subject_changed',
         'plan_proposed', 'criteria_proposed', 'proposal_rejected',
         'check_recorded', 'gaps_accepted',
         'run_completed', 'run_delegated', 'run_failed', 'run_cancelled',
@@ -1388,15 +1151,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         WORK_BRANCH_DELETION_OPERATIONS_CREATE_SQL,
     ),
     ("work_branch_subjects", WORK_BRANCH_SUBJECTS_CREATE_SQL),
-    ("work_patch_artifacts", WORK_PATCH_ARTIFACTS_CREATE_SQL),
-    (
-        "work_patch_materialization_operations",
-        WORK_PATCH_MATERIALIZATION_OPERATIONS_CREATE_SQL,
-    ),
-    (
-        "work_patch_commit_operations",
-        WORK_PATCH_COMMIT_OPERATIONS_CREATE_SQL,
-    ),
     (
         "work_proposal_sequences",
         WORK_PROPOSAL_SEQUENCES_CREATE_SQL,
@@ -1584,8 +1338,6 @@ pub enum WorkDomainError {
     InvalidEventPageLimit { value: u16, maximum: u16 },
     #[error("Work catalog page limit {value} must be between 1 and {maximum}")]
     InvalidCatalogPageLimit { value: u16, maximum: u16 },
-    #[error("Work patch artifact page limit {value} must be between 1 and {maximum}")]
-    InvalidPatchArtifactPageLimit { value: u16, maximum: u16 },
     #[error("invalid Work plan proposal: {violation}")]
     InvalidPlanProposal {
         violation: WorkPlanProposalViolation,

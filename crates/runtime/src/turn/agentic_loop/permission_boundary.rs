@@ -88,7 +88,7 @@ pub(crate) async fn apply_round_permission_mode<H: AgenticLoopHost>(
     }
     let (Some(control), Some(user_id), Some(run_id)) = (
         state.run_control.clone(),
-        state.context_manifest_user_id.clone(),
+        state.owner_user_id.clone(),
         state.current_run_id.clone(),
     ) else {
         return Ok(());
@@ -338,7 +338,7 @@ mod tests {
         let control = Arc::new(Control::default());
         control.request(mode, 1);
         let mut state = make_test_loop_state();
-        state.context_manifest_user_id = Some("owner".into());
+        state.owner_user_id = Some("owner".into());
         state.current_session_id = Some("session".into());
         state.current_run_id = Some("run".into());
         state.current_run_owner_generation = Some(7);

@@ -69,8 +69,8 @@ pub(super) struct RemoteTurnState {
     pub run_transcript_capture: Vec<Value>,
     pub current_session_id: Option<String>,
     pub current_run_id: Option<String>,
-    pub context_manifest_user_id: Option<String>,
-    pub context_manifest_model_name: Option<String>,
+    pub owner_user_id: Option<String>,
+    pub policy_model_name: Option<String>,
     pub final_text: String,
     pub final_text_model_item_id: Option<String>,
     pub total_prompt: u64,
@@ -115,7 +115,7 @@ pub(super) struct RemoteTurnState {
 
 impl RemoteTurnState {
     pub fn current_model_identity(&self) -> Option<&str> {
-        self.context_manifest_model_name.as_deref()
+        self.policy_model_name.as_deref()
     }
 
     pub fn begin_run_transcript_capture(&mut self, items: impl IntoIterator<Item = Value>) {
@@ -195,11 +195,7 @@ impl RemoteTurnState {
         else {
             return;
         };
-        let Some(owner) = self
-            .context_manifest_user_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-        else {
+        let Some(owner) = self.owner_user_id.as_deref().filter(|id| !id.is_empty()) else {
             return;
         };
         let Some(mut heavy) = build_turn_continuity_checkpoint(TurnCheckpointInput {
@@ -230,7 +226,7 @@ impl RemoteTurnState {
             return;
         }
         // Only the root CLI entrance with caller-provided durable journals
-        // installs context_manifest_user_id. Utility/subrun calls do not publish.
+        // installs owner_user_id. Utility/subrun calls do not publish.
         if let Some((checkpoint, _snapshot)) = commit_session_continuity_checkpoint(
             owner,
             session_id,
@@ -447,7 +443,7 @@ pub(super) async fn consume_remote_turn(
             if let Some(buffer) = state.turn_event_buffer.as_mut()
                 && !buffer.is_empty()
                 && let Err(error) =
-                    buffer.flush_for_owner(state.context_manifest_user_id.as_deref(), session, true)
+                    buffer.flush_for_owner(state.owner_user_id.as_deref(), session, true)
             {
                 tracing::warn!(session_id=session,%error,"failed to flush interrupted remote turn journal");
             }
@@ -459,7 +455,7 @@ pub(super) async fn consume_remote_turn(
                 )
                 .with_agentic_step(Some(1));
                 if let Ok(writer) =
-                    journal_writer_for_owner(state.context_manifest_user_id.as_deref(), session)
+                    journal_writer_for_owner(state.owner_user_id.as_deref(), session)
                     && let Err(error) = writer.append(&event)
                 {
                     tracing::warn!(session_id=session,%error,"failed to append remote turn interruption");

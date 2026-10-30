@@ -731,64 +731,6 @@ pub struct WorkBranchDeletionRequestV1 {
 }
 
 #[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchMaterializationRequestV1 {
-    pub request_id: String,
-    pub patch_artifact_id: String,
-    pub expected_target_branch_revision: i64,
-    pub expected_target_graph_revision: i64,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchMaterializationsQueryV1 {
-    pub source_branch_id: String,
-    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub before_operation_id: Option<String>,
-    pub limit: Option<u16>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchCommitRequestV1 {
-    pub request_id: String,
-    pub patch_artifact_id: String,
-    pub expected_target_branch_revision: i64,
-    pub expected_target_graph_revision: i64,
-    pub message: String,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchCommitsQueryV1 {
-    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub before_operation_id: Option<String>,
-    pub limit: Option<u16>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchArtifactExportRequestV1 {
-    pub request_id: String,
-    pub expected_branch_revision: i64,
-    pub expected_graph_revision: i64,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkPatchArtifactsQueryV1 {
-    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub before_patch_artifact_id: Option<String>,
-    pub limit: Option<u16>,
-}
-
-#[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkBranchAttachResponseV1 {
     pub schema_version: u16,
@@ -1597,7 +1539,6 @@ pub struct SessionArtifactResponse {
     pub retention_policy: Option<String>,
     pub retention_until: Option<String>,
     pub status: Option<String>,
-    pub referenced_by_manifest_count: u32,
     pub referenced_by_state_items_count: u32,
     pub referenced_by_citation_count: u32,
     pub referenced_by_durable_count: u32,

@@ -473,7 +473,22 @@ and their signed execution grants remain separate supported contracts.
 `/sandbox` and `/sandbox/{name}` metadata CRUD,
 `/data-versioning/sandbox/{name}/checkpoint`, `/marketplace/quality-report`,
 `/marketplace/stats/{skill_name}` and `/marketplace/search` are no longer routed.
-Ordinary data-versioning checkpoints and skill registry/install APIs remain.
+The five `/data-versioning/checkpoints` and `/data-versioning/lineage` operations
+are also retired. They do not create database snapshots or expose lineage
+traversal. Skill registry/install and canonical `/events` APIs remain.
+
+The seven Work `patch-artifacts`, `patch-materializations` and `patch-commits`
+paths are also retired for all their methods. Work branches, graphs, evidence,
+recovery-point capture and ordinary authorized Git tools remain. No replacement
+patch API or compatibility route is registered.
+
+Run projection no longer includes the prompt-hash `observability` object. Session
+`projection_observability` no longer contains `prompt_request_count` or
+`latest_prompt_request`; canonical heads and actual model-request coverage remain.
+Session state also omits `latest_context_manifest`. Artifact responses omit
+`referenced_by_manifest_count`; only the retired diagnostic counter is removed.
+Real durable reference edges, state/citation counts and upload retention remain.
+The retired hash-diff history is not equivalent to measured provider cache usage.
 
 `POST /sessions/{id}/resume` returns canonical hydration (`session_id`,
 `last_status`, diagnostic totals and `resume_bundle`), rather than a Session

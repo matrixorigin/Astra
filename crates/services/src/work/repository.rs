@@ -7,10 +7,9 @@ use super::{
     WorkBranchRecord, WorkBranchRecordParts, WorkBranchRevision, WorkBranchSubject,
     WorkBranchSubjectChange, WorkChangeReason, WorkChangeRef, WorkCriteriaChange, WorkDomainError,
     WorkEventPage, WorkEventQuery, WorkGoal, WorkId, WorkItemRevisionRef, WorkObservationQuery,
-    WorkObservationReport, WorkOwnerId, WorkPatchArtifact, WorkPatchArtifactBasisResource,
-    WorkPatchArtifactId, WorkPlanContext, WorkPlanProposalAcceptance, WorkProposalStatus,
-    WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding, WorkTaskExecutionSnapshot,
-    WorkTaskGraphPage, WorkTaskGraphQuery,
+    WorkObservationReport, WorkOwnerId, WorkPlanContext, WorkPlanProposalAcceptance,
+    WorkProposalStatus, WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding,
+    WorkTaskExecutionSnapshot, WorkTaskGraphPage, WorkTaskGraphQuery,
 };
 use astra_core::SharedPool;
 use async_trait::async_trait;
@@ -153,10 +152,6 @@ pub enum WorkRepositoryError {
         operation: &'static str,
         #[source]
         source: sqlx::Error,
-    },
-    #[error("Work patch artifact conflict: {resource:?}")]
-    PatchArtifactConflict {
-        resource: WorkPatchArtifactBasisResource,
     },
     #[error("failed to encode canonical {entity}: {source}")]
     ManifestEncoding {
@@ -478,31 +473,6 @@ pub trait WorkRepository: Send + Sync {
         work_id: &WorkId,
         branch_id: &WorkBranchId,
     ) -> Result<Option<WorkBranchSubject>, WorkRepositoryError>;
-
-    async fn record_patch_artifact(
-        &self,
-        artifact: super::NewWorkPatchArtifact,
-    ) -> Result<WorkPatchArtifact, WorkRepositoryError>;
-
-    async fn load_patch_artifact(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<WorkPatchArtifact>, WorkRepositoryError>;
-
-    async fn load_patch_artifact_content(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        branch_id: &WorkBranchId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<super::WorkPatchArtifactContent>, WorkRepositoryError>;
-
-    async fn list_patch_artifacts(
-        &self,
-        query: super::WorkPatchArtifactQuery,
-    ) -> Result<super::WorkPatchArtifactPage, WorkRepositoryError>;
 
     async fn propose_plan(
         &self,
@@ -1834,52 +1804,6 @@ impl WorkRepository for DatabaseWorkRepository {
         branch_id: &WorkBranchId,
     ) -> Result<Option<WorkBranchSubject>, WorkRepositoryError> {
         super::subject_repository::load_branch_subject(self, owner_id, work_id, branch_id).await
-    }
-
-    async fn record_patch_artifact(
-        &self,
-        artifact: super::NewWorkPatchArtifact,
-    ) -> Result<WorkPatchArtifact, WorkRepositoryError> {
-        super::patch_artifact_repository::record_patch_artifact(self, artifact).await
-    }
-
-    async fn load_patch_artifact(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<WorkPatchArtifact>, WorkRepositoryError> {
-        super::patch_artifact_repository::load_patch_artifact(
-            self,
-            owner_id,
-            work_id,
-            patch_artifact_id,
-        )
-        .await
-    }
-
-    async fn load_patch_artifact_content(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        branch_id: &WorkBranchId,
-        patch_artifact_id: &WorkPatchArtifactId,
-    ) -> Result<Option<super::WorkPatchArtifactContent>, WorkRepositoryError> {
-        super::patch_artifact_repository::load_patch_artifact_content(
-            self,
-            owner_id,
-            work_id,
-            branch_id,
-            patch_artifact_id,
-        )
-        .await
-    }
-
-    async fn list_patch_artifacts(
-        &self,
-        query: super::WorkPatchArtifactQuery,
-    ) -> Result<super::WorkPatchArtifactPage, WorkRepositoryError> {
-        super::patch_artifact_repository::list_patch_artifacts(self, query).await
     }
 
     async fn propose_plan(

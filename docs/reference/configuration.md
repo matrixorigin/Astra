@@ -288,7 +288,7 @@ across terminals and browsers; `/explain --format markdown` and
 `/explain --format text` select a different derived companion for the next
 capture.
 
-Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
+Durable harness snapshot history is controlled by the `harness_snapshots` trace category; production defaults keep it off and `trace.profile = "dev"` enables it. Persisted prompt hash-diffs and Context manifests are retired, together with the `prompt_assembly`/`context_assembly` categories and overlays. Configurations naming those categories are unsupported. Live Context traces, actual provider request evidence and explicitly enabled full LLM captures retain their independent controls.
 
 Provider admission is intentionally configured by capacity inputs only. Scope is fixed at provider level; window size, retention, cleanup cadence, burst, and fail-closed behavior are internal runtime policy rather than deployment knobs.
 

@@ -54,8 +54,6 @@ pub(crate) fn spawn_runtime_maintenance_sweeper(
                         target: "astra_runtime::runtime_maintenance_sweeper",
                         explicit_delete_intents_reconciled = result.explicit_delete_intents_reconciled,
                         model_request_context_events_expired = result.model_request_context_events_expired,
-                        prompt_request_records_expired = result.prompt_request_records_expired,
-                        prompt_deltas_expired = result.prompt_deltas_expired,
                         expired_fork_pins_released = result.expired_fork_pins_released,
                         orphaned_forks_collected = result.orphaned_forks_collected,
                         orphaned_manifests_collected = result.orphaned_manifests_collected,

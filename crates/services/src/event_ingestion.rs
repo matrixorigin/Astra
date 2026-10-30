@@ -44,8 +44,8 @@ use measurement::{
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::observation_capture::{
-    DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
-    canonical_observation_payload_hash, classify_capture, record_observation_collisions,
+    DurableCaptureOutcome, ObservationCollisionReceipt, canonical_agent_event_payload_hash,
+    classify_capture, record_observation_collisions,
 };
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
@@ -1654,10 +1654,7 @@ impl<'a> IngestionEventInsertValues<'a> {
     fn from_event(event: &'a IngestionEvent) -> Result<Self, String> {
         let complete_payload = serde_json::to_value(event)
             .map_err(|error| format!("serialize complete ingestion event payload: {error}"))?;
-        let payload_hash = canonical_observation_payload_hash(
-            ObservationPayloadDomain::AgentEvent,
-            &complete_payload,
-        );
+        let payload_hash = canonical_agent_event_payload_hash(&complete_payload);
         let usage = match event.token_usage.as_ref() {
             Some(value) => match CanonicalTokenUsage::from_json(value) {
                 Ok(usage) => Some(usage),
@@ -2775,7 +2772,6 @@ impl EventIngestionWorker {
                     collision_events = collision_events.saturating_add(1);
                     collision_receipts.push(ObservationCollisionReceipt {
                         user_id: &values.event.user_id,
-                        domain: ObservationPayloadDomain::AgentEvent,
                         identity_id: &values.event.event_id,
                         session_id: &values.event.session_id,
                         stored_payload_hash,
@@ -4826,10 +4822,7 @@ mod tests {
     fn event_payload_hash_covers_complete_durable_payload_only() {
         let base = test_event("evt-hash", "sess-hash", "turn_complete");
         let complete_payload = serde_json::to_value(&base).expect("serializable event");
-        let expected = canonical_observation_payload_hash(
-            ObservationPayloadDomain::AgentEvent,
-            &complete_payload,
-        );
+        let expected = canonical_agent_event_payload_hash(&complete_payload);
         assert_eq!(
             IngestionEventInsertValues::from_event(&base)
                 .expect("valid event")
@@ -4852,10 +4845,7 @@ mod tests {
         changed_payload["parent_event_ids"] = serde_json::json!(["parent-a", "parent-b"]);
         assert_ne!(
             expected,
-            canonical_observation_payload_hash(
-                ObservationPayloadDomain::AgentEvent,
-                &changed_payload,
-            ),
+            canonical_agent_event_payload_hash(&changed_payload,),
             "derived edge inputs are part of the complete payload fence"
         );
     }

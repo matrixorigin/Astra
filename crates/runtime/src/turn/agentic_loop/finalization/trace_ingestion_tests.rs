@@ -80,7 +80,7 @@ async fn exercise_exit(cancelled: bool, rejected: bool, writer_unavailable: bool
     let (sender, mut receiver) = IngestionSender::for_tests(64);
     let mut state = make_state();
     state.current_session_id = Some(SESSION.into());
-    state.context_manifest_user_id = Some(OWNER.into());
+    state.owner_user_id = Some(OWNER.into());
     state.current_run_id = Some("trace-loop-run".into());
     state.current_run_owner_generation = Some(7);
     state.telemetry.trace_ingestion = Some(sender);

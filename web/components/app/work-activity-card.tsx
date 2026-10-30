@@ -16,7 +16,6 @@ const EVENT_LABELS: Record<WorkEventKind, string> = {
   branch_archived: "Approach archived",
   branch_restored: "Approach restored",
   subject_changed: "Current result changed",
-  patch_artifact_exported: "Reviewable patch exported",
   plan_proposed: "Plan expanded",
   criteria_proposed: "Done-when criteria suggested",
   proposal_rejected: "Suggestion rejected",

@@ -91,10 +91,6 @@ pub(crate) mod tool_local_transport;
 pub(crate) mod tool_model_catalog;
 mod work_branch_deletion_runtime;
 mod work_handlers;
-mod work_patch_commit_runtime;
-mod work_patch_export_runtime;
-mod work_patch_materialization_runtime;
-mod work_patch_workspace;
 
 fn external_request_descriptor(
     method: &Method,
@@ -327,18 +323,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
                 bg_cancel.clone(),
             ),
         );
-        bg_handles.push(
-            work_patch_materialization_runtime::spawn_work_patch_materialization_recovery(
-                pool.clone(),
-                state.execution.run_lifecycle_service.clone(),
-                bg_cancel.clone(),
-            ),
-        );
-        bg_handles.push(work_patch_commit_runtime::spawn_work_patch_commit_recovery(
-            pool.clone(),
-            state.execution.run_lifecycle_service.clone(),
-            bg_cancel.clone(),
-        ));
         // Spawn background cleanup-debt retry task
         {
             let cleanup_store: std::sync::Arc<dyn astra_services::WorkspaceCleanupDebtStore> =

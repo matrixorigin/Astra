@@ -25,6 +25,11 @@ use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, query, query_scalar};
 use uuid::Uuid;
 
+/// Expired artifact metadata remains readable, but its raw payload is unavailable.
+pub fn session_artifact_raw_payload_is_available(status: &str) -> bool {
+    status != "expired"
+}
+
 /// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
 /// the previous `Result<_, String>` to preserve sqlx / serde context and to
 /// encode validation / overflow failures as distinct variants callers can
@@ -436,7 +441,6 @@ pub struct StoredSessionArtifact {
     pub retention_policy: Option<String>,
     pub retention_until: Option<String>,
     pub status: Option<String>,
-    pub referenced_by_manifest_count: u32,
     pub referenced_by_state_items_count: u32,
     pub referenced_by_citation_count: u32,
     pub referenced_by_durable_count: u32,
@@ -796,7 +800,7 @@ impl DatabaseSessionArtifactStore {
         .await?;
 
         let existing = query(
-            "SELECT artifact_kind, referenced_by_manifest_count, \
+            "SELECT artifact_kind, \
                     referenced_by_state_items_count, referenced_by_citation_count \
              FROM session_artifacts \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
@@ -817,7 +821,6 @@ impl DatabaseSessionArtifactStore {
             );
         }
         let counter_references = [
-            "referenced_by_manifest_count",
             "referenced_by_state_items_count",
             "referenced_by_citation_count",
         ]
@@ -1286,11 +1289,6 @@ fn stored_artifact_from_row(
         retention_policy: artifact_row_optional_string(row, "retention_policy")?,
         retention_until: artifact_row_optional_string(row, "retention_until")?,
         status: artifact_row_optional_string(row, "status")?,
-        referenced_by_manifest_count: artifact_row_u32(
-            row,
-            &artifact_id,
-            "referenced_by_manifest_count",
-        )?,
         referenced_by_state_items_count: artifact_row_u32(
             row,
             &artifact_id,
@@ -1321,7 +1319,7 @@ pub(crate) async fn load_latest_json_artifact_from_pool(
         "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                  content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                  CAST(retention_until AS CHAR) AS retention_until, status, \
-                 referenced_by_manifest_count, referenced_by_state_items_count, \
+                 referenced_by_state_items_count, \
                  referenced_by_citation_count, \
                  (SELECT COUNT(*) FROM session_artifact_references refs \
                   WHERE refs.user_id = session_artifacts.user_id \
@@ -1358,7 +1356,7 @@ pub(crate) async fn load_json_artifact_from_pool(
         "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                 content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                 CAST(retention_until AS CHAR) AS retention_until, status, \
-                referenced_by_manifest_count, referenced_by_state_items_count, \
+                referenced_by_state_items_count, \
                 referenced_by_citation_count, \
                 (SELECT COUNT(*) FROM session_artifact_references refs \
                  WHERE refs.user_id = session_artifacts.user_id \
@@ -1450,7 +1448,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                     CAST(retention_until AS CHAR) AS retention_until, status, \
-                    referenced_by_manifest_count, referenced_by_state_items_count, \
+                    referenced_by_state_items_count, \
                     referenced_by_citation_count, \
                     (SELECT COUNT(*) FROM session_artifact_references refs \
                      WHERE refs.user_id = session_artifacts.user_id \
@@ -1721,7 +1719,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                     CAST(retention_until AS CHAR) AS retention_until, status, \
-                    referenced_by_manifest_count, referenced_by_state_items_count, \
+                    referenced_by_state_items_count, \
                     referenced_by_citation_count, \
                     (SELECT COUNT(*) FROM session_artifact_references refs \
                      WHERE refs.user_id = session_artifacts.user_id \
@@ -2523,7 +2521,7 @@ async fn load_byte_artifact_catalog_in_transaction(
         "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round,
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy,
                     CAST(retention_until AS CHAR) AS retention_until, status,
-                    referenced_by_manifest_count, referenced_by_state_items_count,
+                    referenced_by_state_items_count,
                     referenced_by_citation_count,
                     (SELECT COUNT(*) FROM session_artifact_references refs
                      WHERE refs.user_id = session_artifacts.user_id
@@ -3038,7 +3036,6 @@ mod tests {
                 return Ok(*value);
             }
             Ok(match column {
-                "referenced_by_manifest_count" => 1,
                 "referenced_by_state_items_count" => 2,
                 "referenced_by_citation_count" => 3,
                 "referenced_by_durable_count" => 4,
@@ -3352,7 +3349,6 @@ mod tests {
             Some("2026-06-26 12:00:00")
         );
         assert_eq!(artifact.status.as_deref(), Some("active"));
-        assert_eq!(artifact.referenced_by_manifest_count, 1);
         assert_eq!(artifact.referenced_by_state_items_count, 2);
         assert_eq!(artifact.referenced_by_citation_count, 3);
         assert_eq!(artifact.referenced_by_durable_count, 4);
@@ -3371,7 +3367,6 @@ mod tests {
             "retention_policy",
             "retention_until",
             "status",
-            "referenced_by_manifest_count",
             "referenced_by_state_items_count",
             "referenced_by_citation_count",
             "referenced_by_durable_count",
@@ -3410,10 +3405,10 @@ mod tests {
         );
         assert_invalid_database_column(
             stored_artifact_from_row(&FakeArtifactRow::with_i64(
-                "referenced_by_manifest_count",
+                "referenced_by_state_items_count",
                 -1,
             )),
-            "referenced_by_manifest_count",
+            "referenced_by_state_items_count",
         );
         assert_invalid_database_column(
             stored_artifact_from_row(&FakeArtifactRow::with_i64(

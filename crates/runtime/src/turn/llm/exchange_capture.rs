@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
 use serde_json::{Value, json};
 
@@ -53,18 +52,6 @@ fn resolve_full_llm_capture_enabled(
         .and_then(|metadata| metadata.get(FULL_LLM_CAPTURE_METADATA_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(default_enabled)
-}
-
-fn prompt_request_delta_persistence_enabled_for_trace(
-    trace: &astra_config::runtime_config::SessionTraceConfig,
-) -> bool {
-    trace.category_enabled(astra_config::runtime_config::TraceCategory::PromptAssembly)
-}
-
-fn prompt_request_delta_persistence_enabled() -> bool {
-    prompt_request_delta_persistence_enabled_for_trace(
-        &astra_config::runtime_config::RuntimeConfig::cached().trace,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -332,33 +319,6 @@ pub(crate) async fn persist_configured_capture_or_log(
     }
 }
 
-pub(crate) async fn persist_prompt_request_plan_or_log(
-    context: &'static str,
-    shared_pool: Option<SharedPool>,
-    input: astra_services::PromptRequestPersistInput,
-    plan: astra_services::PromptRequestPlan,
-) {
-    if !prompt_request_delta_persistence_enabled() {
-        return;
-    }
-    let Some(shared_pool) = shared_pool else {
-        return;
-    };
-    if let Err(error) = astra_services::persist_prompt_request(&shared_pool, &input, &plan).await {
-        let pool_stats = shared_pool.stats();
-        tracing::error!(
-            target: "astra_runtime::prompt_delta",
-            %context,
-            request_id = %plan.request_id,
-            db_pool_max = pool_stats.max_connections,
-            db_pool_size = pool_stats.size,
-            db_pool_idle = pool_stats.num_idle,
-            error = %error,
-            "failed to persist prompt request delta"
-        );
-    }
-}
-
 fn capture_file_path(
     session_id: &str,
     user_id: &str,
@@ -508,7 +468,6 @@ pub(crate) fn persist_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
     use astra_services::{StoredSessionArtifact, session_journal::JournalDirGuard};
     use async_trait::async_trait;
     use tempfile::tempdir;
@@ -545,7 +504,6 @@ mod tests {
                 retention_policy: Some("default".into()),
                 retention_until: None,
                 status: Some("active".into()),
-                referenced_by_manifest_count: 0,
                 referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
                 referenced_by_durable_count: 0,
@@ -597,29 +555,6 @@ mod tests {
                 next_cursor: None,
             })
         }
-    }
-
-    #[test]
-    fn prompt_request_delta_db_persistence_follows_prompt_assembly_trace_category() {
-        let production = SessionTraceConfig::default();
-        assert!(
-            !prompt_request_delta_persistence_enabled_for_trace(&production),
-            "production/default trace profile must not write prompt delta diagnostics"
-        );
-
-        let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
-        assert!(
-            prompt_request_delta_persistence_enabled_for_trace(&dev),
-            "dev trace profile enables all diagnostic persistence categories"
-        );
-
-        let custom = SessionTraceConfig {
-            profile: TraceProfile::Custom,
-            enabled_categories: vec![TraceCategory::PromptAssembly],
-            ..SessionTraceConfig::default()
-        }
-        .normalize();
-        assert!(prompt_request_delta_persistence_enabled_for_trace(&custom));
     }
 
     #[test]

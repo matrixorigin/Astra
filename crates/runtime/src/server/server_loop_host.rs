@@ -59,8 +59,7 @@ use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
     TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt,
-    complete_turn_phase, context_manifest_identity_from_result,
-    interaction_scoped_tool_restrictions,
+    complete_turn_phase, interaction_scoped_tool_restrictions,
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
@@ -1838,7 +1837,6 @@ fn record_full_llm_request_event(
     messages: &[Value],
     tools: &[Value],
     max_output_tokens: Option<usize>,
-    prompt_request_plan: &astra_services::PromptRequestPlan,
     provider_attempts: &[crate::turn::llm::client::ProviderAttemptObservation],
 ) {
     if session_id.is_empty() || !full_llm_capture {
@@ -1897,9 +1895,6 @@ fn record_full_llm_request_event(
                 tools,
                 max_output_tokens,
             ),
-            "prompt_request_id": prompt_request_plan.request_id,
-            "request_hash": prompt_request_plan.request_hash,
-            "request_summary": prompt_request_plan.summary_json,
         }),
     );
     evt.offset_ms = Some(buf.offset_ms());
@@ -2533,7 +2528,7 @@ fn delegation_intent_source_from_text(
 ) -> Option<DelegationIntentSource> {
     use sha2::{Digest, Sha256};
 
-    let user_id = state.context_manifest_user_id.as_deref()?.trim();
+    let user_id = state.owner_user_id.as_deref()?.trim();
     let session_id = state.current_session_id.as_deref()?.trim();
     let run_id = state.current_run_id.as_deref()?.trim();
     let turn_chain_id = state.canonical_turn_chain_id.as_deref()?.trim();
@@ -2594,7 +2589,7 @@ fn inherited_delegation_source_from_state(
     state: &AgenticLoopState,
     origin: &astra_turn_types::DelegationUserRequirementSource,
 ) -> Option<DelegationIntentSource> {
-    let user_id = state.context_manifest_user_id.as_deref()?;
+    let user_id = state.owner_user_id.as_deref()?;
     let session_id = state.current_session_id.as_deref()?;
     if user_id != origin.user_id
         || session_id != origin.session_id
@@ -9373,7 +9368,7 @@ impl ServerAgenticLoopHost {
                 || state.current_run_id.as_deref() != Some(observation.correlation.run_id.as_str())
                 || state.current_session_turn_number() != observation.correlation.turn
                 || state
-                    .context_manifest_user_id
+                    .owner_user_id
                     .as_deref()
                     .is_some_and(|owner| owner != self.user_id)
             {
@@ -13876,7 +13871,7 @@ impl ServerAgenticLoopHost {
         let action_context = EdgeActionAdmissionContext {
             run_control: run_control.clone(),
             user_id: state
-                .context_manifest_user_id
+                .owner_user_id
                 .clone()
                 .unwrap_or_else(|| self.user_id.clone()),
             run_id: run_id.to_string(),
@@ -17808,26 +17803,6 @@ impl ServerAgenticLoopHost {
     }
 }
 
-fn server_context_manifest_identity(
-    session_id: &str,
-    state_run_id: Option<&str>,
-    result: Option<&HostTurnResult>,
-) -> Option<(String, String)> {
-    // Server-owned state is admitted before the host is constructed, so its
-    // state run id remains authoritative even when a provider transport
-    // failure returns no SSE accumulator identity. A streamed pair, when
-    // present, is still preferred because it is the exact physical attempt
-    // observed by this boundary.
-    context_manifest_identity_from_result(result).or_else(|| {
-        let session_id = session_id.trim();
-        let run_id = state_run_id?.trim();
-        if session_id.is_empty() || run_id.is_empty() {
-            return None;
-        }
-        Some((session_id.to_string(), run_id.to_string()))
-    })
-}
-
 struct PendingDelegationCall {
     call: Value,
     id: String,
@@ -18395,14 +18370,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ServerAgenticLoopHost::turn_interaction_mode(self)
     }
 
-    fn context_manifest_identity(
-        &self,
-        state: &AgenticLoopState,
-        result: Option<&HostTurnResult>,
-    ) -> Option<(String, String)> {
-        server_context_manifest_identity(&self.session_id, state.current_run_id.as_deref(), result)
-    }
-
     fn execution_handoff_wake(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.execution_handoff
             .as_ref()
@@ -18817,7 +18784,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     ) -> Result<bool, String> {
         let (Some(executor), Some(user_id), Some(session_id), Some(run_id), Some(generation)) = (
             state.runtime_tool_executor.as_deref(),
-            state.context_manifest_user_id.as_deref(),
+            state.owner_user_id.as_deref(),
             state.current_session_id.as_deref(),
             state.current_run_id.as_deref(),
             state.current_run_owner_generation,
@@ -20608,52 +20575,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
             };
-            // Attempt-keyed prompt truth is created only after durable
-            // admission chooses the authoritative logical identity. The
-            // cancelled N recovery fact must never own the request artifact
-            // that is physically sent as N+1.
-            let mut prompt_request_plan =
-                match astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-                    user_id: &self.user_id,
-                    session_id: &self.session_id,
-                    run_id: state.current_run_id.as_deref(),
-                    turn: state.session_turn,
-                    round: prompt_round,
-                    attempt: attempt_in_round,
-                    source: "server_loop_host",
-                    messages: attempt_llm_messages,
-                    tools: &final_tools,
-                    max_output_tokens: Some(effective_max_output),
-                })
-                .map_err(|error| {
-                    astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        format!("failed to plan prompt delta projection: {error}"),
-                    )
-                }) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        self.complete_request_preparation_phase_with_context(
-                            state,
-                            request_attempt_started_at,
-                            attempt_in_round,
-                            &mut request_preparation_recorded_attempts,
-                            TurnPhaseOutcome::Failed,
-                            attempt_context_metrics.clone(),
-                        );
-                        // Durable admission already owns this authoritative
-                        // attempt. If attempt-keyed artifact planning fails
-                        // before provider I/O, terminalize that exact identity
-                        // instead of leaving an admitted orphan.
-                        return Err(error);
-                    }
-                };
-            if let Some(summary) = prompt_request_plan.summary_json.as_object_mut() {
-                summary.insert(
-                    "projection_authority".to_string(),
-                    Value::String("planned_pre_client_projection_v1".to_string()),
-                );
-            }
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             state
                 .step_recorder
@@ -20993,30 +20914,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     attempt_llm_messages,
                     &final_tools,
                     Some(effective_max_output),
-                    &prompt_request_plan,
                     &provider_attempts,
                 );
-                // Prompt-delta persistence describes only a request that
-                // crossed the provider dispatch boundary. Keeping this await
-                // after the call prevents durable-admission expiry from
-                // creating a phantom sent-request artifact.
-                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
-                    "server_loop_host",
-                    self.shared_pool.clone(),
-                    astra_services::PromptRequestPersistInput {
-                        session_id: self.session_id.clone(),
-                        user_id: self.user_id.clone(),
-                        run_id: state.current_run_id.clone(),
-                        turn: state.session_turn,
-                        round: prompt_round,
-                        attempt: attempt_in_round,
-                        source: "server_loop_host".to_string(),
-                        model: llm_cfg.model_name.clone(),
-                        provider: llm_cfg.provider.clone(),
-                    },
-                    prompt_request_plan,
-                )
-                .await;
+
             }
             complete_turn_phase(
                 self,
@@ -23454,24 +23354,6 @@ mod tests {
         }
         gateway.assert_complete();
         assert_eq!(gateway.requests.lock().await.len(), 2);
-    }
-
-    #[test]
-    fn server_manifest_identity_uses_admitted_state_when_result_has_no_ids() {
-        let result = HostTurnResult {
-            accum: ChatTurnSseAccum::default(),
-            ttft_ms: None,
-
-            error_kind: Some(astra_core::ErrorKind::StreamTransport),
-        };
-        assert_eq!(
-            server_context_manifest_identity("session-server", Some("run-server"), Some(&result)),
-            Some(("session-server".to_string(), "run-server".to_string()))
-        );
-        assert_eq!(
-            server_context_manifest_identity("session-server", Some("run-server"), None),
-            Some(("session-server".to_string(), "run-server".to_string()))
-        );
     }
 
     #[test]
@@ -33695,7 +33577,7 @@ mod tests {
             let mut state = create_durable_execution_test_state(&fixture.scope.session_id);
             state.current_run_id = Some(fixture.scope.run_id.clone());
             state.canonical_turn_chain_id = Some("source-turn".into());
-            state.context_manifest_user_id = Some(fixture.scope.user_id.clone());
+            state.owner_user_id = Some(fixture.scope.user_id.clone());
             let allowed_tools = HashSet::from([
                 "mcp__source__search".into(),
                 "tool_search".into(),
@@ -36189,7 +36071,7 @@ mod tests {
                 },
             };
         state.current_session_id = Some("s-explain-catalog".to_string());
-        state.context_manifest_user_id = Some("u-explain-catalog".to_string());
+        state.owner_user_id = Some("u-explain-catalog".to_string());
         state.current_run_owner_generation = Some(1);
         state.canonical_turn_chain_id = Some("chain-explain-catalog".to_string());
         state.session_turn = 1;
@@ -40807,7 +40689,7 @@ mod tests {
         // genesis latch.
         let workspace = tempfile::tempdir().expect("runtime workspace");
         let mut runtime_executor = runtime_tool_executor_with_agent_context(workspace.path());
-        runtime_executor.set_context_manifest_pool(pool.clone());
+        runtime_executor.set_service_pool(pool.clone());
         runtime_executor.set_work_binding(
             crate::server::runtime_tool_executor::WorkRuntimeBinding::new(
                 pool.clone(),
@@ -41473,7 +41355,7 @@ mod tests {
     #[test]
     fn work_admission_judges_guidance_after_context_is_frozen() {
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("source-user".into());
+        state.owner_user_id = Some("source-user".into());
         state.current_session_id = Some("source-session".into());
         state.current_run_id = Some("source-run".into());
         state.canonical_turn_chain_id = Some("source-intent".into());
@@ -41515,7 +41397,7 @@ mod tests {
     #[test]
     fn delegation_intent_source_fences_new_user_text_and_control_generation() {
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("source-user".into());
+        state.owner_user_id = Some("source-user".into());
         state.current_session_id = Some("source-session".into());
         state.current_run_id = Some("source-run".into());
         state.canonical_turn_chain_id = Some("source-intent".into());
@@ -41592,7 +41474,7 @@ mod tests {
         )
         .build();
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("source-user".into());
+        state.owner_user_id = Some("source-user".into());
         state.current_session_id = Some("source-session".into());
         state.current_run_id = Some("source-run".into());
         state.canonical_turn_chain_id = Some("source-intent".into());
@@ -41656,7 +41538,7 @@ mod tests {
             required_capabilities: Vec::new(),
         };
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("source-user".into());
+        state.owner_user_id = Some("source-user".into());
         state.current_session_id = Some("source-session".into());
         state.current_run_id = Some("source-run".into());
         state.canonical_turn_chain_id = Some("source-intent".into());
@@ -41872,7 +41754,7 @@ mod tests {
                 as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
             .build();
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("catalog-user".into());
+        state.owner_user_id = Some("catalog-user".into());
         state.current_session_id = Some("catalog-session".into());
         state.current_run_id = Some("catalog-run".into());
         state.canonical_turn_chain_id = Some("catalog-chain".into());
@@ -42100,7 +41982,7 @@ mod tests {
             }) as Box<dyn SummaryLlmClient>])
             .build();
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("user".into());
+        state.owner_user_id = Some("user".into());
         state.current_session_id = Some("session".into());
         state.current_run_id = Some("root-run".into());
         state.canonical_turn_chain_id = Some("chain".into());
@@ -42213,7 +42095,7 @@ mod tests {
                 as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>])
             .build();
         let mut state = create_test_state();
-        state.context_manifest_user_id = Some("auto-user".into());
+        state.owner_user_id = Some("auto-user".into());
         state.current_session_id = Some("auto-session".into());
         state.current_run_id = Some("auto-run".into());
         state.canonical_turn_chain_id = Some("auto-chain".into());
@@ -42472,7 +42354,7 @@ mod tests {
         let mut state = create_test_state();
         state.recursion_depth = 1;
         state.delegation_chain.push("parent".into());
-        state.context_manifest_user_id = Some("nested-user".into());
+        state.owner_user_id = Some("nested-user".into());
         state.current_session_id = Some("nested-session".into());
         state.current_run_id = Some("child-run".into());
         state.canonical_turn_chain_id = Some("child-chain".into());
@@ -45784,7 +45666,7 @@ mod tests {
         let mut first_state = create_durable_execution_test_state(SESSION_ID);
         first_state.skills.request_constraints.allowed_tools = Some(["glob".to_string(), "tool_search".to_string()].into_iter().collect());
         first_state.current_run_owner_generation = Some(run_authority.owner_generation);
-        first_state.context_manifest_user_id = Some(USER_ID.to_string());
+        first_state.owner_user_id = Some(USER_ID.to_string());
         first_state.permission_context =
             Some(crate::orchestration::PermissionSyncContext::shared_root(
                 crate::orchestration::PermissionMode::Auto,
@@ -45919,7 +45801,7 @@ mod tests {
             "2026-09-08",
             &mut restored_state,
         ).unwrap();
-        restored_state.context_manifest_user_id = Some(USER_ID.to_string());
+        restored_state.owner_user_id = Some(USER_ID.to_string());
         restored_state.permission_context =
             Some(crate::orchestration::PermissionSyncContext::shared_root(
                 crate::orchestration::PermissionMode::Auto,
@@ -49698,7 +49580,7 @@ mod tests {
                 ],
                 correction,
             );
-            state.context_manifest_user_id = Some("provider-fixture-user".into());
+            state.owner_user_id = Some("provider-fixture-user".into());
             state.canonical_turn_chain_id = Some("observation-turn-chain".into());
             crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
             state.message = "last fragment".into();
@@ -49896,7 +49778,7 @@ mod tests {
                 ],
                 "Change the approach.",
             );
-            state.context_manifest_user_id = Some("provider-fixture-user".into());
+            state.owner_user_id = Some("provider-fixture-user".into());
             state.canonical_turn_chain_id = Some("capacity-turn-chain".into());
             crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
             if admission_mode == "db_fixed_window" {
@@ -50701,40 +50583,14 @@ mod tests {
         let captured_request_messages = llm_events[0]["metadata"]["request"]["messages"]
             .as_array()
             .expect("captured request messages");
-        let captured_summary_roles = llm_events[0]["metadata"]["request_summary"]["message_roles"]
-            .as_array()
-            .expect("captured summary roles");
-        assert_eq!(
-            llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
-            Some(captured_request_messages.len() as u64)
-        );
-        assert_eq!(
-            captured_summary_roles.len(),
-            captured_request_messages.len()
-        );
         assert!(
             captured_request_messages.len() >= 2,
             "expected at least system + user messages"
-        );
-        assert!(
-            llm_events[0]["metadata"]["prompt_request_id"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-        );
-        assert_eq!(
-            llm_events[0]["metadata"]["request_summary"]["message_roles"][0]["role"].as_str(),
-            Some("system")
         );
         assert_eq!(
             llm_events[0]["metadata"]["request_projection_authority"].as_str(),
             Some("planned_pre_client_projection_v1"),
             "the journal must identify its canonical pre-client request projection"
-        );
-        assert_eq!(
-            captured_summary_roles
-                .last()
-                .and_then(|entry| entry["role"].as_str()),
-            Some("user")
         );
         assert_eq!(
             captured_request_messages

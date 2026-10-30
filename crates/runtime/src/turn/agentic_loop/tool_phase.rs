@@ -1994,7 +1994,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             let action_fence = state
                 .run_control
                 .as_ref()
-                .zip(state.context_manifest_user_id.as_ref())
+                .zip(state.owner_user_id.as_ref())
                 .zip(state.current_run_id.as_ref())
                 .zip(state.current_session_id.as_ref())
                 // Durable Server/Edge executors must fence guidance inside their
@@ -2022,7 +2022,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             quiet: headless_quiet,
             api: &state.api,
             token: &state.api_token,
-            current_user_id: state.context_manifest_user_id.as_deref(),
+            current_user_id: state.owner_user_id.as_deref(),
             current_session_id: state.current_session_id.as_ref(),
             current_run_id: state.current_run_id.as_deref(),
             current_turn_chain_id: state
@@ -2661,7 +2661,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             restricted_tools: &mut state.restricted_tools,
             remaining_turns: &mut state.remaining_turns,
             step_recorder: &mut state.step_recorder,
-            current_user_id: state.context_manifest_user_id.as_ref(),
+            current_user_id: state.owner_user_id.as_ref(),
             current_session_id: state.current_session_id.as_ref(),
             workspace_observation_quarantine: state.stall.workspace_observation_quarantine.as_ref(),
             max_turns: state.max_turns,

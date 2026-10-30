@@ -1300,7 +1300,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         None,
         None,
     );
-    executor.set_context_manifest_pool(pool.clone());
+    executor.set_service_pool(pool.clone());
     executor.set_work_binding(
         crate::server::runtime_tool_executor::WorkRuntimeBinding::new(
             pool.clone(),
@@ -28951,11 +28951,8 @@ fn shared_child_assembly_preserves_restored_identity_budget_and_workspace_eviden
     let state = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
     assert_eq!(state.self_agent_id, "configured-member");
     assert_eq!(state.current_run_id.as_deref(), Some("run"));
-    assert_eq!(state.context_manifest_user_id.as_deref(), Some("user"));
-    assert_eq!(
-        state.context_manifest_model_name.as_deref(),
-        Some("member-model")
-    );
+    assert_eq!(state.owner_user_id.as_deref(), Some("user"));
+    assert_eq!(state.policy_model_name.as_deref(), Some("member-model"));
     assert_eq!(
         state.inference_purpose,
         astra_turn_types::InferencePurpose::SubAgent
@@ -30933,7 +30930,7 @@ fn explain_test_executor(
         astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
             .with_pool(pool.clone()),
     );
-    executor.set_context_manifest_pool(pool.clone());
+    executor.set_service_pool(pool.clone());
     executor
 }
 

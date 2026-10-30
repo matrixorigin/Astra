@@ -309,7 +309,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     if state.current_session_id.is_none() {
         return;
     }
-    if state.context_manifest_user_id.is_none() {
+    if state.owner_user_id.is_none() {
         astra_core::agent_warn!(
             "checkpoint",
             "Skipping local step checkpoint: missing user_id"
@@ -324,7 +324,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .as_ref()
         .expect("checked session identity");
     let user_id = state
-        .context_manifest_user_id
+        .owner_user_id
         .as_deref()
         .expect("checked user identity");
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
@@ -549,7 +549,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
                     if let Err(error) =
-                        buf.flush_for_owner(state.context_manifest_user_id.as_deref(), sid, true)
+                        buf.flush_for_owner(state.owner_user_id.as_deref(), sid, true)
                     {
                         tracing::warn!(
                             session_id = sid,
@@ -583,7 +583,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
                     if let Err(error) =
-                        buf.flush_for_owner(state.context_manifest_user_id.as_deref(), sid, true)
+                        buf.flush_for_owner(state.owner_user_id.as_deref(), sid, true)
                     {
                         tracing::warn!(
                             session_id = sid,
@@ -600,9 +600,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 interruption.to_json(),
             )
             .with_agentic_step(Some(current_agentic_step(state)));
-            if let Ok(writer) =
-                journal_writer_for_owner(state.context_manifest_user_id.as_deref(), sid)
-            {
+            if let Ok(writer) = journal_writer_for_owner(state.owner_user_id.as_deref(), sid) {
                 if let Err(error) = writer.append(&evt) {
                     tracing::warn!(
                         session_id = sid,
@@ -1299,7 +1297,7 @@ mod tests {
         let mut state = make_state();
         let sid = "11111111-2222-3333-4444-555555555555";
         state.current_session_id = Some(sid.to_string());
-        state.context_manifest_model_name = Some("gpt-5".to_string());
+        state.policy_model_name = Some("gpt-5".to_string());
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
@@ -1471,7 +1469,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
         state.restricted_tools.insert("write_file".to_string());
@@ -1503,7 +1501,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.session_turn = 10;
         state.step_recorder.begin_turn(0);
@@ -1551,7 +1549,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
         state.messages = vec![
@@ -1586,7 +1584,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
         state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
@@ -1621,7 +1619,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.session_turn = 7;
         state.step_recorder.begin_turn(0);
@@ -1680,7 +1678,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.session_turn = 7;
         state.step_recorder.begin_turn(0);
@@ -1728,7 +1726,7 @@ mod tests {
         let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let _guard = SessionDirGuard::new(user_id, &session_id);
         let mut state = make_state();
-        state.context_manifest_user_id = Some(user_id.to_string());
+        state.owner_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.current_run_id = Some("child-run".to_string());
         state.session_turn = 7;
@@ -2401,10 +2399,7 @@ mod tests {
                 Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
                 Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>,
                 ingestion,
-                state
-                    .context_manifest_user_id
-                    .as_deref()
-                    .unwrap_or("test-user"),
+                state.owner_user_id.as_deref().unwrap_or("test-user"),
                 Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
             )
             .with_local_current_snapshot(),
@@ -2441,7 +2436,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.current_session_id = Some(sid.clone());
-        state.context_manifest_user_id = Some("test-user".into());
+        state.owner_user_id = Some("test-user".into());
         state.error_recovery.consecutive_same_error = 0;
         state
             .messages
@@ -2485,7 +2480,7 @@ mod tests {
         .unwrap();
         let mut state = make_state();
         state.current_session_id = Some(session.clone());
-        state.context_manifest_user_id = Some(user.clone());
+        state.owner_user_id = Some(user.clone());
         state.session_turn = 1;
         state.session_facts.turn = 1;
         state

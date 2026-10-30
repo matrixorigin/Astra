@@ -374,32 +374,13 @@ pub(crate) struct RunProjectionResponse {
     pub total_tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_checkpoint: Option<RunProjectionCheckpointResponse>,
-    pub observability: RunProjectionObservabilityResponse,
     pub recent_events: Vec<serde_json::Value>,
 }
 
-#[derive(serde::Serialize)]
-pub(crate) struct PromptRequestObservabilityResponse {
-    pub request_id: String,
-    pub request_hash: String,
-    pub message_count: u32,
-    pub tool_count: u32,
-    pub delta_counts: astra_services::PromptDeltaCounts,
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct RunProjectionObservabilityResponse {
-    pub observability_available: bool,
-    pub prompt_request_count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
-}
-
 impl RunProjectionResponse {
-    fn new(
-        value: astra_services::runs::RunProjectionRecord,
-        observability: RunProjectionObservabilityResponse,
-    ) -> Self {
+    fn new(mut value: astra_services::runs::RunProjectionRecord) -> Self {
+        value.recent_events =
+            transform_stream_run_events_for_client(&value.run_id, value.recent_events);
         Self {
             run_id: value.run_id,
             session_id: value.session_id,
@@ -423,7 +404,6 @@ impl RunProjectionResponse {
                     created_at: checkpoint.created_at,
                 }
             }),
-            observability,
             recent_events: value.recent_events,
         }
     }
@@ -436,78 +416,12 @@ pub(crate) async fn get_run_projection_handler(
     Query(query): Query<RunProjectionQuery>,
 ) -> Result<Json<RunProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let user_id = user.user_id.clone();
     let projection = state
         .execution
         .run_lifecycle_service
-        .get_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
+        .get_run_projection(run_id, user.user_id, query.recent_limit)
         .await?;
-    Ok(Json(
-        build_run_projection_response(&state, &user_id, &run_id, projection).await?,
-    ))
-}
-
-async fn build_run_projection_response(
-    state: &AppState,
-    user_id: &str,
-    run_id: &str,
-    mut projection: astra_services::runs::RunProjectionRecord,
-) -> Result<RunProjectionResponse, (StatusCode, Json<ErrorResponse>)> {
-    projection.recent_events =
-        transform_stream_run_events_for_client(run_id, projection.recent_events);
-    let (observability_available, prompt_request_count, latest_prompt_request) =
-        load_run_prompt_observability(state, user_id, run_id).await?;
-    Ok(RunProjectionResponse::new(
-        projection,
-        RunProjectionObservabilityResponse {
-            observability_available,
-            prompt_request_count,
-            latest_prompt_request,
-        },
-    ))
-}
-
-async fn load_run_prompt_observability(
-    state: &AppState,
-    user_id: &str,
-    run_id: &str,
-) -> Result<
-    (bool, u32, Option<PromptRequestObservabilityResponse>),
-    (StatusCode, Json<ErrorResponse>),
-> {
-    let Some(shared_pool) = state.shared_pool.as_ref() else {
-        return Ok((false, 0, None));
-    };
-    let prompt_request_count =
-        astra_services::count_prompt_requests_for_run(shared_pool, user_id, run_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new(format!(
-                        "Failed to load run prompt request observability: {error}"
-                    ))),
-                )
-            })?;
-    let latest_prompt_request =
-        astra_services::load_latest_prompt_observability_for_run(shared_pool, user_id, run_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new(format!(
-                        "Failed to load latest run prompt request: {error}"
-                    ))),
-                )
-            })?
-            .map(|request| PromptRequestObservabilityResponse {
-                request_id: request.request_id,
-                request_hash: request.request_hash,
-                message_count: request.message_count,
-                tool_count: request.tool_count,
-                delta_counts: request.delta_counts,
-            });
-    Ok((true, prompt_request_count, latest_prompt_request))
+    Ok(Json(RunProjectionResponse::new(projection)))
 }
 
 pub(crate) async fn stream_run_handler(
@@ -2566,16 +2480,7 @@ mod tests {
             json.pointer("/latest_checkpoint/checkpoint_version"),
             Some(&json!("checkpoint_v3"))
         );
-        assert_eq!(json.pointer("/observability/projection_lag_events"), None);
-        assert_eq!(json.pointer("/observability/has_durable_projection"), None);
-        assert_eq!(
-            json.pointer("/observability/observability_available"),
-            Some(&json!(false))
-        );
-        assert_eq!(
-            json.pointer("/observability/prompt_request_count"),
-            Some(&json!(0))
-        );
+        assert!(json.get("observability").is_none());
         let recent_events = json
             .get("recent_events")
             .and_then(serde_json::Value::as_array)

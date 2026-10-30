@@ -307,8 +307,7 @@ impl DatabaseStateProjectionStore {
                 status: version_status,
             });
         }
-        let event_payload_hash = crate::observation_capture::canonical_observation_payload_hash(
-            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+        let event_payload_hash = crate::observation_capture::canonical_agent_event_payload_hash(
             &serde_json::json!({
                 "event_id": event_id, "session_id": session_id, "user_id": user_id,
                 "event_type": "ui.skill.activate", "content": skill_name,

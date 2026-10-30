@@ -5,8 +5,8 @@
 //!
 //! Fixtures are sized by Astra's estimator; this is not an estimator-accuracy
 //! benchmark. It intentionally measures only work Astra can remove locally:
-//! deep clone, compact JSON serialization, prompt-delta hashing/planning, and
-//! compaction. Provider upload remains an unavoidable separate wire cost.
+//! deep clone, compact JSON serialization, and compaction. Provider upload
+//! remains an unavoidable separate wire cost.
 
 use std::time::Duration;
 
@@ -189,37 +189,6 @@ fn bench_history_serialization(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_prompt_delta_plan(c: &mut Criterion) {
-    let fixtures = WINDOWS
-        .into_iter()
-        .map(|(label, window)| (label, context_fixture(window)))
-        .collect::<Vec<_>>();
-    let mut group = c.benchmark_group("context_history_prompt_delta_plan");
-    group.measurement_time(Duration::from_secs(2));
-    group.sample_size(10);
-    for (label, fixture) in &fixtures {
-        group.throughput(Throughput::Bytes(fixture.serialized_bytes));
-        group.bench_with_input(fixture_id(label, fixture), fixture, |b, fixture| {
-            b.iter(|| {
-                astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-                    user_id: "phase0-baseline-user",
-                    session_id: "phase0-baseline-session",
-                    run_id: None,
-                    turn: 50,
-                    round: 3,
-                    attempt: 0,
-                    source: "criterion_context_history",
-                    messages: black_box(&fixture.messages),
-                    tools: &[],
-                    max_output_tokens: Some(4_096),
-                })
-                .expect("plan prompt request")
-            })
-        });
-    }
-    group.finish();
-}
-
 fn bench_high_pressure_compaction(c: &mut Criterion) {
     let fixtures = WINDOWS
         .into_iter()
@@ -303,7 +272,6 @@ criterion_group!(
     context_history_benches,
     bench_history_clone,
     bench_history_serialization,
-    bench_prompt_delta_plan,
     bench_high_pressure_compaction,
     bench_wire_trace_overhead,
 );

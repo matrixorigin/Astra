@@ -38,7 +38,6 @@ pub mod fuzzy_replacer;
 pub mod git_gix;
 pub mod internal_artifacts;
 pub mod memory_tool_contract;
-pub mod patch_materialization;
 pub mod relevance_score;
 #[cfg(unix)]
 pub mod rpc_bridge;

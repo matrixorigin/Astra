@@ -60,6 +60,23 @@ capability
 cause_event_id
 ```
 
+The separate prompt hash-diff product is retired: no per-request chunk hashes,
+predecessor chains, periodic diagnostic checkpoints, or dedicated retention are
+persisted. Run/Session state reads use their canonical facts without querying a
+second prompt history. Actual provider identities, wire receipts, token/cache
+usage, composition and coverage remain owned by model-request observation.
+These measurements do not reconstruct the removed reuse/append/replace/drop
+estimates. Explicit full captures retain request/response content and actual
+provider receipts; their request content remains labelled as a pre-client
+projection rather than exact provider wire bytes.
+
+Persisted Context manifest parents/items, fixed 8k zone projections and their
+per-attempt artifact-evidence list are also retired. Live assembly/SSE/CLI traces
+and actual provider evidence remain, without claiming to reproduce those lists.
+The diagnostic-only artifact reference counter is removed. An otherwise
+unreferenced artifact can expire at its existing deadline; canonical tool,
+transcript, recovery-point and other durable reference edges still protect it.
+
 ## Introspect
 
 Introspect should answer:

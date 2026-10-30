@@ -39,7 +39,7 @@ async fn request(model: &str, prefix: Vec<Value>) -> Value {
         .build();
     let mut state = loop_state(&session, prefix, "Explain this without making changes.");
     bind_server_workspace(&mut state, workspace.path()).await;
-    state.context_manifest_model_name = Some(model.into());
+    state.policy_model_name = Some(model.into());
     state.skills.request_constraints.allowed_tools = Some(
         ["read_file", "glob", "grep"]
             .into_iter()

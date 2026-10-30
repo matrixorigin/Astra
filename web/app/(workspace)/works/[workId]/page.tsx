@@ -44,16 +44,12 @@ export default async function WorkPage({
     const { snapshot: initial, catalog, selectedBranch } =
       await getWorkBranchPresentation(runtime.sdk, workId, requestedBranchId);
     const branchId = selectedBranch.branch_id;
-    const deliveryBranch = catalog.branches.find((branch) => branch.is_delivery)!;
     const [
       attachmentResult,
       activityResult,
       executionResult,
       transcriptResult,
       archivedBranchesResult,
-      patchArtifactsResult,
-      patchMaterializationsResult,
-      patchCommitsResult,
       recoveryPointsResult,
       interactionsResult,
     ] =
@@ -70,14 +66,6 @@ export default async function WorkPage({
       runtime.sdk.getWorkBranchExecution(workId, branchId),
       runtime.sdk.getWorkBranchTranscript(workId, branchId, { limit: 50 }),
       runtime.sdk.listArchivedWorkBranches(workId, { limit: 20 }),
-      runtime.sdk.listWorkPatchArtifacts(workId, branchId, { limit: 10 }),
-      selectedBranch.is_delivery
-        ? Promise.resolve(undefined)
-        : runtime.sdk.listWorkPatchMaterializations(workId, deliveryBranch.branch_id, {
-            sourceBranchId: branchId,
-            limit: 10,
-          }),
-      runtime.sdk.listWorkPatchCommits(workId, deliveryBranch.branch_id, { limit: 10 }),
       runtime.sdk.listWorkBranchRecoveryPoints(workId, branchId, { limit: 10 }),
       runtime.sdk.getWorkBranchInteractions(workId, branchId),
     ]);
@@ -116,9 +104,6 @@ export default async function WorkPage({
         initialExecution={readOrThrow(executionResult)}
         transcript={readOrThrow(transcriptResult)}
         archivedBranches={readOrThrow(archivedBranchesResult)}
-        patchArtifacts={readOrThrow(patchArtifactsResult)}
-        patchMaterializations={readOrThrow(patchMaterializationsResult)}
-        patchCommits={readOrThrow(patchCommitsResult)}
         recoveryPoints={readOrThrow(recoveryPointsResult)}
         initialInteractions={readOrThrow<WorkBranchInteractionPageV1>(interactionsResult)}
       />

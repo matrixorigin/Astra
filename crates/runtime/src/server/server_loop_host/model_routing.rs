@@ -454,7 +454,7 @@ impl ServerAgenticLoopHost {
         // Everything model-dependent is repinned before prompt construction or
         // compaction. No endpoint or credential is included in the saved fact.
         self.model_override = Some(execution.model_name.clone());
-        state.context_manifest_model_name = Some(execution.model_name.clone());
+        state.policy_model_name = Some(execution.model_name.clone());
         state.hooks.admitted_model_execution = Some(execution.clone());
         if let Some(executor) = state.runtime_tool_executor.as_ref() {
             executor.set_agent_model_execution(&execution);

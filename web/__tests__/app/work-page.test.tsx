@@ -48,7 +48,6 @@ test("opens a durable read attachment after resolving the public delivery branch
   } as never;
   const transcript = { schema_version: 1, items: [] } as never;
   const archivedBranches = { schema_version: 1, branches: [] } as never;
-  const patchArtifacts = { schema_version: 1, artifacts: [] } as never;
   const recoveryPoints = {
     schema_version: 1,
     work_id: "work-1",
@@ -63,7 +62,6 @@ test("opens a durable read attachment after resolving the public delivery branch
   const getWorkBranchActivity = vi.fn().mockResolvedValue(activity);
   const getWorkBranchExecution = vi.fn().mockResolvedValue(execution);
   const listArchivedWorkBranches = vi.fn().mockResolvedValue(archivedBranches);
-  const listWorkPatchArtifacts = vi.fn().mockResolvedValue(patchArtifacts);
   const listWorkBranchRecoveryPoints = vi.fn().mockResolvedValue(recoveryPoints);
   const getWorkBranchInteractions = vi.fn().mockResolvedValue({
     schema_version: 1,
@@ -72,18 +70,14 @@ test("opens a durable read attachment after resolving the public delivery branch
     interactions: [],
     next_cursor: null,
   });
-  const patchCommits = { schema_version: 1, operations: [] } as never;
-  const listWorkPatchCommits = vi.fn().mockResolvedValue(patchCommits);
   const sdk = {
     attachWorkBranch,
     getWorkBranchActivity,
     getWorkBranchExecution,
     getWorkBranchTranscript,
     listArchivedWorkBranches,
-    listWorkPatchArtifacts,
     listWorkBranchRecoveryPoints,
     getWorkBranchInteractions,
-    listWorkPatchCommits,
   } as never;
   requireClient.mockResolvedValue({ sdk } as never);
   loadPresentation.mockResolvedValue({
@@ -109,12 +103,6 @@ test("opens a durable read attachment after resolving the public delivery branch
   expect(getWorkBranchActivity).toHaveBeenCalledWith("work-1", "branch-1");
   expect(getWorkBranchExecution).toHaveBeenCalledWith("work-1", "branch-1");
   expect(listArchivedWorkBranches).toHaveBeenCalledWith("work-1", { limit: 20 });
-  expect(listWorkPatchArtifacts).toHaveBeenCalledWith("work-1", "branch-1", {
-    limit: 10,
-  });
-  expect(listWorkPatchCommits).toHaveBeenCalledWith("work-1", "branch-1", {
-    limit: 10,
-  });
   expect(listWorkBranchRecoveryPoints).toHaveBeenCalledWith("work-1", "branch-1", {
     limit: 10,
   });
@@ -126,53 +114,36 @@ test("opens a durable read attachment after resolving the public delivery branch
     initialExecution: execution,
     transcript,
     archivedBranches,
-    patchArtifacts,
-    patchCommits,
     recoveryPoints,
     branchCatalog: catalog,
     selectedBranch,
   });
 });
 
-test("restores durable patch application progress for an alternative branch", async () => {
+test("opens the selected alternative branch through supported Work APIs", async () => {
   const snapshot = { report: { overview: { work_id: "work-1" } } } as never;
   const selectedBranch = { branch_id: "branch-alt", is_delivery: false } as never;
   const deliveryBranch = { branch_id: "branch-main", is_delivery: true } as never;
   const catalog = { branches: [deliveryBranch, selectedBranch] } as never;
-  const materializations = { schema_version: 2, operations: [] } as never;
-  const listWorkPatchMaterializations = vi.fn().mockResolvedValue(materializations);
-  const commits = { schema_version: 1, operations: [] } as never;
-  const listWorkPatchCommits = vi.fn().mockResolvedValue(commits);
+  const recoveryPoints = { schema_version: 1, recovery_points: [] } as never;
   const sdk = {
     attachWorkBranch: vi.fn().mockResolvedValue(null),
     getWorkBranchActivity: vi.fn().mockResolvedValue({}),
     getWorkBranchExecution: vi.fn().mockResolvedValue({}),
     getWorkBranchTranscript: vi.fn().mockResolvedValue({}),
     listArchivedWorkBranches: vi.fn().mockResolvedValue({}),
-    listWorkPatchArtifacts: vi.fn().mockResolvedValue({}),
-    listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue({}),
+    listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(recoveryPoints),
     getWorkBranchInteractions: vi.fn().mockResolvedValue({}),
-    listWorkPatchMaterializations,
-    listWorkPatchCommits,
-  } as never;
+  };
   requireClient.mockResolvedValue({ sdk } as never);
   loadPresentation.mockResolvedValue({ snapshot, catalog, selectedBranch });
-
   const element = await WorkPage({
     params: Promise.resolve({ workId: "work-1" }),
     searchParams: Promise.resolve({ branch: "branch-alt" }),
   });
-
-  expect(listWorkPatchMaterializations).toHaveBeenCalledWith(
-    "work-1",
-    "branch-main",
-    { sourceBranchId: "branch-alt", limit: 10 },
-  );
-  expect(element.props.patchMaterializations).toBe(materializations);
-  expect(listWorkPatchCommits).toHaveBeenCalledWith("work-1", "branch-main", {
-    limit: 10,
-  });
-  expect(element.props.patchCommits).toBe(commits);
+  expect(element.props.selectedBranch).toBe(selectedBranch);
+  expect(element.props.recoveryPoints).toBe(recoveryPoints);
+  expect(sdk.listWorkBranchRecoveryPoints).toHaveBeenCalledWith("work-1", "branch-alt", { limit: 10 });
 });
 
 test("keeps the Work view usable when attachment rejects due to a stale Server", async () => {
@@ -191,8 +162,6 @@ test("keeps the Work view usable when attachment rejects due to a stale Server",
     getWorkBranchExecution: vi.fn().mockResolvedValue(null),
     getWorkBranchTranscript: vi.fn().mockResolvedValue(null),
     listArchivedWorkBranches: vi.fn().mockResolvedValue(null),
-    listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
-    listWorkPatchCommits: vi.fn().mockResolvedValue(null),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
     getWorkBranchInteractions: vi.fn().mockResolvedValue(null),
   } as never;
@@ -223,8 +192,6 @@ test("keeps a saved Work readable while a read attachment is temporarily unavail
     getWorkBranchExecution: vi.fn().mockResolvedValue(null),
     getWorkBranchTranscript: vi.fn().mockResolvedValue(null),
     listArchivedWorkBranches: vi.fn().mockResolvedValue(null),
-    listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
-    listWorkPatchCommits: vi.fn().mockResolvedValue(null),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
     getWorkBranchInteractions: vi.fn().mockResolvedValue(null),
   } as never;
@@ -254,8 +221,6 @@ test("does not turn an attachment authentication error into a partial page", asy
     getWorkBranchExecution: vi.fn().mockResolvedValue(null),
     getWorkBranchTranscript: vi.fn().mockResolvedValue(null),
     listArchivedWorkBranches: vi.fn().mockResolvedValue(null),
-    listWorkPatchArtifacts: vi.fn().mockResolvedValue(null),
-    listWorkPatchCommits: vi.fn().mockResolvedValue(null),
     listWorkBranchRecoveryPoints: vi.fn().mockResolvedValue(null),
     getWorkBranchInteractions: vi.fn().mockResolvedValue(null),
   } as never;

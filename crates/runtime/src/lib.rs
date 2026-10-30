@@ -146,9 +146,6 @@ pub use astra_services::{
         ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
         SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
     },
-    data_versioning::{
-        DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
-    },
     decisions::{
         DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
         DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,

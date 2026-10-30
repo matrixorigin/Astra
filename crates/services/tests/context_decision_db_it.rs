@@ -15,10 +15,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
-    astra_services::observation_capture::canonical_observation_payload_hash(
-        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
-        &payload,
-    )
+    astra_services::observation_capture::canonical_agent_event_payload_hash(&payload)
 }
 
 async fn seed_session_event(

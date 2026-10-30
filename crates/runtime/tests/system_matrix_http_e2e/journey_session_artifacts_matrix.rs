@@ -1308,6 +1308,27 @@ pub async fn run_session_artifact_latest_and_download_routes() {
         "foreign user must not download another user's artifact: {}",
         String::from_utf8_lossy(&foreign_download_body)
     );
+    sqlx::query("UPDATE session_artifacts SET status = 'expired' WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
+        .bind(&ctx.user_id).bind(&session_id).bind(&artifact_id).execute(&ctx.pool).await.unwrap();
+    let (expired_status, _, _) = get_bytes(app, &download_path, Some(auth), &[]).await;
+    assert_eq!(
+        expired_status,
+        StatusCode::GONE,
+        "expired raw payload must not receive a download grant"
+    );
+    let (summary_status, summary) = get_json(
+        app,
+        &format!("/sessions/{session_id}/artifacts/{artifact_id}"),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        summary_status,
+        StatusCode::OK,
+        "expired artifact summary remains readable: {summary}"
+    );
+    assert_eq!(summary["artifact_id"], artifact_id);
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &other_session_id).await;
     ctx.close().await;
