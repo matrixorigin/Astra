@@ -69,10 +69,13 @@ pub(super) fn prepare(
         ));
     }
     let model = call.route.wire_model_name.unwrap_or(call.route.model_name);
-    // Preserve private continuation while applying the canonical advisory and
-    // provider-call-ID projection. The codec validates/replays the saved items.
-    let mut messages = call.messages.to_vec();
-    strip_internal_runtime_markers_preserving_responses(&mut messages);
+    // Direct and pre-projected calls share runtime authority/order, continuation
+    // and provider-call-ID projection before the codec encodes the request.
+    let messages = consolidate_system_messages_for_provider(
+        call.messages,
+        call.route.provider,
+        call.cache_capability,
+    );
     let mut tools = call.tools.to_vec();
     for tool in &mut tools {
         strip_internal_schema_extensions(tool);

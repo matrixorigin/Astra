@@ -4090,20 +4090,23 @@ pub(crate) fn consolidate_system_messages_for_provider(
         cache_cap.volatile_placement,
         VolatilePlacement::AppendOnlyUserTail
     );
-    if matches!(protocol, LlmProviderProtocol::OpenAiCompatible) {
+    if matches!(
+        protocol,
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::OpenAiResponses
+    ) {
         let projected = crate::turn::wire_assembly::project_runtime_roles(messages);
         return consolidate_system_messages_inner(
             &projected,
             false,
             allow_suffix_dependent_history_repair,
-            false,
+            matches!(protocol, LlmProviderProtocol::OpenAiResponses),
         );
     }
     consolidate_system_messages_inner(
         messages,
         preserve_runtime_system_tail,
         allow_suffix_dependent_history_repair,
-        matches!(protocol, LlmProviderProtocol::OpenAiResponses),
+        false,
     )
 }
 
@@ -4131,11 +4134,6 @@ fn provider_history_ids(messages: &[Value]) -> HashMap<String, String> {
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     let provider_ids = provider_history_ids(messages);
     strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
-}
-
-fn strip_internal_runtime_markers_preserving_responses(messages: &mut [Value]) {
-    let provider_ids = provider_history_ids(messages);
-    strip_internal_runtime_markers_with_ids(messages, &provider_ids, true);
 }
 
 fn strip_internal_runtime_markers_with_ids(

@@ -64,11 +64,10 @@ async fn infer_with_budget(
     attempts: &Attempts,
     budget: Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let projected = consolidate_system_messages_for_provider(messages, "chatgpt", None);
     call_llm_and_collect_with_stream_callback(
         LlmCall {
             purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            messages: &projected,
+            messages,
             tools,
             cache_capability: None,
             route: LlmExecutionRoute::from_admitted(execution),
@@ -147,12 +146,30 @@ async fn responses_transport_recovery_and_credential_fencing() {
     messages.push(json!({"role":"assistant","content":"","tool_calls":calls,astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}));
     messages
         .push(json!({"role":"tool","tool_call_id":"internal-call","content":"fixture contents"}));
+    messages.push(
+        crate::turn::wire_assembly::runtime_system_context_message(
+            "FRESH_CHILD_FACT_transport",
+            true,
+        )
+        .unwrap(),
+    );
     let second = infer(&admitted, &messages, &tools, &attempts)
         .await
         .unwrap();
     assert_eq!(second.full_text, "Continued successfully");
     let requests = provider.state.requests.lock().unwrap().clone();
     let replay = requests.last().unwrap()["input"].as_array().unwrap();
+    let result_index = replay
+        .iter()
+        .position(|item| item["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(replay[result_index + 1]["role"], "user");
+    assert!(
+        replay[result_index + 1]
+            .to_string()
+            .contains("FRESH_CHILD_FACT_transport")
+    );
+    assert!(!replay[0].to_string().contains("FRESH_CHILD_FACT_transport"));
     assert!(
         replay
             .iter()
@@ -367,6 +384,90 @@ async fn responses_transport_recovery_and_credential_fencing() {
             .map(|terminal| terminal.status),
         Some(astra_services::InferenceTerminalStatus::DeliveryUnknown)
     );
+}
+
+#[test]
+fn responses_and_openai_share_runtime_role_projection() {
+    use crate::turn::wire_assembly::{
+        RuntimeAuthorityKind, required_runtime_preamble_message, runtime_system_context_message,
+    };
+    use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+    use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+    let connection = "00000000-0000-0000-0000-000000000001";
+    let continuation = ResponseOutput {
+        items: vec![
+            json!({"type":"reasoning","encrypted_content":"opaque","summary":[]}),
+            json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Working"}]}),
+            json!({"type":"function_call","name":"read_file","namespace":"astra","call_id":"provider-call"}),
+        ],
+        ..Default::default()
+    }.continuation(connection, "fixture-model");
+    let mut prefix = None;
+    for fact in ["FRESH_CHILD_FACT_first", "FRESH_CHILD_FACT_changed"] {
+        let messages = vec![
+            json!({"role":"system","content":[{"type":"text","text":"stable policy"}]}),
+            json!({"role":"user","content":"Finish the current task"}),
+            json!({"role":"assistant","content":"Working","phase":"commentary","tool_calls":[{
+                "id":"internal-call",PROVIDER_TOOL_CALL_ID_FIELD:"provider-call","type":"function",
+                "function":{"name":"read_file","arguments":"{}"}
+            }],CONTINUATION_KEY:continuation}),
+            json!({"role":"tool","tool_call_id":"internal-call","content":"still_running"}),
+            runtime_system_context_message(fact, true).unwrap(),
+            required_runtime_preamble_message(
+                &json!({"instruction":"Continue the assigned item","work_item_id":fact})
+                    .to_string(),
+                RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap(),
+        ];
+        let openai = consolidate_system_messages_for_provider(&messages, "openai", None);
+        let responses = consolidate_system_messages_for_provider(&messages, "chatgpt", None);
+        let mut comparable = responses.clone();
+        comparable[2]
+            .as_object_mut()
+            .unwrap()
+            .remove(CONTINUATION_KEY);
+        assert_eq!(comparable, openai, "runtime authority and order must match");
+        assert_eq!(responses[2][CONTINUATION_KEY], continuation);
+        assert_eq!(responses[2]["tool_calls"][0]["id"], "provider-call");
+        assert_eq!(responses[3]["tool_call_id"], "provider-call");
+        assert_eq!(responses[4]["role"], "user");
+        assert_eq!(responses[5]["role"], "user");
+        assert!(responses[5].to_string().contains("boundary_instruction"));
+        assert!(
+            responses[5]
+                .to_string()
+                .contains("Continue the assigned item")
+        );
+        assert!(!responses[0].to_string().contains(fact));
+        if let Some(prefix) = &prefix {
+            assert_eq!(&responses[0], prefix);
+        }
+        prefix = Some(responses[0].clone());
+        assert_eq!(
+            consolidate_system_messages_for_provider(&responses, "chatgpt", None),
+            responses
+        );
+
+        let body = request("fixture-model", &responses, None, connection, false).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        assert!(!input[0].to_string().contains(fact));
+        assert_eq!(input[2]["encrypted_content"], "opaque");
+        assert_eq!(input[3]["phase"], "commentary");
+        assert_eq!(input[4]["type"], "function_call");
+        assert_eq!(input[4]["call_id"], "provider-call");
+        assert_eq!(input[4]["arguments"], "{}");
+        assert_eq!(input[5]["type"], "function_call_output");
+        assert_eq!(input[5]["call_id"], "provider-call");
+        assert_eq!(input[5]["output"], "still_running");
+        assert_eq!(input[6]["role"], "user");
+        assert!(input[6].to_string().contains(fact));
+        assert_eq!(input[7]["role"], "user");
+        assert!(input[7].to_string().contains("boundary_instruction"));
+        assert!(!body.to_string().contains(CONTINUATION_KEY));
+    }
 }
 
 #[test]

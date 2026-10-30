@@ -88,7 +88,9 @@ Streaming protocols share the physical-attempt runner for sending, retries,
 deadlines, error-body reads and settlement. The Responses adapter owns wire
 decoding and its connection fences, including cancellation during a stream.
 
-Responses requests always send full history with `store:false` and `stream:true`.
+Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
+before wire encoding, including direct auxiliary calls. Requests send full
+history with `store:false` and `stream:true`.
 Astra functions occupy the `astra` namespace. Completed provider output items,
 including encrypted reasoning and message phase, live in private canonical
 assistant-message metadata before tool execution/final checkpoint. Opaque

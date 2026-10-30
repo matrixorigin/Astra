@@ -75,6 +75,9 @@ connection. A refused-connection retry with a 100 ms invocation budget must
 expire during its one-second backoff before admitting a second attempt.
 Transient HTTP admission failures exercise the shared retry runner and preserve
 the structured subscription error after physical retries are exhausted.
+Paired OpenAI/Responses projection coverage checks runtime fact/instruction roles,
+tool/result order, prefix stability, and private continuation. The transport
+journey supplies raw canonical messages to exercise direct request preparation.
 The ignored `chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session`
 test in `runtime/tests/web_agent_e2e.rs` exercises authenticated connection and
 model routes, real model-catalog tool execution through `/chat/stream`, and
