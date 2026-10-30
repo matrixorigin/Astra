@@ -134,10 +134,21 @@ class MacRunnerTests(unittest.TestCase):
         self.assertEqual(workflow.count("runs-on: macos-15"), 1)
         for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
             section = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], 1)[0]
-            self.assertIn("needs: [scope, macos-plan, macos-hosted]", section)
+            self.assertIn("needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]", section)
             self.assertIn("runs-on: ubuntu-latest", section)
             self.assertNotIn("uses:", section)
         self.assertNotIn("pull_request_target:", workflow)
+
+    def test_bundle_identity_writes_three_github_output_fields(self):
+        script = workflow_run_script(".github/workflows/test.yml", "Record completed bundle identity")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            result = subprocess.run(["bash", "-c", script], env={**os.environ,
+                "GITHUB_OUTPUT": str(output), "GITHUB_RUN_ID": "1",
+                "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "a" * 40}, capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(dict(line.split("=", 1) for line in output.read_text().splitlines()),
+                             {"run_id": "1", "attempt": "2", "sha": "a" * 40})
 
     def test_unaffected_scope_needs_no_mac_route_or_execution(self):
         scopes = classify(["docs/README.md"])
@@ -159,7 +170,7 @@ class MacRunnerTests(unittest.TestCase):
         for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
             block = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1].split("        run: |\n", 1)[1], 1)[0]
             script = "\n".join(line[10:] for line in block.splitlines())
-            base = {"SCOPE_RESULT": "success", "MINI_JOB_RESULT": "success", "MINI_RESULT": "success",
+            base = {"SCOPE_RESULT": "success", "LINUX_TERMINAL_RESULT": "success", "LINUX_VENDOR_RESULT": "success", "MINI_JOB_RESULT": "success", "MINI_RESULT": "success",
                 "MINI_RUN_ID": "1", "MINI_ATTEMPT": "2", "MINI_SHA": "abc", "HOSTED_JOB_RESULT": "skipped",
                 "HOSTED_RUN_ID": "1", "HOSTED_ATTEMPT": "2", "HOSTED_SHA": "abc",
                 "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "abc"}
@@ -171,7 +182,7 @@ class MacRunnerTests(unittest.TestCase):
                 hosted = route == '["macos-15"]'
                 if hosted:env.update(MINI_JOB_RESULT="skipped", HOSTED_JOB_RESULT="success")
                 variants = [({}, valid)]
-                for key in ("SCOPE_RESULT", "HOSTED_JOB_RESULT" if hosted else "MINI_JOB_RESULT"):
+                for key in ("SCOPE_RESULT", "LINUX_TERMINAL_RESULT", "LINUX_VENDOR_RESULT", "HOSTED_JOB_RESULT" if hosted else "MINI_JOB_RESULT"):
                     variants.extend(({key: value}, False) for value in ("failure", "cancelled", "skipped", ""))
                 prefix = "HOSTED" if hosted else "MINI"
                 for key in (f"{prefix}_RUN_ID", f"{prefix}_ATTEMPT", f"{prefix}_SHA"):
@@ -232,8 +243,9 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("needs.scope.result != 'success'", coordination)
         self.assertIn("if: ${{ !cancelled() }}", coordination)
         contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
-        self.assertIn("needs: [scope, macos-plan, macos-hosted]", contracts)
-        self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
+        self.assertIn("needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]", contracts)
+        hosted = workflow.split("\n  macos-hosted:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertNotIn("terminal-pty-shards", hosted, "Actual Mac work starts independently; only adapters wait for portable coverage")
         online = workflow.split("\n  test-online:\n", 1)[1]
         self.assertIn("lane: [core-runtime, core-services, integration]", online)
         self.assertIn("matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true'", online)

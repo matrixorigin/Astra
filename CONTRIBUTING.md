@@ -112,7 +112,8 @@ strict profile without retries, preserving the complete inventory's CI JUnit
 file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane runs the CLI Bash regression using
 its existing test executable. PR authors in a static contributor ID allowlist
-can attempt one self-hosted ARM bundle containing all five Mac lanes.
+can attempt one self-hosted ARM bundle for default PTY/Bash, workspace coordination and
+the native Mio readiness regression.
 Main pushes default to hosted; operators may enable a separate isolated main
 runner with `ASTRA_MACOS_MAIN_ENABLED=1`. Develop pushes and release builds
 remain hosted. The PR mini shares a persistent account and toolchain and must
@@ -121,7 +122,8 @@ An IDC route gets a 60-minute queue/discovery budget and never switches to
 paid hosted Macs automatically. Queue, setup and control failures fail the
 required checks; fix the cause and **Re-run all jobs** to create a fresh attempt.
 Other known authors and default-hosted pushes use one Mac bundle that shares
-checkout, toolchain setup and Cargo artifacts across all five lanes. Linux
+checkout, toolchain setup and Cargo artifacts across the native checks. Full
+production reflow, dev-tty and portable vendored units stay on Linux. Linux
 execution starts independently. The ordinary workflow retains required checks
 and fork approval; no App or custom check source is needed.
 See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)

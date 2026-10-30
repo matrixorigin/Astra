@@ -128,7 +128,7 @@ IDC PR mini. A selected IDC route never becomes a paid hosted route because of
 queueing, missing controller, API failure, low disk, toolchain failure, lost agent
 or a rerun. Those conditions fail the required checks. Known noneligible PR
 authors and default-hosted pushes use one hosted bundle, sharing checkout,
-toolchain setup and Cargo artifacts across all five lanes. When Mac coverage is
+toolchain setup and Cargo artifacts across the native checks. When Mac coverage is
 selected, missing or malformed routing metadata selects no Mac and fails the
 checks on Linux. A successful scope that selects no Mac coverage skips these
 jobs without needing a Mac route.
@@ -145,9 +145,11 @@ The ordinary Test Suite owns the existing required check names. Linux tests
 start independently from scope. One successful scope with an explicit hosted
 route may allocate a `macos-15` runner; an absent planner/result never authorizes
 it. The five existing Mac-facing checks run as lightweight Ubuntu adapters.
-They pass only for a fully successful producer matching their current source
-run ID, run attempt and tested merge/push SHA. A bundle failure fails all its
-adapters, including lanes not reached after the first failure. No test is inferred
+They pass only for a fully successful native producer matching their current
+source run ID, run attempt and tested merge/push SHA, plus successful full Linux
+terminal/vendor matrices. Their summaries distinguish native Mac execution from
+portable/alternate-backend Linux coverage. A bundle failure fails all adapters,
+including native checks not reached after the first failure. No test is inferred
 from a successful checkout or skipped step.
 
 `macos-scheduler.yml` runs trusted default-branch code on Test Suite's
@@ -194,12 +196,26 @@ original attempt. The default-branch controller must contain this policy before
 rerun-all IDC can be verified; pre-merge tests use the old controller and may fail
 closed for source attempts greater than one.
 
-The canonical `scripts/ci/run-macos-lanes.sh all` runs default reader/Bash,
-production-binary reflow, native Git/workspace coordination, vendored terminal
-units and dev-tty reader. Cargo invocations and their feature sets stay separate,
-with dev-tty last. Mac Clippy remains because Linux cannot lint macOS-only cfg
-branches. The hosted bundle has a 190-minute serial hard backstop, exceeding the
-old per-job timeout sum plus preparation; this is not a duration estimate.
+On Darwin, the canonical `scripts/ci/run-macos-lanes.sh all` runs default CLI
+PTY/Bash, native Git/workspace coordination with Mac Clippy, and the standalone
+Mio simultaneous-readiness test. That test uses Darwin's kqueue, so its exact
+inventory must contain one test before execution; zero matches cannot pass.
+Linux keeps the full default/dev-tty CLI suites, normal-production-binary reflow
+and both complete vendored variants. Mac drops the production CLI binary graph,
+alternate-feature CLI graph and bulk portable vendored runs. It needs no Node
+setup. Two heavy build graphs plus a small native library replace four heavy
+graphs; this is removed work, not a duration estimate.
+
+This is deliberately narrower cross-platform coverage. A Darwin-only problem in
+the full production-renderer or non-default dev-tty combination may surface
+outside this PR gate. The native default reader, real ToolExecutor Bash,
+SIGINT/termios restoration, resize/input, kqueue and workspace behavior remain
+validated on Mac; portable full journeys and both readers remain on Linux.
+The existing controller step name `Run all macOS lanes` stays stable, so the old
+worker can execute the candidate's Darwin-aware dispatcher before merge. It may
+still prepare Node until the default-branch worker workflow is updated. The
+hosted native bundle has the same 65-minute hard backstop as the IDC worker;
+this is a safety bound, not expected runtime.
 
 Self-hosted Rust setup retains Cargo artifacts in
 `$RUNNER_WORKSPACE/.astra-ci-target`, outside the checkout that `git clean`
@@ -222,7 +238,7 @@ time; a cold first run still builds the dependencies.
 The PR runner must match `[self-hosted, macOS, ARM64, mac-arm64-mini]`; the
 isolated main runner uses `mac-arm64-main` instead. Each must be available
 to Astra (including public repository access), and support the pinned Actions,
-Rust and Node versions. Rustup is bootstrapped if absent, Cargo bin is added to PATH, and the selected
+Rust versions. Rustup is bootstrapped if absent, Cargo bin is added to PATH, and the selected
 repository toolchain is exported through GITHUB_ENV for later sccache compiler
 probes outside the checkout. At least 30 GiB workspace disk is required. On self-hosted runners the
 disk guard reports low/unreadable disk without privileged hosted-image cleanup;

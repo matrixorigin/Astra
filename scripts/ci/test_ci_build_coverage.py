@@ -367,6 +367,21 @@ rm() {
         for features in ("", "--features crossterm/use-dev-tty "):
             self.assertIn(f"cargo test --locked -p astra-cli --lib {features}tui::terminal_startup -- --test-threads=2", lanes)
 
+    def test_mac_native_bundle_removes_extra_graphs_and_node_setup(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        hosted = workflow.split("\n  macos-hosted:\n", 1)[1].split("\n  vendored-terminal-macos:", 1)[0]
+        worker = (ROOT / ".github/workflows/macos-mini.yml").read_text()
+        self.assertIn("timeout-minutes: 65", hosted)
+        for job in (hosted, worker):
+            self.assertNotIn("actions/setup-node", job)
+            self.assertIn("run-macos-lanes.sh all", job)
+        commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
+        native = commands.split('if [[ "$(uname -s)" == Darwin ]]; then', 1)[1].split("    fi", 1)[0]
+        for lane in ("default-reader", "coordination", "native-mio"):
+            self.assertIn(f'bash "$0" {lane}', native)
+        for lane in ("reflow", "dev-tty-reader", "vendored"):
+            self.assertNotIn(f'bash "$0" {lane}\n', native)
+
     def test_terminal_reflow_uses_real_binary_and_locked_emulator(self):
         commands = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()
         self.assertIn("cargo build --locked -p astra-cli --bin astra", commands)

@@ -374,7 +374,7 @@ jobs:
       (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') &&
       needs.scope.outputs.macos_runner == '["macos-15"]'
     runs-on: macos-15
-    timeout-minutes: 190
+    timeout-minutes: 65
     outputs:
       run_id: ${{ steps.identity.outputs.run_id }}
       attempt: ${{ steps.identity.outputs.attempt }}
@@ -388,26 +388,23 @@ jobs:
           shared-key: ci-terminal-pty
           save-cache: ${{ github.event_name == 'push' }}
           install-nextest: "false"
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version-file: .nvmrc
       - name: Run all macOS lanes
         run: bash scripts/ci/run-macos-lanes.sh all
       - name: Record completed bundle identity
         id: identity
         run: |
-          echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          printf 'run_id=%s\nattempt=%s\nsha=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   vendored-terminal-macos:
     name: "Test: vendored terminal (macos-15)"
-    needs: [scope, macos-plan, macos-hosted]
+    needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       SCOPE_RESULT: ${{ needs.scope.result }}
+      LINUX_TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
+      LINUX_VENDOR_RESULT: ${{ needs.vendored-terminal.result }}
       MACOS_ROUTE: ${{ needs.scope.outputs.macos_runner }}
       MINI_JOB_RESULT: ${{ needs.macos-plan.result }}
       MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
@@ -423,6 +420,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$SCOPE_RESULT" = success
+          test "$LINUX_TERMINAL_RESULT" = success
+          test "$LINUX_VENDOR_RESULT" = success
           case "$MACOS_ROUTE" in
             '["macos-15"]')
               test "$MINI_JOB_RESULT" = skipped
@@ -439,15 +438,20 @@ jobs:
               ;;
             *) echo '::error::Unknown macOS route; refusing paid execution or unverified success.'; exit 1 ;;
           esac
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo 'Mac: default PTY/Bash, native workspace coordination and Mio readiness. Linux: full renderer/reflow, dev-tty and vendored units; those full combinations were not run on Mac.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   terminal-pty-shards-macos:
     name: "Terminal: ${{ matrix.segment }} (macos-15)"
-    needs: [scope, macos-plan, macos-hosted]
+    needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       SCOPE_RESULT: ${{ needs.scope.result }}
+      LINUX_TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
+      LINUX_VENDOR_RESULT: ${{ needs.vendored-terminal.result }}
       MACOS_ROUTE: ${{ needs.scope.outputs.macos_runner }}
       MINI_JOB_RESULT: ${{ needs.macos-plan.result }}
       MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
@@ -467,6 +471,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$SCOPE_RESULT" = success
+          test "$LINUX_TERMINAL_RESULT" = success
+          test "$LINUX_VENDOR_RESULT" = success
           case "$MACOS_ROUTE" in
             '["macos-15"]')
               test "$MINI_JOB_RESULT" = skipped
@@ -483,15 +489,20 @@ jobs:
               ;;
             *) echo '::error::Unknown macOS route; refusing paid execution or unverified success.'; exit 1 ;;
           esac
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo 'Mac: default PTY/Bash, native workspace coordination and Mio readiness. Linux: full renderer/reflow, dev-tty and vendored units; those full combinations were not run on Mac.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   macos-workspace-coordination-tests:
     name: "macOS workspace coordination contracts"
-    needs: [scope, macos-plan, macos-hosted]
+    needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       SCOPE_RESULT: ${{ needs.scope.result }}
+      LINUX_TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
+      LINUX_VENDOR_RESULT: ${{ needs.vendored-terminal.result }}
       MACOS_ROUTE: ${{ needs.scope.outputs.macos_runner }}
       MINI_JOB_RESULT: ${{ needs.macos-plan.result }}
       MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
@@ -507,6 +518,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$SCOPE_RESULT" = success
+          test "$LINUX_TERMINAL_RESULT" = success
+          test "$LINUX_VENDOR_RESULT" = success
           case "$MACOS_ROUTE" in
             '["macos-15"]')
               test "$MINI_JOB_RESULT" = skipped
@@ -523,6 +536,9 @@ jobs:
               ;;
             *) echo '::error::Unknown macOS route; refusing paid execution or unverified success.'; exit 1 ;;
           esac
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo 'Mac: default PTY/Bash, native workspace coordination and Mio readiness. Linux: full renderer/reflow, dev-tty and vendored units; those full combinations were not run on Mac.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # Preserve the required core check while its package groups run separately.
   # The aggregate requires all selected online jobs, including integration.

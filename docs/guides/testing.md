@@ -478,18 +478,24 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-CI runs the default terminal reader, `use-dev-tty` reader, and reflow binary in
-three parallel Linux jobs. On macOS, they share one sequential bundle with
-workspace coordination and vendored units, on IDC when eligible or on one
-explicitly selected hosted runner. Separate Cargo invocations retain the default
-and dev-tty feature graphs; dev-tty runs last. Hosted bundle preparation and Cargo
-artifacts are shared instead of repeated across five paid Macs. The existing
-`Test: terminal PTY (ubuntu-latest)` and `Test: terminal PTY (macos-15)` required
-checks still reject failed, cancelled or unexpectedly skipped work. Unaffected
-changes skip heavy jobs. IDC failures never allocate a paid fallback; rerun all
-jobs after resolving capacity/control failures. Producer results must match the
-current run, attempt and tested SHA. Push runs populate the terminal dependency
-cache once per OS.
+CI runs the default terminal reader, `use-dev-tty` reader and all eight
+production-binary reflow journeys in three parallel Linux jobs. Linux also runs
+the complete vendored units with both reader feature sets. One Mac bundle runs
+the existing default CLI PTY/Bash suite, native workspace coordination/Clippy,
+and the single Mio simultaneous-readiness regression on Darwin's kqueue.
+The same dispatcher selects this platform-native inventory on Darwin and the
+full inventory on Linux. Mac does not prepare Node or build the production CLI
+and alternate-feature CLI graphs just to repeat the portable integration matrix.
+
+The existing Mac-named terminal/vendor check names are compatibility gates for
+this platform split: they require passing native Mac results and passing Linux
+terminal/vendor matrices, and their summaries state what ran on each OS. Failed,
+cancelled or unexpectedly skipped required work cannot pass. This intentionally
+removes macOS production-binary reflow and dev-tty cross-product coverage; Linux
+cannot prove those exact Darwin combinations. Default Mac PTY tests retain real
+SIGINT/terminal restoration, input and resize/cursor behavior. Unaffected changes
+skip heavy jobs. IDC failure never allocates paid fallback; producer stamps must
+match the current run/attempt/SHA. Pushes populate the terminal cache once per OS.
 The Rust terminal-reader PTY tests also
 verify that a resize cursor query preserves keyboard/paste input and times out
 when the terminal does not answer.

@@ -961,6 +961,8 @@ class LaneTests(unittest.TestCase):
                 root = Path(directory)
                 tools = root / "bin"
                 tools.mkdir()
+                (tools / "uname").write_text("#!/bin/sh\necho Linux\n")
+                (tools / "uname").chmod(0o755)
                 log = root / "commands"
                 for command in ("cargo", "npm"):
                     program = tools / command
@@ -983,6 +985,51 @@ class LaneTests(unittest.TestCase):
                     self.assertTrue(any("workspace_observation::tests:: -- --test-threads=1" in c for c in calls))
                     self.assertTrue(any("npm test --prefix scripts/tui-reflow" in c for c in calls))
                     self.assertIn("crossterm/use-dev-tty", calls[-1])
+
+    def test_darwin_bundle_runs_only_native_graphs_and_requires_mio_discovery(self):
+        native = "event::source::unix::mio::tests::cursor_input_does_not_discard_a_batched_reader_wake"
+        for failure in ("", "default", "coordination", "mio", "list", "missing", "duplicate"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tools = root / "bin"
+                tools.mkdir()
+                log = root / "commands"
+                (tools / "uname").write_text("#!/bin/sh\necho Darwin\n")
+                (tools / "uname").chmod(0o755)
+                recorder = r'''#!/bin/bash
+printf '%s %s\n' "${0##*/}" "$*" >> "$COMMANDS"
+[[ "${0##*/}" == cargo ]] || exit 22
+if [[ "$FAILURE" == default && "$*" == *tui::terminal_startup* ]]; then exit 17; fi
+if [[ "$FAILURE" == coordination && "$*" == *workspace_observation::tests::* ]]; then exit 17; fi
+if [[ "$*" == *"$NATIVE_TEST"* ]]; then
+  if [[ "$*" == *--list* ]]; then
+    [[ "$FAILURE" != list ]] || exit 17
+    [[ "$FAILURE" != missing ]] || exit 0
+    printf '%s: test\n' "$NATIVE_TEST"
+    if [[ "$FAILURE" == duplicate ]]; then printf '%s: test\n' "$NATIVE_TEST"; fi
+  elif [[ "$FAILURE" == mio ]]; then exit 17
+  fi
+fi
+exit 0
+'''
+                for command in ("cargo", "npm"):
+                    (tools / command).write_text(recorder)
+                    (tools / command).chmod(0o755)
+                subprocess.run(["git", "init", "-q", str(root)], check=True)
+                result = subprocess.run(["bash", str(ROOT / "scripts/ci/run-macos-lanes.sh"), "all"],
+                    cwd=root, env={**os.environ, "PATH": str(tools) + ":" + os.environ["PATH"],
+                        "COMMANDS": str(log), "FAILURE": failure, "NATIVE_TEST": native},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, not failure, result.stderr)
+                calls = log.read_text().splitlines()
+                self.assertFalse(any("npm " in c or "--bin astra" in c or "use-dev-tty" in c for c in calls))
+                if not failure:
+                    self.assertEqual(len(calls), 6)
+                    self.assertTrue(any("bash_echo_returns_output" in c for c in calls))
+                    self.assertTrue(any("workspace_observation::tests::" in c for c in calls))
+                    self.assertEqual(sum(native in c for c in calls), 2)  # discovery then execution
+                elif failure in ("missing", "duplicate", "list"):
+                    self.assertEqual(sum(native in c for c in calls), 1)  # never run a missing/ambiguous test
 
 
 if __name__ == "__main__":
